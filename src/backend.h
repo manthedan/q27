@@ -63,14 +63,31 @@ class ComputeBackend {
     // y[rows] = weight[rows, cols] * x[cols], accumulating into F32.
     virtual void matvec(const BackendTensor& weight, const BackendBuffer& x,
                         BackendBuffer& y) = 0;
+    // Shared-input projection pair. Backends may fuse dispatch; the default
+    // preserves semantics for reference implementations.
+    virtual void matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
+                             const BackendTensor& b, BackendBuffer& b_out,
+                             const BackendBuffer& x) {
+        matvec(a, x, a_out); matvec(b, x, b_out);
+    }
     virtual BackendQuantized allocate_quantized(uint32_t count) = 0;
     virtual void quantize(const BackendBuffer& x, BackendQuantized& out) = 0;
     virtual void matvec_quantized(const BackendTensor& weight,
                                   const BackendQuantized& x, BackendBuffer& y) = 0;
+    virtual void matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
+                                       const BackendTensor& b, BackendBuffer& b_out,
+                                       const BackendQuantized& x) {
+        matvec_quantized(a, x, a_out); matvec_quantized(b, x, b_out);
+    }
     virtual void embedding_q8(const BackendTensor& weight, uint32_t token,
                               BackendBuffer& out) = 0;
     virtual void rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
                          BackendBuffer& out, uint32_t n, float eps) = 0;
+    virtual void rmsnorm_quantized(const BackendBuffer& x, const BackendTensor& weight,
+                                   BackendBuffer& out, uint32_t n, float eps,
+                                   BackendQuantized& quantized) {
+        rmsnorm(x,weight,out,n,eps); quantize(out,quantized);
+    }
     virtual void rmsnorm_heads(BackendBuffer& x, const BackendTensor& weight,
                                uint32_t heads, uint32_t head_dim, uint32_t stride,
                                float eps) = 0;

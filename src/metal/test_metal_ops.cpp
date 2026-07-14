@@ -74,6 +74,20 @@ int test_primitives(q27::MetalBackend& backend) {
     float inv = 1.0f / std::sqrt(sum / x.size() + 1e-6f);
     for (size_t i = 0; i < x.size(); i++) if (!near(got[i], x[i] * inv * w[i])) fail("rmsnorm", i, got[i], x[i] * inv * w[i]);
 
+    // Fused RMSNorm + group-32 quantization must match the two-dispatch path.
+    std::vector<float> fx(32),fw(32,1.0f); for(size_t i=0;i<fx.size();i++) fx[i]=(float)((int)i-15)/7;
+    auto fxb=upload_buffer(backend,fx); auto fwt=upload_f32(backend,fw,{32});
+    auto normal=backend.allocate(32*4),fused=backend.allocate(32*4);
+    auto nq=backend.allocate_quantized(32),fq=backend.allocate_quantized(32);
+    backend.begin_commands(); backend.rmsnorm(*fxb,fwt,*normal,32,1e-6f); backend.quantize(*normal,nq); backend.end_commands();
+    backend.rmsnorm_quantized(*fxb,fwt,*fused,32,1e-6f,fq);
+    auto normal_f=read_f32(backend,*normal,32),fused_f=read_f32(backend,*fused,32);
+    std::vector<int8_t> normal_q(32),fused_q(32); float normal_s=0,fused_s=0;
+    backend.read(*nq.values,0,normal_q.data(),32); backend.read(*fq.values,0,fused_q.data(),32);
+    backend.read(*nq.scales,0,&normal_s,4); backend.read(*fq.scales,0,&fused_s,4);
+    for(size_t i=0;i<32;i++) if(normal_f[i]!=fused_f[i] || normal_q[i]!=fused_q[i]) fail("fused rms",i,fused_f[i],normal_f[i]);
+    if(normal_s!=fused_s) fail("fused rms scale",0,fused_s,normal_s);
+
     // Per-head RMSNorm with a stride, then contiguous L2 normalization.
     std::vector<float> heads = {1,2,3,4,99,99, -1,2,-3,4,88,88};
     std::vector<float> hw = {1,0.5f,2,-1};

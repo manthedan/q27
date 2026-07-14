@@ -9,11 +9,12 @@ UNAME_S   := $(shell uname -s)
 .PHONY: all clean test-cpu test-metal
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
 
-test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft
+test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling
 	./build/test_artifacts
 	./build/test_depthctl
 	./build/test_toolconstrain
 	./build/test_suffixdraft
+	./build/test_sampling
 
 ifeq ($(UNAME_S),Darwin)
 test-metal: build/test_metal build/test_metal_ops
@@ -32,14 +33,14 @@ build/test_metal_ops: src/metal/test_metal_ops.cpp src/metal/metal_backend.mm sr
 	        src/metal/metal_backend.mm src/loader.cpp \
 	        -framework Foundation -framework Metal -o $@
 
-build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h \
+build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h \
                  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
 
-build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h \
+build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h \
                         src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                         src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h \
                         third_party/httplib.h third_party/json.hpp | build
@@ -75,6 +76,9 @@ build/test_toolconstrain: tools/test_toolconstrain.cpp src/toolconstrain.h src/t
 
 build/test_suffixdraft: tools/test_suffixdraft.cpp src/suffixdraft.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_suffixdraft.cpp -o $@
+
+build/test_sampling: src/test_sampling.cpp src/sampling.h | build
+	$(CXX) $(CXXFLAGS) -I src src/test_sampling.cpp -o $@
 
 build/width_bench: tools/width_bench.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/width_bench.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@

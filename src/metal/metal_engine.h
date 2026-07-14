@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal_backend.h"
+#include "../sampling.h"
 #include "../loader.h"
 
 #include <cstdint>
@@ -14,6 +15,7 @@ namespace q27 {
 class MetalEngine {
   public:
     struct Snapshot;
+    struct SpecStats { uint64_t rounds=0,drafted=0,accepted=0; };
     explicit MetalEngine(const std::string& model_path, uint32_t context = 128,
                          bool turbo3_kv = false);
 
@@ -29,10 +31,16 @@ class MetalEngine {
                            bool reset_first = true);
     std::vector<uint32_t> generate_from_pending(uint32_t pending, uint32_t count,
                                                 uint32_t mtp_width = 0);
+    std::vector<float> read_logits();
+    std::vector<uint32_t> generate_sampled(const std::vector<uint32_t>& prompt,
+                                           uint32_t count,const SamplingParams& params);
+    std::vector<uint32_t> generate_sampled_from_logits(uint32_t count,
+                                                       const SamplingParams& params);
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
     static constexpr uint32_t vocabulary_size() { return 248320; }
     uint32_t position() const { return position_; }
+    SpecStats last_spec_stats() const { return last_spec_stats_; }
     MetalBackend& backend() { return backend_; }
 
   private:
@@ -64,6 +72,7 @@ class MetalEngine {
     uint32_t max_context_;
     bool turbo3_kv_;
     uint32_t position_ = 0;
+    SpecStats last_spec_stats_;
     std::unordered_map<std::string, BackendTensor> weights_;
     std::vector<LayerState> layers_;
 

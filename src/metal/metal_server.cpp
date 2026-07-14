@@ -118,10 +118,12 @@ struct Runtime {
     }
 
     struct Result { std::string text; uint32_t prompt_tokens; uint32_t output_tokens; size_t prefix_hit; };
-    Result complete(const std::vector<uint32_t>& prompt,uint32_t count) {
+    Result complete(const std::vector<uint32_t>& prompt,uint32_t count,
+                    const q27::SamplingParams& sampling={}) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         std::lock_guard<std::mutex> lock(mutex);
-        const bool mtp=mtp_width!=0;
+        q27::validate_sampling(sampling);
+        const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
         size_t hit=0; uint32_t pending=0;
         if(cache.restore(engine,prompt,mtp,hit,pending)) {
             if(hit<prompt.size()) {
@@ -133,12 +135,24 @@ struct Runtime {
         // about 151 MiB for GDN state, so the default capacity is deliberately 1.
         if(cache.prepare_insert(prompt,mtp))
             cache.insert(prompt,mtp,pending,engine.capture_state());
-        std::vector<uint32_t> output=engine.generate_from_pending(pending,count,mtp_width);
+        std::vector<uint32_t> output=sampling.temperature>0.0f
+            ? engine.generate_sampled_from_logits(count,sampling)
+            : engine.generate_from_pending(pending,count,mtp?mtp_width:0);
         auto eos=std::find(output.begin(),output.end(),(uint32_t)tokenizer.eos());
         if(eos!=output.end()) output.erase(eos+1,output.end());
         return {tokenizer.decode(to_int(output)),(uint32_t)prompt.size(),(uint32_t)output.size(),hit};
     }
 };
+
+q27::SamplingParams sampling_params(const json& body) {
+    q27::SamplingParams result;
+    result.temperature=body.value("temperature",0.0f);
+    result.top_p=body.value("top_p",1.0f);
+    result.top_k=body.value("top_k",0u);
+    result.seed=body.value("seed",0ull);
+    q27::validate_sampling(result);
+    return result;
+}
 
 uint32_t max_tokens(const json& body) {
     long long value=body.value("max_tokens",body.value("max_output_tokens",128ll));
@@ -186,22 +200,23 @@ int main(int argc,char** argv) {
         };
         server.Post("/v1/completions",guarded([&](const json& body,httplib::Response& r){
             std::string prompt=body.value("prompt",""); auto ids=to_u32(runtime.tokenizer.encode(prompt));
-            auto result=runtime.complete(ids,max_tokens(body));
+            auto result=runtime.complete(ids,max_tokens(body),sampling_params(body));
             json_response(r,{{"id","cmpl-metal"},{"object","text_completion"},{"model","q27-metal"},{"choices",json::array({{{"index",0},{"text",result.text},{"finish_reason","length"}}})},{"usage",{{"prompt_tokens",result.prompt_tokens},{"completion_tokens",result.output_tokens},{"total_tokens",result.prompt_tokens+result.output_tokens}}},{"q27_prefix_hit",result.prefix_hit}});
         }));
         server.Post("/v1/chat/completions",guarded([&](const json& body,httplib::Response& r){
             auto ids=to_u32(runtime.tokenizer.apply_chat_template(messages_from(body),body.value("enable_thinking",true)));
-            auto result=runtime.complete(ids,max_tokens(body));
+            auto result=runtime.complete(ids,max_tokens(body),sampling_params(body));
             json_response(r,{{"id","chatcmpl-metal"},{"object","chat.completion"},{"model","q27-metal"},{"choices",json::array({{{"index",0},{"message",{{"role","assistant"},{"content",result.text}}},{"finish_reason","length"}}})},{"usage",{{"prompt_tokens",result.prompt_tokens},{"completion_tokens",result.output_tokens},{"total_tokens",result.prompt_tokens+result.output_tokens}}},{"q27_prefix_hit",result.prefix_hit}});
         }));
         server.Post("/v1/messages",guarded([&](const json& body,httplib::Response& r){
             auto ids=to_u32(runtime.tokenizer.apply_chat_template(messages_from(body),true));
-            auto result=runtime.complete(ids,max_tokens(body));
+            auto result=runtime.complete(ids,max_tokens(body),sampling_params(body));
             json_response(r,{{"id","msg_metal"},{"type","message"},{"role","assistant"},{"model","q27-metal"},{"content",json::array({{{"type","text"},{"text",result.text}}})},{"stop_reason","max_tokens"},{"usage",{{"input_tokens",result.prompt_tokens},{"output_tokens",result.output_tokens}}},{"q27_prefix_hit",result.prefix_hit}});
         }));
         server.Post("/v1/responses",guarded([&](const json& body,httplib::Response& r){
             std::string input=body.contains("input")?text_content(body["input"]):"";
-            auto ids=to_u32(runtime.tokenizer.encode(input)); auto result=runtime.complete(ids,max_tokens(body));
+            auto ids=to_u32(runtime.tokenizer.encode(input));
+            auto result=runtime.complete(ids,max_tokens(body),sampling_params(body));
             json_response(r,{{"id","resp_metal"},{"object","response"},{"model","q27-metal"},{"output_text",result.text},{"output",json::array({{{"type","message"},{"role","assistant"},{"content",json::array({{{"type","output_text"},{"text",result.text}}})}}})},{"usage",{{"input_tokens",result.prompt_tokens},{"output_tokens",result.output_tokens},{"total_tokens",result.prompt_tokens+result.output_tokens}}},{"q27_prefix_hit",result.prefix_hit}});
         }));
         fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u)\n",host.c_str(),port,context,turbo3?"turbo3":"fp16",width);

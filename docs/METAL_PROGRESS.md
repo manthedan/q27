@@ -10,12 +10,12 @@ This is the execution ledger for the Metal port. CUDA remains the behavioral ref
 | 1 | Decode primitives | **Baseline complete** | `make test-metal`, including activation quantization and quantized Q4/Q8 matvec |
 | 2 | One-token Gated DeltaNet | **Baseline complete** | CPU recurrence test; persistent 64-layer state; device snapshot/restore implemented |
 | 3 | FP16 attention | **Baseline complete** | CPU-reference GQA/KV test; production tiling remains |
-| 4 | Full serial decode | **Baseline complete** | Official 27B artifact loads zero-copy; canonical prompt predicts ` Paris`; CUDA probe gate still unavailable locally |
-| 5 | Batched prefill | **In progress** | Prompt tokens are teacher-forced in one command buffer; projection GEMM and chunked prefill remain |
-| 6 | MTP widths 2/4/8/12 | **In progress** | Native MTP layer/head, lane positions, serial verification, acceptance/bonus token and suffix drafting are wired; width-2 canonical run produced ` Paris.`; full width gates remain |
-| 7 | Prefix cache and server | **Baseline complete** | Device state snapshots, longest-prefix LRU, Metal CLI/server, and OpenAI/Anthropic endpoint smoke tests exist; streaming/sampling/tool constraints remain parity work |
-| 8 | turbo3 and long context | **In progress** | Metal WHT, 50-byte codec, KV writer, attention reader, inverse WHT, engine mode, and synthetic quality gate pass; 32K/128K/262K quality/retrieval gates remain |
-| 9 | Performance | **In progress** | mmap views, command batching, activation-quantized GEMV, and 8-row simdgroup dispatch landed; fused/tiled kernels and Instruments work remain |
+| 4 | Full serial decode | **Baseline complete** | Official 27B artifact loads zero-copy; 16-token canonical continuation matches the live CUDA server exactly; 128-token trajectory divergence is under investigation |
+| 5 | Batched prefill | **In progress** | Prompt tokens are teacher-forced in bounded eight-token command chunks; projection GEMM and layer-major recurrence remain |
+| 6 | MTP widths 2/4/8/12 | **Baseline complete** | Widths 2/4/8/12 produce the same 12-token canonical output; native MTP, serial target verification, acceptance accounting, snapshots and suffix drafting are wired; batched verification remains performance work |
+| 7 | Prefix cache and server | **Baseline complete** | Device snapshots (including resident logits), longest-prefix LRU, deterministic CPU top-k/top-p sampling, Metal CLI/server, and OpenAI/Anthropic endpoint smoke tests exist; streaming/tool constraints remain parity work |
+| 8 | turbo3 and long context | **In progress** | Metal WHT, 50-byte codec, KV writer/reader, engine mode, synthetic quality and 32K/262K allocation gates pass; long-context retrieval/perplexity remain blocked on practical batched prefill |
+| 9 | Performance | **In progress** | mmap views, command batching, activation-quantized GEMV, paired projections, fused RMSNorm+quantization, and 8-row simdgroup dispatch landed; tiled kernels remain |
 
 ## Completed foundation
 
@@ -51,19 +51,19 @@ Local official-artifact smoke gates:
 - one-token prompt `760` → ` following`;
 - CPU RSS stayed small because weights alias the mmap (earlier measured peak footprint about 274 MiB), although the GPU still streams/paginates the 17 GiB file.
 
-No CUDA host is available for layer-probe/top-k numerical comparison. The semantic continuation is evidence, not a substitute for that gate.
+The `yukon` RTX 3090 server is now available as a CUDA oracle. `tools/metal_cuda_gate.py --cuda-ssh yukon` compares committed decoded text without copying the model. The 16-token canonical continuation is byte-exact across CUDA and Metal (SHA-256 `6c1d4328...`). Post-prompt logits have matching argmax and top-10 membership, cosine `0.9999038`, RMSE `0.07029`, and max absolute error `0.2125`. At 128 tokens the paths first differ at `on` versus `along`; teacher-forcing the shared prefix makes both backends choose `along`, indicating a low-margin autoregressive/prefill numeric-path distinction rather than an architecture mismatch. Deeper layer probes remain useful.
 
 ### 5 — Prefill
 
-Teacher-forced prompt ingestion now encodes all prompt tokens in one Metal command buffer and computes logits only for the final prompt token. This removes per-token CPU synchronization while preserving the recurrent dependency order. Multi-token projection GEMM, tiled causal attention, and bounded chunking are still required for performance parity.
+Teacher-forced prompt ingestion records tokens in bounded eight-token command chunks and computes logits only for the final prompt token. This removes per-token CPU synchronization while preventing unbounded encoder growth and preserving recurrent dependency order. Multi-token projection GEMM and tiled causal attention are still required for practical long-prompt performance.
 
 ### 6 — MTP
 
-Layer 64 is wired natively: embedding/hidden normalization, concatenation and projection, prompt-history MTP KV warming, MTP attention/FFN, shared-head norm, Q4 draft head, autoregressive draft lanes, target verification, consecutive acceptance, and bonus prediction. Width is accepted from 2 through 12 and live lanes are clipped to remaining output length. The backend-neutral `SuffixDraft` is also available through `--suffix 2..12`, with its existing CPU gate included in `make test-cpu`. The implementation is functionally serial; small-N multi-lane GEMM is checkpoint-9 work.
+Layer 64 is wired natively: embedding/hidden normalization, concatenation and projection, prompt-history MTP KV warming, MTP attention/FFN, shared-head norm, Q4 draft head, autoregressive draft lanes, target verification, consecutive acceptance, bonus prediction, and per-run draft/accept counters. Widths 2, 4, 8 and 12 all produced the exact same 12-token canonical continuation. They are functional gates, not speed claims: measured wall rates were respectively `0.55`, `0.01`, `0.06`, and `0.23 tok/s`, showing why serial verification is not production-ready. The backend-neutral `SuffixDraft` is also available through `--suffix 2..12`, with its CPU gate included in `make test-cpu`. Small-N multi-lane verification GEMM remains checkpoint-9 work.
 
 ### 7 — Prefix/server
 
-`MetalEngine::capture_state` and `restore_state` copy GDN state, active KV rows, MTP KV, position, and the last normalized hidden state on-device. `build/q27-metal` is a backend-neutral CLI. `build/q27-metal-server` adds a mutex-serialized Metal service with longest-prefix snapshot LRU and baseline `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` endpoints. The health endpoint is browser-smoke-tested. Streaming event formats, sampling, constrained tools, multi-slot scheduling, and the full CUDA server compatibility suite remain.
+`MetalEngine::capture_state` and `restore_state` copy GDN state, active KV rows, MTP KV, position, last normalized hidden state, and resident logits on-device. `build/q27-metal` supports token IDs or text prompts, deterministic temperature/top-k/top-p sampling, logit dumps, MTP, and suffix drafting. `build/q27-metal-server` adds a mutex-serialized Metal service with longest-prefix snapshot LRU and baseline `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` endpoints. The health endpoint is browser-smoke-tested. Streaming event formats, constrained tools, multi-slot scheduling, GPU-side sampling, and the full CUDA server compatibility suite remain.
 
 ### 8 — turbo3/long context
 
@@ -77,17 +77,17 @@ Layer 64 is wired natively: embedding/hidden normalization, concatenation and pr
 
 The engine refuses a requested cache above half the device’s recommended Metal working set and recommends turbo3/reduced context rather than risking memory pressure. Synthetic WHT round-trip and end-to-end turbo3 attention tests run without the model artifact. Current synthetic complete-path quality is within the registered gate (observed NRMSE 0.1095, cosine 0.9940; gate NRMSE ≤0.30, cosine ≥0.95).
 
-Long-context allocation, retrieval, perplexity, and GQA=6 turbo3-K quality are not yet passed. The upstream risk note still applies: if turbo3-K quality fails, use FP16/Q8 K plus turbo3 V rather than weakening the quality gate.
+Turbo3 allocation/startup passes at 32K and the full 262144-token limit. KV memory is now logically cleared by resetting `position_`; rows are always written before becoming visible, avoiding an unnecessary O(context) memset. The 262K allocation-only gate starts in 0.11 s with about 207 MiB resident because reserved Metal buffers remain physically lazy. Retrieval, perplexity, and GQA=6 turbo3-K quality are not yet passed: serial token-major prefill makes those runs impractical. The upstream risk note still applies: if turbo3-K quality fails, use FP16/Q8 K plus turbo3 V rather than weakening the quality gate.
 
 ### 9 — Performance
 
-Landed: zero-copy mmap weights, one command buffer per prompt/step, group-32 int8 activation quantization reused across sibling projections, integer-accumulating Q4/Q8 GEMV, and eight independent simdgroups per threadgroup. The post-change official-artifact smoke test still predicts ` Paris`; it took 22.05 s for five cold-prefill tokens plus the output head, with 222 MiB maximum RSS and 257 MiB peak footprint. The mmap therefore avoids a weight-sized CPU allocation, but kernel throughput remains far below parity. Remaining high-impact work: packed SIMD dot instructions, small-N MTP verification GEMM, fused GDN, tiled decode/prefill attention, GPU-side acceptance/sampling, and Instruments attribution.
+Landed: zero-copy mmap weights, one command buffer per prompt/step, group-32 int8 activation quantization reused across sibling projections, integer-accumulating Q4/Q8 GEMV, eight independent simdgroups per threadgroup, shared-input paired projection dispatches, and fused RMSNorm+activation quantization. The 16-token CUDA gate improved from 33.35 s (`0.48 tok/s`) to 25.39 s (`0.63 tok/s`) while preserving exact output; the 128-token run averaged `1.22 tok/s`. Peak process footprint stayed about 276 MiB. Kernel throughput remains far below parity. Remaining high-impact work: packed SIMD dot instructions, small-N MTP verification GEMM, fused GDN, tiled decode/prefill attention, GPU-side acceptance/sampling, and Instruments attribution.
 
 ## Memory-safe test policy
 
 The downloaded `qwen36-27b-mtp.q27` is already the smallest official tier (default 5.25 bpw, about 17 GiB). The q6/q6k files are larger, not lighter. Therefore:
 
-1. `make test-cpu test-metal` is the default gate and uses only small synthetic buffers.
+1. `make test-cpu test-metal` is the default gate and uses only small synthetic buffers; it also passes on the 16 GiB `mac-mini` M4 (10.7 GiB recommended Metal working set).
 2. Do not run width sweeps as separate full-model processes on the 24 GiB machine; they repeatedly page the 17 GiB mmap.
 3. Run a single official-artifact smoke test only at explicit milestones.
 4. Use `--kv turbo3` for long-context work; do not allocate full 262K FP16 KV.
@@ -98,6 +98,9 @@ The downloaded `qwen36-27b-mtp.q27` is already the smallest official tier (defau
 make test-cpu
 make test-metal
 make build/q27-metal build/q27-metal-server
+
+# CUDA/Metal committed-token gate through Yukon's loopback CUDA server
+./tools/metal_cuda_gate.py MODEL TOKENIZER --cuda-ssh yukon -n 16
 
 # Full artifact smoke test (heavy weight streaming; run sparingly)
 ./build/q27-metal models/qwen36-27b-mtp/qwen36-27b-mtp.q27 \

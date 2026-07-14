@@ -3,6 +3,7 @@
 
 #include "metal_backend.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -90,6 +91,7 @@ struct MatvecArgs {
     uint32_t cols;
     uint32_t simdgroups;
 };
+struct MatvecPairArgs { uint32_t rows_a, rows_b, cols, simdgroups; };
 struct VectorArgs { uint32_t n, groups; float eps; };
 struct HeadArgs { uint32_t heads, head_dim, stride, groups; float eps; };
 struct GateArgs { uint32_t heads, head_dim; };
@@ -114,8 +116,12 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
+    id<MTLComputePipelineState> f16_pair;
+    id<MTLComputePipelineState> q8_quantized_pair;
+    id<MTLComputePipelineState> q4_quantized_pair;
     id<MTLComputePipelineState> embedding;
     id<MTLComputePipelineState> rms;
+    id<MTLComputePipelineState> rms_quantized;
     id<MTLComputePipelineState> rms_heads;
     id<MTLComputePipelineState> l2_heads;
     id<MTLComputePipelineState> silu;
@@ -201,8 +207,12 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
+        impl_->f16_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair");
+        impl_->q8_quantized_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized_pair");
+        impl_->q4_quantized_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized_pair");
         impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
         impl_->rms = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm");
+        impl_->rms_quantized = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_quantized");
         impl_->rms_heads = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_heads");
         impl_->l2_heads = make_pipeline(impl_->device, impl_->library, @"q27_l2norm_heads");
         impl_->silu = make_pipeline(impl_->device, impl_->library, @"q27_silu_mul");
@@ -412,6 +422,33 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     }
 }
 
+void MetalBackend::matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
+                               const BackendTensor& b, BackendBuffer& b_out,
+                               const BackendBuffer& x) {
+    if(a.dtype!=DType::F16 || b.dtype!=DType::F16 || a.cols!=b.cols) {
+        matvec(a,x,a_out); matvec(b,x,b_out); return;
+    }
+    if(!a.data || !b.data || !a.rows || !b.rows || !a.cols || a.rows>UINT32_MAX ||
+       b.rows>UINT32_MAX || a.cols>UINT32_MAX)
+        throw std::runtime_error("q27 Metal: invalid fused F16 matvec");
+    check_range(x.size(),0,a.cols*4,"fused matvec input");
+    check_range(a_out.size(),0,a.rows*4,"fused matvec output A");
+    check_range(b_out.size(),0,b.rows*4,"fused matvec output B");
+    const MetalBuffer& ad=metal_buffer(*a.data); const MetalBuffer& bd=metal_buffer(*b.data);
+    const MetalBuffer& input=metal_buffer(x); MetalBuffer& ao=metal_buffer(a_out); MetalBuffer& bo=metal_buffer(b_out);
+    check_range(ad.size(),a.data_offset,a.rows*a.cols*2,"fused matvec weight A");
+    check_range(bd.size(),b.data_offset,b.rows*b.cols*2,"fused matvec weight B");
+    MatvecPairArgs args{(uint32_t)a.rows,(uint32_t)b.rows,(uint32_t)a.cols,8};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->f16_pair];
+        [enc setBuffer:ad.handle() offset:(NSUInteger)a.data_offset atIndex:0]; [enc setBuffer:ao.handle() offset:0 atIndex:1];
+        [enc setBuffer:bd.handle() offset:(NSUInteger)b.data_offset atIndex:2]; [enc setBuffer:bo.handle() offset:0 atIndex:3];
+        [enc setBuffer:input.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(std::max(a.rows,b.rows)+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("fused matvec pair");
+    }
+}
+
 BackendQuantized MetalBackend::allocate_quantized(uint32_t count) {
     if (!count || count % 32) throw std::runtime_error("q27 Metal: quantized activation count must be a multiple of 32");
     BackendQuantized result; result.count=count;
@@ -464,6 +501,42 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
     }
 }
 
+void MetalBackend::matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
+                                         const BackendTensor& b, BackendBuffer& b_out,
+                                         const BackendQuantized& x) {
+    if((a.dtype!=DType::Q4_G64 && a.dtype!=DType::Q8_G128) || b.dtype!=a.dtype || a.cols!=b.cols) {
+        matvec_quantized(a,x,a_out); matvec_quantized(b,x,b_out); return;
+    }
+    if(!a.data || !a.scales || !b.data || !b.scales || !a.rows || !b.rows ||
+       !a.cols || a.cols!=b.cols || a.rows>UINT32_MAX || b.rows>UINT32_MAX || a.cols>UINT32_MAX)
+        throw std::runtime_error("q27 Metal: fused quantized matvec requires compatible weights");
+    const uint64_t group=a.dtype==DType::Q8_G128?128:64;
+    if(a.cols%group || x.count!=a.cols || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: fused quantized matvec activation mismatch");
+    check_range(a_out.size(),0,a.rows*4,"fused quantized output A");
+    check_range(b_out.size(),0,b.rows*4,"fused quantized output B");
+    const MetalBuffer& ad=metal_buffer(*a.data); const MetalBuffer& as=metal_buffer(*a.scales);
+    const MetalBuffer& bd=metal_buffer(*b.data); const MetalBuffer& bs=metal_buffer(*b.scales);
+    const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales);
+    MetalBuffer& ao=metal_buffer(a_out); MetalBuffer& bo=metal_buffer(b_out);
+    uint64_t divisor=a.dtype==DType::Q4_G64?2:1;
+    check_range(ad.size(),a.data_offset,a.rows*a.cols/divisor,"fused quantized weight A");
+    check_range(bd.size(),b.data_offset,b.rows*b.cols/divisor,"fused quantized weight B");
+    check_range(as.size(),a.scales_offset,a.rows*(a.cols/group)*2,"fused quantized scales A");
+    check_range(bs.size(),b.scales_offset,b.rows*(b.cols/group)*2,"fused quantized scales B");
+    check_range(xv.size(),0,x.count,"fused quantized values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"fused quantized scales");
+    MatvecPairArgs args{(uint32_t)a.rows,(uint32_t)b.rows,(uint32_t)a.cols,8};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:a.dtype==DType::Q8_G128?impl_->q8_quantized_pair:impl_->q4_quantized_pair];
+        [enc setBuffer:ad.handle() offset:(NSUInteger)a.data_offset atIndex:0]; [enc setBuffer:as.handle() offset:(NSUInteger)a.scales_offset atIndex:1]; [enc setBuffer:ao.handle() offset:0 atIndex:2];
+        [enc setBuffer:bd.handle() offset:(NSUInteger)b.data_offset atIndex:3]; [enc setBuffer:bs.handle() offset:(NSUInteger)b.scales_offset atIndex:4]; [enc setBuffer:bo.handle() offset:0 atIndex:5];
+        [enc setBuffer:xv.handle() offset:0 atIndex:6]; [enc setBuffer:xs.handle() offset:0 atIndex:7]; [enc setBytes:&args length:sizeof(args) atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(std::max(a.rows,b.rows)+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("fused quantized matvec pair");
+    }
+}
+
 void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
                                  BackendBuffer& out) {
     if (weight.dtype != DType::Q8_G128 || !weight.data || !weight.scales || token >= weight.rows ||
@@ -508,6 +581,27 @@ void MetalBackend::rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
         [enc setBytes:&args length:sizeof(args) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("rmsnorm");
+    }
+}
+
+void MetalBackend::rmsnorm_quantized(const BackendBuffer& x,const BackendTensor& weight,
+                                     BackendBuffer& out,uint32_t n,float eps,
+                                     BackendQuantized& quantized) {
+    if(!n || n%32 || quantized.count!=n || !quantized.values || !quantized.scales)
+        throw std::runtime_error("q27 Metal: invalid fused rmsnorm quantization");
+    const MetalBuffer& w=tensor_data(weight,DType::F32,"fused rmsnorm");
+    const MetalBuffer& input=metal_buffer(x); MetalBuffer& output=metal_buffer(out);
+    MetalBuffer& values=metal_buffer(*quantized.values); MetalBuffer& scales=metal_buffer(*quantized.scales);
+    check_range(input.size(),0,(uint64_t)n*4,"fused rmsnorm input"); check_range(output.size(),0,(uint64_t)n*4,"fused rmsnorm output");
+    check_range(w.size(),weight.data_offset,(uint64_t)n*4,"fused rmsnorm weight"); check_range(values.size(),0,n,"fused rmsnorm values");
+    check_range(scales.size(),0,(uint64_t)(n/32)*4,"fused rmsnorm scales"); VectorArgs args{n,8,eps};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->rms_quantized];
+        [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
+        [enc setBuffer:output.handle() offset:0 atIndex:2]; [enc setBuffer:values.handle() offset:0 atIndex:3];
+        [enc setBuffer:scales.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("fused rmsnorm quantize");
     }
 }
 

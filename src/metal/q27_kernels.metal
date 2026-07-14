@@ -6,6 +6,7 @@ struct MatvecArgs {
     uint cols;
     uint simdgroups;
 };
+struct MatvecPairArgs { uint rows_a; uint rows_b; uint cols; uint simdgroups; };
 
 inline void reduce_row(float sum, device float *out, uint row,
                        threadgroup float *partial, ushort lane, ushort simdgroup,
@@ -53,6 +54,23 @@ kernel void q27_matvec_f16(
     for (uint col = lane; col < args.cols; col += 32) sum += float(weights[base + col]) * x[col];
     sum = simd_sum(sum);
     if (lane == 0) out[row] = sum;
+}
+
+kernel void q27_matvec_f16_pair(
+        device const half *weights_a [[buffer(0)]], device float *out_a [[buffer(1)]],
+        device const half *weights_b [[buffer(2)]], device float *out_b [[buffer(3)]],
+        device const float *x [[buffer(4)]], constant MatvecPairArgs &args [[buffer(5)]],
+        uint group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row=group*8+simdgroup; const ulong base=(ulong)row*args.cols;
+    float sa=0.0f,sb=0.0f;
+    for(uint col=lane;col<args.cols;col+=32) {
+        float xv=x[col];
+        if(row<args.rows_a) sa+=float(weights_a[base+col])*xv;
+        if(row<args.rows_b) sb+=float(weights_b[base+col])*xv;
+    }
+    sa=simd_sum(sa); sb=simd_sum(sb);
+    if(lane==0) { if(row<args.rows_a) out_a[row]=sa; if(row<args.rows_b) out_b[row]=sb; }
 }
 
 kernel void q27_matvec_q8_g128(
@@ -156,6 +174,28 @@ kernel void q27_rmsnorm(
     sum = reduce_sum(sum, partial, lane, simdgroup, args.groups);
     const float inv = rsqrt(sum / float(args.n) + args.eps);
     for (uint i = tid; i < args.n; i += 256) out[i] = x[i] * inv * w[i];
+}
+
+kernel void q27_rmsnorm_quantized(
+        device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
+        device float *out [[buffer(2)]], device char *values [[buffer(3)]],
+        device float *scales [[buffer(4)]], constant VectorArgs &args [[buffer(5)]],
+        uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    float sum=0.0f;
+    for(uint i=tid;i<args.n;i+=256) sum+=x[i]*x[i];
+    threadgroup float partial[32];
+    sum=reduce_sum(sum,partial,lane,simdgroup,args.groups);
+    const float inv=rsqrt(sum/float(args.n)+args.eps);
+    for(uint i=tid;i<args.n;i+=256) out[i]=x[i]*inv*w[i];
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint blocks=args.n/32;
+    for(uint block=simdgroup;block<blocks;block+=8) {
+        const uint i=block*32+lane; const float v=out[i];
+        const float amax=simd_max(abs(v)); const float scale=amax/127.0f;
+        int q=scale>0.0f?int(rint(v/scale)):0; q=clamp(q,-127,127);
+        values[i]=char(q); if(lane==0) scales[block]=scale;
+    }
 }
 
 kernel void q27_rmsnorm_heads(
@@ -502,6 +542,50 @@ kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
         if (lane == 0) result += float(subtotal) * float(weight_scales[(ulong)row * (args.cols / 64) + b / 2]) * x_scales[b];
     }
     if (lane == 0) out[row] = result;
+}
+
+kernel void q27_matvec_q8_quantized_pair(
+        device const char *weights_a [[buffer(0)]], device const half *weight_scales_a [[buffer(1)]], device float *out_a [[buffer(2)]],
+        device const char *weights_b [[buffer(3)]], device const half *weight_scales_b [[buffer(4)]], device float *out_b [[buffer(5)]],
+        device const char *x [[buffer(6)]], device const float *x_scales [[buffer(7)]],
+        constant MatvecPairArgs &args [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row=group*8+simdgroup; const ulong base=(ulong)row*args.cols;
+    float ra=0.0f,rb=0.0f; const uint scale_cols=args.cols/128;
+    for(uint block=0;block<args.cols/32;block++) {
+        const uint col=block*32+lane; int pa=0,pb=0;
+        if(row<args.rows_a) pa=int(weights_a[base+col])*int(x[col]);
+        if(row<args.rows_b) pb=int(weights_b[base+col])*int(x[col]);
+        pa=simd_sum(pa); pb=simd_sum(pb);
+        if(lane==0) {
+            float xs=x_scales[block];
+            if(row<args.rows_a) ra+=float(pa)*float(weight_scales_a[(ulong)row*scale_cols+block/4])*xs;
+            if(row<args.rows_b) rb+=float(pb)*float(weight_scales_b[(ulong)row*scale_cols+block/4])*xs;
+        }
+    }
+    if(lane==0) { if(row<args.rows_a) out_a[row]=ra; if(row<args.rows_b) out_b[row]=rb; }
+}
+
+kernel void q27_matvec_q4_quantized_pair(
+        device const uchar *weights_a [[buffer(0)]], device const half *weight_scales_a [[buffer(1)]], device float *out_a [[buffer(2)]],
+        device const uchar *weights_b [[buffer(3)]], device const half *weight_scales_b [[buffer(4)]], device float *out_b [[buffer(5)]],
+        device const char *x [[buffer(6)]], device const float *x_scales [[buffer(7)]],
+        constant MatvecPairArgs &args [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row=group*8+simdgroup; const ulong base=(ulong)row*(args.cols/2);
+    float ra=0.0f,rb=0.0f; const uint scale_cols=args.cols/64;
+    for(uint block=0;block<args.cols/32;block++) {
+        const uint col=block*32+lane; int pa=0,pb=0;
+        if(row<args.rows_a) { uchar p=weights_a[base+col/2]; int w=int((col&1)?(p>>4):(p&15))-8; pa=w*int(x[col]); }
+        if(row<args.rows_b) { uchar p=weights_b[base+col/2]; int w=int((col&1)?(p>>4):(p&15))-8; pb=w*int(x[col]); }
+        pa=simd_sum(pa); pb=simd_sum(pb);
+        if(lane==0) {
+            float xs=x_scales[block];
+            if(row<args.rows_a) ra+=float(pa)*float(weight_scales_a[(ulong)row*scale_cols+block/2])*xs;
+            if(row<args.rows_b) rb+=float(pb)*float(weight_scales_b[(ulong)row*scale_cols+block/2])*xs;
+        }
+    }
+    if(lane==0) { if(row<args.rows_a) out_a[row]=ra; if(row<args.rows_b) out_b[row]=rb; }
 }
 
 kernel void q27_copy_bytes(device const uchar *src [[buffer(0)]],

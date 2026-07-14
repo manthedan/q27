@@ -150,6 +150,10 @@ int test_f16(q27::MetalBackend& backend) {
     float got[2];
     backend.read(*device_y, 0, got, sizeof(got));
     const float want[2] = {1.0f, 0.5f};
+    auto paired_y=backend.allocate(2*sizeof(float));
+    backend.matvec_pair(device_weight,*device_y,device_weight,*paired_y,*device_x);
+    float paired[2]; backend.read(*paired_y,0,paired,sizeof(paired));
+    for(int row=0;row<2;row++) if(!close(paired[row],want[row])) return 1;
     for (int row = 0; row < 2; row++) {
         if (!close(got[row], want[row])) {
             fprintf(stderr, "F16 row %d: got %.7g, want %.7g\n", row, got[row], want[row]);
@@ -202,6 +206,10 @@ int test_q8(q27::MetalBackend& backend) {
     for(int row=0;row<rows;row++) if(!close(got[row],want[row],2e-2f)) {
         fprintf(stderr,"Q8 quantized row %d: got %.7g, want %.7g\n",row,got[row],want[row]); return 1;
     }
+    auto pair_y=backend.allocate(rows*sizeof(float));
+    backend.matvec_quantized_pair(device_weight,*device_y,device_weight,*pair_y,quantized);
+    float pair_got[rows]; backend.read(*pair_y,0,pair_got,sizeof(pair_got));
+    for(int row=0;row<rows;row++) if(!close(pair_got[row],got[row])) return 1;
     return 0;
 }
 
@@ -252,6 +260,29 @@ int test_q4(q27::MetalBackend& backend) {
     for(int row=0;row<rows;row++) if(!close(got[row],want[row],2e-2f)) {
         fprintf(stderr,"Q4 quantized row %d: got %.7g, want %.7g\n",row,got[row],want[row]); return 1;
     }
+    auto pair_y=backend.allocate(rows*sizeof(float));
+    backend.matvec_quantized_pair(device_weight,*device_y,device_weight,*pair_y,quantized);
+    float pair_got[rows]; backend.read(*pair_y,0,pair_got,sizeof(pair_got));
+    for(int row=0;row<rows;row++) if(!close(pair_got[row],got[row])) return 1;
+    return 0;
+}
+
+int test_mixed_pair(q27::MetalBackend& backend) {
+    constexpr int cols=128; std::vector<float> x(cols); for(int i=0;i<cols;i++) x[i]=(i%13-6)/7.0f;
+    std::vector<uint8_t> q4(cols/2,0x99); std::vector<int8_t> q8(cols,2);
+    std::vector<uint16_t> s4={0x3c00,0x3c00},s8={0x3c00};
+    q27::Tensor a; a.name="mixed-q4"; a.dtype=q27::DType::Q4_G64; a.shape={1,cols};
+    a.data=q4.data(); a.data_size=q4.size(); a.scales=(const uint8_t*)s4.data(); a.scales_size=s4.size()*2;
+    q27::Tensor b; b.name="mixed-q8"; b.dtype=q27::DType::Q8_G128; b.shape={1,cols};
+    b.data=(const uint8_t*)q8.data(); b.data_size=q8.size(); b.scales=(const uint8_t*)s8.data(); b.scales_size=s8.size()*2;
+    auto aw=backend.upload(a); auto bw=backend.upload(b); auto xb=backend.allocate(cols*4);
+    auto ao=backend.allocate(4); auto bo=backend.allocate(4); auto ar=backend.allocate(4); auto br=backend.allocate(4);
+    auto quant=backend.allocate_quantized(cols); backend.write(*xb,0,x.data(),cols*4);
+    backend.begin_commands(); backend.quantize(*xb,quant); backend.matvec_quantized(aw,quant,*ar); backend.matvec_quantized(bw,quant,*br); backend.end_commands();
+    backend.matvec_quantized_pair(aw,*ao,bw,*bo,quant);
+    float expected_a,expected_b,got_a,got_b; backend.read(*ar,0,&expected_a,4); backend.read(*br,0,&expected_b,4);
+    backend.read(*ao,0,&got_a,4); backend.read(*bo,0,&got_b,4);
+    if(got_a!=expected_a || got_b!=expected_b) { fprintf(stderr,"mixed quantized pair fallback mismatch\n"); return 1; }
     return 0;
 }
 
@@ -267,7 +298,7 @@ int main() {
                backend.max_threadgroup_memory_length() / 1024.0);
         if (test_mmap_upload(backend) || test_dispatch_validation(backend) ||
             test_f32(backend) || test_f16(backend) ||
-            test_q8(backend) || test_q4(backend))
+            test_q8(backend) || test_q4(backend) || test_mixed_pair(backend))
             return 1;
         puts("Metal matvec: OK");
         return 0;

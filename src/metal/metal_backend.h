@@ -30,14 +30,23 @@ class MetalBackend final : public ComputeBackend {
     void abort_commands() noexcept override;
     void matvec(const BackendTensor& weight, const BackendBuffer& x,
                 BackendBuffer& y) override;
+    void matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
+                     const BackendTensor& b, BackendBuffer& b_out,
+                     const BackendBuffer& x) override;
     BackendQuantized allocate_quantized(uint32_t count) override;
     void quantize(const BackendBuffer& x, BackendQuantized& out) override;
     void matvec_quantized(const BackendTensor& weight,
                           const BackendQuantized& x, BackendBuffer& y) override;
+    void matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
+                               const BackendTensor& b, BackendBuffer& b_out,
+                               const BackendQuantized& x) override;
     void embedding_q8(const BackendTensor& weight, uint32_t token,
                       BackendBuffer& out) override;
     void rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
                  BackendBuffer& out, uint32_t n, float eps) override;
+    void rmsnorm_quantized(const BackendBuffer& x, const BackendTensor& weight,
+                           BackendBuffer& out, uint32_t n, float eps,
+                           BackendQuantized& quantized) override;
     void rmsnorm_heads(BackendBuffer& x, const BackendTensor& weight,
                        uint32_t heads, uint32_t head_dim, uint32_t stride,
                        float eps) override;

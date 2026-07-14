@@ -34,7 +34,7 @@ struct MetalEngine::Snapshot {
     const MetalEngine* owner = nullptr;
     uint32_t position = 0;
     std::vector<StoredLayer> layers;
-    std::shared_ptr<BackendBuffer> mtp_k_cache, mtp_v_cache, hidden;
+    std::shared_ptr<BackendBuffer> mtp_k_cache, mtp_v_cache, hidden, logits;
 };
 
 std::shared_ptr<BackendBuffer> MetalEngine::alloc_f32(uint64_t count) {
@@ -207,10 +207,9 @@ void MetalEngine::reset() {
     for (LayerState& layer : layers_) {
         if (layer.recurrent) backend_.zero(*layer.recurrent);
         if (layer.ring) backend_.zero(*layer.ring);
-        if (layer.k_cache) backend_.zero(*layer.k_cache);
-        if (layer.v_cache) backend_.zero(*layer.v_cache);
+        // KV rows are written before they become visible through position_;
+        // clearing the full reserved context would make long-context reset O(ctx).
     }
-    backend_.zero(*mtp_k_cache_); backend_.zero(*mtp_v_cache_);
 }
 
 std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
@@ -233,6 +232,7 @@ std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
         backend_.copy(*mtp_v_cache_,0,*snapshot->mtp_v_cache,0,active_cache);
     }
     snapshot->hidden=backend_.allocate(x1_->size()); backend_.copy(*x1_,0,*snapshot->hidden,0,x1_->size());
+    snapshot->logits=backend_.allocate(logits_->size()); backend_.copy(*logits_,0,*snapshot->logits,0,logits_->size());
     batch.finish();
     return snapshot;
 }
@@ -253,16 +253,16 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
     }
     if(snapshot.mtp_k_cache) { backend_.copy(*snapshot.mtp_k_cache,0,*mtp_k_cache_,0,active_cache); backend_.copy(*snapshot.mtp_v_cache,0,*mtp_v_cache_,0,active_cache); }
     backend_.copy(*snapshot.hidden,0,*x1_,0,x1_->size());
+    if(snapshot.logits) backend_.copy(*snapshot.logits,0,*logits_,0,logits_->size());
     batch.finish();
     position_=snapshot.position;
 }
 
 void MetalEngine::gdn_block(uint32_t layer) {
-    backend_.quantize(*x1_, q5120_);
-    backend_.matvec_quantized(layer_weight(layer, "attn_qkv.weight"), q5120_, *qkv_);
-    backend_.matvec_quantized(layer_weight(layer, "attn_gate.weight"), q5120_, *z_);
-    backend_.matvec(layer_weight(layer, "ssm_alpha.weight"), *x1_, *alpha_);
-    backend_.matvec(layer_weight(layer, "ssm_beta.weight"), *x1_, *beta_raw_);
+    backend_.matvec_quantized_pair(layer_weight(layer,"attn_qkv.weight"),*qkv_,
+                                   layer_weight(layer,"attn_gate.weight"),*z_,q5120_);
+    backend_.matvec_pair(layer_weight(layer,"ssm_alpha.weight"),*alpha_,
+                         layer_weight(layer,"ssm_beta.weight"),*beta_raw_,*x1_);
     backend_.gdn_gates(*alpha_, *beta_raw_, layer_weight(layer, "ssm_a"),
                        layer_weight(layer, "ssm_dt.bias"), *g_, *beta_, GDN_HEADS);
     LayerState& state = layers_[layer];
@@ -278,14 +278,13 @@ void MetalEngine::gdn_block(uint32_t layer) {
 }
 
 void MetalEngine::attention_block(uint32_t layer) {
-    backend_.quantize(*x1_, q5120_);
     backend_.matvec_quantized(layer_weight(layer, "attn_q.weight"), q5120_, *qg_);
     backend_.rmsnorm_heads(*qg_, layer_weight(layer, "attn_q_norm.weight"),
                            N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS);
-    backend_.matvec_quantized(layer_weight(layer, "attn_k.weight"), q5120_, *kbuf_);
+    backend_.matvec_quantized_pair(layer_weight(layer,"attn_k.weight"),*kbuf_,
+                                   layer_weight(layer,"attn_v.weight"),*vbuf_,q5120_);
     backend_.rmsnorm_heads(*kbuf_, layer_weight(layer, "attn_k_norm.weight"),
                            N_KV, HEAD_DIM, HEAD_DIM, EPS);
-    backend_.matvec_quantized(layer_weight(layer, "attn_v.weight"), q5120_, *vbuf_);
     backend_.rope_neox(*qg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, position_, FREQ_BASE);
     backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position_, FREQ_BASE);
     LayerState& state = layers_[layer];
@@ -308,9 +307,8 @@ void MetalEngine::attention_block(uint32_t layer) {
 }
 
 void MetalEngine::ffn(uint32_t layer) {
-    backend_.quantize(*x1_, q5120_);
-    backend_.matvec_quantized(layer_weight(layer, "ffn_gate.weight"), q5120_, *ffn_gate_);
-    backend_.matvec_quantized(layer_weight(layer, "ffn_up.weight"), q5120_, *ffn_up_);
+    backend_.matvec_quantized_pair(layer_weight(layer,"ffn_gate.weight"),*ffn_gate_,
+                                   layer_weight(layer,"ffn_up.weight"),*ffn_up_,q5120_);
     backend_.silu_mul(*ffn_gate_, *ffn_up_, *ffn_gate_, N_FFN);
     backend_.quantize(*ffn_gate_, q17408_);
     backend_.matvec_quantized(layer_weight(layer, "ffn_down.weight"), q17408_, *y_);
@@ -321,16 +319,18 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits) {
     if (position_ >= max_context_) throw std::runtime_error("q27 Metal: context exhausted");
     backend_.embedding_q8(weight("token_embd.weight"), token, *h_);
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
-        backend_.rmsnorm(*h_, layer_weight(layer, "attn_norm.weight"), *x1_, N_EMBD, EPS);
+        backend_.rmsnorm_quantized(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
         if (attention_layer(layer)) attention_block(layer); else gdn_block(layer);
         backend_.add_inplace(*h_, *y_, N_EMBD);
-        backend_.rmsnorm(*h_, layer_weight(layer, "post_attention_norm.weight"), *x1_, N_EMBD, EPS);
+        backend_.rmsnorm_quantized(*h_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
         ffn(layer);
         backend_.add_inplace(*h_, *y_, N_EMBD);
     }
-    backend_.rmsnorm(*h_, weight("output_norm.weight"), *x1_, N_EMBD, EPS);
+    if(produce_logits)
+        backend_.rmsnorm_quantized(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+    else
+        backend_.rmsnorm(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS);
     if (produce_logits) {
-        backend_.quantize(*x1_, q5120_);
         backend_.matvec_quantized(weight("output.weight"), q5120_, *logits_);
         backend_.argmax(*logits_, VOCAB, *token_out_);
     }
@@ -356,12 +356,11 @@ void MetalEngine::mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t
     backend_.concat(*mtp_embed_norm_, N_EMBD, *mtp_hidden_norm_, N_EMBD, *mtp_concat_);
     backend_.quantize(*mtp_concat_, q10240_);
     backend_.matvec_quantized(layer_weight(layer, "nextn.eh_proj.weight"), q10240_, *mtp_x_);
-    backend_.rmsnorm(*mtp_x_, layer_weight(layer, "attn_norm.weight"), *x1_, N_EMBD, EPS);
-    backend_.quantize(*x1_, q5120_);
-    backend_.matvec_quantized(layer_weight(layer, "attn_k.weight"), q5120_, *kbuf_);
+    backend_.rmsnorm_quantized(*mtp_x_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+    backend_.matvec_quantized_pair(layer_weight(layer,"attn_k.weight"),*kbuf_,
+                                   layer_weight(layer,"attn_v.weight"),*vbuf_,q5120_);
     backend_.rmsnorm_heads(*kbuf_, layer_weight(layer, "attn_k_norm.weight"),
                            N_KV, HEAD_DIM, HEAD_DIM, EPS);
-    backend_.matvec_quantized(layer_weight(layer, "attn_v.weight"), q5120_, *vbuf_);
     backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position, FREQ_BASE);
     if (turbo3_kv_)
         backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV);
@@ -375,13 +374,19 @@ uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp
         throw std::runtime_error("q27 Metal: prompt exceeds context");
     for (uint32_t token : prompt)
         if (token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
-    CommandBatch batch(backend_);
-    if (warm_mtp && position_ > 0) mtp_warm(*x1_, prompt.front(), position_);
-    for (size_t i = 0; i < prompt.size(); i++) {
-        encode_token(prompt[i], i + 1 == prompt.size());
-        if (warm_mtp && i + 1 < prompt.size()) mtp_warm(*x1_, prompt[i + 1], position_);
+    // Bound encoder growth for long prompts. This remains token-serial, but
+    // avoids recording millions of dispatches into one command buffer.
+    constexpr size_t COMMAND_CHUNK=8;
+    for(size_t begin=0;begin<prompt.size();begin+=COMMAND_CHUNK) {
+        CommandBatch batch(backend_);
+        if(begin==0 && warm_mtp && position_>0) mtp_warm(*x1_,prompt.front(),position_);
+        size_t end=std::min(prompt.size(),begin+COMMAND_CHUNK);
+        for(size_t i=begin;i<end;i++) {
+            encode_token(prompt[i],i+1==prompt.size());
+            if(warm_mtp && i+1<prompt.size()) mtp_warm(*x1_,prompt[i+1],position_);
+        }
+        batch.finish();
     }
-    batch.finish();
     uint32_t next = 0;
     backend_.read(*token_out_, 0, &next, sizeof(next));
     return next;
@@ -400,15 +405,14 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     backend_.quantize(*mtp_concat_, q10240_);
     backend_.matvec_quantized(layer_weight(layer, "nextn.eh_proj.weight"), q10240_, *mtp_x_);
 
-    backend_.rmsnorm(*mtp_x_, layer_weight(layer, "attn_norm.weight"), *x1_, N_EMBD, EPS);
-    backend_.quantize(*x1_, q5120_);
+    backend_.rmsnorm_quantized(*mtp_x_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
     backend_.matvec_quantized(layer_weight(layer, "attn_q.weight"), q5120_, *qg_);
     backend_.rmsnorm_heads(*qg_, layer_weight(layer, "attn_q_norm.weight"),
                            N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS);
-    backend_.matvec_quantized(layer_weight(layer, "attn_k.weight"), q5120_, *kbuf_);
+    backend_.matvec_quantized_pair(layer_weight(layer,"attn_k.weight"),*kbuf_,
+                                   layer_weight(layer,"attn_v.weight"),*vbuf_,q5120_);
     backend_.rmsnorm_heads(*kbuf_, layer_weight(layer, "attn_k_norm.weight"),
                            N_KV, HEAD_DIM, HEAD_DIM, EPS);
-    backend_.matvec_quantized(layer_weight(layer, "attn_v.weight"), q5120_, *vbuf_);
     backend_.rope_neox(*qg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, position, FREQ_BASE);
     backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position, FREQ_BASE);
     if (turbo3_kv_) {
@@ -429,10 +433,9 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     backend_.matvec_quantized(layer_weight(layer, "attn_output.weight"), q6144_, *y_);
     backend_.add_inplace(*mtp_x_, *y_, N_EMBD);
 
-    backend_.rmsnorm(*mtp_x_, layer_weight(layer, "post_attention_norm.weight"), *x1_, N_EMBD, EPS);
-    backend_.quantize(*x1_, q5120_);
-    backend_.matvec_quantized(layer_weight(layer, "ffn_gate.weight"), q5120_, *ffn_gate_);
-    backend_.matvec_quantized(layer_weight(layer, "ffn_up.weight"), q5120_, *ffn_up_);
+    backend_.rmsnorm_quantized(*mtp_x_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+    backend_.matvec_quantized_pair(layer_weight(layer,"ffn_gate.weight"),*ffn_gate_,
+                                   layer_weight(layer,"ffn_up.weight"),*ffn_up_,q5120_);
     backend_.silu_mul(*ffn_gate_, *ffn_up_, *ffn_gate_, N_FFN);
     backend_.quantize(*ffn_gate_, q17408_);
     backend_.matvec_quantized(layer_weight(layer, "ffn_down.weight"), q17408_, *y_);
@@ -455,8 +458,38 @@ uint32_t MetalEngine::ingest_prompt(const std::vector<uint32_t>& tokens, bool wa
     return prefill(tokens, warm_mtp);
 }
 
+std::vector<float> MetalEngine::read_logits() {
+    std::vector<float> result(VOCAB);
+    backend_.synchronize();
+    backend_.read(*logits_,0,result.data(),result.size()*sizeof(float));
+    return result;
+}
+
+std::vector<uint32_t> MetalEngine::generate_sampled_from_logits(uint32_t count,
+                                                                 const SamplingParams& params) {
+    validate_sampling(params); last_spec_stats_={};
+    if((uint64_t)position_+(count?count-1:0)>max_context_)
+        throw std::runtime_error("q27 Metal: generation exceeds context");
+    std::mt19937_64 random(params.seed); std::vector<uint32_t> output; output.reserve(count);
+    for(uint32_t i=0;i<count;i++) {
+        uint32_t token=sample_logits_cpu(read_logits(),params,random); output.push_back(token);
+        if(i+1<count) step(token);
+    }
+    return output;
+}
+
+std::vector<uint32_t> MetalEngine::generate_sampled(const std::vector<uint32_t>& prompt,
+                                                     uint32_t count,const SamplingParams& params) {
+    if(prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
+    if((uint64_t)prompt.size()+count>max_context_+1)
+        throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
+    ingest_prompt(prompt,false,true);
+    return generate_sampled_from_logits(count,params);
+}
+
 std::vector<uint32_t> MetalEngine::generate_from_pending(uint32_t pending, uint32_t count,
                                                           uint32_t mtp_width) {
+    last_spec_stats_={};
     if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
     if (mtp_width && (mtp_width < 2 || mtp_width > 12))
         throw std::runtime_error("q27 Metal: MTP width must be 2..12");
@@ -482,10 +515,12 @@ std::vector<uint32_t> MetalEngine::generate_from_pending(uint32_t pending, uint3
             drafts.push_back(draft_token);
             hidden = mtp_hidden_out_.get();
         }
+        last_spec_stats_.rounds++; last_spec_stats_.drafted+=drafts.size();
         output.push_back(pending);
         uint32_t prediction = step(pending);
         for (uint32_t draft : drafts) {
             if (prediction != draft) break;
+            last_spec_stats_.accepted++;
             output.push_back(draft);
             if (output.size() == count) return output;
             prediction = step(draft);
@@ -519,7 +554,7 @@ std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& 
     if(width<2 || width>12) throw std::runtime_error("q27 Metal: suffix width must be 2..12");
     if((uint64_t)prompt.size()+count>max_context_+1)
         throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
-    uint32_t pending=ingest_prompt(prompt,false,true);
+    uint32_t pending=ingest_prompt(prompt,false,true); last_spec_stats_={};
     std::vector<int> history(prompt.begin(),prompt.end()); SuffixDraft drafter; drafter.reset(history);
     std::vector<uint32_t> output; output.reserve(count);
     while(output.size()<count) {
@@ -527,10 +562,13 @@ std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& 
         const uint32_t lanes=std::min<uint32_t>(width-1,(uint32_t)(count-output.size()-1));
         std::vector<int> proposals(lanes);
         int match=drafter.propose_with((int)pending,(int)lanes,proposals.data());
+        last_spec_stats_.rounds++;
+        if(match>=(int)minimum_match) last_spec_stats_.drafted+=proposals.size();
         output.push_back(pending); drafter.append((int)pending);
         uint32_t prediction=step(pending);
         if(match>=(int)minimum_match) for(int proposal:proposals) {
             if(prediction!=(uint32_t)proposal) break;
+            last_spec_stats_.accepted++;
             output.push_back((uint32_t)proposal); drafter.append(proposal);
             if(output.size()==count) return output;
             prediction=step((uint32_t)proposal);
