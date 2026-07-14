@@ -189,6 +189,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> attention_turbo3_causal_p;
     id<MTLComputePipelineState> sigmoid_gate_rows;
     id<MTLComputePipelineState> argmax_rows_p;
+    id<MTLComputePipelineState> nll_rows_p;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
     bool batching = false;
@@ -387,6 +388,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
         impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
         impl_->argmax_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_argmax_rows");
+        impl_->nll_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_nll_rows");
 
         if (const char* env = getenv("Q27_METAL_PROFILE"); env && *env && *env != '0') {
             id<MTLCounterSet> timestamps = nil;
@@ -1427,6 +1429,29 @@ void MetalBackend::argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows
         [enc setBytes:&args length:sizeof(args) atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(rows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked argmax");
+    }
+}
+
+void MetalBackend::nll_rows(const BackendBuffer& logits, const BackendBuffer& targets,
+                            BackendBuffer& nll, uint32_t n, uint32_t rows) {
+    if (!n || !rows || rows > 12) throw std::runtime_error("q27 Metal: invalid NLL shape");
+    const MetalBuffer& input = metal_buffer(logits);
+    const MetalBuffer& tgt = metal_buffer(targets);
+    MetalBuffer& out = metal_buffer(nll);
+    check_range(input.size(), 0, (uint64_t)n * rows * 4, "NLL logits");
+    check_range(tgt.size(), 0, (uint64_t)rows * 4, "NLL targets");
+    check_range(out.size(), 0, (uint64_t)rows * 4, "NLL output");
+    struct NllRowsArgs { uint32_t n; uint32_t rows; } args{n, rows};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_nll_rows");
+        [enc setComputePipelineState:impl_->nll_rows_p];
+        [enc setBuffer:input.handle() offset:0 atIndex:0];
+        [enc setBuffer:tgt.handle() offset:0 atIndex:1];
+        [enc setBuffer:out.handle() offset:0 atIndex:2];
+        [enc setBytes:&args length:sizeof(args) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("nll rows");
     }
 }
 

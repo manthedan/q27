@@ -240,6 +240,8 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
         cfinal_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
         clogits_ = alloc_f32((uint64_t)CHUNK_MAX * VOCAB);
         cpred_ = backend_.allocate((uint64_t)CHUNK_MAX * sizeof(uint32_t));
+        ctargets_ = backend_.allocate((uint64_t)CHUNK_MAX * sizeof(uint32_t));
+        cnll_ = alloc_f32(CHUNK_MAX);
         // One recurrent + ring slot per GDN layer; both stay physically lazy
         // until the first batched MTP round touches them.
         ckpt_recurrent_ = alloc_f32((uint64_t)(N_LAYER - N_LAYER / 4) * GDN_HEADS * GDN_DIM * GDN_DIM);
@@ -744,6 +746,70 @@ std::vector<float> MetalEngine::read_logits() {
     std::vector<float> result(VOCAB);
     backend_.synchronize();
     backend_.read(*logits_,0,result.data(),result.size()*sizeof(float));
+    return result;
+}
+
+std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& tokens) {
+    if (tokens.size() < 2) throw std::runtime_error("q27 Metal: NLL needs at least two tokens");
+    if (tokens.size() - 1 > max_context_)
+        throw std::runtime_error("q27 Metal: NLL sequence exceeds context");
+    for (uint32_t token : tokens)
+        if (token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
+    reset();
+    const uint32_t n_encode = (uint32_t)tokens.size() - 1;
+    std::vector<float> result;
+    result.reserve(n_encode);
+
+    auto nll_cpu = [](const float* logits, uint32_t target, uint32_t vocab) -> float {
+        double mx = -1e300;
+        for (uint32_t v = 0; v < vocab; v++) mx = std::max(mx, (double)logits[v]);
+        double se = 0.0;
+        for (uint32_t v = 0; v < vocab; v++) se += std::exp((double)logits[v] - mx);
+        return (float)(std::log(se) + mx - (double)logits[target]);
+    };
+
+    uint32_t done = 0;
+    // Prefer the layer-major chunk path: one command buffer per up-to-12
+    // tokens, batched output head, and a GPU logsumexp so only `count`
+    // floats cross back to the CPU per chunk.
+    if (chunked_prefill_ && n_encode >= 2) {
+        while (n_encode - done >= 2) {
+            const uint32_t count = std::min(CHUNK_MAX, n_encode - done);
+            std::vector<uint32_t> targets(count);
+            for (uint32_t r = 0; r < count; r++) targets[r] = tokens[done + r + 1];
+            // Host write before the command batch: targets are shared-memory
+            // and must be visible before the NLL kernel is encoded.
+            backend_.write(*ctargets_, 0, targets.data(), count * sizeof(uint32_t));
+            {
+                CommandBatch batch(backend_);
+                chunk_forward(tokens.data() + done, count);
+                BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
+                backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                                N_EMBD, count, EPS, x5);
+                backend_.matmul_quantized(weight("output.weight"), x5, count, *clogits_);
+                backend_.nll_rows(*clogits_, *ctargets_, *cnll_, VOCAB, count);
+                batch.finish();
+            }
+            position_ += count;
+            std::vector<float> chunk_nll(count);
+            backend_.read(*cnll_, 0, chunk_nll.data(), count * sizeof(float));
+            result.insert(result.end(), chunk_nll.begin(), chunk_nll.end());
+            done += count;
+            if ((done / CHUNK_MAX) % 32 == 0)
+                fprintf(stderr, "  nll pos %u/%u\r", done, n_encode);
+        }
+    }
+    while (done < n_encode) {
+        {
+            CommandBatch batch(backend_);
+            encode_token(tokens[done], true);
+            batch.finish();
+        }
+        std::vector<float> logits = read_logits();
+        result.push_back(nll_cpu(logits.data(), tokens[done + 1], VOCAB));
+        done++;
+    }
+    if (n_encode >= CHUNK_MAX) fprintf(stderr, "\n");
     return result;
 }
 

@@ -245,6 +245,13 @@ class ComputeBackend {
         (void)x; (void)n; (void)rows; (void)out_indices;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
+    // nll[r] = logsumexp(logits[r,:]) - logits[r, targets[r]] over a row-major
+    // [rows, n] logit matrix. Targets are uint32 token ids in [0, n).
+    virtual void nll_rows(const BackendBuffer& logits, const BackendBuffer& targets,
+                          BackendBuffer& nll, uint32_t n, uint32_t rows) {
+        (void)logits; (void)targets; (void)nll; (void)n; (void)rows;
+        throw std::runtime_error("q27: backend has no NLL primitive");
+    }
     virtual void synchronize() = 0;
 };
 

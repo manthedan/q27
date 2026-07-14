@@ -1151,6 +1151,43 @@ kernel void q27_argmax_rows(device const float *x [[buffer(0)]],
     if (tid == 0) out[row] = indices[0];
 }
 
+// nll[r] = logsumexp(logits[r,:]) - logits[r, tgt[r]]. One threadgroup per
+// row, 256 threads: max pass then sum-exp, matching the CUDA quality-gate
+// protocol so Metal --nll-long is comparable to the CUDA buckets.
+struct NllRowsArgs { uint n; uint rows; };
+kernel void q27_nll_rows(device const float *logits [[buffer(0)]],
+                          device const uint *tgt     [[buffer(1)]],
+                          device float *nll          [[buffer(2)]],
+                          constant NllRowsArgs &args [[buffer(3)]],
+                          uint row [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+    if (row >= args.rows) return;
+    device const float *xr = logits + (ulong)row * args.n;
+    float mx = -INFINITY;
+    for (uint i = tid; i < args.n; i += 256) mx = max(mx, xr[i]);
+    threadgroup float values[256];
+    values[tid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) values[tid] = max(values[tid], values[tid + step]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    mx = values[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float se = 0.0f;
+    for (uint i = tid; i < args.n; i += 256) se += exp(xr[i] - mx);
+    values[tid] = se;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) values[tid] += values[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        const uint target = tgt[row];
+        nll[row] = log(values[0]) + mx - xr[target];
+    }
+}
+
 struct AttentionCausalArgs {
     uint q_stride; uint q_row_stride; uint base_len;
     uint q_heads; uint kv_heads; uint head_dim; uint tokens; float scale;

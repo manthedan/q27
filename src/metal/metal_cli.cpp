@@ -2,6 +2,7 @@
 #include "../tokenizer.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -52,21 +53,75 @@ std::vector<uint32_t> parse_tokens(const std::string& text) {
     return result;
 }
 
+std::vector<uint32_t> load_token_file(const std::string& path) {
+    FILE* file = fopen(path.c_str(), "rb");
+    if (!file) throw std::runtime_error("cannot open " + path);
+    if (fseek(file, 0, SEEK_END) != 0) { fclose(file); throw std::runtime_error("cannot seek " + path); }
+    long bytes = ftell(file);
+    if (bytes < 0 || bytes % 4 != 0) { fclose(file); throw std::runtime_error("invalid token file size: " + path); }
+    if (fseek(file, 0, SEEK_SET) != 0) { fclose(file); throw std::runtime_error("cannot seek " + path); }
+    std::vector<uint32_t> tokens((size_t)bytes / 4);
+    if (fread(tokens.data(), 4, tokens.size(), file) != tokens.size()) {
+        fclose(file);
+        throw std::runtime_error("short read on " + path);
+    }
+    fclose(file);
+    return tokens;
+}
+
+// Position buckets match the CUDA --nll-long gate so Metal and CUDA
+// long-context NLL reports are directly comparable.
+void print_nll_long_buckets(const std::vector<float>& nll) {
+    static const int edges[] = {
+        0, 2048, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 163840,
+        196608, 229376, 262144, 327680, 1 << 30
+    };
+    static const char* names[] = {
+        "0-2k", "2k-8k", "8k-16k", "16k-32k", "32k-48k", "48k-64k", "64k-96k",
+        "96k-128k", "128k-160k", "160k-192k", "192k-224k", "224k-256k",
+        "256k-320k", "320k+"
+    };
+    constexpr int NB = 14;
+    double sum[NB] = {};
+    long count[NB] = {};
+    for (size_t i = 0; i < nll.size(); i++) {
+        // Target position is i+1 (logit after encoding token i predicts token i+1).
+        const int tpos = (int)i + 1;
+        int b = 0;
+        while (tpos >= edges[b + 1]) b++;
+        sum[b] += nll[i];
+        count[b]++;
+    }
+    printf("long-context NLL by target position (%zu tokens, no resets):\n", nll.size() + 1);
+    for (int b = 0; b < NB; b++) {
+        if (!count[b]) continue;
+        const double mean = sum[b] / count[b];
+        printf("  %-8s: mean NLL %.4f  PPL %8.3f  (n=%ld)\n", names[b], mean, std::exp(mean), count[b]);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text] [-n count] [--ctx count] [--mtp width | --suffix width] [--kv fp16|turbo3] [--prefill chunk|serial] [--temperature T --top-p P --top-k K --seed S] [--dump-logits file]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
+                "[-n count] [--ctx count] [--mtp width | --suffix width] [--kv fp16|turbo3] "
+                "[--prefill chunk|serial] [--nll-long N] [--temperature T --top-p P --top-k K --seed S] "
+                "[--dump-logits file]\n",
+                argv[0]);
         return 1;
     }
     try {
-        std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits;
-        uint32_t count=1,context=128,mtp_width=0,suffix_width=0; q27::SamplingParams sampling;
+        std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits,nll_path;
+        uint32_t count=1,context=128,mtp_width=0,suffix_width=0,nll_long=0; q27::SamplingParams sampling;
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         for (int i = 3; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--tokens" && i + 1 < argc) token_list = argv[++i];
             else if (arg == "--prompt" && i + 1 < argc) prompt_text = argv[++i];
+            else if (arg == "--nll" && i + 1 < argc) nll_path = argv[++i];
+            else if (arg == "--nll-long" && i + 1 < argc) nll_long = parse_u32(argv[++i], "--nll-long");
             else if (arg == "--validate-only") validate_only = true;
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
@@ -94,7 +149,16 @@ int main(int argc, char** argv) {
         if(sampling.temperature>0 && (mtp_width || suffix_width))
             throw std::runtime_error("sampling cannot be combined with speculative modes");
         if(!token_list.empty() && !prompt_text.empty()) throw std::runtime_error("--tokens and --prompt are mutually exclusive");
-        if(!validate_only && token_list.empty() && prompt_text.empty()) throw std::runtime_error("--tokens or --prompt is required");
+        if (!nll_path.empty() && (!token_list.empty() || !prompt_text.empty() || validate_only))
+            throw std::runtime_error("--nll cannot be combined with --tokens/--prompt/--validate-only");
+        if (!nll_path.empty() && !nll_long)
+            throw std::runtime_error("--nll currently requires --nll-long N (chunked llama-ppl mode is CUDA-only)");
+        if (nll_long && nll_path.empty())
+            throw std::runtime_error("--nll-long requires --nll FILE");
+        if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty())
+            throw std::runtime_error("--tokens, --prompt, --nll, or --validate-only is required");
+        if (!nll_path.empty() && (mtp_width || suffix_width || sampling.temperature > 0 || !dump_logits.empty()))
+            throw std::runtime_error("--nll cannot be combined with speculative/sampling/dump modes");
 
         auto start = std::chrono::steady_clock::now();
         // Validate the small tokenizer artifact before allocating any model
@@ -116,6 +180,28 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Metal model ready on %s in %.2f s\n", engine.backend().name().c_str(),
                 std::chrono::duration<double>(loaded - start).count());
         if (validate_only) { puts("artifacts and Metal architecture: OK"); return 0; }
+
+        if (!nll_path.empty()) {
+            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
+            if (tokens.size() > context)
+                throw std::runtime_error("--nll-long sequence exceeds --ctx; raise --ctx");
+            fprintf(stderr, "nll-long: %zu tokens, single pass, no resets%s\n",
+                    tokens.size(), turbo3_kv ? " (turbo3 KV)" : "");
+            auto nll_start = std::chrono::steady_clock::now();
+            std::vector<float> nll = engine.teacher_force_nll(tokens);
+            auto nll_done = std::chrono::steady_clock::now();
+            print_nll_long_buckets(nll);
+            double mean = 0.0;
+            for (float v : nll) mean += v;
+            mean /= nll.empty() ? 1.0 : (double)nll.size();
+            fprintf(stderr, "nll-long wall: %.2f s (%.2f tok/s), overall mean NLL %.4f PPL %.3f\n",
+                    std::chrono::duration<double>(nll_done - nll_start).count(),
+                    nll.size() / std::chrono::duration<double>(nll_done - nll_start).count(),
+                    mean, std::exp(mean));
+            return 0;
+        }
+
         std::vector<uint32_t> generated = sampling.temperature>0 ? engine.generate_sampled(prompt,count,sampling)
                                            : mtp_width ? engine.generate_mtp(prompt,count,mtp_width)
                                            : suffix_width ? engine.generate_suffix(prompt,count,suffix_width)

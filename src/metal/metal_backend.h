@@ -144,6 +144,8 @@ class MetalBackend final : public ComputeBackend {
                                uint32_t heads, uint32_t head_dim, uint32_t tokens) override;
     void argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows,
                      BackendBuffer& out_indices) override;
+    void nll_rows(const BackendBuffer& logits, const BackendBuffer& targets,
+                  BackendBuffer& nll, uint32_t n, uint32_t rows) override;
     void synchronize() override;
 
     // Clears Q27_METAL_PROFILE accumulation (stats, command-buffer and

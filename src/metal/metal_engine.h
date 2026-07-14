@@ -32,6 +32,10 @@ class MetalEngine {
     std::vector<uint32_t> generate_from_pending(uint32_t pending, uint32_t count,
                                                 uint32_t mtp_width = 0);
     std::vector<float> read_logits();
+    // Teacher-forced NLL for tokens[0..N): returns N-1 values where
+    // result[i] = -log P(tokens[i+1] | tokens[0..i]). Uses layer-major
+    // chunked encode + batched output head when available.
+    std::vector<float> teacher_force_nll(const std::vector<uint32_t>& tokens);
     std::vector<uint32_t> generate_sampled(const std::vector<uint32_t>& prompt,
                                            uint32_t count,const SamplingParams& params);
     std::vector<uint32_t> generate_sampled_from_logits(uint32_t count,
@@ -98,7 +102,9 @@ class MetalEngine {
 
     // Batched MTP verification: per-lane logits/predictions and the GDN
     // state checkpoint that makes the optimistic committing round reversible.
+    // ctargets_/cnll_ also serve teacher-forced NLL quality gates.
     std::shared_ptr<BackendBuffer> cfinal_, clogits_, cpred_;
+    std::shared_ptr<BackendBuffer> ctargets_, cnll_;
     std::shared_ptr<BackendBuffer> ckpt_recurrent_, ckpt_ring_;
 
     std::shared_ptr<BackendBuffer> alloc_f32(uint64_t count);

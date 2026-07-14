@@ -14,7 +14,7 @@ This is the execution ledger for the Metal port. CUDA remains the behavioral ref
 | 5 | Batched prefill | **Baseline complete** | Layer-major 2–12-token chunked prefill is integrated end-to-end through the simdgroup projection GEMM; chunk-aware GDN recurrence and causal attention match the serial path (op gates bit-exact, official-artifact A/B committed tokens identical, 4.3× prefill wall-clock); production tiled attention remains |
 | 6 | MTP widths 2/4/8/12 | **Baseline complete** | Batched layer-major target verification with one CPU sync per round replaced serial verification; canonical committed tokens identical to greedy (byte-exact over a 32-token trajectory); wall rate at greedy parity (`0.71` vs `0.73 tok/s`) versus the `0.01–0.55 tok/s` serial-verify sweep; GPU-resident drafting/acceptance and removing the partial-round commit re-encode remain performance work |
 | 7 | Prefix cache and server | **Baseline complete** | Device snapshots (including resident logits), longest-prefix LRU, deterministic CPU top-k/top-p sampling, Metal CLI/server, and OpenAI/Anthropic endpoint smoke tests exist; streaming/tool constraints remain parity work |
-| 8 | turbo3 and long context | **In progress** | Metal WHT, 50-byte codec, KV writer/reader, engine mode, synthetic quality and 32K/262K allocation gates pass; chunked prefill covers turbo3 KV (A/B identical) and both turbo3 attention kernels are now online-softmax and flat in context (synthetic: 22.9 tok/s chunk prefill at ctx 480, 4.4 tok/s decode at ctx 1024) — the 32K retrieval/perplexity runs are unblocked and are the next gate |
+| 8 | turbo3 and long context | **In progress** | Metal WHT, 50-byte codec, KV writer/reader, engine mode, synthetic quality and 32K/262K allocation gates pass; chunked prefill covers turbo3 KV (A/B identical) and both turbo3 attention kernels are now online-softmax and flat in context (synthetic: 22.9 tok/s chunk prefill at ctx 480, 4.4 tok/s decode at ctx 1024); teacher-forced `--nll-long` is wired (GPU `nll_rows`, chunked encode + batched head, CUDA-matched position buckets) so the 32K turbo3 perplexity run is a single artifact command — still to collect: 32K/128K NLL buckets, needle retrieval, GQA=6 turbo3-K quality |
 | 9 | Performance | **In progress** | mmap views, command batching, fused RMSNorm+quantization, packed-dot GEMV (aggregate 35.6→84.8 GB/s synthetic; 128-token decode 1.22→3.01 tok/s, inside the 3–5 tok/s target band), per-dispatch GPU profiling (`Q27_METAL_PROFILE`), synthetic full-decode-step and full-prefill-chunk benches, online-softmax decode **and chunk-causal** attention, widened F16 pair projections, and a tiled simdgroup-matrix chunk GEMM landed; resident-weight decode ceiling 218 ms/token, prefill-chunk ceiling 2121→525 ms/chunk (5.7→22.9 tok/s synthetic); turbo3 decode/chunk attention now online-softmax too (`--kv turbo3` bench modes: decode 732→227 ms/token at ctx 1024, chunk 884→525 ms/chunk at ctx 480, both flat in context); GQA KV reuse and remaining GEMM/GEMV headroom remain |
 
 ## Completed foundation
@@ -85,6 +85,16 @@ The engine refuses a requested cache above half the device’s recommended Metal
 
 Turbo3 allocation/startup passes at 32K and the full 262144-token limit. KV memory is now logically cleared by resetting `position_`; rows are always written before becoming visible, avoiding an unnecessary O(context) memset. The 262K allocation-only gate starts in 0.11 s with about 207 MiB resident because reserved Metal buffers remain physically lazy. Retrieval, perplexity, and GQA=6 turbo3-K quality are not yet passed, but the throughput blocker is gone: turbo3 prefill and decode attention are online-softmax and flat in context (2026-07-14 late; see item 9), so 32K runs at ~20 tok/s synthetic prefill are now practical. The upstream risk note still applies: if turbo3-K quality fails, use FP16/Q8 K plus turbo3 V rather than weakening the quality gate.
 
+**Teacher-forced NLL (2026-07-14, quality-gate plumbing).** `build/q27-metal` accepts `--nll FILE --nll-long N` matching the CUDA long-context protocol: binary int32 token stream, single pass with no resets, NLL bucketed by target position (`0-2k` … `320k+`). `MetalEngine::teacher_force_nll` encodes all but the last token through the layer-major chunk path (batched output head on every row) and reduces with a GPU `q27_nll_rows` kernel (`logsumexp - target`); leftover single tokens fall back to serial encode + CPU NLL. Synthetic gate: wide (n=2048) multi-row NLL parity against a CPU reference in `make test-metal`. Artifact command for the 32K turbo3 perplexity gate:
+
+```sh
+./build/q27-metal models/qwen36-27b-mtp/qwen36-27b-mtp.q27 \
+  models/qwen36-27b-mtp/qwen36-27b-mtp.tok \
+  --nll TOKENS.bin --nll-long 32768 --ctx 32768 --kv turbo3
+```
+
+Independent-chunk llama-perplexity mode (`--nll-chunk`) remains CUDA-only for now.
+
 ### 9 — Performance
 
 Landed: zero-copy mmap weights, one command buffer per prompt/step, group-32 int8 activation quantization reused across sibling projections, integer-accumulating Q4/Q8 GEMV, eight independent simdgroups per threadgroup, and fused RMSNorm+activation quantization. Initial small-N Q4 prototypes that performed serial per-token SIMD reductions measured `0.62–0.75x` versus serial GEMV and were reverted. Replacing them with 8×8 float `simdgroup_matrix` tiles and on-tile Q4/Q8 dequantization changed the result: 12 activation rows over `[17408,5120]` measure `8.36 ms` versus `27.49 ms` for 12 serial GEMVs (`3.29x`). The 1–12-row primitive has Q4/Q8 CPU-reference tests and passes on both M4 hosts. Layer-major chunked prefill now schedules it end-to-end: a 126-token prompt ingests in ~35 s versus ~153 s token-serial (4.3×, ~3.6 tok/s prefill) with identical committed tokens. Batched MTP verification runs on the same substrate at greedy parity.
@@ -117,7 +127,7 @@ The remaining work should proceed in this order; isolated kernel wins do not clo
 6. **Serving closure:** add true token streaming, GPU sampling, tool constraints, stop handling, cancellation/backpressure, multi-slot scheduling, and the CUDA server compatibility suite.
 7. **Hardware validation:** benchmark cold/warm short decode, long decode, prefill, and MTP on base M4 and available Max/Ultra-class machines; report memory mode and effective bandwidth with every result.
 
-Item 4's kernel work is done on every path (FP16 and turbo3, decode and chunk; only GQA KV reuse and cache-block scheduling remain). The next targets, in leverage order: (1) the item-5 quality closure runs that the turbo3 rewrite unblocked — 32K retrieval and perplexity under `--kv turbo3` at ~20 tok/s synthetic prefill, plus deeper CUDA probes for the 128-token trajectory question; (2) the MTP partial-acceptance commit re-encode and GPU-resident drafting (item 6 details); (3) GQA KV reuse (six query heads re-read each KV row today) and residual chunk-GEMM headroom (still ~25 GB/s effective weight stream against 67–90 GB/s for decode GEMV — half-precision staging and double-buffered K-tiles are the untried levers).
+Item 4's kernel work is done on every path (FP16 and turbo3, decode and chunk; only GQA KV reuse and cache-block scheduling remain). The `--nll-long` plumbing for item 5 is in; the next targets, in leverage order: (1) run the artifact 32K turbo3 NLL buckets and a needle retrieval smoke, plus deeper CUDA probes for the 128-token trajectory question; (2) the MTP partial-acceptance commit re-encode and GPU-resident drafting (item 6 details); (3) GQA KV reuse (six query heads re-read each KV row today) and residual chunk-GEMM headroom (still ~25 GB/s effective weight stream against 67–90 GB/s for decode GEMV — half-precision staging and double-buffered K-tiles are the untried levers).
 
 ## Memory-safe test policy
 
@@ -165,6 +175,9 @@ Q27_METAL_PROFILE=1 ./build/metal_decode_bench --tokens 8 --seq 128
 
 # Memory-constrained long-context mode
 ./build/q27-metal MODEL TOKENIZER --tokens IDS --ctx 131072 --kv turbo3
+
+# Teacher-forced long-context NLL (CUDA-matched position buckets; use turbo3)
+./build/q27-metal MODEL TOKENIZER --nll TOKENS.bin --nll-long 32768 --ctx 32768 --kv turbo3
 
 # A/B the layer-major chunked prompt ingestion against the token-serial path
 ./build/q27-metal MODEL TOKENIZER --prompt TEXT -n 1 --prefill serial

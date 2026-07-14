@@ -634,6 +634,36 @@ int test_chunked(q27::MetalBackend& backend) {
         }
     }
 
+    // Teacher-forced NLL rows: logsumexp - target logit, including a wide
+    // vocab-like width so the 256-thread reduction walks multiple strides.
+    {
+        constexpr uint32_t n = 2048;
+        std::vector<float> logits(T * n);
+        std::vector<uint32_t> targets(T);
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t v = 0; v < n; v++)
+                logits[t * n + v] = std::sin(float(t * 17 + v) * 0.11f) * 3.0f;
+            targets[t] = 100 + t * 37;
+            logits[t * n + targets[t]] += 2.5f;  // make the target distinctive
+        }
+        auto lb = upload_buffer(backend, logits);
+        auto tb = backend.allocate(T * 4);
+        backend.write(*tb, 0, targets.data(), T * 4);
+        auto nb = backend.allocate(T * 4);
+        backend.nll_rows(*lb, *tb, *nb, n, T);
+        std::vector<float> got(T);
+        backend.read(*nb, 0, got.data(), T * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            double mx = -1e300;
+            for (uint32_t v = 0; v < n; v++) mx = std::max(mx, (double)logits[t * n + v]);
+            double se = 0.0;
+            for (uint32_t v = 0; v < n; v++) se += std::exp((double)logits[t * n + v] - mx);
+            const float want = (float)(std::log(se) + mx - (double)logits[t * n + targets[t]]);
+            if (std::fabs(got[t] - want) > 1e-4f)
+                fail("nll rows", t, got[t], want);
+        }
+    }
+
     // Chunked FP16 KV append + causal attention over a warm cache.
     {
         constexpr uint32_t qh = 2, kvh = 1, dim = 4, stride = 8, row = kvh * dim, warm = 2;
