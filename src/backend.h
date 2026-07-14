@@ -143,6 +143,103 @@ class ComputeBackend {
     virtual void gated_norm_gdn(const BackendBuffer& x, const BackendTensor& weight,
                                 const BackendBuffer& gate, BackendBuffer& out,
                                 uint32_t heads, uint32_t head_dim, float eps) = 0;
+
+    // Chunked layer-major execution: each call advances `tokens` (2..12)
+    // consecutive positions in one dispatch. Recurrent operators commit
+    // their carried state exactly once, at the chunk boundary. Backends
+    // without chunked support keep the token-serial path.
+    virtual void embedding_q8_rows(const BackendTensor& weight, const uint32_t* tokens,
+                                   uint32_t count, BackendBuffer& out) {
+        (void)weight; (void)tokens; (void)count; (void)out;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void rmsnorm_rows_quantized(const BackendBuffer& x, const BackendTensor& weight,
+                                        BackendBuffer& out, uint32_t n, uint32_t rows,
+                                        float eps, BackendQuantized& quantized) {
+        (void)x; (void)weight; (void)out; (void)n; (void)rows; (void)eps; (void)quantized;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void matvec_f16_pair_rows(const BackendTensor& a, BackendBuffer& a_out,
+                                      const BackendTensor& b, BackendBuffer& b_out,
+                                      const BackendBuffer& x, uint32_t rows) {
+        (void)a; (void)a_out; (void)b; (void)b_out; (void)x; (void)rows;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void gdn_gates_rows(const BackendBuffer& alpha, const BackendBuffer& beta_raw,
+                                const BackendTensor& ssm_a, const BackendTensor& ssm_dt,
+                                BackendBuffer& g, BackendBuffer& beta,
+                                uint32_t heads, uint32_t tokens) {
+        (void)alpha; (void)beta_raw; (void)ssm_a; (void)ssm_dt; (void)g; (void)beta;
+        (void)heads; (void)tokens;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void conv_chunk(BackendBuffer& ring, const BackendBuffer& qkv,
+                            const BackendTensor& conv_weight, BackendBuffer& out,
+                            uint32_t channels, uint32_t tokens) {
+        (void)ring; (void)qkv; (void)conv_weight; (void)out; (void)channels; (void)tokens;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void delta_chunk(BackendBuffer& state, const BackendBuffer& conv,
+                             const BackendBuffer& g, const BackendBuffer& beta,
+                             BackendBuffer& out, uint32_t value_heads, uint32_t qk_heads,
+                             uint32_t head_dim, uint32_t tokens) {
+        (void)state; (void)conv; (void)g; (void)beta; (void)out;
+        (void)value_heads; (void)qk_heads; (void)head_dim; (void)tokens;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void l2norm_rows(BackendBuffer& x, uint32_t heads, uint32_t head_dim,
+                             uint32_t row_stride, uint32_t tokens, float eps) {
+        (void)x; (void)heads; (void)head_dim; (void)row_stride; (void)tokens; (void)eps;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void rope_neox_rows(BackendBuffer& x, uint32_t heads, uint32_t head_dim,
+                                uint32_t n_rot, uint32_t stride, uint32_t row_stride,
+                                uint32_t position, uint32_t tokens, float freq_base) {
+        (void)x; (void)heads; (void)head_dim; (void)n_rot; (void)stride; (void)row_stride;
+        (void)position; (void)tokens; (void)freq_base;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                   BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                   uint32_t position, uint32_t row_length, uint32_t tokens) {
+        (void)k; (void)v; (void)k_cache; (void)v_cache; (void)position; (void)row_length;
+        (void)tokens;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                      BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                      uint32_t position, uint32_t kv_heads, uint32_t tokens) {
+        (void)k; (void)v; (void)k_cache; (void)v_cache; (void)position; (void)kv_heads;
+        (void)tokens;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
+                                      uint32_t q_row_stride, const BackendBuffer& k_cache,
+                                      const BackendBuffer& v_cache, BackendBuffer& scratch,
+                                      BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
+                                      uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
+                                      float scale) {
+        (void)q; (void)q_stride; (void)q_row_stride; (void)k_cache; (void)v_cache;
+        (void)scratch; (void)out; (void)base_len; (void)q_heads; (void)kv_heads;
+        (void)head_dim; (void)tokens; (void)scale;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void attention_turbo3_causal(const BackendBuffer& q, uint32_t q_stride,
+                                         uint32_t q_row_stride, const BackendBuffer& k_cache,
+                                         const BackendBuffer& v_cache, BackendBuffer& scratch,
+                                         BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
+                                         uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
+                                         float scale) {
+        (void)q; (void)q_stride; (void)q_row_stride; (void)k_cache; (void)v_cache;
+        (void)scratch; (void)out; (void)base_len; (void)q_heads; (void)kv_heads;
+        (void)head_dim; (void)tokens; (void)scale;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
+    virtual void sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,
+                                       uint32_t heads, uint32_t head_dim, uint32_t tokens) {
+        (void)out; (void)qg; (void)heads; (void)head_dim; (void)tokens;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
     virtual void synchronize() = 0;
 };
 

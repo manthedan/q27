@@ -56,13 +56,13 @@ std::vector<uint32_t> parse_tokens(const std::string& text) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text] [-n count] [--ctx count] [--mtp width | --suffix width] [--kv fp16|turbo3] [--temperature T --top-p P --top-k K --seed S] [--dump-logits file]\n", argv[0]);
+        fprintf(stderr, "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text] [-n count] [--ctx count] [--mtp width | --suffix width] [--kv fp16|turbo3] [--prefill chunk|serial] [--temperature T --top-p P --top-k K --seed S] [--dump-logits file]\n", argv[0]);
         return 1;
     }
     try {
         std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits;
         uint32_t count=1,context=128,mtp_width=0,suffix_width=0; q27::SamplingParams sampling;
-        bool turbo3_kv = false, validate_only = false;
+        bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         for (int i = 3; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--tokens" && i + 1 < argc) token_list = argv[++i];
@@ -81,6 +81,11 @@ int main(int argc, char** argv) {
                 std::string mode = argv[++i];
                 if (mode == "turbo3") turbo3_kv = true;
                 else if (mode != "fp16") throw std::runtime_error("--kv must be fp16 or turbo3");
+            }
+            else if (arg == "--prefill" && i + 1 < argc) {
+                std::string mode = argv[++i];
+                if (mode == "serial") serial_prefill = true;
+                else if (mode != "chunk") throw std::runtime_error("--prefill must be chunk or serial");
             }
             else throw std::runtime_error("unknown/incomplete argument: " + arg);
         }
@@ -106,6 +111,7 @@ int main(int argc, char** argv) {
             }
         }
         q27::MetalEngine engine(model_path, context, turbo3_kv);
+        if (serial_prefill) engine.set_chunked_prefill(false);
         auto loaded = std::chrono::steady_clock::now();
         fprintf(stderr, "Metal model ready on %s in %.2f s\n", engine.backend().name().c_str(),
                 std::chrono::duration<double>(loaded - start).count());

@@ -98,6 +98,50 @@ class MetalBackend final : public ComputeBackend {
     void gated_norm_gdn(const BackendBuffer& x, const BackendTensor& weight,
                         const BackendBuffer& gate, BackendBuffer& out,
                         uint32_t heads, uint32_t head_dim, float eps) override;
+    void embedding_q8_rows(const BackendTensor& weight, const uint32_t* tokens,
+                           uint32_t count, BackendBuffer& out) override;
+    void rmsnorm_rows_quantized(const BackendBuffer& x, const BackendTensor& weight,
+                                BackendBuffer& out, uint32_t n, uint32_t rows,
+                                float eps, BackendQuantized& quantized) override;
+    void matvec_f16_pair_rows(const BackendTensor& a, BackendBuffer& a_out,
+                              const BackendTensor& b, BackendBuffer& b_out,
+                              const BackendBuffer& x, uint32_t rows) override;
+    void gdn_gates_rows(const BackendBuffer& alpha, const BackendBuffer& beta_raw,
+                        const BackendTensor& ssm_a, const BackendTensor& ssm_dt,
+                        BackendBuffer& g, BackendBuffer& beta,
+                        uint32_t heads, uint32_t tokens) override;
+    void conv_chunk(BackendBuffer& ring, const BackendBuffer& qkv,
+                    const BackendTensor& conv_weight, BackendBuffer& out,
+                    uint32_t channels, uint32_t tokens) override;
+    void delta_chunk(BackendBuffer& state, const BackendBuffer& conv,
+                     const BackendBuffer& g, const BackendBuffer& beta,
+                     BackendBuffer& out, uint32_t value_heads, uint32_t qk_heads,
+                     uint32_t head_dim, uint32_t tokens) override;
+    void l2norm_rows(BackendBuffer& x, uint32_t heads, uint32_t head_dim,
+                     uint32_t row_stride, uint32_t tokens, float eps) override;
+    void rope_neox_rows(BackendBuffer& x, uint32_t heads, uint32_t head_dim,
+                        uint32_t n_rot, uint32_t stride, uint32_t row_stride,
+                        uint32_t position, uint32_t tokens, float freq_base) override;
+    void kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer& v,
+                           BackendBuffer& k_cache, BackendBuffer& v_cache,
+                           uint32_t position, uint32_t row_length, uint32_t tokens) override;
+    void kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
+                              BackendBuffer& k_cache, BackendBuffer& v_cache,
+                              uint32_t position, uint32_t kv_heads, uint32_t tokens) override;
+    void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
+                              uint32_t q_row_stride, const BackendBuffer& k_cache,
+                              const BackendBuffer& v_cache, BackendBuffer& scratch,
+                              BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
+                              uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
+                              float scale) override;
+    void attention_turbo3_causal(const BackendBuffer& q, uint32_t q_stride,
+                                 uint32_t q_row_stride, const BackendBuffer& k_cache,
+                                 const BackendBuffer& v_cache, BackendBuffer& scratch,
+                                 BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
+                                 uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
+                                 float scale) override;
+    void sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,
+                               uint32_t heads, uint32_t head_dim, uint32_t tokens) override;
     void synchronize() override;
 
     uint64_t recommended_working_set_size() const;

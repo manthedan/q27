@@ -42,6 +42,8 @@ class MetalEngine {
     uint32_t position() const { return position_; }
     SpecStats last_spec_stats() const { return last_spec_stats_; }
     MetalBackend& backend() { return backend_; }
+    bool chunked_prefill() const { return chunked_prefill_; }
+    void set_chunked_prefill(bool enabled);
 
   private:
     static constexpr uint32_t N_LAYER = 64;
@@ -57,6 +59,7 @@ class MetalEngine {
     static constexpr uint32_t GDN_QK_HEADS = 16;
     static constexpr uint32_t GDN_DIM = 128;
     static constexpr uint32_t VOCAB = 248320;
+    static constexpr uint32_t CHUNK_MAX = 12;
     static constexpr float EPS = 1e-6f;
     static constexpr float FREQ_BASE = 1e7f;
 
@@ -85,6 +88,14 @@ class MetalEngine {
     std::shared_ptr<BackendBuffer> mtp_x_, mtp_hidden_out_, mtp_k_cache_, mtp_v_cache_;
     BackendQuantized q5120_, q6144_, q10240_, q17408_;
 
+    // Layer-major chunked prefill state (CHUNK_MAX token rows per buffer).
+    bool chunked_prefill_ = false;
+    std::shared_ptr<BackendBuffer> ch_, cx1_, cy_;
+    std::shared_ptr<BackendBuffer> cqg_, ckbuf_, cvbuf_, cattn_out_, cattn_scratch_;
+    std::shared_ptr<BackendBuffer> cqkv_, cz_, calpha_, cbeta_raw_, cg_, cbeta_, cconv_out_;
+    std::shared_ptr<BackendBuffer> cdelta_out_, cgated_out_, cffn_gate_, cffn_up_;
+    BackendQuantized cq5120_, cq6144_, cq17408_;
+
     std::shared_ptr<BackendBuffer> alloc_f32(uint64_t count);
     const BackendTensor& weight(const std::string& name) const;
     const BackendTensor& layer_weight(uint32_t layer, const char* leaf) const;
@@ -95,6 +106,10 @@ class MetalEngine {
     void attention_block(uint32_t layer);
     void ffn(uint32_t layer);
     void encode_token(uint32_t token, bool produce_logits);
+    void gdn_chunk(uint32_t layer, uint32_t count);
+    void attention_chunk(uint32_t layer, uint32_t count);
+    void ffn_chunk(uint32_t layer, uint32_t count);
+    void encode_chunk(const uint32_t* tokens, uint32_t count);
     uint32_t prefill(const std::vector<uint32_t>& prompt, bool warm_mtp);
     void mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t position);
     uint32_t mtp_forward(const BackendBuffer& hidden, uint32_t token, uint32_t position);

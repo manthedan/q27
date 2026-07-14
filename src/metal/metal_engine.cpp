@@ -25,6 +25,15 @@ class CommandBatch {
     bool active_ = true;
 };
 
+// A shorter view over a chunk-capacity quantized activation, so partial
+// chunks quantize and multiply exactly `count` values without reallocating.
+BackendQuantized quantized_view(const BackendQuantized& full, uint32_t count) {
+    if (count > full.count) throw std::runtime_error("q27 Metal: quantized view exceeds capacity");
+    BackendQuantized view;
+    view.count = count; view.values = full.values; view.scales = full.scales;
+    return view;
+}
+
 } // namespace
 
 struct MetalEngine::Snapshot {
@@ -199,7 +208,43 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
     mtp_k_cache_ = backend_.allocate(mtp_cache_bytes); mtp_v_cache_ = backend_.allocate(mtp_cache_bytes);
     q5120_=backend_.allocate_quantized(N_EMBD); q6144_=backend_.allocate_quantized(GDN_V);
     q10240_=backend_.allocate_quantized(GDN_CH); q17408_=backend_.allocate_quantized(N_FFN);
+
+    // Layer-major chunked prefill routes projections through the simdgroup
+    // GEMM, so it requires the same device family. The per-chunk activation
+    // buffers total a few MiB; the attention probability scratch is reserved
+    // at CHUNK_MAX rows but stays physically lazy until long prompts touch it.
+    chunked_prefill_ = backend_.supports_quantized_matmul();
+    if (chunked_prefill_) {
+        ch_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
+        cx1_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
+        cy_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
+        cqg_ = alloc_f32((uint64_t)CHUNK_MAX * 2 * N_HEAD * HEAD_DIM);
+        ckbuf_ = alloc_f32((uint64_t)CHUNK_MAX * N_KV * HEAD_DIM);
+        cvbuf_ = alloc_f32((uint64_t)CHUNK_MAX * N_KV * HEAD_DIM);
+        cattn_out_ = alloc_f32((uint64_t)CHUNK_MAX * N_HEAD * HEAD_DIM);
+        cattn_scratch_ = alloc_f32((uint64_t)CHUNK_MAX * N_HEAD * max_context_);
+        cqkv_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_CH);
+        cz_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_V);
+        calpha_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
+        cbeta_raw_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
+        cg_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
+        cbeta_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
+        cconv_out_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_CH);
+        cdelta_out_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_V);
+        cgated_out_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_V);
+        cffn_gate_ = alloc_f32((uint64_t)CHUNK_MAX * N_FFN);
+        cffn_up_ = alloc_f32((uint64_t)CHUNK_MAX * N_FFN);
+        cq5120_ = backend_.allocate_quantized(CHUNK_MAX * N_EMBD);
+        cq6144_ = backend_.allocate_quantized(CHUNK_MAX * GDN_V);
+        cq17408_ = backend_.allocate_quantized(CHUNK_MAX * N_FFN);
+    }
     reset();
+}
+
+void MetalEngine::set_chunked_prefill(bool enabled) {
+    if (enabled && !ch_)
+        throw std::runtime_error("q27 Metal: chunked prefill requires quantized matmul support");
+    chunked_prefill_ = enabled;
 }
 
 void MetalEngine::reset() {
@@ -337,6 +382,99 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits) {
     position_++;
 }
 
+void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count) {
+    BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
+    backend_.matmul_quantized(layer_weight(layer, "attn_qkv.weight"), x5, count, *cqkv_);
+    backend_.matmul_quantized(layer_weight(layer, "attn_gate.weight"), x5, count, *cz_);
+    backend_.matvec_f16_pair_rows(layer_weight(layer,"ssm_alpha.weight"),*calpha_,
+                                  layer_weight(layer,"ssm_beta.weight"),*cbeta_raw_,*cx1_,count);
+    backend_.gdn_gates_rows(*calpha_, *cbeta_raw_, layer_weight(layer, "ssm_a"),
+                            layer_weight(layer, "ssm_dt.bias"), *cg_, *cbeta_, GDN_HEADS, count);
+    LayerState& state = layers_[layer];
+    backend_.conv_chunk(*state.ring, *cqkv_, layer_weight(layer, "ssm_conv1d.weight"),
+                        *cconv_out_, GDN_CH, count);
+    backend_.l2norm_rows(*cconv_out_, 2 * GDN_QK_HEADS, GDN_DIM, GDN_CH, count, EPS);
+    backend_.delta_chunk(*state.recurrent, *cconv_out_, *cg_, *cbeta_, *cdelta_out_,
+                         GDN_HEADS, GDN_QK_HEADS, GDN_DIM, count);
+    // Token rows are contiguous, so the per-head gated norm batches by
+    // flattening the chunk into count*GDN_HEADS heads.
+    backend_.gated_norm_gdn(*cdelta_out_, layer_weight(layer, "ssm_norm.weight"), *cz_,
+                            *cgated_out_, count * GDN_HEADS, GDN_DIM, EPS);
+    BackendQuantized x6 = quantized_view(cq6144_, count * GDN_V);
+    backend_.quantize(*cgated_out_, x6);
+    backend_.matmul_quantized(layer_weight(layer, "ssm_out.weight"), x6, count, *cy_);
+}
+
+void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
+    BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
+    backend_.matmul_quantized(layer_weight(layer, "attn_q.weight"), x5, count, *cqg_);
+    backend_.rmsnorm_heads(*cqg_, layer_weight(layer, "attn_q_norm.weight"),
+                           count * N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS);
+    backend_.matmul_quantized(layer_weight(layer, "attn_k.weight"), x5, count, *ckbuf_);
+    backend_.matmul_quantized(layer_weight(layer, "attn_v.weight"), x5, count, *cvbuf_);
+    backend_.rmsnorm_heads(*ckbuf_, layer_weight(layer, "attn_k_norm.weight"),
+                           count * N_KV, HEAD_DIM, HEAD_DIM, EPS);
+    backend_.rope_neox_rows(*cqg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM,
+                            2 * N_HEAD * HEAD_DIM, position_, count, FREQ_BASE);
+    backend_.rope_neox_rows(*ckbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM,
+                            N_KV * HEAD_DIM, position_, count, FREQ_BASE);
+    LayerState& state = layers_[layer];
+    const float scale = 1.0f / std::sqrt((float)HEAD_DIM);
+    if (turbo3_kv_) {
+        backend_.turbo_wht(*cqg_, count * N_HEAD, 2 * HEAD_DIM, false);
+        backend_.kv_store_turbo3_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
+                                      position_, N_KV, count);
+        backend_.attention_turbo3_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
+                                         *state.k_cache, *state.v_cache, *cattn_scratch_,
+                                         *cattn_out_, position_ + 1, N_HEAD, N_KV,
+                                         HEAD_DIM, count, scale);
+        backend_.turbo_wht(*cattn_out_, count * N_HEAD, HEAD_DIM, true);
+    } else {
+        backend_.kv_store_f16_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
+                                   position_, N_KV * HEAD_DIM, count);
+        backend_.attention_f16_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
+                                      *state.k_cache, *state.v_cache, *cattn_scratch_,
+                                      *cattn_out_, position_ + 1, N_HEAD, N_KV,
+                                      HEAD_DIM, count, scale);
+    }
+    backend_.sigmoid_gate_mul_rows(*cattn_out_, *cqg_, N_HEAD, HEAD_DIM, count);
+    BackendQuantized x6 = quantized_view(cq6144_, count * N_HEAD * HEAD_DIM);
+    backend_.quantize(*cattn_out_, x6);
+    backend_.matmul_quantized(layer_weight(layer, "attn_output.weight"), x6, count, *cy_);
+}
+
+void MetalEngine::ffn_chunk(uint32_t layer, uint32_t count) {
+    BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
+    backend_.matmul_quantized(layer_weight(layer, "ffn_gate.weight"), x5, count, *cffn_gate_);
+    backend_.matmul_quantized(layer_weight(layer, "ffn_up.weight"), x5, count, *cffn_up_);
+    backend_.silu_mul(*cffn_gate_, *cffn_up_, *cffn_gate_, count * N_FFN);
+    BackendQuantized x17 = quantized_view(cq17408_, count * N_FFN);
+    backend_.quantize(*cffn_gate_, x17);
+    backend_.matmul_quantized(layer_weight(layer, "ffn_down.weight"), x17, count, *cy_);
+}
+
+void MetalEngine::encode_chunk(const uint32_t* tokens, uint32_t count) {
+    if (!ch_) throw std::runtime_error("q27 Metal: chunked prefill is unavailable");
+    if (!count || count > CHUNK_MAX) throw std::runtime_error("q27 Metal: invalid chunk size");
+    if ((uint64_t)position_ + count > max_context_)
+        throw std::runtime_error("q27 Metal: context exhausted");
+    for (uint32_t i = 0; i < count; i++)
+        if (tokens[i] >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
+    backend_.embedding_q8_rows(weight("token_embd.weight"), tokens, count, *ch_);
+    BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
+    for (uint32_t layer = 0; layer < N_LAYER; layer++) {
+        backend_.rmsnorm_rows_quantized(*ch_, layer_weight(layer, "attn_norm.weight"),
+                                        *cx1_, N_EMBD, count, EPS, x5);
+        if (attention_layer(layer)) attention_chunk(layer, count); else gdn_chunk(layer, count);
+        backend_.add_inplace(*ch_, *cy_, count * N_EMBD);
+        backend_.rmsnorm_rows_quantized(*ch_, layer_weight(layer, "post_attention_norm.weight"),
+                                        *cx1_, N_EMBD, count, EPS, x5);
+        ffn_chunk(layer, count);
+        backend_.add_inplace(*ch_, *cy_, count * N_EMBD);
+    }
+    position_ += count;
+}
+
 uint32_t MetalEngine::step(uint32_t token) {
     if (token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
     if (position_ >= max_context_) throw std::runtime_error("q27 Metal: context exhausted");
@@ -374,12 +512,29 @@ uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp
         throw std::runtime_error("q27 Metal: prompt exceeds context");
     for (uint32_t token : prompt)
         if (token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
-    // Bound encoder growth for long prompts. This remains token-serial, but
-    // avoids recording millions of dispatches into one command buffer.
+    // Layer-major chunked ingestion. MTP warming needs each token's final
+    // normalized hidden state, which the chunked path does not produce, so
+    // MTP prompts stay on the token-serial path. The final prompt token is
+    // always serial: it produces logits and leaves the last hidden state in
+    // x1_ for MTP drafting and prefix snapshots.
+    size_t serial_begin = 0;
+    if (chunked_prefill_ && !warm_mtp && prompt.size() >= 3) {
+        const size_t chunkable = prompt.size() - 1;
+        while (chunkable - serial_begin >= 2) {
+            const uint32_t count =
+                (uint32_t)std::min<size_t>(CHUNK_MAX, chunkable - serial_begin);
+            CommandBatch batch(backend_);
+            encode_chunk(prompt.data() + serial_begin, count);
+            batch.finish();
+            serial_begin += count;
+        }
+    }
+    // Bound encoder growth for long serial prompts: this avoids recording
+    // millions of dispatches into one command buffer.
     constexpr size_t COMMAND_CHUNK=8;
-    for(size_t begin=0;begin<prompt.size();begin+=COMMAND_CHUNK) {
+    for(size_t begin=serial_begin;begin<prompt.size();begin+=COMMAND_CHUNK) {
         CommandBatch batch(backend_);
-        if(begin==0 && warm_mtp && position_>0) mtp_warm(*x1_,prompt.front(),position_);
+        if(begin==serial_begin && warm_mtp && position_>0) mtp_warm(*x1_,prompt.front(),position_);
         size_t end=std::min(prompt.size(),begin+COMMAND_CHUNK);
         for(size_t i=begin;i<end;i++) {
             encode_token(prompt[i],i+1==prompt.size());

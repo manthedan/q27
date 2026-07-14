@@ -103,6 +103,18 @@ struct TurboWhtArgs { uint32_t heads, stride, inverse; };
 struct TurboStoreArgs { uint32_t position, kv_heads; };
 struct AttentionArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim; float scale; };
 struct DeltaArgs { uint32_t value_heads, qk_heads, head_dim; };
+struct EmbedRowsArgs { uint32_t cols, count, tokens[12]; };
+struct RowsNormArgs { uint32_t n, rows, groups; float eps; };
+struct MatvecPairRowsArgs { uint32_t rows_a, rows_b, cols, tokens; };
+struct GatesRowsArgs { uint32_t heads, tokens; };
+struct ConvChunkArgs { uint32_t channels, tokens; };
+struct DeltaChunkArgs { uint32_t value_heads, qk_heads, head_dim, tokens; };
+struct L2RowsArgs { uint32_t heads, head_dim, row_stride, tokens; float eps; };
+struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, position, tokens; float freq_base; };
+struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
+struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
+struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
+struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
 
 } // namespace
 
@@ -143,6 +155,19 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> conv;
     id<MTLComputePipelineState> delta;
     id<MTLComputePipelineState> gated_norm;
+    id<MTLComputePipelineState> embedding_rows;
+    id<MTLComputePipelineState> rms_rows_quantized;
+    id<MTLComputePipelineState> f16_pair_rows;
+    id<MTLComputePipelineState> gates_rows;
+    id<MTLComputePipelineState> conv_chunked;
+    id<MTLComputePipelineState> delta_chunked;
+    id<MTLComputePipelineState> l2_rows;
+    id<MTLComputePipelineState> rope_rows;
+    id<MTLComputePipelineState> kv_store_rows;
+    id<MTLComputePipelineState> kv_store_turbo3_rows;
+    id<MTLComputePipelineState> attention_causal;
+    id<MTLComputePipelineState> attention_turbo3_causal_p;
+    id<MTLComputePipelineState> sigmoid_gate_rows;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
     bool batching = false;
@@ -240,6 +265,19 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->conv = make_pipeline(impl_->device, impl_->library, @"q27_conv_step");
         impl_->delta = make_pipeline(impl_->device, impl_->library, @"q27_delta_step");
         impl_->gated_norm = make_pipeline(impl_->device, impl_->library, @"q27_gated_norm_gdn");
+        impl_->embedding_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8_rows");
+        impl_->rms_rows_quantized = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_rows_quantized");
+        impl_->f16_pair_rows = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair_rows");
+        impl_->gates_rows = make_pipeline(impl_->device, impl_->library, @"q27_gdn_gates_rows");
+        impl_->conv_chunked = make_pipeline(impl_->device, impl_->library, @"q27_conv_chunk");
+        impl_->delta_chunked = make_pipeline(impl_->device, impl_->library, @"q27_delta_chunk");
+        impl_->l2_rows = make_pipeline(impl_->device, impl_->library, @"q27_l2norm_rows");
+        impl_->rope_rows = make_pipeline(impl_->device, impl_->library, @"q27_rope_neox_rows");
+        impl_->kv_store_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_rows");
+        impl_->kv_store_turbo3_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3_rows");
+        impl_->attention_causal = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal");
+        impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
+        impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
     }
 }
 
@@ -926,6 +964,340 @@ void MetalBackend::gated_norm_gdn(const BackendBuffer& x, const BackendTensor& w
         bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->gated_norm];
         [enc setBuffer:xb.handle() offset:0 atIndex:0]; [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1]; [enc setBuffer:gb.handle() offset:0 atIndex:2]; [enc setBuffer:o.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; if(own) impl_->finish_command("GDN gated norm");
+    }
+}
+
+void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t* tokens,
+                                      uint32_t count, BackendBuffer& out) {
+    if (!tokens || !count || count > 12)
+        throw std::runtime_error("q27 Metal: chunked embedding requires 1..12 tokens");
+    if (weight.dtype != DType::Q8_G128 || !weight.data || !weight.scales ||
+        !weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
+        weight.cols % 128)
+        throw std::runtime_error("q27 Metal: invalid chunked embedding tensor");
+    EmbedRowsArgs args{(uint32_t)weight.cols, count, {}};
+    for (uint32_t i = 0; i < count; i++) {
+        if (tokens[i] >= weight.rows) throw std::runtime_error("q27 Metal: chunked embedding token out of range");
+        args.tokens[i] = tokens[i];
+    }
+    check_range(out.size(), 0, (uint64_t)count * weight.cols * 4, "chunked embedding output");
+    const MetalBuffer& data = metal_buffer(*weight.data);
+    const MetalBuffer& scales = metal_buffer(*weight.scales);
+    check_range(data.size(), weight.data_offset, weight.rows * weight.cols, "chunked embedding weight");
+    check_range(scales.size(), weight.scales_offset, weight.rows * (weight.cols / 128) * 2, "chunked embedding scales");
+    MetalBuffer& output = metal_buffer(out);
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->embedding_rows];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:output.handle() offset:0 atIndex:2];
+        [enc setBytes:&args length:sizeof(args) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(weight.cols, count, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("chunked embedding");
+    }
+}
+
+void MetalBackend::rmsnorm_rows_quantized(const BackendBuffer& x, const BackendTensor& weight,
+                                          BackendBuffer& out, uint32_t n, uint32_t rows,
+                                          float eps, BackendQuantized& quantized) {
+    if (!n || n % 32 || !rows || quantized.count != n * rows || !quantized.values || !quantized.scales)
+        throw std::runtime_error("q27 Metal: invalid chunked rmsnorm quantization");
+    const MetalBuffer& w = tensor_data(weight, DType::F32, "chunked rmsnorm");
+    const MetalBuffer& input = metal_buffer(x); MetalBuffer& output = metal_buffer(out);
+    MetalBuffer& values = metal_buffer(*quantized.values); MetalBuffer& scales = metal_buffer(*quantized.scales);
+    const uint64_t total = (uint64_t)n * rows;
+    check_range(input.size(), 0, total * 4, "chunked rmsnorm input");
+    check_range(output.size(), 0, total * 4, "chunked rmsnorm output");
+    check_range(w.size(), weight.data_offset, (uint64_t)n * 4, "chunked rmsnorm weight");
+    check_range(values.size(), 0, total, "chunked rmsnorm values");
+    check_range(scales.size(), 0, (total / 32) * 4, "chunked rmsnorm scales");
+    RowsNormArgs args{n, rows, 8, eps};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->rms_rows_quantized];
+        [enc setBuffer:input.handle() offset:0 atIndex:0];
+        [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
+        [enc setBuffer:output.handle() offset:0 atIndex:2];
+        [enc setBuffer:values.handle() offset:0 atIndex:3];
+        [enc setBuffer:scales.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(rows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked rmsnorm quantize");
+    }
+}
+
+void MetalBackend::matvec_f16_pair_rows(const BackendTensor& a, BackendBuffer& a_out,
+                                        const BackendTensor& b, BackendBuffer& b_out,
+                                        const BackendBuffer& x, uint32_t rows) {
+    if (a.dtype != DType::F16 || b.dtype != DType::F16 || a.cols != b.cols || !a.data || !b.data ||
+        !a.rows || !b.rows || !a.cols || a.rows > UINT32_MAX || b.rows > UINT32_MAX || a.cols > UINT32_MAX)
+        throw std::runtime_error("q27 Metal: chunked F16 matvec pair requires compatible F16 weights");
+    if (!rows || rows > 12) throw std::runtime_error("q27 Metal: chunked F16 matvec pair requires 1..12 rows");
+    check_range(x.size(), 0, (uint64_t)rows * a.cols * 4, "chunked matvec input");
+    check_range(a_out.size(), 0, (uint64_t)rows * a.rows * 4, "chunked matvec output A");
+    check_range(b_out.size(), 0, (uint64_t)rows * b.rows * 4, "chunked matvec output B");
+    const MetalBuffer& ad = metal_buffer(*a.data); const MetalBuffer& bd = metal_buffer(*b.data);
+    const MetalBuffer& input = metal_buffer(x);
+    MetalBuffer& ao = metal_buffer(a_out); MetalBuffer& bo = metal_buffer(b_out);
+    check_range(ad.size(), a.data_offset, a.rows * a.cols * 2, "chunked matvec weight A");
+    check_range(bd.size(), b.data_offset, b.rows * b.cols * 2, "chunked matvec weight B");
+    MatvecPairRowsArgs args{(uint32_t)a.rows, (uint32_t)b.rows, (uint32_t)a.cols, rows};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->f16_pair_rows];
+        [enc setBuffer:ad.handle() offset:(NSUInteger)a.data_offset atIndex:0]; [enc setBuffer:ao.handle() offset:0 atIndex:1];
+        [enc setBuffer:bd.handle() offset:(NSUInteger)b.data_offset atIndex:2]; [enc setBuffer:bo.handle() offset:0 atIndex:3];
+        [enc setBuffer:input.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(std::max(a.rows,b.rows)+7)/8, rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked F16 matvec pair");
+    }
+}
+
+void MetalBackend::gdn_gates_rows(const BackendBuffer& alpha, const BackendBuffer& beta_raw,
+                                  const BackendTensor& ssm_a, const BackendTensor& ssm_dt,
+                                  BackendBuffer& g, BackendBuffer& beta,
+                                  uint32_t heads, uint32_t tokens) {
+    if (!heads || !tokens || tokens > 12) throw std::runtime_error("q27 Metal: invalid chunked GDN gates");
+    const MetalBuffer& ar = metal_buffer(alpha); const MetalBuffer& br = metal_buffer(beta_raw);
+    const MetalBuffer& a = tensor_data(ssm_a, DType::F32, "chunked GDN a");
+    const MetalBuffer& dt = tensor_data(ssm_dt, DType::F32, "chunked GDN dt");
+    MetalBuffer& go = metal_buffer(g); MetalBuffer& bo = metal_buffer(beta);
+    const uint64_t total = (uint64_t)heads * tokens * 4;
+    check_range(ar.size(), 0, total, "chunked GDN alpha"); check_range(br.size(), 0, total, "chunked GDN beta raw");
+    check_range(go.size(), 0, total, "chunked GDN g"); check_range(bo.size(), 0, total, "chunked GDN beta");
+    check_range(a.size(), ssm_a.data_offset, (uint64_t)heads * 4, "chunked GDN a");
+    check_range(dt.size(), ssm_dt.data_offset, (uint64_t)heads * 4, "chunked GDN dt");
+    GatesRowsArgs args{heads, tokens};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->gates_rows];
+        [enc setBuffer:ar.handle() offset:0 atIndex:0]; [enc setBuffer:br.handle() offset:0 atIndex:1];
+        [enc setBuffer:a.handle() offset:(NSUInteger)ssm_a.data_offset atIndex:2];
+        [enc setBuffer:dt.handle() offset:(NSUInteger)ssm_dt.data_offset atIndex:3];
+        [enc setBuffer:go.handle() offset:0 atIndex:4]; [enc setBuffer:bo.handle() offset:0 atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)heads * tokens, 1, 1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+        if (own) impl_->finish_command("chunked GDN gates");
+    }
+}
+
+void MetalBackend::conv_chunk(BackendBuffer& ring, const BackendBuffer& qkv,
+                              const BackendTensor& conv_weight, BackendBuffer& out,
+                              uint32_t channels, uint32_t tokens) {
+    if (!channels || !tokens || tokens > 12) throw std::runtime_error("q27 Metal: invalid chunked convolution");
+    MetalBuffer& rb = metal_buffer(ring); const MetalBuffer& q = metal_buffer(qkv);
+    const MetalBuffer& w = tensor_data(conv_weight, DType::F32, "chunked GDN convolution");
+    MetalBuffer& o = metal_buffer(out);
+    check_range(rb.size(), 0, (uint64_t)channels * 3 * 4, "chunked conv ring");
+    check_range(q.size(), 0, (uint64_t)channels * tokens * 4, "chunked conv input");
+    check_range(w.size(), conv_weight.data_offset, (uint64_t)channels * 4 * 4, "chunked conv weight");
+    check_range(o.size(), 0, (uint64_t)channels * tokens * 4, "chunked conv output");
+    ConvChunkArgs args{channels, tokens};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->conv_chunked];
+        [enc setBuffer:rb.handle() offset:0 atIndex:0]; [enc setBuffer:q.handle() offset:0 atIndex:1];
+        [enc setBuffer:w.handle() offset:(NSUInteger)conv_weight.data_offset atIndex:2];
+        [enc setBuffer:o.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(channels,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked GDN convolution");
+    }
+}
+
+void MetalBackend::delta_chunk(BackendBuffer& state, const BackendBuffer& conv,
+                               const BackendBuffer& g, const BackendBuffer& beta,
+                               BackendBuffer& out, uint32_t value_heads, uint32_t qk_heads,
+                               uint32_t head_dim, uint32_t tokens) {
+    if (head_dim != 128 || qk_heads != 16 || !tokens || tokens > 12 ||
+        impl_->delta_chunked.maxTotalThreadsPerThreadgroup < 512)
+        throw std::runtime_error("q27 Metal: unsupported chunked DeltaNet shape");
+    MetalBuffer& sb = metal_buffer(state); const MetalBuffer& cv = metal_buffer(conv);
+    const MetalBuffer& gb = metal_buffer(g); const MetalBuffer& bb = metal_buffer(beta);
+    MetalBuffer& o = metal_buffer(out);
+    const uint64_t state_bytes = (uint64_t)value_heads * head_dim * head_dim * 4;
+    check_range(sb.size(), 0, state_bytes, "chunked delta state");
+    check_range(cv.size(), 0, (uint64_t)(qk_heads * 2 + value_heads) * head_dim * tokens * 4, "chunked delta conv");
+    check_range(gb.size(), 0, (uint64_t)value_heads * tokens * 4, "chunked delta g");
+    check_range(bb.size(), 0, (uint64_t)value_heads * tokens * 4, "chunked delta beta");
+    check_range(o.size(), 0, (uint64_t)value_heads * head_dim * tokens * 4, "chunked delta output");
+    DeltaChunkArgs args{value_heads, qk_heads, head_dim, tokens};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->delta_chunked];
+        [enc setBuffer:sb.handle() offset:0 atIndex:0]; [enc setBuffer:cv.handle() offset:0 atIndex:1];
+        [enc setBuffer:gb.handle() offset:0 atIndex:2]; [enc setBuffer:bb.handle() offset:0 atIndex:3];
+        [enc setBuffer:o.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(512,1,1)];
+        if (own) impl_->finish_command("chunked DeltaNet recurrence");
+    }
+}
+
+void MetalBackend::l2norm_rows(BackendBuffer& x, uint32_t heads, uint32_t head_dim,
+                               uint32_t row_stride, uint32_t tokens, float eps) {
+    if (!heads || !tokens || tokens > 12 || row_stride < heads * head_dim)
+        throw std::runtime_error("q27 Metal: invalid chunked l2norm");
+    MetalBuffer& input = metal_buffer(x);
+    check_range(input.size(), 0, ((uint64_t)(tokens - 1) * row_stride + (uint64_t)heads * head_dim) * 4,
+                "chunked l2norm input");
+    L2RowsArgs args{heads, head_dim, row_stride, tokens, eps};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->l2_rows];
+        [enc setBuffer:input.handle() offset:0 atIndex:0];
+        [enc setBytes:&args length:sizeof(args) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked l2norm");
+    }
+}
+
+void MetalBackend::rope_neox_rows(BackendBuffer& x, uint32_t heads, uint32_t head_dim,
+                                  uint32_t n_rot, uint32_t stride, uint32_t row_stride,
+                                  uint32_t position, uint32_t tokens, float freq_base) {
+    if (!n_rot || n_rot > head_dim || (n_rot & 1) || !tokens || tokens > 12)
+        throw std::runtime_error("q27 Metal: invalid chunked RoPE dimensions");
+    MetalBuffer& input = metal_buffer(x);
+    check_range(input.size(), 0,
+                ((uint64_t)(tokens - 1) * row_stride + (uint64_t)(heads - 1) * stride + head_dim) * 4,
+                "chunked rope input");
+    RopeRowsArgs args{heads, head_dim, n_rot, stride, row_stride, position, tokens, freq_base};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->rope_rows];
+        [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBytes:&args length:sizeof(args) atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(n_rot/2,heads,tokens) threadsPerThreadgroup:MTLSizeMake(n_rot/2,1,1)];
+        if (own) impl_->finish_command("chunked rope");
+    }
+}
+
+void MetalBackend::kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                     BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                     uint32_t position, uint32_t row_length, uint32_t tokens) {
+    if (!tokens || tokens > 12) throw std::runtime_error("q27 Metal: invalid chunked KV store");
+    const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
+    MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
+    check_range(kb.size(), 0, (uint64_t)row_length * tokens * 4, "chunked K rows");
+    check_range(vb.size(), 0, (uint64_t)row_length * tokens * 4, "chunked V rows");
+    check_range(kc.size(), (uint64_t)position * row_length * 2, (uint64_t)row_length * tokens * 2, "chunked K cache");
+    check_range(vc.size(), (uint64_t)position * row_length * 2, (uint64_t)row_length * tokens * 2, "chunked V cache");
+    KvStoreRowsArgs args{position, row_length, tokens};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->kv_store_rows];
+        [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
+        [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(row_length,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked KV store");
+    }
+}
+
+void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                        BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                        uint32_t position, uint32_t kv_heads, uint32_t tokens) {
+    if (!kv_heads || !tokens || tokens > 12)
+        throw std::runtime_error("q27 Metal: invalid chunked turbo3 KV store");
+    const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
+    MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
+    const uint64_t row_bytes = (uint64_t)kv_heads * 2 * 50;
+    check_range(kb.size(), 0, (uint64_t)kv_heads * 256 * tokens * 4, "chunked turbo3 K rows");
+    check_range(vb.size(), 0, (uint64_t)kv_heads * 256 * tokens * 4, "chunked turbo3 V rows");
+    check_range(kc.size(), (uint64_t)position * row_bytes, row_bytes * tokens, "chunked turbo3 K cache");
+    check_range(vc.size(), (uint64_t)position * row_bytes, row_bytes * tokens, "chunked turbo3 V cache");
+    TurboStoreRowsArgs args{position, kv_heads, tokens};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->kv_store_turbo3_rows];
+        [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
+        [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
+                threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+        if (own) impl_->finish_command("chunked turbo3 KV store");
+    }
+}
+
+void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
+                                        uint32_t q_row_stride, const BackendBuffer& k_cache,
+                                        const BackendBuffer& v_cache, BackendBuffer& scratch,
+                                        BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
+                                        uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
+                                        float scale) {
+    if (!base_len || !kv_heads || q_heads % kv_heads || !tokens || tokens > 12)
+        throw std::runtime_error("q27 Metal: invalid chunked attention dimensions");
+    const MetalBuffer& qb = metal_buffer(q); const MetalBuffer& kc = metal_buffer(k_cache);
+    const MetalBuffer& vc = metal_buffer(v_cache);
+    MetalBuffer& prob = metal_buffer(scratch); MetalBuffer& output = metal_buffer(out);
+    const uint32_t max_seq = base_len + tokens - 1;
+    check_range(qb.size(), 0,
+                ((uint64_t)(tokens-1)*q_row_stride + (uint64_t)(q_heads-1)*q_stride + head_dim)*4,
+                "chunked attention Q");
+    const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * head_dim * 2;
+    check_range(kc.size(), 0, cache_bytes, "chunked attention K cache");
+    check_range(vc.size(), 0, cache_bytes, "chunked attention V cache");
+    check_range(prob.size(), 0, (uint64_t)tokens * q_heads * max_seq * 4, "chunked attention scratch");
+    check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked attention output");
+    AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, scale};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->attention_causal];
+        [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2]; [enc setBuffer:prob.handle() offset:0 atIndex:3];
+        [enc setBuffer:output.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked FP16 attention");
+    }
+}
+
+void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_stride,
+                                           uint32_t q_row_stride, const BackendBuffer& k_cache,
+                                           const BackendBuffer& v_cache, BackendBuffer& scratch,
+                                           BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
+                                           uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
+                                           float scale) {
+    if (!base_len || !kv_heads || q_heads % kv_heads || head_dim != 256 || !tokens || tokens > 12)
+        throw std::runtime_error("q27 Metal: invalid chunked turbo3 attention dimensions");
+    const MetalBuffer& qb = metal_buffer(q); const MetalBuffer& kc = metal_buffer(k_cache);
+    const MetalBuffer& vc = metal_buffer(v_cache);
+    MetalBuffer& prob = metal_buffer(scratch); MetalBuffer& output = metal_buffer(out);
+    const uint32_t max_seq = base_len + tokens - 1;
+    check_range(qb.size(), 0,
+                ((uint64_t)(tokens-1)*q_row_stride + (uint64_t)(q_heads-1)*q_stride + head_dim)*4,
+                "chunked turbo3 attention Q");
+    const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * 2 * 50;
+    check_range(kc.size(), 0, cache_bytes, "chunked turbo3 K cache");
+    check_range(vc.size(), 0, cache_bytes, "chunked turbo3 V cache");
+    check_range(prob.size(), 0, (uint64_t)tokens * q_heads * max_seq * 4, "chunked turbo3 attention scratch");
+    check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked turbo3 attention output");
+    AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, scale};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->attention_turbo3_causal_p];
+        [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2]; [enc setBuffer:prob.handle() offset:0 atIndex:3];
+        [enc setBuffer:output.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked turbo3 attention");
+    }
+}
+
+void MetalBackend::sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,
+                                         uint32_t heads, uint32_t head_dim, uint32_t tokens) {
+    if (!heads || !head_dim || !tokens || tokens > 12)
+        throw std::runtime_error("q27 Metal: invalid chunked sigmoid gate");
+    MetalBuffer& o = metal_buffer(out); const MetalBuffer& gates = metal_buffer(qg);
+    const uint64_t n = (uint64_t)heads * head_dim * tokens;
+    check_range(o.size(), 0, n * 4, "chunked sigmoid output");
+    check_range(gates.size(), 0, n * 2 * 4, "chunked sigmoid gates");
+    GateRowsArgs args{heads, head_dim, tokens};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->sigmoid_gate_rows];
+        [enc setBuffer:o.handle() offset:0 atIndex:0]; [enc setBuffer:gates.handle() offset:0 atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked sigmoid gate");
     }
 }
 

@@ -11,10 +11,10 @@ This is the execution ledger for the Metal port. CUDA remains the behavioral ref
 | 2 | One-token Gated DeltaNet | **Baseline complete** | CPU recurrence test; persistent 64-layer state; device snapshot/restore implemented |
 | 3 | FP16 attention | **Baseline complete** | CPU-reference GQA/KV test; production tiling remains |
 | 4 | Full serial decode | **Baseline complete** | Official 27B artifact loads zero-copy; 16-token canonical continuation matches the live CUDA server exactly; 128-token trajectory divergence is under investigation |
-| 5 | Batched prefill | **In progress** | Bounded teacher forcing and a tested 1–12-row simdgroup projection GEMM exist; engine integration, layer-major recurrence and tiled causal attention remain |
+| 5 | Batched prefill | **Baseline complete** | Layer-major 2–12-token chunked prefill is integrated end-to-end through the simdgroup projection GEMM; chunk-aware GDN recurrence and causal attention match the serial path (op gates bit-exact, official-artifact A/B committed tokens identical, 4.3× prefill wall-clock); production tiled attention remains |
 | 6 | MTP widths 2/4/8/12 | **Baseline complete** | Widths 2/4/8/12 produce the same 12-token canonical output; native MTP, serial target verification, acceptance accounting, snapshots and suffix drafting are wired; batched verification remains performance work |
 | 7 | Prefix cache and server | **Baseline complete** | Device snapshots (including resident logits), longest-prefix LRU, deterministic CPU top-k/top-p sampling, Metal CLI/server, and OpenAI/Anthropic endpoint smoke tests exist; streaming/tool constraints remain parity work |
-| 8 | turbo3 and long context | **In progress** | Metal WHT, 50-byte codec, KV writer/reader, engine mode, synthetic quality and 32K/262K allocation gates pass; long-context retrieval/perplexity remain blocked on practical batched prefill |
+| 8 | turbo3 and long context | **In progress** | Metal WHT, 50-byte codec, KV writer/reader, engine mode, synthetic quality and 32K/262K allocation gates pass; chunked prefill now covers turbo3 KV (A/B identical), but 32K+ retrieval/perplexity still need more prefill throughput than the current ~3.6 tok/s |
 | 9 | Performance | **In progress** | mmap views, command batching, paired projections, fused RMSNorm+quantization, GEMV, and a 3.29x N=12 simdgroup projection kernel landed; engine-level tiled scheduling remains |
 
 ## Completed foundation
@@ -55,7 +55,9 @@ The `yukon` RTX 3090 server is now available as a CUDA oracle. `tools/metal_cuda
 
 ### 5 — Prefill
 
-Teacher-forced prompt ingestion records tokens in bounded eight-token command chunks and computes logits only for the final prompt token. This removes per-token CPU synchronization while preventing unbounded encoder growth and preserving recurrent dependency order. Multi-token projection GEMM and tiled causal attention are still required for practical long-prompt performance.
+Prompt ingestion is now layer-major: `MetalEngine::encode_chunk` advances 2–12 tokens per command buffer through batched embedding, per-row fused RMSNorm+quantization, the 1–12-row simdgroup projection GEMM, a chunk-sequential convolution-ring kernel, a chunk-sequential DeltaNet kernel that keeps the 128×128 state in registers and commits it once per chunk, per-token-position RoPE, batched FP16/turbo3 KV append, and causal chunk attention (token *t* attends to the warm cache plus in-chunk keys `0..t`). The final prompt token always runs the serial path so it produces logits and leaves the last normalized hidden state for MTP drafting and prefix snapshots; MTP-warmed prompts (`generate_mtp`) stay fully serial because warming needs every token's final hidden state. `--prefill serial` restores the old path for A/B comparison.
+
+Gates: every chunked operation has a serial-reference parity test in `make test-metal` (most are bit-exact, including the conv ring and turbo3 store bytes); official-artifact A/B runs produced identical committed tokens for the canonical 16-token FP16 continuation, a 126-token prompt, and a turbo3 run. The 126-token prompt prefilled in ~35 s chunked versus ~153 s serial (4.3×, about 3.6 tok/s prefill). Causal chunk attention still materializes probabilities in a reserved `12 × heads × context` scratch buffer (physically lazy until long prompts touch it); online-softmax tiled attention in critical-path item 4 removes it.
 
 ### 6 — MTP
 
@@ -81,13 +83,13 @@ Turbo3 allocation/startup passes at 32K and the full 262144-token limit. KV memo
 
 ### 9 — Performance
 
-Landed: zero-copy mmap weights, one command buffer per prompt/step, group-32 int8 activation quantization reused across sibling projections, integer-accumulating Q4/Q8 GEMV, eight independent simdgroups per threadgroup, shared-input paired projection dispatches, and fused RMSNorm+activation quantization. The 16-token CUDA gate improved from 33.35 s (`0.48 tok/s`) to 25.39 s (`0.63 tok/s`) while preserving exact output; the 128-token run averaged `1.22 tok/s`. Peak process footprint stayed about 276 MiB. Kernel throughput remains far below parity. Initial small-N Q4 prototypes that performed serial per-token SIMD reductions measured `0.62–0.75x` versus serial GEMV and were reverted. Replacing them with 8×8 float `simdgroup_matrix` tiles and on-tile Q4/Q8 dequantization changed the result: 12 activation rows over `[17408,5120]` measure `8.36 ms` versus `27.49 ms` for 12 serial GEMVs (`3.29x`). The 1–12-row primitive has Q4/Q8 CPU-reference tests and passes on both M4 hosts; integrating it requires layer-major prefill/verification scheduling. Remaining high-impact work: that integration, packed SIMD dot instructions for GEMV, fused GDN, tiled attention, GPU-side acceptance/sampling, and Instruments attribution.
+Landed: zero-copy mmap weights, one command buffer per prompt/step, group-32 int8 activation quantization reused across sibling projections, integer-accumulating Q4/Q8 GEMV, eight independent simdgroups per threadgroup, shared-input paired projection dispatches, and fused RMSNorm+activation quantization. The 16-token CUDA gate improved from 33.35 s (`0.48 tok/s`) to 25.39 s (`0.63 tok/s`) while preserving exact output; the 128-token run averaged `1.22 tok/s`. Peak process footprint stayed about 276 MiB. Kernel throughput remains far below parity. Initial small-N Q4 prototypes that performed serial per-token SIMD reductions measured `0.62–0.75x` versus serial GEMV and were reverted. Replacing them with 8×8 float `simdgroup_matrix` tiles and on-tile Q4/Q8 dequantization changed the result: 12 activation rows over `[17408,5120]` measure `8.36 ms` versus `27.49 ms` for 12 serial GEMVs (`3.29x`). The 1–12-row primitive has Q4/Q8 CPU-reference tests and passes on both M4 hosts. Layer-major chunked prefill now schedules it end-to-end: a 126-token prompt ingests in ~35 s versus ~153 s token-serial (4.3×, ~3.6 tok/s prefill) with identical committed tokens. Remaining high-impact work: batched MTP verification on the same substrate, packed SIMD dot instructions for GEMV, fused GDN, tiled attention, GPU-side acceptance/sampling, and Instruments attribution.
 
 ## Mature-decode critical path
 
 The remaining work should proceed in this order; isolated kernel wins do not close a checkpoint until the engine schedules them end-to-end.
 
-1. **Layer-major 8–12 token execution:** add batched embeddings/RMSNorm/quantization, route projections through the simdgroup GEMM, implement chunk-aware GDN recurrence and causal attention, and commit state at chunk boundaries.
+1. **Layer-major 8–12 token execution:** ✅ done (2026-07-14). Batched embeddings/RMSNorm/quantization, projections through the simdgroup GEMM, chunk-aware GDN recurrence and causal attention, state committed at chunk boundaries. MTP-warmed prompts remain serial until item 2 provides batched layer-64 execution.
 2. **Batched MTP verification:** verify candidate lanes layer-by-layer, checkpoint base state before each round, commit only accepted KV/GDN rows, move the acceptance walk to the GPU, and adapt width from measured acceptance. Committed tokens must remain identical to greedy.
 3. **Greedy hot-path optimization:** profile GPU time and effective bandwidth, add packed-dot Q4/Q8 GEMV, fuse GDN stages and residual/normalization boundaries, and reduce per-token dispatch count. A provisional base-M4 maturity target is `3–5 tok/s` or at least 50% of the measured sustainable bandwidth roofline.
 4. **Production attention:** add online-softmax tiled FP16/turbo3 decode, GQA KV reuse, chunk-causal prefill attention, and long-context cache-block scheduling.
@@ -95,7 +97,7 @@ The remaining work should proceed in this order; isolated kernel wins do not clo
 6. **Serving closure:** add true token streaming, GPU sampling, tool constraints, stop handling, cancellation/backpressure, multi-slot scheduling, and the CUDA server compatibility suite.
 7. **Hardware validation:** benchmark cold/warm short decode, long decode, prefill, and MTP on base M4 and available Max/Ultra-class machines; report memory mode and effective bandwidth with every result.
 
-The immediate implementation target is item 1. It unlocks practical long-context validation and provides the same execution substrate needed by item 2.
+The immediate implementation target is item 2: batched MTP verification now has its execution substrate (chunked layer-major scheduling plus the simdgroup GEMM) and is the largest committed-token-preserving speed lever.
 
 ## Memory-safe test policy
 
@@ -126,4 +128,7 @@ make build/q27-metal build/q27-metal-server
 
 # Memory-constrained long-context mode
 ./build/q27-metal MODEL TOKENIZER --tokens IDS --ctx 131072 --kv turbo3
+
+# A/B the layer-major chunked prompt ingestion against the token-serial path
+./build/q27-metal MODEL TOKENIZER --prompt TEXT -n 1 --prefill serial
 ```

@@ -235,15 +235,349 @@ int test_gdn(q27::MetalBackend& backend) {
     return failures;
 }
 
+uint16_t to_half(float value) {
+    _Float16 h = (_Float16)value;
+    uint16_t bits; __builtin_memcpy(&bits, &h, sizeof(bits));
+    return bits;
+}
+
+// Every chunked layer-major operation must reproduce the token-serial path
+// it replaces: the serial kernels are the validated reference.
+int test_chunked(q27::MetalBackend& backend) {
+    int failures = 0;
+    constexpr uint32_t T = 3;
+    auto fail = [&](const char* name, size_t i, float got, float want) {
+        fprintf(stderr, "chunked %s[%zu]: got %.8g want %.8g\n", name, i, got, want);
+        failures++;
+    };
+    auto row_view = [&](const q27::BackendBuffer& src, size_t row, size_t floats) {
+        auto tmp = backend.allocate(floats * 4);
+        backend.copy(src, row * floats * 4, *tmp, 0, floats * 4);
+        return tmp;
+    };
+
+    // Chunked Q8 embedding.
+    {
+        constexpr uint32_t vocab = 4, cols = 128;
+        std::vector<int8_t> ew(vocab * cols);
+        for (size_t i = 0; i < ew.size(); i++) ew[i] = (int8_t)((int)(i % 29) - 14);
+        std::vector<uint16_t> es = {0x3c00, 0x3800, 0x4000, 0x3400};
+        q27::Tensor et; et.name="embedding"; et.dtype=q27::DType::Q8_G128; et.shape={vocab,cols};
+        et.data=(const uint8_t*)ew.data(); et.data_size=ew.size();
+        et.scales=(const uint8_t*)es.data(); et.scales_size=es.size()*2;
+        auto weight = backend.upload(et);
+        const uint32_t tokens[T] = {2, 0, 3};
+        auto chunk = backend.allocate((uint64_t)T * cols * 4);
+        backend.embedding_q8_rows(weight, tokens, T, *chunk);
+        auto serial = backend.allocate(cols * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            backend.embedding_q8(weight, tokens[t], *serial);
+            auto got = read_f32(backend, *chunk, (size_t)T * cols);
+            auto want = read_f32(backend, *serial, cols);
+            for (uint32_t i = 0; i < cols; i++)
+                if (got[t * cols + i] != want[i]) { fail("embedding", t * cols + i, got[t*cols+i], want[i]); break; }
+        }
+    }
+
+    // Chunked fused RMSNorm + quantization.
+    {
+        constexpr uint32_t n = 64;
+        std::vector<float> x(T * n), w(n);
+        for (size_t i = 0; i < x.size(); i++) x[i] = std::sin(float(i) * .37f) * (1.0f + float(i % 5));
+        for (size_t i = 0; i < n; i++) w[i] = 0.5f + float(i % 3);
+        auto xb = upload_buffer(backend, x); auto wt = upload_f32(backend, w, {n});
+        auto chunk_out = backend.allocate((uint64_t)T * n * 4);
+        auto chunk_q = backend.allocate_quantized(T * n);
+        backend.rmsnorm_rows_quantized(*xb, wt, *chunk_out, n, T, 1e-6f, chunk_q);
+        std::vector<int8_t> chunk_values(T * n); std::vector<float> chunk_scales(T * n / 32);
+        backend.read(*chunk_q.values, 0, chunk_values.data(), chunk_values.size());
+        backend.read(*chunk_q.scales, 0, chunk_scales.data(), chunk_scales.size() * 4);
+        auto chunk_f = read_f32(backend, *chunk_out, (size_t)T * n);
+        auto serial_out = backend.allocate(n * 4); auto serial_q = backend.allocate_quantized(n);
+        for (uint32_t t = 0; t < T; t++) {
+            auto row = row_view(*xb, t, n);
+            backend.rmsnorm_quantized(*row, wt, *serial_out, n, 1e-6f, serial_q);
+            auto want_f = read_f32(backend, *serial_out, n);
+            std::vector<int8_t> want_values(n); std::vector<float> want_scales(n / 32);
+            backend.read(*serial_q.values, 0, want_values.data(), n);
+            backend.read(*serial_q.scales, 0, want_scales.data(), want_scales.size() * 4);
+            for (uint32_t i = 0; i < n; i++)
+                if (chunk_f[t*n+i] != want_f[i] || chunk_values[t*n+i] != want_values[i])
+                    { fail("rmsnorm rows", t*n+i, chunk_f[t*n+i], want_f[i]); break; }
+            for (uint32_t b = 0; b < n / 32; b++)
+                if (chunk_scales[t*(n/32)+b] != want_scales[b]) { fail("rmsnorm rows scale", t*(n/32)+b, chunk_scales[t*(n/32)+b], want_scales[b]); break; }
+        }
+    }
+
+    // Chunked F16 projection pair.
+    {
+        constexpr uint32_t rows_a = 5, rows_b = 3, cols = 32;
+        std::vector<uint16_t> wa(rows_a * cols), wb(rows_b * cols);
+        for (size_t i = 0; i < wa.size(); i++) wa[i] = to_half(((int)(i % 11) - 5) * 0.25f);
+        for (size_t i = 0; i < wb.size(); i++) wb[i] = to_half(((int)(i % 9) - 4) * 0.5f);
+        q27::Tensor ta; ta.name="pair-a"; ta.dtype=q27::DType::F16; ta.shape={rows_a,cols};
+        ta.data=(const uint8_t*)wa.data(); ta.data_size=wa.size()*2;
+        q27::Tensor tb; tb.name="pair-b"; tb.dtype=q27::DType::F16; tb.shape={rows_b,cols};
+        tb.data=(const uint8_t*)wb.data(); tb.data_size=wb.size()*2;
+        auto weight_a = backend.upload(ta); auto weight_b = backend.upload(tb);
+        std::vector<float> x(T * cols);
+        for (size_t i = 0; i < x.size(); i++) x[i] = std::cos(float(i) * .21f);
+        auto xb = upload_buffer(backend, x);
+        auto chunk_a = backend.allocate((uint64_t)T * rows_a * 4);
+        auto chunk_b = backend.allocate((uint64_t)T * rows_b * 4);
+        backend.matvec_f16_pair_rows(weight_a, *chunk_a, weight_b, *chunk_b, *xb, T);
+        auto got_a = read_f32(backend, *chunk_a, (size_t)T * rows_a);
+        auto got_b = read_f32(backend, *chunk_b, (size_t)T * rows_b);
+        auto serial_a = backend.allocate(rows_a * 4); auto serial_b = backend.allocate(rows_b * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            auto row = row_view(*xb, t, cols);
+            backend.matvec_pair(weight_a, *serial_a, weight_b, *serial_b, *row);
+            auto want_a = read_f32(backend, *serial_a, rows_a);
+            auto want_b = read_f32(backend, *serial_b, rows_b);
+            for (uint32_t i = 0; i < rows_a; i++)
+                if (got_a[t*rows_a+i] != want_a[i]) { fail("pair rows A", t*rows_a+i, got_a[t*rows_a+i], want_a[i]); break; }
+            for (uint32_t i = 0; i < rows_b; i++)
+                if (got_b[t*rows_b+i] != want_b[i]) { fail("pair rows B", t*rows_b+i, got_b[t*rows_b+i], want_b[i]); break; }
+        }
+    }
+
+    // Chunked GDN gates.
+    {
+        constexpr uint32_t heads = 4;
+        std::vector<float> alpha(T * heads), braw(T * heads), av(heads), dtv(heads);
+        for (size_t i = 0; i < alpha.size(); i++) { alpha[i] = std::sin(float(i)) * 2; braw[i] = std::cos(float(i)); }
+        for (size_t i = 0; i < heads; i++) { av[i] = -0.1f - 0.2f * float(i); dtv[i] = 0.3f - 0.1f * float(i); }
+        auto ab = upload_buffer(backend, alpha); auto bb = upload_buffer(backend, braw);
+        auto at = upload_f32(backend, av, {heads}); auto dtt = upload_f32(backend, dtv, {heads});
+        auto cgo = backend.allocate((uint64_t)T * heads * 4); auto cbo = backend.allocate((uint64_t)T * heads * 4);
+        backend.gdn_gates_rows(*ab, *bb, at, dtt, *cgo, *cbo, heads, T);
+        auto got_g = read_f32(backend, *cgo, T * heads); auto got_b = read_f32(backend, *cbo, T * heads);
+        auto sgo = backend.allocate(heads * 4); auto sbo = backend.allocate(heads * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            auto arow = row_view(*ab, t, heads); auto brow = row_view(*bb, t, heads);
+            backend.gdn_gates(*arow, *brow, at, dtt, *sgo, *sbo, heads);
+            auto want_g = read_f32(backend, *sgo, heads); auto want_b = read_f32(backend, *sbo, heads);
+            for (uint32_t i = 0; i < heads; i++)
+                if (got_g[t*heads+i] != want_g[i] || got_b[t*heads+i] != want_b[i])
+                    { fail("gates rows", t*heads+i, got_g[t*heads+i], want_g[i]); break; }
+        }
+    }
+
+    // Chunked convolution ring: one dispatch must match T serial steps and
+    // leave the identical ring state.
+    {
+        constexpr uint32_t channels = 7;
+        std::vector<float> ring(channels * 3), qkv(T * channels), cw(channels * 4);
+        for (size_t i = 0; i < ring.size(); i++) ring[i] = std::sin(float(i) * .61f);
+        for (size_t i = 0; i < qkv.size(); i++) qkv[i] = std::cos(float(i) * .43f);
+        for (size_t i = 0; i < cw.size(); i++) cw[i] = 0.05f * float((int)(i % 9) - 4);
+        auto cwt = upload_f32(backend, cw, {channels, 4});
+        auto ring_serial = upload_buffer(backend, ring); auto ring_chunk = upload_buffer(backend, ring);
+        auto qkvb = upload_buffer(backend, qkv);
+        auto chunk_out = backend.allocate((uint64_t)T * channels * 4);
+        backend.conv_chunk(*ring_chunk, *qkvb, cwt, *chunk_out, channels, T);
+        auto got = read_f32(backend, *chunk_out, (size_t)T * channels);
+        auto serial_out = backend.allocate(channels * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            auto row = row_view(*qkvb, t, channels);
+            backend.conv_step(*ring_serial, *ring_serial, *row, cwt, *serial_out, channels);
+            auto want = read_f32(backend, *serial_out, channels);
+            for (uint32_t i = 0; i < channels; i++)
+                if (got[t*channels+i] != want[i]) { fail("conv chunk", t*channels+i, got[t*channels+i], want[i]); break; }
+        }
+        auto ring_a = read_f32(backend, *ring_serial, ring.size());
+        auto ring_b = read_f32(backend, *ring_chunk, ring.size());
+        for (size_t i = 0; i < ring.size(); i++)
+            if (ring_a[i] != ring_b[i]) { fail("conv chunk ring", i, ring_b[i], ring_a[i]); break; }
+    }
+
+    // Chunked DeltaNet recurrence: register-resident chunk state must match
+    // T serial device round trips.
+    {
+        constexpr uint32_t vh = 3, qkh = 16, hd = 128;
+        const size_t state_n = (size_t)vh * hd * hd, conv_row = (qkh * 2 + vh) * hd;
+        std::vector<float> state(state_n), cv(T * conv_row), g(T * vh), beta(T * vh);
+        for (size_t i = 0; i < state.size(); i++) state[i] = (int(i % 17) - 8) * .0005f;
+        for (size_t i = 0; i < cv.size(); i++) cv[i] = (int(i % 23) - 11) * .01f;
+        for (size_t i = 0; i < g.size(); i++) g[i] = -.01f - .002f * float(i % 7);
+        for (size_t i = 0; i < beta.size(); i++) beta[i] = .2f + .05f * float(i % 9);
+        auto state_serial = upload_buffer(backend, state); auto state_chunk = upload_buffer(backend, state);
+        auto cvb = upload_buffer(backend, cv); auto gb = upload_buffer(backend, g); auto betab = upload_buffer(backend, beta);
+        auto chunk_out = backend.allocate((uint64_t)T * vh * hd * 4);
+        backend.delta_chunk(*state_chunk, *cvb, *gb, *betab, *chunk_out, vh, qkh, hd, T);
+        auto got = read_f32(backend, *chunk_out, (size_t)T * vh * hd);
+        auto serial_out = backend.allocate((uint64_t)vh * hd * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            auto cv_row = row_view(*cvb, t, conv_row);
+            auto g_row = row_view(*gb, t, vh); auto beta_row = row_view(*betab, t, vh);
+            backend.delta_step(*state_serial, *state_serial, *cv_row, *g_row, *beta_row, *serial_out, vh, qkh, hd);
+            auto want = read_f32(backend, *serial_out, (size_t)vh * hd);
+            for (uint32_t i = 0; i < vh * hd; i++)
+                if (!near(got[t*vh*hd+i], want[i], 1e-5f)) { fail("delta chunk", t*vh*hd+i, got[t*vh*hd+i], want[i]); break; }
+        }
+        auto sa = read_f32(backend, *state_serial, state_n);
+        auto sb = read_f32(backend, *state_chunk, state_n);
+        for (size_t i = 0; i < state_n; i++)
+            if (!near(sa[i], sb[i], 1e-5f)) { fail("delta chunk state", i, sb[i], sa[i]); break; }
+    }
+
+    // Chunked strided L2 norm (row stride exceeds the normalized span).
+    {
+        constexpr uint32_t heads = 2, hd = 4, row_stride = 12;
+        std::vector<float> x(T * row_stride);
+        for (size_t i = 0; i < x.size(); i++) x[i] = std::sin(float(i) * .83f) + .2f;
+        auto chunk = upload_buffer(backend, x);
+        backend.l2norm_rows(*chunk, heads, hd, row_stride, T, 1e-6f);
+        auto got = read_f32(backend, *chunk, x.size());
+        for (uint32_t t = 0; t < T; t++) {
+            std::vector<float> row(x.begin() + t * row_stride, x.begin() + t * row_stride + heads * hd);
+            auto serial = upload_buffer(backend, row);
+            backend.l2norm_heads(*serial, heads, hd, 1e-6f);
+            auto want = read_f32(backend, *serial, row.size());
+            for (uint32_t i = 0; i < heads * hd; i++)
+                if (got[t*row_stride+i] != want[i]) { fail("l2 rows", t*row_stride+i, got[t*row_stride+i], want[i]); break; }
+            for (uint32_t i = heads * hd; i < row_stride; i++)
+                if (got[t*row_stride+i] != x[t*row_stride+i]) { fail("l2 rows tail", t*row_stride+i, got[t*row_stride+i], x[t*row_stride+i]); break; }
+        }
+    }
+
+    // Chunked RoPE with per-token positions.
+    {
+        constexpr uint32_t heads = 2, hd = 8, n_rot = 4, stride = 8, row_stride = 16, base = 3;
+        std::vector<float> x(T * row_stride);
+        for (size_t i = 0; i < x.size(); i++) x[i] = std::cos(float(i) * .29f) * 2;
+        auto chunk = upload_buffer(backend, x);
+        backend.rope_neox_rows(*chunk, heads, hd, n_rot, stride, row_stride, base, T, 10000.0f);
+        auto got = read_f32(backend, *chunk, x.size());
+        for (uint32_t t = 0; t < T; t++) {
+            std::vector<float> row(x.begin() + t * row_stride, x.begin() + (t + 1) * row_stride);
+            auto serial = upload_buffer(backend, row);
+            backend.rope_neox(*serial, heads, hd, n_rot, stride, base + t, 10000.0f);
+            auto want = read_f32(backend, *serial, row.size());
+            for (uint32_t i = 0; i < row_stride; i++)
+                if (got[t*row_stride+i] != want[i]) { fail("rope rows", t*row_stride+i, got[t*row_stride+i], want[i]); break; }
+        }
+    }
+
+    // Chunked sigmoid gating.
+    {
+        constexpr uint32_t heads = 2, hd = 2;
+        std::vector<float> values(T * heads * hd), qg(T * heads * hd * 2);
+        for (size_t i = 0; i < values.size(); i++) values[i] = float(i % 7) - 3;
+        for (size_t i = 0; i < qg.size(); i++) qg[i] = std::sin(float(i) * 1.1f) * 2;
+        auto chunk = upload_buffer(backend, values); auto qgb = upload_buffer(backend, qg);
+        backend.sigmoid_gate_mul_rows(*chunk, *qgb, heads, hd, T);
+        auto got = read_f32(backend, *chunk, values.size());
+        for (uint32_t t = 0; t < T; t++) {
+            std::vector<float> row(values.begin() + t * heads * hd, values.begin() + (t + 1) * heads * hd);
+            std::vector<float> qg_row(qg.begin() + t * heads * hd * 2, qg.begin() + (t + 1) * heads * hd * 2);
+            auto serial = upload_buffer(backend, row); auto serial_qg = upload_buffer(backend, qg_row);
+            backend.sigmoid_gate_mul(*serial, *serial_qg, heads, hd);
+            auto want = read_f32(backend, *serial, row.size());
+            for (uint32_t i = 0; i < heads * hd; i++)
+                if (got[t*heads*hd+i] != want[i]) { fail("sigmoid rows", t*heads*hd+i, got[t*heads*hd+i], want[i]); break; }
+        }
+    }
+
+    // Chunked FP16 KV append + causal attention over a warm cache.
+    {
+        constexpr uint32_t qh = 2, kvh = 1, dim = 4, stride = 8, row = kvh * dim, warm = 2;
+        auto kc = backend.allocate((uint64_t)(warm + T) * row * 2);
+        auto vc = backend.allocate((uint64_t)(warm + T) * row * 2);
+        for (uint32_t p = 0; p < warm; p++) {
+            std::vector<float> k(row), v(row);
+            for (uint32_t d = 0; d < row; d++) { k[d] = std::sin(float(p * row + d)); v[d] = std::cos(float(p * row + d)); }
+            auto kb = upload_buffer(backend, k); auto vb = upload_buffer(backend, v);
+            backend.kv_store_f16(*kb, *vb, *kc, *vc, p, row);
+        }
+        std::vector<float> knew(T * row), vnew(T * row), q(T * qh * stride);
+        for (size_t i = 0; i < knew.size(); i++) { knew[i] = std::sin(float(i) * .53f); vnew[i] = std::cos(float(i) * .31f); }
+        for (size_t i = 0; i < q.size(); i++) q[i] = std::sin(float(i) * .77f);
+        auto knb = upload_buffer(backend, knew); auto vnb = upload_buffer(backend, vnew);
+        backend.kv_store_f16_rows(*knb, *vnb, *kc, *vc, warm, row, T);
+        auto qb = upload_buffer(backend, q);
+        auto scratch = backend.allocate((uint64_t)T * qh * (warm + T) * 4);
+        auto chunk_out = backend.allocate((uint64_t)T * qh * dim * 4);
+        backend.attention_f16_causal(*qb, stride, qh * stride, *kc, *vc, *scratch, *chunk_out,
+                                     warm + 1, qh, kvh, dim, T, 0.5f);
+        auto got = read_f32(backend, *chunk_out, (size_t)T * qh * dim);
+        auto serial_scratch = backend.allocate((uint64_t)qh * (warm + T) * 4);
+        auto serial_out = backend.allocate((uint64_t)qh * dim * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            auto q_row = row_view(*qb, t, qh * stride);
+            backend.attention_f16(*q_row, stride, *kc, *vc, *serial_scratch, *serial_out,
+                                  warm + 1 + t, qh, kvh, dim, 0.5f);
+            auto want = read_f32(backend, *serial_out, (size_t)qh * dim);
+            for (uint32_t i = 0; i < qh * dim; i++)
+                if (!near(got[t*qh*dim+i], want[i], 1e-5f)) { fail("causal attention", t*qh*dim+i, got[t*qh*dim+i], want[i]); break; }
+        }
+    }
+
+    // Chunked turbo3 KV append + causal attention.
+    {
+        constexpr uint32_t qh = 2, kvh = 1, dim = 256, stride = 256, warm = 2;
+        const uint64_t row_bytes = (uint64_t)kvh * 2 * 50;
+        auto kc = backend.allocate((warm + T) * row_bytes);
+        auto vc = backend.allocate((warm + T) * row_bytes);
+        auto kc_ref = backend.allocate((warm + T) * row_bytes);
+        auto vc_ref = backend.allocate((warm + T) * row_bytes);
+        for (uint32_t p = 0; p < warm; p++) {
+            std::vector<float> k(kvh * dim), v(kvh * dim);
+            for (uint32_t d = 0; d < kvh * dim; d++) { k[d] = std::sin(float(p * 331 + d) * .05f); v[d] = std::cos(float(p * 173 + d) * .07f); }
+            auto kb = upload_buffer(backend, k); auto vb = upload_buffer(backend, v);
+            backend.kv_store_turbo3(*kb, *vb, *kc, *vc, p, kvh);
+            backend.kv_store_turbo3(*kb, *vb, *kc_ref, *vc_ref, p, kvh);
+        }
+        std::vector<float> knew(T * kvh * dim), vnew(T * kvh * dim), q(T * qh * stride);
+        for (size_t i = 0; i < knew.size(); i++) { knew[i] = std::sin(float(i) * .011f); vnew[i] = std::cos(float(i) * .017f); }
+        for (size_t i = 0; i < q.size(); i++) q[i] = std::sin(float(i) * .013f);
+        auto knb = upload_buffer(backend, knew); auto vnb = upload_buffer(backend, vnew);
+        backend.kv_store_turbo3_rows(*knb, *vnb, *kc, *vc, warm, kvh, T);
+        for (uint32_t t = 0; t < T; t++) {
+            auto k_row = row_view(*knb, t, kvh * dim); auto v_row = row_view(*vnb, t, kvh * dim);
+            backend.kv_store_turbo3(*k_row, *v_row, *kc_ref, *vc_ref, warm + t, kvh);
+        }
+        std::vector<uint8_t> cache_a((warm + T) * row_bytes), cache_b(cache_a.size());
+        backend.read(*kc, 0, cache_a.data(), cache_a.size());
+        backend.read(*kc_ref, 0, cache_b.data(), cache_b.size());
+        for (size_t i = 0; i < cache_a.size(); i++)
+            if (cache_a[i] != cache_b[i]) { fail("turbo3 store rows K", i, cache_a[i], cache_b[i]); break; }
+        backend.read(*vc, 0, cache_a.data(), cache_a.size());
+        backend.read(*vc_ref, 0, cache_b.data(), cache_b.size());
+        for (size_t i = 0; i < cache_a.size(); i++)
+            if (cache_a[i] != cache_b[i]) { fail("turbo3 store rows V", i, cache_a[i], cache_b[i]); break; }
+
+        auto qb = upload_buffer(backend, q);
+        backend.turbo_wht(*qb, T * qh, stride, false);
+        auto scratch = backend.allocate((uint64_t)T * qh * (warm + T) * 4);
+        auto chunk_out = backend.allocate((uint64_t)T * qh * dim * 4);
+        backend.attention_turbo3_causal(*qb, stride, qh * stride, *kc, *vc, *scratch, *chunk_out,
+                                        warm + 1, qh, kvh, dim, T, 1.0f / std::sqrt(float(dim)));
+        auto got = read_f32(backend, *chunk_out, (size_t)T * qh * dim);
+        auto serial_scratch = backend.allocate((uint64_t)qh * (warm + T) * 4);
+        auto serial_out = backend.allocate((uint64_t)qh * dim * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            auto q_row = row_view(*qb, t, qh * stride);
+            backend.attention_turbo3(*q_row, stride, *kc, *vc, *serial_scratch, *serial_out,
+                                     warm + 1 + t, qh, kvh, dim, 1.0f / std::sqrt(float(dim)));
+            auto want = read_f32(backend, *serial_out, (size_t)qh * dim);
+            for (uint32_t i = 0; i < qh * dim; i++)
+                if (!near(got[t*qh*dim+i], want[i], 1e-5f)) { fail("turbo3 causal", t*qh*dim+i, got[t*qh*dim+i], want[i]); break; }
+        }
+    }
+
+    return failures;
+}
+
 } // namespace
 
 int main() {
     try {
         q27::MetalBackend backend;
         int failures = test_primitives(backend) + test_attention(backend) +
-                       test_turbo3(backend) + test_gdn(backend);
+                       test_turbo3(backend) + test_gdn(backend) + test_chunked(backend);
         if (failures) { fprintf(stderr, "Metal ops: %d failure(s)\n", failures); return 1; }
-        puts("Metal decode primitives, FP16/turbo3 attention, and GDN: OK");
+        puts("Metal decode primitives, FP16/turbo3 attention, GDN, and chunked prefill ops: OK");
         return 0;
     } catch (const std::exception& error) {
         fprintf(stderr, "%s\n", error.what());

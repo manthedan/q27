@@ -653,6 +653,279 @@ kernel void q27_matmul_q8_simdgroup(
     }
 }
 
+// ---- Chunked layer-major prefill (2..12 tokens per dispatch) ----
+//
+// These kernels advance a whole token chunk through one operation so the
+// engine can execute prompts layer-major and route projections through the
+// simdgroup GEMM. Recurrent operators (convolution ring, DeltaNet state)
+// stay sequential across the chunk inside a single dispatch and commit
+// their state once per chunk.
+
+struct EmbedRowsArgs { uint cols; uint count; uint tokens[12]; };
+kernel void q27_embedding_q8_rows(
+        device const char *weights [[buffer(0)]],
+        device const half *scales  [[buffer(1)]],
+        device float *out          [[buffer(2)]],
+        constant EmbedRowsArgs &args [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.cols || gid.y >= args.count) return;
+    const uint token = args.tokens[gid.y];
+    const ulong wi = (ulong)token * args.cols + gid.x;
+    const ulong si = (ulong)token * (args.cols / 128) + gid.x / 128;
+    out[(ulong)gid.y * args.cols + gid.x] = float(weights[wi]) * float(scales[si]);
+}
+
+struct RowsNormArgs { uint n; uint rows; uint groups; float eps; };
+kernel void q27_rmsnorm_rows_quantized(
+        device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
+        device float *out [[buffer(2)]], device char *values [[buffer(3)]],
+        device float *scales [[buffer(4)]], constant RowsNormArgs &args [[buffer(5)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    if (row >= args.rows) return;
+    device const float *xr = x + (ulong)row * args.n;
+    device float *or_ = out + (ulong)row * args.n;
+    device char *vr = values + (ulong)row * args.n;
+    device float *sr = scales + (ulong)row * (args.n / 32);
+    float sum = 0.0f;
+    for (uint i = tid; i < args.n; i += 256) sum += xr[i] * xr[i];
+    threadgroup float partial[32];
+    sum = reduce_sum(sum, partial, lane, simdgroup, args.groups);
+    const float inv = rsqrt(sum / float(args.n) + args.eps);
+    for (uint i = tid; i < args.n; i += 256) or_[i] = xr[i] * inv * w[i];
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint blocks = args.n / 32;
+    for (uint block = simdgroup; block < blocks; block += 8) {
+        const uint i = block * 32 + lane; const float v = or_[i];
+        const float amax = simd_max(abs(v)); const float scale = amax / 127.0f;
+        int q = scale > 0.0f ? int(rint(v / scale)) : 0; q = clamp(q, -127, 127);
+        vr[i] = char(q); if (lane == 0) sr[block] = scale;
+    }
+}
+
+struct MatvecPairRowsArgs { uint rows_a; uint rows_b; uint cols; uint tokens; };
+kernel void q27_matvec_f16_pair_rows(
+        device const half *weights_a [[buffer(0)]], device float *out_a [[buffer(1)]],
+        device const half *weights_b [[buffer(2)]], device float *out_b [[buffer(3)]],
+        device const float *x [[buffer(4)]], constant MatvecPairRowsArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group.x * 8 + simdgroup, token = group.y;
+    if (token >= args.tokens) return;
+    device const float *xt = x + (ulong)token * args.cols;
+    const ulong base = (ulong)row * args.cols;
+    float sa = 0.0f, sb = 0.0f;
+    for (uint col = lane; col < args.cols; col += 32) {
+        float xv = xt[col];
+        if (row < args.rows_a) sa += float(weights_a[base + col]) * xv;
+        if (row < args.rows_b) sb += float(weights_b[base + col]) * xv;
+    }
+    sa = simd_sum(sa); sb = simd_sum(sb);
+    if (lane == 0) {
+        if (row < args.rows_a) out_a[(ulong)token * args.rows_a + row] = sa;
+        if (row < args.rows_b) out_b[(ulong)token * args.rows_b + row] = sb;
+    }
+}
+
+struct GatesRowsArgs { uint heads; uint tokens; };
+kernel void q27_gdn_gates_rows(device const float *alpha [[buffer(0)]],
+                                device const float *beta_raw [[buffer(1)]],
+                                device const float *ssm_a [[buffer(2)]],
+                                device const float *ssm_dt [[buffer(3)]],
+                                device float *g [[buffer(4)]],
+                                device float *beta [[buffer(5)]],
+                                constant GatesRowsArgs &args [[buffer(6)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.heads * args.tokens) return;
+    const uint head = gid % args.heads;
+    const float value = alpha[gid] + ssm_dt[head];
+    const float softplus = value > 20.0f ? value : log(1.0f + exp(value));
+    g[gid] = ssm_a[head] * softplus;
+    beta[gid] = 1.0f / (1.0f + exp(-beta_raw[gid]));
+}
+
+struct ConvChunkArgs { uint channels; uint tokens; };
+kernel void q27_conv_chunk(device float *ring [[buffer(0)]],
+                            device const float *qkv [[buffer(1)]],
+                            device const float *weight [[buffer(2)]],
+                            device float *out [[buffer(3)]],
+                            constant ConvChunkArgs &args [[buffer(4)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.channels) return;
+    float r0 = ring[gid], r1 = ring[args.channels + gid], r2 = ring[(ulong)2 * args.channels + gid];
+    const float w0 = weight[(ulong)gid * 4], w1 = weight[(ulong)gid * 4 + 1];
+    const float w2 = weight[(ulong)gid * 4 + 2], w3 = weight[(ulong)gid * 4 + 3];
+    for (uint t = 0; t < args.tokens; t++) {
+        const float xv = qkv[(ulong)t * args.channels + gid];
+        const float value = r0 * w0 + r1 * w1 + r2 * w2 + xv * w3;
+        out[(ulong)t * args.channels + gid] = value / (1.0f + exp(-value));
+        r0 = r1; r1 = r2; r2 = xv;
+    }
+    ring[gid] = r0; ring[args.channels + gid] = r1; ring[(ulong)2 * args.channels + gid] = r2;
+}
+
+struct DeltaChunkArgs { uint value_heads; uint qk_heads; uint head_dim; uint tokens; };
+kernel void q27_delta_chunk(device float *state [[buffer(0)]],
+                             device const float *conv [[buffer(1)]],
+                             device const float *g [[buffer(2)]],
+                             device const float *beta [[buffer(3)]],
+                             device float *out [[buffer(4)]],
+                             constant DeltaChunkArgs &args [[buffer(5)]],
+                             uint head [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    if (head >= args.value_heads || args.head_dim != 128 || args.qk_heads != 16) return;
+    const uint j = tid & 127;
+    const uint tile = tid >> 7;
+    const uint i0 = tile * 32;
+    const uint qk = head % args.qk_heads;
+    const ulong conv_row = (ulong)(2 * args.qk_heads + args.value_heads) * 128;
+    const ulong out_row = (ulong)args.value_heads * 128;
+    threadgroup float q[128], k[128], part[4][128], delta[128];
+    device float *sh = state + (ulong)head * 128 * 128;
+    // The chunk's whole state slice lives in registers; it is written back
+    // to device memory exactly once, at the chunk boundary.
+    float saved[32];
+    for (uint n = 0; n < 32; n++) saved[n] = sh[(ulong)(i0 + n) * 128 + j];
+    for (uint t = 0; t < args.tokens; t++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const float *cv = conv + (ulong)t * conv_row;
+        if (tile == 0) { q[j] = cv[(ulong)qk * 128 + j] * rsqrt(128.0f); k[j] = cv[2048 + (ulong)qk * 128 + j]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float decay = exp(g[(ulong)t * args.value_heads + head]);
+        float prediction = 0.0f;
+        for (uint n = 0; n < 32; n++) {
+            saved[n] *= decay;
+            prediction += k[i0 + n] * saved[n];
+        }
+        part[tile][j] = prediction;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tile == 0) {
+            const float predicted = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            delta[j] = beta[(ulong)t * args.value_heads + head] * (cv[4096 + (ulong)head * 128 + j] - predicted);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float result = 0.0f;
+        for (uint n = 0; n < 32; n++) {
+            saved[n] += k[i0 + n] * delta[j];
+            result += q[i0 + n] * saved[n];
+        }
+        part[tile][j] = result;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tile == 0) out[(ulong)t * out_row + (ulong)head * 128 + j] =
+            part[0][j] + part[1][j] + part[2][j] + part[3][j];
+    }
+    for (uint n = 0; n < 32; n++) sh[(ulong)(i0 + n) * 128 + j] = saved[n];
+}
+
+struct L2RowsArgs { uint heads; uint head_dim; uint row_stride; uint tokens; float eps; };
+kernel void q27_l2norm_rows(device float *x [[buffer(0)]],
+                             constant L2RowsArgs &args [[buffer(1)]],
+                             uint2 group [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             ushort lane [[thread_index_in_simdgroup]],
+                             ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    if (group.x >= args.heads || group.y >= args.tokens) return;
+    device float *xh = x + (ulong)group.y * args.row_stride + (ulong)group.x * args.head_dim;
+    float sum = 0.0f;
+    for (uint i = tid; i < args.head_dim; i += 256) sum += xh[i] * xh[i];
+    threadgroup float partial[32];
+    sum = reduce_sum(sum, partial, lane, simdgroup, 8);
+    const float inv = rsqrt(max(sum, args.eps * args.eps));
+    for (uint i = tid; i < args.head_dim; i += 256) xh[i] *= inv;
+}
+
+struct RopeRowsArgs {
+    uint heads; uint head_dim; uint n_rot; uint stride;
+    uint row_stride; uint position; uint tokens; float freq_base;
+};
+kernel void q27_rope_neox_rows(device float *x [[buffer(0)]],
+                                constant RopeRowsArgs &args [[buffer(1)]],
+                                uint3 gid [[thread_position_in_grid]]) {
+    const uint d = gid.x, head = gid.y, token = gid.z;
+    if (head >= args.heads || d >= args.n_rot / 2 || token >= args.tokens) return;
+    device float *xh = x + (ulong)token * args.row_stride + (ulong)head * args.stride;
+    const float theta = float(args.position + token) *
+                        pow(args.freq_base, -2.0f * float(d) / float(args.n_rot));
+    const float cs = cos(theta), sn = sin(theta);
+    const float x0 = xh[d], x1 = xh[d + args.n_rot / 2];
+    xh[d] = x0 * cs - x1 * sn;
+    xh[d + args.n_rot / 2] = x0 * sn + x1 * cs;
+}
+
+struct KvStoreRowsArgs { uint position; uint row_length; uint tokens; };
+kernel void q27_kv_store_f16_rows(device const float *k [[buffer(0)]],
+                                   device const float *v [[buffer(1)]],
+                                   device half *kc       [[buffer(2)]],
+                                   device half *vc       [[buffer(3)]],
+                                   constant KvStoreRowsArgs &args [[buffer(4)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.row_length || gid.y >= args.tokens) return;
+    const ulong src = (ulong)gid.y * args.row_length + gid.x;
+    const ulong dst = (ulong)(args.position + gid.y) * args.row_length + gid.x;
+    kc[dst] = half(k[src]); vc[dst] = half(v[src]);
+}
+
+struct GateRowsArgs { uint heads; uint head_dim; uint tokens; };
+kernel void q27_sigmoid_gate_mul_rows(device float *out [[buffer(0)]],
+                                       device const float *qg [[buffer(1)]],
+                                       constant GateRowsArgs &args [[buffer(2)]],
+                                       uint gid [[thread_position_in_grid]]) {
+    const uint row = args.heads * args.head_dim;
+    if (gid >= row * args.tokens) return;
+    const uint t = gid / row;
+    const uint h = (gid % row) / args.head_dim;
+    const uint d = gid % args.head_dim;
+    const float gate = qg[(ulong)t * row * 2 + (ulong)h * (2 * args.head_dim) + args.head_dim + d];
+    out[gid] *= 1.0f / (1.0f + exp(-gate));
+}
+
+struct AttentionCausalArgs {
+    uint q_stride; uint q_row_stride; uint base_len;
+    uint q_heads; uint kv_heads; uint head_dim; uint tokens; float scale;
+};
+kernel void q27_attention_f16_causal(device const float *q [[buffer(0)]],
+                                      device const half *kc [[buffer(1)]],
+                                      device const half *vc [[buffer(2)]],
+                                      device float *prob     [[buffer(3)]],
+                                      device float *out      [[buffer(4)]],
+                                      constant AttentionCausalArgs &args [[buffer(5)]],
+                                      uint2 group [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]]) {
+    const uint qh = group.x, token = group.y;
+    if (qh >= args.q_heads || token >= args.tokens) return;
+    const uint seq_len = args.base_len + token;
+    const uint max_seq = args.base_len + args.tokens - 1;
+    const uint gqa = args.q_heads / args.kv_heads;
+    const uint kvh = qh / gqa;
+    device const float *qh_ptr = q + (ulong)token * args.q_row_stride + (ulong)qh * args.q_stride;
+    device float *ph = prob + ((ulong)token * args.q_heads + qh) * max_seq;
+    if (tid == 0) {
+        float maximum = -INFINITY;
+        for (uint p = 0; p < seq_len; p++) {
+            device const half *kh = kc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
+            float score = 0.0f;
+            for (uint d = 0; d < args.head_dim; d++) score += qh_ptr[d] * float(kh[d]);
+            score *= args.scale;
+            ph[p] = score;
+            maximum = max(maximum, score);
+        }
+        float denominator = 0.0f;
+        for (uint p = 0; p < seq_len; p++) { ph[p] = exp(ph[p] - maximum); denominator += ph[p]; }
+        const float inv = 1.0f / denominator;
+        for (uint p = 0; p < seq_len; p++) ph[p] *= inv;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    for (uint d = tid; d < args.head_dim; d += 256) {
+        float value = 0.0f;
+        for (uint p = 0; p < seq_len; p++) {
+            device const half *vh = vc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
+            value += ph[p] * float(vh[d]);
+        }
+        out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = value;
+    }
+}
+
 kernel void q27_copy_bytes(device const uchar *src [[buffer(0)]],
                             device uchar *dst [[buffer(1)]],
                             constant ulong &bytes [[buffer(2)]],
@@ -779,5 +1052,88 @@ kernel void q27_attention_turbo3(device const float *q [[buffer(0)]],
             value += ph[p] * turbo_dequant(block, d & 127);
         }
         out[(ulong)qh * args.head_dim + d] = value;
+    }
+}
+
+struct TurboStoreRowsArgs { uint position; uint kv_heads; uint tokens; };
+kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
+                                      device const float *v [[buffer(1)]],
+                                      device uchar *kc [[buffer(2)]],
+                                      device uchar *vc [[buffer(3)]],
+                                      constant TurboStoreRowsArgs &args [[buffer(4)]],
+                                      uint3 group [[threadgroup_position_in_grid]],
+                                      uint j [[thread_index_in_threadgroup]]) {
+    const uint h = group.x >> 1, g = group.x & 1, token = group.z;
+    if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens || j >= 128) return;
+    device const float *src = (group.y ? v : k) +
+        (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
+    device uchar *cache = group.y ? vc : kc;
+    device uchar *block = cache +
+        ((ulong)(args.position + token) * args.kv_heads * 2 + h * 2 + g) * 50;
+    threadgroup float xs[128], red[128];
+    threadgroup uchar indices[128];
+    xs[j] = src[j]; red[j] = src[j] * src[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 64; s; s >>= 1) {
+        if (j < s) red[j] += red[j + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float norm = sqrt(red[0]);
+    xs[j] = xs[j] * (norm > 1e-10f ? 1.0f / norm : 0.0f) * float(turbo_s1[j]);
+    turbo_butterfly(xs, j);
+    const uint index = turbo_nearest(xs[j] * turbo_inv_sqrt_128 * float(turbo_s2[j]));
+    indices[j] = uchar(index); red[j] = turbo_centroids[index] * turbo_centroids[index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 64; s; s >>= 1) {
+        if (j < s) red[j] += red[j + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (j == 0) *(device half *)(block) = half(sqrt(red[0]) > 1e-10f ? norm / sqrt(red[0]) : norm);
+    if ((j & 3) == 0) block[2 + j / 4] = (indices[j] & 3) | ((indices[j+1] & 3) << 2) |
+                                                   ((indices[j+2] & 3) << 4) | ((indices[j+3] & 3) << 6);
+    if ((j & 7) == 0) {
+        uchar bits = 0;
+        for (uint i = 0; i < 8; i++) bits |= uchar((indices[j+i] >> 2) << i);
+        block[34 + j / 8] = bits;
+    }
+}
+
+kernel void q27_attention_turbo3_causal(device const float *q [[buffer(0)]],
+                                         device const uchar *kc [[buffer(1)]],
+                                         device const uchar *vc [[buffer(2)]],
+                                         device float *prob [[buffer(3)]],
+                                         device float *out [[buffer(4)]],
+                                         constant AttentionCausalArgs &args [[buffer(5)]],
+                                         uint2 group [[threadgroup_position_in_grid]],
+                                         uint tid [[thread_index_in_threadgroup]]) {
+    const uint qh = group.x, token = group.y;
+    if (qh >= args.q_heads || token >= args.tokens) return;
+    const uint seq_len = args.base_len + token;
+    const uint max_seq = args.base_len + args.tokens - 1;
+    const uint gqa = args.q_heads / args.kv_heads, kvh = qh / gqa;
+    device const float *qh_ptr = q + (ulong)token * args.q_row_stride + (ulong)qh * args.q_stride;
+    device float *ph = prob + ((ulong)token * args.q_heads + qh) * max_seq;
+    if (tid == 0) {
+        float maximum = -INFINITY;
+        for (uint p = 0; p < seq_len; p++) {
+            float score = 0.0f;
+            for (uint d = 0; d < args.head_dim; d++) {
+                device const uchar *block = kc + ((ulong)p * args.kv_heads * 2 + kvh * 2 + (d >> 7)) * 50;
+                score += qh_ptr[d] * turbo_dequant(block, d & 127);
+            }
+            score *= args.scale; ph[p] = score; maximum = max(maximum, score);
+        }
+        float denominator = 0.0f;
+        for (uint p = 0; p < seq_len; p++) { ph[p] = exp(ph[p] - maximum); denominator += ph[p]; }
+        for (uint p = 0; p < seq_len; p++) ph[p] /= denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    for (uint d = tid; d < args.head_dim; d += 256) {
+        float value = 0.0f;
+        for (uint p = 0; p < seq_len; p++) {
+            device const uchar *block = vc + ((ulong)p * args.kv_heads * 2 + kvh * 2 + (d >> 7)) * 50;
+            value += ph[p] * turbo_dequant(block, d & 127);
+        }
+        out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = value;
     }
 }
