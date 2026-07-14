@@ -53,7 +53,7 @@ void check_range(uint64_t size, uint64_t offset, uint64_t bytes, const char* ope
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 2";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 3";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -349,8 +349,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         // SIMD-scoped matrix multiply is optional on older Intel-family Metal
         // devices. Decode GEMV remains available there; only small-N GEMM is gated.
         if ([impl_->device supportsFamily:MTLGPUFamilyApple7]) {
-            impl_->q4_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_simdgroup");
-            impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_simdgroup");
+            impl_->q4_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_rows");
+            impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_rows");
         }
         impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
         impl_->rms = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm");
@@ -717,12 +717,12 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
     check_range(xv.size(),0,x.count,"quantized matmul values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matmul scales");
     MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own, weight.dtype==DType::Q8_G128?"q27_matmul_q8_simdgroup":"q27_matmul_q4_simdgroup");
+        bool own; auto enc=impl_->encoder_for_operation(own, weight.dtype==DType::Q8_G128?"q27_matmul_q8_rows":"q27_matmul_q4_rows");
         [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:impl_->q4_quantized_matmul];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,(x_rows+7)/8,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("quantized simdgroup matmul");
     }
 }

@@ -267,8 +267,14 @@ int test_q4(q27::MetalBackend& backend) {
     return 0;
 }
 
-int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
-    constexpr uint32_t rows=9,cols=256,tokens=12;
+// The packed-dot rows GEMM mirrors the GEMV accumulation order exactly, so
+// every comparison below is bit-exact. Shapes cover the narrow tail-only
+// path (256), the vectorized main loop (1024+), and a main-loop-plus-tail
+// width (1152 = 1024 + 128), per the width-gated fast-path lesson: a gate
+// shape must actually enter the fast path it gates.
+int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
+                      uint32_t rows,uint32_t cols) {
+    constexpr uint32_t tokens=12;
     std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:(size_t)rows*cols);
     for(uint32_t r=0;r<rows;r++) for(uint32_t c=0;c<cols;c++) {
         int q=(int)((r*7+c*3)%15)-7;
@@ -293,15 +299,22 @@ int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
         backend.read(*yb,0,reference.data()+(size_t)t*rows,rows*4);
     }
     auto all_x=backend.allocate(x.size()*4); backend.write(*all_x,0,x.data(),x.size()*4);
-    for(uint32_t n:{1u,8u,9u,12u}) {
+    for(uint32_t n:{1u,4u,5u,8u,9u,12u}) {
         auto q=backend.allocate_quantized(n*cols); auto out=backend.allocate((uint64_t)n*rows*4);
         backend.begin_commands(); backend.quantize(*all_x,q); backend.matmul_quantized(weight,q,n,*out); backend.end_commands();
         std::vector<float> got(n*rows); backend.read(*out,0,got.data(),got.size()*4);
-        for(size_t i=0;i<got.size();i++) if(!close(got[i],reference[i],3e-4f)) {
-            fprintf(stderr,"%s matmul tile n=%u i=%zu got %.7g want %.7g\n",q27::dtype_name(dtype),n,i,got[i],reference[i]); return 1;
+        for(size_t i=0;i<got.size();i++) if(got[i]!=reference[i]) {
+            fprintf(stderr,"%s matmul rows=%u cols=%u n=%u i=%zu got %.9g want %.9g\n",
+                    q27::dtype_name(dtype),rows,cols,n,i,got[i],reference[i]); return 1;
         }
     }
     return 0;
+}
+
+int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
+    return test_matmul_shape(backend,dtype,9,256) ||
+           test_matmul_shape(backend,dtype,9,1024) ||
+           test_matmul_shape(backend,dtype,17,1152);
 }
 
 // Production-width GEMV parity. The packed-dot kernels take a vectorized

@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 2
+// Q27_SHADER_ABI 3
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -678,67 +678,154 @@ kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
     if (lane == 0) out[row] = acc;
 }
 
-kernel void q27_matmul_q4_simdgroup(
+// Multi-token packed-dot GEMM (x_rows 1..12) for chunked prefill and batched
+// MTP verification. Same streaming structure as the packed-dot GEMV above:
+// one simdgroup per output row, each lane owns a 32-column slice per
+// iteration, per-lane partials reduce once per row via simd_sum. Each
+// 32-column weight packet is loaded (and for Q4, nibble-decoded) once and
+// dotted against every token row, so the weight stream costs the same as a
+// single GEMV while producing up to 12 outputs. Accumulation order is
+// exactly the GEMV's — integer dot per 32 columns, (float(dot) * weight
+// scale) * activation scale, summed in column order, one simd_sum — so a
+// chunked projection is bit-identical to running the serial GEMV per token.
+// (A 4-rows-per-simdgroup variant that amortized activation conversion
+// measured 1.6x slower: 32 live char4 weight packets plus 48 accumulators
+// spill. The kernel is scalar-issue-bound near 4 ops per multiply-add; the
+// planned simdgroup_matrix tile kernel is the structural fix.)
+// Tokens process in unrolled groups of four; whole groups drop out for
+// narrow chunks, and loads for token slots past x_rows-1 clamp to the last
+// valid row (their results are discarded) so partial chunks never read out
+// of bounds.
+inline int q27_dot32(thread const char4 *w, device const int4 *x16, uint idx) {
+    const int4 xp0 = x16[idx], xp1 = x16[idx + 1];
+    return q27_dot4(w[0], as_type<char4>(xp0.x)) + q27_dot4(w[1], as_type<char4>(xp0.y)) +
+           q27_dot4(w[2], as_type<char4>(xp0.z)) + q27_dot4(w[3], as_type<char4>(xp0.w)) +
+           q27_dot4(w[4], as_type<char4>(xp1.x)) + q27_dot4(w[5], as_type<char4>(xp1.y)) +
+           q27_dot4(w[6], as_type<char4>(xp1.z)) + q27_dot4(w[7], as_type<char4>(xp1.w));
+}
+
+inline void q27_decode_q4x8(uint packed, thread char4 *w) {
+    w[0] = char4(char(int(packed         & 15u) - 8), char(int((packed >>  4) & 15u) - 8),
+                 char(int((packed >>  8) & 15u) - 8), char(int((packed >> 12) & 15u) - 8));
+    w[1] = char4(char(int((packed >> 16) & 15u) - 8), char(int((packed >> 20) & 15u) - 8),
+                 char(int((packed >> 24) & 15u) - 8), char(int((packed >> 28)      ) - 8));
+}
+
+// One token's contribution for the vectorized main loop (32 columns) and the
+// scalar tail (4 columns). `xoff16`/`xsoff` are the token row's base offsets
+// in int4 / scale-group units, hoisted by the caller.
+#define Q27_MM_MAIN(acc, xoff16, xsoff)                                              \
+    acc += float(q27_dot32(w, x16, (xoff16) + idx2)) * wscale * x_scales[(xsoff) + cs];
+#define Q27_MM_TAIL(acc, xoff16, xsoff)                                              \
+    acc += float(q27_dot4(wt, *(device const char4 *)(x + (ulong)(xoff16) * 16 + c))) * \
+           wscale * x_scales[(xsoff) + c / 32];
+#define Q27_MM_TOKENS(MACRO)                                                         \
+    MACRO(acc0.x, xoff16[0], xsoff[0]);                                              \
+    MACRO(acc0.y, xoff16[1], xsoff[1]);                                              \
+    MACRO(acc0.z, xoff16[2], xsoff[2]);                                              \
+    MACRO(acc0.w, xoff16[3], xsoff[3]);                                              \
+    if (args.x_rows > 4) {                                                           \
+        MACRO(acc1.x, xoff16[4], xsoff[4]);                                          \
+        MACRO(acc1.y, xoff16[5], xsoff[5]);                                          \
+        MACRO(acc1.z, xoff16[6], xsoff[6]);                                          \
+        MACRO(acc1.w, xoff16[7], xsoff[7]);                                          \
+    }                                                                                \
+    if (args.x_rows > 8) {                                                           \
+        MACRO(acc2.x, xoff16[8], xsoff[8]);                                          \
+        MACRO(acc2.y, xoff16[9], xsoff[9]);                                          \
+        MACRO(acc2.z, xoff16[10], xsoff[10]);                                        \
+        MACRO(acc2.w, xoff16[11], xsoff[11]);                                        \
+    }
+
+// Shared prologue (clamped token-row base offsets; x.count fits in 32 bits,
+// checked at dispatch) and epilogue (simd_sum reduction, executed by every
+// lane, then a lane-0 store of the first x_rows results).
+#define Q27_MM_OFFSETS                                                               \
+    const uint t_last = args.x_rows - 1;                                             \
+    uint xoff16[12], xsoff[12];                                                      \
+    for (uint t = 0; t < 12; t++) {                                                  \
+        const uint tc = min(t, t_last);                                              \
+        xoff16[t] = tc * (args.cols / 16);                                           \
+        xsoff[t] = tc * (args.cols / 32);                                            \
+    }                                                                                \
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+#define Q27_MM_STORE                                                                 \
+    const float sums[12] = {                                                         \
+        simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w),      \
+        simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w),      \
+        simd_sum(acc2.x), simd_sum(acc2.y), simd_sum(acc2.z), simd_sum(acc2.w)};     \
+    if (lane == 0)                                                                   \
+        for (uint t = 0; t < args.x_rows; t++) out[(ulong)t * args.rows + row] = sums[t];
+
+kernel void q27_matmul_q4_rows(
         device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
         device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
         device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
-        uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
-    threadgroup float atile[64],btile[64],ctile[64];
-    simdgroup_float8x8 accum=make_filled_simdgroup_matrix<float,8,8>(0.0f);
-    const uint token_base=group.y*8, row_base=group.x*8;
-    for(uint k=0;k<args.cols;k+=8) {
-        for(uint pass=0;pass<2;pass++) {
-            uint i=lane+pass*32, rr=i/8, cc=i&7, token=token_base+rr, col=k+cc;
-            atile[i]=(token<args.x_rows && col<args.cols)
-                ? float(x[(ulong)token*args.cols+col])*x_scales[(ulong)token*(args.cols/32)+col/32] : 0.0f;
-            uint input=k+rr, row=row_base+cc;
-            if(row<args.rows && input<args.cols) {
-                uchar packed=weights[(ulong)row*(args.cols/2)+input/2];
-                int q=int((input&1)?(packed>>4):(packed&15))-8;
-                btile[i]=float(q)*float(weight_scales[(ulong)row*(args.cols/64)+input/64]);
-            } else btile[i]=0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_float8x8 a,b;
-        simdgroup_load(a,atile,8); simdgroup_load(b,btile,8);
-        simdgroup_multiply_accumulate(accum,a,b,accum);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group * 8 + simdgroup;
+    if (row >= args.rows) return;
+    device const uint4 *w4x8 = (device const uint4 *)(weights + (ulong)row * (args.cols / 2));
+    device const int4 *x16 = (device const int4 *)x;
+    const ulong scale_base = (ulong)row * (args.cols / 64);
+    Q27_MM_OFFSETS
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;
+        const uint4 wp = w4x8[idx];
+        char4 w[8];
+        q27_decode_q4x8(wp.x, w);
+        q27_decode_q4x8(wp.y, w + 2);
+        q27_decode_q4x8(wp.z, w + 4);
+        q27_decode_q4x8(wp.w, w + 6);
+        const uint c = chunk * 1024 + lane * 32;
+        const uint idx2 = idx * 2, cs = c / 32;
+        const float wscale = float(weight_scales[scale_base + c / 64]);
+        Q27_MM_TOKENS(Q27_MM_MAIN)
     }
-    simdgroup_store(accum,ctile,8); threadgroup_barrier(mem_flags::mem_threadgroup);
-    for(uint pass=0;pass<2;pass++) {
-        uint i=lane+pass*32, rr=i/8,cc=i&7,token=token_base+rr,row=row_base+cc;
-        if(token<args.x_rows && row<args.rows) out[(ulong)token*args.rows+row]=ctile[i];
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const uchar2 wp = *(device const uchar2 *)(weights + (ulong)row * (args.cols / 2) + c / 2);
+        const char4 wt = char4(char(int(wp.x & 15u) - 8), char(int(wp.x >> 4) - 8),
+                               char(int(wp.y & 15u) - 8), char(int(wp.y >> 4) - 8));
+        const float wscale = float(weight_scales[scale_base + c / 64]);
+        Q27_MM_TOKENS(Q27_MM_TAIL)
     }
+    Q27_MM_STORE
 }
 
-kernel void q27_matmul_q8_simdgroup(
+kernel void q27_matmul_q8_rows(
         device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
         device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
         device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
-        uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
-    threadgroup float atile[64],btile[64],ctile[64];
-    simdgroup_float8x8 accum=make_filled_simdgroup_matrix<float,8,8>(0.0f);
-    const uint token_base=group.y*8, row_base=group.x*8;
-    for(uint k=0;k<args.cols;k+=8) {
-        for(uint pass=0;pass<2;pass++) {
-            uint i=lane+pass*32, rr=i/8, cc=i&7, token=token_base+rr, col=k+cc;
-            atile[i]=(token<args.x_rows && col<args.cols)
-                ? float(x[(ulong)token*args.cols+col])*x_scales[(ulong)token*(args.cols/32)+col/32] : 0.0f;
-            uint input=k+rr, row=row_base+cc;
-            btile[i]=(row<args.rows && input<args.cols)
-                ? float(weights[(ulong)row*args.cols+input])*float(weight_scales[(ulong)row*(args.cols/128)+input/128]) : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_float8x8 a,b;
-        simdgroup_load(a,atile,8); simdgroup_load(b,btile,8);
-        simdgroup_multiply_accumulate(accum,a,b,accum);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group * 8 + simdgroup;
+    if (row >= args.rows) return;
+    device const int4 *w16 = (device const int4 *)(weights + (ulong)row * args.cols);
+    device const int4 *x16 = (device const int4 *)x;
+    const ulong scale_base = (ulong)row * (args.cols / 128);
+    Q27_MM_OFFSETS
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 64 + lane * 2;
+        const int4 wp0 = w16[idx], wp1 = w16[idx + 1];
+        const char4 w[8] = {
+            as_type<char4>(wp0.x), as_type<char4>(wp0.y), as_type<char4>(wp0.z),
+            as_type<char4>(wp0.w), as_type<char4>(wp1.x), as_type<char4>(wp1.y),
+            as_type<char4>(wp1.z), as_type<char4>(wp1.w)};
+        const uint c = chunk * 1024 + lane * 32;
+        const uint idx2 = idx, cs = c / 32;
+        const float wscale = float(weight_scales[scale_base + c / 128]);
+        Q27_MM_TOKENS(Q27_MM_MAIN)
     }
-    simdgroup_store(accum,ctile,8); threadgroup_barrier(mem_flags::mem_threadgroup);
-    for(uint pass=0;pass<2;pass++) {
-        uint i=lane+pass*32, rr=i/8,cc=i&7,token=token_base+rr,row=row_base+cc;
-        if(token<args.x_rows && row<args.rows) out[(ulong)token*args.rows+row]=ctile[i];
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const char4 wt = *(device const char4 *)(weights + (ulong)row * args.cols + c);
+        const float wscale = float(weight_scales[scale_base + c / 128]);
+        Q27_MM_TOKENS(Q27_MM_TAIL)
     }
+    Q27_MM_STORE
 }
 
 // ---- Chunked layer-major prefill (2..12 tokens per dispatch) ----
