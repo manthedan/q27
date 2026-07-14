@@ -134,11 +134,17 @@ q27::BackendQuantized quantized_view(const q27::BackendQuantized& full, uint32_t
 
 int main(int argc, char** argv) {
     uint32_t prompt = 120, chunk_size = CHUNK_MAX;
+    bool turbo3 = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--prompt" && i + 1 < argc) prompt = (uint32_t)atoi(argv[++i]);
         else if (arg == "--chunk" && i + 1 < argc) chunk_size = (uint32_t)atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--prompt N] [--chunk 2..12]\n", argv[0]); return 1; }
+        else if (arg == "--kv" && i + 1 < argc) {
+            const std::string kv = argv[++i];
+            if (kv == "turbo3") turbo3 = true;
+            else if (kv != "fp16") { fprintf(stderr, "invalid --kv (fp16|turbo3)\n"); return 1; }
+        }
+        else { fprintf(stderr, "usage: %s [--prompt N] [--chunk 2..12] [--kv fp16|turbo3]\n", argv[0]); return 1; }
     }
     if (!prompt || chunk_size < 2 || chunk_size > CHUNK_MAX) {
         fprintf(stderr, "invalid --prompt/--chunk\n");
@@ -150,8 +156,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "device lacks simdgroup matmul support\n");
         return 1;
     }
-    printf("backend: %s, %u-token synthetic prompt in chunks of %u\n",
-           backend.name().c_str(), prompt, chunk_size);
+    printf("backend: %s, %u-token synthetic prompt in chunks of %u, %s KV\n",
+           backend.name().c_str(), prompt, chunk_size, turbo3 ? "turbo3" : "fp16");
 
     // One synthetic weight set per layer type, as in metal_decode_bench: a
     // chunk streams far more bytes than any cache level, so reuse across the
@@ -214,8 +220,11 @@ int main(int argc, char** argv) {
     q27::BackendQuantized cq17408 = backend.allocate_quantized(CHUNK_MAX * N_FFN);
     auto recurrent = alloc_f32((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM);
     auto ring = alloc_f32((uint64_t)3 * GDN_CH);
-    auto k_cache = backend.allocate((uint64_t)ctx * N_KV * HEAD_DIM * 2);
-    auto v_cache = backend.allocate((uint64_t)ctx * N_KV * HEAD_DIM * 2);
+    const uint64_t cache_row_bytes = turbo3 ? (uint64_t)N_KV * 2 * 50
+                                            : (uint64_t)N_KV * HEAD_DIM * 2;
+    auto k_cache = backend.allocate((uint64_t)ctx * cache_row_bytes);
+    auto v_cache = backend.allocate((uint64_t)ctx * cache_row_bytes);
+    auto cattn_scratch = alloc_f32(turbo3 ? (uint64_t)CHUNK_MAX * N_HEAD * ctx : 1);
     backend.zero(*recurrent); backend.zero(*ring);
     backend.zero(*k_cache); backend.zero(*v_cache);
 
@@ -251,11 +260,21 @@ int main(int argc, char** argv) {
                                2 * N_HEAD * HEAD_DIM, position, count, FREQ_BASE);
         backend.rope_neox_rows(*ckbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM,
                                N_KV * HEAD_DIM, position, count, FREQ_BASE);
-        backend.kv_store_f16_rows(*ckbuf, *cvbuf, *k_cache, *v_cache, position,
-                                  N_KV * HEAD_DIM, count);
-        backend.attention_f16_causal(*cqg, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
-                                     *k_cache, *v_cache, *cattn_out,
-                                     position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale);
+        if (turbo3) {
+            backend.turbo_wht(*cqg, count * N_HEAD, 2 * HEAD_DIM, false);
+            backend.kv_store_turbo3_rows(*ckbuf, *cvbuf, *k_cache, *v_cache, position,
+                                         N_KV, count);
+            backend.attention_turbo3_causal(*cqg, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
+                                            *k_cache, *v_cache, *cattn_scratch, *cattn_out,
+                                            position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale);
+            backend.turbo_wht(*cattn_out, count * N_HEAD, HEAD_DIM, true);
+        } else {
+            backend.kv_store_f16_rows(*ckbuf, *cvbuf, *k_cache, *v_cache, position,
+                                      N_KV * HEAD_DIM, count);
+            backend.attention_f16_causal(*cqg, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
+                                         *k_cache, *v_cache, *cattn_out,
+                                         position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale);
+        }
         backend.sigmoid_gate_mul_rows(*cattn_out, *cqg, N_HEAD, HEAD_DIM, count);
         q27::BackendQuantized x6 = quantized_view(cq6144, count * N_HEAD * HEAD_DIM);
         backend.quantize(*cattn_out, x6);

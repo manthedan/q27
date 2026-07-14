@@ -132,16 +132,23 @@ Synthetic make_f32(q27::MetalBackend& backend, const std::vector<uint64_t>& shap
 
 int main(int argc, char** argv) {
     uint32_t tokens = 16, seq = 128;
+    bool turbo3 = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--tokens" && i + 1 < argc) tokens = (uint32_t)atoi(argv[++i]);
         else if (arg == "--seq" && i + 1 < argc) seq = (uint32_t)atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--tokens N] [--seq LEN]\n", argv[0]); return 1; }
+        else if (arg == "--kv" && i + 1 < argc) {
+            const std::string kv = argv[++i];
+            if (kv == "turbo3") turbo3 = true;
+            else if (kv != "fp16") { fprintf(stderr, "invalid --kv (fp16|turbo3)\n"); return 1; }
+        }
+        else { fprintf(stderr, "usage: %s [--tokens N] [--seq LEN] [--kv fp16|turbo3]\n", argv[0]); return 1; }
     }
     if (!tokens || !seq) { fprintf(stderr, "invalid --tokens/--seq\n"); return 1; }
 
     q27::MetalBackend backend;
-    printf("backend: %s, %u simulated tokens at context %u\n", backend.name().c_str(), tokens, seq);
+    printf("backend: %s, %u simulated tokens at context %u, %s KV\n",
+           backend.name().c_str(), tokens, seq, turbo3 ? "turbo3" : "fp16");
 
     // One synthetic weight set per layer type; a block streams far more bytes
     // than any cache level, so reuse across the 48/16/64 repeats is
@@ -194,8 +201,10 @@ int main(int argc, char** argv) {
     auto token_out = backend.allocate(sizeof(uint32_t));
     auto recurrent = alloc_f32((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM);
     auto ring = alloc_f32((uint64_t)3 * GDN_CH);
-    auto k_cache = backend.allocate((uint64_t)(seq + 1) * N_KV * HEAD_DIM * 2);
-    auto v_cache = backend.allocate((uint64_t)(seq + 1) * N_KV * HEAD_DIM * 2);
+    const uint64_t cache_row_bytes = turbo3 ? (uint64_t)N_KV * 2 * 50
+                                            : (uint64_t)N_KV * HEAD_DIM * 2;
+    auto k_cache = backend.allocate((uint64_t)(seq + 1) * cache_row_bytes);
+    auto v_cache = backend.allocate((uint64_t)(seq + 1) * cache_row_bytes);
     backend.zero(*recurrent); backend.zero(*ring);
     backend.zero(*k_cache); backend.zero(*v_cache);
     q27::BackendQuantized q5120 = backend.allocate_quantized(N_EMBD);
@@ -230,9 +239,17 @@ int main(int argc, char** argv) {
         backend.rmsnorm_heads(*kbuf, k_norm.tensor, N_KV, HEAD_DIM, HEAD_DIM, EPS);
         backend.rope_neox(*qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, position, FREQ_BASE);
         backend.rope_neox(*kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position, FREQ_BASE);
-        backend.kv_store_f16(*kbuf, *vbuf, *k_cache, *v_cache, position, N_KV * HEAD_DIM);
-        backend.attention_f16(*qg, 2 * HEAD_DIM, *k_cache, *v_cache, *attn_scratch, *attn_out,
-                              position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
+        if (turbo3) {
+            backend.turbo_wht(*qg, N_HEAD, 2 * HEAD_DIM, false);
+            backend.kv_store_turbo3(*kbuf, *vbuf, *k_cache, *v_cache, position, N_KV);
+            backend.attention_turbo3(*qg, 2 * HEAD_DIM, *k_cache, *v_cache, *attn_scratch,
+                                     *attn_out, position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
+            backend.turbo_wht(*attn_out, N_HEAD, HEAD_DIM, true);
+        } else {
+            backend.kv_store_f16(*kbuf, *vbuf, *k_cache, *v_cache, position, N_KV * HEAD_DIM);
+            backend.attention_f16(*qg, 2 * HEAD_DIM, *k_cache, *v_cache, *attn_scratch, *attn_out,
+                                  position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
+        }
         backend.sigmoid_gate_mul(*attn_out, *qg, N_HEAD, HEAD_DIM);
         backend.quantize(*attn_out, q6144);
         backend.matvec_quantized(attn_out_w.tensor, q6144, *y);
