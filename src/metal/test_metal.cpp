@@ -304,6 +304,95 @@ int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
     return 0;
 }
 
+// Production-width GEMV parity. The packed-dot kernels take a vectorized
+// main loop only when cols >= 1024, so the narrow test_q8/test_q4 shapes
+// never reach it; this caught a wrong per-lane activation-scale index that
+// the 64/128-column tests could not see. Scales are deliberately varied per
+// weight group and per 32-column activation block.
+int test_quantized_wide(q27::MetalBackend& backend, q27::DType dtype) {
+    const uint32_t group = dtype == q27::DType::Q4_G64 ? 64 : 128;
+    // main chunk + tail, then a production column count
+    const uint32_t widths[2] = {1024 + group, 5120};
+    for (uint32_t cols : widths) {
+        constexpr uint32_t rows = 5;
+        const uint32_t groups = cols / group;
+        std::vector<int8_t> w(rows * cols);
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t c = 0; c < cols; c++)
+                w[(size_t)r * cols + c] = (int8_t)((int)((r * 13 + c * 7) % 29) - 14);
+        std::vector<uint8_t> data;
+        if (dtype == q27::DType::Q4_G64) {
+            data.resize((size_t)rows * cols / 2);
+            for (uint32_t r = 0; r < rows; r++)
+                for (uint32_t c = 0; c < cols; c++) {
+                    int q = ((int)w[(size_t)r * cols + c] % 8 + 8) % 16 - 8;
+                    w[(size_t)r * cols + c] = (int8_t)q;
+                    uint8_t nibble = (uint8_t)(q + 8);
+                    size_t i = (size_t)r * cols / 2 + c / 2;
+                    if (c & 1) data[i] = (uint8_t)((data[i] & 15) | (nibble << 4));
+                    else data[i] = (uint8_t)((data[i] & 240) | nibble);
+                }
+        } else {
+            data.assign((const uint8_t*)w.data(), (const uint8_t*)w.data() + w.size());
+        }
+        const uint16_t scale_bits[4] = {0x3400, 0x3800, 0x3c00, 0x4000};
+        const float scale_f32[4] = {0.25f, 0.5f, 1.0f, 2.0f};
+        std::vector<uint16_t> scales(rows * groups);
+        for (size_t i = 0; i < scales.size(); i++) scales[i] = scale_bits[i % 4];
+        q27::Tensor tensor;
+        tensor.name = "wide";
+        tensor.dtype = dtype;
+        tensor.shape = {rows, cols};
+        tensor.data = data.data();
+        tensor.data_size = data.size();
+        tensor.scales = (const uint8_t*)scales.data();
+        tensor.scales_size = scales.size() * 2;
+        auto weight = backend.upload(tensor);
+
+        // Distinct magnitude per 32-column block so every activation scale differs.
+        std::vector<float> x(cols);
+        for (uint32_t c = 0; c < cols; c++)
+            x[c] = (float)((int)((c * 11) % 23) - 11) / 11.0f * (float)(1 + c / 32 % 7);
+        auto xb = backend.allocate(cols * 4);
+        backend.write(*xb, 0, x.data(), cols * 4);
+        auto xq = backend.allocate_quantized(cols);
+        auto yb = backend.allocate(rows * 4);
+        auto y2 = backend.allocate(rows * 4);
+        auto y3 = backend.allocate(rows * 4);
+        backend.begin_commands();
+        backend.quantize(*xb, xq);
+        backend.matvec_quantized(weight, xq, *yb);
+        backend.end_commands();
+        backend.matvec_quantized_pair(weight, *y2, weight, *y3, xq);
+
+        std::vector<int8_t> xv(cols);
+        std::vector<float> xs(cols / 32);
+        backend.read(*xq.values, 0, xv.data(), cols);
+        backend.read(*xq.scales, 0, xs.data(), xs.size() * 4);
+        std::vector<float> got(rows), got2(rows), got3(rows);
+        backend.read(*yb, 0, got.data(), rows * 4);
+        backend.read(*y2, 0, got2.data(), rows * 4);
+        backend.read(*y3, 0, got3.data(), rows * 4);
+        for (uint32_t r = 0; r < rows; r++) {
+            double want = 0.0;
+            for (uint32_t b = 0; b < cols / 32; b++) {
+                int dot = 0;
+                for (uint32_t i = b * 32; i < b * 32 + 32; i++)
+                    dot += (int)w[(size_t)r * cols + i] * (int)xv[i];
+                want += (double)dot * scale_f32[(r * groups + b * 32 / group) % 4] * xs[b];
+            }
+            const float tolerance = (float)(std::fabs(want) * 1e-4 + 1e-3);
+            if (!close(got[r], (float)want, tolerance) || !close(got2[r], (float)want, tolerance) ||
+                !close(got3[r], (float)want, tolerance)) {
+                fprintf(stderr, "%s wide cols=%u row %u: got %.7g pair %.7g/%.7g want %.7g\n",
+                        q27::dtype_name(dtype), cols, r, got[r], got2[r], got3[r], (float)want);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 int test_mixed_pair(q27::MetalBackend& backend) {
     constexpr int cols=128; std::vector<float> x(cols); for(int i=0;i<cols;i++) x[i]=(i%13-6)/7.0f;
     std::vector<uint8_t> q4(cols/2,0x99); std::vector<int8_t> q8(cols,2);
@@ -335,7 +424,10 @@ int main() {
                backend.max_threadgroup_memory_length() / 1024.0);
         if (test_mmap_upload(backend) || test_dispatch_validation(backend) ||
             test_f32(backend) || test_f16(backend) ||
-            test_q8(backend) || test_q4(backend) || test_mixed_pair(backend) ||
+            test_q8(backend) || test_q4(backend) ||
+            test_quantized_wide(backend, q27::DType::Q4_G64) ||
+            test_quantized_wide(backend, q27::DType::Q8_G128) ||
+            test_mixed_pair(backend) ||
             (backend.supports_quantized_matmul() &&
              (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128))))
             return 1;

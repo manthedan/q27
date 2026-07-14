@@ -47,6 +47,12 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp sr
 	$(CXX) $(CXXFLAGS) -fobjc-arc -pthread -I src/metal src/metal/metal_server.cpp src/metal/metal_engine.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
+build/metal_gemv_bench: tools/metal_gemv_bench.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
+                        src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal tools/metal_gemv_bench.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp \
+	        -framework Foundation -framework Metal -o $@
+
 else
 test-metal:
 	@echo "test-metal requires macOS"; exit 1

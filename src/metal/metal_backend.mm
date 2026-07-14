@@ -131,8 +131,6 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
     id<MTLComputePipelineState> f16_pair;
-    id<MTLComputePipelineState> q8_quantized_pair;
-    id<MTLComputePipelineState> q4_quantized_pair;
     id<MTLComputePipelineState> q4_quantized_matmul;
     id<MTLComputePipelineState> q8_quantized_matmul;
     id<MTLComputePipelineState> embedding;
@@ -238,8 +236,6 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
         impl_->f16_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair");
-        impl_->q8_quantized_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized_pair");
-        impl_->q4_quantized_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized_pair");
         // SIMD-scoped matrix multiply is optional on older Intel-family Metal
         // devices. Decode GEMV remains available there; only small-N GEMM is gated.
         if ([impl_->device supportsFamily:MTLGPUFamilyApple7]) {
@@ -551,40 +547,16 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
     }
 }
 
+// Two independent packed-dot dispatches now beat a fused pair kernel: the
+// rewritten GEMV is weight-stream-bound, so sharing the (cached) activation
+// bytes buys nothing, while the fused kernel's doubled register pressure
+// measured 47-55 GB/s against 67-69 GB/s for back-to-back singles (Q4,
+// 17408x5120-class shapes, M4). The entry point survives as the engine's
+// sibling-projection idiom.
 void MetalBackend::matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
                                          const BackendTensor& b, BackendBuffer& b_out,
                                          const BackendQuantized& x) {
-    if((a.dtype!=DType::Q4_G64 && a.dtype!=DType::Q8_G128) || b.dtype!=a.dtype || a.cols!=b.cols) {
-        matvec_quantized(a,x,a_out); matvec_quantized(b,x,b_out); return;
-    }
-    if(!a.data || !a.scales || !b.data || !b.scales || !a.rows || !b.rows ||
-       !a.cols || a.cols!=b.cols || a.rows>UINT32_MAX || b.rows>UINT32_MAX || a.cols>UINT32_MAX)
-        throw std::runtime_error("q27 Metal: fused quantized matvec requires compatible weights");
-    const uint64_t group=a.dtype==DType::Q8_G128?128:64;
-    if(a.cols%group || x.count!=a.cols || !x.values || !x.scales)
-        throw std::runtime_error("q27 Metal: fused quantized matvec activation mismatch");
-    check_range(a_out.size(),0,a.rows*4,"fused quantized output A");
-    check_range(b_out.size(),0,b.rows*4,"fused quantized output B");
-    const MetalBuffer& ad=metal_buffer(*a.data); const MetalBuffer& as=metal_buffer(*a.scales);
-    const MetalBuffer& bd=metal_buffer(*b.data); const MetalBuffer& bs=metal_buffer(*b.scales);
-    const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales);
-    MetalBuffer& ao=metal_buffer(a_out); MetalBuffer& bo=metal_buffer(b_out);
-    uint64_t divisor=a.dtype==DType::Q4_G64?2:1;
-    check_range(ad.size(),a.data_offset,a.rows*a.cols/divisor,"fused quantized weight A");
-    check_range(bd.size(),b.data_offset,b.rows*b.cols/divisor,"fused quantized weight B");
-    check_range(as.size(),a.scales_offset,a.rows*(a.cols/group)*2,"fused quantized scales A");
-    check_range(bs.size(),b.scales_offset,b.rows*(b.cols/group)*2,"fused quantized scales B");
-    check_range(xv.size(),0,x.count,"fused quantized values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"fused quantized scales");
-    MatvecPairArgs args{(uint32_t)a.rows,(uint32_t)b.rows,(uint32_t)a.cols,8};
-    @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own);
-        [enc setComputePipelineState:a.dtype==DType::Q8_G128?impl_->q8_quantized_pair:impl_->q4_quantized_pair];
-        [enc setBuffer:ad.handle() offset:(NSUInteger)a.data_offset atIndex:0]; [enc setBuffer:as.handle() offset:(NSUInteger)a.scales_offset atIndex:1]; [enc setBuffer:ao.handle() offset:0 atIndex:2];
-        [enc setBuffer:bd.handle() offset:(NSUInteger)b.data_offset atIndex:3]; [enc setBuffer:bs.handle() offset:(NSUInteger)b.scales_offset atIndex:4]; [enc setBuffer:bo.handle() offset:0 atIndex:5];
-        [enc setBuffer:xv.handle() offset:0 atIndex:6]; [enc setBuffer:xs.handle() offset:0 atIndex:7]; [enc setBytes:&args length:sizeof(args) atIndex:8];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(std::max(a.rows,b.rows)+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        if(own) impl_->finish_command("fused quantized matvec pair");
-    }
+    matvec_quantized(a,x,a_out); matvec_quantized(b,x,b_out);
 }
 
 void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,

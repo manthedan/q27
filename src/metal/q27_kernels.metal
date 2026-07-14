@@ -500,6 +500,33 @@ kernel void q27_quantize_x(device const float *x [[buffer(0)]],
     if (lane == 0) scales[group] = scale;
 }
 
+// Packed-dot GEMV: each lane loads 16 weight values at once, computes an
+// exact integer dot against 16 int8 activations (max magnitude 16*127*127,
+// exactly representable in float), applies the combined scale per lane, and
+// reduces once per row. Tensor blobs are 256-byte aligned (loader ALIGN), so
+// the vector loads are safe. A lane's 16 columns never straddle a weight or
+// activation scale group. The 128-column tail loop covers synthetic shapes;
+// production columns are all multiples of 512.
+inline int q27_dot4(char4 a, char4 b) {
+    return int(a.x) * int(b.x) + int(a.y) * int(b.y) +
+           int(a.z) * int(b.z) + int(a.w) * int(b.w);
+}
+
+// Even columns sit in low nibbles, odd columns in high nibbles (even=low
+// order). Scalar shift-extract measures faster on M4 than the vectorized
+// mask/shuffle decode (54-64 vs 39-44 GB/s).
+inline int q27_dot8_q4(uint packed, char4 x0, char4 x1) {
+    int sum = (int(packed         & 15u) - 8) * x0.x;
+    sum += (int((packed >>  4) & 15u) - 8) * x0.y;
+    sum += (int((packed >>  8) & 15u) - 8) * x0.z;
+    sum += (int((packed >> 12) & 15u) - 8) * x0.w;
+    sum += (int((packed >> 16) & 15u) - 8) * x1.x;
+    sum += (int((packed >> 20) & 15u) - 8) * x1.y;
+    sum += (int((packed >> 24) & 15u) - 8) * x1.z;
+    sum += (int((packed >> 28)      ) - 8) * x1.w;
+    return sum;
+}
+
 kernel void q27_matvec_q8_quantized(device const char *weights [[buffer(0)]],
                                      device const half *weight_scales [[buffer(1)]],
                                      device const char *x [[buffer(2)]],
@@ -511,15 +538,38 @@ kernel void q27_matvec_q8_quantized(device const char *weights [[buffer(0)]],
                                      ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
     const uint row = group * 8 + simdgroup;
     if (row >= args.rows) return;
-    float result = 0.0f;
-    const ulong base = (ulong)row * args.cols;
-    for (uint b = 0; b < args.cols / 32; b++) {
-        const uint c = b * 32 + lane;
-        int subtotal = int(weights[base + c]) * int(x[c]);
-        subtotal = simd_sum(subtotal);
-        if (lane == 0) result += float(subtotal) * float(weight_scales[(ulong)row * (args.cols / 128) + b / 4]) * x_scales[b];
+    device const int4 *w16 = (device const int4 *)(weights + (ulong)row * args.cols);
+    device const int4 *x16 = (device const int4 *)x;
+    const ulong scale_base = (ulong)row * (args.cols / 128);
+    float acc = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 64 + lane * 2;
+        const int4 wp0 = w16[idx], wp1 = w16[idx + 1];
+        const int4 xp0 = x16[idx], xp1 = x16[idx + 1];
+        const int dot0 = q27_dot4(as_type<char4>(wp0.x), as_type<char4>(xp0.x)) +
+                         q27_dot4(as_type<char4>(wp0.y), as_type<char4>(xp0.y)) +
+                         q27_dot4(as_type<char4>(wp0.z), as_type<char4>(xp0.z)) +
+                         q27_dot4(as_type<char4>(wp0.w), as_type<char4>(xp0.w));
+        const int dot1 = q27_dot4(as_type<char4>(wp1.x), as_type<char4>(xp1.x)) +
+                         q27_dot4(as_type<char4>(wp1.y), as_type<char4>(xp1.y)) +
+                         q27_dot4(as_type<char4>(wp1.z), as_type<char4>(xp1.z)) +
+                         q27_dot4(as_type<char4>(wp1.w), as_type<char4>(xp1.w));
+        // A lane's 32 columns are 32-aligned: both 16-column halves share one
+        // activation-scale block and one weight-scale group, and the summed
+        // integer dot (<= 32*127*127) stays exactly representable in float.
+        const uint c = chunk * 1024 + lane * 32;
+        acc += float(dot0 + dot1) *
+               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
     }
-    if (lane == 0) out[row] = result;
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const char4 wp = *(device const char4 *)(weights + (ulong)row * args.cols + c);
+        const char4 xp = *(device const char4 *)(x + c);
+        acc += float(q27_dot4(wp, xp)) *
+               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[row] = acc;
 }
 
 kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
@@ -533,61 +583,35 @@ kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
                                      ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
     const uint row = group * 8 + simdgroup;
     if (row >= args.rows) return;
-    float result = 0.0f;
-    const ulong base = (ulong)row * (args.cols / 2);
-    for (uint b = 0; b < args.cols / 32; b++) {
-        const uint c = b * 32 + lane;
-        const uchar packed = weights[base + c / 2];
-        const int w = int((c & 1) ? (packed >> 4) : (packed & 15)) - 8;
-        int subtotal = w * int(x[c]);
-        subtotal = simd_sum(subtotal);
-        if (lane == 0) result += float(subtotal) * float(weight_scales[(ulong)row * (args.cols / 64) + b / 2]) * x_scales[b];
+    device const uint4 *w4x8 = (device const uint4 *)(weights + (ulong)row * (args.cols / 2));
+    device const int4 *x16 = (device const int4 *)x;
+    const ulong scale_base = (ulong)row * (args.cols / 64);
+    float acc = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;
+        const uint4 wp = w4x8[idx];
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
+        const int dot0 = q27_dot8_q4(wp.x, as_type<char4>(xp0.x), as_type<char4>(xp0.y)) +
+                         q27_dot8_q4(wp.y, as_type<char4>(xp0.z), as_type<char4>(xp0.w));
+        const int dot1 = q27_dot8_q4(wp.z, as_type<char4>(xp1.x), as_type<char4>(xp1.y)) +
+                         q27_dot8_q4(wp.w, as_type<char4>(xp1.z), as_type<char4>(xp1.w));
+        // Same 32-aligned lane layout as the Q8 kernel: one activation-scale
+        // block and one weight-scale group cover the lane's 32 columns.
+        const uint c = chunk * 1024 + lane * 32;
+        acc += float(dot0 + dot1) *
+               float(weight_scales[scale_base + c / 64]) * x_scales[c / 32];
     }
-    if (lane == 0) out[row] = result;
-}
-
-kernel void q27_matvec_q8_quantized_pair(
-        device const char *weights_a [[buffer(0)]], device const half *weight_scales_a [[buffer(1)]], device float *out_a [[buffer(2)]],
-        device const char *weights_b [[buffer(3)]], device const half *weight_scales_b [[buffer(4)]], device float *out_b [[buffer(5)]],
-        device const char *x [[buffer(6)]], device const float *x_scales [[buffer(7)]],
-        constant MatvecPairArgs &args [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]], ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    const uint row=group*8+simdgroup; const ulong base=(ulong)row*args.cols;
-    float ra=0.0f,rb=0.0f; const uint scale_cols=args.cols/128;
-    for(uint block=0;block<args.cols/32;block++) {
-        const uint col=block*32+lane; int pa=0,pb=0;
-        if(row<args.rows_a) pa=int(weights_a[base+col])*int(x[col]);
-        if(row<args.rows_b) pb=int(weights_b[base+col])*int(x[col]);
-        pa=simd_sum(pa); pb=simd_sum(pb);
-        if(lane==0) {
-            float xs=x_scales[block];
-            if(row<args.rows_a) ra+=float(pa)*float(weight_scales_a[(ulong)row*scale_cols+block/4])*xs;
-            if(row<args.rows_b) rb+=float(pb)*float(weight_scales_b[(ulong)row*scale_cols+block/4])*xs;
-        }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const uchar2 wp = *(device const uchar2 *)(weights + (ulong)row * (args.cols / 2) + c / 2);
+        const char4 xp = *(device const char4 *)(x + c);
+        const int dot = (int(wp.x & 15u) - 8) * xp.x + (int(wp.x >> 4) - 8) * xp.y +
+                        (int(wp.y & 15u) - 8) * xp.z + (int(wp.y >> 4) - 8) * xp.w;
+        acc += float(dot) * float(weight_scales[scale_base + c / 64]) * x_scales[c / 32];
     }
-    if(lane==0) { if(row<args.rows_a) out_a[row]=ra; if(row<args.rows_b) out_b[row]=rb; }
-}
-
-kernel void q27_matvec_q4_quantized_pair(
-        device const uchar *weights_a [[buffer(0)]], device const half *weight_scales_a [[buffer(1)]], device float *out_a [[buffer(2)]],
-        device const uchar *weights_b [[buffer(3)]], device const half *weight_scales_b [[buffer(4)]], device float *out_b [[buffer(5)]],
-        device const char *x [[buffer(6)]], device const float *x_scales [[buffer(7)]],
-        constant MatvecPairArgs &args [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]], ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    const uint row=group*8+simdgroup; const ulong base=(ulong)row*(args.cols/2);
-    float ra=0.0f,rb=0.0f; const uint scale_cols=args.cols/64;
-    for(uint block=0;block<args.cols/32;block++) {
-        const uint col=block*32+lane; int pa=0,pb=0;
-        if(row<args.rows_a) { uchar p=weights_a[base+col/2]; int w=int((col&1)?(p>>4):(p&15))-8; pa=w*int(x[col]); }
-        if(row<args.rows_b) { uchar p=weights_b[base+col/2]; int w=int((col&1)?(p>>4):(p&15))-8; pb=w*int(x[col]); }
-        pa=simd_sum(pa); pb=simd_sum(pb);
-        if(lane==0) {
-            float xs=x_scales[block];
-            if(row<args.rows_a) ra+=float(pa)*float(weight_scales_a[(ulong)row*scale_cols+block/2])*xs;
-            if(row<args.rows_b) rb+=float(pb)*float(weight_scales_b[(ulong)row*scale_cols+block/2])*xs;
-        }
-    }
-    if(lane==0) { if(row<args.rows_a) out_a[row]=ra; if(row<args.rows_b) out_b[row]=rb; }
+    acc = simd_sum(acc);
+    if (lane == 0) out[row] = acc;
 }
 
 kernel void q27_matmul_q4_simdgroup(
