@@ -86,9 +86,14 @@ int main(int argc, char** argv) {
 
     double total_seconds = 0.0, total_bytes = 0.0;
     for (const Shape& shape : shapes) {
-        std::vector<uint8_t> data;
-        std::vector<uint16_t> scales;
+        std::vector<uint8_t> data, data_b;
+        std::vector<uint16_t> scales, scales_b;
         q27::BackendTensor weight = upload_synthetic(backend, shape, data, scales);
+        // Pair shapes stream two distinct weight tensors, matching production
+        // sibling projections; reusing one tensor would let the second
+        // dispatch hit cache lines the first already pulled.
+        q27::BackendTensor weight_b;
+        if (shape.pair) weight_b = upload_synthetic(backend, shape, data_b, scales_b);
 
         std::vector<float> x(shape.cols);
         for (uint32_t i = 0; i < shape.cols; i++) x[i] = (float)((i % 19) - 9) / 9.0f;
@@ -102,7 +107,7 @@ int main(int argc, char** argv) {
         auto run = [&](int count) {
             backend.begin_commands();
             for (int i = 0; i < count; i++) {
-                if (shape.pair) backend.matvec_quantized_pair(weight, *y, weight, *y2, xq);
+                if (shape.pair) backend.matvec_quantized_pair(weight, *y, weight_b, *y2, xq);
                 else backend.matvec_quantized(weight, xq, *y);
             }
             backend.end_commands();

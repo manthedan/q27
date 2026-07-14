@@ -374,16 +374,23 @@ int test_quantized_wide(q27::MetalBackend& backend, q27::DType dtype) {
         backend.read(*y2, 0, got2.data(), rows * 4);
         backend.read(*y3, 0, got3.data(), rows * 4);
         for (uint32_t r = 0; r < rows; r++) {
-            double want = 0.0;
+            double want = 0.0, magnitude = 0.0;
             for (uint32_t b = 0; b < cols / 32; b++) {
                 int dot = 0;
                 for (uint32_t i = b * 32; i < b * 32 + 32; i++)
                     dot += (int)w[(size_t)r * cols + i] * (int)xv[i];
-                want += (double)dot * scale_f32[(r * groups + b * 32 / group) % 4] * xs[b];
+                const double term =
+                    (double)dot * scale_f32[(r * groups + b * 32 / group) % 4] * xs[b];
+                want += term;
+                magnitude += std::fabs(term);
             }
-            const float tolerance = (float)(std::fabs(want) * 1e-4 + 1e-3);
-            if (!close(got[r], (float)want, tolerance) || !close(got2[r], (float)want, tolerance) ||
-                !close(got3[r], (float)want, tolerance)) {
+            // Absolute bound scaled by the sum of |block terms|, so a
+            // cancellation-heavy row cannot hide a wrong-scale bug behind a
+            // relative check, and the double-vs-float summation-order
+            // difference stays within it.
+            const float bound = (float)(magnitude * 1e-5 + 1e-3);
+            const auto ok = [&](float value) { return std::fabs(value - (float)want) <= bound; };
+            if (!ok(got[r]) || !ok(got2[r]) || !ok(got3[r])) {
                 fprintf(stderr, "%s wide cols=%u row %u: got %.7g pair %.7g/%.7g want %.7g\n",
                         q27::dtype_name(dtype), cols, r, got[r], got2[r], got3[r], (float)want);
                 return 1;
