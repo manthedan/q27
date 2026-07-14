@@ -72,10 +72,14 @@ NSString* load_kernel_source() {
         if (!source)
             throw std::runtime_error("q27 Metal: cannot read shader source: " +
                                      std::string(error.localizedDescription.UTF8String));
-        // Match the tag as a complete line so ABI 2 does not accept ABI 20.
-        NSString* tag_line = [@(kShaderAbiTag) stringByAppendingString:@"\n"];
-        if (![source hasPrefix:tag_line] &&
-            ![source containsString:[@"\n" stringByAppendingString:tag_line]])
+        // Match the tag as a complete logical line (any line ending), so
+        // ABI 2 does not accept ABI 20 and CRLF sources still load.
+        bool tag_found = false;
+        for (NSString* line in [source componentsSeparatedByCharactersInSet:
+                                           NSCharacterSet.newlineCharacterSet])
+            if ([[line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]
+                    isEqualToString:@(kShaderAbiTag)]) { tag_found = true; break; }
+        if (!tag_found)
             throw std::runtime_error(std::string("q27 Metal: shader ABI mismatch: ") +
                                      path.UTF8String + " does not carry \"" + kShaderAbiTag +
                                      "\"; rebuild this binary against the current shader source");
