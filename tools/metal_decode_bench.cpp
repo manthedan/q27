@@ -192,7 +192,6 @@ int main(int argc, char** argv) {
     auto h = alloc_f32(N_EMBD), x1 = alloc_f32(N_EMBD), y = alloc_f32(N_EMBD);
     auto qg = alloc_f32(2 * N_HEAD * HEAD_DIM), kbuf = alloc_f32(N_KV * HEAD_DIM);
     auto vbuf = alloc_f32(N_KV * HEAD_DIM), attn_out = alloc_f32(N_HEAD * HEAD_DIM);
-    auto attn_scratch = alloc_f32((uint64_t)N_HEAD * (seq + 1));
     auto qkv = alloc_f32(GDN_CH), z = alloc_f32(GDN_V), alpha = alloc_f32(GDN_HEADS);
     auto beta_raw = alloc_f32(GDN_HEADS), g = alloc_f32(GDN_HEADS), beta = alloc_f32(GDN_HEADS);
     auto conv_out = alloc_f32(GDN_CH), delta_out = alloc_f32(GDN_V), gated_out = alloc_f32(GDN_V);
@@ -242,12 +241,12 @@ int main(int argc, char** argv) {
         if (turbo3) {
             backend.turbo_wht(*qg, N_HEAD, 2 * HEAD_DIM, false);
             backend.kv_store_turbo3(*kbuf, *vbuf, *k_cache, *v_cache, position, N_KV);
-            backend.attention_turbo3(*qg, 2 * HEAD_DIM, *k_cache, *v_cache, *attn_scratch,
+            backend.attention_turbo3(*qg, 2 * HEAD_DIM, *k_cache, *v_cache,
                                      *attn_out, position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
             backend.turbo_wht(*attn_out, N_HEAD, HEAD_DIM, true);
         } else {
             backend.kv_store_f16(*kbuf, *vbuf, *k_cache, *v_cache, position, N_KV * HEAD_DIM);
-            backend.attention_f16(*qg, 2 * HEAD_DIM, *k_cache, *v_cache, *attn_scratch, *attn_out,
+            backend.attention_f16(*qg, 2 * HEAD_DIM, *k_cache, *v_cache, *attn_out,
                                   position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
         }
         backend.sigmoid_gate_mul(*attn_out, *qg, N_HEAD, HEAD_DIM);

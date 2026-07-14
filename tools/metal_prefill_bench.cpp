@@ -224,7 +224,6 @@ int main(int argc, char** argv) {
                                             : (uint64_t)N_KV * HEAD_DIM * 2;
     auto k_cache = backend.allocate((uint64_t)ctx * cache_row_bytes);
     auto v_cache = backend.allocate((uint64_t)ctx * cache_row_bytes);
-    auto cattn_scratch = alloc_f32(turbo3 ? (uint64_t)CHUNK_MAX * N_HEAD * ctx : 1);
     backend.zero(*recurrent); backend.zero(*ring);
     backend.zero(*k_cache); backend.zero(*v_cache);
 
@@ -265,7 +264,7 @@ int main(int argc, char** argv) {
             backend.kv_store_turbo3_rows(*ckbuf, *cvbuf, *k_cache, *v_cache, position,
                                          N_KV, count);
             backend.attention_turbo3_causal(*cqg, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
-                                            *k_cache, *v_cache, *cattn_scratch, *cattn_out,
+                                            *k_cache, *v_cache, *cattn_out,
                                             position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale);
             backend.turbo_wht(*cattn_out, count * N_HEAD, HEAD_DIM, true);
         } else {

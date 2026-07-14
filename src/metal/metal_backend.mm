@@ -53,7 +53,7 @@ void check_range(uint64_t size, uint64_t offset, uint64_t bytes, const char* ope
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 4";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 5";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -968,23 +968,22 @@ void MetalBackend::kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& 
 
 void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
                                      const BackendBuffer& k_cache, const BackendBuffer& v_cache,
-                                     BackendBuffer& scratch, BackendBuffer& out, uint32_t seq_len,
+                                     BackendBuffer& out, uint32_t seq_len,
                                      uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
                                      float scale) {
     if (!seq_len || !kv_heads || q_heads%kv_heads || head_dim != 256)
         throw std::runtime_error("q27 Metal: invalid turbo3 attention dimensions");
     const MetalBuffer& qb=metal_buffer(q); const MetalBuffer& kc=metal_buffer(k_cache); const MetalBuffer& vc=metal_buffer(v_cache);
-    MetalBuffer& prob=metal_buffer(scratch); MetalBuffer& output=metal_buffer(out);
+    MetalBuffer& output=metal_buffer(out);
     check_range(qb.size(),0,((uint64_t)(q_heads-1)*q_stride+head_dim)*4,"turbo3 attention Q");
     const uint64_t cache_bytes=(uint64_t)seq_len*kv_heads*2*50;
     check_range(kc.size(),0,cache_bytes,"turbo3 K cache"); check_range(vc.size(),0,cache_bytes,"turbo3 V cache");
-    check_range(prob.size(),0,(uint64_t)q_heads*seq_len*4,"turbo3 attention scratch");
     check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"turbo3 attention output");
     AttentionArgs args{q_stride,seq_len,q_heads,kv_heads,head_dim,scale};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_turbo3"); [enc setComputePipelineState:impl_->attention_turbo3];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
-        [enc setBuffer:prob.handle() offset:0 atIndex:3]; [enc setBuffer:output.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("turbo3 attention");
     }
@@ -992,12 +991,11 @@ void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
 
 void MetalBackend::attention_f16(const BackendBuffer& q, uint32_t q_stride,
                                   const BackendBuffer& k_cache, const BackendBuffer& v_cache,
-                                  BackendBuffer& scratch, BackendBuffer& out, uint32_t seq_len,
+                                  BackendBuffer& out, uint32_t seq_len,
                                   uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
                                   float scale) {
     if (!seq_len || !kv_heads || q_heads%kv_heads || !head_dim || head_dim > 256)
         throw std::runtime_error("q27 Metal: invalid attention dimensions");
-    (void)scratch; // online softmax: decode attention no longer materializes probabilities
     const MetalBuffer& qb=metal_buffer(q); const MetalBuffer& kc=metal_buffer(k_cache); const MetalBuffer& vc=metal_buffer(v_cache);
     MetalBuffer& output=metal_buffer(out);
     check_range(qb.size(),0,((uint64_t)(q_heads-1)*q_stride+head_dim)*4,"attention Q");
@@ -1366,7 +1364,7 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
 
 void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_stride,
                                            uint32_t q_row_stride, const BackendBuffer& k_cache,
-                                           const BackendBuffer& v_cache, BackendBuffer& scratch,
+                                           const BackendBuffer& v_cache,
                                            BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                            uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
                                            float scale) {
@@ -1374,7 +1372,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
         throw std::runtime_error("q27 Metal: invalid chunked turbo3 attention dimensions");
     const MetalBuffer& qb = metal_buffer(q); const MetalBuffer& kc = metal_buffer(k_cache);
     const MetalBuffer& vc = metal_buffer(v_cache);
-    MetalBuffer& prob = metal_buffer(scratch); MetalBuffer& output = metal_buffer(out);
+    MetalBuffer& output = metal_buffer(out);
     const uint32_t max_seq = base_len + tokens - 1;
     check_range(qb.size(), 0,
                 ((uint64_t)(tokens-1)*q_row_stride + (uint64_t)(q_heads-1)*q_stride + head_dim)*4,
@@ -1382,15 +1380,14 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
     const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * 2 * 50;
     check_range(kc.size(), 0, cache_bytes, "chunked turbo3 K cache");
     check_range(vc.size(), 0, cache_bytes, "chunked turbo3 V cache");
-    check_range(prob.size(), 0, (uint64_t)tokens * q_heads * max_seq * 4, "chunked turbo3 attention scratch");
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked turbo3 attention output");
     AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, scale};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_turbo3_causal");
         [enc setComputePipelineState:impl_->attention_turbo3_causal_p];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
-        [enc setBuffer:vc.handle() offset:0 atIndex:2]; [enc setBuffer:prob.handle() offset:0 atIndex:3];
-        [enc setBuffer:output.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked turbo3 attention");
     }

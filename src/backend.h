@@ -121,12 +121,12 @@ class ComputeBackend {
                                  uint32_t position, uint32_t kv_heads) = 0;
     virtual void attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
                                   const BackendBuffer& k_cache, const BackendBuffer& v_cache,
-                                  BackendBuffer& scratch, BackendBuffer& out,
+                                  BackendBuffer& out,
                                   uint32_t seq_len, uint32_t q_heads, uint32_t kv_heads,
                                   uint32_t head_dim, float scale) = 0;
     virtual void attention_f16(const BackendBuffer& q, uint32_t q_stride,
                                const BackendBuffer& k_cache, const BackendBuffer& v_cache,
-                               BackendBuffer& scratch, BackendBuffer& out, uint32_t seq_len,
+                               BackendBuffer& out, uint32_t seq_len,
                                uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
                                float scale) = 0;
     virtual void gdn_gates(const BackendBuffer& alpha, const BackendBuffer& beta_raw,
@@ -226,12 +226,12 @@ class ComputeBackend {
     }
     virtual void attention_turbo3_causal(const BackendBuffer& q, uint32_t q_stride,
                                          uint32_t q_row_stride, const BackendBuffer& k_cache,
-                                         const BackendBuffer& v_cache, BackendBuffer& scratch,
+                                         const BackendBuffer& v_cache,
                                          BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                          uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
                                          float scale) {
         (void)q; (void)q_stride; (void)q_row_stride; (void)k_cache; (void)v_cache;
-        (void)scratch; (void)out; (void)base_len; (void)q_heads; (void)kv_heads;
+        (void)out; (void)base_len; (void)q_heads; (void)kv_heads;
         (void)head_dim; (void)tokens; (void)scale;
         throw std::runtime_error("q27: backend has no chunked execution");
     }

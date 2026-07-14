@@ -197,7 +197,6 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
     h_ = alloc_f32(N_EMBD); x1_ = alloc_f32(N_EMBD); y_ = alloc_f32(N_EMBD);
     qg_ = alloc_f32(2 * N_HEAD * HEAD_DIM); kbuf_ = alloc_f32(N_KV * HEAD_DIM);
     vbuf_ = alloc_f32(N_KV * HEAD_DIM); attn_out_ = alloc_f32(N_HEAD * HEAD_DIM);
-    attn_scratch_ = alloc_f32((uint64_t)N_HEAD * max_context_);
     qkv_ = alloc_f32(GDN_CH); z_ = alloc_f32(GDN_V); alpha_ = alloc_f32(GDN_HEADS);
     beta_raw_ = alloc_f32(GDN_HEADS); g_ = alloc_f32(GDN_HEADS); beta_ = alloc_f32(GDN_HEADS);
     conv_out_ = alloc_f32(GDN_CH); delta_out_ = alloc_f32(GDN_V); gated_out_ = alloc_f32(GDN_V);
@@ -213,10 +212,8 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
 
     // Layer-major chunked prefill routes projections through the simdgroup
     // GEMM, so it requires the same device family. The per-chunk activation
-    // buffers total a few MiB; the attention probability scratch is reserved
-    // at CHUNK_MAX rows but is only touched by the turbo3 chunk kernel now
-    // (FP16 chunk attention is online-softmax), so it stays physically lazy
-    // for FP16 runs at any context length.
+    // buffers total a few MiB. Every attention kernel is online-softmax now,
+    // so no probability scratch exists on any path at any context length.
     chunked_prefill_ = backend_.supports_quantized_matmul();
     if (chunked_prefill_) {
         ch_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
@@ -226,7 +223,6 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
         ckbuf_ = alloc_f32((uint64_t)CHUNK_MAX * N_KV * HEAD_DIM);
         cvbuf_ = alloc_f32((uint64_t)CHUNK_MAX * N_KV * HEAD_DIM);
         cattn_out_ = alloc_f32((uint64_t)CHUNK_MAX * N_HEAD * HEAD_DIM);
-        cattn_scratch_ = alloc_f32((uint64_t)CHUNK_MAX * N_HEAD * max_context_);
         cqkv_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_CH);
         cz_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_V);
         calpha_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
@@ -348,13 +344,13 @@ void MetalEngine::attention_block(uint32_t layer) {
         backend_.turbo_wht(*qg_, N_HEAD, 2 * HEAD_DIM, false);
         backend_.kv_store_turbo3(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, position_, N_KV);
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
-                                  *attn_scratch_, *attn_out_, position_ + 1, N_HEAD, N_KV,
+                                  *attn_out_, position_ + 1, N_HEAD, N_KV,
                                   HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
         backend_.kv_store_f16(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, position_, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
-                               *attn_scratch_, *attn_out_, position_ + 1, N_HEAD, N_KV,
+                               *attn_out_, position_ + 1, N_HEAD, N_KV,
                                HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
     }
     backend_.sigmoid_gate_mul(*attn_out_, *qg_, N_HEAD, HEAD_DIM);
@@ -436,7 +432,7 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
         backend_.kv_store_turbo3_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
                                       position_, N_KV, count);
         backend_.attention_turbo3_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
-                                         *state.k_cache, *state.v_cache, *cattn_scratch_,
+                                         *state.k_cache, *state.v_cache,
                                          *cattn_out_, position_ + 1, N_HEAD, N_KV,
                                          HEAD_DIM, count, scale);
         backend_.turbo_wht(*cattn_out_, count * N_HEAD, HEAD_DIM, true);
@@ -611,13 +607,13 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
         backend_.turbo_wht(*qg_, N_HEAD, 2 * HEAD_DIM, false);
         backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV);
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *mtp_k_cache_, *mtp_v_cache_,
-                                  *attn_scratch_, *attn_out_, position + 1, N_HEAD, N_KV,
+                                  *attn_out_, position + 1, N_HEAD, N_KV,
                                   HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
         backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *mtp_k_cache_, *mtp_v_cache_,
-                               *attn_scratch_, *attn_out_, position + 1, N_HEAD, N_KV,
+                               *attn_out_, position + 1, N_HEAD, N_KV,
                                HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
     }
     backend_.sigmoid_gate_mul(*attn_out_, *qg_, N_HEAD, HEAD_DIM);

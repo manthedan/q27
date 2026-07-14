@@ -80,7 +80,7 @@ class MetalEngine {
     std::vector<LayerState> layers_;
 
     std::shared_ptr<BackendBuffer> h_, x1_, y_;
-    std::shared_ptr<BackendBuffer> qg_, kbuf_, vbuf_, attn_out_, attn_scratch_;
+    std::shared_ptr<BackendBuffer> qg_, kbuf_, vbuf_, attn_out_;
     std::shared_ptr<BackendBuffer> qkv_, z_, alpha_, beta_raw_, g_, beta_, conv_out_;
     std::shared_ptr<BackendBuffer> delta_out_, gated_out_;
     std::shared_ptr<BackendBuffer> ffn_gate_, ffn_up_, logits_, token_out_;
@@ -91,7 +91,7 @@ class MetalEngine {
     // Layer-major chunked prefill state (CHUNK_MAX token rows per buffer).
     bool chunked_prefill_ = false;
     std::shared_ptr<BackendBuffer> ch_, cx1_, cy_;
-    std::shared_ptr<BackendBuffer> cqg_, ckbuf_, cvbuf_, cattn_out_, cattn_scratch_;
+    std::shared_ptr<BackendBuffer> cqg_, ckbuf_, cvbuf_, cattn_out_;
     std::shared_ptr<BackendBuffer> cqkv_, cz_, calpha_, cbeta_raw_, cg_, cbeta_, cconv_out_;
     std::shared_ptr<BackendBuffer> cdelta_out_, cgated_out_, cffn_gate_, cffn_up_;
     BackendQuantized cq5120_, cq6144_, cq17408_;
