@@ -4,8 +4,12 @@
 #include "metal_backend.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <unistd.h>
 #include <vector>
@@ -46,6 +50,11 @@ void check_range(uint64_t size, uint64_t offset, uint64_t bytes, const char* ope
         throw std::runtime_error(std::string("q27 Metal: buffer range error in ") + operation);
 }
 
+// Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
+// from that file at runtime, so a host binary built before a buffer-binding
+// change would otherwise misbind silently against a newer shader file.
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 2";
+
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
     NSMutableArray<NSString*>* candidates = [NSMutableArray array];
@@ -60,9 +69,14 @@ NSString* load_kernel_source() {
         NSString* source = [NSString stringWithContentsOfFile:path
                                                       encoding:NSUTF8StringEncoding
                                                          error:&error];
-        if (source) return source;
-        throw std::runtime_error("q27 Metal: cannot read shader source: " +
-                                 std::string(error.localizedDescription.UTF8String));
+        if (!source)
+            throw std::runtime_error("q27 Metal: cannot read shader source: " +
+                                     std::string(error.localizedDescription.UTF8String));
+        if (![source containsString:@(kShaderAbiTag)])
+            throw std::runtime_error(std::string("q27 Metal: shader ABI mismatch: ") +
+                                     path.UTF8String + " does not carry \"" + kShaderAbiTag +
+                                     "\"; rebuild this binary against the current shader source");
+        return source;
     }
     throw std::runtime_error("q27 Metal: src/metal/q27_kernels.metal not found "
                              "(set Q27_METAL_SOURCE)");
@@ -172,26 +186,66 @@ struct MetalBackend::Impl {
     id<MTLComputeCommandEncoder> encoder;
     bool batching = false;
 
+    // Q27_METAL_PROFILE=1: per-dispatch GPU-time attribution. Every operation
+    // runs in its own compute encoder bracketed by stage-boundary timestamp
+    // samples, so independent dispatches no longer overlap; absolute wall time
+    // is inflated, the per-kernel shares are the signal.
+    static constexpr uint32_t kMaxProfiledOps = 2048;
+    struct ProfileStat { uint64_t calls = 0; uint64_t ticks = 0; };
+    bool profile = false;
+    id<MTLCounterSampleBuffer> counter_buffer;
+    std::vector<const char*> op_labels;
+    std::map<std::string, ProfileStat> profile_stats;
+    uint64_t profiled_command_buffers = 0;
+    double gpu_busy_seconds = 0.0;
+    double cpu_wait_seconds = 0.0;
+    MTLTimestamp calibration_cpu = 0, calibration_gpu = 0;
+
     void start_command(bool explicit_batch) {
         if (encoder) throw std::runtime_error("q27 Metal: command batch already active");
         command = [queue commandBuffer];
-        encoder = [command computeCommandEncoder];
-        if (!command || !encoder) throw std::runtime_error("q27 Metal: command creation failed");
+        if (!command) throw std::runtime_error("q27 Metal: command creation failed");
+        if (profile) {
+            op_labels.clear();
+        } else {
+            encoder = [command computeCommandEncoder];
+            if (!encoder) throw std::runtime_error("q27 Metal: command creation failed");
+        }
         batching = explicit_batch;
     }
 
-    id<MTLComputeCommandEncoder> encoder_for_operation(bool& own_command) {
+    id<MTLComputeCommandEncoder> encoder_for_operation(bool& own_command, const char* label) {
         own_command = !batching;
         if (own_command) start_command(false);
+        if (profile) {
+            if (op_labels.size() >= kMaxProfiledOps) {
+                // Split the batch so the sample buffer never overflows; the
+                // queue preserves ordering across the two command buffers.
+                const bool was_batching = batching;
+                finish_command("profiling split");
+                start_command(was_batching);
+            }
+            if (encoder) { [encoder endEncoding]; encoder = nil; }
+            MTLComputePassDescriptor* pass = [MTLComputePassDescriptor computePassDescriptor];
+            MTLComputePassSampleBufferAttachmentDescriptor* attachment = pass.sampleBufferAttachments[0];
+            attachment.sampleBuffer = counter_buffer;
+            attachment.startOfEncoderSampleIndex = op_labels.size() * 2;
+            attachment.endOfEncoderSampleIndex = op_labels.size() * 2 + 1;
+            encoder = [command computeCommandEncoderWithDescriptor:pass];
+            if (!encoder) throw std::runtime_error("q27 Metal: profiled encoder creation failed");
+            op_labels.push_back(label);
+        }
         return encoder;
     }
 
     void finish_command(const char* label) {
-        if (!encoder || !command) throw std::runtime_error("q27 Metal: no active command batch");
-        [encoder endEncoding];
-        encoder = nil;
+        if (!command || (!encoder && !profile))
+            throw std::runtime_error("q27 Metal: no active command batch");
+        if (encoder) { [encoder endEncoding]; encoder = nil; }
+        const auto wait_start = std::chrono::steady_clock::now();
         [command commit];
         [command waitUntilCompleted];
+        cpu_wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_start).count();
         if (command.status == MTLCommandBufferStatusError) {
             std::string message = std::string("q27 Metal: ") + label + " failed";
             if (command.error) message += ": " + std::string(command.error.localizedDescription.UTF8String);
@@ -199,8 +253,57 @@ struct MetalBackend::Impl {
             batching = false;
             throw std::runtime_error(message);
         }
+        if (profile) resolve_profile_samples();
         command = nil;
         batching = false;
+    }
+
+    void resolve_profile_samples() {
+        profiled_command_buffers++;
+        if (command.GPUEndTime > command.GPUStartTime)
+            gpu_busy_seconds += command.GPUEndTime - command.GPUStartTime;
+        if (op_labels.empty()) return;
+        NSData* data = [counter_buffer resolveCounterRange:NSMakeRange(0, op_labels.size() * 2)];
+        if (data && data.length >= op_labels.size() * 2 * sizeof(MTLCounterResultTimestamp)) {
+            const auto* samples = (const MTLCounterResultTimestamp*)data.bytes;
+            for (size_t i = 0; i < op_labels.size(); i++) {
+                const uint64_t begin = samples[2 * i].timestamp, end = samples[2 * i + 1].timestamp;
+                if (begin == MTLCounterErrorValue || end == MTLCounterErrorValue || end < begin) continue;
+                ProfileStat& stat = profile_stats[op_labels[i]];
+                stat.calls++;
+                stat.ticks += end - begin;
+            }
+        }
+        op_labels.clear();
+    }
+
+    void report_profile() {
+        if (!profile || profile_stats.empty()) return;
+        // Convert GPU timestamp ticks to nanoseconds with a session-spanning
+        // calibration pair; on Apple Silicon the timebase is usually already
+        // nanoseconds, but that is not contractual.
+        MTLTimestamp cpu_now = 0, gpu_now = 0;
+        [device sampleTimestamps:&cpu_now gpuTimestamp:&gpu_now];
+        double ns_per_tick = 1.0;
+        if (gpu_now > calibration_gpu && cpu_now > calibration_cpu)
+            ns_per_tick = double(cpu_now - calibration_cpu) / double(gpu_now - calibration_gpu);
+        std::vector<std::pair<std::string, ProfileStat>> rows(profile_stats.begin(), profile_stats.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
+        double total_ns = 0.0;
+        uint64_t total_calls = 0;
+        for (const auto& row : rows) { total_ns += double(row.second.ticks) * ns_per_tick; total_calls += row.second.calls; }
+        fprintf(stderr, "q27 Metal profile (per-op encoders; overlap suppressed, shares are the signal)\n");
+        fprintf(stderr, "%-36s %10s %12s %10s %6s\n", "kernel", "calls", "total ms", "avg us", "share");
+        for (const auto& row : rows) {
+            const double ns = double(row.second.ticks) * ns_per_tick;
+            fprintf(stderr, "%-36s %10llu %12.2f %10.1f %5.1f%%\n", row.first.c_str(),
+                    (unsigned long long)row.second.calls, ns / 1e6,
+                    ns / 1e3 / double(row.second.calls), 100.0 * ns / total_ns);
+        }
+        fprintf(stderr, "%-36s %10llu %12.2f\n", "total sampled", (unsigned long long)total_calls, total_ns / 1e6);
+        fprintf(stderr, "command buffers %llu, GPU busy %.3f s, CPU wait %.3f s\n",
+                (unsigned long long)profiled_command_buffers, gpu_busy_seconds, cpu_wait_seconds);
     }
 };
 
@@ -277,10 +380,37 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
         impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
         impl_->argmax_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_argmax_rows");
+
+        if (const char* env = getenv("Q27_METAL_PROFILE"); env && *env && *env != '0') {
+            id<MTLCounterSet> timestamps = nil;
+            for (id<MTLCounterSet> set in impl_->device.counterSets)
+                if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) timestamps = set;
+            if (timestamps &&
+                [impl_->device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+                MTLCounterSampleBufferDescriptor* descriptor = [MTLCounterSampleBufferDescriptor new];
+                descriptor.counterSet = timestamps;
+                descriptor.storageMode = MTLStorageModeShared;
+                descriptor.sampleCount = Impl::kMaxProfiledOps * 2;
+                NSError* error = nil;
+                impl_->counter_buffer = [impl_->device newCounterSampleBufferWithDescriptor:descriptor
+                                                                                       error:&error];
+            }
+            if (impl_->counter_buffer) {
+                impl_->profile = true;
+                [impl_->device sampleTimestamps:&impl_->calibration_cpu
+                                    gpuTimestamp:&impl_->calibration_gpu];
+                fprintf(stderr, "q27 Metal: per-dispatch profiling enabled\n");
+            } else {
+                fprintf(stderr, "q27 Metal: Q27_METAL_PROFILE set but stage-boundary "
+                                "timestamp sampling is unavailable; profiling disabled\n");
+            }
+        }
     }
 }
 
-MetalBackend::~MetalBackend() = default;
+MetalBackend::~MetalBackend() {
+    @autoreleasepool { impl_->report_profile(); }
+}
 
 std::string MetalBackend::name() const {
     return std::string(impl_->device.name.UTF8String);
@@ -324,7 +454,7 @@ void MetalBackend::copy(const BackendBuffer& src, uint64_t src_offset,
     if (!bytes) return;
     if (bytes > UINT32_MAX) throw std::runtime_error("q27 Metal: single copy exceeds kernel limit");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->copy_bytes];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_copy_bytes"); [enc setComputePipelineState:impl_->copy_bytes];
         [enc setBuffer:sb.handle() offset:(NSUInteger)src_offset atIndex:0];
         [enc setBuffer:db.handle() offset:(NSUInteger)dst_offset atIndex:1];
         [enc setBytes:&bytes length:sizeof(bytes) atIndex:2];
@@ -429,11 +559,12 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     if (weight.dtype == DType::Q4_G64) data_bytes /= 2;
     check_range(data.size(), weight.data_offset, data_bytes, "matvec weight");
     id<MTLComputePipelineState> pipeline = nil;
+    const char* label = nullptr;
     switch (weight.dtype) {
-        case DType::F32: pipeline = impl_->f32; break;
-        case DType::F16: pipeline = impl_->f16; break;
-        case DType::Q8_G128: pipeline = impl_->q8; break;
-        case DType::Q4_G64: pipeline = impl_->q4; break;
+        case DType::F32: pipeline = impl_->f32; label = "q27_matvec_f32"; break;
+        case DType::F16: pipeline = impl_->f16; label = "q27_matvec_f16"; break;
+        case DType::Q8_G128: pipeline = impl_->q8; label = "q27_matvec_q8_g128"; break;
+        case DType::Q4_G64: pipeline = impl_->q4; label = "q27_matvec_q4_g64"; break;
     }
     const MetalBuffer* quant_scales = nullptr;
     if (weight.dtype == DType::Q8_G128 || weight.dtype == DType::Q4_G64) {
@@ -446,9 +577,8 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
 
     MatvecArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols, 8};
     @autoreleasepool {
-        const bool own_command = !impl_->batching;
-        if (own_command) impl_->start_command(false);
-        id<MTLComputeCommandEncoder> encoder = impl_->encoder;
+        bool own_command;
+        id<MTLComputeCommandEncoder> encoder = impl_->encoder_for_operation(own_command, label);
         [encoder setComputePipelineState:pipeline];
         if (weight.dtype == DType::F32 || weight.dtype == DType::F16) {
             [encoder setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
@@ -486,11 +616,11 @@ void MetalBackend::matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
     check_range(bd.size(),b.data_offset,b.rows*b.cols*2,"fused matvec weight B");
     MatvecPairArgs args{(uint32_t)a.rows,(uint32_t)b.rows,(uint32_t)a.cols,8};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->f16_pair];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_matvec_f16_pair"); [enc setComputePipelineState:impl_->f16_pair];
         [enc setBuffer:ad.handle() offset:(NSUInteger)a.data_offset atIndex:0]; [enc setBuffer:ao.handle() offset:0 atIndex:1];
         [enc setBuffer:bd.handle() offset:(NSUInteger)b.data_offset atIndex:2]; [enc setBuffer:bo.handle() offset:0 atIndex:3];
         [enc setBuffer:input.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(std::max(a.rows,b.rows)+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)std::max(a.rows,b.rows),1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("fused matvec pair");
     }
 }
@@ -509,7 +639,7 @@ void MetalBackend::quantize(const BackendBuffer& x, BackendQuantized& out) {
     check_range(xb.size(),0,(uint64_t)out.count*4,"quantize input"); check_range(values.size(),0,out.count,"quantize values");
     check_range(scales.size(),0,(uint64_t)(out.count/32)*4,"quantize scales");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->quantize];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_quantize_x"); [enc setComputePipelineState:impl_->quantize];
         [enc setBuffer:xb.handle() offset:0 atIndex:0]; [enc setBuffer:values.handle() offset:0 atIndex:1];
         [enc setBuffer:scales.handle() offset:0 atIndex:2]; [enc setBytes:&out.count length:4 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(out.count/32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
@@ -536,7 +666,7 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
     check_range(xv.size(),0,x.count,"quantized matvec values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matvec activation scales");
     MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,8};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own);
+        bool own; auto enc=impl_->encoder_for_operation(own, weight.dtype==DType::Q8_G128?"q27_matvec_q8_quantized":"q27_matvec_q4_quantized");
         [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized:impl_->q4_quantized];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
@@ -580,7 +710,7 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
     check_range(xv.size(),0,x.count,"quantized matmul values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matmul scales");
     MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own);
+        bool own; auto enc=impl_->encoder_for_operation(own, weight.dtype==DType::Q8_G128?"q27_matmul_q8_simdgroup":"q27_matmul_q4_simdgroup");
         [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:impl_->q4_quantized_matmul];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
@@ -604,7 +734,7 @@ void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
                 weight.rows * (weight.cols / 128) * 2, "embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
-        bool own; id<MTLComputeCommandEncoder> enc = impl_->encoder_for_operation(own);
+        bool own; id<MTLComputeCommandEncoder> enc = impl_->encoder_for_operation(own, "q27_embedding_q8");
         [enc setComputePipelineState:impl_->embedding];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
@@ -626,7 +756,7 @@ void MetalBackend::rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
     check_range(w.size(), weight.data_offset, (uint64_t)n * 4, "rmsnorm weight");
     VectorArgs args{n, 8, eps};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_rmsnorm");
         [enc setComputePipelineState:impl_->rms];
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
@@ -649,7 +779,7 @@ void MetalBackend::rmsnorm_quantized(const BackendBuffer& x,const BackendTensor&
     check_range(w.size(),weight.data_offset,(uint64_t)n*4,"fused rmsnorm weight"); check_range(values.size(),0,n,"fused rmsnorm values");
     check_range(scales.size(),0,(uint64_t)(n/32)*4,"fused rmsnorm scales"); VectorArgs args{n,8,eps};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->rms_quantized];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_rmsnorm_quantized"); [enc setComputePipelineState:impl_->rms_quantized];
         [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2]; [enc setBuffer:values.handle() offset:0 atIndex:3];
         [enc setBuffer:scales.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
@@ -667,7 +797,7 @@ void MetalBackend::rmsnorm_heads(BackendBuffer& x, const BackendTensor& weight,
     check_range(w.size(), weight.data_offset, (uint64_t)head_dim * 4, "head rmsnorm weight");
     HeadArgs args{heads, head_dim, stride, 8, eps};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_rmsnorm_heads");
         [enc setComputePipelineState:impl_->rms_heads];
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
@@ -683,7 +813,7 @@ void MetalBackend::l2norm_heads(BackendBuffer& x, uint32_t heads, uint32_t head_
     check_range(input.size(), 0, (uint64_t)heads * head_dim * 4, "l2norm input");
     HeadArgs args{heads, head_dim, head_dim, 8, eps};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_l2norm_heads");
         [enc setComputePipelineState:impl_->l2_heads];
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBytes:&args length:sizeof(args) atIndex:1];
@@ -699,7 +829,7 @@ void MetalBackend::silu_mul(const BackendBuffer& gate, const BackendBuffer& up,
     check_range(g.size(),0,(uint64_t)n*4,"silu gate"); check_range(u.size(),0,(uint64_t)n*4,"silu up");
     check_range(o.size(),0,(uint64_t)n*4,"silu output");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->silu];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_silu_mul"); [enc setComputePipelineState:impl_->silu];
         [enc setBuffer:g.handle() offset:0 atIndex:0]; [enc setBuffer:u.handle() offset:0 atIndex:1];
         [enc setBuffer:o.handle() offset:0 atIndex:2]; [enc setBytes:&n length:4 atIndex:3];
         [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
@@ -711,7 +841,7 @@ void MetalBackend::add_inplace(BackendBuffer& x, const BackendBuffer& y, uint32_
     MetalBuffer& a=metal_buffer(x); const MetalBuffer& b=metal_buffer(y);
     check_range(a.size(),0,(uint64_t)n*4,"add x"); check_range(b.size(),0,(uint64_t)n*4,"add y");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->add];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_add_inplace"); [enc setComputePipelineState:impl_->add];
         [enc setBuffer:a.handle() offset:0 atIndex:0]; [enc setBuffer:b.handle() offset:0 atIndex:1];
         [enc setBytes:&n length:4 atIndex:2];
         [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
@@ -726,7 +856,7 @@ void MetalBackend::concat(const BackendBuffer& a, uint32_t a_count,
     check_range(ab.size(),0,(uint64_t)a_count*4,"concat a"); check_range(bb.size(),0,(uint64_t)b_count*4,"concat b");
     check_range(ob.size(),0,(uint64_t)(a_count+b_count)*4,"concat output"); ConcatArgs args{a_count,b_count};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->concat];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_concat"); [enc setComputePipelineState:impl_->concat];
         [enc setBuffer:ab.handle() offset:0 atIndex:0]; [enc setBuffer:bb.handle() offset:0 atIndex:1]; [enc setBuffer:ob.handle() offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof(args) atIndex:3];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)a_count+b_count,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
@@ -740,7 +870,7 @@ void MetalBackend::sigmoid_gate_mul(BackendBuffer& out, const BackendBuffer& qg,
     const uint32_t n=heads*head_dim; GateArgs args{heads,head_dim};
     check_range(o.size(),0,(uint64_t)n*4,"sigmoid output"); check_range(gates.size(),0,(uint64_t)n*2*4,"sigmoid gates");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->sigmoid_gate];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_sigmoid_gate_mul"); [enc setComputePipelineState:impl_->sigmoid_gate];
         [enc setBuffer:o.handle() offset:0 atIndex:0]; [enc setBuffer:gates.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
         [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
@@ -755,7 +885,7 @@ void MetalBackend::rope_neox(BackendBuffer& x, uint32_t heads, uint32_t head_dim
     MetalBuffer& input=metal_buffer(x); RopeArgs args{heads,head_dim,n_rot,stride,position,freq_base};
     check_range(input.size(),0,((uint64_t)(heads-1)*stride+head_dim)*4,"rope input");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->rope];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_rope_neox"); [enc setComputePipelineState:impl_->rope];
         [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBytes:&args length:sizeof(args) atIndex:1];
         [enc dispatchThreads:MTLSizeMake(n_rot/2,heads,1) threadsPerThreadgroup:MTLSizeMake(n_rot/2,1,1)];
         if(own) impl_->finish_command("rope");
@@ -766,7 +896,7 @@ void MetalBackend::argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out
     const MetalBuffer& input=metal_buffer(x); MetalBuffer& output=metal_buffer(out_index);
     check_range(input.size(),0,(uint64_t)n*4,"argmax input"); check_range(output.size(),0,4,"argmax output");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->argmax];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_argmax"); [enc setComputePipelineState:impl_->argmax];
         [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&n length:4 atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
@@ -784,7 +914,7 @@ void MetalBackend::kv_store_f16(const BackendBuffer& k, const BackendBuffer& v,
     check_range(vc.size(),(uint64_t)position*row_length*2,(uint64_t)row_length*2,"V cache");
     KvStoreArgs args{position,row_length};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->kv_store];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_kv_store_f16"); [enc setComputePipelineState:impl_->kv_store];
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
@@ -800,7 +930,7 @@ void MetalBackend::turbo_wht(BackendBuffer& x, uint32_t heads, uint32_t stride,
     check_range(xb.size(), 0, ((uint64_t)(heads - 1) * stride + 256) * 4, "turbo3 WHT");
     TurboWhtArgs args{heads, stride, inverse ? 1u : 0u};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->turbo_wht];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_turbo_wht"); [enc setComputePipelineState:impl_->turbo_wht];
         [enc setBuffer:xb.handle() offset:0 atIndex:0]; [enc setBytes:&args length:sizeof(args) atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)heads*2,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
         if(own) impl_->finish_command("turbo3 WHT");
@@ -820,7 +950,7 @@ void MetalBackend::kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& 
     check_range(vc.size(),(uint64_t)position*row_bytes,row_bytes,"turbo3 V cache");
     TurboStoreArgs args{position,kv_heads};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->kv_store_turbo3];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_kv_store_turbo3"); [enc setComputePipelineState:impl_->kv_store_turbo3];
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
@@ -845,7 +975,7 @@ void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
     check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"turbo3 attention output");
     AttentionArgs args{q_stride,seq_len,q_heads,kv_heads,head_dim,scale};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->attention_turbo3];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_turbo3"); [enc setComputePipelineState:impl_->attention_turbo3];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:prob.handle() offset:0 atIndex:3]; [enc setBuffer:output.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
@@ -858,18 +988,20 @@ void MetalBackend::attention_f16(const BackendBuffer& q, uint32_t q_stride,
                                   BackendBuffer& scratch, BackendBuffer& out, uint32_t seq_len,
                                   uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
                                   float scale) {
-    if (!seq_len || !kv_heads || q_heads%kv_heads) throw std::runtime_error("q27 Metal: invalid attention dimensions");
+    if (!seq_len || !kv_heads || q_heads%kv_heads || !head_dim || head_dim > 256)
+        throw std::runtime_error("q27 Metal: invalid attention dimensions");
+    (void)scratch; // online softmax: decode attention no longer materializes probabilities
     const MetalBuffer& qb=metal_buffer(q); const MetalBuffer& kc=metal_buffer(k_cache); const MetalBuffer& vc=metal_buffer(v_cache);
-    MetalBuffer& prob=metal_buffer(scratch); MetalBuffer& output=metal_buffer(out);
+    MetalBuffer& output=metal_buffer(out);
     check_range(qb.size(),0,((uint64_t)(q_heads-1)*q_stride+head_dim)*4,"attention Q");
     const uint64_t cache_bytes=(uint64_t)seq_len*kv_heads*head_dim*2;
     check_range(kc.size(),0,cache_bytes,"attention K cache"); check_range(vc.size(),0,cache_bytes,"attention V cache");
-    check_range(prob.size(),0,(uint64_t)q_heads*seq_len*4,"attention scratch"); check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"attention output");
+    check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"attention output");
     AttentionArgs args{q_stride,seq_len,q_heads,kv_heads,head_dim,scale};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->attention];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_f16"); [enc setComputePipelineState:impl_->attention];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
-        [enc setBuffer:prob.handle() offset:0 atIndex:3]; [enc setBuffer:output.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("FP16 attention");
     }
@@ -885,7 +1017,7 @@ void MetalBackend::gdn_gates(const BackendBuffer& alpha, const BackendBuffer& be
     check_range(go.size(),0,(uint64_t)heads*4,"GDN g"); check_range(bo.size(),0,(uint64_t)heads*4,"GDN beta");
     check_range(a.size(),ssm_a.data_offset,(uint64_t)heads*4,"GDN a"); check_range(dt.size(),ssm_dt.data_offset,(uint64_t)heads*4,"GDN dt");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->gates];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_gdn_gates"); [enc setComputePipelineState:impl_->gates];
         [enc setBuffer:ar.handle() offset:0 atIndex:0]; [enc setBuffer:br.handle() offset:0 atIndex:1];
         [enc setBuffer:a.handle() offset:(NSUInteger)ssm_a.data_offset atIndex:2]; [enc setBuffer:dt.handle() offset:(NSUInteger)ssm_dt.data_offset atIndex:3];
         [enc setBuffer:go.handle() offset:0 atIndex:4]; [enc setBuffer:bo.handle() offset:0 atIndex:5]; [enc setBytes:&heads length:4 atIndex:6];
@@ -901,7 +1033,7 @@ void MetalBackend::conv_step(const BackendBuffer& ring_src, BackendBuffer& ring_
     check_range(src.size(),0,(uint64_t)channels*3*4,"conv ring source"); check_range(dst.size(),0,(uint64_t)channels*3*4,"conv ring destination");
     check_range(q.size(),0,(uint64_t)channels*4,"conv input"); check_range(w.size(),conv_weight.data_offset,(uint64_t)channels*4*4,"conv weight"); check_range(o.size(),0,(uint64_t)channels*4,"conv output");
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->conv];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_conv_step"); [enc setComputePipelineState:impl_->conv];
         [enc setBuffer:src.handle() offset:0 atIndex:0]; [enc setBuffer:dst.handle() offset:0 atIndex:1]; [enc setBuffer:q.handle() offset:0 atIndex:2];
         [enc setBuffer:w.handle() offset:(NSUInteger)conv_weight.data_offset atIndex:3]; [enc setBuffer:o.handle() offset:0 atIndex:4]; [enc setBytes:&channels length:4 atIndex:5];
         [enc dispatchThreads:MTLSizeMake(channels,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; if(own) impl_->finish_command("GDN convolution");
@@ -921,7 +1053,7 @@ void MetalBackend::delta_step(const BackendBuffer& state_src, BackendBuffer& sta
     check_range(cv.size(),0,(uint64_t)(qk_heads*2+value_heads)*head_dim*4,"delta conv"); check_range(gb.size(),0,(uint64_t)value_heads*4,"delta g"); check_range(bb.size(),0,(uint64_t)value_heads*4,"delta beta"); check_range(o.size(),0,(uint64_t)value_heads*head_dim*4,"delta output");
     DeltaArgs args{value_heads,qk_heads,head_dim};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->delta];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_delta_step"); [enc setComputePipelineState:impl_->delta];
         [enc setBuffer:src.handle() offset:0 atIndex:0]; [enc setBuffer:dst.handle() offset:0 atIndex:1]; [enc setBuffer:cv.handle() offset:0 atIndex:2];
         [enc setBuffer:gb.handle() offset:0 atIndex:3]; [enc setBuffer:bb.handle() offset:0 atIndex:4]; [enc setBuffer:o.handle() offset:0 atIndex:5]; [enc setBytes:&args length:sizeof(args) atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(512,1,1)]; if(own) impl_->finish_command("DeltaNet recurrence");
@@ -936,7 +1068,7 @@ void MetalBackend::gated_norm_gdn(const BackendBuffer& x, const BackendTensor& w
     check_range(xb.size(),0,bytes,"GDN norm input"); check_range(gb.size(),0,bytes,"GDN norm gate"); check_range(o.size(),0,bytes,"GDN norm output"); check_range(w.size(),weight.data_offset,(uint64_t)head_dim*4,"GDN norm weight");
     HeadArgs args{heads,head_dim,head_dim,8,eps};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own); [enc setComputePipelineState:impl_->gated_norm];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_gated_norm_gdn"); [enc setComputePipelineState:impl_->gated_norm];
         [enc setBuffer:xb.handle() offset:0 atIndex:0]; [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1]; [enc setBuffer:gb.handle() offset:0 atIndex:2]; [enc setBuffer:o.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; if(own) impl_->finish_command("GDN gated norm");
     }
@@ -962,7 +1094,7 @@ void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t
     check_range(scales.size(), weight.scales_offset, weight.rows * (weight.cols / 128) * 2, "chunked embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_embedding_q8_rows");
         [enc setComputePipelineState:impl_->embedding_rows];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
@@ -989,7 +1121,7 @@ void MetalBackend::rmsnorm_rows_quantized(const BackendBuffer& x, const BackendT
     check_range(scales.size(), 0, (total / 32) * 4, "chunked rmsnorm scales");
     RowsNormArgs args{n, rows, 8, eps};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_rmsnorm_rows_quantized");
         [enc setComputePipelineState:impl_->rms_rows_quantized];
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
@@ -1019,12 +1151,12 @@ void MetalBackend::matvec_f16_pair_rows(const BackendTensor& a, BackendBuffer& a
     check_range(bd.size(), b.data_offset, b.rows * b.cols * 2, "chunked matvec weight B");
     MatvecPairRowsArgs args{(uint32_t)a.rows, (uint32_t)b.rows, (uint32_t)a.cols, rows};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_matvec_f16_pair_rows");
         [enc setComputePipelineState:impl_->f16_pair_rows];
         [enc setBuffer:ad.handle() offset:(NSUInteger)a.data_offset atIndex:0]; [enc setBuffer:ao.handle() offset:0 atIndex:1];
         [enc setBuffer:bd.handle() offset:(NSUInteger)b.data_offset atIndex:2]; [enc setBuffer:bo.handle() offset:0 atIndex:3];
         [enc setBuffer:input.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(std::max(a.rows,b.rows)+7)/8, rows, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)std::max(a.rows,b.rows), rows, 1)
                 threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked F16 matvec pair");
     }
@@ -1046,7 +1178,7 @@ void MetalBackend::gdn_gates_rows(const BackendBuffer& alpha, const BackendBuffe
     check_range(dt.size(), ssm_dt.data_offset, (uint64_t)heads * 4, "chunked GDN dt");
     GatesRowsArgs args{heads, tokens};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_gdn_gates_rows");
         [enc setComputePipelineState:impl_->gates_rows];
         [enc setBuffer:ar.handle() offset:0 atIndex:0]; [enc setBuffer:br.handle() offset:0 atIndex:1];
         [enc setBuffer:a.handle() offset:(NSUInteger)ssm_a.data_offset atIndex:2];
@@ -1071,7 +1203,7 @@ void MetalBackend::conv_chunk(BackendBuffer& ring, const BackendBuffer& qkv,
     check_range(o.size(), 0, (uint64_t)channels * tokens * 4, "chunked conv output");
     ConvChunkArgs args{channels, tokens};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_conv_chunk");
         [enc setComputePipelineState:impl_->conv_chunked];
         [enc setBuffer:rb.handle() offset:0 atIndex:0]; [enc setBuffer:q.handle() offset:0 atIndex:1];
         [enc setBuffer:w.handle() offset:(NSUInteger)conv_weight.data_offset atIndex:2];
@@ -1099,7 +1231,7 @@ void MetalBackend::delta_chunk(BackendBuffer& state, const BackendBuffer& conv,
     check_range(o.size(), 0, (uint64_t)value_heads * head_dim * tokens * 4, "chunked delta output");
     DeltaChunkArgs args{value_heads, qk_heads, head_dim, tokens};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_delta_chunk");
         [enc setComputePipelineState:impl_->delta_chunked];
         [enc setBuffer:sb.handle() offset:0 atIndex:0]; [enc setBuffer:cv.handle() offset:0 atIndex:1];
         [enc setBuffer:gb.handle() offset:0 atIndex:2]; [enc setBuffer:bb.handle() offset:0 atIndex:3];
@@ -1118,7 +1250,7 @@ void MetalBackend::l2norm_rows(BackendBuffer& x, uint32_t heads, uint32_t head_d
                 "chunked l2norm input");
     L2RowsArgs args{heads, head_dim, row_stride, tokens, eps};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_l2norm_rows");
         [enc setComputePipelineState:impl_->l2_rows];
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBytes:&args length:sizeof(args) atIndex:1];
@@ -1138,7 +1270,7 @@ void MetalBackend::rope_neox_rows(BackendBuffer& x, uint32_t heads, uint32_t hea
                 "chunked rope input");
     RopeRowsArgs args{heads, head_dim, n_rot, stride, row_stride, position, tokens, freq_base};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_rope_neox_rows");
         [enc setComputePipelineState:impl_->rope_rows];
         [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBytes:&args length:sizeof(args) atIndex:1];
         [enc dispatchThreads:MTLSizeMake(n_rot/2,heads,tokens) threadsPerThreadgroup:MTLSizeMake(n_rot/2,1,1)];
@@ -1158,7 +1290,7 @@ void MetalBackend::kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer
     check_range(vc.size(), (uint64_t)position * row_length * 2, (uint64_t)row_length * tokens * 2, "chunked V cache");
     KvStoreRowsArgs args{position, row_length, tokens};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_f16_rows");
         [enc setComputePipelineState:impl_->kv_store_rows];
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
@@ -1182,7 +1314,7 @@ void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuf
     check_range(vc.size(), (uint64_t)position * row_bytes, row_bytes * tokens, "chunked turbo3 V cache");
     TurboStoreRowsArgs args{position, kv_heads, tokens};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_turbo3_rows");
         [enc setComputePipelineState:impl_->kv_store_turbo3_rows];
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
@@ -1215,7 +1347,7 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked attention output");
     AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, scale};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_f16_causal");
         [enc setComputePipelineState:impl_->attention_causal];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2]; [enc setBuffer:prob.handle() offset:0 atIndex:3];
@@ -1247,7 +1379,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked turbo3 attention output");
     AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, scale};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_turbo3_causal");
         [enc setComputePipelineState:impl_->attention_turbo3_causal_p];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2]; [enc setBuffer:prob.handle() offset:0 atIndex:3];
@@ -1267,7 +1399,7 @@ void MetalBackend::sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer
     check_range(gates.size(), 0, n * 2 * 4, "chunked sigmoid gates");
     GateRowsArgs args{heads, head_dim, tokens};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_sigmoid_gate_mul_rows");
         [enc setComputePipelineState:impl_->sigmoid_gate_rows];
         [enc setBuffer:o.handle() offset:0 atIndex:0]; [enc setBuffer:gates.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
@@ -1284,7 +1416,7 @@ void MetalBackend::argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows
     check_range(output.size(), 0, (uint64_t)rows * 4, "chunked argmax output");
     ArgmaxRowsArgs args{n, rows};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own);
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_argmax_rows");
         [enc setComputePipelineState:impl_->argmax_rows_p];
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBuffer:output.handle() offset:0 atIndex:1];

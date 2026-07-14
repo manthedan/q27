@@ -144,6 +144,65 @@ int test_attention(q27::MetalBackend& backend) {
     return failures;
 }
 
+// Production-shape gate for the online-softmax decode kernel: 24:4 GQA at
+// head_dim 256 with sequence lengths that exercise unequal simdgroup stripes
+// (133), empty stripes (5), and running-max updates (scores swing sign and
+// magnitude across positions). The tiny test above cannot reach any of that.
+int test_attention_production_shape(q27::MetalBackend& backend) {
+    int failures = 0;
+    uint32_t lcg = 12345;
+    auto uniform = [&]() { lcg = lcg * 1664525u + 1013904223u; return (float)(lcg >> 8) / 8388608.0f - 1.0f; };
+    for (uint32_t seq : {5u, 133u}) {
+        constexpr uint32_t qh = 24, kvh = 4, dim = 256, stride = 2 * dim;
+        const float scale = 1.0f / 16.0f;
+        std::vector<std::vector<float>> keys(seq), vals(seq);
+        auto kc = backend.allocate((uint64_t)seq * kvh * dim * 2);
+        auto vc = backend.allocate((uint64_t)seq * kvh * dim * 2);
+        for (uint32_t p = 0; p < seq; p++) {
+            keys[p].resize(kvh * dim); vals[p].resize(kvh * dim);
+            // Alternate key magnitudes so the running maximum keeps moving.
+            const float magnitude = (p % 3 == 0) ? 2.5f : 0.4f;
+            for (auto& value : keys[p]) value = uniform() * magnitude;
+            for (auto& value : vals[p]) value = uniform() * 3.0f;
+            auto kb = upload_buffer(backend, keys[p]), vb = upload_buffer(backend, vals[p]);
+            backend.kv_store_f16(*kb, *vb, *kc, *vc, p, kvh * dim);
+        }
+        // Half-precision K/V for the CPU reference, matching what the cache holds.
+        auto as_half = [](float v) { return (float)(_Float16)v; };
+        std::vector<float> q((uint64_t)qh * stride);
+        for (auto& value : q) value = uniform() * 1.5f;
+        auto qb = upload_buffer(backend, q);
+        auto scratch = backend.allocate((uint64_t)qh * seq * 4);
+        auto out = backend.allocate((uint64_t)qh * dim * 4);
+        backend.attention_f16(*qb, stride, *kc, *vc, *scratch, *out, seq, qh, kvh, dim, scale);
+        auto got = read_f32(backend, *out, (uint64_t)qh * dim);
+        for (uint32_t h = 0; h < qh; h++) {
+            const uint32_t kh = h / (qh / kvh);
+            std::vector<float> s(seq);
+            float mx = -1e30f;
+            for (uint32_t p = 0; p < seq; p++) {
+                s[p] = 0;
+                for (uint32_t d = 0; d < dim; d++) s[p] += q[h * stride + d] * as_half(keys[p][kh * dim + d]);
+                s[p] *= scale;
+                mx = std::max(mx, s[p]);
+            }
+            float den = 0;
+            for (float& value : s) { value = std::exp(value - mx); den += value; }
+            for (float& value : s) value /= den;
+            for (uint32_t d = 0; d < dim; d++) {
+                float want = 0;
+                for (uint32_t p = 0; p < seq; p++) want += s[p] * as_half(vals[p][kh * dim + d]);
+                if (!near(got[h * dim + d], want, 2e-3f)) {
+                    fprintf(stderr, "attention prod seq=%u [%u,%u] got %.8g want %.8g\n",
+                            seq, h, d, got[h * dim + d], want);
+                    failures++;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 int test_turbo3(q27::MetalBackend& backend) {
     constexpr uint32_t seq=3,qh=2,kvh=1,dim=256,stride=256;
     int failures=0;
@@ -594,6 +653,7 @@ int main() {
     try {
         q27::MetalBackend backend;
         int failures = test_primitives(backend) + test_attention(backend) +
+                       test_attention_production_shape(backend) +
                        test_turbo3(backend) + test_gdn(backend) + test_chunked(backend);
         if (failures) { fprintf(stderr, "Metal ops: %d failure(s)\n", failures); return 1; }
         puts("Metal decode primitives, FP16/turbo3 attention, GDN, and chunked prefill ops: OK");

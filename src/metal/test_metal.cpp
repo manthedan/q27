@@ -309,6 +309,52 @@ int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
 // never reach it; this caught a wrong per-lane activation-scale index that
 // the 64/128-column tests could not see. Scales are deliberately varied per
 // weight group and per 32-column activation block.
+// Wide-shape gate for the threadgroup-per-row F16 pair kernel: the packed
+// vector main loop and the 8-simdgroup reduction tree only fill up past a few
+// hundred columns, so this runs the production alpha/beta shape (48 x 5120),
+// an odd width that leaves a scalar tail, and asymmetric row counts.
+int test_f16_pair_wide(q27::MetalBackend& backend) {
+    for (uint32_t cols : {1030u, 5120u}) {
+        constexpr uint32_t rows_a = 48, rows_b = 16;
+        std::vector<_Float16> wa((size_t)rows_a * cols), wb((size_t)rows_b * cols);
+        for (size_t i = 0; i < wa.size(); i++) wa[i] = (_Float16)(((int)((i * 7) % 31) - 15) * 0.0625f);
+        for (size_t i = 0; i < wb.size(); i++) wb[i] = (_Float16)(((int)((i * 11) % 27) - 13) * 0.125f);
+        std::vector<float> x(cols);
+        for (uint32_t c = 0; c < cols; c++) x[c] = (float)((int)((c * 13) % 21) - 10) / 10.0f;
+
+        q27::Tensor ta; ta.name = "pair-wide-a"; ta.dtype = q27::DType::F16; ta.shape = {rows_a, cols};
+        ta.data = reinterpret_cast<const uint8_t*>(wa.data()); ta.data_size = wa.size() * 2;
+        q27::Tensor tb; tb.name = "pair-wide-b"; tb.dtype = q27::DType::F16; tb.shape = {rows_b, cols};
+        tb.data = reinterpret_cast<const uint8_t*>(wb.data()); tb.data_size = wb.size() * 2;
+        auto weight_a = backend.upload(ta);
+        auto weight_b = backend.upload(tb);
+        auto xb = backend.allocate(cols * 4);
+        backend.write(*xb, 0, x.data(), cols * 4);
+        auto ya = backend.allocate(rows_a * 4), yb = backend.allocate(rows_b * 4);
+        backend.matvec_pair(weight_a, *ya, weight_b, *yb, *xb);
+        std::vector<float> got_a(rows_a), got_b(rows_b);
+        backend.read(*ya, 0, got_a.data(), rows_a * 4);
+        backend.read(*yb, 0, got_b.data(), rows_b * 4);
+        for (uint32_t r = 0; r < rows_a; r++) {
+            double want = 0;
+            for (uint32_t c = 0; c < cols; c++) want += (double)(float)wa[(size_t)r * cols + c] * x[c];
+            if (!close(got_a[r], (float)want, 2e-3f)) {
+                fprintf(stderr, "F16 pair wide A cols=%u row %u: got %.7g want %.7g\n", cols, r, got_a[r], (float)want);
+                return 1;
+            }
+        }
+        for (uint32_t r = 0; r < rows_b; r++) {
+            double want = 0;
+            for (uint32_t c = 0; c < cols; c++) want += (double)(float)wb[(size_t)r * cols + c] * x[c];
+            if (!close(got_b[r], (float)want, 2e-3f)) {
+                fprintf(stderr, "F16 pair wide B cols=%u row %u: got %.7g want %.7g\n", cols, r, got_b[r], (float)want);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 int test_quantized_wide(q27::MetalBackend& backend, q27::DType dtype) {
     const uint32_t group = dtype == q27::DType::Q4_G64 ? 64 : 128;
     // main chunk + tail, then a production column count
@@ -434,6 +480,7 @@ int main() {
             test_q8(backend) || test_q4(backend) ||
             test_quantized_wide(backend, q27::DType::Q4_G64) ||
             test_quantized_wide(backend, q27::DType::Q8_G128) ||
+            test_f16_pair_wide(backend) ||
             test_mixed_pair(backend) ||
             (backend.supports_quantized_matmul() &&
              (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128))))

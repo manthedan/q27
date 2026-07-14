@@ -1,3 +1,11 @@
+// Q27_SHADER_ABI 2
+//
+// Shaders compile from this file at RUNTIME, so a host binary built before a
+// buffer-binding change silently misbinds against a newer file (this exact
+// mismatch produced coherent-but-wrong decode output on 2026-07-14). The tag
+// above names the binding layout; metal_backend.mm refuses to load a source
+// whose tag differs from the one it was compiled against. Bump both on any
+// change to kernel buffer indices or argument structs.
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
@@ -58,21 +66,50 @@ kernel void q27_matvec_f16(
     if (lane == 0) out[row] = sum;
 }
 
+// One 256-thread threadgroup per row pair. The production users are the
+// 48-row GDN alpha/beta projections; a simdgroup-per-row layout put only
+// 1,536 threads on the whole GPU and measured ~11 GB/s. packed_half4 keeps
+// 2-byte alignment so mmap-aliased tensor offsets stay valid.
 kernel void q27_matvec_f16_pair(
         device const half *weights_a [[buffer(0)]], device float *out_a [[buffer(1)]],
         device const half *weights_b [[buffer(2)]], device float *out_b [[buffer(3)]],
         device const float *x [[buffer(4)]], constant MatvecPairArgs &args [[buffer(5)]],
-        uint group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
-        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    const uint row=group*8+simdgroup; const ulong base=(ulong)row*args.cols;
-    float sa=0.0f,sb=0.0f;
-    for(uint col=lane;col<args.cols;col+=32) {
-        float xv=x[col];
-        if(row<args.rows_a) sa+=float(weights_a[base+col])*xv;
-        if(row<args.rows_b) sb+=float(weights_b[base+col])*xv;
+        uint row [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]], ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const bool row_a = row < args.rows_a, row_b = row < args.rows_b;
+    const ulong base = (ulong)row * args.cols;
+    device const packed_half4 *wa4 = (device const packed_half4 *)(weights_a + base);
+    device const packed_half4 *wb4 = (device const packed_half4 *)(weights_b + base);
+    const uint vectors = args.cols / 4;
+    float sa = 0.0f, sb = 0.0f;
+    for (uint v = tid; v < vectors; v += 256) {
+        const float4 xv = float4(x[v * 4], x[v * 4 + 1], x[v * 4 + 2], x[v * 4 + 3]);
+        if (row_a) sa += dot(float4(wa4[v]), xv);
+        if (row_b) sb += dot(float4(wb4[v]), xv);
     }
-    sa=simd_sum(sa); sb=simd_sum(sb);
-    if(lane==0) { if(row<args.rows_a) out_a[row]=sa; if(row<args.rows_b) out_b[row]=sb; }
+    for (uint col = vectors * 4 + tid; col < args.cols; col += 256) {
+        const float xv = x[col];
+        if (row_a) sa += float(weights_a[base + col]) * xv;
+        if (row_b) sb += float(weights_b[base + col]) * xv;
+    }
+    threadgroup float partial[8];
+    sa = simd_sum(sa);
+    if (lane == 0) partial[simdgroup] = sa;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        float total = lane < 8 ? partial[lane] : 0.0f;
+        total = simd_sum(total);
+        if (lane == 0 && row_a) out_a[row] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sb = simd_sum(sb);
+    if (lane == 0) partial[simdgroup] = sb;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        float total = lane < 8 ? partial[lane] : 0.0f;
+        total = simd_sum(total);
+        if (lane == 0 && row_b) out_b[row] = total;
+    }
 }
 
 kernel void q27_matvec_q8_g128(
@@ -331,42 +368,69 @@ struct AttentionArgs {
     uint head_dim;
     float scale;
 };
+// Online-softmax decode attention: one threadgroup per query head, eight
+// simdgroups striping the sequence. Each simdgroup keeps a running
+// (max, denominator, weighted-value) triple entirely in registers — one
+// lane holds head_dim/32 output dims — and the eight partials merge through
+// threadgroup memory in log2 rounds. No probability scratch is materialized,
+// so the cost is one streaming pass over the head's K and V rows.
 kernel void q27_attention_f16(device const float *q [[buffer(0)]],
                                device const half *kc [[buffer(1)]],
                                device const half *vc [[buffer(2)]],
-                               device float *prob     [[buffer(3)]],
-                               device float *out      [[buffer(4)]],
-                               constant AttentionArgs &args [[buffer(5)]],
+                               device float *out      [[buffer(3)]],
+                               constant AttentionArgs &args [[buffer(4)]],
                                uint qh [[threadgroup_position_in_grid]],
-                               uint tid [[thread_index_in_threadgroup]]) {
+                               ushort lane [[thread_index_in_simdgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]]) {
     if (qh >= args.q_heads) return;
     const uint gqa = args.q_heads / args.kv_heads;
     const uint kvh = qh / gqa;
     device const float *qh_ptr = q + (ulong)qh * args.q_stride;
-    device float *ph = prob + (ulong)qh * args.seq_len;
-    if (tid == 0) {
-        float maximum = -INFINITY;
-        for (uint p = 0; p < args.seq_len; p++) {
-            device const half *kh = kc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
-            float score = 0.0f;
-            for (uint d = 0; d < args.head_dim; d++) score += qh_ptr[d] * float(kh[d]);
-            score *= args.scale;
-            ph[p] = score;
-            maximum = max(maximum, score);
-        }
-        float denominator = 0.0f;
-        for (uint p = 0; p < args.seq_len; p++) { ph[p] = exp(ph[p] - maximum); denominator += ph[p]; }
-        const float inv = 1.0f / denominator;
-        for (uint p = 0; p < args.seq_len; p++) ph[p] *= inv;
+
+    float acc[8];                       // head_dim <= 256 -> at most 8 dims per lane
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint p = sg; p < args.seq_len; p += 8) {
+        device const half *kh = kc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
+        float partial = 0.0f;
+        for (uint d = lane; d < args.head_dim; d += 32) partial += qh_ptr[d] * float(kh[d]);
+        const float score = simd_sum(partial) * args.scale;
+        const float m_new = max(m, score);
+        const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
+        const float weight = exp(score - m_new);
+        l = l * correction + weight;
+        device const half *vh = vc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
+        for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+            acc[i] = acc[i] * correction + weight * float(vh[d]);
+        m = m_new;
     }
-    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    for (uint d = tid; d < args.head_dim; d += 256) {
-        float value = 0.0f;
-        for (uint p = 0; p < args.seq_len; p++) {
-            device const half *vh = vc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
-            value += ph[p] * float(vh[d]);
+
+    // Merge the eight simdgroup partials: rounds of 4, 2, 1. A simdgroup that
+    // saw no positions carries m = -inf, l = 0 and merges as a no-op.
+    threadgroup float tg_m[4], tg_l[4], tg_acc[4][256];
+    for (uint offset = 4; offset >= 1; offset /= 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg >= offset && sg < 2 * offset) {
+            if (lane == 0) { tg_m[sg - offset] = m; tg_l[sg - offset] = l; }
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                tg_acc[sg - offset][d] = acc[i];
         }
-        out[(ulong)qh * args.head_dim + d] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < offset) {
+            const float m_other = tg_m[sg], l_other = tg_l[sg];
+            const float m_new = max(m, m_other);
+            if (m_new == -INFINITY) continue;       // both stripes empty
+            const float c_mine = exp(m - m_new), c_other = exp(m_other - m_new);
+            l = l * c_mine + l_other * c_other;
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                acc[i] = acc[i] * c_mine + tg_acc[sg][d] * c_other;
+            m = m_new;
+        }
+    }
+    if (sg == 0) {
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+            out[(ulong)qh * args.head_dim + d] = acc[i] * inv;
     }
 }
 
@@ -728,27 +792,52 @@ kernel void q27_rmsnorm_rows_quantized(
     }
 }
 
+// Mirrors q27_matvec_f16_pair's per-row structure exactly (threadgroup per
+// row, packed_half4 dots, 8-partial tree) so chunked and serial results stay
+// bit-identical; the grid adds a token dimension.
 struct MatvecPairRowsArgs { uint rows_a; uint rows_b; uint cols; uint tokens; };
 kernel void q27_matvec_f16_pair_rows(
         device const half *weights_a [[buffer(0)]], device float *out_a [[buffer(1)]],
         device const half *weights_b [[buffer(2)]], device float *out_b [[buffer(3)]],
         device const float *x [[buffer(4)]], constant MatvecPairRowsArgs &args [[buffer(5)]],
-        uint2 group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
-        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    const uint row = group.x * 8 + simdgroup, token = group.y;
+        uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]], ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group.x, token = group.y;
     if (token >= args.tokens) return;
     device const float *xt = x + (ulong)token * args.cols;
+    const bool row_a = row < args.rows_a, row_b = row < args.rows_b;
     const ulong base = (ulong)row * args.cols;
+    device const packed_half4 *wa4 = (device const packed_half4 *)(weights_a + base);
+    device const packed_half4 *wb4 = (device const packed_half4 *)(weights_b + base);
+    const uint vectors = args.cols / 4;
     float sa = 0.0f, sb = 0.0f;
-    for (uint col = lane; col < args.cols; col += 32) {
-        float xv = xt[col];
-        if (row < args.rows_a) sa += float(weights_a[base + col]) * xv;
-        if (row < args.rows_b) sb += float(weights_b[base + col]) * xv;
+    for (uint v = tid; v < vectors; v += 256) {
+        const float4 xv = float4(xt[v * 4], xt[v * 4 + 1], xt[v * 4 + 2], xt[v * 4 + 3]);
+        if (row_a) sa += dot(float4(wa4[v]), xv);
+        if (row_b) sb += dot(float4(wb4[v]), xv);
     }
-    sa = simd_sum(sa); sb = simd_sum(sb);
-    if (lane == 0) {
-        if (row < args.rows_a) out_a[(ulong)token * args.rows_a + row] = sa;
-        if (row < args.rows_b) out_b[(ulong)token * args.rows_b + row] = sb;
+    for (uint col = vectors * 4 + tid; col < args.cols; col += 256) {
+        const float xv = xt[col];
+        if (row_a) sa += float(weights_a[base + col]) * xv;
+        if (row_b) sb += float(weights_b[base + col]) * xv;
+    }
+    threadgroup float partial[8];
+    sa = simd_sum(sa);
+    if (lane == 0) partial[simdgroup] = sa;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        float total = lane < 8 ? partial[lane] : 0.0f;
+        total = simd_sum(total);
+        if (lane == 0 && row_a) out_a[(ulong)token * args.rows_a + row] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sb = simd_sum(sb);
+    if (lane == 0) partial[simdgroup] = sb;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        float total = lane < 8 ? partial[lane] : 0.0f;
+        total = simd_sum(total);
+        if (lane == 0 && row_b) out_b[(ulong)token * args.rows_b + row] = total;
     }
 }
 
