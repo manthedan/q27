@@ -267,11 +267,13 @@ int test_q4(q27::MetalBackend& backend) {
     return 0;
 }
 
-// The packed-dot rows GEMM mirrors the GEMV accumulation order exactly, so
-// every comparison below is bit-exact. Shapes cover the narrow tail-only
-// path (256), the vectorized main loop (1024+), and a main-loop-plus-tail
-// width (1152 = 1024 + 128), per the width-gated fast-path lesson: a gate
-// shape must actually enter the fast path it gates.
+// The tiled simdgroup-matrix GEMM keeps the weight side integer-exact and
+// rounds the activation side once per value at staging, but accumulates
+// K-tiles in a different float-addition order than the serial GEMV, so the
+// comparison is tolerance-based. Shapes cover several K-tile counts, row
+// remainders against the 32-row tile (9, 17), and every token-group width,
+// per the width-gated fast-path lesson: a gate shape must actually enter
+// the fast path it gates.
 int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
                       uint32_t rows,uint32_t cols) {
     constexpr uint32_t tokens=12;
@@ -303,7 +305,7 @@ int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
         auto q=backend.allocate_quantized(n*cols); auto out=backend.allocate((uint64_t)n*rows*4);
         backend.begin_commands(); backend.quantize(*all_x,q); backend.matmul_quantized(weight,q,n,*out); backend.end_commands();
         std::vector<float> got(n*rows); backend.read(*out,0,got.data(),got.size()*4);
-        for(size_t i=0;i<got.size();i++) if(got[i]!=reference[i]) {
+        for(size_t i=0;i<got.size();i++) if(!close(got[i],reference[i],3e-4f)) {
             fprintf(stderr,"%s matmul rows=%u cols=%u n=%u i=%zu got %.9g want %.9g\n",
                     q27::dtype_name(dtype),rows,cols,n,i,got[i],reference[i]); return 1;
         }
