@@ -14,6 +14,7 @@
 
 #include "metal_backend.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -60,20 +61,25 @@ uint64_t tensor_bytes(const q27::BackendTensor& t) {
 }
 
 Synthetic make_quant(q27::MetalBackend& backend, uint32_t rows, uint32_t cols, DType dtype) {
+    // Fill the Metal buffer through a small staging slice instead of a full
+    // host copy, so even the 1.3 GiB head tensor never exists twice.
     Synthetic s;
     const uint64_t group = dtype == DType::Q8_G128 ? 128 : 64;
-    s.data.resize((uint64_t)rows * cols / (dtype == DType::Q4_G64 ? 2 : 1));
-    for (size_t i = 0; i < s.data.size(); i++) s.data[i] = (uint8_t)(i * 2654435761u >> 24);
+    const uint64_t data_bytes = (uint64_t)rows * cols / (dtype == DType::Q4_G64 ? 2 : 1);
+    s.tensor.dtype = dtype;
+    s.tensor.rows = rows;
+    s.tensor.cols = cols;
+    s.tensor.data = backend.allocate(data_bytes);
+    std::vector<uint8_t> slice(std::min<uint64_t>(data_bytes, 64ull << 20));
+    for (uint64_t offset = 0; offset < data_bytes; offset += slice.size()) {
+        const uint64_t chunk = std::min<uint64_t>(slice.size(), data_bytes - offset);
+        for (uint64_t i = 0; i < chunk; i++) slice[i] = (uint8_t)((offset + i) * 2654435761u >> 24);
+        backend.write(*s.tensor.data, offset, slice.data(), chunk);
+    }
     s.scales.assign((uint64_t)rows * (cols / group), 0x3c00 /* f16 1.0 */);
-    q27::Tensor t;
-    t.name = "synthetic";
-    t.dtype = dtype;
-    t.shape = {rows, cols};
-    t.data = s.data.data();
-    t.data_size = s.data.size();
-    t.scales = reinterpret_cast<const uint8_t*>(s.scales.data());
-    t.scales_size = s.scales.size() * sizeof(uint16_t);
-    s.tensor = backend.upload(t);
+    s.tensor.scales = backend.allocate(s.scales.size() * sizeof(uint16_t));
+    backend.write(*s.tensor.scales, 0, s.scales.data(), s.scales.size() * sizeof(uint16_t));
+    s.scales.clear(); s.scales.shrink_to_fit();
     return s;
 }
 
@@ -92,6 +98,10 @@ Synthetic make_f16(q27::MetalBackend& backend, uint32_t rows, uint32_t cols) {
     t.data = s.data.data();
     t.data_size = s.data.size();
     s.tensor = backend.upload(t);
+    // upload() copied the bytes into a Metal buffer; drop the host copy so the
+    // tool's footprint stays at one copy of the ~1.4 GiB weight set.
+    s.data.clear(); s.data.shrink_to_fit();
+    s.scales.clear(); s.scales.shrink_to_fit();
     return s;
 }
 
@@ -111,6 +121,10 @@ Synthetic make_f32(q27::MetalBackend& backend, const std::vector<uint64_t>& shap
     t.data = s.data.data();
     t.data_size = s.data.size();
     s.tensor = backend.upload(t);
+    // upload() copied the bytes into a Metal buffer; drop the host copy so the
+    // tool's footprint stays at one copy of the ~1.4 GiB weight set.
+    s.data.clear(); s.data.shrink_to_fit();
+    s.scales.clear(); s.scales.shrink_to_fit();
     return s;
 }
 
