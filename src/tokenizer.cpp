@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <sys/stat.h>
 #include <unordered_map>
 
 namespace q27 {
@@ -44,47 +47,103 @@ struct Tokenizer::Impl {
     std::vector<std::pair<std::string, int>> specials; // control tokens, longest first
 };
 
-static std::string read_lp(FILE* f) {
-    uint16_t n;
-    if (fread(&n, 2, 1, f) != 1) throw std::runtime_error("tok: truncated");
-    std::string s(n, 0);
-    if (n && fread(s.data(), 1, n, f) != n) throw std::runtime_error("tok: truncated");
-    return s;
-}
+namespace {
+constexpr uint32_t MAX_TOKENS = 4u << 20;
+constexpr uint32_t MAX_MERGES = 16u << 20;
 
-Tokenizer::Tokenizer(const std::string& path) : impl_(new Impl) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) throw std::runtime_error("tok: cannot open " + path);
-    uint32_t magic, ver, n, bos, eos;
-    fread(&magic, 4, 1, f); fread(&ver, 4, 1, f); fread(&n, 4, 1, f);
-    fread(&bos, 4, 1, f); fread(&eos, 4, 1, f);
+struct FileCloser {
+    void operator()(FILE* f) const { if (f) fclose(f); }
+};
+
+struct TokReader {
+    FILE* f;
+    uint64_t left;
+
+    template <typename T> T read() {
+        T value;
+        bytes(&value, sizeof(value));
+        return value;
+    }
+
+    void bytes(void* dst, size_t n) {
+        if ((uint64_t)n > left) throw std::runtime_error("tok: truncated");
+        if (n && fread(dst, 1, n, f) != n) throw std::runtime_error("tok: truncated");
+        left -= n;
+    }
+
+    std::string lp() {
+        uint16_t n = read<uint16_t>();
+        std::string s(n, 0);
+        bytes(s.data(), n);
+        return s;
+    }
+};
+} // namespace
+
+Tokenizer::Tokenizer(const std::string& path) {
+    std::unique_ptr<FILE, FileCloser> file(fopen(path.c_str(), "rb"));
+    if (!file) throw std::runtime_error("tok: cannot open " + path);
+    struct stat st{};
+    if (fstat(fileno(file.get()), &st) != 0 || st.st_size < 0)
+        throw std::runtime_error("tok: cannot stat " + path);
+    TokReader r{file.get(), (uint64_t)st.st_size};
+    std::unique_ptr<Impl> next(new Impl);
+
+    uint32_t magic = r.read<uint32_t>();
+    uint32_t ver = r.read<uint32_t>();
+    uint32_t n = r.read<uint32_t>();
+    uint32_t bos = r.read<uint32_t>();
+    uint32_t eos = r.read<uint32_t>();
     if (magic != 0x54373251) throw std::runtime_error("tok: bad magic");
-    bos_ = (int)bos; eos_ = (int)eos;
-    tokens_.reserve(n);
-    for (uint32_t i = 0; i < n; i++) tokens_.push_back(read_lp(f));
-    types_.resize(n);
-    fread(types_.data(), 1, n, f);
-    uint32_t nm;
-    fread(&nm, 4, 1, f);
-    for (uint32_t i = 0; i < nm; i++) impl_->merge_rank.emplace(read_lp(f), (int)i);
-    fclose(f);
+    if (ver != 1) throw std::runtime_error("tok: unsupported version");
+    if (!n || n > MAX_TOKENS || n > (uint32_t)std::numeric_limits<int>::max() ||
+        n > r.left / 3)
+        throw std::runtime_error("tok: invalid token count");
+    if (bos >= n || eos >= n) throw std::runtime_error("tok: special token id out of range");
+    bos_ = (int)bos;
+    eos_ = (int)eos;
 
-    for (uint32_t i = 0; i < n; i++) impl_->tok2id.emplace(tokens_[i], (int)i);
-    build_byte_maps(impl_->b2u, impl_->u2b);
+    tokens_.reserve(n);
+    for (uint32_t i = 0; i < n; i++) tokens_.push_back(r.lp());
+    types_.resize(n);
+    r.bytes(types_.data(), n);
+
+    uint32_t nm = r.read<uint32_t>();
+    if (nm > MAX_MERGES || nm > (uint32_t)std::numeric_limits<int>::max() ||
+        nm > r.left / 2)
+        throw std::runtime_error("tok: invalid merge count");
+    for (uint32_t i = 0; i < nm; i++) {
+        std::string merge = r.lp();
+        if (merge.empty()) throw std::runtime_error("tok: empty merge");
+        if (!next->merge_rank.emplace(std::move(merge), (int)i).second)
+            throw std::runtime_error("tok: duplicate merge");
+    }
+    if (r.left) throw std::runtime_error("tok: trailing data");
+
+    for (uint32_t i = 0; i < n; i++) {
+        if (!next->tok2id.emplace(tokens_[i], (int)i).second)
+            throw std::runtime_error("tok: duplicate token");
+        if (types_[i] == 3 && tokens_[i].empty())
+            throw std::runtime_error("tok: empty control token");
+    }
+    build_byte_maps(next->b2u, next->u2b);
     for (uint32_t i = 0; i < n; i++)
-        if (types_[i] == 3) impl_->specials.push_back({tokens_[i], (int)i});
+        if (types_[i] == 3) next->specials.push_back({tokens_[i], (int)i});
     // added tokens that are not type-3 controls but that BPE merges cannot
     // form -- must match in text like HF added tokens (think-block prefills
     // and the server's string-rendered prompts depend on this)
     for (const char* s : {"<think>", "</think>"}) {
-        auto it = impl_->tok2id.find(s);
-        if (it != impl_->tok2id.end() && types_[it->second] != 3)
-            impl_->specials.push_back({s, it->second});
+        auto it = next->tok2id.find(s);
+        if (it != next->tok2id.end() && types_[it->second] != 3)
+            next->specials.push_back({s, it->second});
     }
     // longest-first for greedy matching
-    std::sort(impl_->specials.begin(), impl_->specials.end(),
+    std::sort(next->specials.begin(), next->specials.end(),
               [](auto& a, auto& b) { return a.first.size() > b.first.size(); });
+    impl_ = next.release();
 }
+
+Tokenizer::~Tokenizer() { delete impl_; }
 
 // split a UTF-8 string into unicode chars (as utf8 substrings)
 static std::vector<std::string> utf8_chars(const std::string& s) {

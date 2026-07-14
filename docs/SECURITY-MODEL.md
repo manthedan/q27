@@ -29,6 +29,13 @@ oversight -- hardening has real cost (validation on every hot path, allocation f
 checked bounds, per-request cache scoping) and buys nothing against a threat that is not
 present.
 
+**Metal-fork note (2026-07-13):** artifact validation is now performed once at startup,
+before either backend can upload weights. The `.q27` loader checks arithmetic, dtype,
+rank, dimensions, exact blob sizes, alignment, ranges, duplicate names, and overlaps;
+the tokenizer checks every read, version/count bounds, special IDs, duplicates, empty
+controls, and trailing data. These checks have no inference hot-path cost. Network,
+authentication, TLS, hostile-client DoS, and multi-tenant isolation remain out of scope.
+
 ### What is explicitly NOT defended against
 
 - Untrusted network clients / missing auth / missing TLS.

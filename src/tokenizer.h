@@ -3,6 +3,7 @@
 // regex for ASCII + "non-ASCII == letter" approximation; exactness is gated
 // against llama-tokenize on an English/code corpus (see test_tokenizer).
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -12,6 +13,9 @@ namespace q27 {
 class Tokenizer {
   public:
     explicit Tokenizer(const std::string& tok_path);
+    ~Tokenizer();
+    Tokenizer(const Tokenizer&) = delete;
+    Tokenizer& operator=(const Tokenizer&) = delete;
 
     std::vector<int> encode(const std::string& text) const; // handles special tokens
     std::string decode(const std::vector<int>& ids) const;
@@ -19,6 +23,7 @@ class Tokenizer {
 
     int bos() const { return bos_; }
     int eos() const { return eos_; }
+    size_t vocab_size() const { return tokens_.size(); }
 
     // ChatML wrapper: messages as {role, content} pairs -> prompt token ids.
     // think=false appends the empty think block (Qwen3-family
@@ -44,7 +49,7 @@ class Tokenizer {
     int bos_ = 0, eos_ = 0;
     // lookup structures built at load
     struct Impl;
-    Impl* impl_;
+    Impl* impl_ = nullptr;
 
     std::vector<int> bpe_word(const std::string& word) const;
     std::vector<std::string> pretokenize(const std::string& text) const;

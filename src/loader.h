@@ -42,6 +42,11 @@ struct Model {
 
     static Model open(const std::string& path); // throws std::runtime_error
 
+    // Read-only mapped file range. Backends may wrap page-aligned subranges
+    // without copying; the Model must outlive every such device view.
+    const void* mapping_base() const { return map_base_; }
+    size_t mapping_size() const { return map_size_; }
+
   private:
     void* map_base_ = nullptr;
     size_t map_size_ = 0;

@@ -1,4 +1,5 @@
 *.q27
+models/
 __pycache__/
 build/
 scratchpad/
