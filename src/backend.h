@@ -240,6 +240,11 @@ class ComputeBackend {
         (void)out; (void)qg; (void)heads; (void)head_dim; (void)tokens;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
+    virtual void argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows,
+                             BackendBuffer& out_indices) {
+        (void)x; (void)n; (void)rows; (void)out_indices;
+        throw std::runtime_error("q27: backend has no chunked execution");
+    }
     virtual void synchronize() = 0;
 };
 

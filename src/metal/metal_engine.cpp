@@ -4,8 +4,10 @@
 #include "../suffixdraft.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace q27 {
@@ -237,6 +239,13 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
         cq5120_ = backend_.allocate_quantized(CHUNK_MAX * N_EMBD);
         cq6144_ = backend_.allocate_quantized(CHUNK_MAX * GDN_V);
         cq17408_ = backend_.allocate_quantized(CHUNK_MAX * N_FFN);
+        cfinal_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
+        clogits_ = alloc_f32((uint64_t)CHUNK_MAX * VOCAB);
+        cpred_ = backend_.allocate((uint64_t)CHUNK_MAX * sizeof(uint32_t));
+        // One recurrent + ring slot per GDN layer; both stay physically lazy
+        // until the first batched MTP round touches them.
+        ckpt_recurrent_ = alloc_f32((uint64_t)(N_LAYER - N_LAYER / 4) * GDN_HEADS * GDN_DIM * GDN_DIM);
+        ckpt_ring_ = alloc_f32((uint64_t)(N_LAYER - N_LAYER / 4) * 3 * GDN_CH);
     }
     reset();
 }
@@ -453,7 +462,7 @@ void MetalEngine::ffn_chunk(uint32_t layer, uint32_t count) {
     backend_.matmul_quantized(layer_weight(layer, "ffn_down.weight"), x17, count, *cy_);
 }
 
-void MetalEngine::encode_chunk(const uint32_t* tokens, uint32_t count) {
+void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count) {
     if (!ch_) throw std::runtime_error("q27 Metal: chunked prefill is unavailable");
     if (!count || count > CHUNK_MAX) throw std::runtime_error("q27 Metal: invalid chunk size");
     if ((uint64_t)position_ + count > max_context_)
@@ -472,7 +481,33 @@ void MetalEngine::encode_chunk(const uint32_t* tokens, uint32_t count) {
         ffn_chunk(layer, count);
         backend_.add_inplace(*ch_, *cy_, count * N_EMBD);
     }
+}
+
+void MetalEngine::encode_chunk(const uint32_t* tokens, uint32_t count) {
+    chunk_forward(tokens, count);
     position_ += count;
+}
+
+// Copies all persistent GDN state (recurrent + convolution ring) to or from
+// the checkpoint slots. Roughly 157 MiB of device traffic: negligible next
+// to one chunk's full weight stream, and it makes the optimistic committing
+// verification round reversible.
+void MetalEngine::gdn_state_copy(bool restore) {
+    uint64_t slot = 0;
+    for (uint32_t layer = 0; layer < N_LAYER; layer++) {
+        if (attention_layer(layer)) continue;
+        LayerState& state = layers_[layer];
+        const uint64_t recurrent_bytes = state.recurrent->size();
+        const uint64_t ring_bytes = state.ring->size();
+        if (restore) {
+            backend_.copy(*ckpt_recurrent_, slot * recurrent_bytes, *state.recurrent, 0, recurrent_bytes);
+            backend_.copy(*ckpt_ring_, slot * ring_bytes, *state.ring, 0, ring_bytes);
+        } else {
+            backend_.copy(*state.recurrent, 0, *ckpt_recurrent_, slot * recurrent_bytes, recurrent_bytes);
+            backend_.copy(*state.ring, 0, *ckpt_ring_, slot * ring_bytes, ring_bytes);
+        }
+        slot++;
+    }
 }
 
 uint32_t MetalEngine::step(uint32_t token) {
@@ -607,6 +642,100 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     return result;
 }
 
+// One batched MTP round: draft serially through layer 64, then verify every
+// lane in a single optimistic committing layer-major pass with a batched
+// output head and per-lane argmax — one CPU synchronization per round
+// instead of one per committed token. The GDN checkpoint makes partial
+// acceptance reversible; committed tokens follow the exact serial-walk
+// semantics, including never encoding the final output token.
+std::vector<uint32_t> MetalEngine::generate_mtp_batched(uint32_t pending, uint32_t count,
+                                                        uint32_t width) {
+    std::vector<uint32_t> output;
+    output.reserve(count);
+    // Start narrow and let acceptance widen the window: committed tokens are
+    // width-invariant, and a wide first round pays for many serial drafts
+    // through a cold draft head before acceptance has been measured once.
+    uint32_t live_width = std::min(width, 4u);
+    while (output.size() < count) {
+        if (output.size() + 1 == count) { output.push_back(pending); break; }
+        const uint32_t remaining = (uint32_t)(count - output.size());
+        uint32_t live = std::min(live_width, remaining);
+        // The verify chunk stores a KV row for every lane, so it must stay
+        // inside the reserved context even before acceptance is known.
+        if ((uint64_t)position_ + live > max_context_)
+            live = (uint32_t)(max_context_ - position_);
+        if (live < 2) {
+            output.push_back(pending);
+            if (output.size() == count) break;
+            pending = step(pending);
+            continue;
+        }
+        static const bool trace = getenv("Q27_MTP_TRACE") != nullptr;
+        auto clock = [] { return std::chrono::steady_clock::now(); };
+        auto since = [](std::chrono::steady_clock::time_point start) {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        };
+        auto draft_start = clock();
+        std::vector<uint32_t> lanes(live);
+        lanes[0] = pending;
+        const BackendBuffer* hidden = x1_.get();
+        for (uint32_t lane = 1; lane < live; lane++) {
+            lanes[lane] = mtp_forward(*hidden, lanes[lane - 1], position_ + lane - 1);
+            hidden = mtp_hidden_out_.get();
+        }
+        last_spec_stats_.rounds++;
+        last_spec_stats_.drafted += live - 1;
+        auto verify_start = clock();
+        {
+            CommandBatch batch(backend_);
+            gdn_state_copy(false);
+            chunk_forward(lanes.data(), live);
+            BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
+            backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                            N_EMBD, live, EPS, x5);
+            backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+            backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
+            batch.finish();
+        }
+        std::vector<uint32_t> predictions(live);
+        backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
+        uint32_t accepted = 0;
+        while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
+        uint32_t committed = std::min(accepted + 1, remaining);
+        // The final output token is pushed but never encoded, exactly like
+        // the serial walk, so snapshots and continuations stay compatible.
+        const uint32_t encoded = committed == remaining ? committed - 1 : committed;
+        last_spec_stats_.accepted += committed - 1;
+        auto commit_start = clock();
+        {
+            CommandBatch batch(backend_);
+            if (encoded != live) {
+                gdn_state_copy(true);
+                if (encoded) chunk_forward(lanes.data(), encoded);
+            }
+            if (encoded) {
+                backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
+                              *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+                backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
+                              *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+            }
+            batch.finish();
+        }
+        position_ += encoded;
+        if (trace)
+            fprintf(stderr, "mtp round: live %u accepted %u | draft %.2fs verify %.2fs commit %.2fs\n",
+                    live, accepted, std::chrono::duration<double>(verify_start - draft_start).count(),
+                    std::chrono::duration<double>(commit_start - verify_start).count(), since(commit_start));
+        for (uint32_t i = 0; i < committed; i++) output.push_back(lanes[i]);
+        pending = predictions[committed - 1];
+        // Width adaptation is a pure performance control: committed tokens
+        // are width-invariant, matching the recorded 2/4/8/12 gate.
+        live_width = accepted + 1 == live ? std::min(width, live_width + 2)
+                                          : std::max(2u, accepted + 2);
+    }
+    return output;
+}
+
 uint32_t MetalEngine::ingest_prompt(const std::vector<uint32_t>& tokens, bool warm_mtp,
                                     bool reset_first) {
     if (reset_first) reset();
@@ -650,6 +779,8 @@ std::vector<uint32_t> MetalEngine::generate_from_pending(uint32_t pending, uint3
         throw std::runtime_error("q27 Metal: MTP width must be 2..12");
     if ((uint64_t)position_ + (count ? count - 1 : 0) > max_context_)
         throw std::runtime_error("q27 Metal: generation exceeds context");
+    if (mtp_width && chunked_prefill_)
+        return generate_mtp_batched(pending, count, mtp_width);
     std::vector<uint32_t> output;
     output.reserve(count);
     if (!mtp_width) {

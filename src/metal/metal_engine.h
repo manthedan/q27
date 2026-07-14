@@ -96,6 +96,11 @@ class MetalEngine {
     std::shared_ptr<BackendBuffer> cdelta_out_, cgated_out_, cffn_gate_, cffn_up_;
     BackendQuantized cq5120_, cq6144_, cq17408_;
 
+    // Batched MTP verification: per-lane logits/predictions and the GDN
+    // state checkpoint that makes the optimistic committing round reversible.
+    std::shared_ptr<BackendBuffer> cfinal_, clogits_, cpred_;
+    std::shared_ptr<BackendBuffer> ckpt_recurrent_, ckpt_ring_;
+
     std::shared_ptr<BackendBuffer> alloc_f32(uint64_t count);
     const BackendTensor& weight(const std::string& name) const;
     const BackendTensor& layer_weight(uint32_t layer, const char* leaf) const;
@@ -109,7 +114,11 @@ class MetalEngine {
     void gdn_chunk(uint32_t layer, uint32_t count);
     void attention_chunk(uint32_t layer, uint32_t count);
     void ffn_chunk(uint32_t layer, uint32_t count);
+    void chunk_forward(const uint32_t* tokens, uint32_t count);
     void encode_chunk(const uint32_t* tokens, uint32_t count);
+    void gdn_state_copy(bool restore);
+    std::vector<uint32_t> generate_mtp_batched(uint32_t pending, uint32_t count,
+                                               uint32_t width);
     uint32_t prefill(const std::vector<uint32_t>& prompt, bool warm_mtp);
     void mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t position);
     uint32_t mtp_forward(const BackendBuffer& hidden, uint32_t token, uint32_t position);

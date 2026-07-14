@@ -114,6 +114,7 @@ struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, posit
 struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
 struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
 struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
+struct ArgmaxRowsArgs { uint32_t n, rows; };
 struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
 
 } // namespace
@@ -168,6 +169,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> attention_causal;
     id<MTLComputePipelineState> attention_turbo3_causal_p;
     id<MTLComputePipelineState> sigmoid_gate_rows;
+    id<MTLComputePipelineState> argmax_rows_p;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
     bool batching = false;
@@ -278,6 +280,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_causal = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal");
         impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
         impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
+        impl_->argmax_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_argmax_rows");
     }
 }
 
@@ -1298,6 +1301,24 @@ void MetalBackend::sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer
         [enc setBytes:&args length:sizeof(args) atIndex:2];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked sigmoid gate");
+    }
+}
+
+void MetalBackend::argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows,
+                               BackendBuffer& out_indices) {
+    if (!n || !rows || rows > 12) throw std::runtime_error("q27 Metal: invalid chunked argmax");
+    const MetalBuffer& input = metal_buffer(x); MetalBuffer& output = metal_buffer(out_indices);
+    check_range(input.size(), 0, (uint64_t)n * rows * 4, "chunked argmax input");
+    check_range(output.size(), 0, (uint64_t)rows * 4, "chunked argmax output");
+    ArgmaxRowsArgs args{n, rows};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own);
+        [enc setComputePipelineState:impl_->argmax_rows_p];
+        [enc setBuffer:input.handle() offset:0 atIndex:0];
+        [enc setBuffer:output.handle() offset:0 atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(rows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("chunked argmax");
     }
 }
 

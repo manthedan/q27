@@ -880,6 +880,37 @@ kernel void q27_sigmoid_gate_mul_rows(device float *out [[buffer(0)]],
     out[gid] *= 1.0f / (1.0f + exp(-gate));
 }
 
+struct ArgmaxRowsArgs { uint n; uint rows; };
+kernel void q27_argmax_rows(device const float *x [[buffer(0)]],
+                             device uint *out       [[buffer(1)]],
+                             constant ArgmaxRowsArgs &args [[buffer(2)]],
+                             uint row [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    if (row >= args.rows) return;
+    device const float *xr = x + (ulong)row * args.n;
+    float best = -INFINITY;
+    uint best_i = 0;
+    for (uint i = tid; i < args.n; i += 256) {
+        const float value = xr[i];
+        if (value > best || (value == best && i < best_i)) { best = value; best_i = i; }
+    }
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+    values[tid] = best; indices[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 128; step; step >>= 1) {
+        if (tid < step) {
+            const float other = values[tid + step];
+            const uint other_i = indices[tid + step];
+            if (other > values[tid] || (other == values[tid] && other_i < indices[tid])) {
+                values[tid] = other; indices[tid] = other_i;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) out[row] = indices[0];
+}
+
 struct AttentionCausalArgs {
     uint q_stride; uint q_row_stride; uint base_len;
     uint q_heads; uint kv_heads; uint head_dim; uint tokens; float scale;

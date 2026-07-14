@@ -142,6 +142,8 @@ class MetalBackend final : public ComputeBackend {
                                  float scale) override;
     void sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,
                                uint32_t heads, uint32_t head_dim, uint32_t tokens) override;
+    void argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows,
+                     BackendBuffer& out_indices) override;
     void synchronize() override;
 
     uint64_t recommended_working_set_size() const;

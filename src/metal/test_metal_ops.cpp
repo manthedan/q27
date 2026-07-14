@@ -479,6 +479,25 @@ int test_chunked(q27::MetalBackend& backend) {
         }
     }
 
+    // Chunked per-lane argmax, including the lower-index tie break.
+    {
+        constexpr uint32_t n = 300;
+        std::vector<float> logits(T * n);
+        for (size_t i = 0; i < logits.size(); i++) logits[i] = std::sin(float(i) * .7f) * 5;
+        logits[0 * n + 37] = 100; logits[1 * n + 4] = 100; logits[1 * n + 250] = 100;
+        auto lb = upload_buffer(backend, logits);
+        auto rows_out = backend.allocate(T * 4);
+        backend.argmax_rows(*lb, n, T, *rows_out);
+        std::vector<uint32_t> got(T); backend.read(*rows_out, 0, got.data(), T * 4);
+        auto serial_out = backend.allocate(4);
+        for (uint32_t t = 0; t < T; t++) {
+            auto row = row_view(*lb, t, n);
+            backend.argmax(*row, n, *serial_out);
+            uint32_t want = 0; backend.read(*serial_out, 0, &want, 4);
+            if (got[t] != want) fail("argmax rows", t, (float)got[t], (float)want);
+        }
+    }
+
     // Chunked FP16 KV append + causal attention over a warm cache.
     {
         constexpr uint32_t qh = 2, kvh = 1, dim = 4, stride = 8, row = kvh * dim, warm = 2;
