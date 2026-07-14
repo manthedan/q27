@@ -1,0 +1,278 @@
+#include "metal_backend.h"
+
+#include <cmath>
+#include <cstdio>
+#include <exception>
+#include <string>
+#include <unistd.h>
+#include <vector>
+
+namespace {
+
+template <typename T> void append(std::vector<uint8_t>& out, T value) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&value);
+    out.insert(out.end(), p, p + sizeof(value));
+}
+
+int test_mmap_upload(q27::MetalBackend& backend) {
+    const float weights[12] = {1, 2, 3, 4, -2, 1, 0.5f, 3, 0, 0, 0, 0};
+    std::vector<uint8_t> file;
+    append<uint32_t>(file, 0x46373251);
+    append<uint32_t>(file, 1);
+    append<uint32_t>(file, 1);
+    append<uint32_t>(file, 2);
+    file.push_back('{'); file.push_back('}');
+    append<uint16_t>(file, 1); file.push_back('m');
+    append<uint8_t>(file, 0); append<uint8_t>(file, 2);
+    append<uint64_t>(file, 3); append<uint64_t>(file, 4);
+    append<uint64_t>(file, 0); append<uint64_t>(file, sizeof(weights));
+    append<uint64_t>(file, 0); append<uint64_t>(file, 0);
+    file.resize(256);
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(weights);
+    file.insert(file.end(), bytes, bytes + sizeof(weights));
+
+    char path[] = "/tmp/q27-metal-model-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return 1;
+    size_t done = 0;
+    while (done < file.size()) {
+        ssize_t n = write(fd, file.data() + done, file.size() - done);
+        if (n <= 0) { close(fd); unlink(path); return 1; }
+        done += (size_t)n;
+    }
+    close(fd);
+    try {
+        q27::Model model = q27::Model::open(path);
+        unlink(path);
+        q27::BackendTensor weight = backend.upload(model, model.get("m"));
+        const float x[4] = {2, -1, 0.5f, 3};
+        auto device_x = backend.allocate(sizeof(x));
+        auto device_y = backend.allocate(3 * sizeof(float));
+        backend.write(*device_x, 0, x, sizeof(x));
+        backend.begin_commands();
+        backend.matvec(weight, *device_x, *device_y);
+        backend.end_commands();
+        float got[3];
+        backend.read(*device_y, 0, got, sizeof(got));
+        return std::fabs(got[0] - 13.5f) > 1e-4f || std::fabs(got[1] - 4.25f) > 1e-4f;
+    } catch (...) {
+        unlink(path);
+        throw;
+    }
+}
+
+bool close(float got, float want, float tolerance = 1e-4f) {
+    return std::fabs(got - want) <= tolerance * std::fmax(1.0f, std::fabs(want));
+}
+
+int test_dispatch_validation(q27::MetalBackend& backend) {
+    std::vector<int8_t> short_data(1, 1);
+    std::vector<uint16_t> short_scales(1, 0x3c00);
+    q27::Tensor tensor;
+    tensor.name="short-embedding"; tensor.dtype=q27::DType::Q8_G128; tensor.shape={2,128};
+    tensor.data=reinterpret_cast<const uint8_t*>(short_data.data()); tensor.data_size=short_data.size();
+    tensor.scales=reinterpret_cast<const uint8_t*>(short_scales.data()); tensor.scales_size=2;
+    auto weight=backend.upload(tensor); auto out=backend.allocate(128*4);
+    bool rejected=false;
+    backend.begin_commands();
+    try { backend.embedding_q8(weight,0,*out); }
+    catch(const std::runtime_error&) { rejected=true; }
+    backend.abort_commands();
+    if(!rejected) { fprintf(stderr,"undersized embedding was not rejected\n"); return 1; }
+
+    std::vector<int8_t> bad_group_data(32,1); std::vector<uint16_t> bad_group_scale(1,0x3c00);
+    q27::Tensor bad_group; bad_group.name="bad-group"; bad_group.dtype=q27::DType::Q8_G128;
+    bad_group.shape={1,32}; bad_group.data=reinterpret_cast<const uint8_t*>(bad_group_data.data());
+    bad_group.data_size=bad_group_data.size(); bad_group.scales=reinterpret_cast<const uint8_t*>(bad_group_scale.data()); bad_group.scales_size=2;
+    auto bad_weight=backend.upload(bad_group); auto bad_x=backend.allocate(32*4),bad_y=backend.allocate(4);
+    rejected=false; try { backend.matvec(bad_weight,*bad_x,*bad_y); } catch(const std::runtime_error&) { rejected=true; }
+    if(!rejected) { fprintf(stderr,"invalid quantization group was not rejected\n"); return 1; }
+
+    // Aborting a failed explicit batch must leave the backend reusable.
+    std::vector<float> x={1,2,3,4}; auto xb=backend.allocate(16),yb=backend.allocate(16);
+    backend.write(*xb,0,x.data(),16); backend.copy(*xb,0,*yb,0,16);
+    float got[4]={}; backend.read(*yb,0,got,16);
+    for(int i=0;i<4;i++) if(got[i]!=x[i]) return 1;
+    return 0;
+}
+
+int test_f32(q27::MetalBackend& backend) {
+    std::vector<float> weights = {
+        1, 2, 3, 4,
+        -2, 1, 0.5f, 3,
+        0, 0, 0, 0,
+    };
+    std::vector<float> x = {2, -1, 0.5f, 3};
+    q27::Tensor tensor;
+    tensor.name = "f32-test";
+    tensor.dtype = q27::DType::F32;
+    tensor.shape = {3, 4};
+    tensor.data = reinterpret_cast<const uint8_t*>(weights.data());
+    tensor.data_size = weights.size() * sizeof(float);
+
+    q27::BackendTensor device_weight = backend.upload(tensor);
+    auto device_x = backend.allocate(x.size() * sizeof(float));
+    auto device_y = backend.allocate(3 * sizeof(float));
+    backend.write(*device_x, 0, x.data(), x.size() * sizeof(float));
+    backend.matvec(device_weight, *device_x, *device_y);
+    float got[3];
+    backend.read(*device_y, 0, got, sizeof(got));
+
+    const float want[3] = {13.5f, 4.25f, 0.0f};
+    for (int i = 0; i < 3; i++) {
+        if (!close(got[i], want[i])) {
+            fprintf(stderr, "F32 row %d: got %.7g, want %.7g\n", i, got[i], want[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int test_f16(q27::MetalBackend& backend) {
+    // 1, 2, -1, 0.5 and -2, 0, 3, 1 as IEEE-754 binary16.
+    std::vector<uint16_t> weights = {
+        0x3c00, 0x4000, 0xbc00, 0x3800,
+        0xc000, 0x0000, 0x4200, 0x3c00,
+    };
+    std::vector<float> x = {2, -1, 0.5f, 3};
+    q27::Tensor tensor;
+    tensor.name = "f16-test";
+    tensor.dtype = q27::DType::F16;
+    tensor.shape = {2, 4};
+    tensor.data = reinterpret_cast<const uint8_t*>(weights.data());
+    tensor.data_size = weights.size() * sizeof(uint16_t);
+
+    q27::BackendTensor device_weight = backend.upload(tensor);
+    auto device_x = backend.allocate(x.size() * sizeof(float));
+    auto device_y = backend.allocate(2 * sizeof(float));
+    backend.write(*device_x, 0, x.data(), x.size() * sizeof(float));
+    backend.matvec(device_weight, *device_x, *device_y);
+    float got[2];
+    backend.read(*device_y, 0, got, sizeof(got));
+    const float want[2] = {1.0f, 0.5f};
+    for (int row = 0; row < 2; row++) {
+        if (!close(got[row], want[row])) {
+            fprintf(stderr, "F16 row %d: got %.7g, want %.7g\n", row, got[row], want[row]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int test_q8(q27::MetalBackend& backend) {
+    constexpr int rows = 2, cols = 128;
+    std::vector<int8_t> weights(rows * cols);
+    std::vector<float> x(cols);
+    float want[rows] = {};
+    for (int i = 0; i < cols; i++) x[i] = (float)((i % 9) - 4) / 8.0f;
+    for (int row = 0; row < rows; row++) {
+        const float scale = row == 0 ? 1.0f : 0.5f;
+        for (int i = 0; i < cols; i++) {
+            int q = row == 0 ? (i % 31) - 15 : 12 - (i % 25);
+            weights[row * cols + i] = (int8_t)q;
+            want[row] += q * scale * x[i];
+        }
+    }
+    std::vector<uint16_t> scales = {0x3c00, 0x3800};
+    q27::Tensor tensor;
+    tensor.name = "q8-test";
+    tensor.dtype = q27::DType::Q8_G128;
+    tensor.shape = {rows, cols};
+    tensor.data = reinterpret_cast<const uint8_t*>(weights.data());
+    tensor.data_size = weights.size();
+    tensor.scales = reinterpret_cast<const uint8_t*>(scales.data());
+    tensor.scales_size = scales.size() * sizeof(uint16_t);
+
+    q27::BackendTensor device_weight = backend.upload(tensor);
+    auto device_x = backend.allocate(x.size() * sizeof(float));
+    auto device_y = backend.allocate(rows * sizeof(float));
+    backend.write(*device_x, 0, x.data(), x.size() * sizeof(float));
+    backend.matvec(device_weight, *device_x, *device_y);
+    float got[rows];
+    backend.read(*device_y, 0, got, sizeof(got));
+    for (int row = 0; row < rows; row++) {
+        if (!close(got[row], want[row])) {
+            fprintf(stderr, "Q8 row %d: got %.7g, want %.7g\n", row, got[row], want[row]);
+            return 1;
+        }
+    }
+    auto quantized=backend.allocate_quantized(cols);
+    backend.begin_commands(); backend.quantize(*device_x,quantized); backend.matvec_quantized(device_weight,quantized,*device_y); backend.end_commands();
+    backend.read(*device_y,0,got,sizeof(got));
+    for(int row=0;row<rows;row++) if(!close(got[row],want[row],2e-2f)) {
+        fprintf(stderr,"Q8 quantized row %d: got %.7g, want %.7g\n",row,got[row],want[row]); return 1;
+    }
+    return 0;
+}
+
+int test_q4(q27::MetalBackend& backend) {
+    constexpr int rows = 2, cols = 64;
+    std::vector<uint8_t> packed(rows * cols / 2);
+    std::vector<float> x(cols);
+    float want[rows] = {};
+    for (int i = 0; i < cols; i++) x[i] = (float)((i % 7) - 3) / 4.0f;
+    for (int row = 0; row < rows; row++) {
+        const float scale = row == 0 ? 1.0f : 0.5f;
+        for (int i = 0; i < cols; i += 2) {
+            const int q0 = row == 0 ? (i % 16) - 8 : 7 - (i % 16);
+            const int q1 = row == 0 ? ((i + 1) % 16) - 8 : 7 - ((i + 1) % 16);
+            packed[row * cols / 2 + i / 2] = (uint8_t)((q0 + 8) | ((q1 + 8) << 4));
+            want[row] += q0 * scale * x[i] + q1 * scale * x[i + 1];
+        }
+    }
+    // IEEE-754 binary16 encodings for 1.0 and 0.5.
+    std::vector<uint16_t> scales = {0x3c00, 0x3800};
+
+    q27::Tensor tensor;
+    tensor.name = "q4-test";
+    tensor.dtype = q27::DType::Q4_G64;
+    tensor.shape = {rows, cols};
+    tensor.data = packed.data();
+    tensor.data_size = packed.size();
+    tensor.scales = reinterpret_cast<const uint8_t*>(scales.data());
+    tensor.scales_size = scales.size() * sizeof(uint16_t);
+
+    q27::BackendTensor device_weight = backend.upload(tensor);
+    auto device_x = backend.allocate(x.size() * sizeof(float));
+    auto device_y = backend.allocate(rows * sizeof(float));
+    backend.write(*device_x, 0, x.data(), x.size() * sizeof(float));
+    backend.matvec(device_weight, *device_x, *device_y);
+    float got[rows];
+    backend.read(*device_y, 0, got, sizeof(got));
+
+    for (int row = 0; row < rows; row++) {
+        if (!close(got[row], want[row])) {
+            fprintf(stderr, "Q4 row %d: got %.7g, want %.7g\n", row, got[row], want[row]);
+            return 1;
+        }
+    }
+    auto quantized=backend.allocate_quantized(cols);
+    backend.begin_commands(); backend.quantize(*device_x,quantized); backend.matvec_quantized(device_weight,quantized,*device_y); backend.end_commands();
+    backend.read(*device_y,0,got,sizeof(got));
+    for(int row=0;row<rows;row++) if(!close(got[row],want[row],2e-2f)) {
+        fprintf(stderr,"Q4 quantized row %d: got %.7g, want %.7g\n",row,got[row],want[row]); return 1;
+    }
+    return 0;
+}
+
+} // namespace
+
+int main() {
+    try {
+        q27::MetalBackend backend;
+        printf("Metal device: %s\n", backend.name().c_str());
+        printf("working set %.1f GiB, max buffer %.1f GiB, threadgroup memory %.1f KiB\n",
+               backend.recommended_working_set_size() / 1073741824.0,
+               backend.max_buffer_length() / 1073741824.0,
+               backend.max_threadgroup_memory_length() / 1024.0);
+        if (test_mmap_upload(backend) || test_dispatch_validation(backend) ||
+            test_f32(backend) || test_f16(backend) ||
+            test_q8(backend) || test_q4(backend))
+            return 1;
+        puts("Metal matvec: OK");
+        return 0;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "%s\n", error.what());
+        return 1;
+    }
+}

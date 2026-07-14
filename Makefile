@@ -4,9 +4,52 @@ NVCC      ?= /usr/local/cuda/bin/nvcc
 # sm_120 = RTX 5090, sm_86 = RTX 3090 (fallback device for tests)
 NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
+UNAME_S   := $(shell uname -s)
 
-.PHONY: all clean
-all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_depthctl build/test_toolconstrain
+.PHONY: all clean test-cpu test-metal
+all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
+
+test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft
+	./build/test_artifacts
+	./build/test_depthctl
+	./build/test_toolconstrain
+	./build/test_suffixdraft
+
+ifeq ($(UNAME_S),Darwin)
+test-metal: build/test_metal build/test_metal_ops
+	./build/test_metal
+	./build/test_metal_ops
+
+build/test_metal: src/metal/test_metal.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
+                  src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal src/metal/test_metal.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp \
+	        -framework Foundation -framework Metal -o $@
+
+build/test_metal_ops: src/metal/test_metal_ops.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
+                      src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal src/metal/test_metal_ops.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp \
+	        -framework Foundation -framework Metal -o $@
+
+build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h \
+                 src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
+                 src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
+	        -framework Foundation -framework Metal -o $@
+
+build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h \
+                        src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
+                        src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h \
+                        third_party/httplib.h third_party/json.hpp | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -pthread -I src/metal src/metal/metal_server.cpp src/metal/metal_engine.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
+	        -framework Foundation -framework Metal -o $@
+else
+test-metal:
+	@echo "test-metal requires macOS"; exit 1
+endif
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h | build
@@ -20,6 +63,9 @@ build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 
 build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) src/test_tokenizer.cpp src/tokenizer.cpp -o $@
+
+build/test_artifacts: src/test_artifacts.cpp src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) src/test_artifacts.cpp src/loader.cpp src/tokenizer.cpp -o $@
 
 build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 	$(CXX) $(CXXFLAGS) tools/test_depthctl.cpp -o $@

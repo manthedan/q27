@@ -2,6 +2,13 @@
 
 A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090 (also supports 3090). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
 
+> **Metal fork status:** baseline 64-layer greedy decode, command-batched
+> prefill, MTP drafting, state snapshots, and FP16/turbo3 KV are wired and
+> tested on Apple Silicon (`build/q27-metal`). The official canonical prompt
+> predicts ` Paris` on an M4. CUDA remains the optimized production/reference
+> backend; Metal performance and cross-backend gates are still in progress.
+> See [`docs/METAL_PROGRESS.md`](docs/METAL_PROGRESS.md).
+
 ## Why this is interesting
 
 - **Fastest known way to run this model.** +47% decode over tuned
