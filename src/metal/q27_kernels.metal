@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 3
+// Q27_SHADER_ABI 4
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -1155,45 +1155,74 @@ struct AttentionCausalArgs {
     uint q_stride; uint q_row_stride; uint base_len;
     uint q_heads; uint kv_heads; uint head_dim; uint tokens; float scale;
 };
+// Chunk-causal FP16 attention, online-softmax. Mirrors the decode kernel
+// (q27_attention_f16) exactly — one threadgroup per (query head, chunk
+// token), eight simdgroups striping the token's visible sequence
+// (base_len + token positions) with running max/denominator/weighted-value
+// in registers and a log2 merge through threadgroup memory — so a chunk
+// token's output is bit-identical to the serial decode kernel at the same
+// sequence length, and no probability scratch is materialized (the old
+// kernel serialized scores on thread 0 through a tokens x heads x context
+// device buffer).
 kernel void q27_attention_f16_causal(device const float *q [[buffer(0)]],
                                       device const half *kc [[buffer(1)]],
                                       device const half *vc [[buffer(2)]],
-                                      device float *prob     [[buffer(3)]],
-                                      device float *out      [[buffer(4)]],
-                                      constant AttentionCausalArgs &args [[buffer(5)]],
+                                      device float *out      [[buffer(3)]],
+                                      constant AttentionCausalArgs &args [[buffer(4)]],
                                       uint2 group [[threadgroup_position_in_grid]],
-                                      uint tid [[thread_index_in_threadgroup]]) {
+                                      ushort lane [[thread_index_in_simdgroup]],
+                                      ushort sg [[simdgroup_index_in_threadgroup]]) {
     const uint qh = group.x, token = group.y;
     if (qh >= args.q_heads || token >= args.tokens) return;
     const uint seq_len = args.base_len + token;
-    const uint max_seq = args.base_len + args.tokens - 1;
     const uint gqa = args.q_heads / args.kv_heads;
     const uint kvh = qh / gqa;
     device const float *qh_ptr = q + (ulong)token * args.q_row_stride + (ulong)qh * args.q_stride;
-    device float *ph = prob + ((ulong)token * args.q_heads + qh) * max_seq;
-    if (tid == 0) {
-        float maximum = -INFINITY;
-        for (uint p = 0; p < seq_len; p++) {
-            device const half *kh = kc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
-            float score = 0.0f;
-            for (uint d = 0; d < args.head_dim; d++) score += qh_ptr[d] * float(kh[d]);
-            score *= args.scale;
-            ph[p] = score;
-            maximum = max(maximum, score);
-        }
-        float denominator = 0.0f;
-        for (uint p = 0; p < seq_len; p++) { ph[p] = exp(ph[p] - maximum); denominator += ph[p]; }
-        const float inv = 1.0f / denominator;
-        for (uint p = 0; p < seq_len; p++) ph[p] *= inv;
+
+    float acc[8];                       // head_dim <= 256 -> at most 8 dims per lane
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint p = sg; p < seq_len; p += 8) {
+        device const half *kh = kc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
+        float partial = 0.0f;
+        for (uint d = lane; d < args.head_dim; d += 32) partial += qh_ptr[d] * float(kh[d]);
+        const float score = simd_sum(partial) * args.scale;
+        const float m_new = max(m, score);
+        const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
+        const float weight = exp(score - m_new);
+        l = l * correction + weight;
+        device const half *vh = vc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
+        for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+            acc[i] = acc[i] * correction + weight * float(vh[d]);
+        m = m_new;
     }
-    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    for (uint d = tid; d < args.head_dim; d += 256) {
-        float value = 0.0f;
-        for (uint p = 0; p < seq_len; p++) {
-            device const half *vh = vc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
-            value += ph[p] * float(vh[d]);
+
+    // Merge the eight simdgroup partials: rounds of 4, 2, 1. A simdgroup that
+    // saw no positions carries m = -inf, l = 0 and merges as a no-op.
+    threadgroup float tg_m[4], tg_l[4], tg_acc[4][256];
+    for (uint offset = 4; offset >= 1; offset /= 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg >= offset && sg < 2 * offset) {
+            if (lane == 0) { tg_m[sg - offset] = m; tg_l[sg - offset] = l; }
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                tg_acc[sg - offset][d] = acc[i];
         }
-        out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < offset) {
+            const float m_other = tg_m[sg], l_other = tg_l[sg];
+            const float m_new = max(m, m_other);
+            if (m_new == -INFINITY) continue;       // both stripes empty
+            const float c_mine = exp(m - m_new), c_other = exp(m_other - m_new);
+            l = l * c_mine + l_other * c_other;
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                acc[i] = acc[i] * c_mine + tg_acc[sg][d] * c_other;
+            m = m_new;
+        }
+    }
+    if (sg == 0) {
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+            out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = acc[i] * inv;
     }
 }
 

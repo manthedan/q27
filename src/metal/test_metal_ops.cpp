@@ -574,9 +574,8 @@ int test_chunked(q27::MetalBackend& backend) {
         auto knb = upload_buffer(backend, knew); auto vnb = upload_buffer(backend, vnew);
         backend.kv_store_f16_rows(*knb, *vnb, *kc, *vc, warm, row, T);
         auto qb = upload_buffer(backend, q);
-        auto scratch = backend.allocate((uint64_t)T * qh * (warm + T) * 4);
         auto chunk_out = backend.allocate((uint64_t)T * qh * dim * 4);
-        backend.attention_f16_causal(*qb, stride, qh * stride, *kc, *vc, *scratch, *chunk_out,
+        backend.attention_f16_causal(*qb, stride, qh * stride, *kc, *vc, *chunk_out,
                                      warm + 1, qh, kvh, dim, T, 0.5f);
         auto got = read_f32(backend, *chunk_out, (size_t)T * qh * dim);
         auto serial_scratch = backend.allocate((uint64_t)qh * (warm + T) * 4);
@@ -588,6 +587,49 @@ int test_chunked(q27::MetalBackend& backend) {
             auto want = read_f32(backend, *serial_out, (size_t)qh * dim);
             for (uint32_t i = 0; i < qh * dim; i++)
                 if (!near(got[t*qh*dim+i], want[i], 1e-5f)) { fail("causal attention", t*qh*dim+i, got[t*qh*dim+i], want[i]); break; }
+        }
+    }
+
+    // Production-shape chunk-causal attention (24:4 GQA, head_dim 256). The
+    // online-softmax chunk kernel mirrors the serial decode kernel exactly,
+    // so the comparison is bit-exact. warm=2 leaves most simdgroup stripes
+    // empty for the first chunk tokens; warm=130 exercises multi-stripe
+    // running-max updates at the decode gate's seq length (133).
+    for (uint32_t warm : {2u, 130u}) {
+        constexpr uint32_t qh = 24, kvh = 4, dim = 256, stride = 512, row = kvh * dim;
+        auto kc = backend.allocate((uint64_t)(warm + T) * row * 2);
+        auto vc = backend.allocate((uint64_t)(warm + T) * row * 2);
+        for (uint32_t p = 0; p < warm; p++) {
+            std::vector<float> k(row), v(row);
+            for (uint32_t d = 0; d < row; d++) {
+                k[d] = std::sin(float(p * 37 + d) * .021f) * (1.0f + float(p % 5));
+                v[d] = std::cos(float(p * 53 + d) * .013f);
+            }
+            auto kb = upload_buffer(backend, k); auto vb = upload_buffer(backend, v);
+            backend.kv_store_f16(*kb, *vb, *kc, *vc, p, row);
+        }
+        std::vector<float> knew(T * row), vnew(T * row), q(T * qh * stride);
+        for (size_t i = 0; i < knew.size(); i++) {
+            knew[i] = std::sin(float(i) * .0047f) * (1.0f + float(i % 7));
+            vnew[i] = std::cos(float(i) * .0031f);
+        }
+        for (size_t i = 0; i < q.size(); i++) q[i] = std::sin(float(i) * .0077f);
+        auto knb = upload_buffer(backend, knew); auto vnb = upload_buffer(backend, vnew);
+        backend.kv_store_f16_rows(*knb, *vnb, *kc, *vc, warm, row, T);
+        auto qb = upload_buffer(backend, q);
+        auto chunk_out = backend.allocate((uint64_t)T * qh * dim * 4);
+        backend.attention_f16_causal(*qb, stride, qh * stride, *kc, *vc, *chunk_out,
+                                     warm + 1, qh, kvh, dim, T, 0.0625f);
+        auto got = read_f32(backend, *chunk_out, (size_t)T * qh * dim);
+        auto serial_scratch = backend.allocate((uint64_t)qh * (warm + T) * 4);
+        auto serial_out = backend.allocate((uint64_t)qh * dim * 4);
+        for (uint32_t t = 0; t < T; t++) {
+            auto q_row = row_view(*qb, t, qh * stride);
+            backend.attention_f16(*q_row, stride, *kc, *vc, *serial_scratch, *serial_out,
+                                  warm + 1 + t, qh, kvh, dim, 0.0625f);
+            auto want = read_f32(backend, *serial_out, (size_t)qh * dim);
+            for (uint32_t i = 0; i < qh * dim; i++)
+                if (got[t*qh*dim+i] != want[i]) { fail("causal attention wide", t*qh*dim+i, got[t*qh*dim+i], want[i]); break; }
         }
     }
 

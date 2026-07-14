@@ -53,7 +53,7 @@ void check_range(uint64_t size, uint64_t offset, uint64_t bytes, const char* ope
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 3";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 4";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -1334,15 +1334,16 @@ void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuf
 
 void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
                                         uint32_t q_row_stride, const BackendBuffer& k_cache,
-                                        const BackendBuffer& v_cache, BackendBuffer& scratch,
+                                        const BackendBuffer& v_cache,
                                         BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                         uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
                                         float scale) {
-    if (!base_len || !kv_heads || q_heads % kv_heads || !tokens || tokens > 12)
+    if (!base_len || !kv_heads || q_heads % kv_heads || !head_dim || head_dim > 256 ||
+        !tokens || tokens > 12)
         throw std::runtime_error("q27 Metal: invalid chunked attention dimensions");
     const MetalBuffer& qb = metal_buffer(q); const MetalBuffer& kc = metal_buffer(k_cache);
     const MetalBuffer& vc = metal_buffer(v_cache);
-    MetalBuffer& prob = metal_buffer(scratch); MetalBuffer& output = metal_buffer(out);
+    MetalBuffer& output = metal_buffer(out);
     const uint32_t max_seq = base_len + tokens - 1;
     check_range(qb.size(), 0,
                 ((uint64_t)(tokens-1)*q_row_stride + (uint64_t)(q_heads-1)*q_stride + head_dim)*4,
@@ -1350,15 +1351,14 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
     const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * head_dim * 2;
     check_range(kc.size(), 0, cache_bytes, "chunked attention K cache");
     check_range(vc.size(), 0, cache_bytes, "chunked attention V cache");
-    check_range(prob.size(), 0, (uint64_t)tokens * q_heads * max_seq * 4, "chunked attention scratch");
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked attention output");
     AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, scale};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_f16_causal");
         [enc setComputePipelineState:impl_->attention_causal];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
-        [enc setBuffer:vc.handle() offset:0 atIndex:2]; [enc setBuffer:prob.handle() offset:0 atIndex:3];
-        [enc setBuffer:output.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked FP16 attention");
     }

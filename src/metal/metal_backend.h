@@ -130,7 +130,7 @@ class MetalBackend final : public ComputeBackend {
                               uint32_t position, uint32_t kv_heads, uint32_t tokens) override;
     void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
                               uint32_t q_row_stride, const BackendBuffer& k_cache,
-                              const BackendBuffer& v_cache, BackendBuffer& scratch,
+                              const BackendBuffer& v_cache,
                               BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                               uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
                               float scale) override;

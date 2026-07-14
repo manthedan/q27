@@ -214,7 +214,9 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
     // Layer-major chunked prefill routes projections through the simdgroup
     // GEMM, so it requires the same device family. The per-chunk activation
     // buffers total a few MiB; the attention probability scratch is reserved
-    // at CHUNK_MAX rows but stays physically lazy until long prompts touch it.
+    // at CHUNK_MAX rows but is only touched by the turbo3 chunk kernel now
+    // (FP16 chunk attention is online-softmax), so it stays physically lazy
+    // for FP16 runs at any context length.
     chunked_prefill_ = backend_.supports_quantized_matmul();
     if (chunked_prefill_) {
         ch_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
@@ -442,7 +444,7 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
         backend_.kv_store_f16_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
                                    position_, N_KV * HEAD_DIM, count);
         backend_.attention_f16_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
-                                      *state.k_cache, *state.v_cache, *cattn_scratch_,
+                                      *state.k_cache, *state.v_cache,
                                       *cattn_out_, position_ + 1, N_HEAD, N_KV,
                                       HEAD_DIM, count, scale);
     }

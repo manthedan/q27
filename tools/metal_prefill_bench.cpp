@@ -198,7 +198,6 @@ int main(int argc, char** argv) {
     auto ckbuf = alloc_f32((uint64_t)CHUNK_MAX * N_KV * HEAD_DIM);
     auto cvbuf = alloc_f32((uint64_t)CHUNK_MAX * N_KV * HEAD_DIM);
     auto cattn_out = alloc_f32((uint64_t)CHUNK_MAX * N_HEAD * HEAD_DIM);
-    auto cattn_scratch = alloc_f32((uint64_t)CHUNK_MAX * N_HEAD * ctx);
     auto cqkv = alloc_f32((uint64_t)CHUNK_MAX * GDN_CH);
     auto cz = alloc_f32((uint64_t)CHUNK_MAX * GDN_V);
     auto calpha = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
@@ -255,7 +254,7 @@ int main(int argc, char** argv) {
         backend.kv_store_f16_rows(*ckbuf, *cvbuf, *k_cache, *v_cache, position,
                                   N_KV * HEAD_DIM, count);
         backend.attention_f16_causal(*cqg, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
-                                     *k_cache, *v_cache, *cattn_scratch, *cattn_out,
+                                     *k_cache, *v_cache, *cattn_out,
                                      position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale);
         backend.sigmoid_gate_mul_rows(*cattn_out, *cqg, N_HEAD, HEAD_DIM, count);
         q27::BackendQuantized x6 = quantized_view(cq6144, count * N_HEAD * HEAD_DIM);
