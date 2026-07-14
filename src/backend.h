@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace q27 {
@@ -78,6 +79,11 @@ class ComputeBackend {
                                        const BackendTensor& b, BackendBuffer& b_out,
                                        const BackendQuantized& x) {
         matvec_quantized(a, x, a_out); matvec_quantized(b, x, b_out);
+    }
+    virtual void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
+                                  uint32_t x_rows,BackendBuffer& y) {
+        if(x_rows!=1) throw std::runtime_error("q27: backend has no quantized matmul");
+        matvec_quantized(weight,x,y);
     }
     virtual void embedding_q8(const BackendTensor& weight, uint32_t token,
                               BackendBuffer& out) = 0;

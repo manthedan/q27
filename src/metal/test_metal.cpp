@@ -267,6 +267,43 @@ int test_q4(q27::MetalBackend& backend) {
     return 0;
 }
 
+int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
+    constexpr uint32_t rows=9,cols=256,tokens=12;
+    std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:(size_t)rows*cols);
+    for(uint32_t r=0;r<rows;r++) for(uint32_t c=0;c<cols;c++) {
+        int q=(int)((r*7+c*3)%15)-7;
+        if(dtype==q27::DType::Q4_G64) {
+            size_t i=(size_t)r*cols/2+c/2; uint8_t nibble=(uint8_t)(q+8);
+            if(c&1) data[i]=(data[i]&15)|(nibble<<4); else data[i]=(data[i]&240)|nibble;
+        } else data[(size_t)r*cols+c]=(uint8_t)(int8_t)q;
+    }
+    uint32_t groups=cols/(dtype==q27::DType::Q4_G64?64:128);
+    const uint16_t scale_values[4]={0x3400,0x3800,0x3c00,0x4000};
+    std::vector<uint16_t> scales(rows*groups);
+    for(uint32_t r=0;r<rows;r++) for(uint32_t g=0;g<groups;g++) scales[r*groups+g]=scale_values[(r+g)%4];
+    q27::Tensor tensor; tensor.name="matmul-tiles"; tensor.dtype=dtype; tensor.shape={rows,cols};
+    tensor.data=data.data(); tensor.data_size=data.size(); tensor.scales=(const uint8_t*)scales.data(); tensor.scales_size=scales.size()*2;
+    auto weight=backend.upload(tensor); std::vector<float> x(tokens*cols);
+    for(uint32_t t=0;t<tokens;t++) for(uint32_t c=0;c<cols;c++)
+        x[(size_t)t*cols+c]=(((int)((t+1)*11+c*5)%31)-15)*(float)(c/32+1)/(float)(t+3);
+    std::vector<float> reference(tokens*rows);
+    for(uint32_t t=0;t<tokens;t++) {
+        auto xb=backend.allocate(cols*4),yb=backend.allocate(rows*4); backend.write(*xb,0,x.data()+(size_t)t*cols,cols*4);
+        auto q=backend.allocate_quantized(cols); backend.begin_commands(); backend.quantize(*xb,q); backend.matvec_quantized(weight,q,*yb); backend.end_commands();
+        backend.read(*yb,0,reference.data()+(size_t)t*rows,rows*4);
+    }
+    auto all_x=backend.allocate(x.size()*4); backend.write(*all_x,0,x.data(),x.size()*4);
+    for(uint32_t n:{1u,8u,9u,12u}) {
+        auto q=backend.allocate_quantized(n*cols); auto out=backend.allocate((uint64_t)n*rows*4);
+        backend.begin_commands(); backend.quantize(*all_x,q); backend.matmul_quantized(weight,q,n,*out); backend.end_commands();
+        std::vector<float> got(n*rows); backend.read(*out,0,got.data(),got.size()*4);
+        for(size_t i=0;i<got.size();i++) if(!close(got[i],reference[i],3e-4f)) {
+            fprintf(stderr,"%s matmul tile n=%u i=%zu got %.7g want %.7g\n",q27::dtype_name(dtype),n,i,got[i],reference[i]); return 1;
+        }
+    }
+    return 0;
+}
+
 int test_mixed_pair(q27::MetalBackend& backend) {
     constexpr int cols=128; std::vector<float> x(cols); for(int i=0;i<cols;i++) x[i]=(i%13-6)/7.0f;
     std::vector<uint8_t> q4(cols/2,0x99); std::vector<int8_t> q8(cols,2);
@@ -298,7 +335,9 @@ int main() {
                backend.max_threadgroup_memory_length() / 1024.0);
         if (test_mmap_upload(backend) || test_dispatch_validation(backend) ||
             test_f32(backend) || test_f16(backend) ||
-            test_q8(backend) || test_q4(backend) || test_mixed_pair(backend))
+            test_q8(backend) || test_q4(backend) || test_mixed_pair(backend) ||
+            (backend.supports_quantized_matmul() &&
+             (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128))))
             return 1;
         puts("Metal matvec: OK");
         return 0;

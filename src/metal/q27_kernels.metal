@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 struct MatvecArgs {
@@ -7,6 +8,7 @@ struct MatvecArgs {
     uint simdgroups;
 };
 struct MatvecPairArgs { uint rows_a; uint rows_b; uint cols; uint simdgroups; };
+struct MatmulArgs { uint rows; uint cols; uint x_rows; uint simdgroups; };
 
 inline void reduce_row(float sum, device float *out, uint row,
                        threadgroup float *partial, ushort lane, ushort simdgroup,
@@ -586,6 +588,69 @@ kernel void q27_matvec_q4_quantized_pair(
         }
     }
     if(lane==0) { if(row<args.rows_a) out_a[row]=ra; if(row<args.rows_b) out_b[row]=rb; }
+}
+
+kernel void q27_matmul_q4_simdgroup(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float atile[64],btile[64],ctile[64];
+    simdgroup_float8x8 accum=make_filled_simdgroup_matrix<float,8,8>(0.0f);
+    const uint token_base=group.y*8, row_base=group.x*8;
+    for(uint k=0;k<args.cols;k+=8) {
+        for(uint pass=0;pass<2;pass++) {
+            uint i=lane+pass*32, rr=i/8, cc=i&7, token=token_base+rr, col=k+cc;
+            atile[i]=(token<args.x_rows && col<args.cols)
+                ? float(x[(ulong)token*args.cols+col])*x_scales[(ulong)token*(args.cols/32)+col/32] : 0.0f;
+            uint input=k+rr, row=row_base+cc;
+            if(row<args.rows && input<args.cols) {
+                uchar packed=weights[(ulong)row*(args.cols/2)+input/2];
+                int q=int((input&1)?(packed>>4):(packed&15))-8;
+                btile[i]=float(q)*float(weight_scales[(ulong)row*(args.cols/64)+input/64]);
+            } else btile[i]=0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 a,b;
+        simdgroup_load(a,atile,8); simdgroup_load(b,btile,8);
+        simdgroup_multiply_accumulate(accum,a,b,accum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(accum,ctile,8); threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint pass=0;pass<2;pass++) {
+        uint i=lane+pass*32, rr=i/8,cc=i&7,token=token_base+rr,row=row_base+cc;
+        if(token<args.x_rows && row<args.rows) out[(ulong)token*args.rows+row]=ctile[i];
+    }
+}
+
+kernel void q27_matmul_q8_simdgroup(
+        device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float atile[64],btile[64],ctile[64];
+    simdgroup_float8x8 accum=make_filled_simdgroup_matrix<float,8,8>(0.0f);
+    const uint token_base=group.y*8, row_base=group.x*8;
+    for(uint k=0;k<args.cols;k+=8) {
+        for(uint pass=0;pass<2;pass++) {
+            uint i=lane+pass*32, rr=i/8, cc=i&7, token=token_base+rr, col=k+cc;
+            atile[i]=(token<args.x_rows && col<args.cols)
+                ? float(x[(ulong)token*args.cols+col])*x_scales[(ulong)token*(args.cols/32)+col/32] : 0.0f;
+            uint input=k+rr, row=row_base+cc;
+            btile[i]=(row<args.rows && input<args.cols)
+                ? float(weights[(ulong)row*args.cols+input])*float(weight_scales[(ulong)row*(args.cols/128)+input/128]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 a,b;
+        simdgroup_load(a,atile,8); simdgroup_load(b,btile,8);
+        simdgroup_multiply_accumulate(accum,a,b,accum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(accum,ctile,8); threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint pass=0;pass<2;pass++) {
+        uint i=lane+pass*32, rr=i/8,cc=i&7,token=token_base+rr,row=row_base+cc;
+        if(token<args.x_rows && row<args.rows) out[(ulong)token*args.rows+row]=ctile[i];
+    }
 }
 
 kernel void q27_copy_bytes(device const uchar *src [[buffer(0)]],

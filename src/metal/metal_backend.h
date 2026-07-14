@@ -40,6 +40,8 @@ class MetalBackend final : public ComputeBackend {
     void matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
                                const BackendTensor& b, BackendBuffer& b_out,
                                const BackendQuantized& x) override;
+    void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
+                          uint32_t x_rows,BackendBuffer& y) override;
     void embedding_q8(const BackendTensor& weight, uint32_t token,
                       BackendBuffer& out) override;
     void rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
@@ -101,6 +103,7 @@ class MetalBackend final : public ComputeBackend {
     uint64_t recommended_working_set_size() const;
     uint64_t max_buffer_length() const;
     uint64_t max_threadgroup_memory_length() const;
+    bool supports_quantized_matmul() const;
 
   private:
     struct Impl;
