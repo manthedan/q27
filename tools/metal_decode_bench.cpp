@@ -264,6 +264,7 @@ int main(int argc, char** argv) {
     };
 
     token_step(1); token_step(2); // warmup: clock ramp + first-touch paging
+    backend.profile_reset();      // keep the cold dispatches out of the attribution
     const auto start = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < tokens; i++) token_step(i + 3);
     const double seconds =

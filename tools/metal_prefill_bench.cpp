@@ -290,9 +290,11 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < prompt; i++) tokens[i] = (i * 2654435761u) % VOCAB;
 
     // Warmup: clock ramp plus first-touch paging of the synthetic weights,
-    // then restart the sequence so the measured run ingests the whole prompt.
-    chunk_step(tokens.data(), chunk_size);
+    // then restart the sequence so the measured run ingests the whole prompt
+    // and the profile attribution excludes the cold dispatches.
+    chunk_step(tokens.data(), std::min(chunk_size, prompt));
     backend.synchronize();
+    backend.profile_reset();
     position = 0;
 
     const auto start = std::chrono::steady_clock::now();

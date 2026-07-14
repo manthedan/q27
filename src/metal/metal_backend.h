@@ -146,6 +146,11 @@ class MetalBackend final : public ComputeBackend {
                      BackendBuffer& out_indices) override;
     void synchronize() override;
 
+    // Clears Q27_METAL_PROFILE accumulation (stats, command-buffer and
+    // busy/wait counters) so benches can exclude their warmup dispatches
+    // from the attribution table. No-op when profiling is disabled.
+    void profile_reset();
+
     uint64_t recommended_working_set_size() const;
     uint64_t max_buffer_length() const;
     uint64_t max_threadgroup_memory_length() const;

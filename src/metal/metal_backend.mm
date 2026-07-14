@@ -1446,6 +1446,14 @@ void MetalBackend::synchronize() {
     }
 }
 
+void MetalBackend::profile_reset() {
+    if (!impl_->profile) return;
+    impl_->profile_stats.clear();
+    impl_->profiled_command_buffers = 0;
+    impl_->gpu_busy_seconds = 0.0;
+    impl_->cpu_wait_seconds = 0.0;
+}
+
 uint64_t MetalBackend::recommended_working_set_size() const {
     return (uint64_t)impl_->device.recommendedMaxWorkingSetSize;
 }
