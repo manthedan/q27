@@ -1,6 +1,6 @@
 # Metal implementation progress
 
-**Updated:** 2026-07-13  
+**Updated:** 2026-07-14  
 **Test device:** Apple M4, 24 GiB unified memory, 17.8 GiB recommended Metal working set
 
 This is the execution ledger for the Metal port. CUDA remains the behavioral reference. “Baseline” means the end-to-end operation exists and has local CPU/synthetic coverage; it does not mean the optimized CUDA-equivalent gate has passed.
@@ -82,6 +82,20 @@ Turbo3 allocation/startup passes at 32K and the full 262144-token limit. KV memo
 ### 9 — Performance
 
 Landed: zero-copy mmap weights, one command buffer per prompt/step, group-32 int8 activation quantization reused across sibling projections, integer-accumulating Q4/Q8 GEMV, eight independent simdgroups per threadgroup, shared-input paired projection dispatches, and fused RMSNorm+activation quantization. The 16-token CUDA gate improved from 33.35 s (`0.48 tok/s`) to 25.39 s (`0.63 tok/s`) while preserving exact output; the 128-token run averaged `1.22 tok/s`. Peak process footprint stayed about 276 MiB. Kernel throughput remains far below parity. Initial small-N Q4 prototypes that performed serial per-token SIMD reductions measured `0.62–0.75x` versus serial GEMV and were reverted. Replacing them with 8×8 float `simdgroup_matrix` tiles and on-tile Q4/Q8 dequantization changed the result: 12 activation rows over `[17408,5120]` measure `8.36 ms` versus `27.49 ms` for 12 serial GEMVs (`3.29x`). The 1–12-row primitive has Q4/Q8 CPU-reference tests and passes on both M4 hosts; integrating it requires layer-major prefill/verification scheduling. Remaining high-impact work: that integration, packed SIMD dot instructions for GEMV, fused GDN, tiled attention, GPU-side acceptance/sampling, and Instruments attribution.
+
+## Mature-decode critical path
+
+The remaining work should proceed in this order; isolated kernel wins do not close a checkpoint until the engine schedules them end-to-end.
+
+1. **Layer-major 8–12 token execution:** add batched embeddings/RMSNorm/quantization, route projections through the simdgroup GEMM, implement chunk-aware GDN recurrence and causal attention, and commit state at chunk boundaries.
+2. **Batched MTP verification:** verify candidate lanes layer-by-layer, checkpoint base state before each round, commit only accepted KV/GDN rows, move the acceptance walk to the GPU, and adapt width from measured acceptance. Committed tokens must remain identical to greedy.
+3. **Greedy hot-path optimization:** profile GPU time and effective bandwidth, add packed-dot Q4/Q8 GEMV, fuse GDN stages and residual/normalization boundaries, and reduce per-token dispatch count. A provisional base-M4 maturity target is `3–5 tok/s` or at least 50% of the measured sustainable bandwidth roofline.
+4. **Production attention:** add online-softmax tiled FP16/turbo3 decode, GQA KV reuse, chunk-causal prefill attention, and long-context cache-block scheduling.
+5. **Quality closure:** collect deeper CUDA layer/state/top-k probes, then run 32K/128K/262K retrieval, perplexity, and turbo3 quality gates. Numerical tolerance is allowed across architectures; semantic, ranking, and committed-token regressions are not.
+6. **Serving closure:** add true token streaming, GPU sampling, tool constraints, stop handling, cancellation/backpressure, multi-slot scheduling, and the CUDA server compatibility suite.
+7. **Hardware validation:** benchmark cold/warm short decode, long decode, prefill, and MTP on base M4 and available Max/Ultra-class machines; report memory mode and effective bandwidth with every result.
+
+The immediate implementation target is item 1. It unlocks practical long-context validation and provides the same execution substrate needed by item 2.
 
 ## Memory-safe test policy
 
