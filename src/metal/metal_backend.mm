@@ -11,6 +11,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 
@@ -199,6 +200,14 @@ struct MetalBackend::Impl {
     id<MTLComputeCommandEncoder> encoder;
     bool batching = false;
 
+    // Model mappings that fit maxBufferLength are wrapped as a single
+    // MTLBuffer (tensors bind at offsets), and on macOS 15+ that buffer joins
+    // a residency set attached to the queue: pages stay wired between command
+    // buffers, so file-backed weight pages are neither faulted in token by
+    // token on first touch nor evictable under memory pressure mid-run.
+    std::map<const void*, std::weak_ptr<MetalBuffer>> model_wraps;
+    API_AVAILABLE(macos(15.0)) id<MTLResidencySet> residency_set;
+
     // Q27_METAL_PROFILE=1: per-dispatch GPU-time attribution. Every operation
     // runs in its own compute encoder bracketed by stage-boundary timestamp
     // samples, so independent dispatches no longer overlap; absolute wall time
@@ -326,6 +335,19 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         if (!impl_->device) throw std::runtime_error("q27 Metal: no Metal device");
         impl_->queue = [impl_->device newCommandQueue];
         if (!impl_->queue) throw std::runtime_error("q27 Metal: cannot create command queue");
+
+        if (@available(macOS 15.0, *)) {
+            const char* env = getenv("Q27_METAL_NO_RESIDENCY");
+            if (!env || !*env || *env == '0') {
+                MTLResidencySetDescriptor* residency_descriptor = [MTLResidencySetDescriptor new];
+                residency_descriptor.label = @"q27 model weights";
+                NSError* residency_error = nil;
+                impl_->residency_set =
+                    [impl_->device newResidencySetWithDescriptor:residency_descriptor
+                                                           error:&residency_error];
+                if (impl_->residency_set) [impl_->queue addResidencySet:impl_->residency_set];
+            }
+        }
 
         MTLCompileOptions* options = [MTLCompileOptions new];
         // Correctness baseline; enable relaxed math only after CUDA comparison.
@@ -497,6 +519,74 @@ BackendTensor MetalBackend::upload(const Tensor& tensor) {
 }
 
 BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
+    // Preferred form: one MTLBuffer wraps the whole mapping and every tensor
+    // binds at an offset. One buffer instead of two per tensor keeps the
+    // per-commit residency/tracking work constant in model size, and gives
+    // the residency set a single allocation to wire. Mappings larger than
+    // maxBufferLength (the 5.25 bpw tier) keep per-tensor page-aligned views
+    // and stay unwired -- they do not fit in memory either way.
+    auto wrap_mapping = [&]() -> std::shared_ptr<MetalBuffer> {
+        void* base = (void*)model.mapping_base();
+        const uint64_t size = model.mapping_size();
+        auto& slot = impl_->model_wraps[base];
+        if (auto held = slot.lock()) return held;
+        madvise(base, (size_t)size, MADV_WILLNEED);
+        id<MTLBuffer> buffer = [impl_->device newBufferWithBytesNoCopy:base
+                                                                length:(NSUInteger)size
+                                                               options:MTLResourceStorageModeShared
+                                                           deallocator:nil];
+        if (!buffer) throw std::runtime_error("q27 Metal: cannot wrap model mmap");
+        std::shared_ptr<MetalBuffer> wrapped;
+        if (@available(macOS 15.0, *)) {
+            if (id<MTLResidencySet> set = impl_->residency_set) {
+                [set addAllocation:buffer];
+                [set commit];
+                [set requestResidency];
+                // The set retains the buffer and keeps its pages wired; drop
+                // it when the last tensor goes away so a later munmap cannot
+                // leave the set holding a dead address range.
+                wrapped = std::shared_ptr<MetalBuffer>(
+                    new MetalBuffer(buffer), [set](MetalBuffer* wrapper) {
+                        if (@available(macOS 15.0, *)) {
+                            [set removeAllocation:wrapper->handle()];
+                            [set commit];
+                        }
+                        delete wrapper;
+                    });
+            }
+        }
+        if (!wrapped) wrapped = std::make_shared<MetalBuffer>(buffer);
+        slot = wrapped;
+        return wrapped;
+    };
+
+    auto mapping_offset = [&](const uint8_t* ptr, uint64_t bytes) -> uint64_t {
+        if (!ptr || !bytes) throw std::runtime_error("q27 Metal: invalid model view");
+        const uintptr_t base = (uintptr_t)model.mapping_base();
+        const uintptr_t address = (uintptr_t)ptr;
+        if (address < base) throw std::runtime_error("q27 Metal: tensor precedes model mapping");
+        const uint64_t offset = (uint64_t)(address - base);
+        if (offset > model.mapping_size() || bytes > model.mapping_size() - offset)
+            throw std::runtime_error("q27 Metal: tensor outside model mapping");
+        return offset;
+    };
+
+    if (!model.mapping_base() || !model.mapping_size())
+        throw std::runtime_error("q27 Metal: invalid model view");
+    if (model.mapping_size() <= (uint64_t)impl_->device.maxBufferLength) {
+        BackendTensor result;
+        result.dtype = tensor.dtype;
+        result.rows = tensor.rows();
+        result.cols = tensor.cols();
+        result.data_offset = mapping_offset(tensor.data, tensor.data_size);
+        result.data = wrap_mapping();
+        if (tensor.scales_size) {
+            result.scales_offset = mapping_offset(tensor.scales, tensor.scales_size);
+            result.scales = result.data;
+        }
+        return result;
+    }
+
     auto wrap = [&](const uint8_t* ptr, uint64_t bytes, uint64_t& inner) {
         if (!ptr || !bytes || !model.mapping_base() || !model.mapping_size())
             throw std::runtime_error("q27 Metal: invalid model view");

@@ -344,6 +344,30 @@ scaled by bandwidth.
 - Prefill chunk rate: T2 ≈ Q4/Q8 (470 vs 484 ms/chunk synthetic) — compute-
   bound, as expected; ternary doesn't change the prefill wall.
 
+### Phase 4 paging chase — attribution and verdict (2026-07-15)
+
+- **vm_stat attribution:** steady-state decode refaults nothing (pageins ≈ 0
+  between tokens); the paging cost is **launch-time only** — each process
+  start refaulted 3–6 GiB at ~1.8 GB/s during the first tokens, inside the
+  tok/s timer, because the page cache is dropped between runs under memory
+  pressure.
+- **Landed (metal_backend.mm):** whole-mapping single-MTLBuffer wrap with
+  per-tensor offsets when the mapping fits `maxBufferLength` (13.3 GiB here;
+  the 16.5 GiB official tier keeps per-tensor views), `madvise(WILLNEED)`,
+  and an MTLResidencySet on macOS 15+ attached to the queue
+  (`Q27_METAL_NO_RESIDENCY=1` opt-out). Weights now wire at load ("ready"
+  0.1 s → 2.5–5 s) and cannot be evicted mid-serve. Tests green, official
+  tier fallback verified, greedy output byte-identical.
+- **A/B verdict:** interleaved 3×3 base/res/no-residency showed no
+  steady-state difference beyond ±0.5 tok/s noise. The 8.2–9.4-vs-12.66 gap
+  was (a) launch fault-in inside the timer and (b) thermal mismatch — the
+  ceiling itself re-measured mid-session was 10.57 tok/s, and profiling the
+  artifact shows GPU busy 96% of wall with the T2 GEMV at 84.7% / ~77
+  ms/token: decode is kernel-bound at the bandwidth limit, within a few
+  percent of the same-moment ceiling.
+- **Protocol rule:** ceiling and artifact numbers are only comparable when
+  measured back-to-back at matched thermal state.
+
 ## Non-goals (this plan)
 
 Binary 1.125-bpw tier (follow-up — same kernel skeleton, do after ternary proves out);
