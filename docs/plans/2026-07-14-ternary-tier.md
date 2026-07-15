@@ -389,6 +389,50 @@ cross-artifact gap; suspects are the T2 float-activation chunk GEMM route
 and overnight power state. Any timed rerun should also measure the causal
 GQA path (default threshold), which was −7.8% already at 8K.
 
+## Whitepaper-derived follow-ups (2026-07-15, full read of bonsai-27b-whitepaper.pdf)
+
+Ranked; items 1–2 are concrete next levers, the rest are references and
+protocol notes.
+
+1. **Adopt their KV-tolerance methodology as a q27 gate (paper §4.4,
+   Table 6).** They measure KV-quantization damage as **output forward-KL
+   against the same model's FP16-KV baseline** — on-policy (own MATH-500
+   generations) and off-policy (BABILong-16K) — not corpus NLL. This
+   isolates the KV effect from weight quality, which gate 3 could only
+   disentangle by bucket-shape argument. q27 version: one process, one
+   model mapping, two engines (fp16 KV + turbo3 KV share the weight wrap),
+   teacher-force the same wikitext stream through both, per-position
+   forward-KL, depth-bucketed. ~2× the cost of one 8K pass. This is also
+   the right instrument for any sub-2-bit KV experiment (their early
+   results say the key cache tolerates sub-2-bit, and that low-bit weights
+   tolerate KV noise *better* — 0.0011–0.0029 nats vs FP16's 0.0137–0.222
+   — a claim worth reproducing on turbo3 before trusting).
+2. **Native ternary packing (paper §4.3 + §9 roadmap).** Their own kernels
+   store each trit in a 2-bit slot (deployed 7.2 GB vs 5.9 GB
+   information-theoretic); ours inherit that layout (T2_G128). Base-3
+   packing (5 trits/byte ≈ 1.6 bpw + scales ≈ 1.71 effective) cuts the
+   decode weight stream ~15–18% — at the bandwidth bound that is a direct
+   ~12.4 → ~14+ tok/s ceiling move. Kernel shape: 243-entry byte→5-trit
+   LUT feeding the existing select-form dot. They list this as *their*
+   future work; landing it first extends the q27 edge.
+3. **Prefill reference point (paper §5.1, Table 8).** Their fork does
+   pp512 52.48 tok/s on this exact M4 (Phase 0 measurement; 125–133 on M4
+   Pro). Our chunk rate (~470 ms per 12-token chunk ≈ ~25 tok/s) is roughly
+   half their stack on the same machine — independent confirmation that
+   chunk-GEMM staging (half-precision staging, double-buffered K-tiles) is
+   the top prefill lever, with a concrete beatable number.
+4. **Behavioral-gate sampling config (paper §B.1).** Their evals run
+   thinking mode at temperature 0.7, top-p 0.95, top-k 20 (greedy is not
+   their recommended operating point). Our behavioral probes should match
+   that config once GPU-assisted sampling (stage 2) lands — which also
+   makes top_k=20 the exact GPU-candidate case.
+5. **Drafting reality check (paper §6.2 + §9).** Their DSpark drafter is
+   net-positive only on CUDA; they state batch-1 verification does not
+   amortize on Apple Silicon — the same wall our MTP/suffix experiments
+   hit. Treat GPU-resident drafting on Metal as research, not a scheduled
+   lever; their ~1.34–1.37× CUDA speedup bounds the prize if the
+   verification cost problem is solved.
+
 ## Non-goals (this plan)
 
 Binary 1.125-bpw tier (follow-up — same kernel skeleton, do after ternary proves out);
