@@ -163,6 +163,10 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q4;
     id<MTLComputePipelineState> t2;
     id<MTLComputePipelineState> t3;
+    id<MTLComputePipelineState> t2_quantized_matmul_h;
+    // Half-staging T2 chunk GEMM: default ON (1.28x chunk rate at quality
+    // parity on this tier's gates); Q27_METAL_GEMM_HALF=0 opts out.
+    bool gemm_half = true;
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
@@ -492,6 +496,9 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->q4_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm");
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
+            impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
+            if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
+                impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
         }
         impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
         impl_->embedding_t2 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2");
@@ -966,11 +973,14 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
     check_range(xv.size(),0,x.count,"quantized matmul values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matmul scales");
     MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
     @autoreleasepool {
+        // Q27_METAL_GEMM_HALF=1: half-staging T2 GEMM (A/B lever, see
+        // docs/plans/2026-07-15-gemm-half-staging.md).
+        const bool t2h = impl_->gemm_half && weight.dtype==DType::T2_G128;
         bool own; auto enc=impl_->encoder_for_operation(own,
             weight.dtype==DType::Q8_G128?"q27_matmul_q8_mm":
-            weight.dtype==DType::T2_G128?"q27_matmul_t2_mm":"q27_matmul_q4_mm");
+            weight.dtype==DType::T2_G128?(t2h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):"q27_matmul_q4_mm");
         [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:
-                                     weight.dtype==DType::T2_G128?impl_->t2_quantized_matmul:impl_->q4_quantized_matmul];
+                                     weight.dtype==DType::T2_G128?(t2h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):impl_->q4_quantized_matmul];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
