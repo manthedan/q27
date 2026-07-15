@@ -368,6 +368,27 @@ scaled by bandwidth.
 - **Protocol rule:** ceiling and artifact numbers are only comparable when
   measured back-to-back at matched thermal state.
 
+### Gate 3 — 32K turbo3 NLL verdict (2026-07-15, PASS)
+
+Full single pass, no resets, `Q27_METAL_GQA_THRESHOLD=0` (proven kernels
+only). Overall mean NLL 2.4590, **PPL 11.693** (official tier: 5.318).
+Buckets vs official: 0–2k 9.483/4.904 (1.93×), 2k–8k 15.409/6.884 (2.24×),
+8k–16k 7.456/3.525 (2.11×), 16k–32k 13.554/5.988 (2.26×). The bucket shape
+matches the official run exactly — 8–16k best in both, deepest bucket
+better than 2k–8k in both — so variation tracks content, not position:
+**no ternary×turbo3 depth compounding; the tier's quality cost is a
+depth-uniform ~2.1–2.3×**, consistent with Phase 0. The 0–2k and 2k–8k
+buckets reproduce the 8K short-pass bucket-exactly, validating the cheap
+paired protocol for this artifact.
+
+**Flagged follow-up (performance, not quality):** wall 33,201.62 s
+(0.99 tok/s) vs the official artifact's 7,458.87 s (4.39 tok/s) for the
+same pass on the same machine — 4.4× slower despite streaming fewer weight
+bytes. Quadratic attention work explains the within-run decay, not the
+cross-artifact gap; suspects are the T2 float-activation chunk GEMM route
+and overnight power state. Any timed rerun should also measure the causal
+GQA path (default threshold), which was −7.8% already at 8K.
+
 ## Non-goals (this plan)
 
 Binary 1.125-bpw tier (follow-up — same kernel skeleton, do after ternary proves out);
