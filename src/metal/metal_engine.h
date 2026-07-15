@@ -128,12 +128,20 @@ class MetalEngine {
     std::vector<std::shared_ptr<BackendBuffer>> park_qkv_, park_g_, park_beta_;
     std::shared_ptr<BackendBuffer> discard_recurrent_, discard_ring_;
 
+    // Ternary artifacts (quant_policy bonsai-t2-v1) carry no MTP layer.
+    bool has_mtp_ = true;
+
     std::shared_ptr<BackendBuffer> alloc_f32(uint64_t count);
     const BackendTensor& weight(const std::string& name) const;
     const BackendTensor& layer_weight(uint32_t layer, const char* leaf) const;
     static bool attention_layer(uint32_t layer) { return layer % 4 == 3; }
 
     void validate_architecture() const;
+    void project(const BackendTensor& w, const BackendBuffer& x_float,
+                 const BackendQuantized& xq, BackendBuffer& out);
+    void project_pair(const BackendTensor& a, BackendBuffer& a_out,
+                      const BackendTensor& b, BackendBuffer& b_out,
+                      const BackendBuffer& x_float, const BackendQuantized& xq);
     void gdn_block(uint32_t layer);
     void attention_block(uint32_t layer);
     void ffn(uint32_t layer);
