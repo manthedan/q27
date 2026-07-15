@@ -4,7 +4,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <memory>
 #include <numeric>
 #include <vector>
 
@@ -334,6 +337,334 @@ int test_turbo3_production_shape(q27::MetalBackend& backend) {
                     failures++;
                 }
             }
+        }
+    }
+    return failures;
+}
+
+// GQA KV-reuse path parity: a second backend built under
+// Q27_METAL_GQA_THRESHOLD=1 forces every decode attention call through the
+// blocked kernels (one threadgroup per KV head per 1024-position block, one
+// simdgroup per query head, block partials merged in index order). Same CPU
+// references as the production-shape gates above; the sequence lengths
+// cover a single partial block plus normalize-only merge (133), a two-block
+// split with a six-row tail tile (1030), and three blocks (2050).
+int test_attention_gqa_path() {
+    setenv("Q27_METAL_GQA_THRESHOLD", "1", 1);
+    q27::MetalBackend backend;
+    unsetenv("Q27_METAL_GQA_THRESHOLD");
+    int failures = 0;
+    uint32_t lcg = 98765;
+    auto uniform = [&]() { lcg = lcg * 1664525u + 1013904223u; return (float)(lcg >> 8) / 8388608.0f - 1.0f; };
+    auto as_half = [](float v) { return (float)(_Float16)v; };
+    constexpr uint32_t qh = 24, kvh = 4, dim = 256, stride = 2 * dim;
+    const float scale = 1.0f / 16.0f;
+
+    for (uint32_t seq : {133u, 1030u, 2050u}) {
+        std::vector<std::vector<float>> keys(seq), vals(seq);
+        std::vector<std::shared_ptr<q27::BackendBuffer>> kbufs(seq), vbufs(seq);
+        auto kc = backend.allocate((uint64_t)seq * kvh * dim * 2);
+        auto vc = backend.allocate((uint64_t)seq * kvh * dim * 2);
+        for (uint32_t p = 0; p < seq; p++) {
+            keys[p].resize(kvh * dim); vals[p].resize(kvh * dim);
+            const float magnitude = (p % 3 == 0) ? 2.5f : 0.4f;
+            for (auto& value : keys[p]) value = uniform() * magnitude;
+            for (auto& value : vals[p]) value = uniform() * 3.0f;
+            kbufs[p] = upload_buffer(backend, keys[p]);
+            vbufs[p] = upload_buffer(backend, vals[p]);
+        }
+        backend.begin_commands();
+        for (uint32_t p = 0; p < seq; p++)
+            backend.kv_store_f16(*kbufs[p], *vbufs[p], *kc, *vc, p, kvh * dim);
+        backend.end_commands();
+        std::vector<float> q((uint64_t)qh * stride);
+        for (auto& value : q) value = uniform() * 1.5f;
+        auto qb = upload_buffer(backend, q);
+        auto out = backend.allocate((uint64_t)qh * dim * 4);
+        backend.attention_f16(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale);
+        auto got = read_f32(backend, *out, (uint64_t)qh * dim);
+        for (uint32_t h = 0; h < qh; h++) {
+            const uint32_t kh = h / (qh / kvh);
+            std::vector<float> s(seq);
+            float mx = -1e30f;
+            for (uint32_t p = 0; p < seq; p++) {
+                s[p] = 0;
+                for (uint32_t d = 0; d < dim; d++) s[p] += q[h * stride + d] * as_half(keys[p][kh * dim + d]);
+                s[p] *= scale;
+                mx = std::max(mx, s[p]);
+            }
+            float den = 0;
+            for (float& value : s) { value = std::exp(value - mx); den += value; }
+            for (float& value : s) value /= den;
+            for (uint32_t d = 0; d < dim; d++) {
+                float want = 0;
+                for (uint32_t p = 0; p < seq; p++) want += s[p] * as_half(vals[p][kh * dim + d]);
+                if (!near(got[h * dim + d], want, 2e-3f)) {
+                    fprintf(stderr, "gqa f16 seq=%u [%u,%u] got %.8g want %.8g\n",
+                            seq, h, d, got[h * dim + d], want);
+                    failures++;
+                }
+            }
+        }
+    }
+
+    constexpr float centroids[8] = {
+        -0.190207f, -0.118786f, -0.066822f, -0.021663f,
+         0.021663f,  0.066822f,  0.118786f,  0.190207f };
+    auto dequant = [&](const uint8_t* block, uint32_t j) {
+        const uint32_t low = (block[2 + (j >> 2)] >> ((j & 3) * 2)) & 3;
+        const uint32_t high = (block[34 + (j >> 3)] >> (j & 7)) & 1;
+        _Float16 h; __builtin_memcpy(&h, block, 2);
+        return centroids[low | (high << 2)] * (float)h;
+    };
+    for (uint32_t seq : {133u, 1030u, 2050u}) {
+        const uint64_t row_bytes = (uint64_t)kvh * 2 * 50;
+        auto kc = backend.allocate(seq * row_bytes);
+        auto vc = backend.allocate(seq * row_bytes);
+        std::vector<std::shared_ptr<q27::BackendBuffer>> kbufs(seq), vbufs(seq);
+        for (uint32_t p = 0; p < seq; p++) {
+            std::vector<float> k(kvh * dim), v(kvh * dim);
+            const float magnitude = (p % 3 == 0) ? 2.5f : 0.4f;
+            for (auto& value : k) value = uniform() * magnitude;
+            for (auto& value : v) value = uniform() * 3.0f;
+            kbufs[p] = upload_buffer(backend, k);
+            vbufs[p] = upload_buffer(backend, v);
+        }
+        backend.begin_commands();
+        for (uint32_t p = 0; p < seq; p++)
+            backend.kv_store_turbo3(*kbufs[p], *vbufs[p], *kc, *vc, p, kvh);
+        backend.end_commands();
+        std::vector<uint8_t> k_blocks(seq * row_bytes), v_blocks(seq * row_bytes);
+        backend.read(*kc, 0, k_blocks.data(), k_blocks.size());
+        backend.read(*vc, 0, v_blocks.data(), v_blocks.size());
+        std::vector<float> q((uint64_t)qh * stride);
+        for (auto& value : q) value = uniform() * 1.5f;
+        auto qb = upload_buffer(backend, q);
+        backend.turbo_wht(*qb, qh, stride, false);
+        auto q_wht = read_f32(backend, *qb, q.size());
+        auto out = backend.allocate((uint64_t)qh * dim * 4);
+        backend.attention_turbo3(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale);
+        auto got = read_f32(backend, *out, (uint64_t)qh * dim);
+        for (uint32_t h = 0; h < qh; h++) {
+            const uint32_t kh = h / (qh / kvh);
+            std::vector<float> s(seq);
+            float mx = -1e30f;
+            for (uint32_t p = 0; p < seq; p++) {
+                s[p] = 0;
+                for (uint32_t d = 0; d < dim; d++) {
+                    const uint8_t* block =
+                        k_blocks.data() + ((uint64_t)p * kvh * 2 + kh * 2 + (d >> 7)) * 50;
+                    s[p] += q_wht[h * stride + d] * dequant(block, d & 127);
+                }
+                s[p] *= scale;
+                mx = std::max(mx, s[p]);
+            }
+            float den = 0;
+            for (float& value : s) { value = std::exp(value - mx); den += value; }
+            for (float& value : s) value /= den;
+            for (uint32_t d = 0; d < dim; d++) {
+                float want = 0;
+                for (uint32_t p = 0; p < seq; p++) {
+                    const uint8_t* block =
+                        v_blocks.data() + ((uint64_t)p * kvh * 2 + kh * 2 + (d >> 7)) * 50;
+                    want += s[p] * dequant(block, d & 127);
+                }
+                if (!near(got[h * dim + d], want, 2e-3f)) {
+                    fprintf(stderr, "gqa turbo3 seq=%u [%u,%u] got %.8g want %.8g\n",
+                            seq, h, d, got[h * dim + d], want);
+                    failures++;
+                }
+            }
+        }
+    }
+
+    // Causal-chunk GQA path: base 2040, 12 tokens, so the per-token live
+    // block count changes inside the chunk (tokens 0-8 span two 1024-blocks,
+    // tokens 9-11 span three) and the merge's dead-partial guard is on the
+    // line. Same CPU references as the chunked gates.
+    {
+        constexpr uint32_t base = 2040, tokens = 12, max_seq = base + tokens - 1;
+        const uint32_t q_row_stride = qh * stride;
+        std::vector<std::vector<float>> keys(max_seq), vals(max_seq);
+        std::vector<std::shared_ptr<q27::BackendBuffer>> kbufs(max_seq), vbufs(max_seq);
+        auto kc = backend.allocate((uint64_t)max_seq * kvh * dim * 2);
+        auto vc = backend.allocate((uint64_t)max_seq * kvh * dim * 2);
+        for (uint32_t p = 0; p < max_seq; p++) {
+            keys[p].resize(kvh * dim); vals[p].resize(kvh * dim);
+            const float magnitude = (p % 3 == 0) ? 2.5f : 0.4f;
+            for (auto& value : keys[p]) value = uniform() * magnitude;
+            for (auto& value : vals[p]) value = uniform() * 3.0f;
+            kbufs[p] = upload_buffer(backend, keys[p]);
+            vbufs[p] = upload_buffer(backend, vals[p]);
+        }
+        backend.begin_commands();
+        for (uint32_t p = 0; p < max_seq; p++)
+            backend.kv_store_f16(*kbufs[p], *vbufs[p], *kc, *vc, p, kvh * dim);
+        backend.end_commands();
+        std::vector<float> q((uint64_t)tokens * q_row_stride);
+        for (auto& value : q) value = uniform() * 1.5f;
+        auto qb = upload_buffer(backend, q);
+        auto out = backend.allocate((uint64_t)tokens * qh * dim * 4);
+        backend.attention_f16_causal(*qb, stride, q_row_stride, *kc, *vc, *out,
+                                     base, qh, kvh, dim, tokens, scale);
+        auto got = read_f32(backend, *out, (uint64_t)tokens * qh * dim);
+        for (uint32_t t = 0; t < tokens; t++) {
+            const uint32_t seq = base + t;
+            for (uint32_t h = 0; h < qh; h++) {
+                const uint32_t kh = h / (qh / kvh);
+                std::vector<float> s(seq);
+                float mx = -1e30f;
+                for (uint32_t p = 0; p < seq; p++) {
+                    s[p] = 0;
+                    for (uint32_t d = 0; d < dim; d++)
+                        s[p] += q[(uint64_t)t * q_row_stride + h * stride + d] * as_half(keys[p][kh * dim + d]);
+                    s[p] *= scale;
+                    mx = std::max(mx, s[p]);
+                }
+                float den = 0;
+                for (float& value : s) { value = std::exp(value - mx); den += value; }
+                for (float& value : s) value /= den;
+                for (uint32_t d = 0; d < dim; d++) {
+                    float want = 0;
+                    for (uint32_t p = 0; p < seq; p++) want += s[p] * as_half(vals[p][kh * dim + d]);
+                    const float have = got[((uint64_t)t * qh + h) * dim + d];
+                    if (!near(have, want, 2e-3f)) {
+                        fprintf(stderr, "gqa f16 causal t=%u [%u,%u] got %.8g want %.8g\n",
+                                t, h, d, have, want);
+                        failures++;
+                    }
+                }
+            }
+        }
+    }
+    {
+        constexpr uint32_t base = 2040, tokens = 12, max_seq = base + tokens - 1;
+        const uint32_t q_row_stride = qh * stride;
+        const uint64_t row_bytes = (uint64_t)kvh * 2 * 50;
+        auto kc = backend.allocate((uint64_t)max_seq * row_bytes);
+        auto vc = backend.allocate((uint64_t)max_seq * row_bytes);
+        std::vector<std::shared_ptr<q27::BackendBuffer>> kbufs(max_seq), vbufs(max_seq);
+        for (uint32_t p = 0; p < max_seq; p++) {
+            std::vector<float> k(kvh * dim), v(kvh * dim);
+            const float magnitude = (p % 3 == 0) ? 2.5f : 0.4f;
+            for (auto& value : k) value = uniform() * magnitude;
+            for (auto& value : v) value = uniform() * 3.0f;
+            kbufs[p] = upload_buffer(backend, k);
+            vbufs[p] = upload_buffer(backend, v);
+        }
+        backend.begin_commands();
+        for (uint32_t p = 0; p < max_seq; p++)
+            backend.kv_store_turbo3(*kbufs[p], *vbufs[p], *kc, *vc, p, kvh);
+        backend.end_commands();
+        std::vector<uint8_t> k_blocks(max_seq * row_bytes), v_blocks(max_seq * row_bytes);
+        backend.read(*kc, 0, k_blocks.data(), k_blocks.size());
+        backend.read(*vc, 0, v_blocks.data(), v_blocks.size());
+        std::vector<float> q((uint64_t)tokens * q_row_stride);
+        for (auto& value : q) value = uniform() * 1.5f;
+        auto qb = upload_buffer(backend, q);
+        backend.turbo_wht(*qb, tokens * qh, stride, false);
+        auto q_wht = read_f32(backend, *qb, q.size());
+        auto out = backend.allocate((uint64_t)tokens * qh * dim * 4);
+        backend.attention_turbo3_causal(*qb, stride, q_row_stride, *kc, *vc, *out,
+                                        base, qh, kvh, dim, tokens, scale);
+        auto got = read_f32(backend, *out, (uint64_t)tokens * qh * dim);
+        for (uint32_t t = 0; t < tokens; t++) {
+            const uint32_t seq = base + t;
+            for (uint32_t h = 0; h < qh; h++) {
+                const uint32_t kh = h / (qh / kvh);
+                std::vector<float> s(seq);
+                float mx = -1e30f;
+                for (uint32_t p = 0; p < seq; p++) {
+                    s[p] = 0;
+                    for (uint32_t d = 0; d < dim; d++) {
+                        const uint8_t* block =
+                            k_blocks.data() + ((uint64_t)p * kvh * 2 + kh * 2 + (d >> 7)) * 50;
+                        s[p] += q_wht[(uint64_t)t * q_row_stride + h * stride + d] * dequant(block, d & 127);
+                    }
+                    s[p] *= scale;
+                    mx = std::max(mx, s[p]);
+                }
+                float den = 0;
+                for (float& value : s) { value = std::exp(value - mx); den += value; }
+                for (float& value : s) value /= den;
+                for (uint32_t d = 0; d < dim; d++) {
+                    float want = 0;
+                    for (uint32_t p = 0; p < seq; p++) {
+                        const uint8_t* block =
+                            v_blocks.data() + ((uint64_t)p * kvh * 2 + kh * 2 + (d >> 7)) * 50;
+                        want += s[p] * dequant(block, d & 127);
+                    }
+                    const float have = got[((uint64_t)t * qh + h) * dim + d];
+                    if (!near(have, want, 2e-3f)) {
+                        fprintf(stderr, "gqa turbo3 causal t=%u [%u,%u] got %.8g want %.8g\n",
+                                t, h, d, have, want);
+                        failures++;
+                    }
+                }
+            }
+        }
+    }
+    return failures;
+}
+
+// Threshold-straddle contract gate (codex review finding 1): with the
+// DEFAULT threshold, a chunk whose rows span the switch point must produce
+// bit-identical output to serial decode at each row's sequence length —
+// rows below the threshold on the legacy kernels, rows at or above it on
+// the GQA kernels, split into two dispatches by the host. base 2043 with 12
+// tokens puts the 2048 switch inside the chunk.
+int test_attention_gqa_straddle() {
+    q27::MetalBackend backend;      // default Q27_METAL_GQA_THRESHOLD = 2048
+    int failures = 0;
+    uint32_t lcg = 24680;
+    auto uniform = [&]() { lcg = lcg * 1664525u + 1013904223u; return (float)(lcg >> 8) / 8388608.0f - 1.0f; };
+    constexpr uint32_t qh = 24, kvh = 4, dim = 256, stride = 2 * dim;
+    constexpr uint32_t base = 2043, tokens = 12, max_seq = base + tokens - 1;
+    const uint32_t q_row_stride = qh * stride;
+    const float scale = 1.0f / 16.0f;
+    const uint64_t row_bytes = (uint64_t)kvh * 2 * 50;
+
+    auto kc = backend.allocate((uint64_t)max_seq * row_bytes);
+    auto vc = backend.allocate((uint64_t)max_seq * row_bytes);
+    std::vector<std::shared_ptr<q27::BackendBuffer>> kbufs(max_seq), vbufs(max_seq);
+    for (uint32_t p = 0; p < max_seq; p++) {
+        std::vector<float> k(kvh * dim), v(kvh * dim);
+        const float magnitude = (p % 3 == 0) ? 2.5f : 0.4f;
+        for (auto& value : k) value = uniform() * magnitude;
+        for (auto& value : v) value = uniform() * 3.0f;
+        kbufs[p] = upload_buffer(backend, k);
+        vbufs[p] = upload_buffer(backend, v);
+    }
+    backend.begin_commands();
+    for (uint32_t p = 0; p < max_seq; p++)
+        backend.kv_store_turbo3(*kbufs[p], *vbufs[p], *kc, *vc, p, kvh);
+    backend.end_commands();
+
+    std::vector<float> q((uint64_t)tokens * q_row_stride);
+    for (auto& value : q) value = uniform() * 1.5f;
+    auto qb = upload_buffer(backend, q);
+    backend.turbo_wht(*qb, tokens * qh, stride, false);
+    auto q_wht = read_f32(backend, *qb, q.size());
+    auto out_chunk = backend.allocate((uint64_t)tokens * qh * dim * 4);
+    backend.attention_turbo3_causal(*qb, stride, q_row_stride, *kc, *vc, *out_chunk,
+                                    base, qh, kvh, dim, tokens, scale);
+    auto chunk = read_f32(backend, *out_chunk, (uint64_t)tokens * qh * dim);
+
+    auto qrow = backend.allocate((uint64_t)q_row_stride * 4);
+    auto out_dec = backend.allocate((uint64_t)qh * dim * 4);
+    for (uint32_t t = 0; t < tokens; t++) {
+        backend.write(*qrow, 0, q_wht.data() + (uint64_t)t * q_row_stride, (uint64_t)q_row_stride * 4);
+        backend.attention_turbo3(*qrow, stride, *kc, *vc, *out_dec, base + t, qh, kvh, dim, scale);
+        auto dec = read_f32(backend, *out_dec, (uint64_t)qh * dim);
+        if (std::memcmp(dec.data(), chunk.data() + (uint64_t)t * qh * dim,
+                        (size_t)qh * dim * sizeof(float)) != 0) {
+            for (uint32_t i = 0; i < qh * dim; i++)
+                if (dec[i] != chunk[(uint64_t)t * qh * dim + i]) {
+                    fprintf(stderr, "gqa straddle t=%u (seq %u) first diff at %u: chunk %.9g decode %.9g\n",
+                            t, base + t, i, chunk[(uint64_t)t * qh * dim + i], dec[i]);
+                    break;
+                }
+            failures++;
         }
     }
     return failures;
@@ -876,9 +1207,10 @@ int main() {
         int failures = test_primitives(backend) + test_attention(backend) +
                        test_attention_production_shape(backend) +
                        test_turbo3(backend) + test_turbo3_production_shape(backend) +
+                       test_attention_gqa_path() + test_attention_gqa_straddle() +
                        test_gdn(backend) + test_chunked(backend);
         if (failures) { fprintf(stderr, "Metal ops: %d failure(s)\n", failures); return 1; }
-        puts("Metal decode primitives, FP16/turbo3 attention, GDN, and chunked prefill ops: OK");
+        puts("Metal decode primitives, FP16/turbo3 attention (incl. GQA KV-reuse path), GDN, and chunked prefill ops: OK");
         return 0;
     } catch (const std::exception& error) {
         fprintf(stderr, "%s\n", error.what());

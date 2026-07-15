@@ -124,6 +124,8 @@ struct KvStoreArgs { uint32_t position, row_length; };
 struct TurboWhtArgs { uint32_t heads, stride, inverse; };
 struct TurboStoreArgs { uint32_t position, kv_heads; };
 struct AttentionArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim; float scale; };
+struct AttentionGqaArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim, block, n_blocks; float scale; };
+struct AttentionGqaCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, block, n_blocks_max, tokens; float scale; };
 struct DeltaArgs { uint32_t value_heads, qk_heads, head_dim; };
 struct EmbedRowsArgs { uint32_t cols, count, tokens[12]; };
 struct RowsNormArgs { uint32_t n, rows, groups; float eps; };
@@ -196,6 +198,12 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> sigmoid_gate_rows;
     id<MTLComputePipelineState> argmax_rows_p;
     id<MTLComputePipelineState> nll_rows_p;
+    id<MTLComputePipelineState> attention_f16_gqa_p;
+    id<MTLComputePipelineState> attention_turbo3_gqa_p;
+    id<MTLComputePipelineState> attention_gqa_merge_p;
+    id<MTLComputePipelineState> attention_f16_causal_gqa_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_p;
+    id<MTLComputePipelineState> attention_gqa_merge_rows_p;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
     bool batching = false;
@@ -207,6 +215,95 @@ struct MetalBackend::Impl {
     // token on first touch nor evictable under memory pressure mid-run.
     std::map<const void*, std::weak_ptr<MetalBuffer>> model_wraps;
     API_AVAILABLE(macos(15.0)) id<MTLResidencySet> residency_set;
+
+    // GQA KV-reuse decode attention: sequences at or beyond the threshold
+    // route to the blocked kernels that read each KV row once for all
+    // q_heads/kv_heads query heads. 0 disables; 1 forces every sequence
+    // (parity testing). The block partials scratch grows as context deepens
+    // and is GPU-private (never host-read).
+    uint32_t gqa_threshold = 2048;
+    id<MTLBuffer> gqa_partials;
+
+    void attention_gqa_dispatch(bool turbo3, const MetalBuffer& qb, uint32_t q_stride,
+                                const MetalBuffer& kc, const MetalBuffer& vc,
+                                MetalBuffer& output, uint32_t seq_len, uint32_t q_heads,
+                                uint32_t kv_heads, uint32_t head_dim, float scale) {
+        const uint32_t block = 1024;
+        const uint32_t n_blocks = 1 + (seq_len - 1) / block;   // seq_len >= 1 host-checked
+        const uint32_t gqa = q_heads / kv_heads;
+        const uint64_t partial_bytes = (uint64_t)q_heads * n_blocks * 258 * 4;
+        if (!gqa_partials || gqa_partials.length < partial_bytes)
+            gqa_partials = [device newBufferWithLength:(NSUInteger)partial_bytes
+                                               options:MTLResourceStorageModePrivate];
+        if (!gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+        AttentionGqaArgs args{q_stride, seq_len, q_heads, kv_heads, head_dim,
+                              block, n_blocks, scale};
+        @autoreleasepool {
+            bool own;
+            auto enc = encoder_for_operation(own, turbo3 ? "q27_attention_turbo3_gqa"
+                                                         : "q27_attention_f16_gqa");
+            [enc setComputePipelineState:turbo3 ? attention_turbo3_gqa_p : attention_f16_gqa_p];
+            [enc setBuffer:qb.handle() offset:0 atIndex:0];
+            [enc setBuffer:kc.handle() offset:0 atIndex:1];
+            [enc setBuffer:vc.handle() offset:0 atIndex:2];
+            [enc setBuffer:gqa_partials offset:0 atIndex:3];
+            [enc setBytes:&args length:sizeof(args) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks, 1)
+                threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+            // Same serial encoder: the merge reads the partials the first
+            // dispatch wrote; serial compute encoders order dispatches.
+            [enc setComputePipelineState:attention_gqa_merge_p];
+            [enc setBuffer:gqa_partials offset:0 atIndex:0];
+            [enc setBuffer:output.handle() offset:0 atIndex:1];
+            [enc setBytes:&args length:sizeof(args) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(q_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            if (own) finish_command("GQA attention");
+        }
+    }
+
+    void attention_gqa_causal_dispatch(bool turbo3, const MetalBuffer& qb, uint32_t q_stride,
+                                       uint32_t q_row_stride, const MetalBuffer& kc,
+                                       const MetalBuffer& vc, MetalBuffer& output,
+                                       uint32_t base_len, uint32_t q_heads, uint32_t kv_heads,
+                                       uint32_t head_dim, uint32_t tokens, float scale,
+                                       uint64_t q_byte_offset, uint64_t out_byte_offset) {
+        const uint32_t block = 1024;
+        const uint32_t max_seq = base_len + tokens - 1;     // overflow host-checked
+        const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
+        const uint32_t gqa = q_heads / kv_heads;
+        const uint64_t partial_bytes =
+            (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
+        if (!gqa_partials || gqa_partials.length < partial_bytes)
+            gqa_partials = [device newBufferWithLength:(NSUInteger)partial_bytes
+                                               options:MTLResourceStorageModePrivate];
+        if (!gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+        AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
+                                    head_dim, block, n_blocks_max, tokens, scale};
+        @autoreleasepool {
+            bool own;
+            auto enc = encoder_for_operation(own, turbo3 ? "q27_attention_turbo3_causal_gqa"
+                                                         : "q27_attention_f16_causal_gqa");
+            [enc setComputePipelineState:turbo3 ? attention_turbo3_causal_gqa_p
+                                                : attention_f16_causal_gqa_p];
+            [enc setBuffer:qb.handle() offset:(NSUInteger)q_byte_offset atIndex:0];
+            [enc setBuffer:kc.handle() offset:0 atIndex:1];
+            [enc setBuffer:vc.handle() offset:0 atIndex:2];
+            [enc setBuffer:gqa_partials offset:0 atIndex:3];
+            [enc setBytes:&args length:sizeof(args) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, tokens)
+                threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+            // Same serial encoder: the merge reads the partials the first
+            // dispatch wrote; serial compute encoders order dispatches.
+            [enc setComputePipelineState:attention_gqa_merge_rows_p];
+            [enc setBuffer:gqa_partials offset:0 atIndex:0];
+            [enc setBuffer:output.handle() offset:(NSUInteger)out_byte_offset atIndex:1];
+            [enc setBytes:&args length:sizeof(args) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            if (own) finish_command("GQA chunked attention");
+        }
+    }
 
     // Q27_METAL_PROFILE=1: per-dispatch GPU-time attribution. Every operation
     // runs in its own compute encoder bracketed by stage-boundary timestamp
@@ -421,6 +518,14 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
         impl_->argmax_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_argmax_rows");
         impl_->nll_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_nll_rows");
+        impl_->attention_f16_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_gqa");
+        impl_->attention_turbo3_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa");
+        impl_->attention_gqa_merge_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge");
+        impl_->attention_f16_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa");
+        impl_->attention_turbo3_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa");
+        impl_->attention_gqa_merge_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge_rows");
+        if (const char* env = getenv("Q27_METAL_GQA_THRESHOLD"); env && *env)
+            impl_->gqa_threshold = (uint32_t)strtoul(env, nullptr, 10);
 
         if (const char* env = getenv("Q27_METAL_PROFILE"); env && *env && *env != '0') {
             id<MTLCounterSet> timestamps = nil;
@@ -1100,6 +1205,11 @@ void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
     const uint64_t cache_bytes=(uint64_t)seq_len*kv_heads*2*50;
     check_range(kc.size(),0,cache_bytes,"turbo3 K cache"); check_range(vc.size(),0,cache_bytes,"turbo3 V cache");
     check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"turbo3 attention output");
+    const uint32_t gqa=q_heads/kv_heads;
+    if (impl_->gqa_threshold && seq_len >= impl_->gqa_threshold && gqa >= 2 && gqa <= 8) {
+        impl_->attention_gqa_dispatch(true,qb,q_stride,kc,vc,output,seq_len,q_heads,kv_heads,head_dim,scale);
+        return;
+    }
     AttentionArgs args{q_stride,seq_len,q_heads,kv_heads,head_dim,scale};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_turbo3"); [enc setComputePipelineState:impl_->attention_turbo3];
@@ -1123,6 +1233,11 @@ void MetalBackend::attention_f16(const BackendBuffer& q, uint32_t q_stride,
     const uint64_t cache_bytes=(uint64_t)seq_len*kv_heads*head_dim*2;
     check_range(kc.size(),0,cache_bytes,"attention K cache"); check_range(vc.size(),0,cache_bytes,"attention V cache");
     check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"attention output");
+    const uint32_t gqa=q_heads/kv_heads;
+    if (impl_->gqa_threshold && seq_len >= impl_->gqa_threshold && gqa >= 2 && gqa <= 8) {
+        impl_->attention_gqa_dispatch(false,qb,q_stride,kc,vc,output,seq_len,q_heads,kv_heads,head_dim,scale);
+        return;
+    }
     AttentionArgs args{q_stride,seq_len,q_heads,kv_heads,head_dim,scale};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_f16"); [enc setComputePipelineState:impl_->attention];
@@ -1482,14 +1597,33 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
     check_range(kc.size(), 0, cache_bytes, "chunked attention K cache");
     check_range(vc.size(), 0, cache_bytes, "chunked attention V cache");
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked attention output");
-    AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, scale};
+    if (base_len > UINT32_MAX - tokens - 1024)
+        throw std::runtime_error("q27 Metal: chunked attention sequence too large");
+    // Each chunk row must take the same path serial decode takes at that
+    // row's sequence length, or chunked prefill and serial ingestion diverge
+    // at the threshold. Rows past the threshold go to the GQA kernels; a
+    // chunk straddling it splits into two dispatches.
+    const uint32_t gqa = q_heads / kv_heads;
+    uint32_t gqa_from = tokens;
+    if (impl_->gqa_threshold && gqa >= 2 && gqa <= 8)
+        gqa_from = base_len >= impl_->gqa_threshold ? 0
+                 : std::min(tokens, impl_->gqa_threshold - base_len);
+    if (gqa_from < tokens) {
+        impl_->attention_gqa_causal_dispatch(false, qb, q_stride, q_row_stride, kc, vc, output,
+                                             base_len + gqa_from, q_heads, kv_heads, head_dim,
+                                             tokens - gqa_from, scale,
+                                             (uint64_t)gqa_from * q_row_stride * 4,
+                                             (uint64_t)gqa_from * q_heads * head_dim * 4);
+        if (gqa_from == 0) return;
+    }
+    AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, gqa_from, scale};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_f16_causal");
         [enc setComputePipelineState:impl_->attention_causal];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads,gqa_from,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked FP16 attention");
     }
 }
@@ -1513,14 +1647,33 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
     check_range(kc.size(), 0, cache_bytes, "chunked turbo3 K cache");
     check_range(vc.size(), 0, cache_bytes, "chunked turbo3 V cache");
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked turbo3 attention output");
-    AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, scale};
+    if (base_len > UINT32_MAX - tokens - 1024)
+        throw std::runtime_error("q27 Metal: chunked turbo3 attention sequence too large");
+    // Each chunk row must take the same path serial decode takes at that
+    // row's sequence length, or chunked prefill and serial ingestion diverge
+    // at the threshold. Rows past the threshold go to the GQA kernels; a
+    // chunk straddling it splits into two dispatches.
+    const uint32_t gqa = q_heads / kv_heads;
+    uint32_t gqa_from = tokens;
+    if (impl_->gqa_threshold && gqa >= 2 && gqa <= 8)
+        gqa_from = base_len >= impl_->gqa_threshold ? 0
+                 : std::min(tokens, impl_->gqa_threshold - base_len);
+    if (gqa_from < tokens) {
+        impl_->attention_gqa_causal_dispatch(true, qb, q_stride, q_row_stride, kc, vc, output,
+                                             base_len + gqa_from, q_heads, kv_heads, head_dim,
+                                             tokens - gqa_from, scale,
+                                             (uint64_t)gqa_from * q_row_stride * 4,
+                                             (uint64_t)gqa_from * q_heads * head_dim * 4);
+        if (gqa_from == 0) return;
+    }
+    AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, gqa_from, scale};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_turbo3_causal");
         [enc setComputePipelineState:impl_->attention_turbo3_causal_p];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads,gqa_from,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked turbo3 attention");
     }
 }

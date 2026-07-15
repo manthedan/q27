@@ -1782,3 +1782,309 @@ kernel void q27_attention_turbo3_causal(device const float *q [[buffer(0)]],
             out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = acc[i] * inv;
     }
 }
+
+// GQA KV-reuse decode attention. The per-query-head kernels above stream
+// each KV row q_heads/kv_heads (= 6) times; here one threadgroup serves ALL
+// query heads of one KV head over one sequence block: K/V rows are staged
+// (turbo3: dequantized once, not per query head) into threadgroup memory,
+// and one simdgroup per query head runs its own online softmax over the
+// staged tile. Blocks write {m, l, acc[head_dim]} partials (258 floats);
+// q27_attention_gqa_merge folds the blocks in index order — deterministic
+// run-to-run, but NOT bit-equal to the per-query-head kernels (different
+// summation order). The host routes only long sequences here; short
+// contexts keep the proven kernels, and the causal chunk kernels are
+// untouched.
+struct AttentionGqaArgs {
+    uint q_stride;
+    uint seq_len;
+    uint q_heads;
+    uint kv_heads;
+    uint head_dim;
+    uint block;
+    uint n_blocks;
+    float scale;
+};
+
+kernel void q27_attention_f16_gqa(device const float *q [[buffer(0)]],
+                                   device const half *kc [[buffer(1)]],
+                                   device const half *vc [[buffer(2)]],
+                                   device float *partials [[buffer(3)]],
+                                   constant AttentionGqaArgs &args [[buffer(4)]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   ushort lane [[thread_index_in_simdgroup]],
+                                   ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint kvh = group.x, blk = group.y;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || blk >= args.n_blocks || sg >= gqa) return;
+    const uint p0 = blk * args.block;
+    const uint p1 = min(p0 + args.block, args.seq_len);
+    const uint qh = kvh * gqa + sg;
+    device const float *qh_ptr = q + (ulong)qh * args.q_stride;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+
+    threadgroup float Kt[8][256], Vt[8][256];
+    float acc[8];                       // head_dim <= 256 -> at most 8 dims per lane
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * args.head_dim; idx += threads) {
+            const uint r = idx / args.head_dim, d = idx % args.head_dim;
+            const ulong row = ((ulong)(t0 + r) * args.kv_heads + kvh) * args.head_dim;
+            Kt[r][d] = float(kc[row + d]);
+            Vt[r][d] = float(vc[row + d]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            float partial = 0.0f;
+            for (uint d = lane; d < args.head_dim; d += 32) partial += qh_ptr[d] * Kt[r][d];
+            const float score = simd_sum(partial) * args.scale;
+            const float m_new = max(m, score);
+            const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
+            const float weight = exp(score - m_new);
+            l = l * correction + weight;
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                acc[i] = acc[i] * correction + weight * Vt[r][d];
+            m = m_new;
+        }
+    }
+    device float *ph = partials + ((ulong)qh * args.n_blocks + blk) * 258;
+    if (lane == 0) { ph[0] = m; ph[1] = l; }
+    for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++) ph[2 + d] = acc[i];
+}
+
+kernel void q27_attention_turbo3_gqa(device const float *q [[buffer(0)]],
+                                      device const uchar *kc [[buffer(1)]],
+                                      device const uchar *vc [[buffer(2)]],
+                                      device float *partials [[buffer(3)]],
+                                      constant AttentionGqaArgs &args [[buffer(4)]],
+                                      uint2 group [[threadgroup_position_in_grid]],
+                                      ushort lane [[thread_index_in_simdgroup]],
+                                      ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint kvh = group.x, blk = group.y;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || blk >= args.n_blocks || sg >= gqa) return;
+    const uint p0 = blk * args.block;
+    const uint p1 = min(p0 + args.block, args.seq_len);
+    const uint qh = kvh * gqa + sg;
+    device const float *qh_ptr = q + (ulong)qh * args.q_stride;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+
+    threadgroup float Kt[8][256], Vt[8][256];
+    float acc[8];                       // head_dim == 256 -> 8 dims per lane
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * 256; idx += threads) {
+            const uint r = idx >> 8, d = idx & 255;
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            float partial = 0.0f;
+            for (uint d = lane; d < 256; d += 32) partial += qh_ptr[d] * Kt[r][d];
+            const float score = simd_sum(partial) * args.scale;
+            const float m_new = max(m, score);
+            const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
+            const float weight = exp(score - m_new);
+            l = l * correction + weight;
+            for (uint d = lane, i = 0; d < 256; d += 32, i++)
+                acc[i] = acc[i] * correction + weight * Vt[r][d];
+            m = m_new;
+        }
+    }
+    device float *ph = partials + ((ulong)qh * args.n_blocks + blk) * 258;
+    if (lane == 0) { ph[0] = m; ph[1] = l; }
+    for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[i];
+}
+
+// Folds the {m, l, acc} block partials for one query head in block-index
+// order and writes the normalized output row. One simdgroup per query head;
+// a single-block dispatch reduces to normalize-and-store.
+kernel void q27_attention_gqa_merge(device const float *partials [[buffer(0)]],
+                                     device float *out [[buffer(1)]],
+                                     constant AttentionGqaArgs &args [[buffer(2)]],
+                                     uint qh [[threadgroup_position_in_grid]],
+                                     ushort lane [[thread_index_in_simdgroup]]) {
+    if (qh >= args.q_heads) return;
+    float acc[8];
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint b = 0; b < args.n_blocks; b++) {
+        device const float *ph = partials + ((ulong)qh * args.n_blocks + b) * 258;
+        const float m_other = ph[0], l_other = ph[1];
+        const float m_new = max(m, m_other);
+        if (m_new == -INFINITY) continue;       // both partials empty
+        const float c_mine = exp(m - m_new), c_other = exp(m_other - m_new);
+        l = l * c_mine + l_other * c_other;
+        for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+            acc[i] = acc[i] * c_mine + ph[2 + d] * c_other;
+        m = m_new;
+    }
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+        out[(ulong)qh * args.head_dim + d] = acc[i] * inv;
+}
+
+// GQA KV-reuse causal chunk attention. Same blocked structure as the decode
+// GQA kernels above — identical tile staging, per-simdgroup online softmax,
+// and block-order merge — so a chunk token's output is bit-identical to the
+// GQA decode kernel at the same sequence length. Grid adds the chunk-token
+// dimension; a token whose visible sequence ends before this block returns
+// before any barrier, and the merge derives each token's live block count
+// from base_len + token, so dead partials are never read.
+struct AttentionGqaCausalArgs {
+    uint q_stride;
+    uint q_row_stride;
+    uint base_len;
+    uint q_heads;
+    uint kv_heads;
+    uint head_dim;
+    uint block;
+    uint n_blocks_max;
+    uint tokens;
+    float scale;
+};
+
+kernel void q27_attention_f16_causal_gqa(device const float *q [[buffer(0)]],
+                                          device const half *kc [[buffer(1)]],
+                                          device const half *vc [[buffer(2)]],
+                                          device float *partials [[buffer(3)]],
+                                          constant AttentionGqaCausalArgs &args [[buffer(4)]],
+                                          uint3 group [[threadgroup_position_in_grid]],
+                                          ushort lane [[thread_index_in_simdgroup]],
+                                          ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint kvh = group.x, blk = group.y, token = group.z;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || token >= args.tokens || sg >= gqa) return;
+    const uint seq_len = args.base_len + token;
+    const uint p0 = blk * args.block;
+    if (p0 >= seq_len) return;
+    const uint p1 = min(p0 + args.block, seq_len);
+    const uint qh = kvh * gqa + sg;
+    device const float *qh_ptr = q + (ulong)token * args.q_row_stride + (ulong)qh * args.q_stride;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+
+    threadgroup float Kt[8][256], Vt[8][256];
+    float acc[8];                       // head_dim <= 256 -> at most 8 dims per lane
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * args.head_dim; idx += threads) {
+            const uint r = idx / args.head_dim, d = idx % args.head_dim;
+            const ulong row = ((ulong)(t0 + r) * args.kv_heads + kvh) * args.head_dim;
+            Kt[r][d] = float(kc[row + d]);
+            Vt[r][d] = float(vc[row + d]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            float partial = 0.0f;
+            for (uint d = lane; d < args.head_dim; d += 32) partial += qh_ptr[d] * Kt[r][d];
+            const float score = simd_sum(partial) * args.scale;
+            const float m_new = max(m, score);
+            const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
+            const float weight = exp(score - m_new);
+            l = l * correction + weight;
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                acc[i] = acc[i] * correction + weight * Vt[r][d];
+            m = m_new;
+        }
+    }
+    device float *ph = partials +
+        (((ulong)token * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+    if (lane == 0) { ph[0] = m; ph[1] = l; }
+    for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++) ph[2 + d] = acc[i];
+}
+
+kernel void q27_attention_turbo3_causal_gqa(device const float *q [[buffer(0)]],
+                                             device const uchar *kc [[buffer(1)]],
+                                             device const uchar *vc [[buffer(2)]],
+                                             device float *partials [[buffer(3)]],
+                                             constant AttentionGqaCausalArgs &args [[buffer(4)]],
+                                             uint3 group [[threadgroup_position_in_grid]],
+                                             ushort lane [[thread_index_in_simdgroup]],
+                                             ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint kvh = group.x, blk = group.y, token = group.z;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || token >= args.tokens || sg >= gqa) return;
+    const uint seq_len = args.base_len + token;
+    const uint p0 = blk * args.block;
+    if (p0 >= seq_len) return;
+    const uint p1 = min(p0 + args.block, seq_len);
+    const uint qh = kvh * gqa + sg;
+    device const float *qh_ptr = q + (ulong)token * args.q_row_stride + (ulong)qh * args.q_stride;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+
+    threadgroup float Kt[8][256], Vt[8][256];
+    float acc[8];                       // head_dim == 256 -> 8 dims per lane
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * 256; idx += threads) {
+            const uint r = idx >> 8, d = idx & 255;
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            float partial = 0.0f;
+            for (uint d = lane; d < 256; d += 32) partial += qh_ptr[d] * Kt[r][d];
+            const float score = simd_sum(partial) * args.scale;
+            const float m_new = max(m, score);
+            const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
+            const float weight = exp(score - m_new);
+            l = l * correction + weight;
+            for (uint d = lane, i = 0; d < 256; d += 32, i++)
+                acc[i] = acc[i] * correction + weight * Vt[r][d];
+            m = m_new;
+        }
+    }
+    device float *ph = partials +
+        (((ulong)token * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+    if (lane == 0) { ph[0] = m; ph[1] = l; }
+    for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[i];
+}
+
+// Causal-chunk merge: folds each (token, query head)'s live blocks in index
+// order. The live block count comes from base_len + token, so partials of
+// blocks past a token's visible sequence are never touched.
+kernel void q27_attention_gqa_merge_rows(device const float *partials [[buffer(0)]],
+                                          device float *out [[buffer(1)]],
+                                          constant AttentionGqaCausalArgs &args [[buffer(2)]],
+                                          uint2 group [[threadgroup_position_in_grid]],
+                                          ushort lane [[thread_index_in_simdgroup]]) {
+    const uint qh = group.x, token = group.y;
+    if (qh >= args.q_heads || token >= args.tokens) return;
+    const uint seq_len = args.base_len + token;
+    const uint live_blocks = 1 + (seq_len - 1) / args.block;    // base_len >= 1 host-checked
+    float acc[8];
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint b = 0; b < live_blocks; b++) {
+        device const float *ph = partials +
+            (((ulong)token * args.q_heads + qh) * args.n_blocks_max + b) * 258;
+        const float m_other = ph[0], l_other = ph[1];
+        const float m_new = max(m, m_other);
+        if (m_new == -INFINITY) continue;       // both partials empty
+        const float c_mine = exp(m - m_new), c_other = exp(m_other - m_new);
+        l = l * c_mine + l_other * c_other;
+        for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+            acc[i] = acc[i] * c_mine + ph[2 + d] * c_other;
+        m = m_new;
+    }
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+        out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = acc[i] * inv;
+}
