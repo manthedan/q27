@@ -5,6 +5,7 @@
 #include "../loader.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -40,6 +41,23 @@ class MetalEngine {
                                            uint32_t count,const SamplingParams& params);
     std::vector<uint32_t> generate_sampled_from_logits(uint32_t count,
                                                        const SamplingParams& params);
+
+    // Streaming generation. `sink(token)` is called for each committed,
+    // non-EOS token in order; return false from the sink to cancel (client
+    // disconnect). Generation stops at EOS (StopCause::Eos, the EOS token is
+    // not passed to the sink), when `count` tokens have been emitted
+    // (StopCause::MaxTokens), or when the sink returns false
+    // (StopCause::Cancelled). Returns the number of tokens passed to the sink.
+    // These mirror the CUDA server's generate(prompt, n_max, eos, on_token)
+    // contract so the two servers report finish_reason identically.
+    enum class StopCause { MaxTokens, Eos, Cancelled };
+    using TokenSink = std::function<bool(uint32_t)>;
+    uint32_t stream_from_pending(uint32_t pending, uint32_t count, uint32_t eos,
+                                 uint32_t mtp_width, const TokenSink& sink, StopCause& cause);
+    uint32_t stream_sampled_from_logits(uint32_t count, uint32_t eos,
+                                        const SamplingParams& params,
+                                        const TokenSink& sink, StopCause& cause);
+
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
     static constexpr uint32_t vocabulary_size() { return 248320; }
@@ -125,6 +143,8 @@ class MetalEngine {
     void gdn_state_copy(bool restore);
     std::vector<uint32_t> generate_mtp_batched(uint32_t pending, uint32_t count,
                                                uint32_t width);
+    uint32_t stream_mtp_batched(uint32_t pending, uint32_t count, uint32_t width,
+                                uint32_t eos, const TokenSink& sink, StopCause& cause);
     uint32_t prefill(const std::vector<uint32_t>& prompt, bool warm_mtp);
     void mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t position);
     uint32_t mtp_forward(const BackendBuffer& hidden, uint32_t token, uint32_t position);

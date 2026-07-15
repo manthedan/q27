@@ -650,23 +650,44 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
 // semantics, including never encoding the final output token.
 std::vector<uint32_t> MetalEngine::generate_mtp_batched(uint32_t pending, uint32_t count,
                                                         uint32_t width) {
+    // Vector convenience wrapper over the streaming core: a sink that never
+    // cancels and an EOS sentinel that never matches (tokens are < VOCAB <
+    // UINT32_MAX) reproduce the previous whole-completion behaviour exactly.
     std::vector<uint32_t> output;
     output.reserve(count);
+    StopCause cause;
+    stream_mtp_batched(pending, count, width, UINT32_MAX,
+                       [&](uint32_t token) { output.push_back(token); return true; }, cause);
+    return output;
+}
+
+uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint32_t width,
+                                         uint32_t eos, const TokenSink& sink, StopCause& cause) {
+    uint32_t emitted = 0;
+    cause = StopCause::MaxTokens;
+    // commit() streams one token through the sink, stopping on EOS or cancel.
+    // Returns 0 = continue, 1 = EOS reached, 2 = client cancelled.
+    auto commit = [&](uint32_t token) -> int {
+        if (token == eos) { cause = StopCause::Eos; return 1; }
+        if (!sink(token)) { cause = StopCause::Cancelled; return 2; }
+        emitted++;
+        return 0;
+    };
     // Start narrow and let acceptance widen the window: committed tokens are
     // width-invariant, and a wide first round pays for many serial drafts
     // through a cold draft head before acceptance has been measured once.
     uint32_t live_width = std::min(width, 4u);
-    while (output.size() < count) {
-        if (output.size() + 1 == count) { output.push_back(pending); break; }
-        const uint32_t remaining = (uint32_t)(count - output.size());
+    while (emitted < count) {
+        if (emitted + 1 == count) { commit(pending); return emitted; }
+        const uint32_t remaining = (uint32_t)(count - emitted);
         uint32_t live = std::min(live_width, remaining);
         // The verify chunk stores a KV row for every lane, so it must stay
         // inside the reserved context even before acceptance is known.
         if ((uint64_t)position_ + live > max_context_)
             live = (uint32_t)(max_context_ - position_);
         if (live < 2) {
-            output.push_back(pending);
-            if (output.size() == count) break;
+            if (commit(pending)) return emitted;
+            if (emitted == count) return emitted;
             pending = step(pending);
             continue;
         }
@@ -726,14 +747,15 @@ std::vector<uint32_t> MetalEngine::generate_mtp_batched(uint32_t pending, uint32
             fprintf(stderr, "mtp round: live %u accepted %u | draft %.2fs verify %.2fs commit %.2fs\n",
                     live, accepted, std::chrono::duration<double>(verify_start - draft_start).count(),
                     std::chrono::duration<double>(commit_start - verify_start).count(), since(commit_start));
-        for (uint32_t i = 0; i < committed; i++) output.push_back(lanes[i]);
+        for (uint32_t i = 0; i < committed; i++)
+            if (commit(lanes[i])) return emitted;
         pending = predictions[committed - 1];
         // Width adaptation is a pure performance control: committed tokens
         // are width-invariant, matching the recorded 2/4/8/12 gate.
         live_width = accepted + 1 == live ? std::min(width, live_width + 2)
                                           : std::max(2u, accepted + 2);
     }
-    return output;
+    return emitted;
 }
 
 uint32_t MetalEngine::ingest_prompt(const std::vector<uint32_t>& tokens, bool warm_mtp,
@@ -833,6 +855,51 @@ std::vector<uint32_t> MetalEngine::generate_sampled(const std::vector<uint32_t>&
         throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
     ingest_prompt(prompt,false,true);
     return generate_sampled_from_logits(count,params);
+}
+
+uint32_t MetalEngine::stream_sampled_from_logits(uint32_t count, uint32_t eos,
+                                                 const SamplingParams& params,
+                                                 const TokenSink& sink, StopCause& cause) {
+    validate_sampling(params); last_spec_stats_={};
+    if((uint64_t)position_+(count?count-1:0)>max_context_)
+        throw std::runtime_error("q27 Metal: generation exceeds context");
+    std::mt19937_64 random(params.seed);
+    cause = StopCause::MaxTokens;
+    uint32_t emitted=0;
+    while(emitted<count) {
+        uint32_t token=sample_logits_cpu(read_logits(),params,random);
+        if(token==eos) { cause=StopCause::Eos; return emitted; }
+        if(!sink(token)) { cause=StopCause::Cancelled; return emitted; }
+        if(++emitted==count) return emitted;
+        step(token);
+    }
+    return emitted;
+}
+
+uint32_t MetalEngine::stream_from_pending(uint32_t pending, uint32_t count, uint32_t eos,
+                                          uint32_t mtp_width, const TokenSink& sink,
+                                          StopCause& cause) {
+    last_spec_stats_={};
+    if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (mtp_width && (mtp_width < 2 || mtp_width > 12))
+        throw std::runtime_error("q27 Metal: MTP width must be 2..12");
+    if ((uint64_t)position_ + (count ? count - 1 : 0) > max_context_)
+        throw std::runtime_error("q27 Metal: generation exceeds context");
+    cause = StopCause::MaxTokens;
+    if (mtp_width && chunked_prefill_)
+        return stream_mtp_batched(pending, count, mtp_width, eos, sink, cause);
+    // Serial greedy walk: the pending token is emitted, then each step()
+    // yields the next. EOS stops without emitting it; the sink returning
+    // false is a client cancel (mirrors the CUDA engine's on_token contract).
+    uint32_t emitted=0;
+    uint32_t cur=pending;
+    while(emitted<count) {
+        if(cur==eos) { cause=StopCause::Eos; return emitted; }
+        if(!sink(cur)) { cause=StopCause::Cancelled; return emitted; }
+        if(++emitted==count) return emitted;
+        cur=step(cur);
+    }
+    return emitted;
 }
 
 std::vector<uint32_t> MetalEngine::generate_from_pending(uint32_t pending, uint32_t count,

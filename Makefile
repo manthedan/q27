@@ -17,9 +17,13 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	./build/test_sampling
 
 ifeq ($(UNAME_S),Darwin)
-test-metal: build/test_metal build/test_metal_ops
+test-metal: build/test_metal build/test_metal_ops build/test_metal_stream
 	./build/test_metal
 	./build/test_metal_ops
+	./build/test_metal_stream
+
+build/test_metal_stream: src/metal/test_metal_stream.cpp src/metal/stream_format.h third_party/json.hpp | build
+	$(CXX) $(CXXFLAGS) -I src/metal src/metal/test_metal_stream.cpp -o $@
 
 build/test_metal: src/metal/test_metal.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
                   src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build
@@ -40,7 +44,7 @@ build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/me
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
 
-build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h \
+build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/metal/stream_format.h src/suffixdraft.h src/sampling.h \
                         src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                         src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h \
                         third_party/httplib.h third_party/json.hpp | build
