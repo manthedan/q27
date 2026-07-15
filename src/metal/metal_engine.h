@@ -17,8 +17,22 @@ class MetalEngine {
   public:
     struct Snapshot;
     struct SpecStats { uint64_t rounds=0,drafted=0,accepted=0; };
+    // One-per-artifact state shared by engines in the same process: the
+    // artifact mapping, the Metal queue/pipelines (the whole-mapping buffer
+    // and residency set live behind the backend), and the weight wrap.
+    // Engines sharing a Shared never map or wire the artifact twice, so the
+    // one-model-load memory policy sees a single load however many engines
+    // (e.g. an fp16-KV baseline and a turbo3-KV subject) attach to it.
+    struct Shared {
+        Model model;
+        MetalBackend backend;
+        std::unordered_map<std::string, BackendTensor> weights;
+        explicit Shared(Model&& opened) : model(std::move(opened)) {}
+    };
+    static std::shared_ptr<Shared> open_shared(const std::string& model_path);
     explicit MetalEngine(const std::string& model_path, uint32_t context = 128,
                          bool turbo3_kv = false);
+    MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool turbo3_kv);
 
     void reset();
     uint32_t step(uint32_t token);
@@ -37,6 +51,13 @@ class MetalEngine {
     // result[i] = -log P(tokens[i+1] | tokens[0..i]). Uses layer-major
     // chunked encode + batched output head when available.
     std::vector<float> teacher_force_nll(const std::vector<uint32_t>& tokens);
+    // Teacher-forced chunk logits for cross-engine comparison gates (e.g.
+    // the KL KV-tolerance gate): encode tokens[0..count) at the engine's
+    // current position — count 1..12; a single token takes the serial path —
+    // and fill `out` with count x vocab logits rows. The caller loops over
+    // the stream and interleaves engines; both must advance in lockstep.
+    void teacher_force_logits(const uint32_t* tokens, uint32_t count,
+                              std::vector<float>& out);
     std::vector<uint32_t> generate_sampled(const std::vector<uint32_t>& prompt,
                                            uint32_t count,const SamplingParams& params);
     std::vector<uint32_t> generate_sampled_from_logits(uint32_t count,
@@ -93,13 +114,14 @@ class MetalEngine {
         std::shared_ptr<BackendBuffer> v_cache;
     };
 
-    Model model_;
-    MetalBackend backend_;
+    std::shared_ptr<Shared> shared_;
+    Model& model_;
+    MetalBackend& backend_;
     uint32_t max_context_;
     bool turbo3_kv_;
     uint32_t position_ = 0;
     SpecStats last_spec_stats_;
-    std::unordered_map<std::string, BackendTensor> weights_;
+    std::unordered_map<std::string, BackendTensor>& weights_;
     std::vector<LayerState> layers_;
 
     std::shared_ptr<BackendBuffer> h_, x1_, y_;

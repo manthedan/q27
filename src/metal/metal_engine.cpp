@@ -183,8 +183,24 @@ void MetalEngine::validate_architecture() const {
             throw std::runtime_error("q27 Metal: output_q4.weight mismatch");
 }
 
+std::shared_ptr<MetalEngine::Shared> MetalEngine::open_shared(const std::string& model_path) {
+    return std::make_shared<Shared>(Model::open(model_path));
+}
+
+namespace {
+std::shared_ptr<MetalEngine::Shared> require_shared(std::shared_ptr<MetalEngine::Shared> shared) {
+    if (!shared) throw std::runtime_error("q27 Metal: null shared context");
+    return shared;
+}
+} // namespace
+
 MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool turbo3_kv)
-    : model_(Model::open(model_path)), max_context_(context), turbo3_kv_(turbo3_kv) {
+    : MetalEngine(open_shared(model_path), context, turbo3_kv) {}
+
+MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool turbo3_kv)
+    : shared_(require_shared(std::move(shared))), model_(shared_->model),
+      backend_(shared_->backend), max_context_(context), turbo3_kv_(turbo3_kv),
+      weights_(shared_->weights) {
     if (!context || context > 262144) throw std::runtime_error("q27 Metal: context must be 1..262144");
     validate_architecture();
     has_mtp_ = model_.find("blk.64.attn_norm.weight") != nullptr;
@@ -195,10 +211,13 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
     if (total_cache_bytes > backend_.recommended_working_set_size() / 2)
         throw std::runtime_error("q27 Metal: requested KV cache is too large for this device; use --kv turbo3 or reduce --ctx");
 
-    // All wrappers alias the mmap. No weight-sized copy is created.
-    weights_.reserve(model_.tensors.size());
-    for (const Tensor& tensor : model_.tensors)
-        weights_.emplace(tensor.name, backend_.upload(model_, tensor));
+    // All wrappers alias the mmap. No weight-sized copy is created. A second
+    // engine on the same Shared reuses the wrap — never a second mapping.
+    if (weights_.empty()) {
+        weights_.reserve(model_.tensors.size());
+        for (const Tensor& tensor : model_.tensors)
+            weights_.emplace(tensor.name, backend_.upload(model_, tensor));
+    }
 
     layers_.resize(N_LAYER);
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
@@ -921,6 +940,40 @@ std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& t
     }
     if (n_encode >= CHUNK_MAX) fprintf(stderr, "\n");
     return result;
+}
+
+void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
+                                       std::vector<float>& out) {
+    if (!count || count > CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: teacher_force_logits takes 1..12 tokens");
+    if ((uint64_t)position_ + count > max_context_)
+        throw std::runtime_error("q27 Metal: teacher-forced chunk exceeds context");
+    for (uint32_t i = 0; i < count; i++)
+        if (tokens[i] >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
+    out.resize((size_t)count * VOCAB);
+    if (chunked_prefill_ && count >= 2) {
+        {
+            CommandBatch batch(backend_);
+            chunk_forward(tokens, count);
+            BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
+            backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                            N_EMBD, count, EPS, x5);
+            backend_.matmul_quantized(weight("output.weight"), x5, count, *clogits_);
+            batch.finish();
+        }
+        position_ += count;
+        backend_.read(*clogits_, 0, out.data(), out.size() * sizeof(float));
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        {
+            CommandBatch batch(backend_);
+            encode_token(tokens[i], true);
+            batch.finish();
+        }
+        backend_.read(*logits_, 0, out.data() + (size_t)i * VOCAB,
+                      (uint64_t)VOCAB * sizeof(float));
+    }
 }
 
 // GPU-assisted sampling: when top-k is active and within the radix-select
