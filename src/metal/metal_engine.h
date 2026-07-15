@@ -82,6 +82,7 @@ class MetalEngine {
     static constexpr uint32_t GDN_DIM = 128;
     static constexpr uint32_t VOCAB = 248320;
     static constexpr uint32_t CHUNK_MAX = 12;
+    static constexpr uint32_t TOPK_CAPACITY = 1024;
     static constexpr float EPS = 1e-6f;
     static constexpr float FREQ_BASE = 1e7f;
 
@@ -106,6 +107,10 @@ class MetalEngine {
     std::shared_ptr<BackendBuffer> qkv_, z_, alpha_, beta_raw_, g_, beta_, conv_out_;
     std::shared_ptr<BackendBuffer> delta_out_, gated_out_;
     std::shared_ptr<BackendBuffer> ffn_gate_, ffn_up_, logits_, token_out_;
+    // GPU-assisted sampling: top-k candidate over-set staging
+    // (Q27_METAL_GPU_SAMPLE=0 forces the full-logits readback path).
+    std::shared_ptr<BackendBuffer> topk_values_, topk_indices_, topk_count_;
+    bool gpu_sample_ = true;
     std::shared_ptr<BackendBuffer> mtp_embed_norm_, mtp_hidden_norm_, mtp_concat_;
     std::shared_ptr<BackendBuffer> mtp_x_, mtp_hidden_out_, mtp_k_cache_, mtp_v_cache_;
     BackendQuantized q5120_, q6144_, q10240_, q17408_;
@@ -137,6 +142,7 @@ class MetalEngine {
     static bool attention_layer(uint32_t layer) { return layer % 4 == 3; }
 
     void validate_architecture() const;
+    uint32_t sample_next(const SamplingParams& params, std::mt19937_64& random);
     void project(const BackendTensor& w, const BackendBuffer& x_float,
                  const BackendQuantized& xq, BackendBuffer& out);
     void project_pair(const BackendTensor& a, BackendBuffer& a_out,
