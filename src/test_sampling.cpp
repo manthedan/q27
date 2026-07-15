@@ -15,6 +15,43 @@ int main() {
     bool rejected=false; try { q27::SamplingParams bad{1.0f,0.0f,0,0}; q27::sample_logits_cpu(logits,bad,rng); }
     catch(const std::runtime_error&) { rejected=true; }
     if(!rejected) return 1;
+
+    // GPU-assisted sampling: sample_candidates_cpu on a shuffled exact
+    // top-k over-set must match sample_logits_cpu on the full vector,
+    // token-for-token and with identical RNG consumption, across
+    // temperatures, top-p cutoffs, top-k widths, and repeated draws.
+    {
+        const uint32_t n=4096;
+        std::vector<float> full(n); uint32_t lcg=2468;
+        for(uint32_t i=0;i<n;i++) { lcg=lcg*1664525u+1013904223u; full[i]=(float)(lcg>>8)/8388608.0f*12.0f-6.0f; }
+        std::vector<uint32_t> rank(n);
+        for(uint32_t i=0;i<n;i++) rank[i]=i;
+        std::sort(rank.begin(),rank.end(),[&](uint32_t a,uint32_t b){
+            return full[a]!=full[b]?full[a]>full[b]:a<b;});
+        const float temps[]={0.0f,0.7f,1.0f,1.3f};
+        const float tops[]={0.9f,0.95f,1.0f};
+        const uint32_t ks[]={1,3,40,256};
+        for(float t:temps) for(float tp:tops) for(uint32_t k:ks) {
+            const uint32_t cnt=k+17; // over-set: exact top-k plus sub-boundary extras
+            std::vector<uint32_t> perm(cnt);
+            for(uint32_t i=0;i<cnt;i++) perm[i]=i;
+            std::mt19937_64 shuf(4242); std::shuffle(perm.begin(),perm.end(),shuf);
+            std::vector<float> cv(cnt); std::vector<uint32_t> ci(cnt);
+            for(uint32_t i=0;i<cnt;i++) { cv[i]=full[rank[perm[i]]]; ci[i]=rank[perm[i]]; }
+            q27::SamplingParams p{t,tp,k,777};
+            std::mt19937_64 ra(p.seed),rb(p.seed);
+            for(int iter=0;iter<25;iter++) {
+                uint32_t want=q27::sample_logits_cpu(full,p,ra);
+                uint32_t got=q27::sample_candidates_cpu(cv,ci,cnt,p,rb);
+                if(want!=got) { fprintf(stderr,"candidates mismatch t=%g tp=%g k=%u iter=%d: %u vs %u\n",(double)t,(double)tp,k,iter,want,got); return 1; }
+                if(!(ra==rb)) { fprintf(stderr,"candidates rng divergence t=%g tp=%g k=%u iter=%d\n",(double)t,(double)tp,k,iter); return 1; }
+            }
+        }
+        bool short_rejected=false;
+        try { std::mt19937_64 r(1); q27::sample_candidates_cpu({1.0f},{0},2,q27::SamplingParams{1.0f,1.0f,1,0},r); }
+        catch(const std::runtime_error&) { short_rejected=true; }
+        if(!short_rejected) return 1;
+    }
     puts("CPU sampling: PASS");
     return 0;
 }

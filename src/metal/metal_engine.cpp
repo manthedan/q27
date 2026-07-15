@@ -220,6 +220,11 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
     conv_out_ = alloc_f32(GDN_CH); delta_out_ = alloc_f32(GDN_V); gated_out_ = alloc_f32(GDN_V);
     ffn_gate_ = alloc_f32(N_FFN); ffn_up_ = alloc_f32(N_FFN);
     logits_ = alloc_f32(VOCAB); token_out_ = backend_.allocate(sizeof(uint32_t));
+    topk_values_ = alloc_f32(TOPK_CAPACITY);
+    topk_indices_ = backend_.allocate(TOPK_CAPACITY * sizeof(uint32_t));
+    topk_count_ = backend_.allocate(sizeof(uint32_t));
+    if (const char* env = getenv("Q27_METAL_GPU_SAMPLE"); env && *env)
+        gpu_sample_ = strtoul(env, nullptr, 10) != 0;
     if (has_mtp_) {
         mtp_embed_norm_ = alloc_f32(N_EMBD); mtp_hidden_norm_ = alloc_f32(N_EMBD);
         mtp_concat_ = alloc_f32(2 * N_EMBD); mtp_x_ = alloc_f32(N_EMBD);
@@ -918,6 +923,29 @@ std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& t
     return result;
 }
 
+// GPU-assisted sampling: when top-k is active and within the radix-select
+// range, extract the candidate over-set on the GPU and read back ~k pairs
+// instead of the full 600 KB logits vector. A candidate count above
+// capacity signals degenerate ties — fall back to the exact full-readback
+// path, which is also the Q27_METAL_GPU_SAMPLE=0 opt-out and the
+// temperature-0 / no-top-k route. Same-seed token sequences match the
+// full path exactly (one uniform draw either way; real logits don't tie).
+uint32_t MetalEngine::sample_next(const SamplingParams& params, std::mt19937_64& random) {
+    if (gpu_sample_ && params.temperature != 0.0f && params.top_k >= 1 && params.top_k <= 256) {
+        backend_.topk(*logits_, VOCAB, params.top_k, *topk_values_, *topk_indices_, *topk_count_);
+        uint32_t count = 0;
+        backend_.read(*topk_count_, 0, &count, sizeof(count));
+        if (count <= TOPK_CAPACITY) {
+            std::vector<float> values(count);
+            std::vector<uint32_t> indices(count);
+            backend_.read(*topk_values_, 0, values.data(), count * sizeof(float));
+            backend_.read(*topk_indices_, 0, indices.data(), count * sizeof(uint32_t));
+            return sample_candidates_cpu(values, indices, count, params, random);
+        }
+    }
+    return sample_logits_cpu(read_logits(), params, random);
+}
+
 std::vector<uint32_t> MetalEngine::generate_sampled_from_logits(uint32_t count,
                                                                  const SamplingParams& params) {
     validate_sampling(params); last_spec_stats_={};
@@ -925,7 +953,7 @@ std::vector<uint32_t> MetalEngine::generate_sampled_from_logits(uint32_t count,
         throw std::runtime_error("q27 Metal: generation exceeds context");
     std::mt19937_64 random(params.seed); std::vector<uint32_t> output; output.reserve(count);
     for(uint32_t i=0;i<count;i++) {
-        uint32_t token=sample_logits_cpu(read_logits(),params,random); output.push_back(token);
+        uint32_t token=sample_next(params,random); output.push_back(token);
         if(i+1<count) step(token);
     }
     return output;
@@ -950,7 +978,7 @@ uint32_t MetalEngine::stream_sampled_from_logits(uint32_t count, uint32_t eos,
     cause = StopCause::MaxTokens;
     uint32_t emitted=0;
     while(emitted<count) {
-        uint32_t token=sample_logits_cpu(read_logits(),params,random);
+        uint32_t token=sample_next(params,random);
         if(token==eos) { cause=StopCause::Eos; return emitted; }
         if(!sink(token)) { cause=StopCause::Cancelled; return emitted; }
         if(++emitted==count) return emitted;
