@@ -96,6 +96,21 @@ quality cost; the official artifact remains the quality tier. Proceed to Phase 1
 Phase 3's gate 3 (32K NLL A/B on our own harness, same protocol both tiers) upgrades
 the PPL comparison from indicative to definitive.
 
+### Phase 1 kickoff notes (post-reboot re-setup)
+
+- Models already on disk (keep both): `models/ternary-bonsai-27b/Ternary-Bonsai-27B-Q2_0.gguf`
+  (7.17 GB, native g128 — the Phase 1 repack source) and `...-Q2_g64.gguf` (7.59 GB,
+  mainline-shaped but still fork-only at compute time).
+- Fork binaries (wiped from /tmp on reboot; re-fetch as needed):
+  `https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b9591-62061f9/llama-prism-b9591-62061f9-bin-macos-arm64.tar.gz`
+- First actions: (1) re-run `llama-bench -m models/ternary-bonsai-27b/Ternary-Bonsai-27B-Q2_0.gguf`
+  on the quiet machine and update the Phase 0 verdict's throughput note; (2) read the
+  fork's ggml type-42 dequant source (`PrismML-Eng/llama.cpp`) and document the slot
+  encoding here before writing any repack code; (3) wikitext raw re-downloads via
+  `https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip`
+  (the tokenized `data/wikitext2-test.tokens.bin` is already in-repo and reproducible
+  via `build/tokenize_to_bin`).
+
 ## Phase 1 — format + repack
 
 - `DType::T2_G128 = 4` (or `T2_G64` if the source scales don't collapse — see below).
