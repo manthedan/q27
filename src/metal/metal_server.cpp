@@ -321,7 +321,12 @@ int main(int argc,char** argv) {
                                 q27::openai_stream_chunk(chat,id,objd,created,"q27-metal",piece));
                             return sink.write(s.data(),s.size());
                         };
-                        runtime.run(ids,n,sampling,stops,emit);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit);
+                        // Terminal chunk with a real finish_reason before [DONE]
+                        // (parity with server.cu security-review fix #7).
+                        std::string fin=q27::sse_data(q27::openai_stream_final_chunk(
+                            chat,id,objd,created,"q27-metal",openai_finish(outcome.finish)));
+                        sink.write(fin.data(),fin.size());
                         std::string done=q27::sse_done(); sink.write(done.data(),done.size());
                     } catch(const std::exception& e) {
                         std::string s=q27::sse_data({{"error",{{"message",e.what()},{"type","invalid_request_error"}}}});

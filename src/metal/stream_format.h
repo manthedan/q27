@@ -153,8 +153,8 @@ inline std::string sse_event(const std::string& name, const nlohmann::json& j) {
 inline std::string sse_done() { return "data: [DONE]\n\n"; }
 
 // One OpenAI streaming delta chunk. `chat` selects chat.completion.chunk
-// (delta.content) vs text_completion (text); finish_reason is always null in
-// stream chunks, exactly as the CUDA server emits them.
+// (delta.content) vs text_completion (text); finish_reason is null in piece
+// chunks, exactly as the CUDA server emits them.
 inline nlohmann::json openai_stream_chunk(bool chat, const std::string& id, const char* object,
                                           long created, const std::string& model,
                                           const std::string& piece) {
@@ -162,6 +162,23 @@ inline nlohmann::json openai_stream_chunk(bool chat, const std::string& id, cons
     json choice = chat
         ? json{{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}
         : json{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
+    return json{{"id", id}, {"object", object}, {"created", created},
+                {"model", model}, {"choices", json::array({choice})}};
+}
+
+// Terminal OpenAI streaming chunk: a real finish_reason ("stop"/"length")
+// before [DONE], per the OpenAI streaming spec — clients otherwise never
+// learn whether generation hit EOS or the token cap. Mirrors the CUDA
+// server's shape (upstream security-review fix #7): empty delta object for
+// chat, empty text for completions.
+inline nlohmann::json openai_stream_final_chunk(bool chat, const std::string& id,
+                                                const char* object, long created,
+                                                const std::string& model,
+                                                const char* finish_reason) {
+    using nlohmann::json;
+    json choice = chat
+        ? json{{"index", 0}, {"delta", json::object()}, {"finish_reason", finish_reason}}
+        : json{{"index", 0}, {"text", ""}, {"finish_reason", finish_reason}};
     return json{{"id", id}, {"object", object}, {"created", created},
                 {"model", model}, {"choices", json::array({choice})}};
 }

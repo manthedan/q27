@@ -115,6 +115,18 @@ int test_sse_framing() {
     check(txt["choices"][0]["text"] == "yo", "sse: text chunk text");
     check(txt["choices"][0]["finish_reason"].is_null(), "sse: text chunk null finish");
 
+    // Terminal chunk: real finish_reason, empty delta object (chat) / empty
+    // text (completions) — server.cu's shape after security-review fix #7.
+    json fchat = q27::openai_stream_final_chunk(true, "chatcmpl-metal", "chat.completion.chunk",
+                                                1700000000, "q27-metal", "stop");
+    check(fchat["choices"][0]["finish_reason"] == "stop", "sse: final chat finish_reason");
+    check(fchat["choices"][0]["delta"].is_object() && fchat["choices"][0]["delta"].empty(),
+          "sse: final chat empty delta object");
+    json ftxt = q27::openai_stream_final_chunk(false, "cmpl-metal", "text_completion",
+                                               1700000000, "q27-metal", "length");
+    check(ftxt["choices"][0]["finish_reason"] == "length", "sse: final text finish_reason");
+    check(ftxt["choices"][0]["text"] == "", "sse: final text empty");
+
     // Invalid UTF-8 must not throw through the serializer (replace backstop).
     std::string bad = q27::sse_data(q27::openai_stream_chunk(true, "id", "chat.completion.chunk",
                                                              0, "m", std::string("\xE2\x80")));
