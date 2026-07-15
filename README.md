@@ -788,6 +788,34 @@ docs/perf-attribution-p14.md.
   multi-request state -- flake hunt required before any split/adaptive
   path ships; keep OFF under `--slots`
 
+## Benchmarks
+
+Cross-engine comparison against llama.cpp (mainline, and TheTom's `ngram-mod`
+fork) on a **public, reproducible** agentic task set: 12 pinned
+SWE-bench_Verified instances driven through Claude Code, the **same**
+Qwen3.6-27B-MTP model on every engine, all 5090-only + q8 KV + greedy. Real
+agentic decode throughput:
+
+| engine | decode | wall/inst |
+|---|---|---|
+| **q27** (MTP + SuffixDraft, fused) | **202.7 t/s** | **47 s** |
+| vLLM NVFP4 + MTP | 117.1 t/s | 133 s |
+| llama mainline + MTP (`--spec-type draft-mtp`) | 116.3 t/s | 80 s |
+| llama `ngram-mod` (fork) | 61.1 t/s | 118 s |
+| llama mainline (no spec) | 62.0 t/s | 120 s |
+
+With the *same* MTP head, enabling MTP nearly doubles stock llama.cpp, and **two
+independent engines (llama.cpp and vLLM) land on the same ~117 t/s** -- yet q27 is
+a further ~1.73x on top. That residual is the engine (fused shared-KV
+MTP+SuffixDraft verify, NVFP4 kernels), not the drafter choice. ngram-mod adds
+~nothing on real coding (its win is synthetic high-echo re-emission only). vLLM's
+wall/inst is worst because its prefix caching is dead on this hybrid-GDN arch
+(re-prefill every turn). Quality is engine-independent (11-12/12 edited-gold-file).
+
+Full methodology, fairness controls, the payload microbench, and reproduce
+steps: [docs/BENCHMARKING.md](docs/BENCHMARKING.md). Harness, pinned task set,
+and raw per-instance results: [bench/swebench/](bench/swebench/).
+
 ## Build log
 
 The full chronological build log (P0..P9, the quality A/B, every DONE

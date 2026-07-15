@@ -1,0 +1,11 @@
+model_list:
+  # Claude Code asks for various claude-* model ids; wildcard-route them all to vLLM.
+  - model_name: "*"
+    litellm_params:
+      model: openai/vllm-qwen           # openai/<served-model-name in vLLM>
+      api_base: http://host.docker.internal:8080/v1
+      api_key: "local"
+litellm_settings:
+  drop_params: true                     # tolerate anthropic-only params vLLM doesn't take
+general_settings:
+  master_key: "local"

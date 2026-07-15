@@ -652,6 +652,20 @@ int main(int argc, char** argv) {
         std::vector<int> prompt = build_prompt(body);
         ReqTrace rt{req_counter++, chat ? "oai" : "cmpl", conv_fp(body),
                     std::chrono::steady_clock::now(), ms_since(tk0)};
+        // Reject an empty prompt before slot selection: reuse_len() would run
+        // ckpt_best() over an empty vector, and (pre-fix) a zero-token prompt
+        // decodes from stale recurrent state and echoes the prior request's
+        // pending token. An empty /v1/completions prompt is nonsensical anyway;
+        // chat/messages always tokenize non-empty (template structure).
+        if (prompt.empty()) {
+            res.status = 400;
+            res.set_content(json{{"error", {{"message", "empty prompt"},
+                                            {"type", "invalid_request_error"},
+                                            {"code", "empty_prompt"}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
         // context-limit preflight BEFORE slot claim / SSE commit (review
         // follow-up 2026-07-09 #3): past this bound the routed slot's
         // n_max clamp floors at 0 -> empty 200
@@ -738,7 +752,7 @@ int main(int argc, char** argv) {
                     return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
                                 {"model", served_name}, {"choices", json::array({choice})}};
                 };
-                eng.generate(prompt, nm, EOS, [&](int id) {
+                int produced = eng.generate(prompt, nm, EOS, [&](int id) {
                     // empty pieces (control tokens, gate holdbacks) still probe
                     // the socket so a disconnected client stops generation
                     return send(piece_chunk(ugate.feed(tok.decode_one(id))));
@@ -746,6 +760,17 @@ int main(int argc, char** argv) {
                 eng.on_round_gap = nullptr;
                 std::string tailp = ugate.flush();
                 if (!tailp.empty()) send(piece_chunk(tailp));
+                // Terminal chunk with a real finish_reason (OpenAI streaming spec):
+                // clients otherwise never learn whether generation hit EOS or the
+                // token cap. produced >= nm == the length cap; else a stop.
+                {
+                    const char* fr = produced >= nm ? "length" : "stop";
+                    json fchoice = chat ? json{{"index", 0}, {"delta", json::object()},
+                                               {"finish_reason", fr}}
+                                        : json{{"index", 0}, {"text", ""}, {"finish_reason", fr}};
+                    send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                              {"model", served_name}, {"choices", json::array({fchoice})}});
+                }
                 req_log(rt, qw, eng, sl.id);
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
@@ -948,9 +973,12 @@ int main(int argc, char** argv) {
                 tc.begin(tool_names_v);
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
+                bool alive = true; // cleared when a write fails (client disconnected)
                 auto ev = [&](const char* name, const json& j) {
                     std::string s = std::string("event: ") + name + "\ndata: " + jdump(j) + "\n\n";
-                    return sink.write(s.data(), s.size());
+                    bool ok = sink.write(s.data(), s.size());
+                    if (!ok) alive = false;
+                    return ok;
                 };
                 json msg = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
                             {"model", served_name}, {"content", json::array()},
@@ -1032,7 +1060,7 @@ int main(int argc, char** argv) {
                 int produced = eng.generate(prompt, nm, EOS, [&](int id) {
                     tc.on_id(id);
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
-                    return true;
+                    return alive; // stop generating once the client has disconnected
                 }, stable_len);
                 tc.end();
                 eng.on_pending = nullptr;
@@ -1324,11 +1352,14 @@ int main(int argc, char** argv) {
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
                     std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
+                bool alive = true; // cleared when a write fails (client disconnected)
                 auto ev = [&](const json& j) {
                     // codex keys off data.type; the event: line is decorative
                     std::string s = "event: " + j.value("type", std::string("x")) +
                                     "\ndata: " + jdump(j) + "\n\n";
-                    return sink.write(s.data(), s.size());
+                    bool ok = sink.write(s.data(), s.size());
+                    if (!ok) alive = false;
+                    return ok;
                 };
                 ev({{"type", "response.created"},
                     {"response", {{"id", resp_id}, {"object", "response"},
@@ -1438,7 +1469,7 @@ int main(int argc, char** argv) {
                 q27::Utf8Gate ugate;
                 int produced = eng.generate(prompt, nm, EOS, [&](int id) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
-                    return true;
+                    return alive; // stop generating once the client has disconnected
                 });
                 eng.on_round_gap = nullptr;
                 req_log(rt, qw, eng, sl.id);

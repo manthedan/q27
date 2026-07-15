@@ -5417,3 +5417,299 @@ green-light. Prefill attention (17% @65K, grows to ~130K+) and GDN (10%) remain 
 and mostly at floor. Spike tool kept for the follow-on. This is the session's discipline
 on a marginal lever: measured the ceiling, reported it honestly, did not oversell +4% as
 the 1.4x the framing hoped.
+
+## 2026-07-14 -- P1 SHIPPED: ldmatrix-B integrated into the prefill GEMM, bitwise, +1.5% batched prefill (below the +2.6% projection)
+
+External review P1: integrate the ldmatrix-B spike (tools/gemm_ldm_spike.cu,
+07-13: +4.1% GEMM, bitwise, 0/17.8M floats differ; B-side only -- A loses, AB
+cancels) into the production prefill GEMM (src/prefill.cu k_gemm_mma_T, scalar
+B-loads). Done: added a plain `ldm_x2` helper (non-trans m8n8.x2.shared.b16) and
+swapped the scalar activation-fragment loads for `ldmatrix.x2` in BOTH branches --
+XG64 (two x2 per gg, b0..b3) and XG32 (one x2 per cc, b0,b1) -- behind
+`#if Q27_GEMM_LDMB` (default 1; -DQ27_GEMM_LDMB=0 = scalar reference, the in-binary
+A/B leg). ldmatrix address = the spike's exact formula (lane->token lane%8, K-half
+(lane%16)/8), which reuses production's own MR/NT/KS/LDX layout, so it's a direct
+swap.
+
+GATES (vanilla qwen, --pf batched prefill = the k_gemm_mma_T path):
+  - BITWISE: dump-logits(LDMB=1) == dump-logits(LDMB=0), byte-for-byte (993280-B
+    logit vector), on BOTH branches -- default XG64 AND Q27_PF_XG=32. ldmatrix moves
+    the same bytes into the same registers; confirmed in the production kernel on
+    real weights, not just the synthetic spike.
+  - canonical a2982c51 EXACT (decode path unaffected -- it uses the GEMV, not this
+    kernel).
+  - Q8 (Q4IN=false) NOT run (no Q8 weights on hand) but covered BY CONSTRUCTION:
+    the B/activation load I changed is Q4IN-independent (Q4IN only touches the
+    weight/A side + scale unpack), identical code in each branch.
+
+PERF (--pf 4096, batched TTFT t/s, 3 runs median, <0.3% spread):
+  LDMB ON  3507.3 t/s   LDMB OFF 3455.4 t/s   = +1.50% end-to-end batched prefill.
+
+HONEST DELTA: +1.5% measured, BELOW the reviewer's +2.6% projection. The +4.1% was
+the ffn_gate GEMM in ISOLATION at T=1024; end-to-end batched prefill at T=4096 runs
+all layers' GEMMs plus attention/GDN/other kernels, so the isolated GEMM win does
+not translate 1:1 (either the GEMM is <64% of prefill at this shape or the in-context
+per-GEMM benefit is smaller). Still a FREE, bitwise, universal-on-prefill win with
+zero VRAM/quality cost -- default on. Session discipline again: measure the real
+end-to-end number, don't ship the isolated-kernel projection. NOTE: the CLI carries
+it; server binaries (q27-server[-w16]) need a rebuild to pick up the prefill.cu
+change. Reference binary build/q27-ldmoff kept for A/B.
+
+## 2026-07-14 -- P2: short-tail prefill GEMM = runtime NT dispatch (+13-16% short prefill, bitwise); serial-threshold is the bigger follow-on
+
+External review P2: the NT=128 prefill GEMM collapses below T~32 (a mostly-empty
+128-token tile + high smem = low occupancy). Fix per the plan (docs/plans/
+2026-07-13-gemm-verify.md:414): prefill is NOT graph-captured, so NT can be picked
+at launch for free; NT is BITWISE-invariant (same per-output FP accumulation order),
+so it is a pure speed choice.
+
+MICROBENCH (scratchpad/gemm_nt_sweep.cu, real ffn_gate Q4, templated NT):
+  T    best-NT   ms(best vs NT=128)
+  16   NT=16     0.025 vs 0.067  (2.7x)
+  32   NT=32     0.027 vs 0.068  (2.5x)
+  64   NT=64     0.047 vs 0.072  (1.5x)
+  128  NT=128    optimum
+  192  NT=64     +34% (128+64 wastes a half-tile)
+Smaller tile fills small T and uses less smem (more occupancy). Big win <= T=64.
+
+SHIPPED: templated k_gemm_mma_T<Q4IN,XG64,NT>; launch_gemm_mma_x dispatches
+nt = T<=16?16 : T<=32?32 : T<=64?64 : 128 (Q27_PF_NT forces a fixed tile for A/B).
+4 NT x 4 (Q4IN,XG64) = 16 instantiations; each sets its own smem attr once.
+
+GATES (vanilla qwen): canonical a2982c51 EXACT; BITWISE auto-dispatch ==
+forced-NT=128 dump-logits byte-for-byte @T=16 (auto->16), T=48 (auto->64), T=512
+(auto->128). NT invariance proven, not asserted.
+
+PERF (--pf batched TTFT, 3-4 run median): +16% @T=32, +13% @T=64 end-to-end. Diluted
+from the isolated 2.5-3x GEMM by the non-GEMM prefill (attention/GDN/norms). Applies
+to prefix-cache suffixes and prefill tails: prefill_chunk runs with small Tc even on
+long prompts (engine.cuh:2343 chunks [base..NP) at PF_T; short suffix Tc=NP-base ->
+NT dispatch), so the common agentic short-turn case benefits. Free, bitwise, no VRAM.
+
+SEPARATE FINDING -- serial-threshold lowering: a 4x win gated by a POLICY choice, not
+a bug (earlier "latent bug" call was a MISDIAGNOSIS, corrected here). Total prompts <
+32 tokens skip batched prefill (engine.cuh:2291 `NP >= 32`) and take the SERIAL
+per-token path -- 230ms @T=16 (~16x14ms). Lowering the threshold (Q27_PF_MINBATCH
+knob) DID give 4.0x @NP=16 (230->58ms), 2.2x @NP=8. The --pf serial-vs-batched M6
+identity FAILS under XG32 at NP=6,8,10 (PASSES 5,12,16). FIRST READ: a small-NP bug.
+WRONG -- follow-up shows XG32 batched != serial at NATIVE batched sizes TOO (N=33,64,
+128 MISMATCH; 40,512 IDENTICAL), and those sizes are what production runs every day
+without issue. So it is NOT a small-NP bug: batched prefill is INHERENTLY tolerance-
+class vs serial (different FP reduction orders in the batched attention/GDN kernels,
+NOT the GEMM -- reproduces with Q27_PF_NT=128), and the greedy continuation matches
+serial only for CONFIDENT content; tie-prone content flips. Short prompts flip more
+because short context is uncertain. The "XG32 = exact serial-vs-batched identity"
+claim (prefill.cu:219) is inaccurate -- it holds for confident content, not
+universally; the M6 gate has been passing because it is run at a size/content that
+happens to be confident.
+
+CONSEQUENCE: the 32-threshold is NOT load-bearing for a bug -- it is the boundary
+below which short prompts get the EXACT serial path. Lowering it is a POLICY choice:
+trade the 4x short-prompt speed for switching short prompts from exact-serial to the
+(already-shipped) tolerance-class batched path. That CHANGES short-prompt greedy
+outputs, INCLUDING the canonical (NP=5 -> batched -> new md5, needs re-baseline).
+Deferred to a quality/policy call, not a bug fix. No code shipped for it (knob
+reverted). Discipline note: "fix the bug" turned up that there was no bug -- the
+measurement (XG32 mismatches at native batched sizes) refuted the premise.
+
+## 2026-07-14 -- security/robustness review triage: 4 in-scope fixes, 3 out-of-scope (hostile artifact), 1 deferred
+
+Second external security review (server/loader/tokenizer). Cross-checked against the
+authoritative docs/SECURITY-MODEL.md (single-operator localhost engine; hostile-
+artifact + adversarial-DoS findings out of scope by design). Verified each against
+current code before acting.
+
+FIXED (in-scope -- bite the operator's own benign workflow; all built + smoke-verified):
+- #1 empty-prompt crash (HIGH, REAL, a GAP past the 2026-07-07 fix). reuse_len() ->
+  ckpt_best() runs at SLOT SELECTION, before the engine-entry `NP>=1` guard
+  (engine.cuh:2259). ckpt_best did `c.toks.size() > prompt.size()-1` -> size_t
+  underflow to SIZE_MAX on an empty prompt -> nothing skipped -> std::equal derefs the
+  empty vector's begin() (nullptr) -> crash, once any checkpoint exists. Fix:
+  `c.toks.size()+1 > prompt.size()` (no underflow) + reject empty prompt at the
+  handler (server.cu, 400 before slot claim). Smoke: `{"prompt":""}` and missing
+  prompt both -> HTTP 400, server stays alive.
+- #2 disconnect keeps generating (Anthropic + Responses). The OpenAI streaming
+  callback already returns the sink.write() result (stops on disconnect); Anthropic
+  (server.cu:1032) and Responses returned `true` unconditionally. Fix: the ev SSE
+  emitter sets a captured `alive` flag on write failure; both callbacks return
+  `alive`. Smoke: Anthropic stream, max_tokens=800, client cut at 3s -> engine
+  stopped at dec=408 (was: generate to 800).
+- #3 quadratic BPE (the one #3 sub-point the security model itself flags). bpe_word
+  is O(n^2) (full pair rescan + erase-in-loop); a no-whitespace blob (minified JS/
+  base64) collapses to one huge word and stalls tokenization. Fix: WORD_CAP=1024,
+  chunk over-cap words -> O(n*WORD_CAP). Inert below 1024B, so normal text +
+  canonical byte-identical. (The unbounded-request-size half of #3 stays out --
+  network/DoS, `--host 127.0.0.1` is the mitigation.)
+- #7 missing terminal finish_reason (OpenAI streaming). Every chunk had
+  finish_reason:null then [DONE]; clients never learned stop vs length. Fix: emit a
+  terminal chunk with "length" (produced>=nm) or "stop" before [DONE]. Smoke: stream
+  now ends with finish_reason:"length".
+
+OUT OF SCOPE (require a hostile model/tokenizer artifact -- SECURITY-MODEL.md
+dispositions these as #9/#10/#11; q27 loads one self-produced model+tokenizer):
+- #4 model tensor bounds integer overflow (loader.cpp), #5 model metadata negative
+  layer index (engine.cuh:445), #6 truncated tokenizer header reads (tokenizer.cpp:58).
+  Real code observations, but they need an attacker-supplied artifact q27 does not face.
+  (If q27 ever ingests third-party model zoos, these re-activate -- per the model doc.)
+
+DEFERRED:
+- #8 capturing structured bindings is a C++20 feature (server.cu:1303 make_item_cbs
+  4-tuple, 32 refs). NVCC warns but builds+runs; a real fix is a struct-return refactor
+  of 32 sites for a portability nicety. Low; left as a warning.
+
+Gates: canonical a2982c51 EXACT; test_tokenizer self-tests PASS; server smokes above.
+
+**2026-07-14 -- CROSS-ENGINE: q27 vs llama-cpp-turboquant (TheTom) ngram-mod, side-by-side.**
+Both engines, vanilla qwen, greedy, decode-only t/s (excludes prefill). q27 =
+NVFP4 5.25bpw git 94e645a (MTP+SuffixDraft, its shipped config). llama =
+Qwen3.6-27B-MTP-Q5_K_M ~5.5bpw git c3e6dbb13 with `--spec-type ngram-mod`
+(n_match=24, n_max=64, n_min=48 defaults; self-speculative, no draft model).
+IDENTICAL /v1/completions payloads on both. Decode-only comparison isolates
+spec-decode effectiveness (both base kernels ~50-65 t/s single-stream, so the
+delta IS the drafter):
+
+  payload                     regime                 q27        llama ngram-mod
+  echo_ctx12k (256 tok)       pure verbatim echo     603 t/s*   529 t/s (96% acc)
+  fileemit_verbatim (1024)    partial-echo cont.     178 t/s    409 t/s (89% acc)*
+  novel_prose (400)           novel generation       157 t/s*   56 cold / 97 warmed
+  echo_ctx26k (256)           CONFOUNDED (diverged)  290 t/s    49 t/s (0 drafts)
+  (* = winner; tok/round q27: 11.6 / 3.0 / 2.6 respectively)
+
+NO clean winner -- complementary drafter strengths:
+1. PURE SHORT ECHO (drafter fires hard, 108 fires, 11.6 tok/rnd): q27 WINS
+   603 vs 529. Fused MTP+suffix verify is faster per accepted token than
+   ngram-mod's separate draft/verify once acceptance is near-saturated.
+2. PARTIAL-ECHO CONTINUATION (12K ctx, 1024 tok code): llama WINS 409 vs 178.
+   q27's SuffixDraft fired only 25-38x/291 rounds (3.0 tok/rnd) where
+   ngram-mod hit 89%. ROOT CAUSE = mechanism: q27 SuffixDraft needs EXACT
+   suffix repetition + is greedy-gated + capped at width 12; ngram-mod's
+   24-token lookup drafts up to 64 forward from ANY in-context match, so it
+   tolerates near-repeats that break q27's suffix match. THIS is TheTom's
+   "653 file-re-emit" regime -- real, and q27's weakest spot.
+3. NOVEL GENERATION: q27 WINS decisively 157 vs 56 (cold). MTP head drafts a
+   learned guess every round regardless of echo material; ngram-mod has
+   nothing to match -> falls to base decode. NOTE: ngram-mod PERSISTS its
+   table across requests, so repeated identical novel prompts warm 56->79->97
+   by echoing their own prior greedy output; the cold 56 is the honest
+   single-shot number. q27's 157.5 is request-invariant (no server-side table).
+4. echo_ctx26k is NOT comparable: Q5 vs NVFP4 quant divergence made the greedy
+   outputs differ (llama 169 tok w/ 0 drafts vs q27 256 tok) -> different text,
+   drop it.
+
+bpw confound: llama Q5_K_M ~5.5bpw has MORE bits than q27's 5.25 (mild edge to
+llama) yet still loses novel + pure-echo -> qualitative conclusion robust.
+
+ENGINEERING LEVER (not yet built): the fileemit regime is where q27 leaves the
+most on the table. Adding an ngram-style long-lookahead lookup (24-tok match ->
+draft-forward-N) to COMPLEMENT MTP+SuffixDraft (not replace) would capture
+llama's partial-echo win without touching the novel-prose MTP advantage. The
+current SuffixDraft is deliberately conservative (exact-suffix + greedy-gate +
+W12) for bitwise determinism; an ngram path would need the same tie/tolerance
+discipline as the wide fdmma verify. Candidate follow-on.
+
+**2026-07-14 -- CROSS-ENGINE #2: llama-ngram-mod ON REAL THUNDERDOME AGENTIC TRAFFIC.**
+Drove Claude Code (the claude-code-q27-haight adapter -- retargets ANTHROPIC_BASE_URL
+at :8081) against the llama-cpp-turboquant fork on the SAME 3 tasks q27 ran. The fork
+serves the Anthropic /v1/messages API natively (streaming, tool_use, thinking blocks,
+count_tokens all verified) so no proxy needed. llama config made FAIR to q27:
+5090-only (CUDA_VISIBLE_DEVICES=0, no 3090 layer-split), q8_0 KV (~ q27 fp8), single
+slot, --spec-type ngram-mod --jinja, Q5_K_M ~5.5bpw. Same base model.
+
+                          wall    exit       score   q27 wall  q27 score
+  analytics-dashboard     741s    completed  0.609    150s     0.512
+  time-tracker            173s    completed  0.653     54s     0.791
+  structural-merge        363s    completed  0.943     90s     0.911
+
+  DECODE:   llama 61.0 t/s agg / 55.5 med   vs   q27 289.8 agg / 236.5 med
+  ngram-mod draft acceptance on agentic traffic = 34% (14370/42116)
+
+q27 is ~4.75x faster decode and ~4x faster wall-to-wall on real agentic coding, and
+wins DESPITE its known cold-prefill disadvantage (llama has the tensor-core GEMM) --
+because agentic turns are decode-bound (long generation), and decode is where q27's
+MTP dominates. The 34% ngram-mod acceptance is the whole story: real agentic coding is
+mostly NOVEL generation (writing new code), not re-emission, so ngram-mod falls to
+llama's ~55 t/s base rate. It only hit 89% on the synthetic fileemit payload. q27's
+MTP head drafts every round regardless of echo -> 5.46 tok/round -> 289.8 t/s.
+Both engines COMPLETED all tasks; scores are run-to-run noisy (agentic nondeterminism),
+not the signal. Cost column ignored (synthetic price, meaningless for local).
+
+Net across both cross-engine studies: ngram-mod's win is REAL but NARROW (high-echo
+re-emission only); on the actual q27 workload q27 wins decisively. The fileemit lever
+(add ngram-lookahead to complement MTP) would help the narrow echo case without
+touching this agentic win. See prior 2026-07-14 entry for the payload-level split.
+
+**2026-07-14 -- CROSS-ENGINE #3: reproducible SWE-bench agentic bench, THREE engines.**
+Replaced the private thunderdome tasks (not redistributable) with a public, pinned
+task set: 12 SWE-bench_Verified instances (fast-test repos: requests/flask/pytest/
+pylint/xarray, <15min difficulty), Claude Code driving each engine's Anthropic
+/v1/messages API, sandboxed per-instance in the thunderdome/claude-code Docker image
+via plain `docker run` (NOT the private orchestration; --user 1000:1000 node, since
+claude refuses --dangerously-skip-permissions as root). Artifacts in bench/swebench/
+(run.sh, manifest.json, select_instances.py, results.*.jsonl). Full method +
+reproduce steps in docs/BENCHMARKING.md. Fair config: all 5090-only, q8 KV, greedy,
+same base model (Qwen3.6-27B-MTP), llama Q5_K_M ~5.5bpw (+0.25 vs q27 NVFP4).
+
+  engine                        decode agg  med    wall/inst  gold-file
+  q27 (MTP+SuffixDraft)         202.7 t/s   208.4   47 s      11/12
+  llama ngram-mod (fork c3e6d)  61.1 t/s    56.9   118 s      11/12
+  llama MAINLINE (13e67386,none) 62.0 t/s   62.5   120 s      12/12
+
+MAINLINE BASELINE IS THE PAYOFF: it loads the qwen35 GGUF fine (LLM_ARCH_QWEN35 +
+/v1/messages both upstream as of Jul-01) and runs stock autoregressive (no spec).
+Result: fork ngram-mod (61.1) == mainline (62.0) within noise -- actually fork is
+marginally LOWER (failed-draft + table overhead at 34% acceptance ~cancels wins).
+So on REAL agentic coding ngram-mod adds ~nothing; its Method-A win (409 vs 178 on
+synthetic file-emit) does NOT generalize. Base decode kernels are comparable (~62
+t/s), so the ENTIRE ~3.3x gap is q27's MTP head drafting productively on novel
+generation where prompt-lookup/ngram have nothing to match. Quality identical
+(11-12/12 gold-file, model is the same; engine only changes speed). q27 finishes
+each instance in ~40% of the llama wall time despite +0.25bpw and slower cold prefill.
+
+**2026-07-14 -- CROSS-ENGINE #4: llama.cpp WITH the MTP head (apples-to-apples).**
+Ran mainline llama.cpp (13e67386, which has --spec-type draft-mtp + auto-discovers the
+GGUF's MTP head) with --spec-type draft-mtp --spec-draft-n-max 6 on the same 12
+SWE-bench instances. Same MTP head + same model as q27 -> isolates ENGINE quality, not
+drafter choice. Fair config (5090-only, q8 KV, greedy). results.llamammtp.jsonl.
+
+  engine                                 decode agg  med    wall/inst  gold
+  q27 (MTP + SuffixDraft, fused)         202.7 t/s   208.4   47 s      11/12
+  llama mainline + MTP (n-max 6)         116.3 t/s   127.3   80 s      11/12
+  llama ngram-mod (fork)                  61.1 t/s    56.9  118 s      11/12
+  llama mainline (no spec)                62.0 t/s    62.5  120 s      12/12
+
+GAP DECOMPOSITION (real agentic decode, all same model): stock 62 -> +ngram-mod ~62
+(x1.0, adds nothing) -> +MTP 116 (x1.9, MTP is the real lever, 58% accept on agentic vs
+ngram's 34%) -> q27 203 (x1.74 ON TOP of llama+MTP). So MTP nearly doubles stock, and
+q27's engine (fused shared-KV MTP+SuffixDraft verify, NVFP4 kernels, tie/tolerance
+discipline) is another ~1.74x over mainline's MTP -- with the IDENTICAL head. Payload
+smoke agrees: q27 vs llama+MTP = 157 vs 92 novel (x1.7), 178 vs 184 fileemit (tie);
+agentic is novel-heavy so the mix lands at x1.74. Quality engine-independent (11-12/12).
+Answers "what about llama.cpp with MTP": it closes ~half the gap to q27; the residual
+1.74x is q27's engine, not the drafter. Full 4-engine table in docs/BENCHMARKING.md.
+
+**2026-07-15 -- CROSS-ENGINE #5: vLLM NVFP4 + MTP on the SWE-bench agentic bench.**
+Added vLLM as a 5th engine. vLLM has no /v1/messages, so Claude Code drives it via a
+litellm Anthropic<->OpenAI shim (:8081 -> vLLM :8080). Model: unsloth/Qwen3.6-27B-NVFP4
+(compressed-tensors, has mtp_num_hidden_layers=1; multimodal Qwen3_5ForConditionalGeneration
+variant, vision tower unused). vLLM nightly, 5090-only, single-seq, fp8 KV, MTP spec
+(method:mtp n=3). Gotchas hit + fixed: (a) hermes tool-parser returns null -- this model
+emits Qwen XML tool calls <function=x><parameter=y>, needs --tool-call-parser qwen3_coder;
+(b) KV didn't fit 131072 at 0.92 util -> 0.96; (c) first run 4/12 empty = ContextWindowExceeded
+(Claude Code requests ~32k max_tokens, prompt+output > the 98304 I'd set) -> raised to 131072,
+re-ran clean 12/12. Harness/scripts in bench/swebench/vllm/. Decode t/s from vLLM /metrics
+(generation_tokens_total / inter_token_latency_seconds_sum).
+
+  engine                          decode agg  wall/inst  gold
+  q27 (MTP + SuffixDraft, fused)  202.7 t/s    47 s      11/12
+  vLLM NVFP4 + MTP (n=3)          117.1 t/s   133 s      11/12
+  llama mainline + MTP (n-max 6)  116.3 t/s    80 s      11/12
+  llama ngram-mod (fork)           61.1 t/s   118 s      11/12
+  llama mainline (no spec)         62.0 t/s   120 s      12/12
+
+TWO KEY TAKEAWAYS: (1) vLLM's MTP (117.1) == llama's MTP (116.3) to within noise -- two
+independent codebases converge on the same ~117 t/s MTP ceiling, and q27 is a further
+~1.73x on top with the SAME head. Strong evidence the lead is q27's engine, not a one-off.
+(2) vLLM has the WORST wall/inst (133s) despite competitive decode, because prefix caching
+is dead on hybrid-GDN (0% reuse) -> re-prefill every turn, plus the litellm hop. q27/llama
+reuse prefix state across turns and convert competitive decode into low wall time. Quality
+engine-independent (11-12/12). Full 5-engine table + vLLM caveats in docs/BENCHMARKING.md.

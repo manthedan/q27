@@ -161,6 +161,22 @@ static std::vector<std::string> utf8_chars(const std::string& s) {
 }
 
 std::vector<int> Tokenizer::bpe_word(const std::string& word) const {
+    // Bounded-word guard: the merge loop below is O(word^2) (full pair rescan +
+    // erase-in-loop per merge). A pathological no-whitespace blob (minified JS,
+    // base64) collapses to one huge "word" and stalls tokenization single-threaded
+    // before any context check. Cap the word and BPE in WORD_CAP-byte chunks so cost
+    // is O(n * WORD_CAP), not O(n^2). Only over-cap words (already-degenerate input)
+    // get different token boundaries; normal whitespace-delimited text is far under
+    // the cap and byte-identical (the canonical is unaffected).
+    static constexpr size_t WORD_CAP = 1024;
+    if (word.size() > WORD_CAP) {
+        std::vector<int> out;
+        for (size_t off = 0; off < word.size(); off += WORD_CAP) {
+            auto chunk = bpe_word(word.substr(off, WORD_CAP));
+            out.insert(out.end(), chunk.begin(), chunk.end());
+        }
+        return out;
+    }
     // word is raw bytes; map to byte-encoded char strings
     std::vector<std::string> parts;
     parts.reserve(word.size());

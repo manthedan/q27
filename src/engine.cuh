@@ -2087,7 +2087,12 @@ struct Engine {
         size_t best_len = 0;
         for (size_t k = 0; k < ckpts.size(); k++) {
             const auto& c = ckpts[k];
-            if (!c.buf || c.toks.empty() || c.toks.size() > prompt.size() - 1) continue;
+            // c.toks.size()+1 > prompt.size(), NOT c.toks.size() > prompt.size()-1:
+            // the latter underflows size_t on an empty prompt (0-1 = SIZE_MAX), so
+            // nothing is skipped and std::equal below reads past the empty vector's
+            // begin() (nullptr) -> crash. reuse_len() runs this at slot-selection,
+            // BEFORE the engine-entry NP>=1 guard, so the empty prompt reaches here.
+            if (!c.buf || c.toks.empty() || c.toks.size() + 1 > prompt.size()) continue;
             if (c.toks.size() <= best_len) continue;
             if (std::equal(c.toks.begin(), c.toks.end(), prompt.begin())) {
                 best = (int)k;
