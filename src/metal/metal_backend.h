@@ -66,6 +66,8 @@ class MetalBackend final : public ComputeBackend {
                    uint32_t n_rot, uint32_t stride, uint32_t position,
                    float freq_base) override;
     void argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out_index) override;
+    void topk(const BackendBuffer& x, uint32_t n, uint32_t k,
+              BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count) override;
     void kv_store_f16(const BackendBuffer& k, const BackendBuffer& v,
                       BackendBuffer& k_cache, BackendBuffer& v_cache,
                       uint32_t position, uint32_t row_length) override;

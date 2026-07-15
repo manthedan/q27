@@ -116,6 +116,17 @@ class ComputeBackend {
                            uint32_t n_rot, uint32_t stride, uint32_t position,
                            float freq_base) = 0;
     virtual void argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out_index) = 0;
+    // Top-k candidate extraction for GPU-assisted sampling: writes >= k
+    // (value, index) pairs containing the true top-k into values/indices
+    // (capacity = min buffer length) and the total candidate count into
+    // count (uint32). A count above capacity means degenerate ties; the
+    // caller must fall back to a full logits readback. Candidates are
+    // unordered; the caller sorts.
+    virtual void topk(const BackendBuffer& x, uint32_t n, uint32_t k,
+                      BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count) {
+        (void)x; (void)n; (void)k; (void)values; (void)indices; (void)count;
+        throw std::runtime_error("q27: backend has no top-k primitive");
+    }
     virtual void kv_store_f16(const BackendBuffer& k, const BackendBuffer& v,
                               BackendBuffer& k_cache, BackendBuffer& v_cache,
                               uint32_t position, uint32_t row_length) = 0;

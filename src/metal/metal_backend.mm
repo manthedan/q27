@@ -135,6 +135,7 @@ struct TurboStoreArgs { uint32_t position, kv_heads; };
 struct AttentionArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim; float scale; };
 struct AttentionGqaArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim, block, n_blocks; float scale; };
 struct AttentionGqaCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, block, n_blocks_max, tokens; float scale; };
+struct TopkArgs { uint32_t n, k, capacity; };
 struct DeltaArgs { uint32_t value_heads, qk_heads, head_dim; };
 struct EmbedRowsArgs { uint32_t cols, count, tokens[12]; };
 struct RowsNormArgs { uint32_t n, rows, groups; float eps; };
@@ -213,6 +214,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> attention_f16_causal_gqa_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_p;
     id<MTLComputePipelineState> attention_gqa_merge_rows_p;
+    id<MTLComputePipelineState> topk_logits_p;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
     bool batching = false;
@@ -533,6 +535,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_f16_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa");
         impl_->attention_turbo3_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa");
         impl_->attention_gqa_merge_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge_rows");
+        impl_->topk_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_topk_logits");
         if (const char* env = getenv("Q27_METAL_GQA_THRESHOLD"); env && *env)
             impl_->gqa_threshold = (uint32_t)strtoul(env, nullptr, 10);
 
@@ -1150,6 +1153,27 @@ void MetalBackend::argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out
         [enc setBytes:&n length:4 atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("argmax");
+    }
+}
+
+void MetalBackend::topk(const BackendBuffer& x, uint32_t n, uint32_t k,
+                        BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count) {
+    const MetalBuffer& input=metal_buffer(x);
+    MetalBuffer& vb=metal_buffer(values); MetalBuffer& ib=metal_buffer(indices); MetalBuffer& cb=metal_buffer(count);
+    if (!n || !k || k > 256) throw std::runtime_error("q27 Metal: top-k requires 1..256 candidates");
+    check_range(input.size(),0,(uint64_t)n*4,"top-k input"); check_range(cb.size(),0,4,"top-k count");
+    const uint64_t capacity=std::min(vb.size(),ib.size())/4;
+    if (capacity < 2*(uint64_t)k) throw std::runtime_error("q27 Metal: top-k output capacity below 2k");
+    if (impl_->batching) throw std::runtime_error("q27 Metal: top-k requires its own command");
+    std::memset(cb.handle().contents,0,4);
+    TopkArgs args{n,k,(uint32_t)std::min<uint64_t>(capacity,UINT32_MAX)};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_topk_logits"); [enc setComputePipelineState:impl_->topk_logits_p];
+        [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
+        [enc setBuffer:ib.handle() offset:0 atIndex:2]; [enc setBuffer:cb.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];
+        if(own) impl_->finish_command("top-k");
     }
 }
 

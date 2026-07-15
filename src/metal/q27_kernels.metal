@@ -2088,3 +2088,80 @@ kernel void q27_attention_gqa_merge_rows(device const float *partials [[buffer(0
     for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
         out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = acc[i] * inv;
 }
+
+// Top-k candidate extraction for GPU-assisted sampling: a 16-bit radix
+// select finds a threshold whose over-set contains the true top-k, then
+// compacts (value, index) pairs so the host reads ~k candidates instead of
+// the whole vocabulary. The over-set can exceed k on 16-bit-key ties; the
+// host truncates after an exact sort, and falls back to a full logits
+// readback when out_count exceeds the capacity (degenerate tie storms).
+struct TopkArgs { uint n; uint k; uint capacity; };
+
+inline uint topk_sortable(float value) {
+    // Monotonic float -> uint map: larger float == larger key. NaN maps
+    // high or low deterministically; logits are finite in practice.
+    uint u = as_type<uint>(value);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+kernel void q27_topk_logits(device const float *logits [[buffer(0)]],
+                             device float *out_values [[buffer(1)]],
+                             device uint *out_indices [[buffer(2)]],
+                             device atomic_uint *out_count [[buffer(3)]],
+                             constant TopkArgs &args [[buffer(4)]],
+                             uint tid [[thread_position_in_threadgroup]],
+                             uint threads [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint hist[256];
+    threadgroup uint tg_b1, tg_above, tg_threshold;
+
+    // Pass 1: histogram of the top key byte; find the bin where the
+    // descending cumulative count crosses k, and the count strictly above it.
+    for (uint b = tid; b < 256; b += threads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < args.n; i += threads)
+        atomic_fetch_add_explicit(&hist[topk_sortable(logits[i]) >> 24], 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint cumulative = 0, bin = 255;
+        for (;; bin--) {
+            const uint count = atomic_load_explicit(&hist[bin], memory_order_relaxed);
+            if (cumulative + count >= args.k || bin == 0) { tg_above = cumulative; break; }
+            cumulative += count;
+        }
+        tg_b1 = bin;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint b1 = tg_b1;
+    const uint above = tg_above;
+
+    // Pass 2: histogram of the second byte within the boundary bin; walk it
+    // for the k - above candidates the boundary bin must still supply.
+    for (uint b = tid; b < 256; b += threads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < args.n; i += threads) {
+        const uint key = topk_sortable(logits[i]);
+        if ((key >> 24) == b1)
+            atomic_fetch_add_explicit(&hist[(key >> 16) & 255u], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        const uint remaining = args.k > above ? args.k - above : 1;
+        uint cumulative = 0, bin = 255;
+        for (;; bin--) {
+            cumulative += atomic_load_explicit(&hist[bin], memory_order_relaxed);
+            if (cumulative >= remaining || bin == 0) break;
+        }
+        tg_threshold = (b1 << 8) | bin;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint threshold = tg_threshold;
+
+    // Pass 3: compact every candidate at or above the 16-bit threshold.
+    for (uint i = tid; i < args.n; i += threads) {
+        const uint key16 = topk_sortable(logits[i]) >> 16;
+        if (key16 >= threshold) {
+            const uint slot = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+            if (slot < args.capacity) { out_values[slot] = logits[i]; out_indices[slot] = i; }
+        }
+    }
+}

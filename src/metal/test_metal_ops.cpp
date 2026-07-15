@@ -670,6 +670,69 @@ int test_attention_gqa_straddle() {
     return failures;
 }
 
+// GPU top-k candidate extraction: the radix-select over-set must contain
+// the exact top-k (value desc, index asc tie-break), stay within capacity
+// on realistic logits, and signal fallback (count > capacity) on
+// degenerate tie storms.
+int test_topk(q27::MetalBackend& backend) {
+    int failures = 0;
+    uint32_t lcg = 13579;
+    auto uniform = [&]() { lcg = lcg * 1664525u + 1013904223u; return (float)(lcg >> 8) / 8388608.0f - 1.0f; };
+    constexpr uint32_t n = 151936, capacity = 1024;
+    auto values_buffer = backend.allocate(capacity * 4);
+    auto indices_buffer = backend.allocate(capacity * 4);
+    auto count_buffer = backend.allocate(4);
+
+    auto check = [&](const std::vector<float>& logits, uint32_t k, const char* label) {
+        auto lb = upload_buffer(backend, logits);
+        backend.topk(*lb, (uint32_t)logits.size(), k, *values_buffer, *indices_buffer, *count_buffer);
+        uint32_t count = 0;
+        backend.read(*count_buffer, 0, &count, 4);
+        if (count < k) { fprintf(stderr, "topk %s: count %u < k %u\n", label, count, k); return ++failures, void(); }
+        if (count > capacity) { fprintf(stderr, "topk %s: unexpected overflow (%u)\n", label, count); return ++failures, void(); }
+        std::vector<uint32_t> got_indices(count);
+        backend.read(*indices_buffer, 0, got_indices.data(), count * 4);
+        std::vector<uint32_t> order(logits.size());
+        for (uint32_t i = 0; i < order.size(); i++) order[i] = i;
+        std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                          [&](uint32_t a, uint32_t b) {
+                              return logits[a] != logits[b] ? logits[a] > logits[b] : a < b;
+                          });
+        std::vector<bool> present(logits.size(), false);
+        for (uint32_t index : got_indices) {
+            if (index >= logits.size()) { fprintf(stderr, "topk %s: index out of range\n", label); failures++; return; }
+            present[index] = true;
+        }
+        for (uint32_t i = 0; i < k; i++)
+            if (!present[order[i]]) {
+                fprintf(stderr, "topk %s: missing rank %u (index %u, value %.8g)\n",
+                        label, i, order[i], logits[order[i]]);
+                failures++;
+                return;
+            }
+    };
+
+    std::vector<float> logits(n);
+    for (auto& value : logits) value = uniform() * 12.0f;
+    check(logits, 1, "k=1");
+    check(logits, 40, "k=40");
+    check(logits, 256, "k=256");
+    // Quantized logits: ~600-way ties at every distinct value, so the
+    // boundary bucket is fat but still under capacity.
+    std::vector<float> tied(n);
+    for (uint32_t i = 0; i < n; i++) tied[i] = std::round(logits[i] * 10.0f) / 10.0f;
+    check(tied, 40, "tied");
+    // Degenerate: every logit equal -> over-set is the whole vocabulary and
+    // the count must signal fallback.
+    std::vector<float> flat(n, 1.5f);
+    auto fb = upload_buffer(backend, flat);
+    backend.topk(*fb, n, 40, *values_buffer, *indices_buffer, *count_buffer);
+    uint32_t count = 0;
+    backend.read(*count_buffer, 0, &count, 4);
+    if (count <= capacity) { fprintf(stderr, "topk flat: count %u did not signal fallback\n", count); failures++; }
+    return failures;
+}
+
 int test_gdn(q27::MetalBackend& backend) {
     int failures=0;
     // Gates.
@@ -1208,6 +1271,7 @@ int main() {
                        test_attention_production_shape(backend) +
                        test_turbo3(backend) + test_turbo3_production_shape(backend) +
                        test_attention_gqa_path() + test_attention_gqa_straddle() +
+                       test_topk(backend) +
                        test_gdn(backend) + test_chunked(backend);
         if (failures) { fprintf(stderr, "Metal ops: %d failure(s)\n", failures); return 1; }
         puts("Metal decode primitives, FP16/turbo3 attention (incl. GQA KV-reuse path), GDN, and chunked prefill ops: OK");
