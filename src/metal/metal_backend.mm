@@ -148,13 +148,18 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> f16;
     id<MTLComputePipelineState> q8;
     id<MTLComputePipelineState> q4;
+    id<MTLComputePipelineState> t2;
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
+    id<MTLComputePipelineState> t2_quantized;
     id<MTLComputePipelineState> f16_pair;
     id<MTLComputePipelineState> q4_quantized_matmul;
     id<MTLComputePipelineState> q8_quantized_matmul;
+    id<MTLComputePipelineState> t2_quantized_matmul;
     id<MTLComputePipelineState> embedding;
+    id<MTLComputePipelineState> embedding_t2;
+    id<MTLComputePipelineState> embedding_t2_rows;
     id<MTLComputePipelineState> rms;
     id<MTLComputePipelineState> rms_quantized;
     id<MTLComputePipelineState> rms_heads;
@@ -343,17 +348,22 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->f16 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16");
         impl_->q8 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_g128");
         impl_->q4 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_g64");
+        impl_->t2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128");
         impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
+        impl_->t2_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized");
         impl_->f16_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair");
         // SIMD-scoped matrix multiply is optional on older Intel-family Metal
         // devices. Decode GEMV remains available there; only small-N GEMM is gated.
         if ([impl_->device supportsFamily:MTLGPUFamilyApple7]) {
             impl_->q4_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm");
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
+            impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
         }
         impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
+        impl_->embedding_t2 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2");
+        impl_->embedding_t2_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_rows");
         impl_->rms = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm");
         impl_->rms_quantized = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_quantized");
         impl_->rms_heads = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_heads");
@@ -559,6 +569,7 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     const MetalBuffer& input = metal_buffer(x);
     MetalBuffer& output = metal_buffer(y);
     const uint64_t quant_group = weight.dtype == DType::Q8_G128 ? 128 :
+                                 weight.dtype == DType::T2_G128 ? 128 :
                                  weight.dtype == DType::Q4_G64 ? 64 : 0;
     if (quant_group && weight.cols % quant_group)
         throw std::runtime_error("q27 Metal: matvec columns do not match quantization group");
@@ -566,6 +577,7 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     if (weight.dtype == DType::F32) data_bytes *= 4;
     if (weight.dtype == DType::F16) data_bytes *= 2;
     if (weight.dtype == DType::Q4_G64) data_bytes /= 2;
+    if (weight.dtype == DType::T2_G128) data_bytes /= 4;
     check_range(data.size(), weight.data_offset, data_bytes, "matvec weight");
     id<MTLComputePipelineState> pipeline = nil;
     const char* label = nullptr;
@@ -574,9 +586,10 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
         case DType::F16: pipeline = impl_->f16; label = "q27_matvec_f16"; break;
         case DType::Q8_G128: pipeline = impl_->q8; label = "q27_matvec_q8_g128"; break;
         case DType::Q4_G64: pipeline = impl_->q4; label = "q27_matvec_q4_g64"; break;
+        case DType::T2_G128: pipeline = impl_->t2; label = "q27_matvec_t2_g128"; break;
     }
     const MetalBuffer* quant_scales = nullptr;
-    if (weight.dtype == DType::Q8_G128 || weight.dtype == DType::Q4_G64) {
+    if (quant_group) {
         if (!weight.scales) throw std::runtime_error("q27 Metal: quantized weight has no scales");
         quant_scales = &metal_buffer(*weight.scales);
         const uint64_t group = quant_group;
@@ -601,7 +614,10 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
             [encoder setBuffer:output.handle() offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
         }
-        [encoder dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows + 7) / 8, 1, 1)
+        // T2 runs 4 rows per simdgroup (32 per threadgroup); others 1 (8).
+        const NSUInteger row_groups = weight.dtype == DType::T2_G128
+            ? (NSUInteger)(weight.rows + 31) / 32 : (NSUInteger)(weight.rows + 7) / 8;
+        [encoder dispatchThreadgroups:MTLSizeMake(row_groups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         if (own_command) impl_->finish_command("matvec");
     }
@@ -658,9 +674,10 @@ void MetalBackend::quantize(const BackendBuffer& x, BackendQuantized& out) {
 
 void MetalBackend::matvec_quantized(const BackendTensor& weight,
                                      const BackendQuantized& x, BackendBuffer& y) {
-    if ((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128) || !weight.data || !weight.scales)
-        throw std::runtime_error("q27 Metal: quantized matvec requires Q4/Q8 weight");
-    const uint64_t group=weight.dtype==DType::Q8_G128?128:64;
+    if ((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
+         weight.dtype!=DType::T2_G128) || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: quantized matvec requires Q4/Q8/T2 weight");
+    const uint64_t group=weight.dtype==DType::Q4_G64?64:128;
     if (!weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
         weight.cols%group)
         throw std::runtime_error("q27 Metal: invalid quantized matvec dimensions");
@@ -669,14 +686,18 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
     check_range(y.size(),0,weight.rows*4,"quantized matvec output");
     const MetalBuffer& data=metal_buffer(*weight.data); const MetalBuffer& ws=metal_buffer(*weight.scales);
     const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales); MetalBuffer& out=metal_buffer(y);
-    const uint64_t data_bytes=weight.rows*weight.cols/(weight.dtype==DType::Q4_G64?2:1);
+    const uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:1;
+    const uint64_t data_bytes=weight.rows*weight.cols/divisor;
     check_range(data.size(),weight.data_offset,data_bytes,"quantized matvec weight");
     check_range(ws.size(),weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matvec weight scales");
     check_range(xv.size(),0,x.count,"quantized matvec values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matvec activation scales");
     MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,8};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own, weight.dtype==DType::Q8_G128?"q27_matvec_q8_quantized":"q27_matvec_q4_quantized");
-        [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized:impl_->q4_quantized];
+        bool own; auto enc=impl_->encoder_for_operation(own,
+            weight.dtype==DType::Q8_G128?"q27_matvec_q8_quantized":
+            weight.dtype==DType::T2_G128?"q27_matvec_t2_quantized":"q27_matvec_q4_quantized");
+        [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized:
+                                     weight.dtype==DType::T2_G128?impl_->t2_quantized:impl_->q4_quantized];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
@@ -700,27 +721,31 @@ void MetalBackend::matvec_quantized_pair(const BackendTensor& a, BackendBuffer& 
 
 void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
                                     uint32_t x_rows,BackendBuffer& y) {
-    if(!impl_->q4_quantized_matmul || !impl_->q8_quantized_matmul) {
+    if(!impl_->q4_quantized_matmul || !impl_->q8_quantized_matmul || !impl_->t2_quantized_matmul) {
         if(x_rows==1) { matvec_quantized(weight,x,y); return; }
         throw std::runtime_error("q27 Metal: quantized matmul requires Apple GPU family 7 or newer");
     }
-    if((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128) || !weight.data || !weight.scales)
-        throw std::runtime_error("q27 Metal: quantized matmul requires Q4/Q8 weight");
-    uint64_t group=weight.dtype==DType::Q8_G128?128:64;
+    if((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
+        weight.dtype!=DType::T2_G128) || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: quantized matmul requires Q4/Q8/T2 weight");
+    uint64_t group=weight.dtype==DType::Q4_G64?64:128;
     if(!x_rows || x_rows>12 || !weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
        weight.cols%group || (uint64_t)weight.cols*x_rows>UINT32_MAX || x.count!=weight.cols*x_rows || !x.values || !x.scales)
         throw std::runtime_error("q27 Metal: invalid quantized matmul dimensions");
     check_range(y.size(),0,weight.rows*x_rows*4,"quantized matmul output");
     const MetalBuffer& data=metal_buffer(*weight.data); const MetalBuffer& ws=metal_buffer(*weight.scales);
     const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales); MetalBuffer& out=metal_buffer(y);
-    uint64_t divisor=weight.dtype==DType::Q4_G64?2:1;
+    uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:1;
     check_range(data.size(),weight.data_offset,weight.rows*weight.cols/divisor,"quantized matmul weight");
     check_range(ws.size(),weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matmul weight scales");
     check_range(xv.size(),0,x.count,"quantized matmul values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matmul scales");
     MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own, weight.dtype==DType::Q8_G128?"q27_matmul_q8_mm":"q27_matmul_q4_mm");
-        [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:impl_->q4_quantized_matmul];
+        bool own; auto enc=impl_->encoder_for_operation(own,
+            weight.dtype==DType::Q8_G128?"q27_matmul_q8_mm":
+            weight.dtype==DType::T2_G128?"q27_matmul_t2_mm":"q27_matmul_q4_mm");
+        [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:
+                                     weight.dtype==DType::T2_G128?impl_->t2_quantized_matmul:impl_->q4_quantized_matmul];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
@@ -731,20 +756,24 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
 
 void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
                                  BackendBuffer& out) {
-    if (weight.dtype != DType::Q8_G128 || !weight.data || !weight.scales || token >= weight.rows ||
+    const bool t2 = weight.dtype == DType::T2_G128;
+    if ((weight.dtype != DType::Q8_G128 && !t2) || !weight.data || !weight.scales ||
+        token >= weight.rows ||
         !weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
         weight.cols % 128)
         throw std::runtime_error("q27 Metal: invalid embedding tensor/token");
     check_range(out.size(), 0, weight.cols * 4, "embedding output");
     const MetalBuffer& data = metal_buffer(*weight.data);
     const MetalBuffer& scales = metal_buffer(*weight.scales);
-    check_range(data.size(), weight.data_offset, weight.rows * weight.cols, "embedding weight");
+    check_range(data.size(), weight.data_offset,
+                weight.rows * weight.cols / (t2 ? 4 : 1), "embedding weight");
     check_range(scales.size(), weight.scales_offset,
                 weight.rows * (weight.cols / 128) * 2, "embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
-        bool own; id<MTLComputeCommandEncoder> enc = impl_->encoder_for_operation(own, "q27_embedding_q8");
-        [enc setComputePipelineState:impl_->embedding];
+        bool own; id<MTLComputeCommandEncoder> enc = impl_->encoder_for_operation(own,
+            t2 ? "q27_embedding_t2" : "q27_embedding_q8");
+        [enc setComputePipelineState:t2 ? impl_->embedding_t2 : impl_->embedding];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
@@ -1085,7 +1114,8 @@ void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t
                                       uint32_t count, BackendBuffer& out) {
     if (!tokens || !count || count > 12)
         throw std::runtime_error("q27 Metal: chunked embedding requires 1..12 tokens");
-    if (weight.dtype != DType::Q8_G128 || !weight.data || !weight.scales ||
+    const bool t2 = weight.dtype == DType::T2_G128;
+    if ((weight.dtype != DType::Q8_G128 && !t2) || !weight.data || !weight.scales ||
         !weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
         weight.cols % 128)
         throw std::runtime_error("q27 Metal: invalid chunked embedding tensor");
@@ -1097,12 +1127,14 @@ void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t
     check_range(out.size(), 0, (uint64_t)count * weight.cols * 4, "chunked embedding output");
     const MetalBuffer& data = metal_buffer(*weight.data);
     const MetalBuffer& scales = metal_buffer(*weight.scales);
-    check_range(data.size(), weight.data_offset, weight.rows * weight.cols, "chunked embedding weight");
+    check_range(data.size(), weight.data_offset,
+                weight.rows * weight.cols / (t2 ? 4 : 1), "chunked embedding weight");
     check_range(scales.size(), weight.scales_offset, weight.rows * (weight.cols / 128) * 2, "chunked embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own, "q27_embedding_q8_rows");
-        [enc setComputePipelineState:impl_->embedding_rows];
+        bool own; auto enc = impl_->encoder_for_operation(own,
+            t2 ? "q27_embedding_t2_rows" : "q27_embedding_q8_rows");
+        [enc setComputePipelineState:t2 ? impl_->embedding_t2_rows : impl_->embedding_rows];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
@@ -1493,7 +1525,7 @@ uint64_t MetalBackend::max_buffer_length() const {
 }
 
 bool MetalBackend::supports_quantized_matmul() const {
-    return impl_->q4_quantized_matmul && impl_->q8_quantized_matmul;
+    return impl_->q4_quantized_matmul && impl_->q8_quantized_matmul && impl_->t2_quantized_matmul;
 }
 
 uint64_t MetalBackend::max_threadgroup_memory_length() const {

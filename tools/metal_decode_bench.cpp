@@ -56,7 +56,9 @@ uint64_t tensor_bytes(const q27::BackendTensor& t) {
     if (t.dtype == DType::F32) data *= 4;
     if (t.dtype == DType::F16) data *= 2;
     if (t.dtype == DType::Q4_G64) data /= 2;
-    const uint64_t group = t.dtype == DType::Q8_G128 ? 128 : t.dtype == DType::Q4_G64 ? 64 : 0;
+    if (t.dtype == DType::T2_G128) data /= 4;
+    const uint64_t group = t.dtype == DType::Q4_G64 ? 64 :
+        (t.dtype == DType::Q8_G128 || t.dtype == DType::T2_G128) ? 128 : 0;
     return data + (group ? t.rows * (t.cols / group) * 2 : 0);
 }
 
@@ -64,8 +66,9 @@ Synthetic make_quant(q27::MetalBackend& backend, uint32_t rows, uint32_t cols, D
     // Fill the Metal buffer through a small staging slice instead of a full
     // host copy, so even the 1.3 GiB head tensor never exists twice.
     Synthetic s;
-    const uint64_t group = dtype == DType::Q8_G128 ? 128 : 64;
-    const uint64_t data_bytes = (uint64_t)rows * cols / (dtype == DType::Q4_G64 ? 2 : 1);
+    const uint64_t group = dtype == DType::Q4_G64 ? 64 : 128;
+    const uint64_t data_bytes = (uint64_t)rows * cols /
+        (dtype == DType::Q4_G64 ? 2 : dtype == DType::T2_G128 ? 4 : 1);
     s.tensor.dtype = dtype;
     s.tensor.rows = rows;
     s.tensor.cols = cols;
@@ -132,7 +135,7 @@ Synthetic make_f32(q27::MetalBackend& backend, const std::vector<uint64_t>& shap
 
 int main(int argc, char** argv) {
     uint32_t tokens = 16, seq = 128;
-    bool turbo3 = false;
+    bool turbo3 = false, t2 = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--tokens" && i + 1 < argc) tokens = (uint32_t)atoi(argv[++i]);
@@ -142,39 +145,55 @@ int main(int argc, char** argv) {
             if (kv == "turbo3") turbo3 = true;
             else if (kv != "fp16") { fprintf(stderr, "invalid --kv (fp16|turbo3)\n"); return 1; }
         }
-        else { fprintf(stderr, "usage: %s [--tokens N] [--seq LEN] [--kv fp16|turbo3]\n", argv[0]); return 1; }
+        else if (arg == "--dtype" && i + 1 < argc) {
+            const std::string d = argv[++i];
+            if (d == "t2") t2 = true;
+            else if (d != "q4q8") { fprintf(stderr, "invalid --dtype (q4q8|t2)\n"); return 1; }
+        }
+        else { fprintf(stderr, "usage: %s [--tokens N] [--seq LEN] [--kv fp16|turbo3] [--dtype q4q8|t2]\n", argv[0]); return 1; }
     }
     if (!tokens || !seq) { fprintf(stderr, "invalid --tokens/--seq\n"); return 1; }
 
     q27::MetalBackend backend;
-    printf("backend: %s, %u simulated tokens at context %u, %s KV\n",
-           backend.name().c_str(), tokens, seq, turbo3 ? "turbo3" : "fp16");
+    printf("backend: %s, %u simulated tokens at context %u, %s KV%s\n",
+           backend.name().c_str(), tokens, seq, turbo3 ? "turbo3" : "fp16",
+           t2 ? ", ternary weights" : "");
+
+    // --dtype t2 replays the ternary-tier decode: every projection and the
+    // head/embedding table T2, projections dispatched through the
+    // float-activation GEMV exactly as MetalEngine::project routes them.
+    // ssm_alpha/beta stay F16 in the q4q8 mix and T2 in the ternary mix, as
+    // the artifacts pack them.
+    const DType bulk = t2 ? DType::T2_G128 : DType::Q4_G64;
+    const DType vocab_dtype = t2 ? DType::T2_G128 : DType::Q8_G128;
 
     // One synthetic weight set per layer type; a block streams far more bytes
     // than any cache level, so reuse across the 48/16/64 repeats is
     // bandwidth-equivalent to distinct per-layer tensors.
-    Synthetic gdn_qkv = make_quant(backend, GDN_CH, N_EMBD, DType::Q4_G64);
-    Synthetic gdn_gate = make_quant(backend, GDN_V, N_EMBD, DType::Q4_G64);
-    Synthetic gdn_out = make_quant(backend, N_EMBD, GDN_V, DType::Q4_G64);
-    Synthetic ssm_alpha = make_f16(backend, GDN_HEADS, N_EMBD);
-    Synthetic ssm_beta = make_f16(backend, GDN_HEADS, N_EMBD);
+    Synthetic gdn_qkv = make_quant(backend, GDN_CH, N_EMBD, bulk);
+    Synthetic gdn_gate = make_quant(backend, GDN_V, N_EMBD, bulk);
+    Synthetic gdn_out = make_quant(backend, N_EMBD, GDN_V, bulk);
+    Synthetic ssm_alpha = t2 ? make_quant(backend, GDN_HEADS, N_EMBD, bulk)
+                             : make_f16(backend, GDN_HEADS, N_EMBD);
+    Synthetic ssm_beta = t2 ? make_quant(backend, GDN_HEADS, N_EMBD, bulk)
+                            : make_f16(backend, GDN_HEADS, N_EMBD);
     Synthetic ssm_a = make_f32(backend, {GDN_HEADS});
     Synthetic ssm_dt = make_f32(backend, {GDN_HEADS});
     Synthetic ssm_conv = make_f32(backend, {GDN_CH, 4});
     Synthetic ssm_norm = make_f32(backend, {GDN_DIM});
-    Synthetic attn_q = make_quant(backend, 2 * N_HEAD * HEAD_DIM, N_EMBD, DType::Q4_G64);
-    Synthetic attn_k = make_quant(backend, N_KV * HEAD_DIM, N_EMBD, DType::Q4_G64);
-    Synthetic attn_v = make_quant(backend, N_KV * HEAD_DIM, N_EMBD, DType::Q4_G64);
-    Synthetic attn_out_w = make_quant(backend, N_EMBD, N_HEAD * HEAD_DIM, DType::Q4_G64);
+    Synthetic attn_q = make_quant(backend, 2 * N_HEAD * HEAD_DIM, N_EMBD, bulk);
+    Synthetic attn_k = make_quant(backend, N_KV * HEAD_DIM, N_EMBD, bulk);
+    Synthetic attn_v = make_quant(backend, N_KV * HEAD_DIM, N_EMBD, bulk);
+    Synthetic attn_out_w = make_quant(backend, N_EMBD, N_HEAD * HEAD_DIM, bulk);
     Synthetic q_norm = make_f32(backend, {HEAD_DIM});
     Synthetic k_norm = make_f32(backend, {HEAD_DIM});
-    Synthetic ffn_gate_w = make_quant(backend, N_FFN, N_EMBD, DType::Q4_G64);
-    Synthetic ffn_up_w = make_quant(backend, N_FFN, N_EMBD, DType::Q4_G64);
-    Synthetic ffn_down_w = make_quant(backend, N_EMBD, N_FFN, DType::Q4_G64);
+    Synthetic ffn_gate_w = make_quant(backend, N_FFN, N_EMBD, bulk);
+    Synthetic ffn_up_w = make_quant(backend, N_FFN, N_EMBD, bulk);
+    Synthetic ffn_down_w = make_quant(backend, N_EMBD, N_FFN, bulk);
     Synthetic norm_w = make_f32(backend, {N_EMBD});
     // The head weight doubles as the embedding table, as in the artifact both
     // are VOCAB x N_EMBD Q8; embedding reads one row, the head streams all.
-    Synthetic head = make_quant(backend, VOCAB, N_EMBD, DType::Q8_G128);
+    Synthetic head = make_quant(backend, VOCAB, N_EMBD, vocab_dtype);
 
     const uint64_t gdn_bytes = tensor_bytes(gdn_qkv.tensor) + tensor_bytes(gdn_gate.tensor) +
                                tensor_bytes(gdn_out.tensor) + tensor_bytes(ssm_alpha.tensor) +
@@ -219,8 +238,19 @@ int main(int argc, char** argv) {
     const float scale = 1.0f / 16.0f; // rsqrt(HEAD_DIM)
     const uint32_t position = seq - 1;
 
+    auto proj = [&](const q27::BackendTensor& w, q27::BackendBuffer& xf,
+                    const q27::BackendQuantized& xq, q27::BackendBuffer& out) {
+        if (w.dtype == DType::T2_G128) backend.matvec(w, xf, out);
+        else backend.matvec_quantized(w, xq, out);
+    };
+    auto proj_pair = [&](const q27::BackendTensor& a, q27::BackendBuffer& a_out,
+                         const q27::BackendTensor& b, q27::BackendBuffer& b_out,
+                         q27::BackendBuffer& xf, const q27::BackendQuantized& xq) {
+        if (a.dtype == DType::T2_G128) { proj(a, xf, xq, a_out); proj(b, xf, xq, b_out); }
+        else backend.matvec_quantized_pair(a, a_out, b, b_out, xq);
+    };
     auto gdn_block = [&]() {
-        backend.matvec_quantized_pair(gdn_qkv.tensor, *qkv, gdn_gate.tensor, *z, q5120);
+        proj_pair(gdn_qkv.tensor, *qkv, gdn_gate.tensor, *z, *x1, q5120);
         backend.matvec_pair(ssm_alpha.tensor, *alpha, ssm_beta.tensor, *beta_raw, *x1);
         backend.gdn_gates(*alpha, *beta_raw, ssm_a.tensor, ssm_dt.tensor, *g, *beta, GDN_HEADS);
         backend.conv_step(*ring, *ring, *qkv, ssm_conv.tensor, *conv_out, GDN_CH);
@@ -228,13 +258,13 @@ int main(int argc, char** argv) {
         backend.delta_step(*recurrent, *recurrent, *conv_out, *g, *beta, *delta_out,
                            GDN_HEADS, GDN_QK_HEADS, GDN_DIM);
         backend.gated_norm_gdn(*delta_out, ssm_norm.tensor, *z, *gated_out, GDN_HEADS, GDN_DIM, EPS);
-        backend.quantize(*gated_out, q6144);
-        backend.matvec_quantized(gdn_out.tensor, q6144, *y);
+        if (!t2) backend.quantize(*gated_out, q6144);
+        proj(gdn_out.tensor, *gated_out, q6144, *y);
     };
     auto attention_block = [&]() {
-        backend.matvec_quantized(attn_q.tensor, q5120, *qg);
+        proj(attn_q.tensor, *x1, q5120, *qg);
         backend.rmsnorm_heads(*qg, q_norm.tensor, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS);
-        backend.matvec_quantized_pair(attn_k.tensor, *kbuf, attn_v.tensor, *vbuf, q5120);
+        proj_pair(attn_k.tensor, *kbuf, attn_v.tensor, *vbuf, *x1, q5120);
         backend.rmsnorm_heads(*kbuf, k_norm.tensor, N_KV, HEAD_DIM, HEAD_DIM, EPS);
         backend.rope_neox(*qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, position, FREQ_BASE);
         backend.rope_neox(*kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position, FREQ_BASE);
@@ -250,14 +280,14 @@ int main(int argc, char** argv) {
                                   position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
         }
         backend.sigmoid_gate_mul(*attn_out, *qg, N_HEAD, HEAD_DIM);
-        backend.quantize(*attn_out, q6144);
-        backend.matvec_quantized(attn_out_w.tensor, q6144, *y);
+        if (!t2) backend.quantize(*attn_out, q6144);
+        proj(attn_out_w.tensor, *attn_out, q6144, *y);
     };
     auto ffn_block = [&]() {
-        backend.matvec_quantized_pair(ffn_gate_w.tensor, *ffn_gate, ffn_up_w.tensor, *ffn_up, q5120);
+        proj_pair(ffn_gate_w.tensor, *ffn_gate, ffn_up_w.tensor, *ffn_up, *x1, q5120);
         backend.silu_mul(*ffn_gate, *ffn_up, *ffn_gate, N_FFN);
-        backend.quantize(*ffn_gate, q17408);
-        backend.matvec_quantized(ffn_down_w.tensor, q17408, *y);
+        if (!t2) backend.quantize(*ffn_gate, q17408);
+        proj(ffn_down_w.tensor, *ffn_gate, q17408, *y);
     };
     auto token_step = [&](uint32_t token) {
         backend.begin_commands();
@@ -271,7 +301,7 @@ int main(int argc, char** argv) {
             backend.add_inplace(*h, *y, N_EMBD);
         }
         backend.rmsnorm_quantized(*h, norm_w.tensor, *x1, N_EMBD, EPS, q5120);
-        backend.matvec_quantized(head.tensor, q5120, *logits);
+        proj(head.tensor, *x1, q5120, *logits);
         backend.argmax(*logits, VOCAB, *token_out);
         backend.end_commands();
         uint32_t next = 0;

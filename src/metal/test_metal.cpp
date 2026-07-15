@@ -267,6 +267,135 @@ int test_q4(q27::MetalBackend& backend) {
     return 0;
 }
 
+int test_t2(q27::MetalBackend& backend) {
+    constexpr int rows = 2, cols = 128;
+    std::vector<uint8_t> packed(rows * cols / 4, 0);
+    std::vector<float> x(cols);
+    float want[rows] = {};
+    int8_t q_ref[rows][cols];
+    for (int i = 0; i < cols; i++) x[i] = (float)((i % 11) - 5) / 5.0f;
+    for (int row = 0; row < rows; row++) {
+        const float scale = row == 0 ? 1.0f : 0.5f;
+        for (int i = 0; i < cols; i++) {
+            const int q = ((i * 5 + row * 3) % 3) - 1;   // {-1, 0, +1}
+            q_ref[row][i] = (int8_t)q;
+            packed[(size_t)row * cols / 4 + i / 4] |= (uint8_t)((q + 1) << ((i % 4) * 2));
+            want[row] += q * scale * x[i];
+        }
+    }
+    // IEEE-754 binary16 encodings for 1.0 and 0.5.
+    std::vector<uint16_t> scales = {0x3c00, 0x3800};
+
+    q27::Tensor tensor;
+    tensor.name = "t2-test";
+    tensor.dtype = q27::DType::T2_G128;
+    tensor.shape = {rows, cols};
+    tensor.data = packed.data();
+    tensor.data_size = packed.size();
+    tensor.scales = reinterpret_cast<const uint8_t*>(scales.data());
+    tensor.scales_size = scales.size() * sizeof(uint16_t);
+
+    q27::BackendTensor device_weight = backend.upload(tensor);
+    auto device_x = backend.allocate(x.size() * sizeof(float));
+    auto device_y = backend.allocate(rows * sizeof(float));
+    backend.write(*device_x, 0, x.data(), x.size() * sizeof(float));
+    backend.matvec(device_weight, *device_x, *device_y);
+    float got[rows];
+    backend.read(*device_y, 0, got, sizeof(got));
+    for (int row = 0; row < rows; row++) {
+        if (!close(got[row], want[row])) {
+            fprintf(stderr, "T2 row %d: got %.7g, want %.7g\n", row, got[row], want[row]);
+            return 1;
+        }
+    }
+    auto quantized = backend.allocate_quantized(cols);
+    backend.begin_commands(); backend.quantize(*device_x, quantized);
+    backend.matvec_quantized(device_weight, quantized, *device_y); backend.end_commands();
+    backend.read(*device_y, 0, got, sizeof(got));
+    for (int row = 0; row < rows; row++) if (!close(got[row], want[row], 2e-2f)) {
+        fprintf(stderr, "T2 quantized row %d: got %.7g, want %.7g\n", row, got[row], want[row]);
+        return 1;
+    }
+    auto pair_y = backend.allocate(rows * sizeof(float));
+    backend.matvec_quantized_pair(device_weight, *device_y, device_weight, *pair_y, quantized);
+    float pair_got[rows]; backend.read(*pair_y, 0, pair_got, sizeof(pair_got));
+    for (int row = 0; row < rows; row++) if (!close(pair_got[row], got[row])) return 1;
+
+    // Ternary embedding row-lookup: exact dequant of one row.
+    auto embed_out = backend.allocate(cols * sizeof(float));
+    backend.embedding_q8(device_weight, 1, *embed_out);
+    std::vector<float> embed(cols);
+    backend.read(*embed_out, 0, embed.data(), cols * sizeof(float));
+    for (int i = 0; i < cols; i++) {
+        const float expect = (float)q_ref[1][i] * 0.5f;
+        if (embed[i] != expect) {
+            fprintf(stderr, "T2 embedding col %d: got %.7g, want %.7g\n", i, embed[i], expect);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Wide-shape gate for the select-form float-activation T2 GEMV (the
+// production ternary decode path): rows that span threadgroups and leave a
+// 32-row remainder (clamped compute-only rows), block counts that exercise
+// the four-blocks-in-flight loop with a tail, and scales varied per group.
+int test_t2_wide(q27::MetalBackend& backend) {
+    for (uint32_t cols : {1152u, 5120u}) {
+        constexpr uint32_t rows = 37;   // 32 + 5: second threadgroup clamps rows 37..63
+        const uint32_t groups = cols / 128;
+        std::vector<uint8_t> data((size_t)rows * cols / 4, 0);
+        std::vector<int8_t> w((size_t)rows * cols);
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t c = 0; c < cols; c++) {
+                const int q = (int)((r * 13 + c * 7) % 3) - 1;
+                w[(size_t)r * cols + c] = (int8_t)q;
+                data[(size_t)r * cols / 4 + c / 4] |= (uint8_t)((q + 1) << ((c % 4) * 2));
+            }
+        const uint16_t scale_bits[4] = {0x3400, 0x3800, 0x3c00, 0x4000};
+        const float scale_f32[4] = {0.25f, 0.5f, 1.0f, 2.0f};
+        std::vector<uint16_t> scales((size_t)rows * groups);
+        for (size_t i = 0; i < scales.size(); i++) scales[i] = scale_bits[i % 4];
+        q27::Tensor tensor;
+        tensor.name = "t2-wide";
+        tensor.dtype = q27::DType::T2_G128;
+        tensor.shape = {rows, cols};
+        tensor.data = data.data();
+        tensor.data_size = data.size();
+        tensor.scales = (const uint8_t*)scales.data();
+        tensor.scales_size = scales.size() * 2;
+        auto weight = backend.upload(tensor);
+
+        std::vector<float> x(cols);
+        for (uint32_t c = 0; c < cols; c++)
+            x[c] = (float)((int)((c * 11) % 23) - 11) / 11.0f * (float)(1 + c / 32 % 7);
+        auto xb = backend.allocate(cols * 4);
+        backend.write(*xb, 0, x.data(), cols * 4);
+        auto yb = backend.allocate(rows * 4);
+        backend.matvec(weight, *xb, *yb);
+        std::vector<float> got(rows);
+        backend.read(*yb, 0, got.data(), rows * 4);
+        for (uint32_t r = 0; r < rows; r++) {
+            double want = 0.0, magnitude = 0.0;
+            for (uint32_t g = 0; g < groups; g++) {
+                double dot = 0.0;
+                for (uint32_t c = g * 128; c < g * 128 + 128; c++)
+                    dot += (double)w[(size_t)r * cols + c] * x[c];
+                const double term = dot * scale_f32[((size_t)r * groups + g) % 4];
+                want += term;
+                magnitude += std::fabs(term);
+            }
+            const float bound = (float)(magnitude * 1e-5 + 1e-3);
+            if (std::fabs(got[r] - (float)want) > bound) {
+                fprintf(stderr, "T2 wide cols=%u row %u: got %.7g want %.7g\n",
+                        cols, r, got[r], (float)want);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // The tiled simdgroup-matrix GEMM keeps the weight side integer-exact and
 // rounds the activation side once per value at staging, but accumulates
 // K-tiles in a different float-addition order than the serial GEMV, so the
@@ -277,12 +406,16 @@ int test_q4(q27::MetalBackend& backend) {
 int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
                       uint32_t rows,uint32_t cols) {
     constexpr uint32_t tokens=12;
-    std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:(size_t)rows*cols);
+    std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:
+                              dtype==q27::DType::T2_G128?(size_t)rows*cols/4:(size_t)rows*cols,0);
     for(uint32_t r=0;r<rows;r++) for(uint32_t c=0;c<cols;c++) {
         int q=(int)((r*7+c*3)%15)-7;
         if(dtype==q27::DType::Q4_G64) {
             size_t i=(size_t)r*cols/2+c/2; uint8_t nibble=(uint8_t)(q+8);
             if(c&1) data[i]=(data[i]&15)|(nibble<<4); else data[i]=(data[i]&240)|nibble;
+        } else if(dtype==q27::DType::T2_G128) {
+            q=(int)((r*7+c*3)%3)-1;
+            data[(size_t)r*cols/4+c/4]|=(uint8_t)((q+1)<<((c%4)*2));
         } else data[(size_t)r*cols+c]=(uint8_t)(int8_t)q;
     }
     uint32_t groups=cols/(dtype==q27::DType::Q4_G64?64:128);
@@ -382,7 +515,15 @@ int test_quantized_wide(q27::MetalBackend& backend, q27::DType dtype) {
             for (uint32_t c = 0; c < cols; c++)
                 w[(size_t)r * cols + c] = (int8_t)((int)((r * 13 + c * 7) % 29) - 14);
         std::vector<uint8_t> data;
-        if (dtype == q27::DType::Q4_G64) {
+        if (dtype == q27::DType::T2_G128) {
+            data.assign((size_t)rows * cols / 4, 0);
+            for (uint32_t r = 0; r < rows; r++)
+                for (uint32_t c = 0; c < cols; c++) {
+                    const int q = (int)((r * 13 + c * 7) % 3) - 1;
+                    w[(size_t)r * cols + c] = (int8_t)q;
+                    data[(size_t)r * cols / 4 + c / 4] |= (uint8_t)((q + 1) << ((c % 4) * 2));
+                }
+        } else if (dtype == q27::DType::Q4_G64) {
             data.resize((size_t)rows * cols / 2);
             for (uint32_t r = 0; r < rows; r++)
                 for (uint32_t c = 0; c < cols; c++) {
@@ -492,13 +633,16 @@ int main() {
                backend.max_threadgroup_memory_length() / 1024.0);
         if (test_mmap_upload(backend) || test_dispatch_validation(backend) ||
             test_f32(backend) || test_f16(backend) ||
-            test_q8(backend) || test_q4(backend) ||
+            test_q8(backend) || test_q4(backend) || test_t2(backend) ||
             test_quantized_wide(backend, q27::DType::Q4_G64) ||
             test_quantized_wide(backend, q27::DType::Q8_G128) ||
+            test_quantized_wide(backend, q27::DType::T2_G128) ||
+            test_t2_wide(backend) ||
             test_f16_pair_wide(backend) ||
             test_mixed_pair(backend) ||
             (backend.supports_quantized_matmul() &&
-             (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128))))
+             (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128) ||
+              test_matmul_tiles(backend,q27::DType::T2_G128))))
             return 1;
         puts("Metal matvec: OK");
         return 0;

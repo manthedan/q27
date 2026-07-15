@@ -58,7 +58,9 @@ uint64_t tensor_bytes(const q27::BackendTensor& t) {
     if (t.dtype == DType::F32) data *= 4;
     if (t.dtype == DType::F16) data *= 2;
     if (t.dtype == DType::Q4_G64) data /= 2;
-    const uint64_t group = t.dtype == DType::Q8_G128 ? 128 : t.dtype == DType::Q4_G64 ? 64 : 0;
+    if (t.dtype == DType::T2_G128) data /= 4;
+    const uint64_t group = t.dtype == DType::Q4_G64 ? 64 :
+        (t.dtype == DType::Q8_G128 || t.dtype == DType::T2_G128) ? 128 : 0;
     return data + (group ? t.rows * (t.cols / group) * 2 : 0);
 }
 
@@ -66,8 +68,9 @@ Synthetic make_quant(q27::MetalBackend& backend, uint32_t rows, uint32_t cols, D
     // Fill the Metal buffer through a small staging slice instead of a full
     // host copy, so even the 1.3 GiB embedding table never exists twice.
     Synthetic s;
-    const uint64_t group = dtype == DType::Q8_G128 ? 128 : 64;
-    const uint64_t data_bytes = (uint64_t)rows * cols / (dtype == DType::Q4_G64 ? 2 : 1);
+    const uint64_t group = dtype == DType::Q4_G64 ? 64 : 128;
+    const uint64_t data_bytes = (uint64_t)rows * cols /
+        (dtype == DType::Q4_G64 ? 2 : dtype == DType::T2_G128 ? 4 : 1);
     s.tensor.dtype = dtype;
     s.tensor.rows = rows;
     s.tensor.cols = cols;
@@ -134,7 +137,7 @@ q27::BackendQuantized quantized_view(const q27::BackendQuantized& full, uint32_t
 
 int main(int argc, char** argv) {
     uint32_t prompt = 120, chunk_size = CHUNK_MAX;
-    bool turbo3 = false;
+    bool turbo3 = false, t2 = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--prompt" && i + 1 < argc) prompt = (uint32_t)atoi(argv[++i]);
@@ -144,7 +147,12 @@ int main(int argc, char** argv) {
             if (kv == "turbo3") turbo3 = true;
             else if (kv != "fp16") { fprintf(stderr, "invalid --kv (fp16|turbo3)\n"); return 1; }
         }
-        else { fprintf(stderr, "usage: %s [--prompt N] [--chunk 2..12] [--kv fp16|turbo3]\n", argv[0]); return 1; }
+        else if (arg == "--dtype" && i + 1 < argc) {
+            const std::string d = argv[++i];
+            if (d == "t2") t2 = true;
+            else if (d != "q4q8") { fprintf(stderr, "invalid --dtype (q4q8|t2)\n"); return 1; }
+        }
+        else { fprintf(stderr, "usage: %s [--prompt N] [--chunk 2..12] [--kv fp16|turbo3] [--dtype q4q8|t2]\n", argv[0]); return 1; }
     }
     if (!prompt || chunk_size < 2 || chunk_size > CHUNK_MAX) {
         fprintf(stderr, "invalid --prompt/--chunk\n");
@@ -156,32 +164,40 @@ int main(int argc, char** argv) {
         fprintf(stderr, "device lacks simdgroup matmul support\n");
         return 1;
     }
-    printf("backend: %s, %u-token synthetic prompt in chunks of %u, %s KV\n",
-           backend.name().c_str(), prompt, chunk_size, turbo3 ? "turbo3" : "fp16");
+    printf("backend: %s, %u-token synthetic prompt in chunks of %u, %s KV%s\n",
+           backend.name().c_str(), prompt, chunk_size, turbo3 ? "turbo3" : "fp16",
+           t2 ? ", ternary weights" : "");
+
+    // --dtype t2 replays the ternary-tier weight mix (every projection and
+    // the embedding table T2, as the Bonsai artifact packs them). ssm_alpha/
+    // ssm_beta stay F16 here to keep the dispatch sequence identical to the
+    // engine's current chunk_forward; they are 0.5% of the weight stream.
+    const DType bulk = t2 ? DType::T2_G128 : DType::Q4_G64;
+    const DType vocab_dtype = t2 ? DType::T2_G128 : DType::Q8_G128;
 
     // One synthetic weight set per layer type, as in metal_decode_bench: a
     // chunk streams far more bytes than any cache level, so reuse across the
     // 48/16/64 layer repeats is bandwidth-equivalent to distinct tensors.
-    Synthetic gdn_qkv = make_quant(backend, GDN_CH, N_EMBD, DType::Q4_G64);
-    Synthetic gdn_gate = make_quant(backend, GDN_V, N_EMBD, DType::Q4_G64);
-    Synthetic gdn_out = make_quant(backend, N_EMBD, GDN_V, DType::Q4_G64);
+    Synthetic gdn_qkv = make_quant(backend, GDN_CH, N_EMBD, bulk);
+    Synthetic gdn_gate = make_quant(backend, GDN_V, N_EMBD, bulk);
+    Synthetic gdn_out = make_quant(backend, N_EMBD, GDN_V, bulk);
     Synthetic ssm_alpha = make_f16(backend, GDN_HEADS, N_EMBD);
     Synthetic ssm_beta = make_f16(backend, GDN_HEADS, N_EMBD);
     Synthetic ssm_a = make_f32(backend, {GDN_HEADS});
     Synthetic ssm_dt = make_f32(backend, {GDN_HEADS});
     Synthetic ssm_conv = make_f32(backend, {GDN_CH, 4});
     Synthetic ssm_norm = make_f32(backend, {GDN_DIM});
-    Synthetic attn_q = make_quant(backend, 2 * N_HEAD * HEAD_DIM, N_EMBD, DType::Q4_G64);
-    Synthetic attn_k = make_quant(backend, N_KV * HEAD_DIM, N_EMBD, DType::Q4_G64);
-    Synthetic attn_v = make_quant(backend, N_KV * HEAD_DIM, N_EMBD, DType::Q4_G64);
-    Synthetic attn_out_w = make_quant(backend, N_EMBD, N_HEAD * HEAD_DIM, DType::Q4_G64);
+    Synthetic attn_q = make_quant(backend, 2 * N_HEAD * HEAD_DIM, N_EMBD, bulk);
+    Synthetic attn_k = make_quant(backend, N_KV * HEAD_DIM, N_EMBD, bulk);
+    Synthetic attn_v = make_quant(backend, N_KV * HEAD_DIM, N_EMBD, bulk);
+    Synthetic attn_out_w = make_quant(backend, N_EMBD, N_HEAD * HEAD_DIM, bulk);
     Synthetic q_norm = make_f32(backend, {HEAD_DIM});
     Synthetic k_norm = make_f32(backend, {HEAD_DIM});
-    Synthetic ffn_gate_w = make_quant(backend, N_FFN, N_EMBD, DType::Q4_G64);
-    Synthetic ffn_up_w = make_quant(backend, N_FFN, N_EMBD, DType::Q4_G64);
-    Synthetic ffn_down_w = make_quant(backend, N_EMBD, N_FFN, DType::Q4_G64);
+    Synthetic ffn_gate_w = make_quant(backend, N_FFN, N_EMBD, bulk);
+    Synthetic ffn_up_w = make_quant(backend, N_FFN, N_EMBD, bulk);
+    Synthetic ffn_down_w = make_quant(backend, N_EMBD, N_FFN, bulk);
     Synthetic norm_w = make_f32(backend, {N_EMBD});
-    Synthetic embed = make_quant(backend, VOCAB, N_EMBD, DType::Q8_G128);
+    Synthetic embed = make_quant(backend, VOCAB, N_EMBD, vocab_dtype);
 
     const uint64_t gdn_bytes = tensor_bytes(gdn_qkv.tensor) + tensor_bytes(gdn_gate.tensor) +
                                tensor_bytes(gdn_out.tensor) + tensor_bytes(ssm_alpha.tensor) +

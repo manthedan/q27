@@ -158,6 +158,67 @@ kernel void q27_matvec_q4_g64(
     if (lane == 0) out[row] = sum;
 }
 
+// T2_G128 ternary weights (FORMAT.md): element i of a row -> byte i/4, 2-bit
+// field at bit offset (i%4)*2 (sequential, LSB-first); code c in {0,1,2}
+// decodes to (c-1)*scale, one fp16 scale per 128 columns. Code 3 never
+// appears in valid artifacts (repack.py hard-fails on it).
+//
+// This is the intended production decode path for ternary weights: FLOAT
+// activations, so the math is exact ternary (+x/-x/0, no activation
+// quantization error). Two structural choices, both taken from measuring
+// against the PrismML fork's kernel (theirs sustains ~60 GB/s effective on
+// M4; a Q4-style shift/mask/imad loop and a byte->float4 LUT+fma variant
+// both saturated ~125 Gelem/s ≈ 33 GB/s at 2.27 bpw):
+//   1. select-form dot, no multiplies and no decode:
+//        sum((c-1)*y) = sum_lo(y) + 2*sum_hi(y) - sum(y)
+//      where sum_lo/sum_hi conditionally add y where the code's low/high
+//      bit is set, and sum(y) is computed once per block slice.
+//   2. four rows per simdgroup with the y-slice held in registers, so
+//      activation reads amortize across rows.
+// Lane layout: lane/8 picks one of four 128-column blocks in flight,
+// (lane%8)*16 the 16-element slice within it; each lane's slice sits inside
+// one scale group by construction.
+kernel void q27_matvec_t2_g128(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint ix = lane / 8;              // block in flight (4 per simdgroup)
+    const uint il = (lane % 8) * 16;       // element offset within the block
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float *yb = x + ix * 128 + il;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float yl[16];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 16; i++) { yl[i] = yb[i]; sumy += yb[i]; }
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            device const uchar *qs = weights + (ulong)row * (args.cols / 4) + ib * 32 + il / 4;
+            const float d = float(scales[(ulong)row * nb + ib]);
+            const uchar4 b = *(device const uchar4 *)qs;
+            float acc_lo = 0.0f, acc_hi = 0.0f;
+            for (uint i = 0; i < 16; i++) {
+                acc_lo += select(0.0f, yl[i], bool(b[i / 4] & (1u << (2 * (i % 4)))));
+                acc_hi += select(0.0f, yl[i], bool(b[i / 4] & (2u << (2 * (i % 4)))));
+            }
+            sumf[r] += d * (acc_lo + 2.0f * acc_hi - sumy);
+        }
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
 struct VectorArgs {
     uint n;
     uint groups;
@@ -197,6 +258,20 @@ kernel void q27_embedding_q8(
     const ulong wi = (ulong)token * cols + gid;
     const ulong si = (ulong)token * (cols / 128) + gid / 128;
     out[gid] = float(weights[wi]) * float(scales[si]);
+}
+
+kernel void q27_embedding_t2(
+        device const uchar *weights [[buffer(0)]],
+        device const half *scales   [[buffer(1)]],
+        device float *out           [[buffer(2)]],
+        constant uint &token        [[buffer(3)]],
+        constant uint &cols         [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const ulong wi = (ulong)token * cols + gid;   // cols % 128 == 0, so wi/4 is exact bytes
+    const uint code = (weights[wi >> 2] >> ((wi & 3) * 2)) & 3;
+    const ulong si = (ulong)token * (cols / 128) + gid / 128;
+    out[gid] = float(int(code) - 1) * float(scales[si]);
 }
 
 kernel void q27_rmsnorm(
@@ -678,6 +753,70 @@ kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
     if (lane == 0) out[row] = acc;
 }
 
+// 16 sequential LSB-first 2-bit codes per uint; code c contributes (c-1)*x.
+// The integer dot is exact: |dot| <= 16*1*127 = 2032 per uint, 4064 per
+// lane-chunk, well inside float's exact-integer range.
+inline int q27_dot16_t2(uint packed, int4 xp) {
+    const char4 x0 = as_type<char4>(xp.x), x1 = as_type<char4>(xp.y);
+    const char4 x2 = as_type<char4>(xp.z), x3 = as_type<char4>(xp.w);
+    int sum = (int(packed         & 3u) - 1) * x0.x;
+    sum += (int((packed >>  2) & 3u) - 1) * x0.y;
+    sum += (int((packed >>  4) & 3u) - 1) * x0.z;
+    sum += (int((packed >>  6) & 3u) - 1) * x0.w;
+    sum += (int((packed >>  8) & 3u) - 1) * x1.x;
+    sum += (int((packed >> 10) & 3u) - 1) * x1.y;
+    sum += (int((packed >> 12) & 3u) - 1) * x1.z;
+    sum += (int((packed >> 14) & 3u) - 1) * x1.w;
+    sum += (int((packed >> 16) & 3u) - 1) * x2.x;
+    sum += (int((packed >> 18) & 3u) - 1) * x2.y;
+    sum += (int((packed >> 20) & 3u) - 1) * x2.z;
+    sum += (int((packed >> 22) & 3u) - 1) * x2.w;
+    sum += (int((packed >> 24) & 3u) - 1) * x3.x;
+    sum += (int((packed >> 26) & 3u) - 1) * x3.y;
+    sum += (int((packed >> 28) & 3u) - 1) * x3.z;
+    sum += (int((packed >> 30)      ) - 1) * x3.w;
+    return sum;
+}
+
+// Packed-dot ternary GEMV, same skeleton as the Q4/Q8 kernels: a lane's 32
+// columns (one uint2 of codes) are 32-aligned, so they share one activation-
+// scale block and sit inside one 128-column weight-scale group.
+kernel void q27_matvec_t2_quantized(device const uchar *weights [[buffer(0)]],
+                                     device const half *weight_scales [[buffer(1)]],
+                                     device const char *x [[buffer(2)]],
+                                     device const float *x_scales [[buffer(3)]],
+                                     device float *out [[buffer(4)]],
+                                     constant MatvecArgs &args [[buffer(5)]],
+                                     uint group [[threadgroup_position_in_grid]],
+                                     ushort lane [[thread_index_in_simdgroup]],
+                                     ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group * 8 + simdgroup;
+    if (row >= args.rows) return;
+    device const uint2 *w2 = (device const uint2 *)(weights + (ulong)row * (args.cols / 4));
+    device const int4 *x16 = (device const int4 *)x;
+    const ulong scale_base = (ulong)row * (args.cols / 128);
+    float acc = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;      // one uint2 = 32 columns
+        const uint2 wp = w2[idx];
+        const int dot0 = q27_dot16_t2(wp.x, x16[idx * 2]);
+        const int dot1 = q27_dot16_t2(wp.y, x16[idx * 2 + 1]);
+        const uint c = chunk * 1024 + lane * 32;
+        acc += float(dot0 + dot1) *
+               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+    }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const uchar wp = weights[(ulong)row * (args.cols / 4) + c / 4];
+        const char4 xp = *(device const char4 *)(x + c);
+        const int dot = (int(wp         & 3u) - 1) * xp.x + (int((wp >> 2) & 3u) - 1) * xp.y +
+                        (int((wp >> 4) & 3u) - 1) * xp.z + (int((wp >> 6)      ) - 1) * xp.w;
+        acc += float(dot) * float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
 // Tiled simdgroup-matrix GEMM (x_rows 1..12) for chunked prefill and
 // batched MTP verification. A 128-thread threadgroup (4 simdgroups) owns a
 // 32-row x 16-token output tile and walks K in 64-column tiles: weights are
@@ -868,6 +1007,96 @@ kernel void q27_matmul_q8_mm(
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
 
+// Ternary tiled chunk GEMM. Identical structure to q27_matmul_q8_mm — the
+// 64-column K-tile subdivides the 128-column T2 scale group, so the per-tile
+// flush scale stays constant within the tile — with the staging block
+// decoding 16 sequential LSB-first 2-bit codes per uint into exact integers.
+kernel void q27_matmul_t2_mm(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Wt[32 * 64];
+    threadgroup float Xt[64 * 16];
+    threadgroup float Sc[4 * 128];
+    const uint row0 = group * 32;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint xtok = tid % 16, xcb = (tid / 16) * 8;
+    const bool xvalid = xtok < args.x_rows;
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 128;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            threadgroup float *dst = Wt + wrow * 64 + wcb;
+            dst[0]  = float(int(wp         & 3u) - 1);
+            dst[1]  = float(int((wp >>  2) & 3u) - 1);
+            dst[2]  = float(int((wp >>  4) & 3u) - 1);
+            dst[3]  = float(int((wp >>  6) & 3u) - 1);
+            dst[4]  = float(int((wp >>  8) & 3u) - 1);
+            dst[5]  = float(int((wp >> 10) & 3u) - 1);
+            dst[6]  = float(int((wp >> 12) & 3u) - 1);
+            dst[7]  = float(int((wp >> 14) & 3u) - 1);
+            dst[8]  = float(int((wp >> 16) & 3u) - 1);
+            dst[9]  = float(int((wp >> 18) & 3u) - 1);
+            dst[10] = float(int((wp >> 20) & 3u) - 1);
+            dst[11] = float(int((wp >> 22) & 3u) - 1);
+            dst[12] = float(int((wp >> 24) & 3u) - 1);
+            dst[13] = float(int((wp >> 26) & 3u) - 1);
+            dst[14] = float(int((wp >> 28) & 3u) - 1);
+            dst[15] = float(int((wp >> 30)      ) - 1);
+        }
+        {
+            const float xs = xvalid ? x_scales[xsbase + (c0 + xcb) / 32] : 0.0f;
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup float *dst = Xt + xcb * 16 + xtok;
+            dst[0 * 16] = float(xa.x) * xs; dst[1 * 16] = float(xa.y) * xs;
+            dst[2 * 16] = float(xa.z) * xs; dst[3 * 16] = float(xa.w) * xs;
+            dst[4 * 16] = float(xb.x) * xs; dst[5 * 16] = float(xb.y) * xs;
+            dst[6 * 16] = float(xb.z) * xs; dst[7 * 16] = float(xb.w) * xs;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k8 = 0; k8 < 64; k8 += 8) {
+            simdgroup_float8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                float4(wsA, wsB, wsA, wsB);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    const uint tokA = lane % 8, tokB = 8 + lane % 8;
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
 // ---- Chunked layer-major prefill (2..12 tokens per dispatch) ----
 //
 // These kernels advance a whole token chunk through one operation so the
@@ -888,6 +1117,20 @@ kernel void q27_embedding_q8_rows(
     const ulong wi = (ulong)token * args.cols + gid.x;
     const ulong si = (ulong)token * (args.cols / 128) + gid.x / 128;
     out[(ulong)gid.y * args.cols + gid.x] = float(weights[wi]) * float(scales[si]);
+}
+
+kernel void q27_embedding_t2_rows(
+        device const uchar *weights [[buffer(0)]],
+        device const half *scales   [[buffer(1)]],
+        device float *out           [[buffer(2)]],
+        constant EmbedRowsArgs &args [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.cols || gid.y >= args.count) return;
+    const uint token = args.tokens[gid.y];
+    const ulong wi = (ulong)token * args.cols + gid.x;
+    const uint code = (weights[wi >> 2] >> ((wi & 3) * 2)) & 3;
+    const ulong si = (ulong)token * (args.cols / 128) + gid.x / 128;
+    out[(ulong)gid.y * args.cols + gid.x] = float(int(code) - 1) * float(scales[si]);
 }
 
 struct RowsNormArgs { uint n; uint rows; uint groups; float eps; };
