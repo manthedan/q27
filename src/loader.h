@@ -7,7 +7,7 @@
 
 namespace q27 {
 
-enum class DType : uint8_t { F32 = 0, F16 = 1, Q8_G128 = 2, Q4_G64 = 3 };
+enum class DType : uint8_t { F32 = 0, F16 = 1, Q8_G128 = 2, Q4_G64 = 3, T2_G128 = 4 };
 
 const char* dtype_name(DType t);
 

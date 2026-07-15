@@ -14,7 +14,7 @@ Offline-repacked weights for the q27 engine. Produced by `tools/repack.py` from 
 [tensor table]  n_tensors entries:
   name_len   u16
   name       u8[name_len]   GGUF tensor name, unchanged
-  dtype      u8             0=F32  1=F16  2=Q8_G128  3=Q4_G64
+  dtype      u8             0=F32  1=F16  2=Q8_G128  3=Q4_G64  4=T2_G128
   n_dims     u8
   shape      u64[n_dims]    numpy row-major shape (outer first; innermost/contiguous LAST)
   data_off   u64            relative to data section start, 256-byte aligned
@@ -40,6 +40,22 @@ reduction axis for every matmul weight in this model.
 - symmetric, group size 128: `scale = max(|w_group|) / 127`, int8
 - scales: fp16, `[rows, cols/128]`
 - effective 8.125 bpw
+
+### T2_G128 (ternary tier, `quant_policy: bonsai-t2-v1`)
+- ternary codes, group size 128: element `i` of a row -> byte `i/4`, 2-bit field at
+  bit offset `(i%4)*2` (**sequential, LSB-first** — no nibble split); code
+  `c ∈ {0,1,2}` decodes to `(c-1) * scale`, i.e. `{-scale, 0, +scale}`. Code 3 is
+  **forbidden** (the source format decodes it to +2; repack.py hard-fails if present).
+- scales: fp16, `[rows, cols/128]`, separate contiguous blob (as Q8_G128)
+- effective 2.25 bpw in-container (2 bits + fp16/128); a warp reading 128 B gets
+  512 consecutive weights = exactly 4 groups
+- produced losslessly (byte-copy of code bytes) from the PrismML fork's ggml type 42
+  ("Q2_0", 34-byte `{fp16 d; u8 qs[32]}` blocks) — same within-byte order and decode
+  formula; see docs/plans/2026-07-14-ternary-tier.md for the authoritative source
+  reading. Ternary packs quantize `token_embd`, `output`, `ssm_alpha`, `ssm_beta`
+  ternary too (unlike the official-tier policy); norms/`ssm_a`/`ssm_dt.bias`/
+  `ssm_conv1d` stay F32. No MTP layer (`blk.64.*`) and no `output_q4.weight` alias —
+  the loader must tolerate their absence (greedy + suffix drafting only).
 
 ## Quant policy (v1)
 
