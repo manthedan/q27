@@ -31,6 +31,11 @@ struct BackendTensor {
     std::shared_ptr<BackendBuffer> scales;
     uint64_t data_offset = 0;
     uint64_t scales_offset = 0;
+    // Logical tensor extents within the buffers. Buffers may be shared views
+    // of a whole model mapping, so buffer size alone cannot bound a tensor;
+    // 0 means unknown and falls back to the buffer size.
+    uint64_t data_size = 0;
+    uint64_t scales_size = 0;
 };
 
 // This intentionally starts small. New primitives should describe model

@@ -51,6 +51,15 @@ void check_range(uint64_t size, uint64_t offset, uint64_t bytes, const char* ope
         throw std::runtime_error(std::string("q27 Metal: buffer range error in ") + operation);
 }
 
+// Bounds a tensor access by its logical extent, not just its buffer: shared
+// whole-mapping buffers would otherwise let a per-tensor byte-count error
+// read silently into the neighboring tensor.
+uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_size) {
+    if (!logical_size) return buffer_size;
+    const uint64_t end = offset > UINT64_MAX - logical_size ? UINT64_MAX : offset + logical_size;
+    return end < buffer_size ? end : buffer_size;
+}
+
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
@@ -615,9 +624,11 @@ BackendTensor MetalBackend::upload(const Tensor& tensor) {
     result.rows = tensor.rows();
     result.cols = tensor.cols();
     result.data = allocate(tensor.data_size);
+    result.data_size = tensor.data_size;
     write(*result.data, 0, tensor.data, tensor.data_size);
     if (tensor.scales_size) {
         result.scales = allocate(tensor.scales_size);
+        result.scales_size = tensor.scales_size;
         write(*result.scales, 0, tensor.scales, tensor.scales_size);
     }
     return result;
@@ -685,9 +696,11 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
         result.cols = tensor.cols();
         result.data_offset = mapping_offset(tensor.data, tensor.data_size);
         result.data = wrap_mapping();
+        result.data_size = tensor.data_size;
         if (tensor.scales_size) {
             result.scales_offset = mapping_offset(tensor.scales, tensor.scales_size);
             result.scales = result.data;
+            result.scales_size = tensor.scales_size;
         }
         return result;
     }
@@ -730,8 +743,11 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
     result.rows = tensor.rows();
     result.cols = tensor.cols();
     result.data = wrap(tensor.data, tensor.data_size, result.data_offset);
-    if (tensor.scales_size)
+    result.data_size = tensor.data_size;
+    if (tensor.scales_size) {
         result.scales = wrap(tensor.scales, tensor.scales_size, result.scales_offset);
+        result.scales_size = tensor.scales_size;
+    }
     return result;
 }
 
@@ -773,7 +789,7 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     if (weight.dtype == DType::F16) data_bytes *= 2;
     if (weight.dtype == DType::Q4_G64) data_bytes /= 2;
     if (weight.dtype == DType::T2_G128) data_bytes /= 4;
-    check_range(data.size(), weight.data_offset, data_bytes, "matvec weight");
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset, data_bytes, "matvec weight");
     id<MTLComputePipelineState> pipeline = nil;
     const char* label = nullptr;
     switch (weight.dtype) {
@@ -789,7 +805,7 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
         quant_scales = &metal_buffer(*weight.scales);
         const uint64_t group = quant_group;
         const uint64_t scale_bytes = weight.rows * (weight.cols / group) * 2;
-        check_range(quant_scales->size(), weight.scales_offset, scale_bytes, "matvec scales");
+        check_range(tensor_limit(quant_scales->size(), weight.scales_offset, weight.scales_size), weight.scales_offset, scale_bytes, "matvec scales");
     }
 
     MatvecArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols, 8};
@@ -832,8 +848,8 @@ void MetalBackend::matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
     check_range(b_out.size(),0,b.rows*4,"fused matvec output B");
     const MetalBuffer& ad=metal_buffer(*a.data); const MetalBuffer& bd=metal_buffer(*b.data);
     const MetalBuffer& input=metal_buffer(x); MetalBuffer& ao=metal_buffer(a_out); MetalBuffer& bo=metal_buffer(b_out);
-    check_range(ad.size(),a.data_offset,a.rows*a.cols*2,"fused matvec weight A");
-    check_range(bd.size(),b.data_offset,b.rows*b.cols*2,"fused matvec weight B");
+    check_range(tensor_limit(ad.size(), a.data_offset, a.data_size), a.data_offset,a.rows*a.cols*2,"fused matvec weight A");
+    check_range(tensor_limit(bd.size(), b.data_offset, b.data_size), b.data_offset,b.rows*b.cols*2,"fused matvec weight B");
     MatvecPairArgs args{(uint32_t)a.rows,(uint32_t)b.rows,(uint32_t)a.cols,8};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_matvec_f16_pair"); [enc setComputePipelineState:impl_->f16_pair];
@@ -883,8 +899,8 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
     const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales); MetalBuffer& out=metal_buffer(y);
     const uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:1;
     const uint64_t data_bytes=weight.rows*weight.cols/divisor;
-    check_range(data.size(),weight.data_offset,data_bytes,"quantized matvec weight");
-    check_range(ws.size(),weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matvec weight scales");
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,data_bytes,"quantized matvec weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matvec weight scales");
     check_range(xv.size(),0,x.count,"quantized matvec values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matvec activation scales");
     MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,8};
     @autoreleasepool {
@@ -931,8 +947,8 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
     const MetalBuffer& data=metal_buffer(*weight.data); const MetalBuffer& ws=metal_buffer(*weight.scales);
     const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales); MetalBuffer& out=metal_buffer(y);
     uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:1;
-    check_range(data.size(),weight.data_offset,weight.rows*weight.cols/divisor,"quantized matmul weight");
-    check_range(ws.size(),weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matmul weight scales");
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/divisor,"quantized matmul weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matmul weight scales");
     check_range(xv.size(),0,x.count,"quantized matmul values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matmul scales");
     MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
     @autoreleasepool {
@@ -960,9 +976,9 @@ void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
     check_range(out.size(), 0, weight.cols * 4, "embedding output");
     const MetalBuffer& data = metal_buffer(*weight.data);
     const MetalBuffer& scales = metal_buffer(*weight.scales);
-    check_range(data.size(), weight.data_offset,
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,
                 weight.rows * weight.cols / (t2 ? 4 : 1), "embedding weight");
-    check_range(scales.size(), weight.scales_offset,
+    check_range(tensor_limit(scales.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,
                 weight.rows * (weight.cols / 128) * 2, "embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
@@ -986,7 +1002,7 @@ void MetalBackend::rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
     const MetalBuffer& input = metal_buffer(x); MetalBuffer& output = metal_buffer(out);
     check_range(input.size(), 0, (uint64_t)n * 4, "rmsnorm input");
     check_range(output.size(), 0, (uint64_t)n * 4, "rmsnorm output");
-    check_range(w.size(), weight.data_offset, (uint64_t)n * 4, "rmsnorm weight");
+    check_range(tensor_limit(w.size(), weight.data_offset, weight.data_size), weight.data_offset, (uint64_t)n * 4, "rmsnorm weight");
     VectorArgs args{n, 8, eps};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_rmsnorm");
@@ -1009,7 +1025,7 @@ void MetalBackend::rmsnorm_quantized(const BackendBuffer& x,const BackendTensor&
     const MetalBuffer& input=metal_buffer(x); MetalBuffer& output=metal_buffer(out);
     MetalBuffer& values=metal_buffer(*quantized.values); MetalBuffer& scales=metal_buffer(*quantized.scales);
     check_range(input.size(),0,(uint64_t)n*4,"fused rmsnorm input"); check_range(output.size(),0,(uint64_t)n*4,"fused rmsnorm output");
-    check_range(w.size(),weight.data_offset,(uint64_t)n*4,"fused rmsnorm weight"); check_range(values.size(),0,n,"fused rmsnorm values");
+    check_range(tensor_limit(w.size(), weight.data_offset, weight.data_size), weight.data_offset,(uint64_t)n*4,"fused rmsnorm weight"); check_range(values.size(),0,n,"fused rmsnorm values");
     check_range(scales.size(),0,(uint64_t)(n/32)*4,"fused rmsnorm scales"); VectorArgs args{n,8,eps};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_rmsnorm_quantized"); [enc setComputePipelineState:impl_->rms_quantized];
@@ -1027,7 +1043,7 @@ void MetalBackend::rmsnorm_heads(BackendBuffer& x, const BackendTensor& weight,
     const MetalBuffer& w = tensor_data(weight, DType::F32, "head rmsnorm");
     MetalBuffer& input = metal_buffer(x);
     check_range(input.size(), 0, ((uint64_t)(heads - 1) * stride + head_dim) * 4, "head rmsnorm input");
-    check_range(w.size(), weight.data_offset, (uint64_t)head_dim * 4, "head rmsnorm weight");
+    check_range(tensor_limit(w.size(), weight.data_offset, weight.data_size), weight.data_offset, (uint64_t)head_dim * 4, "head rmsnorm weight");
     HeadArgs args{heads, head_dim, stride, 8, eps};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_rmsnorm_heads");
@@ -1256,7 +1272,7 @@ void MetalBackend::gdn_gates(const BackendBuffer& alpha, const BackendBuffer& be
     MetalBuffer& go=metal_buffer(g); MetalBuffer& bo=metal_buffer(beta);
     check_range(ar.size(),0,(uint64_t)heads*4,"GDN alpha"); check_range(br.size(),0,(uint64_t)heads*4,"GDN beta raw");
     check_range(go.size(),0,(uint64_t)heads*4,"GDN g"); check_range(bo.size(),0,(uint64_t)heads*4,"GDN beta");
-    check_range(a.size(),ssm_a.data_offset,(uint64_t)heads*4,"GDN a"); check_range(dt.size(),ssm_dt.data_offset,(uint64_t)heads*4,"GDN dt");
+    check_range(tensor_limit(a.size(), ssm_a.data_offset, ssm_a.data_size), ssm_a.data_offset,(uint64_t)heads*4,"GDN a"); check_range(tensor_limit(dt.size(), ssm_dt.data_offset, ssm_dt.data_size), ssm_dt.data_offset,(uint64_t)heads*4,"GDN dt");
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_gdn_gates"); [enc setComputePipelineState:impl_->gates];
         [enc setBuffer:ar.handle() offset:0 atIndex:0]; [enc setBuffer:br.handle() offset:0 atIndex:1];
@@ -1272,7 +1288,7 @@ void MetalBackend::conv_step(const BackendBuffer& ring_src, BackendBuffer& ring_
     const MetalBuffer& src=metal_buffer(ring_src); MetalBuffer& dst=metal_buffer(ring_dst); const MetalBuffer& q=metal_buffer(qkv);
     const MetalBuffer& w=tensor_data(conv_weight,DType::F32,"GDN convolution"); MetalBuffer& o=metal_buffer(out);
     check_range(src.size(),0,(uint64_t)channels*3*4,"conv ring source"); check_range(dst.size(),0,(uint64_t)channels*3*4,"conv ring destination");
-    check_range(q.size(),0,(uint64_t)channels*4,"conv input"); check_range(w.size(),conv_weight.data_offset,(uint64_t)channels*4*4,"conv weight"); check_range(o.size(),0,(uint64_t)channels*4,"conv output");
+    check_range(q.size(),0,(uint64_t)channels*4,"conv input"); check_range(tensor_limit(w.size(), conv_weight.data_offset, conv_weight.data_size), conv_weight.data_offset,(uint64_t)channels*4*4,"conv weight"); check_range(o.size(),0,(uint64_t)channels*4,"conv output");
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_conv_step"); [enc setComputePipelineState:impl_->conv];
         [enc setBuffer:src.handle() offset:0 atIndex:0]; [enc setBuffer:dst.handle() offset:0 atIndex:1]; [enc setBuffer:q.handle() offset:0 atIndex:2];
@@ -1306,7 +1322,7 @@ void MetalBackend::gated_norm_gdn(const BackendBuffer& x, const BackendTensor& w
                                    uint32_t heads, uint32_t head_dim, float eps) {
     const MetalBuffer& xb=metal_buffer(x); const MetalBuffer& w=tensor_data(weight,DType::F32,"GDN norm"); const MetalBuffer& gb=metal_buffer(gate); MetalBuffer& o=metal_buffer(out);
     const uint64_t bytes=(uint64_t)heads*head_dim*4;
-    check_range(xb.size(),0,bytes,"GDN norm input"); check_range(gb.size(),0,bytes,"GDN norm gate"); check_range(o.size(),0,bytes,"GDN norm output"); check_range(w.size(),weight.data_offset,(uint64_t)head_dim*4,"GDN norm weight");
+    check_range(xb.size(),0,bytes,"GDN norm input"); check_range(gb.size(),0,bytes,"GDN norm gate"); check_range(o.size(),0,bytes,"GDN norm output"); check_range(tensor_limit(w.size(), weight.data_offset, weight.data_size), weight.data_offset,(uint64_t)head_dim*4,"GDN norm weight");
     HeadArgs args{heads,head_dim,head_dim,8,eps};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_gated_norm_gdn"); [enc setComputePipelineState:impl_->gated_norm];
@@ -1332,9 +1348,9 @@ void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t
     check_range(out.size(), 0, (uint64_t)count * weight.cols * 4, "chunked embedding output");
     const MetalBuffer& data = metal_buffer(*weight.data);
     const MetalBuffer& scales = metal_buffer(*weight.scales);
-    check_range(data.size(), weight.data_offset,
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,
                 weight.rows * weight.cols / (t2 ? 4 : 1), "chunked embedding weight");
-    check_range(scales.size(), weight.scales_offset, weight.rows * (weight.cols / 128) * 2, "chunked embedding scales");
+    check_range(tensor_limit(scales.size(), weight.scales_offset, weight.scales_size), weight.scales_offset, weight.rows * (weight.cols / 128) * 2, "chunked embedding scales");
     MetalBuffer& output = metal_buffer(out);
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own,
@@ -1360,7 +1376,7 @@ void MetalBackend::rmsnorm_rows_quantized(const BackendBuffer& x, const BackendT
     const uint64_t total = (uint64_t)n * rows;
     check_range(input.size(), 0, total * 4, "chunked rmsnorm input");
     check_range(output.size(), 0, total * 4, "chunked rmsnorm output");
-    check_range(w.size(), weight.data_offset, (uint64_t)n * 4, "chunked rmsnorm weight");
+    check_range(tensor_limit(w.size(), weight.data_offset, weight.data_size), weight.data_offset, (uint64_t)n * 4, "chunked rmsnorm weight");
     check_range(values.size(), 0, total, "chunked rmsnorm values");
     check_range(scales.size(), 0, (total / 32) * 4, "chunked rmsnorm scales");
     RowsNormArgs args{n, rows, 8, eps};
@@ -1391,8 +1407,8 @@ void MetalBackend::matvec_f16_pair_rows(const BackendTensor& a, BackendBuffer& a
     const MetalBuffer& ad = metal_buffer(*a.data); const MetalBuffer& bd = metal_buffer(*b.data);
     const MetalBuffer& input = metal_buffer(x);
     MetalBuffer& ao = metal_buffer(a_out); MetalBuffer& bo = metal_buffer(b_out);
-    check_range(ad.size(), a.data_offset, a.rows * a.cols * 2, "chunked matvec weight A");
-    check_range(bd.size(), b.data_offset, b.rows * b.cols * 2, "chunked matvec weight B");
+    check_range(tensor_limit(ad.size(), a.data_offset, a.data_size), a.data_offset, a.rows * a.cols * 2, "chunked matvec weight A");
+    check_range(tensor_limit(bd.size(), b.data_offset, b.data_size), b.data_offset, b.rows * b.cols * 2, "chunked matvec weight B");
     MatvecPairRowsArgs args{(uint32_t)a.rows, (uint32_t)b.rows, (uint32_t)a.cols, rows};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_matvec_f16_pair_rows");
@@ -1418,8 +1434,8 @@ void MetalBackend::gdn_gates_rows(const BackendBuffer& alpha, const BackendBuffe
     const uint64_t total = (uint64_t)heads * tokens * 4;
     check_range(ar.size(), 0, total, "chunked GDN alpha"); check_range(br.size(), 0, total, "chunked GDN beta raw");
     check_range(go.size(), 0, total, "chunked GDN g"); check_range(bo.size(), 0, total, "chunked GDN beta");
-    check_range(a.size(), ssm_a.data_offset, (uint64_t)heads * 4, "chunked GDN a");
-    check_range(dt.size(), ssm_dt.data_offset, (uint64_t)heads * 4, "chunked GDN dt");
+    check_range(tensor_limit(a.size(), ssm_a.data_offset, ssm_a.data_size), ssm_a.data_offset, (uint64_t)heads * 4, "chunked GDN a");
+    check_range(tensor_limit(dt.size(), ssm_dt.data_offset, ssm_dt.data_size), ssm_dt.data_offset, (uint64_t)heads * 4, "chunked GDN dt");
     GatesRowsArgs args{heads, tokens};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_gdn_gates_rows");
@@ -1446,7 +1462,7 @@ void MetalBackend::conv_chunk(const BackendBuffer& ring_src, BackendBuffer& ring
     check_range(rs.size(), 0, (uint64_t)channels * 3 * 4, "chunked conv ring src");
     check_range(rd.size(), 0, (uint64_t)channels * 3 * 4, "chunked conv ring dst");
     check_range(q.size(), 0, (uint64_t)channels * tokens * 4, "chunked conv input");
-    check_range(w.size(), conv_weight.data_offset, (uint64_t)channels * 4 * 4, "chunked conv weight");
+    check_range(tensor_limit(w.size(), conv_weight.data_offset, conv_weight.data_size), conv_weight.data_offset, (uint64_t)channels * 4 * 4, "chunked conv weight");
     check_range(o.size(), 0, (uint64_t)channels * tokens * 4, "chunked conv output");
     ConvChunkArgs args{channels, tokens};
     @autoreleasepool {
