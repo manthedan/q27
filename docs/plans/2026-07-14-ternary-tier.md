@@ -59,6 +59,43 @@ wikitext tokens look sane via llama.cpp's own tooling. **No-go** if quality is
 unusable for our purposes — file the findings, stay on course. Machine rule: 7.2 + 17
 GiB > 24 GiB — the two artifacts are NEVER resident simultaneously; all A/Bs serial.
 
+### Phase 0 verdict (2026-07-14, night): **GO**
+
+Run on the base M4 (24 GiB), Ternary-Bonsai-27B Q2_0 7.17 GB pack, PrismML fork
+binaries `prism-b9591-62061f9` (mainline b9960 cannot run the packs — their "Q2_0" is
+a fork-only ggml type, id 42, aborts in the Metal backend; offsets also reveal the
+7.17 GB pack is g128-scaled under a g64-sized type name. The Q2_g64 pack loads in
+mainline but still aborts on compute. Their fork binaries are the only stock path,
+and the authoritative dequant reference for Phase 1).
+
+- **Throughput (their stack, loaded machine):** tg128 `5.17 ± 0.15` tok/s, pp512
+  `24.2 ± 1.8` tok/s. Far below the whitepaper's M4 Pro figures even after ~2.3×
+  bandwidth scaling (predicts ~8); effective weight stream ~37 GB/s vs our kernels'
+  ~85 GB/s. **The engineering upside grew:** a q27 ternary tier at our measured GEMV
+  efficiency projects to ~8–12 tok/s — roughly 2× their own product on this hardware.
+  (Number taken under desktop load + swap debt from the day's 17 GiB runs; re-bench on
+  a quiet machine before quoting externally.)
+- **Behavioral probes (thinking mode, their llama-server): all pass.** JSON-only
+  constrained output: exact. 7-constraint list-formatting probe (their weakest
+  category): every constraint honored. Native OpenAI tool call: correct function,
+  correct arguments, no leakage. `merge_intervals` with a planted touching-intervals
+  edge case: correct.
+- **Wikitext-2 PPL (ctx-512 chunks, 24 chunks): `10.04 ± 0.36`.** Same corpus and
+  tokenizer as our 32K gate (official artifact: 5.318 at 32K single-pass, 4.90 in the
+  0–2k bucket). Protocols differ, but the direction is clear: **roughly 1.7–1.9× the
+  perplexity of the full-quality tier** — a real LM-quality gap, larger than the
+  whitepaper's benchmark-retention framing suggests (they never report weight-quant
+  PPL), yet clearly not the collapse regime given the behavioral results.
+- **Server-build quirks recorded:** their `llama-cli` enters interactive mode despite
+  `-no-cnv` (use llama-server or llama-bench); per-request `thinking_budget_tokens`
+  is ignored on this build; thinking cannot be disabled per-request.
+
+Verdict rationale: the two-tier architecture prices this correctly — ternary buys
+resident decode and ~2-4× throughput on 24 GiB machines at a real but non-collapsing
+quality cost; the official artifact remains the quality tier. Proceed to Phase 1.
+Phase 3's gate 3 (32K NLL A/B on our own harness, same protocol both tiers) upgrades
+the PPL comparison from indicative to definitive.
+
 ## Phase 1 — format + repack
 
 - `DType::T2_G128 = 4` (or `T2_G64` if the source scales don't collapse — see below).
