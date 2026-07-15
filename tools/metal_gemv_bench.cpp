@@ -30,9 +30,14 @@ uint64_t data_divisor(DType dtype) {
     return dtype == DType::Q4_G64 ? 2 : dtype == DType::T2_G128 ? 4 : 1;
 }
 
+uint64_t data_bytes_for(const Shape& s) {
+    if (s.dtype == DType::T3_G128) return (uint64_t)s.rows * (s.cols / 128) * 26;
+    return (uint64_t)s.rows * s.cols / data_divisor(s.dtype);
+}
+
 uint64_t weight_bytes(const Shape& s) {
     const uint64_t group = s.dtype == DType::Q4_G64 ? 64 : 128;
-    const uint64_t data = (uint64_t)s.rows * s.cols / data_divisor(s.dtype);
+    const uint64_t data = data_bytes_for(s);
     const uint64_t scales = (uint64_t)s.rows * (s.cols / group) * 2;
     return (data + scales) * (s.pair ? 2 : 1);
 }
@@ -41,13 +46,15 @@ q27::BackendTensor upload_synthetic(q27::MetalBackend& backend, const Shape& s,
                                     std::vector<uint8_t>& data,
                                     std::vector<uint16_t>& scales) {
     const uint64_t group = s.dtype == DType::Q4_G64 ? 64 : 128;
-    data.resize((uint64_t)s.rows * s.cols / data_divisor(s.dtype));
+    data.resize(data_bytes_for(s));
     for (size_t i = 0; i < data.size(); i++) data[i] = (uint8_t)(i * 2654435761u >> 24);
     if (s.dtype == DType::T2_G128)   // keep every 2-bit slot a valid ternary code (no 0b11)
         for (size_t i = 0; i < data.size(); i++) {
             const uint8_t lo = data[i] & 0x55;
             data[i] = (uint8_t)((data[i] & 0xaa & (uint8_t)~(lo << 1)) | lo);
         }
+    if (s.dtype == DType::T3_G128)   // keep every byte a valid base-3 code pack
+        for (size_t i = 0; i < data.size(); i++) data[i] = (uint8_t)(data[i] % 243);
     scales.assign((uint64_t)s.rows * (s.cols / group), 0x3c00 /* f16 1.0 */);
     q27::Tensor tensor;
     tensor.name = s.name;
@@ -64,24 +71,25 @@ q27::BackendTensor upload_synthetic(q27::MetalBackend& backend, const Shape& s,
 
 int main(int argc, char** argv) {
     int reps = 20;
-    bool t2 = false;
+    bool t2 = false, t3 = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--dtype" && i + 1 < argc) {
             const std::string d = argv[++i];
             if (d == "t2") t2 = true;
-            else if (d != "q4q8") { fprintf(stderr, "invalid --dtype (q4q8|t2)\n"); return 1; }
+            else if (d == "t3") t3 = true;
+            else if (d != "q4q8") { fprintf(stderr, "invalid --dtype (q4q8|t2|t3)\n"); return 1; }
         } else if (!arg.empty() && arg[0] != '-') {
             reps = atoi(arg.c_str());
         } else {
-            fprintf(stderr, "usage: %s [reps] [--dtype q4q8|t2]\n", argv[0]);
+            fprintf(stderr, "usage: %s [reps] [--dtype q4q8|t2|t3]\n", argv[0]);
             return 1;
         }
     }
     if (reps < 1) reps = 1;
     q27::MetalBackend backend;
     printf("backend: %s, %d reps per shape%s\n", backend.name().c_str(), reps,
-           t2 ? ", ternary weights" : "");
+           t3 ? ", base-3 ternary weights" : t2 ? ", ternary weights" : "");
 
     // The t2 table runs the same production shapes with every matrix weight
     // ternary, as the Bonsai artifact packs them (embedding/head included).
@@ -103,8 +111,17 @@ int main(int argc, char** argv) {
         {"ssm_out           [5120x6144]",  5120, 6144, DType::T2_G128, false},
         {"output head       [248320x5120]", 248320, 5120, DType::T2_G128, false},
     };
-    const Shape* shapes = t2 ? shapes_t2 : shapes_q;
-    const size_t n_shapes = t2 ? sizeof(shapes_t2) / sizeof(Shape)
+    const Shape shapes_t3[] = {
+        {"ffn_gate single   [17408x5120]", 17408, 5120, DType::T3_G128, false},
+        {"ffn_gate+up pair  [17408x5120]", 17408, 5120, DType::T3_G128, true},
+        {"ffn_down          [5120x17408]", 5120, 17408, DType::T3_G128, false},
+        {"gdn qkv           [10240x5120]", 10240, 5120, DType::T3_G128, false},
+        {"ssm_out           [5120x6144]",  5120, 6144, DType::T3_G128, false},
+        {"output head       [248320x5120]", 248320, 5120, DType::T3_G128, false},
+    };
+    const Shape* shapes = t3 ? shapes_t3 : t2 ? shapes_t2 : shapes_q;
+    const size_t n_shapes = t3 ? sizeof(shapes_t3) / sizeof(Shape)
+                          : t2 ? sizeof(shapes_t2) / sizeof(Shape)
                                : sizeof(shapes_q) / sizeof(Shape);
 
     // Ramp GPU/memory clocks before timing anything: the first ~second of
@@ -147,7 +164,7 @@ int main(int argc, char** argv) {
         auto run = [&](int count) {
             backend.begin_commands();
             for (int i = 0; i < count; i++) {
-                if (shape.dtype == DType::T2_G128) {
+                if (shape.dtype == DType::T2_G128 || shape.dtype == DType::T3_G128) {
                     backend.matvec(weight, *xb, *y);
                     if (shape.pair) backend.matvec(weight_b, *xb, *y2);
                 } else if (shape.pair) {
@@ -166,7 +183,8 @@ int main(int argc, char** argv) {
         const double bytes = (double)weight_bytes(shape) * reps;
         printf("%-34s %-3s %8.3f ms/op %8.2f GB/s\n", shape.name,
                shape.dtype == DType::Q4_G64 ? "q4" :
-               shape.dtype == DType::T2_G128 ? "t2" : "q8",
+               shape.dtype == DType::T2_G128 ? "t2" :
+               shape.dtype == DType::T3_G128 ? "t3" : "q8",
                seconds / reps * 1e3, bytes / seconds / 1e9);
         total_seconds += seconds;
         total_bytes += bytes;

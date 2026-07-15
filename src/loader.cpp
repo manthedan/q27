@@ -26,6 +26,7 @@ const char* dtype_name(DType t) {
         case DType::Q8_G128: return "Q8_G128";
         case DType::Q4_G64:  return "Q4_G64";
         case DType::T2_G128: return "T2_G128";
+        case DType::T3_G128: return "T3_G128";
     }
     return "?";
 }
@@ -123,6 +124,11 @@ uint64_t expected_sizes(const Tensor& t, uint64_t& scales) {
             if (cols % 128) throw std::runtime_error("q27: T2 columns not divisible by 128: " + t.name);
             scales = checked_mul(checked_mul(rows, cols / 128, t.name), 2, t.name);
             return elements / 4;
+        case DType::T3_G128:
+            // base-3: 26 bytes per 128-column group (5 codes/byte, 2 pad slots)
+            if (cols % 128) throw std::runtime_error("q27: T3 columns not divisible by 128: " + t.name);
+            scales = checked_mul(checked_mul(rows, cols / 128, t.name), 2, t.name);
+            return checked_mul(checked_mul(rows, cols / 128, t.name), 26, t.name);
     }
     throw std::runtime_error("q27: invalid tensor dtype: " + t.name);
 }
@@ -182,7 +188,7 @@ Model Model::open(const std::string& path) {
         if (t.name.find('\0') != std::string::npos)
             throw std::runtime_error("q27: NUL in tensor name");
         uint8_t dtype = c.read<uint8_t>();
-        if (dtype > (uint8_t)DType::T2_G128)
+        if (dtype > (uint8_t)DType::T3_G128)
             throw std::runtime_error("q27: invalid tensor dtype: " + t.name);
         t.dtype = (DType)dtype;
         uint8_t nd = c.read<uint8_t>();
