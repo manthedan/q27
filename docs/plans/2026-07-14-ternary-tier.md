@@ -389,6 +389,13 @@ cross-artifact gap; suspects are the T2 float-activation chunk GEMM route
 and overnight power state. Any timed rerun should also measure the causal
 GQA path (default threshold), which was −7.8% already at 8K.
 
+**RESOLVED (2026-07-15, mac-mini attribution pair):** machine state, not
+code. A caffeinated 16K pass on the mac-mini runs at 13.21 tok/s on the
+legacy kernels (quality bit-consistent with gate 3), so the overnight wall
+was a bare-`nohup` power-state artifact. Causal GQA at 16K: 16.52 tok/s,
+−20.1% wall at quality parity. Protocol rule recorded in METAL_PROGRESS:
+`caffeinate -dims` every long run.
+
 ## Whitepaper-derived follow-ups (2026-07-15, full read of bonsai-27b-whitepaper.pdf)
 
 Ranked; items 1–2 are concrete next levers, the rest are references and
@@ -432,6 +439,19 @@ protocol notes.
    hit. Treat GPU-resident drafting on Metal as research, not a scheduled
    lever; their ~1.34–1.37× CUDA speedup bounds the prize if the
    verification cost problem is solved.
+6. **Verify llama.cpp's batch-1 Metal MTP claim; if real, lift the
+   scheduling (2026-07-15, from the Gemma 4 / Unsloth release trail).**
+   llama.cpp mainlined MTP speculative decoding (Unsloth changelog
+   2026-05-18 / 06-03: auto-enabled for MTP GGUFs, "hardware-specific
+   customized settings", "~2x faster", Apple Silicon prebuilts; Gemma 4
+   shipped family-wide MTP drafters 2026-04-16). This directly contradicts
+   item 5's amortization wall — if their gain holds at batch 1 on Metal.
+   Cheap verification first: read their speculative-MTP scheduling code
+   (draft width per hardware tier, when-to-verify policy) and bench their
+   prebuilt on this M4. If it holds, port the *scheduling policy* onto our
+   existing batched MTP verify (official tier has the MTP layer; verify
+   path is byte-exact) — not their code. If it does not hold at batch 1 on
+   Metal, record the measurement next to item 5 and keep drafting parked.
 
 ## Non-goals (this plan)
 
