@@ -118,10 +118,12 @@ class ComputeBackend {
     virtual void argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out_index) = 0;
     // Top-k candidate extraction for GPU-assisted sampling: writes >= k
     // (value, index) pairs containing the true top-k into values/indices
-    // (capacity = min buffer length) and the total candidate count into
-    // count (uint32). A count above capacity means degenerate ties; the
-    // caller must fall back to a full logits readback. Candidates are
-    // unordered; the caller sorts.
+    // (capacity = min buffer length; implementations may require capacity
+    // >= 2k of tie headroom) and the total candidate count into count
+    // (uint32). A count above capacity means degenerate ties; the caller
+    // must fall back to a full logits readback. Candidates are unordered;
+    // the caller sorts. Must run outside a command batch: the count buffer
+    // is CPU-cleared immediately before dispatch.
     virtual void topk(const BackendBuffer& x, uint32_t n, uint32_t k,
                       BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count) {
         (void)x; (void)n; (void)k; (void)values; (void)indices; (void)count;

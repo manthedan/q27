@@ -219,7 +219,8 @@ int main(int argc, char** argv) {
             std::vector<uint32_t> tokens = load_token_file(nll_path);
             if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
             if (tokens.size() < 2) throw std::runtime_error("--kl-kv needs at least two tokens");
-            if (tokens.size() > context)
+            // n-1 positions are encoded; the final token is only a target.
+            if (tokens.size() - 1 > context)
                 throw std::runtime_error("--kl-kv sequence exceeds --ctx; raise --ctx");
             // One mapping, one queue, one weight wrap; two engines that
             // differ only in KV representation, teacher-forced in lockstep.
@@ -280,7 +281,8 @@ int main(int argc, char** argv) {
         if (!nll_path.empty()) {
             std::vector<uint32_t> tokens = load_token_file(nll_path);
             if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
-            if (tokens.size() > context)
+            // n-1 positions are encoded; the final token is only a target.
+            if (tokens.size() - 1 > context)
                 throw std::runtime_error("--nll-long sequence exceeds --ctx; raise --ctx");
             fprintf(stderr, "nll-long: %zu tokens, single pass, no resets%s\n",
                     tokens.size(), turbo3_kv ? " (turbo3 KV)" : "");

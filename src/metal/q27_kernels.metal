@@ -519,7 +519,8 @@ kernel void q27_gdn_gates(device const float *alpha [[buffer(0)]],
                            uint gid [[thread_position_in_grid]]) {
     if (gid >= heads) return;
     const float value = alpha[gid] + ssm_dt[gid];
-    const float softplus = value > 20.0f ? value : log(1.0f + exp(value));
+    const float softplus = value > 20.0f ? value
+                         : (value < -16.0f ? exp(value) : log(1.0f + exp(value)));
     g[gid] = ssm_a[gid] * softplus;
     beta[gid] = 1.0f / (1.0f + exp(-beta_raw[gid]));
 }
@@ -1223,7 +1224,8 @@ kernel void q27_gdn_gates_rows(device const float *alpha [[buffer(0)]],
     if (gid >= args.heads * args.tokens) return;
     const uint head = gid % args.heads;
     const float value = alpha[gid] + ssm_dt[head];
-    const float softplus = value > 20.0f ? value : log(1.0f + exp(value));
+    const float softplus = value > 20.0f ? value
+                         : (value < -16.0f ? exp(value) : log(1.0f + exp(value)));
     g[gid] = ssm_a[head] * softplus;
     beta[gid] = 1.0f / (1.0f + exp(-beta_raw[gid]));
 }
