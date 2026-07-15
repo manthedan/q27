@@ -82,6 +82,9 @@ build:
 build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) src/inspect.cpp src/loader.cpp -o $@
 
+build/tokenize_to_bin: tools/tokenize_to_bin.cpp src/tokenizer.cpp src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/tokenize_to_bin.cpp src/tokenizer.cpp -o $@
+
 build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) src/test_tokenizer.cpp src/tokenizer.cpp -o $@
 
