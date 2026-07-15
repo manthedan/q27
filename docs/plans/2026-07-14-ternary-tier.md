@@ -388,13 +388,32 @@ bytes. Quadratic attention work explains the within-run decay, not the
 cross-artifact gap; suspects are the T2 float-activation chunk GEMM route
 and overnight power state. Any timed rerun should also measure the causal
 GQA path (default threshold), which was −7.8% already at 8K.
+**(Resolved — see the wall-anomaly verdict below: overnight power state,
+not the T2 path.)**
 
-**RESOLVED (2026-07-15, mac-mini attribution pair):** machine state, not
-code. A caffeinated 16K pass on the mac-mini runs at 13.21 tok/s on the
-legacy kernels (quality bit-consistent with gate 3), so the overnight wall
-was a bare-`nohup` power-state artifact. Causal GQA at 16K: 16.52 tok/s,
-−20.1% wall at quality parity. Protocol rule recorded in METAL_PROGRESS:
-`caffeinate -dims` every long run.
+### Gate 3 wall anomaly — second-rig attribution pair verdict (2026-07-15)
+
+Caffeinated sequential 16K turbo3 NLL pair on the certified 16 GiB M4
+mac-mini (suite green, T2 artifact md5-verified, whole-mapping +
+residency-set path — first 16 GiB machine to take it), same command as
+gate 3, idle machine:
+
+- **Legacy kernels (`Q27_METAL_GQA_THRESHOLD=0`): wall 1240.34 s
+  (13.21 tok/s)**, overall PPL 10.088, buckets 9.483 / 15.409 / 7.456 —
+  bit-identical to gate 3's first three buckets — and no slowdown anywhere
+  in the pass (gate 3's collapse concentrated after ~position 11k).
+- **Verdict: hypothesis B.** Identical deterministic computation at 13×
+  gate 3's 0.99 tok/s exonerates the T2 float-activation chunk GEMM route;
+  the 4.4× anomaly was the 24 GB machine's overnight power/pressure state.
+  Gate 3's quality verdict stands; nothing reruns. Protocol rule: long
+  unattended runs must be `caffeinate`d, and timed records note power
+  state. (Optional: a short caffeinated confirmation slice on the 24 GB
+  machine if same-machine confirmation is ever wanted.)
+- **GQA 16K point: causal GQA (default threshold 2048) wall 991.59 s
+  (16.52 tok/s) — −20.1% vs legacy at 16K**, extending the −7.8%-at-8K
+  curve; 0–2k bucket bit-identical (9.483 — sub-threshold chunks share the
+  legacy path), deeper buckets +0.11–0.17% PPL (15.435 / 7.464 vs
+  15.409 / 7.456; summation-reorder noise, same magnitude as the 8K A/B).
 
 ## Whitepaper-derived follow-ups (2026-07-15, full read of bonsai-27b-whitepaper.pdf)
 
