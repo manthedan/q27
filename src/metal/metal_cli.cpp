@@ -1,4 +1,5 @@
 #include "metal_engine.h"
+#include "../kl.h"
 #include "../tokenizer.h"
 
 #include <chrono>
@@ -100,6 +101,38 @@ void print_nll_long_buckets(const std::vector<float>& nll) {
     }
 }
 
+// Same position buckets as the NLL report; values are per-position forward
+// KL in nats against the fp16-KV baseline (whitepaper §4.4 methodology).
+void print_kl_buckets(const std::vector<double>& kl) {
+    static const int edges[] = {
+        0, 2048, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 163840,
+        196608, 229376, 262144, 327680, 1 << 30
+    };
+    static const char* names[] = {
+        "0-2k", "2k-8k", "8k-16k", "16k-32k", "32k-48k", "48k-64k", "64k-96k",
+        "96k-128k", "128k-160k", "160k-192k", "192k-224k", "224k-256k",
+        "256k-320k", "320k+"
+    };
+    constexpr int NB = 14;
+    double sum[NB] = {}, peak[NB] = {};
+    long count[NB] = {};
+    for (size_t i = 0; i < kl.size(); i++) {
+        const int tpos = (int)i + 1;
+        int b = 0;
+        while (tpos >= edges[b + 1]) b++;
+        sum[b] += kl[i];
+        if (kl[i] > peak[b]) peak[b] = kl[i];
+        count[b]++;
+    }
+    printf("KV forward-KL vs fp16 baseline by target position (%zu tokens, no resets):\n",
+           kl.size() + 1);
+    for (int b = 0; b < NB; b++) {
+        if (!count[b]) continue;
+        printf("  %-8s: mean KL %.6g nats  max %.6g  (n=%ld)\n",
+               names[b], sum[b] / count[b], peak[b], count[b]);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -107,7 +140,8 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width] [--kv fp16|turbo3] "
-                "[--prefill chunk|serial] [--nll-long N] [--temperature T --top-p P --top-k K --seed S] "
+                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self] "
+                "[--temperature T --top-p P --top-k K --seed S] "
                 "[--dump-logits file]\n",
                 argv[0]);
         return 1;
@@ -116,6 +150,7 @@ int main(int argc, char** argv) {
         std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits,nll_path;
         uint32_t count=1,context=128,mtp_width=0,suffix_width=0,nll_long=0; q27::SamplingParams sampling;
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
+        bool kl_kv = false, kl_self = false;
         for (int i = 3; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--tokens" && i + 1 < argc) token_list = argv[++i];
@@ -123,6 +158,8 @@ int main(int argc, char** argv) {
             else if (arg == "--nll" && i + 1 < argc) nll_path = argv[++i];
             else if (arg == "--nll-long" && i + 1 < argc) nll_long = parse_u32(argv[++i], "--nll-long");
             else if (arg == "--validate-only") validate_only = true;
+            else if (arg == "--kl-kv") kl_kv = true;
+            else if (arg == "--kl-kv-self") { kl_kv = true; kl_self = true; }
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
@@ -155,6 +192,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--nll currently requires --nll-long N (chunked llama-ppl mode is CUDA-only)");
         if (nll_long && nll_path.empty())
             throw std::runtime_error("--nll-long requires --nll FILE");
+        if (kl_kv && nll_path.empty())
+            throw std::runtime_error("--kl-kv rides the --nll FILE --nll-long N input path");
+        if (kl_kv && turbo3_kv)
+            throw std::runtime_error("--kl-kv builds its own fp16 baseline and turbo3 subject; drop --kv");
         if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty())
             throw std::runtime_error("--tokens, --prompt, --nll, or --validate-only is required");
         if (!nll_path.empty() && (mtp_width || suffix_width || sampling.temperature > 0 || !dump_logits.empty()))
@@ -174,6 +215,57 @@ int main(int argc, char** argv) {
                 prompt.push_back((uint32_t)token);
             }
         }
+        if (kl_kv) {
+            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
+            if (tokens.size() < 2) throw std::runtime_error("--kl-kv needs at least two tokens");
+            if (tokens.size() > context)
+                throw std::runtime_error("--kl-kv sequence exceeds --ctx; raise --ctx");
+            // One mapping, one queue, one weight wrap; two engines that
+            // differ only in KV representation, teacher-forced in lockstep.
+            auto shared = q27::MetalEngine::open_shared(model_path);
+            q27::MetalEngine baseline(shared, context, false);
+            q27::MetalEngine subject(shared, context, !kl_self);
+            auto ready = std::chrono::steady_clock::now();
+            fprintf(stderr, "Metal model ready on %s in %.2f s (two engines, one mapping: fp16 baseline vs %s)\n",
+                    baseline.backend().name().c_str(),
+                    std::chrono::duration<double>(ready - start).count(),
+                    kl_self ? "fp16 self-check" : "turbo3");
+            const uint32_t vocab = q27::MetalEngine::vocabulary_size();
+            const uint32_t n = (uint32_t)tokens.size() - 1;
+            fprintf(stderr, "kl-kv: %u positions, single pass, no resets\n", n);
+            std::vector<float> p, q;
+            std::vector<double> kl(n);
+            auto kl_start = std::chrono::steady_clock::now();
+            uint32_t done = 0, chunk_index = 0;
+            while (done < n) {
+                const uint32_t take = std::min(12u, n - done);
+                baseline.teacher_force_logits(tokens.data() + done, take, p);
+                subject.teacher_force_logits(tokens.data() + done, take, q);
+                for (uint32_t r = 0; r < take; r++)
+                    kl[done + r] = q27::forward_kl(p.data() + (size_t)r * vocab,
+                                                   q.data() + (size_t)r * vocab, vocab);
+                done += take;
+                if (++chunk_index % 32 == 0) fprintf(stderr, "  kl pos %u/%u\r", done, n);
+                if (done / 2048 != (done - take) / 2048) {
+                    double running = 0.0;
+                    for (uint32_t i = 0; i < done; i++) running += kl[i];
+                    fprintf(stderr, "  kl pos %u: running mean %.6g nats\n", done, running / done);
+                }
+            }
+            auto kl_done = std::chrono::steady_clock::now();
+            if (n >= 12) fprintf(stderr, "\n");
+            print_kl_buckets(kl);
+            double mean = 0.0, peak = 0.0;
+            for (double v : kl) { mean += v; if (v > peak) peak = v; }
+            mean /= n;
+            fprintf(stderr, "kl-kv wall: %.2f s (%.2f pos/s through both engines), overall mean KL %.6g nats, max %.6g\n",
+                    std::chrono::duration<double>(kl_done - kl_start).count(),
+                    n / std::chrono::duration<double>(kl_done - kl_start).count(),
+                    mean, peak);
+            return 0;
+        }
+
         q27::MetalEngine engine(model_path, context, turbo3_kv);
         if (serial_prefill) engine.set_chunked_prefill(false);
         auto loaded = std::chrono::steady_clock::now();
