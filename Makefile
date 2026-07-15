@@ -38,7 +38,7 @@ build/test_metal_ops: src/metal/test_metal_ops.cpp src/metal/metal_backend.mm sr
 	        src/metal/metal_backend.mm src/loader.cpp \
 	        -framework Foundation -framework Metal -o $@
 
-build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h \
+build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h src/kl.h \
                  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
