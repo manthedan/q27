@@ -1227,6 +1227,130 @@ kernel void q27_matmul_t2_mm(
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
 
+// Half-staging variant of the T2 chunk GEMM (default path,
+// Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
+// variant B): tiles and accumulators are half, which doubles simdgroup-MMA
+// rate and halves threadgroup traffic, and BOTH operands stay integer-exact
+// in half — trits on the weight side, raw int8 on the activation side. The
+// activation scale folds at the flush instead of at staging, so flushes run
+// per 32-K sub-slab (the x-scale group) with the racc component scaled by
+// ws(row) * xs(token); flushes run per 16-K sub-slab, so partials are
+// integer sums bounded by 16*127 = 2032 — always exact in half. (Variant A
+// staged prescaled activations and failed the shape suite; variant B's
+// 32-K flush let sums round past 2048 and moved the 2K NLL +0.4%.)
+kernel void q27_matmul_t2_mm_h(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group * 32;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint xtok = tid % 16, xcb = (tid / 16) * 8;
+    const bool xvalid = xtok < args.x_rows;
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = lane % 8, tokB = 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            threadgroup half *dst = Wt + wrow * 64 + wcb;
+            dst[0]  = half(int(wp         & 3u) - 1);
+            dst[1]  = half(int((wp >>  2) & 3u) - 1);
+            dst[2]  = half(int((wp >>  4) & 3u) - 1);
+            dst[3]  = half(int((wp >>  6) & 3u) - 1);
+            dst[4]  = half(int((wp >>  8) & 3u) - 1);
+            dst[5]  = half(int((wp >> 10) & 3u) - 1);
+            dst[6]  = half(int((wp >> 12) & 3u) - 1);
+            dst[7]  = half(int((wp >> 14) & 3u) - 1);
+            dst[8]  = half(int((wp >> 16) & 3u) - 1);
+            dst[9]  = half(int((wp >> 18) & 3u) - 1);
+            dst[10] = half(int((wp >> 20) & 3u) - 1);
+            dst[11] = half(int((wp >> 22) & 3u) - 1);
+            dst[12] = half(int((wp >> 24) & 3u) - 1);
+            dst[13] = half(int((wp >> 26) & 3u) - 1);
+            dst[14] = half(int((wp >> 28) & 3u) - 1);
+            dst[15] = half(int((wp >> 30)      ) - 1);
+        }
+        {
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xtok;
+            // Raw int8 values: exact in half. The per-token 32-group scale
+            // folds at the flush below; invalid token slots stage clamped
+            // real values whose outputs are never stored.
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        // Float accumulators keep int8 x trit sums exact to 2^24. The two
+        // 32-K sub-slabs (activation-scale groups) accumulate into separate
+        // tile pairs so both fold in ONE barrier region per staged 64.
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
 // ---- Chunked layer-major prefill (2..12 tokens per dispatch) ----
 //
 // These kernels advance a whole token chunk through one operation so the
