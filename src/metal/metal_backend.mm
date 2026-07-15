@@ -162,6 +162,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q8;
     id<MTLComputePipelineState> q4;
     id<MTLComputePipelineState> t2;
+    id<MTLComputePipelineState> t3;
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
@@ -479,6 +480,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->q8 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_g128");
         impl_->q4 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_g64");
         impl_->t2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128");
+        impl_->t3 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t3_g128");
         impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
@@ -787,6 +789,7 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     MetalBuffer& output = metal_buffer(y);
     const uint64_t quant_group = weight.dtype == DType::Q8_G128 ? 128 :
                                  weight.dtype == DType::T2_G128 ? 128 :
+                                 weight.dtype == DType::T3_G128 ? 128 :
                                  weight.dtype == DType::Q4_G64 ? 64 : 0;
     if (quant_group && weight.cols % quant_group)
         throw std::runtime_error("q27 Metal: matvec columns do not match quantization group");
@@ -797,6 +800,7 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
     if (weight.dtype == DType::F16) data_bytes *= 2;
     if (weight.dtype == DType::Q4_G64) data_bytes /= 2;
     if (weight.dtype == DType::T2_G128) data_bytes /= 4;
+    if (weight.dtype == DType::T3_G128) data_bytes = weight.rows * (weight.cols / 128) * 26;
     check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset, data_bytes, "matvec weight");
     id<MTLComputePipelineState> pipeline = nil;
     const char* label = nullptr;
@@ -806,6 +810,7 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
         case DType::Q8_G128: pipeline = impl_->q8; label = "q27_matvec_q8_g128"; break;
         case DType::Q4_G64: pipeline = impl_->q4; label = "q27_matvec_q4_g64"; break;
         case DType::T2_G128: pipeline = impl_->t2; label = "q27_matvec_t2_g128"; break;
+        case DType::T3_G128: pipeline = impl_->t3; label = "q27_matvec_t3_g128"; break;
     }
     const MetalBuffer* quant_scales = nullptr;
     if (quant_group) {
@@ -833,8 +838,9 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
             [encoder setBuffer:output.handle() offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
         }
-        // T2 runs 4 rows per simdgroup (32 per threadgroup); others 1 (8).
-        const NSUInteger row_groups = weight.dtype == DType::T2_G128
+        // T2/T3 run 4 rows per simdgroup (32 per threadgroup); others 1 (8).
+        const bool ternary = weight.dtype == DType::T2_G128 || weight.dtype == DType::T3_G128;
+        const NSUInteger row_groups = ternary
             ? (NSUInteger)(weight.rows + 31) / 32 : (NSUInteger)(weight.rows + 7) / 8;
         [encoder dispatchThreadgroups:MTLSizeMake(row_groups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];

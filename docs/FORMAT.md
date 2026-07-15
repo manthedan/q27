@@ -57,6 +57,15 @@ reduction axis for every matmul weight in this model.
   `ssm_conv1d` stay F32. No MTP layer (`blk.64.*`) and no `output_q4.weight` alias —
   the loader must tolerate their absence (greedy + suffix drafting only).
 
+### T3_G128 (experimental, parked — no artifacts produced)
+- base-3 recode of T2: 5 codes per byte (`c0 + 3c1 + 9c2 + 27c3 + 81c4`,
+  byte ∈ [0,242]), 26 bytes per 128-column group (byte 25 carries columns
+  125–127; slots 3–4 must be code 1), scales as T2. 1.75 bpw effective.
+- dtype id 5 is reserved and the Metal decode GEMV exists and is gated, but
+  the Phase-0 bench killed the format on M4: decode-bound at ~50 GB/s vs
+  T2's ~95 (see docs/plans/2026-07-15-t3-packing.md). `tools/repack.py`
+  never emits it.
+
 ## Quant policy (v1)
 
 | tensors | dtype | why |

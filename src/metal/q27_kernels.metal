@@ -219,6 +219,135 @@ kernel void q27_matvec_t2_g128(
     }
 }
 
+// T3_G128: five ternary codes per byte, base-3 (243 values), 26 bytes per
+// 128-column group, scales as T2. The LUT expands a byte into five 2-bit
+// codes (bits 2t..2t+1 = code for slot t); the select-form dot then runs
+// the same math as the T2 kernel: scale * (sum(code_i * y_i) - sum(y_i)).
+// Entries 243..255 decode to all-code-1 (trit 0), so a corrupt byte is
+// inert rather than out-of-bounds.
+constant ushort t3_codes[256] = {
+    0x000, 0x001, 0x002, 0x004, 0x005, 0x006, 0x008, 0x009, 0x00a, 0x010, 0x011, 0x012, 0x014, 0x015, 0x016, 0x018,
+    0x019, 0x01a, 0x020, 0x021, 0x022, 0x024, 0x025, 0x026, 0x028, 0x029, 0x02a, 0x040, 0x041, 0x042, 0x044, 0x045,
+    0x046, 0x048, 0x049, 0x04a, 0x050, 0x051, 0x052, 0x054, 0x055, 0x056, 0x058, 0x059, 0x05a, 0x060, 0x061, 0x062,
+    0x064, 0x065, 0x066, 0x068, 0x069, 0x06a, 0x080, 0x081, 0x082, 0x084, 0x085, 0x086, 0x088, 0x089, 0x08a, 0x090,
+    0x091, 0x092, 0x094, 0x095, 0x096, 0x098, 0x099, 0x09a, 0x0a0, 0x0a1, 0x0a2, 0x0a4, 0x0a5, 0x0a6, 0x0a8, 0x0a9,
+    0x0aa, 0x100, 0x101, 0x102, 0x104, 0x105, 0x106, 0x108, 0x109, 0x10a, 0x110, 0x111, 0x112, 0x114, 0x115, 0x116,
+    0x118, 0x119, 0x11a, 0x120, 0x121, 0x122, 0x124, 0x125, 0x126, 0x128, 0x129, 0x12a, 0x140, 0x141, 0x142, 0x144,
+    0x145, 0x146, 0x148, 0x149, 0x14a, 0x150, 0x151, 0x152, 0x154, 0x155, 0x156, 0x158, 0x159, 0x15a, 0x160, 0x161,
+    0x162, 0x164, 0x165, 0x166, 0x168, 0x169, 0x16a, 0x180, 0x181, 0x182, 0x184, 0x185, 0x186, 0x188, 0x189, 0x18a,
+    0x190, 0x191, 0x192, 0x194, 0x195, 0x196, 0x198, 0x199, 0x19a, 0x1a0, 0x1a1, 0x1a2, 0x1a4, 0x1a5, 0x1a6, 0x1a8,
+    0x1a9, 0x1aa, 0x200, 0x201, 0x202, 0x204, 0x205, 0x206, 0x208, 0x209, 0x20a, 0x210, 0x211, 0x212, 0x214, 0x215,
+    0x216, 0x218, 0x219, 0x21a, 0x220, 0x221, 0x222, 0x224, 0x225, 0x226, 0x228, 0x229, 0x22a, 0x240, 0x241, 0x242,
+    0x244, 0x245, 0x246, 0x248, 0x249, 0x24a, 0x250, 0x251, 0x252, 0x254, 0x255, 0x256, 0x258, 0x259, 0x25a, 0x260,
+    0x261, 0x262, 0x264, 0x265, 0x266, 0x268, 0x269, 0x26a, 0x280, 0x281, 0x282, 0x284, 0x285, 0x286, 0x288, 0x289,
+    0x28a, 0x290, 0x291, 0x292, 0x294, 0x295, 0x296, 0x298, 0x299, 0x29a, 0x2a0, 0x2a1, 0x2a2, 0x2a4, 0x2a5, 0x2a6,
+    0x2a8, 0x2a9, 0x2aa, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155, 0x155,
+};
+
+// Pure-ALU base-3 decode: five 2-bit codes from one byte, no memory access.
+inline ushort t3_decode(uint v) {
+    const uint c0 = v % 3u, v1 = v / 3u;
+    const uint c1 = v1 % 3u, v2 = v1 / 3u;
+    const uint c2 = v2 % 3u, v3 = v2 / 3u;
+    const uint c3 = v3 % 3u, c4 = v3 / 3u;
+    return (ushort)(c0 | (c1 << 2) | (c2 << 4) | (c3 << 6) | (c4 << 8));
+}
+
+kernel void q27_matvec_t3_g128(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort tid                   [[thread_index_in_threadgroup]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    // Divergent per-lane byte values make a constant-memory LUT serialize;
+    // stage it in banked threadgroup memory once per threadgroup.
+    threadgroup ushort lut[256];
+    for (uint i = tid; i < 256; i += 256) lut[i] = t3_codes[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint row_bytes = nb * 26;
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // uint-aligned weight walk: one 4-byte load per row covers 20 columns.
+    // Odd group counts leave a 1..3-byte row tail (row_bytes = nb*26); the
+    // first lanes pick those up as scalar bytes after the word loop. Each
+    // byte keeps its own group scale (a word can span a group boundary);
+    // byte b with b%26 == 25 is the 3-column group tail (slots 3-4 are
+    // canonical code-1 padding).
+    const uint words_per_row = (row_bytes & 3) ? 0 : row_bytes / 4;
+    for (uint wi = lane; wi < words_per_row; wi += 32) {
+        uint wv[4];
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            wv[r] = *(device const uint *)(weights + (ulong)row * row_bytes + wi * 4);
+        }
+        for (uint i = 0; i < 4; i++) {
+            const uint b = wi * 4 + i;
+            const uint g = b / 26;
+            const uint p = b - g * 26;
+            const uint col = g * 128 + p * 5;
+            float yl[5];
+            float sumy;
+            if (p != 25) {
+                const packed_float4 y4 = *(device const packed_float4 *)(x + col);
+                yl[0] = y4.x; yl[1] = y4.y; yl[2] = y4.z; yl[3] = y4.w; yl[4] = x[col + 4];
+                sumy = yl[0] + yl[1] + yl[2] + yl[3] + yl[4];
+            } else {   // group tail: three columns
+                yl[0] = x[col]; yl[1] = x[col + 1]; yl[2] = x[col + 2];
+                yl[3] = 0.0f; yl[4] = 0.0f;
+                sumy = yl[0] + yl[1] + yl[2];
+            }
+            for (uint r = 0; r < 4; r++) {
+                const uint row = min(row0 + r, rlast);
+                const ushort codes = lut[(wv[r] >> (8 * i)) & 0xff];
+                const float d = float(scales[(ulong)row * nb + g]);
+                float acc_lo = 0.0f, acc_hi = 0.0f;
+                for (uint t = 0; t < 5; t++) {
+                    acc_lo += select(0.0f, yl[t], bool(codes & (1u << (2 * t))));
+                    acc_hi += select(0.0f, yl[t], bool(codes & (2u << (2 * t))));
+                }
+                sumf[r] += d * (acc_lo + 2.0f * acc_hi - sumy);
+            }
+        }
+    }
+    // Odd group counts make row_bytes odd, so odd rows are not word-aligned
+    // and the word walk is skipped entirely; every byte then takes this
+    // scalar lane-strided path (model shapes all have even nb and never do).
+    for (uint b = words_per_row * 4 + lane; b < row_bytes; b += 32) {
+        const uint g = b / 26;
+        const uint p = b - g * 26;
+        const uint col = g * 128 + p * 5;
+        const uint valid = min(5u, 128u - p * 5);
+        float yl[5];
+        float sumy = 0.0f;
+        for (uint t = 0; t < 5; t++) {
+            yl[t] = t < valid ? x[col + t] : 0.0f;
+            sumy += yl[t];
+        }
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);
+            const ushort codes = lut[weights[(ulong)row * row_bytes + b]];
+            const float d = float(scales[(ulong)row * nb + g]);
+            float acc_lo = 0.0f, acc_hi = 0.0f;
+            for (uint t = 0; t < 5; t++) {
+                acc_lo += select(0.0f, yl[t], bool(codes & (1u << (2 * t))));
+                acc_hi += select(0.0f, yl[t], bool(codes & (2u << (2 * t))));
+            }
+            sumf[r] += d * (acc_lo + 2.0f * acc_hi - sumy);
+        }
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
 struct VectorArgs {
     uint n;
     uint groups;

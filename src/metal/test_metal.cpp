@@ -396,6 +396,88 @@ int test_t2_wide(q27::MetalBackend& backend) {
     return 0;
 }
 
+// Wide-shape gate for the base-3 T3 GEMV: the same trits as a T2 packing,
+// re-coded 5-per-byte (26 bytes per 128-column group, slots 3-4 of the last
+// byte canonical code-1 padding). Checks the kernel against the CPU
+// reference AND against the T2 kernel on identical trits (tolerance — the
+// byte-per-lane schedule sums in a different order than T2's 16-col split).
+int test_t3_wide(q27::MetalBackend& backend) {
+    for (uint32_t cols : {1152u, 5120u}) {
+        constexpr uint32_t rows = 37;   // 32 + 5: second threadgroup clamps rows 37..63
+        const uint32_t groups = cols / 128;
+        std::vector<uint8_t> t2_data((size_t)rows * cols / 4, 0);
+        std::vector<uint8_t> t3_data((size_t)rows * groups * 26, 0);
+        std::vector<int8_t> w((size_t)rows * cols);
+        static const uint16_t pow3[5] = {1, 3, 9, 27, 81};
+        for (uint32_t r = 0; r < rows; r++) {
+            for (uint32_t c = 0; c < cols; c++) {
+                const int q = (int)((r * 13 + c * 7) % 3) - 1;
+                w[(size_t)r * cols + c] = (int8_t)q;
+                t2_data[(size_t)r * cols / 4 + c / 4] |= (uint8_t)((q + 1) << ((c % 4) * 2));
+                const uint32_t g = c / 128, pg = c % 128;
+                t3_data[(size_t)r * groups * 26 + g * 26 + pg / 5] +=
+                    (uint8_t)((q + 1) * pow3[pg % 5]);
+            }
+            for (uint32_t g = 0; g < groups; g++)   // canonical padding: slots 3,4 of byte 25
+                t3_data[(size_t)r * groups * 26 + g * 26 + 25] += 27 + 81;
+        }
+        const uint16_t scale_bits[4] = {0x3400, 0x3800, 0x3c00, 0x4000};
+        const float scale_f32[4] = {0.25f, 0.5f, 1.0f, 2.0f};
+        std::vector<uint16_t> scales((size_t)rows * groups);
+        for (size_t i = 0; i < scales.size(); i++) scales[i] = scale_bits[i % 4];
+
+        auto make = [&](q27::DType dtype, std::vector<uint8_t>& data, const char* name) {
+            q27::Tensor tensor;
+            tensor.name = name;
+            tensor.dtype = dtype;
+            tensor.shape = {rows, cols};
+            tensor.data = data.data();
+            tensor.data_size = data.size();
+            tensor.scales = (const uint8_t*)scales.data();
+            tensor.scales_size = scales.size() * 2;
+            return backend.upload(tensor);
+        };
+        auto w3 = make(q27::DType::T3_G128, t3_data, "t3-wide");
+        auto w2 = make(q27::DType::T2_G128, t2_data, "t2-ref");
+
+        std::vector<float> x(cols);
+        for (uint32_t c = 0; c < cols; c++)
+            x[c] = (float)((int)((c * 11) % 23) - 11) / 11.0f * (float)(1 + c / 32 % 7);
+        auto xb = backend.allocate(cols * 4);
+        backend.write(*xb, 0, x.data(), cols * 4);
+        auto y3 = backend.allocate(rows * 4);
+        auto y2 = backend.allocate(rows * 4);
+        backend.matvec(w3, *xb, *y3);
+        backend.matvec(w2, *xb, *y2);
+        std::vector<float> got(rows), ref(rows);
+        backend.read(*y3, 0, got.data(), rows * 4);
+        backend.read(*y2, 0, ref.data(), rows * 4);
+        for (uint32_t r = 0; r < rows; r++) {
+            double want = 0.0, magnitude = 0.0;
+            for (uint32_t g = 0; g < groups; g++) {
+                double dot = 0.0;
+                for (uint32_t c = g * 128; c < g * 128 + 128; c++)
+                    dot += (double)w[(size_t)r * cols + c] * x[c];
+                const double term = dot * scale_f32[((size_t)r * groups + g) % 4];
+                want += term;
+                magnitude += std::fabs(term);
+            }
+            const float bound = (float)(magnitude * 1e-5 + 1e-3);
+            if (std::fabs(got[r] - (float)want) > bound) {
+                fprintf(stderr, "T3 wide cols=%u row %u: got %.7g want %.7g\n",
+                        cols, r, got[r], (float)want);
+                return 1;
+            }
+            if (std::fabs(got[r] - ref[r]) > bound) {
+                fprintf(stderr, "T3 vs T2 cols=%u row %u: %.7g vs %.7g\n",
+                        cols, r, got[r], ref[r]);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // The tiled simdgroup-matrix GEMM keeps the weight side integer-exact and
 // rounds the activation side once per value at staging, but accumulates
 // K-tiles in a different float-addition order than the serial GEMV, so the
@@ -638,6 +720,7 @@ int main() {
             test_quantized_wide(backend, q27::DType::Q8_G128) ||
             test_quantized_wide(backend, q27::DType::T2_G128) ||
             test_t2_wide(backend) ||
+            test_t3_wide(backend) ||
             test_f16_pair_wide(backend) ||
             test_mixed_pair(backend) ||
             (backend.supports_quantized_matmul() &&
