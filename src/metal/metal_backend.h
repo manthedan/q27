@@ -110,10 +110,12 @@ class MetalBackend final : public ComputeBackend {
                         const BackendTensor& ssm_a, const BackendTensor& ssm_dt,
                         BackendBuffer& g, BackendBuffer& beta,
                         uint32_t heads, uint32_t tokens) override;
-    void conv_chunk(BackendBuffer& ring, const BackendBuffer& qkv,
+    void conv_chunk(const BackendBuffer& ring_src, BackendBuffer& ring_dst,
+                    const BackendBuffer& qkv,
                     const BackendTensor& conv_weight, BackendBuffer& out,
                     uint32_t channels, uint32_t tokens) override;
-    void delta_chunk(BackendBuffer& state, const BackendBuffer& conv,
+    void delta_chunk(const BackendBuffer& state_src, BackendBuffer& state_dst,
+                     const BackendBuffer& conv,
                      const BackendBuffer& g, const BackendBuffer& beta,
                      BackendBuffer& out, uint32_t value_heads, uint32_t qk_heads,
                      uint32_t head_dim, uint32_t tokens) override;

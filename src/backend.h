@@ -173,17 +173,23 @@ class ComputeBackend {
         (void)heads; (void)tokens;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
-    virtual void conv_chunk(BackendBuffer& ring, const BackendBuffer& qkv,
+    // Chunk state kernels take separate src/dst state bindings (in-place when
+    // equal): speculative verification writes dst to a discard slot so the
+    // chunk never commits, and acceptance replay commits from parked inputs.
+    virtual void conv_chunk(const BackendBuffer& ring_src, BackendBuffer& ring_dst,
+                            const BackendBuffer& qkv,
                             const BackendTensor& conv_weight, BackendBuffer& out,
                             uint32_t channels, uint32_t tokens) {
-        (void)ring; (void)qkv; (void)conv_weight; (void)out; (void)channels; (void)tokens;
+        (void)ring_src; (void)ring_dst; (void)qkv; (void)conv_weight; (void)out;
+        (void)channels; (void)tokens;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
-    virtual void delta_chunk(BackendBuffer& state, const BackendBuffer& conv,
+    virtual void delta_chunk(const BackendBuffer& state_src, BackendBuffer& state_dst,
+                             const BackendBuffer& conv,
                              const BackendBuffer& g, const BackendBuffer& beta,
                              BackendBuffer& out, uint32_t value_heads, uint32_t qk_heads,
                              uint32_t head_dim, uint32_t tokens) {
-        (void)state; (void)conv; (void)g; (void)beta; (void)out;
+        (void)state_src; (void)state_dst; (void)conv; (void)g; (void)beta; (void)out;
         (void)value_heads; (void)qk_heads; (void)head_dim; (void)tokens;
         throw std::runtime_error("q27: backend has no chunked execution");
     }

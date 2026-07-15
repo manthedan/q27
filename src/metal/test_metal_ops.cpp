@@ -511,7 +511,7 @@ int test_chunked(q27::MetalBackend& backend) {
         auto ring_serial = upload_buffer(backend, ring); auto ring_chunk = upload_buffer(backend, ring);
         auto qkvb = upload_buffer(backend, qkv);
         auto chunk_out = backend.allocate((uint64_t)T * channels * 4);
-        backend.conv_chunk(*ring_chunk, *qkvb, cwt, *chunk_out, channels, T);
+        backend.conv_chunk(*ring_chunk, *ring_chunk, *qkvb, cwt, *chunk_out, channels, T);
         auto got = read_f32(backend, *chunk_out, (size_t)T * channels);
         auto serial_out = backend.allocate(channels * 4);
         for (uint32_t t = 0; t < T; t++) {
@@ -540,7 +540,7 @@ int test_chunked(q27::MetalBackend& backend) {
         auto state_serial = upload_buffer(backend, state); auto state_chunk = upload_buffer(backend, state);
         auto cvb = upload_buffer(backend, cv); auto gb = upload_buffer(backend, g); auto betab = upload_buffer(backend, beta);
         auto chunk_out = backend.allocate((uint64_t)T * vh * hd * 4);
-        backend.delta_chunk(*state_chunk, *cvb, *gb, *betab, *chunk_out, vh, qkh, hd, T);
+        backend.delta_chunk(*state_chunk, *state_chunk, *cvb, *gb, *betab, *chunk_out, vh, qkh, hd, T);
         auto got = read_f32(backend, *chunk_out, (size_t)T * vh * hd);
         auto serial_out = backend.allocate((uint64_t)vh * hd * 4);
         for (uint32_t t = 0; t < T; t++) {
@@ -555,6 +555,80 @@ int test_chunked(q27::MetalBackend& backend) {
         auto sb = read_f32(backend, *state_chunk, state_n);
         for (size_t i = 0; i < state_n; i++)
             if (!near(sa[i], sb[i], 1e-5f)) { fail("delta chunk state", i, sb[i], sa[i]); break; }
+    }
+
+    // MTP verification state discipline: a chunk writing state to a discard
+    // slot must leave live state bit-untouched with identical outputs, and
+    // replaying a K-token prefix afterwards (the acceptance path) must
+    // bit-match a directly committed K-token chunk. This is the partial
+    // acceptance contract that replaced the checkpoint/restore/re-encode.
+    {
+        constexpr uint32_t channels = 7, K = 2;
+        static_assert(K < T, "replay must cover a strict prefix");
+        std::vector<float> ring(channels * 3), qkv(T * channels), cw(channels * 4);
+        for (size_t i = 0; i < ring.size(); i++) ring[i] = std::cos(float(i) * .29f);
+        for (size_t i = 0; i < qkv.size(); i++) qkv[i] = std::sin(float(i) * .53f);
+        for (size_t i = 0; i < cw.size(); i++) cw[i] = 0.04f * float((int)(i % 7) - 3);
+        auto cwt = upload_f32(backend, cw, {channels, 4});
+        auto ring_live = upload_buffer(backend, ring);
+        auto ring_ref = upload_buffer(backend, ring);
+        auto ring_discard = backend.allocate((uint64_t)channels * 3 * 4);
+        auto qkvb = upload_buffer(backend, qkv);
+        auto out_full = backend.allocate((uint64_t)T * channels * 4);
+        auto out_prefix = backend.allocate((uint64_t)K * channels * 4);
+        auto out_replay = backend.allocate((uint64_t)K * channels * 4);
+        backend.conv_chunk(*ring_live, *ring_discard, *qkvb, cwt, *out_full, channels, T);
+        auto untouched = read_f32(backend, *ring_live, ring.size());
+        for (size_t i = 0; i < ring.size(); i++)
+            if (untouched[i] != ring[i]) { fail("conv discard ring", i, untouched[i], ring[i]); break; }
+        backend.conv_chunk(*ring_ref, *ring_ref, *qkvb, cwt, *out_prefix, channels, K);
+        backend.conv_chunk(*ring_live, *ring_live, *qkvb, cwt, *out_replay, channels, K);
+        auto want_ring = read_f32(backend, *ring_ref, ring.size());
+        auto got_ring = read_f32(backend, *ring_live, ring.size());
+        for (size_t i = 0; i < ring.size(); i++)
+            if (got_ring[i] != want_ring[i]) { fail("conv replay ring", i, got_ring[i], want_ring[i]); break; }
+        auto full = read_f32(backend, *out_full, (size_t)T * channels);
+        auto prefix = read_f32(backend, *out_prefix, (size_t)K * channels);
+        auto replay = read_f32(backend, *out_replay, (size_t)K * channels);
+        for (size_t i = 0; i < (size_t)K * channels; i++) {
+            if (full[i] != prefix[i]) { fail("conv prefix invariance", i, full[i], prefix[i]); break; }
+            if (replay[i] != prefix[i]) { fail("conv replay out", i, replay[i], prefix[i]); break; }
+        }
+    }
+    {
+        constexpr uint32_t vh = 3, qkh = 16, hd = 128, K = 2;
+        static_assert(K < T, "replay must cover a strict prefix");
+        const size_t state_n = (size_t)vh * hd * hd, conv_row = (qkh * 2 + vh) * hd;
+        std::vector<float> state(state_n), cv(T * conv_row), g(T * vh), beta(T * vh);
+        for (size_t i = 0; i < state.size(); i++) state[i] = (int(i % 13) - 6) * .0007f;
+        for (size_t i = 0; i < cv.size(); i++) cv[i] = (int(i % 19) - 9) * .012f;
+        for (size_t i = 0; i < g.size(); i++) g[i] = -.02f - .003f * float(i % 5);
+        for (size_t i = 0; i < beta.size(); i++) beta[i] = .15f + .04f * float(i % 7);
+        auto state_live = upload_buffer(backend, state);
+        auto state_ref = upload_buffer(backend, state);
+        auto state_discard = backend.allocate(state_n * 4);
+        auto cvb = upload_buffer(backend, cv);
+        auto gb = upload_buffer(backend, g); auto betab = upload_buffer(backend, beta);
+        auto out_full = backend.allocate((uint64_t)T * vh * hd * 4);
+        auto out_prefix = backend.allocate((uint64_t)K * vh * hd * 4);
+        auto out_replay = backend.allocate((uint64_t)K * vh * hd * 4);
+        backend.delta_chunk(*state_live, *state_discard, *cvb, *gb, *betab, *out_full, vh, qkh, hd, T);
+        auto untouched = read_f32(backend, *state_live, state_n);
+        for (size_t i = 0; i < state_n; i++)
+            if (untouched[i] != state[i]) { fail("delta discard state", i, untouched[i], state[i]); break; }
+        backend.delta_chunk(*state_ref, *state_ref, *cvb, *gb, *betab, *out_prefix, vh, qkh, hd, K);
+        backend.delta_chunk(*state_live, *state_live, *cvb, *gb, *betab, *out_replay, vh, qkh, hd, K);
+        auto want_state = read_f32(backend, *state_ref, state_n);
+        auto got_state = read_f32(backend, *state_live, state_n);
+        for (size_t i = 0; i < state_n; i++)
+            if (got_state[i] != want_state[i]) { fail("delta replay state", i, got_state[i], want_state[i]); break; }
+        auto full = read_f32(backend, *out_full, (size_t)T * vh * hd);
+        auto prefix = read_f32(backend, *out_prefix, (size_t)K * vh * hd);
+        auto replay = read_f32(backend, *out_replay, (size_t)K * vh * hd);
+        for (size_t i = 0; i < (size_t)K * vh * hd; i++) {
+            if (full[i] != prefix[i]) { fail("delta prefix invariance", i, full[i], prefix[i]); break; }
+            if (replay[i] != prefix[i]) { fail("delta replay out", i, replay[i], prefix[i]); break; }
+        }
     }
 
     // Chunked strided L2 norm (row stride exceeds the normalized span).

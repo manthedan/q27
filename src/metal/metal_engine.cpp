@@ -242,10 +242,20 @@ MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool t
         cpred_ = backend_.allocate((uint64_t)CHUNK_MAX * sizeof(uint32_t));
         ctargets_ = backend_.allocate((uint64_t)CHUNK_MAX * sizeof(uint32_t));
         cnll_ = alloc_f32(CHUNK_MAX);
-        // One recurrent + ring slot per GDN layer; both stay physically lazy
-        // until the first batched MTP round touches them.
-        ckpt_recurrent_ = alloc_f32((uint64_t)(N_LAYER - N_LAYER / 4) * GDN_HEADS * GDN_DIM * GDN_DIM);
-        ckpt_ring_ = alloc_f32((uint64_t)(N_LAYER - N_LAYER / 4) * 3 * GDN_CH);
+        // Batched MTP verification parks each GDN layer's chunk inputs
+        // (~24 MiB total) so acceptance can replay the recurrence over the
+        // accepted prefix, and discards speculative state commits into two
+        // slots shared by every layer. All of it stays physically lazy until
+        // the first batched MTP round.
+        const uint32_t gdn_layers = N_LAYER - N_LAYER / 4;
+        park_qkv_.reserve(gdn_layers); park_g_.reserve(gdn_layers); park_beta_.reserve(gdn_layers);
+        for (uint32_t i = 0; i < gdn_layers; i++) {
+            park_qkv_.push_back(alloc_f32((uint64_t)CHUNK_MAX * GDN_CH));
+            park_g_.push_back(alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS));
+            park_beta_.push_back(alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS));
+        }
+        discard_recurrent_ = alloc_f32((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM);
+        discard_ring_ = alloc_f32((uint64_t)3 * GDN_CH);
     }
     reset();
 }
@@ -391,7 +401,7 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits) {
     position_++;
 }
 
-void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count) {
+void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count, bool verify) {
     BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
     backend_.matmul_quantized(layer_weight(layer, "attn_qkv.weight"), x5, count, *cqkv_);
     backend_.matmul_quantized(layer_weight(layer, "attn_gate.weight"), x5, count, *cz_);
@@ -400,10 +410,21 @@ void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count) {
     backend_.gdn_gates_rows(*calpha_, *cbeta_raw_, layer_weight(layer, "ssm_a"),
                             layer_weight(layer, "ssm_dt.bias"), *cg_, *cbeta_, GDN_HEADS, count);
     LayerState& state = layers_[layer];
-    backend_.conv_chunk(*state.ring, *cqkv_, layer_weight(layer, "ssm_conv1d.weight"),
+    // Verification parks the recurrence inputs and discards the speculative
+    // state commit; gdn_replay later commits real state for the accepted
+    // prefix from the parked copies — bit-identical inputs, no re-encode.
+    if (verify) {
+        const uint32_t slot = gdn_slot(layer);
+        backend_.copy(*cqkv_, 0, *park_qkv_[slot], 0, (uint64_t)count * GDN_CH * sizeof(float));
+        backend_.copy(*cg_, 0, *park_g_[slot], 0, (uint64_t)count * GDN_HEADS * sizeof(float));
+        backend_.copy(*cbeta_, 0, *park_beta_[slot], 0, (uint64_t)count * GDN_HEADS * sizeof(float));
+    }
+    BackendBuffer& ring_dst = verify ? *discard_ring_ : *state.ring;
+    BackendBuffer& recurrent_dst = verify ? *discard_recurrent_ : *state.recurrent;
+    backend_.conv_chunk(*state.ring, ring_dst, *cqkv_, layer_weight(layer, "ssm_conv1d.weight"),
                         *cconv_out_, GDN_CH, count);
     backend_.l2norm_rows(*cconv_out_, 2 * GDN_QK_HEADS, GDN_DIM, GDN_CH, count, EPS);
-    backend_.delta_chunk(*state.recurrent, *cconv_out_, *cg_, *cbeta_, *cdelta_out_,
+    backend_.delta_chunk(*state.recurrent, recurrent_dst, *cconv_out_, *cg_, *cbeta_, *cdelta_out_,
                          GDN_HEADS, GDN_QK_HEADS, GDN_DIM, count);
     // Token rows are contiguous, so the per-head gated norm batches by
     // flattening the chunk into count*GDN_HEADS heads.
@@ -462,7 +483,7 @@ void MetalEngine::ffn_chunk(uint32_t layer, uint32_t count) {
     backend_.matmul_quantized(layer_weight(layer, "ffn_down.weight"), x17, count, *cy_);
 }
 
-void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count) {
+void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count, bool verify) {
     if (!ch_) throw std::runtime_error("q27 Metal: chunked prefill is unavailable");
     if (!count || count > CHUNK_MAX) throw std::runtime_error("q27 Metal: invalid chunk size");
     if ((uint64_t)position_ + count > max_context_)
@@ -474,7 +495,7 @@ void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count) {
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         backend_.rmsnorm_rows_quantized(*ch_, layer_weight(layer, "attn_norm.weight"),
                                         *cx1_, N_EMBD, count, EPS, x5);
-        if (attention_layer(layer)) attention_chunk(layer, count); else gdn_chunk(layer, count);
+        if (attention_layer(layer)) attention_chunk(layer, count); else gdn_chunk(layer, count, verify);
         backend_.add_inplace(*ch_, *cy_, count * N_EMBD);
         backend_.rmsnorm_rows_quantized(*ch_, layer_weight(layer, "post_attention_norm.weight"),
                                         *cx1_, N_EMBD, count, EPS, x5);
@@ -488,25 +509,23 @@ void MetalEngine::encode_chunk(const uint32_t* tokens, uint32_t count) {
     position_ += count;
 }
 
-// Copies all persistent GDN state (recurrent + convolution ring) to or from
-// the checkpoint slots. Roughly 157 MiB of device traffic: negligible next
-// to one chunk's full weight stream, and it makes the optimistic committing
-// verification round reversible.
-void MetalEngine::gdn_state_copy(bool restore) {
-    uint64_t slot = 0;
+// Commits GDN state (recurrent + convolution ring) for the first `count`
+// verified lanes by replaying only the conv/DeltaNet recurrence from the
+// inputs parked during the verify chunk. Both chunk kernels are sequential
+// in-kernel, so the replayed state is bit-identical to the state the verify
+// chunk would have committed after `count` lanes — the full-stack commit
+// re-encode this replaces streamed every weight a second time (~0.9 s).
+void MetalEngine::gdn_replay(uint32_t count) {
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         if (attention_layer(layer)) continue;
         LayerState& state = layers_[layer];
-        const uint64_t recurrent_bytes = state.recurrent->size();
-        const uint64_t ring_bytes = state.ring->size();
-        if (restore) {
-            backend_.copy(*ckpt_recurrent_, slot * recurrent_bytes, *state.recurrent, 0, recurrent_bytes);
-            backend_.copy(*ckpt_ring_, slot * ring_bytes, *state.ring, 0, ring_bytes);
-        } else {
-            backend_.copy(*state.recurrent, 0, *ckpt_recurrent_, slot * recurrent_bytes, recurrent_bytes);
-            backend_.copy(*state.ring, 0, *ckpt_ring_, slot * ring_bytes, ring_bytes);
-        }
-        slot++;
+        const uint32_t slot = gdn_slot(layer);
+        backend_.conv_chunk(*state.ring, *state.ring, *park_qkv_[slot],
+                            layer_weight(layer, "ssm_conv1d.weight"), *cconv_out_, GDN_CH, count);
+        backend_.l2norm_rows(*cconv_out_, 2 * GDN_QK_HEADS, GDN_DIM, GDN_CH, count, EPS);
+        backend_.delta_chunk(*state.recurrent, *state.recurrent, *cconv_out_,
+                             *park_g_[slot], *park_beta_[slot], *cdelta_out_,
+                             GDN_HEADS, GDN_QK_HEADS, GDN_DIM, count);
     }
 }
 
@@ -643,11 +662,15 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
 }
 
 // One batched MTP round: draft serially through layer 64, then verify every
-// lane in a single optimistic committing layer-major pass with a batched
-// output head and per-lane argmax — one CPU synchronization per round
-// instead of one per committed token. The GDN checkpoint makes partial
-// acceptance reversible; committed tokens follow the exact serial-walk
-// semantics, including never encoding the final output token.
+// lane in a single state-free layer-major pass with a batched output head
+// and per-lane argmax — one CPU synchronization per round instead of one
+// per committed token. The verify chunk parks each GDN layer's recurrence
+// inputs and discards its speculative state commits; acceptance then
+// replays only the GDN recurrence over the accepted prefix (gdn_replay),
+// so no state checkpoint, restore, or full-stack commit re-encode exists.
+// KV rows written for rejected lanes stay invisible behind position_.
+// Committed tokens follow the exact serial-walk semantics, including never
+// encoding the final output token.
 std::vector<uint32_t> MetalEngine::generate_mtp_batched(uint32_t pending, uint32_t count,
                                                         uint32_t width) {
     std::vector<uint32_t> output;
@@ -688,8 +711,7 @@ std::vector<uint32_t> MetalEngine::generate_mtp_batched(uint32_t pending, uint32
         auto verify_start = clock();
         {
             CommandBatch batch(backend_);
-            gdn_state_copy(false);
-            chunk_forward(lanes.data(), live);
+            chunk_forward(lanes.data(), live, /*verify=*/true);
             BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
             backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                             N_EMBD, live, EPS, x5);
@@ -707,18 +729,13 @@ std::vector<uint32_t> MetalEngine::generate_mtp_batched(uint32_t pending, uint32
         const uint32_t encoded = committed == remaining ? committed - 1 : committed;
         last_spec_stats_.accepted += committed - 1;
         auto commit_start = clock();
-        {
+        if (encoded) {
             CommandBatch batch(backend_);
-            if (encoded != live) {
-                gdn_state_copy(true);
-                if (encoded) chunk_forward(lanes.data(), encoded);
-            }
-            if (encoded) {
-                backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
-                              *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
-                backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
-                              *logits_, 0, (uint64_t)VOCAB * sizeof(float));
-            }
+            gdn_replay(encoded);
+            backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
+                          *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+            backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
+                          *logits_, 0, (uint64_t)VOCAB * sizeof(float));
             batch.finish();
         }
         position_ += encoded;
