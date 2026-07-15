@@ -187,6 +187,10 @@ std::shared_ptr<MetalEngine::Shared> MetalEngine::open_shared(const std::string&
     return std::make_shared<Shared>(Model::open(model_path));
 }
 
+// Return this engine's KV budget to the mapping so later engines on a
+// still-live Shared are not falsely rejected (codex sweep finding).
+MetalEngine::~MetalEngine() { shared_->cache_bytes -= engine_cache_bytes_; }
+
 namespace {
 std::shared_ptr<MetalEngine::Shared> require_shared(std::shared_ptr<MetalEngine::Shared> shared) {
     if (!shared) throw std::runtime_error("q27 Metal: null shared context");
@@ -214,6 +218,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     if (shared_->cache_bytes + total_cache_bytes > backend_.recommended_working_set_size() / 2)
         throw std::runtime_error("q27 Metal: requested KV cache (across engines on this mapping) is too large for this device; use --kv turbo3 or reduce --ctx");
     shared_->cache_bytes += total_cache_bytes;
+    engine_cache_bytes_ = total_cache_bytes;
 
     // All wrappers alias the mmap. No weight-sized copy is created. A second
     // engine on the same Shared reuses the wrap — never a second mapping.
@@ -966,6 +971,11 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
             batch.finish();
         }
         position_ += count;
+        // Keep the serial logits buffer coherent with the last encoded row so
+        // sampling or snapshotting after a chunk sees post-chunk state
+        // (mirrors prefill; codex sweep finding, 2026-07-15).
+        backend_.copy(*clogits_, (uint64_t)(count - 1) * VOCAB * sizeof(float),
+                      *logits_, 0, (uint64_t)VOCAB * sizeof(float));
         backend_.read(*clogits_, 0, out.data(), out.size() * sizeof(float));
         return;
     }

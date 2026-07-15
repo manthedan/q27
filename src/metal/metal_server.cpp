@@ -378,11 +378,18 @@ int main(int argc,char** argv) {
                         json msg={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
                             {"content",json::array()},{"stop_reason",nullptr},{"stop_sequence",nullptr},
                             {"usage",{{"input_tokens",(int)ids.size()},{"output_tokens",0}}}};
-                        ev("message_start",{{"type","message_start"},{"message",msg}});
-                        ev("content_block_start",{{"type","content_block_start"},{"index",0},
-                            {"content_block",{{"type","text"},{"text",""}}}});
+                        // A client gone before generation starts must not hold
+                        // the engine through the token cap: gate the run on the
+                        // opening writes, and probe the socket on empty pieces
+                        // (still no empty text_delta — parity w/ server.cu).
+                        if(!ev("message_start",{{"type","message_start"},{"message",msg}}) ||
+                           !ev("content_block_start",{{"type","content_block_start"},{"index",0},
+                               {"content_block",{{"type","text"},{"text",""}}}})) {
+                            sink.done();
+                            return true;
+                        }
                         auto emit=[&](const std::string& piece)->bool {
-                            if(piece.empty()) return true; // no empty text_delta (parity w/ server.cu)
+                            if(piece.empty()) return sink.is_writable();
                             return ev("content_block_delta",{{"type","content_block_delta"},{"index",0},
                                 {"delta",{{"type","text_delta"},{"text",piece}}}});
                         };
@@ -433,15 +440,21 @@ int main(int argc,char** argv) {
                 [&runtime,ids,n,sampling,stops,rid,mid](size_t,httplib::DataSink& sink)->bool {
                     auto ev=[&](const json& j){ std::string s=q27::sse_event(j.value("type",std::string("x")),j); return sink.write(s.data(),s.size()); };
                     try {
-                        ev({{"type","response.created"},{"response",{{"id",rid},{"object","response"},{"status","in_progress"}}}});
-                        ev({{"type","response.output_item.added"},{"output_index",0},
-                            {"item",{{"type","message"},{"id",mid},{"role","assistant"},{"status","in_progress"},{"content",json::array()}}}});
-                        ev({{"type","response.content_part.added"},{"item_id",mid},{"output_index",0},{"content_index",0},
-                            {"part",{{"type","output_text"},{"text",""},{"annotations",json::array()}}}});
+                        // Gate the run on the opening writes and probe the
+                        // socket on empty pieces, so a disconnected client
+                        // cannot hold the engine through the token cap.
+                        if(!ev({{"type","response.created"},{"response",{{"id",rid},{"object","response"},{"status","in_progress"}}}}) ||
+                           !ev({{"type","response.output_item.added"},{"output_index",0},
+                               {"item",{{"type","message"},{"id",mid},{"role","assistant"},{"status","in_progress"},{"content",json::array()}}}}) ||
+                           !ev({{"type","response.content_part.added"},{"item_id",mid},{"output_index",0},{"content_index",0},
+                               {"part",{{"type","output_text"},{"text",""},{"annotations",json::array()}}}})) {
+                            sink.done();
+                            return true;
+                        }
                         std::string text;
                         auto emit=[&](const std::string& piece)->bool {
                             text+=piece;
-                            if(piece.empty()) return true;
+                            if(piece.empty()) return sink.is_writable();
                             return ev({{"type","response.output_text.delta"},{"item_id",mid},
                                 {"output_index",0},{"content_index",0},{"delta",piece}});
                         };

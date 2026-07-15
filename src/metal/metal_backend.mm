@@ -588,6 +588,9 @@ void MetalBackend::write(BackendBuffer& dst, uint64_t offset, const void* src, u
     MetalBuffer& buffer = metal_buffer(dst);
     check_range(buffer.size(), offset, bytes, "write");
     if (bytes && !src) throw std::runtime_error("q27 Metal: null write source");
+    // Same contract zero() already enforces: a host write racing an open
+    // command batch changes what already-encoded operations observe.
+    if (impl_->batching) throw std::runtime_error("q27 Metal: cannot CPU-write during command batch");
     if (bytes) std::memcpy((uint8_t*)buffer.handle().contents + offset, src, (size_t)bytes);
 }
 
@@ -787,6 +790,8 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
                                  weight.dtype == DType::Q4_G64 ? 64 : 0;
     if (quant_group && weight.cols % quant_group)
         throw std::runtime_error("q27 Metal: matvec columns do not match quantization group");
+    if (weight.cols && weight.rows > UINT64_MAX / 4 / weight.cols)
+        throw std::runtime_error("q27 Metal: weight shape overflows byte arithmetic");
     uint64_t data_bytes = weight.rows * weight.cols;
     if (weight.dtype == DType::F32) data_bytes *= 4;
     if (weight.dtype == DType::F16) data_bytes *= 2;

@@ -23,6 +23,9 @@ class MetalEngine {
     // Engines sharing a Shared never map or wire the artifact twice, so the
     // one-model-load memory policy sees a single load however many engines
     // (e.g. an fp16-KV baseline and a turbo3-KV subject) attach to it.
+    // Contract: engines on one Shared must be constructed and driven from a
+    // single thread (or externally serialized) — they alias one command
+    // queue and one batching state, and nothing here locks.
     struct Shared {
         Model model;
         MetalBackend backend;
@@ -41,6 +44,7 @@ class MetalEngine {
     // position_ would corrupt its sibling. Engines are pinned to their spot.
     MetalEngine(const MetalEngine&) = delete;
     MetalEngine& operator=(const MetalEngine&) = delete;
+    ~MetalEngine();
 
     void reset();
     uint32_t step(uint32_t token);
@@ -127,6 +131,7 @@ class MetalEngine {
     MetalBackend& backend_;
     uint32_t max_context_;
     bool turbo3_kv_;
+    uint64_t engine_cache_bytes_ = 0;
     uint32_t position_ = 0;
     SpecStats last_spec_stats_;
     std::unordered_map<std::string, BackendTensor>& weights_;
