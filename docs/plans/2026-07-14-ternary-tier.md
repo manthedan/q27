@@ -68,13 +68,16 @@ a fork-only ggml type, id 42, aborts in the Metal backend; offsets also reveal t
 mainline but still aborts on compute. Their fork binaries are the only stock path,
 and the authoritative dequant reference for Phase 1).
 
-- **Throughput (their stack, loaded machine):** tg128 `5.17 ± 0.15` tok/s, pp512
-  `24.2 ± 1.8` tok/s. Far below the whitepaper's M4 Pro figures even after ~2.3×
-  bandwidth scaling (predicts ~8); effective weight stream ~37 GB/s vs our kernels'
-  ~85 GB/s. **The engineering upside grew:** a q27 ternary tier at our measured GEMV
-  efficiency projects to ~8–12 tok/s — roughly 2× their own product on this hardware.
-  (Number taken under desktop load + swap debt from the day's 17 GiB runs; re-bench on
-  a quiet machine before quoting externally.)
+- **Throughput (their stack):** quiet machine (2026-07-14, post-reboot, fork
+  `prism-b9591-62061f9`): tg128 `8.41 ± 1.36` tok/s, pp512 `52.48 ± 1.64` tok/s —
+  right at the whitepaper's M4 Pro figure scaled by ~2.3× bandwidth (predicts ~8).
+  Effective weight stream ≈ 6.66 GiB × 8.41 ≈ 60 GB/s before KV/activation traffic,
+  vs our decode GEMV's ~85 GB/s. (The original loaded-machine run — tg128
+  `5.17 ± 0.15`, pp512 `24.2 ± 1.8`, desktop load + swap debt from the day's 17 GiB
+  runs — is superseded; quote the quiet numbers.) The q27 upside is real but
+  narrower than the loaded run suggested: ~85 GB/s GEMV efficiency projects to
+  ~11–12 tok/s, roughly **1.3–1.4×** their stack on this hardware, plus what our
+  prefill/turbo3-KV/suffix-drafting advantages add on top.
 - **Behavioral probes (thinking mode, their llama-server): all pass.** JSON-only
   constrained output: exact. 7-constraint list-formatting probe (their weakest
   category): every constraint honored. Native OpenAI tool call: correct function,
@@ -111,6 +114,33 @@ the PPL comparison from indicative to definitive.
   (the tokenized `data/wikitext2-test.tokens.bin` is already in-repo and reproducible
   via `build/tokenize_to_bin`).
 
+### Fork "Q2_0" (ggml type 42) slot encoding — authoritative (read 2026-07-14, tag `prism-b9591-62061f9`)
+
+Source of truth: `ggml/src/ggml-common.h` (`block_q2_0`), `ggml/src/ggml-quants.c`
+(`quantize_row_q2_0_ref`, `dequantize_row_q2_0`), `ggml/src/ggml-metal/ggml-metal.metal`
+(`dequantize_q2_0`). CPU and Metal decoders are bit-identical.
+
+- **Block:** `QK2_0 = 128` values → `{ ggml_half d; uint8_t qs[32]; }`, 34 bytes,
+  **2.125 bpw**. The fork is natively g128 — the "g64" in the pack filename is
+  cosmetic; no scale-pair collapse is needed for the 7.17 GB Q2_0 pack. A row of k
+  elements is k/128 consecutive 34-byte blocks (standard ggml row layout: scale first,
+  then the 32 quant bytes).
+- **Slot packing:** sequential, 4 values per byte, **LSB-first**. Element `j` of a
+  block lives in `qs[j/4]` at bit offset `(j%4)*2`. No Q4_0-style lo/hi nibble split.
+- **Decode:** `value = ((int)q - 1) * d` with `q = (qs[j/4] >> ((j%4)*2)) & 3`,
+  i.e. codes `{0,1,2,3} → {−1, 0, +1, +2}`. **The codespace is NOT strictly ternary:
+  code 3 decodes to +2.** The fork's own quantizer can never emit it (scale is the
+  block amax, so `round(w/d) ∈ [−1,1]`), but the Bonsai pack comes from their QAT
+  pipeline, not this quantizer — the repack must scan every slot and hard-fail on
+  code 3 (or, if it ever appears, T2_G128 must grow a +2 story; don't decide that
+  silently).
+- **Scale:** one FP16 `d` per 128 values; dequant multiplies in FP32 after the
+  integer subtract. Reference dequant order: FP16→FP32 the scale once per block, then
+  `(q−1)*d` per element.
+- Sibling type `GGML_TYPE_Q1_0` (`QK1_0 = 128`, 1 bit/element, 18-byte block) exists
+  in the fork — the binary-tier follow-up has the same authoritative-source answer
+  waiting.
+
 ## Phase 1 — format + repack
 
 - `DType::T2_G128 = 4` (or `T2_G64` if the source scales don't collapse — see below).
@@ -119,14 +149,48 @@ the PPL comparison from indicative to definitive.
   (packing order chosen for 128-byte coalesced reads, documented in FORMAT.md).
 - `tools/repack.py` grows a ternary path (`quant_policy: bonsai-t2-v1`): read their
   GGUF pack, verify values ∈ {−1, 0, +1} per slot exactly, re-pack into our layout.
-  Whitepaper: the g64 Q2_0 pack is the native g128 representation with each scale
+  ~~Whitepaper: the g64 Q2_0 pack is the native g128 representation with each scale
   repeated per 64-value block — verify pairs are equal and collapse to g128; keep g64
-  as fallback. Read their fork's dequant source for the authoritative slot encoding
-  first; do not guess it.
+  as fallback.~~ **Resolved by the source reading:** the fork's type 42 is natively
+  g128 (`QK2_0 = 128`); the 7.17 GB Q2_0 pack needs no scale collapse, and its code
+  bytes are already in exactly the layout T2_G128 wants — the repack is a lossless
+  byte-copy plus scale-blob separation.
 - Verify tokenizer identity (same base model) against our `.tok`; MTP-head tensors:
   confirm absent, and record what the engine needs to tolerate their absence cleanly.
 - Gate: repacked artifact round-trips — dequantized q27 tensors bit-match dequantized
   GGUF tensors for every weight.
+
+### Phase 1 status (2026-07-14 night): repack DONE, all gates passed
+
+Artifact: `models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27` (7.15 GB, md5
+`8babb56d…` in the dir's CHECKSUMS.md5), repacked from the Q2_0 pack in 143 s.
+`gguf-py` doesn't know the fork's types; repack.py now forges enum members for
+type 42 (and 41, the binary sibling) so the mainline package reads their packs.
+
+- **Round-trip gate: PASSED.** All 498 Q2_0 tensors byte-copy losslessly into
+  T2_G128 (same code bytes, same decode formula); the chunked bit-exact dequant
+  comparison (fork reference formula vs FORMAT.md formula) passed on every tensor.
+  All F32 tensors pass through untouched. rel-RMSE 0.0000 across the board.
+- **Strictly ternary: CONFIRMED.** Zero code-3 slots across all 26.89 B ternary
+  weights — the +2 code is unused, as hoped; T2_G128's forbidden-code rule is safe.
+  Sparsity: 29.7% zeros overall (range 23.4% `blk.0.ssm_alpha` → 34.1%
+  `blk.33.ssm_beta`) — a ternary-GEMV skip path has real headroom if ever needed.
+- **Tokenizer identity: CONFIRMED byte-exact.** `tools/export_tokenizer.py` output
+  from the ternary GGUF is byte-identical to `models/qwen36-27b-mtp/qwen36-27b-mtp.tok`
+  (248,320 tokens, 247,587 merges, bos 248044, eos 248046). The ternary tier reuses
+  the official `.tok`; no second tokenizer file needed.
+- **Pack census** (851 tensors, arch `qwen35`, blk 0–63, ctx 262144 — same dims as
+  the official artifact): Q2_0 = every matmul weight *including* `token_embd`,
+  `output`, `ssm_alpha`, `ssm_beta`; F32 = all norms, `ssm_a`, `ssm_dt.bias`,
+  `ssm_conv1d`. MTP (`blk.64.*`): **absent**, as predicted.
+- **What the engine must tolerate (Phase 3 loader/dispatch checklist):**
+  1. dtype byte 4 → T2_G128 kernels (GEMV + chunk GEMM, Phase 2).
+  2. `token_embd.weight` in T2 → ternary row-lookup dequant (trivial: 40 groups/row).
+  3. Missing `blk.64.*` and missing `output_q4.weight` → disable MTP drafting
+     cleanly (greedy + suffix drafting only); today's loader treats blk.64 as
+     required — needs an explicit "no MTP layer" mode keyed off the tensor table.
+  4. `ssm_alpha`/`ssm_beta` arrive as T2 (official tier has them F16) — dispatch is
+     per-tensor already, but any code assuming their dtype must be checked.
 
 ## Phase 2 — Metal kernels
 
@@ -142,6 +206,49 @@ the PPL comparison from indicative to definitive.
   per-group scales; `metal_gemv_bench`/`metal_prefill_bench` gain `--dtype t2` synthetic
   modes for bandwidth attribution. New kernels add entry points; if any buffer-index or
   argument-struct change touches existing kernels, bump `Q27_SHADER_ABI`.
+
+### Phase 2 status (2026-07-14 late night): kernels DONE, all gates passed
+
+- **Ternary GEMV (`q27_matvec_t2_g128`), 93.2 GB/s aggregate** on the production
+  decode shapes (M4, synthetic resident weights) — above the Q8 kernel's 87 GB/s
+  and fully bandwidth-bound. Projects to **~12.5 tok/s resident-decode kernel
+  ceiling** (7.15 GB / 90 GB/s ≈ 79 ms/token) before attention/overhead — on the
+  plan's ~11–12 prediction. Two structures failed first (recorded because the
+  wrong-turn is instructive): a Q4-style shift/mask/imad packed-dot and a
+  byte→float4 threadgroup-LUT+fma variant both saturated ~125 Gelem/s — the M4's
+  issue-bound ceiling for per-element decode — which at 2.27 bpw is only ~33 GB/s,
+  *slower in wall time than Q4 on the same shape*. The winning structure (read
+  from the PrismML fork's kernel, then re-measured ourselves): **select-form dot**
+  (`Σ(c−1)y = Σ_lo y + 2Σ_hi y − Σy`, two conditional adds per element, no
+  multiplies, no decode) plus **4 rows per simdgroup** with the y-slice in
+  registers so activation reads amortize across rows.
+- **Design decision for Phase 3 dispatch: the production T2 GEMV takes FLOAT
+  activations** (`matvec`, not `matvec_quantized`). Ternary math with float x is
+  exact (+x/−x/0), needs no activation quantization, and the select-form kernel
+  wants floats anyway. The engine's decode path already materializes the float
+  rmsnorm output alongside the quantized copy, so routing is a per-dtype branch,
+  not a new buffer. `q27_matvec_t2_quantized` (int8 x, scalar integer-exact)
+  exists as the non-family-7 matmul fallback and parity reference.
+- **Ternary chunk GEMM (`q27_matmul_t2_mm`)**: q8_mm structure with 2-bit staging
+  (the 64-col K-tile subdivides the 128-col scale group identically). Prefill
+  chunk rate is unchanged vs Q4/Q8 (470 vs 484 ms/chunk synthetic) — prefill is
+  compute-bound, ternary neither helps nor hurts it.
+- **Embedding row-lookup kernels** (`q27_embedding_t2`, `_t2_rows`) landed;
+  `embedding_q8`/`embedding_q8_rows` entry points route per-dtype.
+- **Gates** (all in `make test-metal`, all passing on a clean rebuild): narrow
+  exact T2 matvec + embedding row (128 cols), wide float-path parity at 1152/5120
+  cols with 37 rows (threadgroup-spanning + clamped-row tail) and varied
+  per-group scales, wide int-path parity at 1152/5120, tiled GEMM parity at
+  {9×256, 9×1024, 17×1152} × n∈{1,4,5,8,9,12}. `test-cpu` green.
+- **ABI unchanged (6)** — new entry points only; the T2 grid shape (32 rows/tg)
+  is host-side. Loader/inspect know dtype 4; `repack.py`-produced artifacts load.
+- Benches: `metal_gemv_bench [reps] [--dtype q4q8|t2]`,
+  `metal_prefill_bench ... [--dtype t2]` (t2 = every projection + embedding
+  ternary; ssm_alpha/beta stay F16 pending the Phase 3 dispatch decision).
+- Deferred to merge time: the byte-exact CUDA 16-token gate on the official
+  artifact (shared loader.cpp touched — additive enum only, but the gate is
+  mandatory for shared-path merges) and a `metal_decode_bench --dtype t2` mode
+  (Phase 4 lists it).
 
 ## Phase 3 — engine integration + quality gates
 
@@ -159,6 +266,60 @@ the PPL comparison from indicative to definitive.
      low-bit weights *increase* KV tolerance; we get the measurement for free).
   4. Suffix-drafting A/B: committed tokens identical to ternary greedy.
 
+### Phase 3 status (2026-07-15 early): integration DONE; gates 1, 2, 4 passed, gate 3 running
+
+The ternary artifact now runs end-to-end on the q27 Metal engine — the first
+fully-resident 27B decode on this machine.
+
+- **Loader/validation:** `validate_architecture()` branches on
+  `quant_policy == "bonsai-t2-v1"`: 64 blocks (no `nextn_predict_layers`, no
+  blk.64 in the attention map), T2 `token_embd`/`output`/`ssm_alpha`/`ssm_beta`,
+  `group_t2 == 128`, and an explicit assertion that no MTP tensors exist in a
+  ternary artifact. `has_mtp_` gates every MTP entry point with a clear error
+  ("use --suffix drafting"); MTP KV caches are not allocated for ternary.
+- **Dispatch:** new `project`/`project_pair` helpers route T2 projections to the
+  float-activation select-form GEMV (and skip the now-dead activation-quantize
+  dispatches); Q4/Q8 keep the packed-dot path through the same helpers.
+  Chunked prefill stays on `matmul_quantized` (the T2 GEMM); ternary
+  `ssm_alpha`/`ssm_beta` chunk through the T2 GEMM instead of the F16 pair-rows
+  kernel (same output layout). Unrouted sites still work — the quantized entry
+  points accept T2 — so nothing can dispatch-fail on dtype.
+- **Gate 1 (validate + suites): PASSED.** `--validate-only` OK on both tiers;
+  `make test-metal test-cpu` green.
+- **Gate 2 (vs the fork, same pack): PASSED, byte-identical** — stronger than
+  the tolerance-level expectation. Greedy continuations match the fork's
+  llama-server (`temperature 0, top_k 1`; note: `"samplers": []` makes their
+  server nondeterministic — use top_k 1) token-for-token on "The capital of
+  France is" (16 and 48 tokens) and "def fibonacci(n):" (32 tokens).
+- **Gate 4 (suffix drafting): PASSED** — committed tokens identical to greedy
+  (0 drafts accepted on the test prompt; drafting effectiveness is a Phase 4
+  question, identity is the gate).
+- **Official-tier regression:** canonical smoke (`--tokens 760,6511,314,9338,369`)
+  still produces "Paris" after the dispatch refactor. The byte-exact CUDA
+  16-token gate remains mandatory at merge time.
+- **Observed throughput (unprofiled, base M4, greedy serial):** ~8.2–9.4 tok/s
+  over 256-token runs (run-to-run variance, likely thermal), vs the fork's
+  8.41 ± 1.36 on the same machine. `Q27_METAL_PROFILE` attribution puts the
+  T2 GEMV at ~83 ms/token — exactly the bandwidth prediction — so the gap to
+  ~11 tok/s is per-token overhead outside the GEMV (argmax readback sync per
+  step, command-buffer turnaround, attention/GDN residual): Phase 4 material.
+- **Gate 3 (32K turbo3 NLL A/B): deferred to an overnight run** (killed at
+  ~2k/32768 positions — a 2 h machine-exclusive job mid-session was the wrong
+  trade; it gates no current decision). Two harness notes for the rerun and all
+  future NLL work:
+  1. `--nll` now prints a **running mean NLL/PPL every 2048 positions**, so a
+     long pass yields its verdict in the first minutes and the tail only
+     refines the deep buckets.
+  2. The cheap protocol when only the weight-quality question matters: a
+     short pass over the same stream compares bucket-exactly against the
+     official 32K run's shallow buckets (0–2k PPL 4.904, 2k–8k PPL 6.884) —
+     `--nll-long 8192 --ctx 8192 --kv turbo3` reproduces both, `4096` the
+     first. Attention is linear-in-position, so an 8K pass is ~1/16 the
+     attention work of 32K. Only the weights×KV depth-interaction question
+     needs the full pass, once per artifact/KV config, never per code change.
+  Overnight command:
+  `./build/q27-metal models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27 models/qwen36-27b-mtp/qwen36-27b-mtp.tok --nll data/wikitext2-test.tokens.bin --nll-long 32768 --ctx 32768 --kv turbo3`
+
 ## Phase 4 — performance validation
 
 `metal_decode_bench --dtype t2` resident ceiling; artifact decode tg128-style (expect
@@ -166,6 +327,22 @@ no paging term at all — first fully-resident 27B on this machine); prefill chu
 `Q27_METAL_PROFILE` attribution to confirm the GEMV share lands near the bandwidth
 bound. Report vs the ~11–12 tok/s prediction and vs their published M4 Pro numbers
 scaled by bandwidth.
+
+### Phase 4 first measurements (2026-07-15 early)
+
+- **Resident decode ceiling (`metal_decode_bench --dtype t2`, full step incl.
+  attention/GDN/argmax sync): 12.40 tok/s fp16 KV, 12.66 tok/s turbo3**
+  (80.7 / 79.0 ms/token, ~85 GB/s effective weight stream) — above the ~11–12
+  projection.
+- **Observed artifact decode: ~8.2–9.4 tok/s** warm (vs the fork's 8.41 ± 1.36
+  on this machine). Gap to ceiling ≈ 37 ms/token; the weights are mmap-wrapped
+  rather than resident synthetic buffers, so the suspects are page
+  residency/wiring of the mmap-backed MTLBuffers (the artifact *fits* now —
+  unlike the 17 GiB tier this tax should be removable: residency sets or
+  pre-touch/pin of the weight range) and per-step command-buffer + argmax
+  readback turnaround. Attribution next.
+- Prefill chunk rate: T2 ≈ Q4/Q8 (470 vs 484 ms/chunk synthetic) — compute-
+  bound, as expected; ternary doesn't change the prefill wall.
 
 ## Non-goals (this plan)
 
