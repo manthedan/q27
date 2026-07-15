@@ -208,8 +208,12 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
                                                 : (uint64_t)N_KV * HEAD_DIM * 2;
     const uint64_t total_cache_bytes =
         (16ull + (has_mtp_ ? 1 : 0)) * 2 * max_context_ * cache_row_bytes;
-    if (total_cache_bytes > backend_.recommended_working_set_size() / 2)
-        throw std::runtime_error("q27 Metal: requested KV cache is too large for this device; use --kv turbo3 or reduce --ctx");
+    // Budget the combined caches of every engine on this mapping, not just
+    // this one — two engines can each pass a per-engine check while jointly
+    // overcommitting the device.
+    if (shared_->cache_bytes + total_cache_bytes > backend_.recommended_working_set_size() / 2)
+        throw std::runtime_error("q27 Metal: requested KV cache (across engines on this mapping) is too large for this device; use --kv turbo3 or reduce --ctx");
+    shared_->cache_bytes += total_cache_bytes;
 
     // All wrappers alias the mmap. No weight-sized copy is created. A second
     // engine on the same Shared reuses the wrap — never a second mapping.

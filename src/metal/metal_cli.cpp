@@ -226,6 +226,10 @@ int main(int argc, char** argv) {
             auto shared = q27::MetalEngine::open_shared(model_path);
             q27::MetalEngine baseline(shared, context, false);
             q27::MetalEngine subject(shared, context, !kl_self);
+            if (serial_prefill) {
+                baseline.set_chunked_prefill(false);
+                subject.set_chunked_prefill(false);
+            }
             auto ready = std::chrono::steady_clock::now();
             fprintf(stderr, "Metal model ready on %s in %.2f s (two engines, one mapping: fp16 baseline vs %s)\n",
                     baseline.backend().name().c_str(),

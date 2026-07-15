@@ -27,12 +27,20 @@ class MetalEngine {
         Model model;
         MetalBackend backend;
         std::unordered_map<std::string, BackendTensor> weights;
+        // Combined KV-cache footprint of every engine on this mapping, so a
+        // second engine cannot pass the per-engine budget check while the
+        // pair overcommits the device (codex review finding, 2026-07-15).
+        uint64_t cache_bytes = 0;
         explicit Shared(Model&& opened) : model(std::move(opened)) {}
     };
     static std::shared_ptr<Shared> open_shared(const std::string& model_path);
     explicit MetalEngine(const std::string& model_path, uint32_t context = 128,
                          bool turbo3_kv = false);
     MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool turbo3_kv);
+    // Reference members alias shared GPU state; a copy with an independent
+    // position_ would corrupt its sibling. Engines are pinned to their spot.
+    MetalEngine(const MetalEngine&) = delete;
+    MetalEngine& operator=(const MetalEngine&) = delete;
 
     void reset();
     uint32_t step(uint32_t token);
