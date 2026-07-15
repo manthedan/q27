@@ -433,6 +433,12 @@ protocol notes.
    results say the key cache tolerates sub-2-bit, and that low-bit weights
    tolerate KV noise *better* — 0.0011–0.0029 nats vs FP16's 0.0137–0.222
    — a claim worth reproducing on turbo3 before trusting).
+   **LANDED (2026-07-15, `--kl-kv` / `--kl-kv-self`, design in
+   docs/plans/2026-07-15-kl-kv-gate.md). First 8K measurement: mean
+   0.0115 nats, depth-flat (0.0123 / 0.0113), max 2.83 — 4–10× their
+   low-bit band, just under their FP16 floor; their tolerance claim does
+   not reproduce at magnitude for T2+turbo3. See the METAL_PROGRESS
+   entry.**
 2. **Native ternary packing (paper §4.3 + §9 roadmap).** Their own kernels
    store each trit in a 2-bit slot (deployed 7.2 GB vs 5.9 GB
    information-theoretic); ours inherit that layout (T2_G128). Base-3
