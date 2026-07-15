@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 5
+// Q27_SHADER_ABI 6
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -985,15 +985,19 @@ kernel void q27_gdn_gates_rows(device const float *alpha [[buffer(0)]],
     beta[gid] = 1.0f / (1.0f + exp(-beta_raw[gid]));
 }
 
+// Separate src/dst ring bindings mirror q27_conv_step: MTP verification
+// points dst at a discard slot so the optimistic chunk never commits state,
+// and the acceptance replay commits it from parked inputs (src == dst).
 struct ConvChunkArgs { uint channels; uint tokens; };
-kernel void q27_conv_chunk(device float *ring [[buffer(0)]],
-                            device const float *qkv [[buffer(1)]],
-                            device const float *weight [[buffer(2)]],
-                            device float *out [[buffer(3)]],
-                            constant ConvChunkArgs &args [[buffer(4)]],
+kernel void q27_conv_chunk(device const float *ring_src [[buffer(0)]],
+                            device float *ring_dst [[buffer(1)]],
+                            device const float *qkv [[buffer(2)]],
+                            device const float *weight [[buffer(3)]],
+                            device float *out [[buffer(4)]],
+                            constant ConvChunkArgs &args [[buffer(5)]],
                             uint gid [[thread_position_in_grid]]) {
     if (gid >= args.channels) return;
-    float r0 = ring[gid], r1 = ring[args.channels + gid], r2 = ring[(ulong)2 * args.channels + gid];
+    float r0 = ring_src[gid], r1 = ring_src[args.channels + gid], r2 = ring_src[(ulong)2 * args.channels + gid];
     const float w0 = weight[(ulong)gid * 4], w1 = weight[(ulong)gid * 4 + 1];
     const float w2 = weight[(ulong)gid * 4 + 2], w3 = weight[(ulong)gid * 4 + 3];
     for (uint t = 0; t < args.tokens; t++) {
@@ -1002,16 +1006,17 @@ kernel void q27_conv_chunk(device float *ring [[buffer(0)]],
         out[(ulong)t * args.channels + gid] = value / (1.0f + exp(-value));
         r0 = r1; r1 = r2; r2 = xv;
     }
-    ring[gid] = r0; ring[args.channels + gid] = r1; ring[(ulong)2 * args.channels + gid] = r2;
+    ring_dst[gid] = r0; ring_dst[args.channels + gid] = r1; ring_dst[(ulong)2 * args.channels + gid] = r2;
 }
 
 struct DeltaChunkArgs { uint value_heads; uint qk_heads; uint head_dim; uint tokens; };
-kernel void q27_delta_chunk(device float *state [[buffer(0)]],
-                             device const float *conv [[buffer(1)]],
-                             device const float *g [[buffer(2)]],
-                             device const float *beta [[buffer(3)]],
-                             device float *out [[buffer(4)]],
-                             constant DeltaChunkArgs &args [[buffer(5)]],
+kernel void q27_delta_chunk(device const float *state_src [[buffer(0)]],
+                             device float *state_dst [[buffer(1)]],
+                             device const float *conv [[buffer(2)]],
+                             device const float *g [[buffer(3)]],
+                             device const float *beta [[buffer(4)]],
+                             device float *out [[buffer(5)]],
+                             constant DeltaChunkArgs &args [[buffer(6)]],
                              uint head [[threadgroup_position_in_grid]],
                              uint tid [[thread_index_in_threadgroup]]) {
     if (head >= args.value_heads || args.head_dim != 128 || args.qk_heads != 16) return;
@@ -1022,9 +1027,11 @@ kernel void q27_delta_chunk(device float *state [[buffer(0)]],
     const ulong conv_row = (ulong)(2 * args.qk_heads + args.value_heads) * 128;
     const ulong out_row = (ulong)args.value_heads * 128;
     threadgroup float q[128], k[128], part[4][128], delta[128];
-    device float *sh = state + (ulong)head * 128 * 128;
+    device const float *sh = state_src + (ulong)head * 128 * 128;
+    device float *sd = state_dst + (ulong)head * 128 * 128;
     // The chunk's whole state slice lives in registers; it is written back
-    // to device memory exactly once, at the chunk boundary.
+    // exactly once, at the chunk boundary, to state_dst (a discard slot for
+    // MTP verification, the live state for prefill and acceptance replay).
     float saved[32];
     for (uint n = 0; n < 32; n++) saved[n] = sh[(ulong)(i0 + n) * 128 + j];
     for (uint t = 0; t < args.tokens; t++) {
@@ -1055,7 +1062,7 @@ kernel void q27_delta_chunk(device float *state [[buffer(0)]],
         if (tile == 0) out[(ulong)t * out_row + (ulong)head * 128 + j] =
             part[0][j] + part[1][j] + part[2][j] + part[3][j];
     }
-    for (uint n = 0; n < 32; n++) sh[(ulong)(i0 + n) * 128 + j] = saved[n];
+    for (uint n = 0; n < 32; n++) sd[(ulong)(i0 + n) * 128 + j] = saved[n];
 }
 
 struct L2RowsArgs { uint heads; uint head_dim; uint row_stride; uint tokens; float eps; };

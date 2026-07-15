@@ -53,7 +53,7 @@ void check_range(uint64_t size, uint64_t offset, uint64_t bytes, const char* ope
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 5";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 6";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -1197,14 +1197,17 @@ void MetalBackend::gdn_gates_rows(const BackendBuffer& alpha, const BackendBuffe
     }
 }
 
-void MetalBackend::conv_chunk(BackendBuffer& ring, const BackendBuffer& qkv,
+void MetalBackend::conv_chunk(const BackendBuffer& ring_src, BackendBuffer& ring_dst,
+                              const BackendBuffer& qkv,
                               const BackendTensor& conv_weight, BackendBuffer& out,
                               uint32_t channels, uint32_t tokens) {
     if (!channels || !tokens || tokens > 12) throw std::runtime_error("q27 Metal: invalid chunked convolution");
-    MetalBuffer& rb = metal_buffer(ring); const MetalBuffer& q = metal_buffer(qkv);
+    const MetalBuffer& rs = metal_buffer(ring_src); MetalBuffer& rd = metal_buffer(ring_dst);
+    const MetalBuffer& q = metal_buffer(qkv);
     const MetalBuffer& w = tensor_data(conv_weight, DType::F32, "chunked GDN convolution");
     MetalBuffer& o = metal_buffer(out);
-    check_range(rb.size(), 0, (uint64_t)channels * 3 * 4, "chunked conv ring");
+    check_range(rs.size(), 0, (uint64_t)channels * 3 * 4, "chunked conv ring src");
+    check_range(rd.size(), 0, (uint64_t)channels * 3 * 4, "chunked conv ring dst");
     check_range(q.size(), 0, (uint64_t)channels * tokens * 4, "chunked conv input");
     check_range(w.size(), conv_weight.data_offset, (uint64_t)channels * 4 * 4, "chunked conv weight");
     check_range(o.size(), 0, (uint64_t)channels * tokens * 4, "chunked conv output");
@@ -1212,26 +1215,30 @@ void MetalBackend::conv_chunk(BackendBuffer& ring, const BackendBuffer& qkv,
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_conv_chunk");
         [enc setComputePipelineState:impl_->conv_chunked];
-        [enc setBuffer:rb.handle() offset:0 atIndex:0]; [enc setBuffer:q.handle() offset:0 atIndex:1];
-        [enc setBuffer:w.handle() offset:(NSUInteger)conv_weight.data_offset atIndex:2];
-        [enc setBuffer:o.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc setBuffer:rs.handle() offset:0 atIndex:0]; [enc setBuffer:rd.handle() offset:0 atIndex:1];
+        [enc setBuffer:q.handle() offset:0 atIndex:2];
+        [enc setBuffer:w.handle() offset:(NSUInteger)conv_weight.data_offset atIndex:3];
+        [enc setBuffer:o.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
         [enc dispatchThreads:MTLSizeMake(channels,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked GDN convolution");
     }
 }
 
-void MetalBackend::delta_chunk(BackendBuffer& state, const BackendBuffer& conv,
+void MetalBackend::delta_chunk(const BackendBuffer& state_src, BackendBuffer& state_dst,
+                               const BackendBuffer& conv,
                                const BackendBuffer& g, const BackendBuffer& beta,
                                BackendBuffer& out, uint32_t value_heads, uint32_t qk_heads,
                                uint32_t head_dim, uint32_t tokens) {
     if (head_dim != 128 || qk_heads != 16 || !tokens || tokens > 12 ||
         impl_->delta_chunked.maxTotalThreadsPerThreadgroup < 512)
         throw std::runtime_error("q27 Metal: unsupported chunked DeltaNet shape");
-    MetalBuffer& sb = metal_buffer(state); const MetalBuffer& cv = metal_buffer(conv);
+    const MetalBuffer& ss = metal_buffer(state_src); MetalBuffer& sd = metal_buffer(state_dst);
+    const MetalBuffer& cv = metal_buffer(conv);
     const MetalBuffer& gb = metal_buffer(g); const MetalBuffer& bb = metal_buffer(beta);
     MetalBuffer& o = metal_buffer(out);
     const uint64_t state_bytes = (uint64_t)value_heads * head_dim * head_dim * 4;
-    check_range(sb.size(), 0, state_bytes, "chunked delta state");
+    check_range(ss.size(), 0, state_bytes, "chunked delta state src");
+    check_range(sd.size(), 0, state_bytes, "chunked delta state dst");
     check_range(cv.size(), 0, (uint64_t)(qk_heads * 2 + value_heads) * head_dim * tokens * 4, "chunked delta conv");
     check_range(gb.size(), 0, (uint64_t)value_heads * tokens * 4, "chunked delta g");
     check_range(bb.size(), 0, (uint64_t)value_heads * tokens * 4, "chunked delta beta");
@@ -1240,9 +1247,10 @@ void MetalBackend::delta_chunk(BackendBuffer& state, const BackendBuffer& conv,
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_delta_chunk");
         [enc setComputePipelineState:impl_->delta_chunked];
-        [enc setBuffer:sb.handle() offset:0 atIndex:0]; [enc setBuffer:cv.handle() offset:0 atIndex:1];
-        [enc setBuffer:gb.handle() offset:0 atIndex:2]; [enc setBuffer:bb.handle() offset:0 atIndex:3];
-        [enc setBuffer:o.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc setBuffer:ss.handle() offset:0 atIndex:0]; [enc setBuffer:sd.handle() offset:0 atIndex:1];
+        [enc setBuffer:cv.handle() offset:0 atIndex:2];
+        [enc setBuffer:gb.handle() offset:0 atIndex:3]; [enc setBuffer:bb.handle() offset:0 atIndex:4];
+        [enc setBuffer:o.handle() offset:0 atIndex:5]; [enc setBytes:&args length:sizeof(args) atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(512,1,1)];
         if (own) impl_->finish_command("chunked DeltaNet recurrence");
     }

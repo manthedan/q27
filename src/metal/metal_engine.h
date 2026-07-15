@@ -118,12 +118,15 @@ class MetalEngine {
     std::shared_ptr<BackendBuffer> cdelta_out_, cgated_out_, cffn_gate_, cffn_up_;
     BackendQuantized cq5120_, cq6144_, cq17408_;
 
-    // Batched MTP verification: per-lane logits/predictions and the GDN
-    // state checkpoint that makes the optimistic committing round reversible.
+    // Batched MTP verification: per-lane logits/predictions plus the parked
+    // GDN inputs and shared discard slots that make the verify chunk
+    // state-free — acceptance replays only the GDN recurrence over the
+    // accepted prefix, so no checkpoint, restore, or commit re-encode exists.
     // ctargets_/cnll_ also serve teacher-forced NLL quality gates.
     std::shared_ptr<BackendBuffer> cfinal_, clogits_, cpred_;
     std::shared_ptr<BackendBuffer> ctargets_, cnll_;
-    std::shared_ptr<BackendBuffer> ckpt_recurrent_, ckpt_ring_;
+    std::vector<std::shared_ptr<BackendBuffer>> park_qkv_, park_g_, park_beta_;
+    std::shared_ptr<BackendBuffer> discard_recurrent_, discard_ring_;
 
     std::shared_ptr<BackendBuffer> alloc_f32(uint64_t count);
     const BackendTensor& weight(const std::string& name) const;
@@ -135,12 +138,13 @@ class MetalEngine {
     void attention_block(uint32_t layer);
     void ffn(uint32_t layer);
     void encode_token(uint32_t token, bool produce_logits);
-    void gdn_chunk(uint32_t layer, uint32_t count);
+    void gdn_chunk(uint32_t layer, uint32_t count, bool verify);
     void attention_chunk(uint32_t layer, uint32_t count);
     void ffn_chunk(uint32_t layer, uint32_t count);
-    void chunk_forward(const uint32_t* tokens, uint32_t count);
+    void chunk_forward(const uint32_t* tokens, uint32_t count, bool verify = false);
     void encode_chunk(const uint32_t* tokens, uint32_t count);
-    void gdn_state_copy(bool restore);
+    static uint32_t gdn_slot(uint32_t layer) { return layer - (layer + 1) / 4; }
+    void gdn_replay(uint32_t count);
     std::vector<uint32_t> generate_mtp_batched(uint32_t pending, uint32_t count,
                                                uint32_t width);
     uint32_t stream_mtp_batched(uint32_t pending, uint32_t count, uint32_t width,

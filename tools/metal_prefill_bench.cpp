@@ -238,9 +238,9 @@ int main(int argc, char** argv) {
                                      *cx1, count);
         backend.gdn_gates_rows(*calpha, *cbeta_raw, ssm_a.tensor, ssm_dt.tensor, *cg, *cbeta,
                                GDN_HEADS, count);
-        backend.conv_chunk(*ring, *cqkv, ssm_conv.tensor, *cconv_out, GDN_CH, count);
+        backend.conv_chunk(*ring, *ring, *cqkv, ssm_conv.tensor, *cconv_out, GDN_CH, count);
         backend.l2norm_rows(*cconv_out, 2 * GDN_QK_HEADS, GDN_DIM, GDN_CH, count, EPS);
-        backend.delta_chunk(*recurrent, *cconv_out, *cg, *cbeta, *cdelta_out,
+        backend.delta_chunk(*recurrent, *recurrent, *cconv_out, *cg, *cbeta, *cdelta_out,
                             GDN_HEADS, GDN_QK_HEADS, GDN_DIM, count);
         backend.gated_norm_gdn(*cdelta_out, ssm_norm.tensor, *cz, *cgated_out,
                                count * GDN_HEADS, GDN_DIM, EPS);
