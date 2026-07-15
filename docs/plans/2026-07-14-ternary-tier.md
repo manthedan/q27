@@ -477,6 +477,22 @@ protocol notes.
    existing batched MTP verify (official tier has the MTP layer; verify
    path is byte-exact) — not their code. If it does not hold at batch 1 on
    Metal, record the measurement next to item 5 and keep drafting parked.
+   **RESOLVED (2026-07-15, code-read + public-evidence survey): the claim
+   is contradicted as a blanket statement and there is no scheduling policy
+   to lift.** llama.cpp PR #22673 / #23398 mainlined MTP spec-decode, but
+   the policy is a fixed draft width (`--spec-draft-n-max`, default 3), no
+   acceptance-adaptive width, no hardware tiers, opt-in only — the
+   "auto-enable, hardware-specific settings, ~2x" line is Unsloth Studio
+   marketing around static flags. Direct batch-1 Metal evidence: M1 Max
+   9B measured a NET LOSS at every setting (issue #23752, unfixed); the
+   Metal FA verification-kernel fix (PR #23114) regressed on M2 Ultra and
+   was closed unmerged; the only positive Metal datapoint (1.78×, dense
+   27B) is an M5 Max with ~4× this M4's bandwidth. Bonsai §6.2 and our own
+   amortization wall are corroborated for low-bandwidth Apple Silicon.
+   Drafting stays parked. (Optional same-hardware A/B if ever wanted:
+   `unsloth/gemma-4-E4B-it-qat-GGUF` UD-Q4_K_XL 4.2 GB + 60 MB MTP drafter,
+   llama-server `--spec-type draft-mtp` on/off, ~10 min — needs a ~4.3 GB
+   download and a post-2026-06-08 llama.cpp build.)
 
 ## Non-goals (this plan)
 
