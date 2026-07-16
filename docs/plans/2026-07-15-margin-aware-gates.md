@@ -50,6 +50,25 @@ metric + margin → recorded as the contract constants in this doc; hard
 alarm thresholds set one order above. Runs on the mac-mini, ~256–2048
 positions, minutes not hours.
 
+## Phase 1 result (2026-07-16): envelope measured — contract constants adopted (provisional)
+
+The `--envelope` instrument landed and ran (full record:
+2026-07-16-envelope-instrument.md). Per-class constants on T2/wikitext2
+at 2,048 positions per class, zero contradictions, repeat exactly zero:
+
+| class | max|Δ| p99.5 | KL p99.5 | corpus max |
+|---|---|---|---|
+| GEMM (half-staging pair) | 0.670 | 0.0031 | 1.163 |
+| attention (blocked-vs-legacy) | 0.620 | 0.0025 | 1.198 |
+| fold-order (chunk-vs-serial) | 0.646 | 0.0031 | 1.393 |
+
+Adopted (PROVISIONAL — one pair per class; Q6 wants two variants +
+holdout, queued for the 24 GB rig): normal envelope max|Δ| ≤ 0.7 and
+KL ≤ 0.004 nats per class; flips legitimate only at margin < 0.15 with
+ρ ≥ 1; hard alarms max|Δ| > 2.0, KL > 0.05, ρ<1 flip, NaN/Inf, repeat
+nonzero. The serial class p99.5 equals the old 384-position control max
+(0.646) — the quantile story validated.
+
 ## Reopened levers, re-priced under the new contract
 
 1. **Attention block-size {128..2048} and query-head-grouping {1,2,3,6}
