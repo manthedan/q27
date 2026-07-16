@@ -1424,6 +1424,279 @@ kernel void q27_matmul_t2_mm(
 // integer sums bounded by 16*127 = 2032 — always exact in half. (Variant A
 // staged prescaled activations and failed the shape suite; variant B's
 // 32-K flush let sums round past 2048 and moved the 2K NLL +0.4%.)
+// Trit code -> half bit pattern: (c-1) as f16 is one of three constants
+// (code 3 decodes to +2, preserving the arithmetic unpack's behavior for
+// a corrupt pack byte). The MMA roofline measured the unpack/convert
+// chain at 13.5% of the production GEMM (C/Beq, docs/plans/2026-07-16-
+// mma-roofline.md); constructing the bit pattern directly deletes the
+// integer subtract and int->half convert per element — the roofline's
+// ONE authorized targeted round. The staged halves are identical values,
+// so kernel output is bit-identical to the arithmetic unpack (pre/post
+// artifact A/B gates the change).
+constant ushort q27_t2_half_lut[4] = {0xbc00, 0x0000, 0x3c00, 0x4000};
+
+// Byte -> 4 trit halves (little-endian codes): one constant-memory gather
+// replaces four shift/mask/select chains. 2 KB, generated from the 2-bit
+// code map (code 3 -> +2.0h, matching the arithmetic unpack).
+constant half4 q27_t2_half4_lut[256] = {
+    half4(-1.0h, -1.0h, -1.0h, -1.0h),
+    half4(0.0h, -1.0h, -1.0h, -1.0h),
+    half4(1.0h, -1.0h, -1.0h, -1.0h),
+    half4(2.0h, -1.0h, -1.0h, -1.0h),
+    half4(-1.0h, 0.0h, -1.0h, -1.0h),
+    half4(0.0h, 0.0h, -1.0h, -1.0h),
+    half4(1.0h, 0.0h, -1.0h, -1.0h),
+    half4(2.0h, 0.0h, -1.0h, -1.0h),
+    half4(-1.0h, 1.0h, -1.0h, -1.0h),
+    half4(0.0h, 1.0h, -1.0h, -1.0h),
+    half4(1.0h, 1.0h, -1.0h, -1.0h),
+    half4(2.0h, 1.0h, -1.0h, -1.0h),
+    half4(-1.0h, 2.0h, -1.0h, -1.0h),
+    half4(0.0h, 2.0h, -1.0h, -1.0h),
+    half4(1.0h, 2.0h, -1.0h, -1.0h),
+    half4(2.0h, 2.0h, -1.0h, -1.0h),
+    half4(-1.0h, -1.0h, 0.0h, -1.0h),
+    half4(0.0h, -1.0h, 0.0h, -1.0h),
+    half4(1.0h, -1.0h, 0.0h, -1.0h),
+    half4(2.0h, -1.0h, 0.0h, -1.0h),
+    half4(-1.0h, 0.0h, 0.0h, -1.0h),
+    half4(0.0h, 0.0h, 0.0h, -1.0h),
+    half4(1.0h, 0.0h, 0.0h, -1.0h),
+    half4(2.0h, 0.0h, 0.0h, -1.0h),
+    half4(-1.0h, 1.0h, 0.0h, -1.0h),
+    half4(0.0h, 1.0h, 0.0h, -1.0h),
+    half4(1.0h, 1.0h, 0.0h, -1.0h),
+    half4(2.0h, 1.0h, 0.0h, -1.0h),
+    half4(-1.0h, 2.0h, 0.0h, -1.0h),
+    half4(0.0h, 2.0h, 0.0h, -1.0h),
+    half4(1.0h, 2.0h, 0.0h, -1.0h),
+    half4(2.0h, 2.0h, 0.0h, -1.0h),
+    half4(-1.0h, -1.0h, 1.0h, -1.0h),
+    half4(0.0h, -1.0h, 1.0h, -1.0h),
+    half4(1.0h, -1.0h, 1.0h, -1.0h),
+    half4(2.0h, -1.0h, 1.0h, -1.0h),
+    half4(-1.0h, 0.0h, 1.0h, -1.0h),
+    half4(0.0h, 0.0h, 1.0h, -1.0h),
+    half4(1.0h, 0.0h, 1.0h, -1.0h),
+    half4(2.0h, 0.0h, 1.0h, -1.0h),
+    half4(-1.0h, 1.0h, 1.0h, -1.0h),
+    half4(0.0h, 1.0h, 1.0h, -1.0h),
+    half4(1.0h, 1.0h, 1.0h, -1.0h),
+    half4(2.0h, 1.0h, 1.0h, -1.0h),
+    half4(-1.0h, 2.0h, 1.0h, -1.0h),
+    half4(0.0h, 2.0h, 1.0h, -1.0h),
+    half4(1.0h, 2.0h, 1.0h, -1.0h),
+    half4(2.0h, 2.0h, 1.0h, -1.0h),
+    half4(-1.0h, -1.0h, 2.0h, -1.0h),
+    half4(0.0h, -1.0h, 2.0h, -1.0h),
+    half4(1.0h, -1.0h, 2.0h, -1.0h),
+    half4(2.0h, -1.0h, 2.0h, -1.0h),
+    half4(-1.0h, 0.0h, 2.0h, -1.0h),
+    half4(0.0h, 0.0h, 2.0h, -1.0h),
+    half4(1.0h, 0.0h, 2.0h, -1.0h),
+    half4(2.0h, 0.0h, 2.0h, -1.0h),
+    half4(-1.0h, 1.0h, 2.0h, -1.0h),
+    half4(0.0h, 1.0h, 2.0h, -1.0h),
+    half4(1.0h, 1.0h, 2.0h, -1.0h),
+    half4(2.0h, 1.0h, 2.0h, -1.0h),
+    half4(-1.0h, 2.0h, 2.0h, -1.0h),
+    half4(0.0h, 2.0h, 2.0h, -1.0h),
+    half4(1.0h, 2.0h, 2.0h, -1.0h),
+    half4(2.0h, 2.0h, 2.0h, -1.0h),
+    half4(-1.0h, -1.0h, -1.0h, 0.0h),
+    half4(0.0h, -1.0h, -1.0h, 0.0h),
+    half4(1.0h, -1.0h, -1.0h, 0.0h),
+    half4(2.0h, -1.0h, -1.0h, 0.0h),
+    half4(-1.0h, 0.0h, -1.0h, 0.0h),
+    half4(0.0h, 0.0h, -1.0h, 0.0h),
+    half4(1.0h, 0.0h, -1.0h, 0.0h),
+    half4(2.0h, 0.0h, -1.0h, 0.0h),
+    half4(-1.0h, 1.0h, -1.0h, 0.0h),
+    half4(0.0h, 1.0h, -1.0h, 0.0h),
+    half4(1.0h, 1.0h, -1.0h, 0.0h),
+    half4(2.0h, 1.0h, -1.0h, 0.0h),
+    half4(-1.0h, 2.0h, -1.0h, 0.0h),
+    half4(0.0h, 2.0h, -1.0h, 0.0h),
+    half4(1.0h, 2.0h, -1.0h, 0.0h),
+    half4(2.0h, 2.0h, -1.0h, 0.0h),
+    half4(-1.0h, -1.0h, 0.0h, 0.0h),
+    half4(0.0h, -1.0h, 0.0h, 0.0h),
+    half4(1.0h, -1.0h, 0.0h, 0.0h),
+    half4(2.0h, -1.0h, 0.0h, 0.0h),
+    half4(-1.0h, 0.0h, 0.0h, 0.0h),
+    half4(0.0h, 0.0h, 0.0h, 0.0h),
+    half4(1.0h, 0.0h, 0.0h, 0.0h),
+    half4(2.0h, 0.0h, 0.0h, 0.0h),
+    half4(-1.0h, 1.0h, 0.0h, 0.0h),
+    half4(0.0h, 1.0h, 0.0h, 0.0h),
+    half4(1.0h, 1.0h, 0.0h, 0.0h),
+    half4(2.0h, 1.0h, 0.0h, 0.0h),
+    half4(-1.0h, 2.0h, 0.0h, 0.0h),
+    half4(0.0h, 2.0h, 0.0h, 0.0h),
+    half4(1.0h, 2.0h, 0.0h, 0.0h),
+    half4(2.0h, 2.0h, 0.0h, 0.0h),
+    half4(-1.0h, -1.0h, 1.0h, 0.0h),
+    half4(0.0h, -1.0h, 1.0h, 0.0h),
+    half4(1.0h, -1.0h, 1.0h, 0.0h),
+    half4(2.0h, -1.0h, 1.0h, 0.0h),
+    half4(-1.0h, 0.0h, 1.0h, 0.0h),
+    half4(0.0h, 0.0h, 1.0h, 0.0h),
+    half4(1.0h, 0.0h, 1.0h, 0.0h),
+    half4(2.0h, 0.0h, 1.0h, 0.0h),
+    half4(-1.0h, 1.0h, 1.0h, 0.0h),
+    half4(0.0h, 1.0h, 1.0h, 0.0h),
+    half4(1.0h, 1.0h, 1.0h, 0.0h),
+    half4(2.0h, 1.0h, 1.0h, 0.0h),
+    half4(-1.0h, 2.0h, 1.0h, 0.0h),
+    half4(0.0h, 2.0h, 1.0h, 0.0h),
+    half4(1.0h, 2.0h, 1.0h, 0.0h),
+    half4(2.0h, 2.0h, 1.0h, 0.0h),
+    half4(-1.0h, -1.0h, 2.0h, 0.0h),
+    half4(0.0h, -1.0h, 2.0h, 0.0h),
+    half4(1.0h, -1.0h, 2.0h, 0.0h),
+    half4(2.0h, -1.0h, 2.0h, 0.0h),
+    half4(-1.0h, 0.0h, 2.0h, 0.0h),
+    half4(0.0h, 0.0h, 2.0h, 0.0h),
+    half4(1.0h, 0.0h, 2.0h, 0.0h),
+    half4(2.0h, 0.0h, 2.0h, 0.0h),
+    half4(-1.0h, 1.0h, 2.0h, 0.0h),
+    half4(0.0h, 1.0h, 2.0h, 0.0h),
+    half4(1.0h, 1.0h, 2.0h, 0.0h),
+    half4(2.0h, 1.0h, 2.0h, 0.0h),
+    half4(-1.0h, 2.0h, 2.0h, 0.0h),
+    half4(0.0h, 2.0h, 2.0h, 0.0h),
+    half4(1.0h, 2.0h, 2.0h, 0.0h),
+    half4(2.0h, 2.0h, 2.0h, 0.0h),
+    half4(-1.0h, -1.0h, -1.0h, 1.0h),
+    half4(0.0h, -1.0h, -1.0h, 1.0h),
+    half4(1.0h, -1.0h, -1.0h, 1.0h),
+    half4(2.0h, -1.0h, -1.0h, 1.0h),
+    half4(-1.0h, 0.0h, -1.0h, 1.0h),
+    half4(0.0h, 0.0h, -1.0h, 1.0h),
+    half4(1.0h, 0.0h, -1.0h, 1.0h),
+    half4(2.0h, 0.0h, -1.0h, 1.0h),
+    half4(-1.0h, 1.0h, -1.0h, 1.0h),
+    half4(0.0h, 1.0h, -1.0h, 1.0h),
+    half4(1.0h, 1.0h, -1.0h, 1.0h),
+    half4(2.0h, 1.0h, -1.0h, 1.0h),
+    half4(-1.0h, 2.0h, -1.0h, 1.0h),
+    half4(0.0h, 2.0h, -1.0h, 1.0h),
+    half4(1.0h, 2.0h, -1.0h, 1.0h),
+    half4(2.0h, 2.0h, -1.0h, 1.0h),
+    half4(-1.0h, -1.0h, 0.0h, 1.0h),
+    half4(0.0h, -1.0h, 0.0h, 1.0h),
+    half4(1.0h, -1.0h, 0.0h, 1.0h),
+    half4(2.0h, -1.0h, 0.0h, 1.0h),
+    half4(-1.0h, 0.0h, 0.0h, 1.0h),
+    half4(0.0h, 0.0h, 0.0h, 1.0h),
+    half4(1.0h, 0.0h, 0.0h, 1.0h),
+    half4(2.0h, 0.0h, 0.0h, 1.0h),
+    half4(-1.0h, 1.0h, 0.0h, 1.0h),
+    half4(0.0h, 1.0h, 0.0h, 1.0h),
+    half4(1.0h, 1.0h, 0.0h, 1.0h),
+    half4(2.0h, 1.0h, 0.0h, 1.0h),
+    half4(-1.0h, 2.0h, 0.0h, 1.0h),
+    half4(0.0h, 2.0h, 0.0h, 1.0h),
+    half4(1.0h, 2.0h, 0.0h, 1.0h),
+    half4(2.0h, 2.0h, 0.0h, 1.0h),
+    half4(-1.0h, -1.0h, 1.0h, 1.0h),
+    half4(0.0h, -1.0h, 1.0h, 1.0h),
+    half4(1.0h, -1.0h, 1.0h, 1.0h),
+    half4(2.0h, -1.0h, 1.0h, 1.0h),
+    half4(-1.0h, 0.0h, 1.0h, 1.0h),
+    half4(0.0h, 0.0h, 1.0h, 1.0h),
+    half4(1.0h, 0.0h, 1.0h, 1.0h),
+    half4(2.0h, 0.0h, 1.0h, 1.0h),
+    half4(-1.0h, 1.0h, 1.0h, 1.0h),
+    half4(0.0h, 1.0h, 1.0h, 1.0h),
+    half4(1.0h, 1.0h, 1.0h, 1.0h),
+    half4(2.0h, 1.0h, 1.0h, 1.0h),
+    half4(-1.0h, 2.0h, 1.0h, 1.0h),
+    half4(0.0h, 2.0h, 1.0h, 1.0h),
+    half4(1.0h, 2.0h, 1.0h, 1.0h),
+    half4(2.0h, 2.0h, 1.0h, 1.0h),
+    half4(-1.0h, -1.0h, 2.0h, 1.0h),
+    half4(0.0h, -1.0h, 2.0h, 1.0h),
+    half4(1.0h, -1.0h, 2.0h, 1.0h),
+    half4(2.0h, -1.0h, 2.0h, 1.0h),
+    half4(-1.0h, 0.0h, 2.0h, 1.0h),
+    half4(0.0h, 0.0h, 2.0h, 1.0h),
+    half4(1.0h, 0.0h, 2.0h, 1.0h),
+    half4(2.0h, 0.0h, 2.0h, 1.0h),
+    half4(-1.0h, 1.0h, 2.0h, 1.0h),
+    half4(0.0h, 1.0h, 2.0h, 1.0h),
+    half4(1.0h, 1.0h, 2.0h, 1.0h),
+    half4(2.0h, 1.0h, 2.0h, 1.0h),
+    half4(-1.0h, 2.0h, 2.0h, 1.0h),
+    half4(0.0h, 2.0h, 2.0h, 1.0h),
+    half4(1.0h, 2.0h, 2.0h, 1.0h),
+    half4(2.0h, 2.0h, 2.0h, 1.0h),
+    half4(-1.0h, -1.0h, -1.0h, 2.0h),
+    half4(0.0h, -1.0h, -1.0h, 2.0h),
+    half4(1.0h, -1.0h, -1.0h, 2.0h),
+    half4(2.0h, -1.0h, -1.0h, 2.0h),
+    half4(-1.0h, 0.0h, -1.0h, 2.0h),
+    half4(0.0h, 0.0h, -1.0h, 2.0h),
+    half4(1.0h, 0.0h, -1.0h, 2.0h),
+    half4(2.0h, 0.0h, -1.0h, 2.0h),
+    half4(-1.0h, 1.0h, -1.0h, 2.0h),
+    half4(0.0h, 1.0h, -1.0h, 2.0h),
+    half4(1.0h, 1.0h, -1.0h, 2.0h),
+    half4(2.0h, 1.0h, -1.0h, 2.0h),
+    half4(-1.0h, 2.0h, -1.0h, 2.0h),
+    half4(0.0h, 2.0h, -1.0h, 2.0h),
+    half4(1.0h, 2.0h, -1.0h, 2.0h),
+    half4(2.0h, 2.0h, -1.0h, 2.0h),
+    half4(-1.0h, -1.0h, 0.0h, 2.0h),
+    half4(0.0h, -1.0h, 0.0h, 2.0h),
+    half4(1.0h, -1.0h, 0.0h, 2.0h),
+    half4(2.0h, -1.0h, 0.0h, 2.0h),
+    half4(-1.0h, 0.0h, 0.0h, 2.0h),
+    half4(0.0h, 0.0h, 0.0h, 2.0h),
+    half4(1.0h, 0.0h, 0.0h, 2.0h),
+    half4(2.0h, 0.0h, 0.0h, 2.0h),
+    half4(-1.0h, 1.0h, 0.0h, 2.0h),
+    half4(0.0h, 1.0h, 0.0h, 2.0h),
+    half4(1.0h, 1.0h, 0.0h, 2.0h),
+    half4(2.0h, 1.0h, 0.0h, 2.0h),
+    half4(-1.0h, 2.0h, 0.0h, 2.0h),
+    half4(0.0h, 2.0h, 0.0h, 2.0h),
+    half4(1.0h, 2.0h, 0.0h, 2.0h),
+    half4(2.0h, 2.0h, 0.0h, 2.0h),
+    half4(-1.0h, -1.0h, 1.0h, 2.0h),
+    half4(0.0h, -1.0h, 1.0h, 2.0h),
+    half4(1.0h, -1.0h, 1.0h, 2.0h),
+    half4(2.0h, -1.0h, 1.0h, 2.0h),
+    half4(-1.0h, 0.0h, 1.0h, 2.0h),
+    half4(0.0h, 0.0h, 1.0h, 2.0h),
+    half4(1.0h, 0.0h, 1.0h, 2.0h),
+    half4(2.0h, 0.0h, 1.0h, 2.0h),
+    half4(-1.0h, 1.0h, 1.0h, 2.0h),
+    half4(0.0h, 1.0h, 1.0h, 2.0h),
+    half4(1.0h, 1.0h, 1.0h, 2.0h),
+    half4(2.0h, 1.0h, 1.0h, 2.0h),
+    half4(-1.0h, 2.0h, 1.0h, 2.0h),
+    half4(0.0h, 2.0h, 1.0h, 2.0h),
+    half4(1.0h, 2.0h, 1.0h, 2.0h),
+    half4(2.0h, 2.0h, 1.0h, 2.0h),
+    half4(-1.0h, -1.0h, 2.0h, 2.0h),
+    half4(0.0h, -1.0h, 2.0h, 2.0h),
+    half4(1.0h, -1.0h, 2.0h, 2.0h),
+    half4(2.0h, -1.0h, 2.0h, 2.0h),
+    half4(-1.0h, 0.0h, 2.0h, 2.0h),
+    half4(0.0h, 0.0h, 2.0h, 2.0h),
+    half4(1.0h, 0.0h, 2.0h, 2.0h),
+    half4(2.0h, 0.0h, 2.0h, 2.0h),
+    half4(-1.0h, 1.0h, 2.0h, 2.0h),
+    half4(0.0h, 1.0h, 2.0h, 2.0h),
+    half4(1.0h, 1.0h, 2.0h, 2.0h),
+    half4(2.0h, 1.0h, 2.0h, 2.0h),
+    half4(-1.0h, 2.0h, 2.0h, 2.0h),
+    half4(0.0h, 2.0h, 2.0h, 2.0h),
+    half4(1.0h, 2.0h, 2.0h, 2.0h),
+    half4(2.0h, 2.0h, 2.0h, 2.0h),
+};
+
 kernel void q27_matmul_t2_mm_h(
         device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
         device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
@@ -1443,9 +1716,7 @@ kernel void q27_matmul_t2_mm_h(
     device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
     const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
     const uint xtok = tok0 + xloc;                       // device rows are global
-    const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
-    const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
     const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
     const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
     const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
@@ -1459,23 +1730,20 @@ kernel void q27_matmul_t2_mm_h(
     for (uint c0 = 0; c0 < args.cols; c0 += 64) {
         {
             const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
-            threadgroup half *dst = Wt + wrow * 64 + wcb;
-            dst[0]  = half(int(wp         & 3u) - 1);
-            dst[1]  = half(int((wp >>  2) & 3u) - 1);
-            dst[2]  = half(int((wp >>  4) & 3u) - 1);
-            dst[3]  = half(int((wp >>  6) & 3u) - 1);
-            dst[4]  = half(int((wp >>  8) & 3u) - 1);
-            dst[5]  = half(int((wp >> 10) & 3u) - 1);
-            dst[6]  = half(int((wp >> 12) & 3u) - 1);
-            dst[7]  = half(int((wp >> 14) & 3u) - 1);
-            dst[8]  = half(int((wp >> 16) & 3u) - 1);
-            dst[9]  = half(int((wp >> 18) & 3u) - 1);
-            dst[10] = half(int((wp >> 20) & 3u) - 1);
-            dst[11] = half(int((wp >> 22) & 3u) - 1);
-            dst[12] = half(int((wp >> 24) & 3u) - 1);
-            dst[13] = half(int((wp >> 26) & 3u) - 1);
-            dst[14] = half(int((wp >> 28) & 3u) - 1);
-            dst[15] = half(int((wp >> 30)      ) - 1);
+            // Roofline round (docs/plans/2026-07-16-mma-roofline.md): one
+            // byte-LUT gather per 4 trits + 4 vector stores replaces the
+            // 16 shift/mask/int-sub/convert chains and 16 scalar stores —
+            // staged halves are identical values, so output is
+            // bit-identical to the arithmetic unpack. (K=128 staging was
+            // also tried in the round and REGRESSED — 16 KB threadgroup
+            // footprint cost more occupancy than the halved barrier
+            // cadence saved; K=64 stands, as K=32 already showed from the
+            // other side. wcb is a multiple of 16 -> half4-aligned.)
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+            dst[3] = q27_t2_half4_lut[wp >> 24         ];
         }
         {
             const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
@@ -1483,7 +1751,10 @@ kernel void q27_matmul_t2_mm_h(
             threadgroup half *dst = Xt + xcb * 16 + xloc;
             // Raw int8 values: exact in half. The per-token 32-group scale
             // folds at the flush below; invalid token slots stage clamped
-            // real values whose outputs are never stored.
+            // real values whose outputs are never stored. (Stores are
+            // 16-strided by tile layout — not vectorizable; a device-side
+            // int8->half pre-pass measured C/Cx = 1.006, not worth a
+            // kernel + ABI bump.)
             dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
             dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
             dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
@@ -1538,6 +1809,7 @@ kernel void q27_matmul_t2_mm_h(
     if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
+
 
 // ---- A/B/C MMA roofline probes (bench-only, docs/plans/2026-07-16-mma-
 // roofline.md). Same dispatch grid, tile geometry, edge clamps, and
@@ -1703,6 +1975,119 @@ kernel void q27_mma_roofline_b_eq(
             dst[2 * 16] = xb2.x; dst[3 * 16] = xb2.y;
             dst[4 * 16] = xb2.y; dst[5 * 16] = xb2.x;
             dst[6 * 16] = xa2.y; dst[7 * 16] = xa2.x;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Arm Cx — the pre-converted-activation candidate: production packed-T2
+// weight staging (LUT unpack) with activations already half in device
+// memory (raw int8 values converted once device-side are exact in half,
+// so this candidate would be bit-identical in production; scale still
+// folds at the flush). Cx measures the ceiling of deleting the per-tile
+// char->half converts before building the production pre-pass.
+kernel void q27_mma_roofline_cx(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const half *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + xloc;
+    device const half *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            threadgroup half *dst = Wt + wrow * 64 + wcb;
+            dst[0]  = as_type<half>(q27_t2_half_lut[wp         & 3u]);
+            dst[1]  = as_type<half>(q27_t2_half_lut[(wp >>  2) & 3u]);
+            dst[2]  = as_type<half>(q27_t2_half_lut[(wp >>  4) & 3u]);
+            dst[3]  = as_type<half>(q27_t2_half_lut[(wp >>  6) & 3u]);
+            dst[4]  = as_type<half>(q27_t2_half_lut[(wp >>  8) & 3u]);
+            dst[5]  = as_type<half>(q27_t2_half_lut[(wp >> 10) & 3u]);
+            dst[6]  = as_type<half>(q27_t2_half_lut[(wp >> 12) & 3u]);
+            dst[7]  = as_type<half>(q27_t2_half_lut[(wp >> 14) & 3u]);
+            dst[8]  = as_type<half>(q27_t2_half_lut[(wp >> 16) & 3u]);
+            dst[9]  = as_type<half>(q27_t2_half_lut[(wp >> 18) & 3u]);
+            dst[10] = as_type<half>(q27_t2_half_lut[(wp >> 20) & 3u]);
+            dst[11] = as_type<half>(q27_t2_half_lut[(wp >> 22) & 3u]);
+            dst[12] = as_type<half>(q27_t2_half_lut[(wp >> 24) & 3u]);
+            dst[13] = as_type<half>(q27_t2_half_lut[(wp >> 26) & 3u]);
+            dst[14] = as_type<half>(q27_t2_half_lut[(wp >> 28) & 3u]);
+            dst[15] = as_type<half>(q27_t2_half_lut[wp >> 30        ]);
+        }
+        {
+            const half4 xa = *(device const half4 *)(xsrc + c0 + xcb);
+            const half4 xb = *(device const half4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = xa.x; dst[1 * 16] = xa.y;
+            dst[2 * 16] = xa.z; dst[3 * 16] = xa.w;
+            dst[4 * 16] = xb.x; dst[5 * 16] = xb.y;
+            dst[6 * 16] = xb.z; dst[7 * 16] = xb.w;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float wsA = float(weight_scales[wsrowA + c0 / 128]);

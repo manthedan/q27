@@ -61,8 +61,14 @@ const Shape SHAPES[] = {
     {"attn k/v     [1024x5120]",  1024, 5120, 32},
 };
 constexpr size_t N_SHAPES = sizeof(SHAPES) / sizeof(Shape);
-enum Arm { C = 0, BEQ = 1, B = 2, A = 3, N_ARMS = 4 };
-const char* ARM_NAMES[N_ARMS] = {"C", "Beq", "B", "A"};
+// Cx = the pre-converted-activation candidate (packed weights, LUT unpack,
+// half activations from device): measures the ceiling of deleting the
+// per-tile char->half converts before any production pre-pass is built.
+enum Arm { C = 0, BEQ = 1, B = 2, A = 3, CX = 4, N_ARMS = 5 };
+const char* ARM_NAMES[N_ARMS] = {"C", "Beq", "B", "A", "Cx"};
+static_assert(TRIALS % N_ARMS == 0,
+              "trial count must be a multiple of the arm count so the rotated "
+              "arm order is fully counterbalanced (codex P2)");
 
 struct Stat { double mean, lo, hi; };
 
@@ -192,11 +198,16 @@ int main(int argc, char** argv) {
         auto seed = upload_halves(backend, 32 * 64 + 64 * 16, true);
         auto y = backend.allocate((uint64_t)s.rows * X_ROWS * 4);
 
+        // Cx weights: the same packed T2 bytes as C, as a raw buffer.
+        auto wt2raw = backend.allocate(t2data.size());
+        backend.write(*wt2raw, 0, t2data.data(), t2data.size());
+
         const std::function<void()> ops[N_ARMS] = {
             [&] { backend.matmul_quantized(wt2, xq, X_ROWS, *y); },
             [&] { backend.mma_roofline('e', s.rows, s.cols, X_ROWS, *whe, wsh.get(), xhe.get(), xsb.get(), *y); },
             [&] { backend.mma_roofline('b', s.rows, s.cols, X_ROWS, *wh, wsh.get(), xh.get(), xsb.get(), *y); },
             [&] { backend.mma_roofline('a', s.rows, s.cols, X_ROWS, *seed, nullptr, nullptr, nullptr, *y); },
+            [&] { backend.mma_roofline('x', s.rows, s.cols, X_ROWS, *wt2raw, wsh.get(), xh.get(), xsb.get(), *y); },
         };
 
         // Anti-vacuity gates (zero-poisoned per arm), then warmup.
@@ -224,18 +235,19 @@ int main(int argc, char** argv) {
         }
     }
 
-    printf("%-28s %9s %9s %9s %9s | %-18s %8s\n",
-           "shape", "C ms", "Beq ms", "B ms", "A ms", "C/Beq [95% CI]", "C TFLOPs");
+    printf("%-28s %9s %9s %9s %9s %9s | %-18s %8s\n",
+           "shape", "C ms", "Beq ms", "B ms", "A ms", "Cx ms", "C/Beq [95% CI]", "C TFLOPs");
     for (size_t si = 0; si < N_SHAPES; si++) {
         const Shape& s = SHAPES[si];
         const Stat c = stat_of(t[si][C]), beq = stat_of(t[si][BEQ]);
         const Stat b = stat_of(t[si][B]), a = stat_of(t[si][A]);
+        const Stat cx = stat_of(t[si][CX]);
         std::vector<double> ratio(TRIALS);
         for (uint32_t k = 0; k < TRIALS; k++) ratio[k] = t[si][C][k] / t[si][BEQ][k];
         const Stat r = stat_of(ratio);
         const double tgs = (double)((s.rows + 31) / 32) * ((X_ROWS + 15) / 16);
-        printf("%-28s %9.3f %9.3f %9.3f %9.3f | %.3f [%.3f,%.3f] %8.2f\n",
-               s.name, c.mean * 1e3, beq.mean * 1e3, b.mean * 1e3, a.mean * 1e3,
+        printf("%-28s %9.3f %9.3f %9.3f %9.3f %9.3f | %.3f [%.3f,%.3f] %8.2f\n",
+               s.name, c.mean * 1e3, beq.mean * 1e3, b.mean * 1e3, a.mean * 1e3, cx.mean * 1e3,
                r.mean, r.lo, r.hi, tgs * s.cols * 1024.0 / c.mean / 1e12);
     }
 
@@ -254,10 +266,13 @@ int main(int argc, char** argv) {
         return stat_of(r);
     };
     const Stat Req = agg_ratio(C, BEQ), Rb = agg_ratio(C, B), Rba = agg_ratio(BEQ, A);
+    const Stat Rcx = agg_ratio(C, CX);
     printf("aggregate C/Beq (decision arm)      : %.3f [%.3f, %.3f]\n", Req.mean, Req.lo, Req.hi);
     printf("aggregate C/B   (expert-literal arm): %.3f [%.3f, %.3f]  (traffic-confounded, "
            "conservative)\n", Rb.mean, Rb.lo, Rb.hi);
     printf("aggregate Beq/A (cadence residual)  : %.3f [%.3f, %.3f]\n", Rba.mean, Rba.lo, Rba.hi);
+    printf("aggregate C/Cx  (half-x candidate)  : %.3f [%.3f, %.3f]  (bit-identical if built: "
+           "raw int8 is exact in half)\n", Rcx.mean, Rcx.lo, Rcx.hi);
     // No-headroom needs the UPPER bound under the line; headroom needs the
     // LOWER bound above it; anything else is inconclusive (codex P1).
     const char* verdict =
