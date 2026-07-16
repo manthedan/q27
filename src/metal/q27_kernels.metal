@@ -1644,6 +1644,113 @@ kernel void q27_mma_roofline_b(
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
 
+// Arm B_eq — equal-traffic no-unpack roofline (codex P1 on the landing
+// commit: literal arm B streams 8x the weight bytes of C, confounding the
+// unpack cost with bandwidth). This variant loads EXACTLY C's device bytes
+// per thread per tile (one half2 = 4 B for the weight, one half4 = 8 B for
+// the activation), replicates the values into the same 16/8 staging
+// stores, and keeps barriers, MMA loops, and the scale-fold flush
+// identical. C/B_eq isolates unpack + conversion ALU at equal traffic;
+// MMA timing is data-independent, so the replicated values don't matter.
+kernel void q27_mma_roofline_b_eq(
+        device const half *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const half *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    // Packed-equivalent layout: cols/8 halves per row (= cols/4 bytes, C's
+    // packed weight row size).
+    device const half *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 8);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + xloc;
+    device const half *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * (args.cols / 2);
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const half2 w2 = *(device const half2 *)(wsrc + (c0 + wcb) / 8);
+            threadgroup half *dst = Wt + wrow * 64 + wcb;
+            dst[0]  = w2.x; dst[1]  = w2.y; dst[2]  = w2.x; dst[3]  = w2.y;
+            dst[4]  = w2.x; dst[5]  = w2.y; dst[6]  = w2.x; dst[7]  = w2.y;
+            dst[8]  = w2.y; dst[9]  = w2.x; dst[10] = w2.y; dst[11] = w2.x;
+            dst[12] = w2.y; dst[13] = w2.x; dst[14] = w2.y; dst[15] = w2.x;
+        }
+        {
+            // Two 4-byte loads, matching C's two char4 loads per slot
+            // (codex P2: one 8-byte load would understate load-issue cost).
+            const half2 xa2 = *(device const half2 *)(xsrc + (c0 + xcb) / 2);
+            const half2 xb2 = *(device const half2 *)(xsrc + (c0 + xcb) / 2 + 2);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = xa2.x; dst[1 * 16] = xa2.y;
+            dst[2 * 16] = xb2.x; dst[3 * 16] = xb2.y;
+            dst[4 * 16] = xb2.y; dst[5 * 16] = xb2.x;
+            dst[6 * 16] = xa2.y; dst[7 * 16] = xa2.x;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
 // Arm A — MMA-core roofline: tiles filled once from an opaque device seed
 // (defeats constant folding), then the SAME per-64-K MMA loop count with
 // accumulators carried across the whole K walk (the acc dependency chain
