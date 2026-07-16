@@ -4,6 +4,7 @@
 #include "../suffixdraft.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -188,8 +189,12 @@ std::shared_ptr<MetalEngine::Shared> MetalEngine::open_shared(const std::string&
 }
 
 // Return this engine's KV budget to the mapping so later engines on a
-// still-live Shared are not falsely rejected (codex sweep finding).
-MetalEngine::~MetalEngine() { shared_->cache_bytes -= engine_cache_bytes_; }
+// still-live Shared are not falsely rejected (codex sweep finding). The
+// assert guards double-return/underflow (round-2 expert P0 #2 companion).
+MetalEngine::~MetalEngine() {
+    assert(shared_->cache_bytes >= engine_cache_bytes_ && "KV reservation underflow");
+    shared_->cache_bytes -= engine_cache_bytes_;
+}
 
 int MetalEngine::mask_pool_add(const void* bits) {
     constexpr uint64_t words = ((uint64_t)VOCAB + 31) / 32;
@@ -232,6 +237,17 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     // overcommitting the device.
     if (shared_->cache_bytes + total_cache_bytes > backend_.recommended_working_set_size() / 2)
         throw std::runtime_error("q27 Metal: requested KV cache (across engines on this mapping) is too large for this device; use --kv turbo3 or reduce --ctx");
+    // Constructor-exception safety (round-2 expert P0): the destructor only
+    // runs for fully-constructed engines, so a throw in any allocation below
+    // would otherwise strand this reservation and falsely reject later
+    // engines on a still-live Shared. Roll back unless the constructor
+    // completes; Shared is single-thread by contract, plain arithmetic.
+    struct ReservationGuard {
+        Shared& shared;
+        uint64_t bytes;
+        bool committed = false;
+        ~ReservationGuard() { if (!committed) shared.cache_bytes -= bytes; }
+    } reservation{*shared_, total_cache_bytes};
     shared_->cache_bytes += total_cache_bytes;
     engine_cache_bytes_ = total_cache_bytes;
 
@@ -329,6 +345,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
         discard_ring_ = alloc_f32((uint64_t)3 * GDN_CH);
     }
     reset();
+    reservation.committed = true;
 }
 
 void MetalEngine::set_chunked_prefill(bool enabled) {
