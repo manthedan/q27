@@ -93,6 +93,19 @@ class MetalEngine {
 
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
+
+    // Constrained tool decoding (BasicToolConstrainer engine surface): an
+    // append-only device pool of uint32 legal-token bitsets. mask_pool_add
+    // uploads one mask and returns its slot (-1 when the pool is full);
+    // set_tool_constraint selects the active slot (-1 disengages). The
+    // active mask is applied to the logits inside encode_token, before the
+    // argmax, so greedy decode, top-k extraction, and CPU sampling all see
+    // only legal tokens. Serial decode only; the MTP verify lanes
+    // (set_tool_masks5) are not wired on Metal.
+    static constexpr int MASK_POOL_CAP = 64;
+    int mask_pool_used = 0;
+    int mask_pool_add(const void* bits);
+    void set_tool_constraint(int mask_id);
     static constexpr uint32_t vocabulary_size() { return 248320; }
     uint32_t position() const { return position_; }
     SpecStats last_spec_stats() const { return last_spec_stats_; }
@@ -116,6 +129,7 @@ class MetalEngine {
     static constexpr uint32_t VOCAB = 248320;
     static constexpr uint32_t CHUNK_MAX = 12;
     static constexpr uint32_t TOPK_CAPACITY = 1024;
+    static constexpr uint32_t RESIDENT_MAX = 8;
     static constexpr float EPS = 1e-6f;
     static constexpr float FREQ_BASE = 1e7f;
 
@@ -146,6 +160,12 @@ class MetalEngine {
     // (Q27_METAL_GPU_SAMPLE=0 forces the full-logits readback path).
     std::shared_ptr<BackendBuffer> topk_values_, topk_indices_, topk_count_;
     bool gpu_sample_ = true;
+    std::shared_ptr<BackendBuffer> mask_pool_;   // lazy: MASK_POOL_CAP bitsets
+    int active_mask_ = -1;
+    // GPU-resident greedy decode: K chained steps per command buffer, token
+    // ids archived device-side (Q27_METAL_RESIDENT=0 opts out).
+    std::shared_ptr<BackendBuffer> token_ring_;
+    bool resident_ = true;
     std::shared_ptr<BackendBuffer> mtp_embed_norm_, mtp_hidden_norm_, mtp_concat_;
     std::shared_ptr<BackendBuffer> mtp_x_, mtp_hidden_out_, mtp_k_cache_, mtp_v_cache_;
     BackendQuantized q5120_, q6144_, q10240_, q17408_;
@@ -178,6 +198,7 @@ class MetalEngine {
 
     void validate_architecture() const;
     uint32_t sample_next(const SamplingParams& params, std::mt19937_64& random);
+    uint32_t decode_resident(uint32_t pending, uint32_t* out, uint32_t k);
     void project(const BackendTensor& w, const BackendBuffer& x_float,
                  const BackendQuantized& xq, BackendBuffer& out);
     void project_pair(const BackendTensor& a, BackendBuffer& a_out,
@@ -186,7 +207,7 @@ class MetalEngine {
     void gdn_block(uint32_t layer);
     void attention_block(uint32_t layer);
     void ffn(uint32_t layer);
-    void encode_token(uint32_t token, bool produce_logits);
+    void encode_token(uint32_t token, bool produce_logits, bool token_from_device = false);
     void gdn_chunk(uint32_t layer, uint32_t count, bool verify);
     void attention_chunk(uint32_t layer, uint32_t count);
     void ffn_chunk(uint32_t layer, uint32_t count);

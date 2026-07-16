@@ -733,6 +733,45 @@ int test_topk(q27::MetalBackend& backend) {
     return failures;
 }
 
+// Constrained-decoding mask: -inf where the bitset bit is clear, exact
+// passthrough where set; a masked argmax must pick the best LEGAL token.
+int test_mask_logits(q27::MetalBackend& backend) {
+    constexpr uint32_t n = 1000;   // odd tail: exercises the last partial word
+    std::vector<float> logits(n);
+    for (uint32_t i = 0; i < n; i++) logits[i] = (float)((i * 37) % 501) - 250.0f;
+    std::vector<uint32_t> mask((n + 31) / 32, 0);
+    for (uint32_t i = 0; i < n; i += 3) mask[i >> 5] |= 1u << (i & 31);  // every 3rd legal
+    auto lb = backend.allocate(n * 4);
+    auto mb = backend.allocate(mask.size() * 4);
+    backend.write(*lb, 0, logits.data(), n * 4);
+    backend.write(*mb, 0, mask.data(), mask.size() * 4);
+    backend.mask_logits(*lb, *mb, 0, n);
+    std::vector<float> got(n);
+    backend.read(*lb, 0, got.data(), n * 4);
+    uint32_t best_legal = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const bool legal = (mask[i >> 5] >> (i & 31)) & 1u;
+        if (legal && got[i] != logits[i]) {
+            fprintf(stderr, "mask_logits: legal %u changed (%g vs %g)\n", i, got[i], logits[i]);
+            return 1;
+        }
+        if (!legal && !(got[i] == -INFINITY)) {
+            fprintf(stderr, "mask_logits: illegal %u not -inf (%g)\n", i, got[i]);
+            return 1;
+        }
+        if (legal && logits[i] > logits[best_legal]) best_legal = i;
+    }
+    auto idx = backend.allocate(4);
+    backend.argmax(*lb, n, *idx);
+    uint32_t picked = 0;
+    backend.read(*idx, 0, &picked, 4);
+    if (picked != best_legal) {
+        fprintf(stderr, "mask_logits: argmax picked %u, best legal %u\n", picked, best_legal);
+        return 1;
+    }
+    return 0;
+}
+
 int test_gdn(q27::MetalBackend& backend) {
     int failures=0;
     // Gates.
@@ -1271,7 +1310,7 @@ int main() {
                        test_attention_production_shape(backend) +
                        test_turbo3(backend) + test_turbo3_production_shape(backend) +
                        test_attention_gqa_path() + test_attention_gqa_straddle() +
-                       test_topk(backend) +
+                       test_topk(backend) + test_mask_logits(backend) +
                        test_gdn(backend) + test_chunked(backend);
         if (failures) { fprintf(stderr, "Metal ops: %d failure(s)\n", failures); return 1; }
         puts("Metal decode primitives, FP16/turbo3 attention (incl. GQA KV-reuse path), GDN, and chunked prefill ops: OK");

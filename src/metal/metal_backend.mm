@@ -164,6 +164,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> t2;
     id<MTLComputePipelineState> t3;
     id<MTLComputePipelineState> t2_quantized_matmul_h;
+    id<MTLComputePipelineState> mask_logits_p;
     // Half-staging T2 chunk GEMM: default ON (1.28x chunk rate at quality
     // parity on this tier's gates); Q27_METAL_GEMM_HALF=0 opts out.
     bool gemm_half = true;
@@ -177,6 +178,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> t2_quantized_matmul;
     id<MTLComputePipelineState> embedding;
     id<MTLComputePipelineState> embedding_t2;
+    id<MTLComputePipelineState> embedding_dev;
+    id<MTLComputePipelineState> embedding_t2_dev;
     id<MTLComputePipelineState> embedding_t2_rows;
     id<MTLComputePipelineState> rms;
     id<MTLComputePipelineState> rms_quantized;
@@ -485,6 +488,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->q4 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_g64");
         impl_->t2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128");
         impl_->t3 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t3_g128");
+        impl_->mask_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_mask_logits");
         impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
@@ -502,6 +506,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         }
         impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
         impl_->embedding_t2 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2");
+        impl_->embedding_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8_dev");
+        impl_->embedding_t2_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_dev");
         impl_->embedding_t2_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_rows");
         impl_->rms = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm");
         impl_->rms_quantized = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_quantized");
@@ -1020,6 +1026,42 @@ void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
     }
 }
 
+// GPU-resident greedy decode: same row lookup, but the token id lives in a
+// device buffer written by the previous step's argmax — chained steps need
+// no CPU sync. The id cannot be range-checked host-side; argmax only writes
+// ids < vocab, and the kernels never index past the id row.
+void MetalBackend::embedding_from_device(const BackendTensor& weight, const BackendBuffer& token,
+                                         BackendBuffer& out) {
+    const bool t2 = weight.dtype == DType::T2_G128;
+    if ((weight.dtype != DType::Q8_G128 && !t2) || !weight.data || !weight.scales ||
+        !weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
+        weight.cols % 128)
+        throw std::runtime_error("q27 Metal: invalid embedding tensor");
+    check_range(out.size(), 0, weight.cols * 4, "embedding output");
+    const MetalBuffer& tokb = metal_buffer(token);
+    check_range(tokb.size(), 0, 4, "embedding token id");
+    const MetalBuffer& data = metal_buffer(*weight.data);
+    const MetalBuffer& scales = metal_buffer(*weight.scales);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,
+                weight.rows * weight.cols / (t2 ? 4 : 1), "embedding weight");
+    check_range(tensor_limit(scales.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,
+                weight.rows * (weight.cols / 128) * 2, "embedding scales");
+    MetalBuffer& output = metal_buffer(out);
+    @autoreleasepool {
+        bool own; id<MTLComputeCommandEncoder> enc = impl_->encoder_for_operation(own,
+            t2 ? "q27_embedding_t2_dev" : "q27_embedding_q8_dev");
+        [enc setComputePipelineState:t2 ? impl_->embedding_t2_dev : impl_->embedding_dev];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:output.handle() offset:0 atIndex:2];
+        [enc setBuffer:tokb.handle() offset:0 atIndex:3];
+        uint32_t cols = (uint32_t)weight.cols;
+        [enc setBytes:&cols length:sizeof(cols) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(cols, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("embedding (device token)");
+    }
+}
+
 void MetalBackend::rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
                             BackendBuffer& out, uint32_t n, float eps) {
     const MetalBuffer& w = tensor_data(weight, DType::F32, "rmsnorm");
@@ -1195,6 +1237,26 @@ void MetalBackend::topk(const BackendBuffer& x, uint32_t n, uint32_t k,
         [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];
         if(own) impl_->finish_command("top-k");
+    }
+}
+
+void MetalBackend::mask_logits(BackendBuffer& logits, const BackendBuffer& masks,
+                                uint64_t mask_offset, uint32_t n) {
+    MetalBuffer& lb = metal_buffer(logits);
+    const MetalBuffer& mb = metal_buffer(masks);
+    if (!n) throw std::runtime_error("q27 Metal: empty mask_logits");
+    check_range(lb.size(), 0, (uint64_t)n * 4, "mask_logits logits");
+    check_range(mb.size(), mask_offset, ((uint64_t)n + 31) / 32 * 4, "mask_logits mask");
+    if (mask_offset % 4) throw std::runtime_error("q27 Metal: mask offset must be word-aligned");
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_mask_logits");
+        [enc setComputePipelineState:impl_->mask_logits_p];
+        [enc setBuffer:lb.handle() offset:0 atIndex:0];
+        [enc setBuffer:mb.handle() offset:(NSUInteger)mask_offset atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((n + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("mask logits");
     }
 }
 

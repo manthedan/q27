@@ -68,6 +68,15 @@ class MetalBackend final : public ComputeBackend {
     void argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out_index) override;
     void topk(const BackendBuffer& x, uint32_t n, uint32_t k,
               BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count) override;
+    // Constrained decoding: -inf every logit whose bit is clear in the
+    // uint32 bitset at mask_offset (word-aligned) inside masks.
+    void mask_logits(BackendBuffer& logits, const BackendBuffer& masks,
+                     uint64_t mask_offset, uint32_t n);
+    // GPU-resident greedy decode: embedding row selected by a device-side
+    // token id (the previous step's argmax output) — no CPU sync between
+    // chained decode steps.
+    void embedding_from_device(const BackendTensor& weight, const BackendBuffer& token,
+                               BackendBuffer& out);
     void kv_store_f16(const BackendBuffer& k, const BackendBuffer& v,
                       BackendBuffer& k_cache, BackendBuffer& v_cache,
                       uint32_t position, uint32_t row_length) override;
