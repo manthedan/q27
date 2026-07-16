@@ -61,7 +61,14 @@ transfer across tiers.
    break-even ~2.9 tok/round, inside DSpark's measured 3.8). Gates: existing
    chunk shape suite (exit-code-checked), artifact committed tokens
    byte-identical, oracle re-sweep S(12) ≥ 3× as the acceptance measure.
-2. **Verify width past 12.** Decouple `VERIFY_CHUNK_MAX` from the NLL/KL
+2. **LANDED 2026-07-16 (mac-mini) — the S(48) ≥ 3× bar FIRES: S(48) =
+   3.938× (S(16) = 3.859×), state gate PASS all widths, VERIFY_CHUNK_MAX
+   = 48 shipped.** Key structure finding: round cost is flat per 16-token
+   TILE (w=16 costs +3.6% over w=12), stepping a full weight stream per
+   tile — full-tile widths {16, 32, 48} are the sweet spots. w=12 round
+   re-measured 356 ms (from 424) on the byte-LUT kernel round alone.
+   Full record: 2026-07-16-lever2-verify-width.md. ~~Verify width past
+   12.~~ Decouple `VERIFY_CHUNK_MAX` from the NLL/KL
    width-12 contract exactly as `PREFILL_CHUNK_MAX` was decoupled (buffers:
    `clogits_` grows 11.9 → 47.7 MB at 48-wide — fine). At the measured 48-wide
    chunk rate (48.37 tok/s → ~992 ms/chunk) a 48-lane verify is ~20.7 ms/token:

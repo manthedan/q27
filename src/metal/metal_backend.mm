@@ -2228,7 +2228,9 @@ void MetalBackend::sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer
 
 void MetalBackend::argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows,
                                BackendBuffer& out_indices) {
-    if (!n || !rows || rows > 12) throw std::runtime_error("q27 Metal: invalid chunked argmax");
+    // Cap matches VERIFY_CHUNK_MAX (lever 2): the verify/oracle path argmaxes
+    // up to 48 rows; the kernel is one threadgroup per row, width-agnostic.
+    if (!n || !rows || rows > 48) throw std::runtime_error("q27 Metal: invalid chunked argmax");
     const MetalBuffer& input = metal_buffer(x); MetalBuffer& output = metal_buffer(out_indices);
     check_range(input.size(), 0, (uint64_t)n * rows * 4, "chunked argmax input");
     check_range(output.size(), 0, (uint64_t)rows * 4, "chunked argmax output");
