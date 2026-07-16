@@ -50,6 +50,12 @@ expect_reject() {
 SNAP="$TMP/snap.fp16"
 head -c 1000 "$SNAP" > "$TMP/truncated.snap"
 expect_reject "truncated file" "$BIN" "$MODEL" "$TOK" --load-state "$TMP/truncated.snap" -n 4 --ctx $CTX
+# Truncation INSIDE the final blob: every earlier blob is intact, so a
+# validator that only walks lengths would bless it and pass 2 would
+# partially restore (codex P2 on 39d74a0).
+SNAPBYTES=$(wc -c < "$SNAP")
+head -c $((SNAPBYTES - 100)) "$SNAP" > "$TMP/tail_truncated.snap"
+expect_reject "truncation inside the final blob" "$BIN" "$MODEL" "$TOK" --load-state "$TMP/tail_truncated.snap" -n 4 --ctx $CTX
 cp "$SNAP" "$TMP/badid.snap"
 printf '\xff\xff\xff\xff' | dd of="$TMP/badid.snap" bs=1 seek=20 count=4 conv=notrunc 2>/dev/null
 expect_reject "corrupted artifact identity" "$BIN" "$MODEL" "$TOK" --load-state "$TMP/badid.snap" -n 4 --ctx $CTX

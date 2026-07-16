@@ -515,24 +515,6 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
 
 namespace {
 
-struct SnapshotIdentity { uint64_t size; unsigned char sha1[20]; };
-
-SnapshotIdentity artifact_identity(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) throw std::runtime_error("q27 Metal: cannot open artifact for identity: " + path);
-    SnapshotIdentity id{};
-    std::vector<unsigned char> head(65536);
-    const size_t got = fread(head.data(), 1, head.size(), f);
-    if (fseeko(f, 0, SEEK_END) != 0 || got == 0) {
-        fclose(f);
-        throw std::runtime_error("q27 Metal: cannot read artifact for identity: " + path);
-    }
-    id.size = (uint64_t)ftello(f);
-    fclose(f);
-    CC_SHA1(head.data(), (CC_LONG)got, id.sha1);
-    return id;
-}
-
 struct SnapshotHeader {
     char magic[8];
     uint64_t artifact_size;
@@ -557,6 +539,24 @@ void snap_read(FILE* f, void* data, size_t bytes, const std::string& path) {
 
 } // namespace
 
+// SHA1 over the whole mapped artifact — the bytes this engine actually
+// computes with. Chunked updates (CC_LONG is 32-bit); cached per Shared.
+const unsigned char* MetalEngine::snapshot_identity() {
+    if (!shared_->snap_sha_ready) {
+        CC_SHA1_CTX ctx;
+        CC_SHA1_Init(&ctx);
+        const unsigned char* base = (const unsigned char*)model_.mapping_base();
+        const uint64_t total = model_.mapping_size();
+        if (!base || !total)
+            throw std::runtime_error("q27 Metal: artifact mapping unavailable for snapshot identity");
+        for (uint64_t off = 0; off < total; off += 256u << 20)
+            CC_SHA1_Update(&ctx, base + off, (CC_LONG)std::min<uint64_t>(256u << 20, total - off));
+        CC_SHA1_Final(shared_->snap_sha1, &ctx);
+        shared_->snap_sha_ready = true;
+    }
+    return shared_->snap_sha1;
+}
+
 void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
                              uint32_t token_count) {
     if (token_count && !tokens)
@@ -572,9 +572,8 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
     try {
         SnapshotHeader h{};
         memcpy(h.magic, SNAP_MAGIC, sizeof h.magic);
-        const SnapshotIdentity id = artifact_identity(shared_->path);
-        h.artifact_size = id.size;
-        memcpy(h.artifact_sha1, id.sha1, sizeof h.artifact_sha1);
+        h.artifact_size = model_.mapping_size();
+        memcpy(h.artifact_sha1, snapshot_identity(), sizeof h.artifact_sha1);
         h.kv_dtype = turbo3_kv_ ? 1 : 0;
         h.position = position_;
         h.token_count = token_count;
@@ -621,9 +620,8 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         snap_read(f, &h, sizeof h, path);
         if (memcmp(h.magic, SNAP_MAGIC, sizeof h.magic) != 0)
             throw std::runtime_error("q27 Metal: not a q27 snapshot: " + path);
-        const SnapshotIdentity id = artifact_identity(shared_->path);
-        if (h.artifact_size != id.size ||
-            memcmp(h.artifact_sha1, id.sha1, sizeof id.sha1) != 0)
+        if (h.artifact_size != model_.mapping_size() ||
+            memcmp(h.artifact_sha1, snapshot_identity(), 20) != 0)
             throw std::runtime_error("q27 Metal: snapshot was taken against a different artifact: " + path);
         if (h.kv_dtype != (turbo3_kv_ ? 1u : 0u))
             throw std::runtime_error("q27 Metal: snapshot KV dtype does not match this engine: " + path);
@@ -650,19 +648,28 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         blobs.push_back({x1_.get(), x1_->size()});
         blobs.push_back({logits_.get(), logits_->size()});
         const off_t blob_start = ftello(f);
+        // Real file size up front: fseeko past EOF succeeds silently, so the
+        // walk below could otherwise bless a file truncated inside its FINAL
+        // blob and pass 2 would partially restore (codex P2 on 39d74a0).
+        if (fseeko(f, 0, SEEK_END) != 0)
+            throw std::runtime_error("q27 Metal: cannot read snapshot: " + path);
+        const off_t file_size = ftello(f);
+        if (fseeko(f, blob_start, SEEK_SET) != 0)
+            throw std::runtime_error("q27 Metal: cannot rewind snapshot: " + path);
+        uint64_t expected_end = (uint64_t)blob_start;
         for (const auto& [buf, bytes] : blobs) {
             uint64_t stored = 0;
             snap_read(f, &stored, sizeof stored, path);
             if (stored != bytes)
                 throw std::runtime_error("q27 Metal: snapshot blob layout does not match this engine: " + path);
+            expected_end += sizeof stored + stored;
+            if (expected_end > (uint64_t)file_size)
+                throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
             if (fseeko(f, (off_t)stored, SEEK_CUR) != 0)
                 throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
         }
-        unsigned char probe = 0;
-        if (fread(&probe, 1, 1, f) == 1)
+        if (expected_end != (uint64_t)file_size)
             throw std::runtime_error("q27 Metal: trailing bytes after snapshot blobs: " + path);
-        if (feof(f) == 0 && ferror(f) != 0)
-            throw std::runtime_error("q27 Metal: cannot read snapshot: " + path);
         // Pass 2: stream the validated blobs into the live buffers.
         backend_.synchronize();
         if (fseeko(f, blob_start, SEEK_SET) != 0)
