@@ -147,7 +147,13 @@ class PrefixCache {
 // only save_state/load_state (which read/write GPU buffers) go under it.
 class DiskSnapshotStore {
   public:
-    void init(std::string dir, uint64_t max_bytes) { dir_=std::move(dir); max_bytes_=max_bytes; }
+    // tag = artifact/KV identity prefix baked into every filename, so one
+    // directory shared by different artifacts or fp16/turbo3 servers never
+    // cross-matches or overwrites incompatible snapshots (codex P2 on
+    // 607160e); the deep header identity check at load stays underneath.
+    void init(std::string dir, uint64_t max_bytes, std::string tag) {
+        dir_=std::move(dir); max_bytes_=max_bytes; tag_=std::move(tag);
+    }
     bool enabled() const { return !dir_.empty(); }
 
     // Longest stored token prefix of `prompt`. Full-length matches whose
@@ -160,6 +166,7 @@ class DiskSnapshotStore {
         std::error_code ec;
         for(const auto& e:std::filesystem::directory_iterator(dir_,ec)) {
             if(!e.is_regular_file() || e.path().extension()!=".q27snap") continue;
+            if(e.path().filename().string().rfind(tag_,0)!=0) continue;
             q27::MetalEngine::SnapshotInfo info;
             try { info=q27::MetalEngine::peek_snapshot(e.path().string()); }
             catch(...) { continue; }   // corrupt/foreign file: never a hit
@@ -184,7 +191,7 @@ class DiskSnapshotStore {
         CC_SHA1(tokens,(CC_LONG)(count*4),sha);
         char hex[41];
         for(int i=0;i<20;i++) snprintf(hex+2*i,3,"%02x",sha[i]);
-        return dir_+"/"+hex+".q27snap";
+        return dir_+"/"+tag_+hex+".q27snap";
     }
 
     // Budget enforcement: oldest-first until the directory fits. The
@@ -211,7 +218,7 @@ class DiskSnapshotStore {
 
     std::atomic<uint64_t> hits{0}, saves{0};
   private:
-    std::string dir_; uint64_t max_bytes_=0; std::mutex m_;
+    std::string dir_; uint64_t max_bytes_=0; std::string tag_; std::mutex m_;
 };
 
 struct Runtime {
@@ -369,10 +376,19 @@ struct Runtime {
             std::filesystem::create_directories(sdir,ec);
             if(ec || !std::filesystem::is_directory(sdir))
                 throw std::runtime_error(std::string("Q27_METAL_SNAPSHOT_DIR is not a usable directory: ")+sdir);
-            snapstore.init(sdir,snap_mb*1024ull*1024ull);
-            slots[0]->engine.snapshot_identity();
-            fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB\n",
-                    sdir,(unsigned long long)snap_mb);
+            const unsigned char* sha=slots[0]->engine.snapshot_identity();
+            char tag[16];
+            snprintf(tag,sizeof tag,"%02x%02x%02x%02x%c-",sha[0],sha[1],sha[2],sha[3],
+                     turbo3?'t':'f');
+            snapstore.init(sdir,snap_mb*1024ull*1024ull,tag);
+            // A restart over an oversized directory must come back under
+            // budget without waiting for the next save (codex P2 on 607160e).
+            snapstore.evict_past_budget();
+            if(!slots[0]->engine.chunked_prefill())
+                fprintf(stderr,"prefix-snapshots: WARNING — no chunked prefill on this device; "
+                        "\"snapshot\" hints are ignored (loads still served)\n");
+            fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB, tag %s\n",
+                    sdir,(unsigned long long)snap_mb,tag);
         }
         if(constrain_tools) {
             vocab_bytes_v=tokenizer.vocab_bytes();
@@ -515,14 +531,18 @@ struct Runtime {
             engine.set_tool_constraint(-1);
             restored=slot->cache.restore(engine,prompt,mtp,hit,pending);
             if(!restored) { engine.reset(); hit=0; }
-            if(!restored && disk_ok && disk_len>0) {
-                // A stale or vanished file is a cold start, never an error.
+            // The deeper prefix wins across tiers: a short in-memory entry
+            // must not mask a much longer persisted one (codex P2 on
+            // 607160e). load_state validates fully before its first GPU
+            // write, so a rejected file leaves a memory-restored state
+            // intact; only a mid-restore I/O error falls all the way cold.
+            if(disk_ok && disk_len>hit) {
                 try {
                     engine.load_state(disk_path);
                     hit=disk_len;
                     if(hit==prompt.size()) { pending=engine.pending_from_logits(); restored=true; }
                     snapstore.hits++;
-                } catch(const std::exception&) { engine.reset(); hit=0; }
+                } catch(const std::exception&) { engine.reset(); hit=0; restored=false; }
             }
             if((uint64_t)engine.position()+(prompt.size()-hit)>context)
                 throw std::runtime_error("prompt exceeds context");
@@ -552,8 +572,14 @@ struct Runtime {
                 while(chunkable-i>=2) {
                     const uint32_t width=quantum_width(slot);
                     uint32_t take=(uint32_t)std::min<size_t>(width,chunkable-i);
-                    if(save_at && hit+i<save_at)
-                        take=(uint32_t)std::min<size_t>(take,save_at-(hit+i));
+                    if(save_at && hit+i<save_at) {
+                        // prefill_chunk takes 2..96 tokens: a one-token gap
+                        // to the boundary cannot be reached by capping, so
+                        // the (best-effort) save is skipped rather than the
+                        // request failing (codex P1 on 607160e).
+                        if(save_at-(hit+i)==1) save_at=0;
+                        else take=(uint32_t)std::min<size_t>(take,save_at-(hit+i));
+                    }
                     auto gpu=lease_now();
                     engine.prefill_chunk(suffix.data()+i,take);
                     i+=take;
