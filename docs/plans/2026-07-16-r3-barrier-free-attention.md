@@ -89,10 +89,14 @@ the kernel is correct, just slow. Decode head-major control unchanged
 
 bf2 lands at the **untiled** kernel's wall time almost exactly. Reading:
 
-- **Staging + two barriers per 8-row tile cost ~nothing on M4.** bf2
-  deletes them and gains zero; the block sweep says shorter serial softmax
-  chains and more independent partials buy zero too (slightly negative —
-  merge fold overhead grows).
+- **The barrier-cadence lever has no deployable win on M4.** bf2 deletes
+  staging and barriers and loses 2×; the block sweep says shorter serial
+  softmax chains and more independent partials buy nothing either
+  (slightly negative — merge fold overhead grows). Attribution caveat
+  (codex): this A/B changes barrier cost AND dequant/read sharing
+  simultaneously, so it bounds the *combined* lever, not the barrier term
+  alone — the barrier cost could be nonzero and merely swamped by the ~6×
+  dequant duplication.
 - **R1b's 2× was dequant/stream sharing, not barrier amortization**: t2
   halves per-token dequant + KV traffic (each staged row serves 2 tokens ×
   6 heads). bf2 gives sharing up entirely — each simdgroup dequantizes
@@ -109,8 +113,13 @@ bf2 lands at the **untiled** kernel's wall time almost exactly. Reading:
   half (halves threadgroup traffic; the GEMM half-staging lever's sibling)
   or a register-disciplined t3 (t4 lost to spills, but t3 with 25% less
   register pressure than t4 is unexplored).
-- The 3-loop barrier-cost calibration bench is superseded: bf2-vs-staged
-  at equal B *is* that measurement, and it read ~zero barrier cost.
+- The 3-loop barrier-cost calibration bench (isolating barrier floor /
+  arrival skew / duplication with otherwise-identical loops) remains OPEN,
+  not superseded: this A/B confounds barrier savings with duplication
+  cost (codex P2 on the landing commit corrected an overclaim here). It
+  is unscheduled — the deploy decision doesn't need the attribution, and
+  both R3 variants are parked — but any future attention lever that
+  banks on barrier reduction must run it first.
 - Probe surface stays in tree (bench-only, `attention_turbo3_causal_gqa_bf`
   + `--seq`-driven sweep in `metal_attn_bench`) as the negative-result
   witness and for a one-shot re-run on other hardware.
