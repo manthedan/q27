@@ -147,7 +147,7 @@ struct L2RowsArgs { uint32_t heads, head_dim, row_stride, tokens; float eps; };
 struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, position, tokens; float freq_base; };
 struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
 struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
-struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode; };
+struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode, head; };
 struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
 struct ArgmaxRowsArgs { uint32_t n, rows; };
 struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
@@ -2112,11 +2112,13 @@ void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuf
 void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
                                             BackendBuffer& k_cache, BackendBuffer& v_cache,
                                             uint32_t position, uint32_t kv_heads, uint32_t tokens,
-                                            uint32_t mode) {
+                                            uint32_t mode, uint32_t head) {
     if (!kv_heads || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid KV attribution store");
     if (mode != 1 && mode != 2)
         throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K) or 2 (V)");
+    if (head != UINT32_MAX && head >= kv_heads)
+        throw std::runtime_error("q27 Metal: KV attribution head out of range");
     const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
     MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
     const uint64_t row_floats = (uint64_t)kv_heads * 256;
@@ -2124,7 +2126,7 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
     check_range(vb.size(), 0, row_floats * tokens * 4, "attrib V rows");
     check_range(kc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib K cache");
     check_range(vc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib V cache");
-    TurboAttribArgs args{position, kv_heads, tokens, mode};
+    TurboAttribArgs args{position, kv_heads, tokens, mode, head};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_f16_attrib_rows");
         [enc setComputePipelineState:impl_->kv_store_attrib_rows];
