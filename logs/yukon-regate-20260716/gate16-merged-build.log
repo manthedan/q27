@@ -1,0 +1,1 @@
+gate error: Command '['ssh', 'yukon', 'curl', '-fsS', 'http://127.0.0.1:18080/v1/completions', '-H', 'Content-Type:application/json', '--data-binary', '@-']' returned non-zero exit status 7.

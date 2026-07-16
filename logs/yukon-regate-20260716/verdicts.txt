@@ -1,0 +1,6 @@
+YUKON RE-GATE PASS x2 (2026-07-16):
+1. Live prebuilt w8 server (Jul-14 build): 16-token canonical byte-exact, sha 6c1d4328... matches record.
+2. Merged CUDA build (62f9f95, isolated worktree ~/projects/q27-regate, sm_86-only, CUDA 12.0 compat fix): via build/q27 CLI — 16 generated IDs decode exactly to the canonical continuation. PASS.
+FINDING: merged q27-server OOMs on the 3090 at ctx 16384 AND 4096 (cudaGraphInstantiate verify_graph_w / spec_sample_graph) — conductor/P2c graph footprint outgrew 24GB where prebuilt w8 fit at 23.2GB. Candidate upstream issue; yukon server upgrades blocked on it.
+RESTORED: prebuilt w8 relaunched exactly as found (ctx 16384, port 18080), health + live completion verified, 23224 MiB identical.
+DEFERRED: 2 CUDA-runtime P2s (DepthCtl trimmed-cap, mixed fast-head union) not exercised by this gate — worktree left in place for them.
