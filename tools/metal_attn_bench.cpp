@@ -134,6 +134,11 @@ int main(int argc, char** argv) {
     // (codex P2, 2026-07-15).
     setenv("Q27_METAL_GQA_THRESHOLD", "1", 1);
     setenv("Q27_METAL_GQA_TILE", "1", 1);
+    // Pin the block too: the R3 bf2 verify and ratios assume the staged
+    // baselines run at block 1024 — an inherited Q27_METAL_GQA_BLOCK would
+    // change the merge fold and fail the memcmp, or (with --no-verify)
+    // silently compare mismatched blocks (codex P2, 2026-07-16).
+    setenv("Q27_METAL_GQA_BLOCK", "1024", 1);
 
     q27::MetalBackend backend;
     const bool turbo3 = kv == "turbo3";
