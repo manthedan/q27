@@ -357,6 +357,16 @@ void MetalEngine::set_chunked_prefill(bool enabled) {
     chunked_prefill_ = enabled;
 }
 
+void MetalEngine::set_kv_attrib(uint32_t mode) {
+    if (mode > 2)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 0 (off), 1 (K), or 2 (V)");
+    if (mode && turbo3_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (mode && position_)
+        throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
+    kv_attrib_ = mode;
+}
+
 void MetalEngine::reset() {
     position_ = 0;
     for (LayerState& layer : layers_) {
@@ -532,7 +542,11 @@ void MetalEngine::attention_block(uint32_t layer) {
                                   HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
-        backend_.kv_store_f16(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, position_, N_KV * HEAD_DIM);
+        if (kv_attrib_)
+            backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache,
+                                              position_, N_KV, 1, kv_attrib_);
+        else
+            backend_.kv_store_f16(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, position_, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
                                *attn_out_, position_ + 1, N_HEAD, N_KV,
                                HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
@@ -648,8 +662,12 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
                                          HEAD_DIM, count, scale);
         backend_.turbo_wht(*cattn_out_, count * N_HEAD, HEAD_DIM, true);
     } else {
-        backend_.kv_store_f16_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
-                                   position_, N_KV * HEAD_DIM, count);
+        if (kv_attrib_)
+            backend_.kv_store_f16_attrib_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
+                                              position_, N_KV, count, kv_attrib_);
+        else
+            backend_.kv_store_f16_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
+                                       position_, N_KV * HEAD_DIM, count);
         backend_.attention_f16_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                       *state.k_cache, *state.v_cache,
                                       *cattn_out_, position_ + 1, N_HEAD, N_KV,
@@ -772,6 +790,9 @@ void MetalEngine::mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t
     backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position, FREQ_BASE);
     if (turbo3_kv_)
         backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV);
+    else if (kv_attrib_)
+        backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_,
+                                          position, N_KV, 1, kv_attrib_);
     else
         backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
 }
@@ -866,7 +887,11 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
                                   HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
-        backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
+        if (kv_attrib_)
+            backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_,
+                                              position, N_KV, 1, kv_attrib_);
+        else
+            backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *mtp_k_cache_, *mtp_v_cache_,
                                *attn_out_, position + 1, N_HEAD, N_KV,
                                HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));

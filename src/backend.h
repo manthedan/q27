@@ -237,6 +237,17 @@ class ComputeBackend {
         (void)tokens;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
+    // KV-codec attribution store (kl-kv instrument): fp16 cache write with
+    // one side (mode 1 = K, mode 2 = V) round-tripped through the turbo3
+    // quantizer, so the side's quantization error can be measured alone.
+    virtual void kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                          BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                          uint32_t position, uint32_t kv_heads, uint32_t tokens,
+                                          uint32_t mode) {
+        (void)k; (void)v; (void)k_cache; (void)v_cache; (void)position; (void)kv_heads;
+        (void)tokens; (void)mode;
+        throw std::runtime_error("q27: backend has no KV attribution store");
+    }
     virtual void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
                                       uint32_t q_row_stride, const BackendBuffer& k_cache,
                                       const BackendBuffer& v_cache,

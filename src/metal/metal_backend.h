@@ -159,6 +159,10 @@ class MetalBackend final : public ComputeBackend {
     void kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
                               BackendBuffer& k_cache, BackendBuffer& v_cache,
                               uint32_t position, uint32_t kv_heads, uint32_t tokens) override;
+    void kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                  BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                  uint32_t position, uint32_t kv_heads, uint32_t tokens,
+                                  uint32_t mode) override;
     void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
                               uint32_t q_row_stride, const BackendBuffer& k_cache,
                               const BackendBuffer& v_cache,

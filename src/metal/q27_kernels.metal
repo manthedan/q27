@@ -3023,6 +3023,56 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
     }
 }
 
+// KV-codec attribution store (kl-kv instrument): writes the fp16 KV cache,
+// but routes one side (mode 1 = K, mode 2 = V) through the exact turbo3
+// quantizer — normalize, sign flips, butterfly, 8-centroid nearest,
+// half-rounded norm-correction scale — and back through the inverse
+// transform. The engine stays on the fp16 attention kernels throughout, so
+// a KL delta against the fp16 baseline is attributable to that one side's
+// quantization alone.
+struct TurboAttribArgs { uint position; uint kv_heads; uint tokens; uint mode; };
+kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
+                                          device const float *v [[buffer(1)]],
+                                          device half *kc [[buffer(2)]],
+                                          device half *vc [[buffer(3)]],
+                                          constant TurboAttribArgs &args [[buffer(4)]],
+                                          uint3 group [[threadgroup_position_in_grid]],
+                                          uint j [[thread_index_in_threadgroup]]) {
+    const uint h = group.x >> 1, g = group.x & 1, token = group.z;
+    if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens || j >= 128) return;
+    device const float *src = (group.y ? v : k) +
+        (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
+    device half *dst = (group.y ? vc : kc) +
+        (ulong)(args.position + token) * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
+    // group.y is uniform across the threadgroup, so this early exit and the
+    // barriers below never diverge within a threadgroup.
+    if (args.mode != (group.y ? 2u : 1u)) { dst[j] = half(src[j]); return; }
+    threadgroup float xs[128], red[128];
+    xs[j] = src[j]; red[j] = src[j] * src[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 64; s; s >>= 1) {
+        if (j < s) red[j] += red[j + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float norm = sqrt(red[0]);
+    xs[j] = xs[j] * (norm > 1e-10f ? 1.0f / norm : 0.0f) * float(turbo_s1[j]);
+    turbo_butterfly(xs, j);
+    const uint index = turbo_nearest(xs[j] * turbo_inv_sqrt_128 * float(turbo_s2[j]));
+    red[j] = turbo_centroids[index] * turbo_centroids[index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 64; s; s >>= 1) {
+        if (j < s) red[j] += red[j + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Scale passes through half exactly as the packed block header does, so
+    // the reconstructed values match what turbo3 attention would dequantize.
+    const float cn = sqrt(red[0]);
+    const float scale = float(half(cn > 1e-10f ? norm / cn : norm));
+    xs[j] = turbo_centroids[index] * scale * float(turbo_s2[j]);
+    turbo_butterfly(xs, j);
+    dst[j] = half(xs[j] * turbo_inv_sqrt_128 * float(turbo_s1[j]));
+}
+
 // Chunk-causal turbo3 attention, online-softmax. Mirrors the turbo3 decode
 // kernel exactly — one threadgroup per (query head, chunk token), eight
 // simdgroups striping the token's visible sequence — so a chunk token's
