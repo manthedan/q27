@@ -2,6 +2,7 @@
 // (all methods inline) so both the CLI and the server can embed it.
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <chrono>
 #include <functional>
@@ -67,6 +68,15 @@ static_assert(W_PLUMB == 16, "LANESW lists 16 slots -- keep it in step with W_PL
     {{F##_L[0], F##_L[1], F##_L[2], F##_L[3], F##_L[4], F##_L[5], F##_L[6],    \
       F##_L[7], F##_L[8], F##_L[9], F##_L[10], F##_L[11], F##_L[12],           \
       F##_L[13], F##_L[14], F##_L[15]}}
+// View-side twin of LANESW (P0 batching, design 2026-07-14): the identical
+// 16-slot brace list read from a LaneView array field V.F instead of the
+// member arrays, so the weight-sweep halves (pre/post) can run over a union
+// view. Solo views copy the member pointers, so the expansion is
+// pointer-identical to LANESW there.
+#define LANESV(V, F)                                                           \
+    {{(V).F[0], (V).F[1], (V).F[2], (V).F[3], (V).F[4], (V).F[5], (V).F[6],    \
+      (V).F[7], (V).F[8], (V).F[9], (V).F[10], (V).F[11], (V).F[12],           \
+      (V).F[13], (V).F[14], (V).F[15]}}
 
 struct Engine {
     // P10-A1: weights (Model + DeviceModel) are shared read-only across slots.
@@ -945,21 +955,80 @@ struct Engine {
     // dmax = # MTP drafts the draft graph produces (4 default; 5 for the gated
     // depth-5 draft graph). Capture-time only, like vw.
     int dmax = 4;
+    // Continuous-batching P0 (docs/plans/2026-07-14-continuous-batching.md):
+    // everything the verify forward's WEIGHT-SWEEP half reads or writes that
+    // is PER-LANE, gathered behind one view so the fused cross-engine round
+    // (P1) can point union slot k at any engine's lane buffers. Solo path:
+    // solo_view() returns this engine's own lanes -- pointer-identical to the
+    // member arrays, so routing the existing round through it changes nothing
+    // by construction. Deliberately NOT here: mixer state (RBuf/SBuf roles,
+    // kcache/vcache, attention scratch, convout -- all touched only inside
+    // the member-based mix sections) and the tails' d_mask_*/d_amax/
+    // finish_round state. Mixers and tails stay per-engine (design 07-14).
+    struct LaneView {
+        // sweep activations, written IN PLACE in the owning engine's buffers
+        // (its mix/tail then reads them back as members, untouched):
+        // x1/y/h = layer io; qkv/z/alpha/betar/g/beta + o/og = GDN pre/post;
+        // qg/kbuf/vbuf/attnout = attn pre/post; ffn_g/ffn_u = MLP gate/up;
+        // lg[t] = lane t's logits (logits2 + t*VOCAB; t >= W_MAX aliases
+        // lane 0, never read -- same rule as the head mm5 today).
+        std::array<float*, W_PLUMB> x1, qkv, z, alpha, betar, g, beta, o, og,
+            y, qg, kbuf, vbuf, attnout, ffn_g, ffn_u, h, lg;
+        std::array<q27k::XQuant, W_PLUMB> xq; // quantize3 dst / mm5 act src
+        q27k::IP3 vtok;               // embed3 sources (pending + drafts)
+        q27k::WIP3 pos;               // per-lane position ptrs (rope3)
+        std::array<int*, W_PLUMB> dv; // per-lane argmax outs (greedy tail)
+        float* vgemm_ws;              // k_vgemm workspace (>= union width)
+        int vw;                       // live width THIS round
+        cudaStream_t stm;             // stream the round runs on
+        // P1 Task 9 GEMM-family policy: mm5 keys vgemm-vs-GEMV on the VIEW's
+        // width, so a fused union crossing the member threshold (9) would
+        // silently compute logits on a different numeric family than each
+        // lane's solo round did (Task 8 finding; vgemm==gemv was never
+        // claimed bitwise). The view carries its own threshold: solo_view()
+        // copies the member (zero change); build_union_view() sets it per
+        // union class -- all-gated 99 (GEMV, bitwise vs solo), all-suffix 2
+        // (vgemm, the family solo suffix rounds took), Q27_BATCH_GEMM=1
+        // forces 2 (the tolerance-class perf leg).
+        int gemm_min;
+    };
+    LaneView solo_view() {
+        LaneView v{};
+        v.x1 = x1_L; v.qkv = qkv_L; v.z = z_L; v.alpha = alpha_L;
+        v.betar = betar_L; v.g = g_L; v.beta = beta_L; v.o = o_L;
+        v.og = og_L; v.y = y_L; v.qg = qg_L; v.kbuf = kbuf_L;
+        v.vbuf = vbuf_L; v.attnout = attnout_L; v.ffn_g = ffn_g_L;
+        v.ffn_u = ffn_u_L; v.h = h_L;
+        for (int t = 0; t < W_PLUMB; t++)
+            v.lg[t] = logits2 + (size_t)(t < W_MAX ? t : 0) * VOCAB;
+        v.xq = xq_L;
+        v.dv = d_v_L;
+        v.vtok = verify_tokens();
+        v.pos = lane_pos();
+        v.vgemm_ws = d_vgemm_ws;
+        v.vw = vw;
+        v.stm = stm;
+        v.gemm_min = gemm_min;
+        return v;
+    }
     // W16: the flat 12-pointer overloads are gone. They existed so a call site
     // could name its lanes, but at W_PLUMB=16 mm5's flat form would take 17
     // params -- the exact signature wall that pushed prep/finish onto by-value
     // structs. Every caller already had its lanes in a W_PLUMB array (or can
     // build one, as the vocab head does), so the array form is the only form.
-    void qx5(const std::array<float*, W_PLUMB>& x, int cols) {
+    // P0 batching: qx5/mm5 read per-lane state through the view (solo:
+    // pointer-identical to the members), so the fused round can hand them a
+    // union view without touching the weight-sweep code again.
+    void qx5(const LaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
         q27k::XQ3 q{};
         q27k::CP3 xs{};
         for (int i = 0; i < W_PLUMB; i++) {
-            q.q[i] = xq_L[i]; // xq_L[0]/[1] alias xq2[0]/[1]
+            q.q[i] = v.xq[i]; // solo: xq_L (xq_L[0]/[1] alias xq2[0]/[1])
             xs.p[i] = x[i];
         }
-        q27k::quantize3(xs, cols, q, stm, vw);
+        q27k::quantize3(xs, cols, q, v.stm, v.vw);
     }
-    void mm5(const DevTensor& w, const std::array<float*, W_PLUMB>& ys_a) {
+    void mm5(const LaneView& v, const DevTensor& w, const std::array<float*, W_PLUMB>& ys_a) {
         // P2: WIDE rounds take the flat-in-W MMA GEMM; the ladder keeps the GEMV.
         // Both `vw` and `gemm_min` are host ints read at CUDA-GRAPH CAPTURE, so the
         // branch is baked per graph -- no per-call work, no divergence at replay.
@@ -969,128 +1038,184 @@ struct Engine {
         // k_vgemm reuses the group-32 int8 activations quantize3 ALREADY writes
         // (xq_L[i].nat/.scale are dead stores on the dp4a GEMV path today), so this
         // adds no quantize pass, no buffer and no graph node on the activation side.
-        if (vw >= gemm_min && (int64_t)w.rows >= gemm_min_rows) {
+        // P1 Task 9: the threshold comes from the VIEW (solo: a copy of the
+        // member, identical branch; fused: the union-class policy set by
+        // build_union_view) so a union crossing the member's 9 cannot fork
+        // the numeric family away from what each lane's solo round took.
+        if (v.vw >= v.gemm_min && (int64_t)w.rows >= gemm_min_rows) {
             q27k::XLanes X{};
             q27k::YLanes Y{};
             for (int i = 0; i < W_PLUMB; i++) {
-                X.nat[i] = xq_L[i].nat;
-                X.xs[i] = xq_L[i].scale;
+                X.nat[i] = v.xq[i].nat;
+                X.xs[i] = v.xq[i].scale;
                 Y.y[i] = ys_a[i];
             }
             // Honor the false: an ineligible shape MUST fall through to the GEMV
             // rather than silently produce nothing (the launch_fdmma contract).
-            if (q27k::vgemm_verify(w, X, Y, d_vgemm_ws, vw, stm)) return;
+            if (q27k::vgemm_verify(w, X, Y, v.vgemm_ws, v.vw, v.stm)) return;
         }
         q27k::XQuant qs[W_PLUMB];
         float* ys[W_PLUMB];
         for (int i = 0; i < W_PLUMB; i++) {
-            qs[i] = xq_L[i];
+            qs[i] = v.xq[i];
             ys[i] = ys_a[i];
         }
         if (w.dtype == DType::Q4_G64)
-            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, vw, ys, w.rows,
-                            w.cols, stm);
+            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
+                            w.cols, v.stm);
         else
-            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, vw, ys, w.rows,
-                            w.cols, stm);
+            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
+                            w.cols, v.stm);
     }
 
-    void gdn_pair(int il) {
-        const float eps = EPS;
-        qx5(x1_L, N_EMBD);
-        mm5(T(il, "attn_qkv.weight"), qkv_L);
-        mm5(T(il, "attn_gate.weight"), z_L);
+    // P0 batching split (design 2026-07-14, docs/plans/2026-07-14-continuous-
+    // batching-design.md): each pair is pre(view) -> mix(member) -> post(view).
+    // pre/post are the WEIGHT-SWEEP halves -- pure per-lane weight/elementwise
+    // ops reading everything through the LaneView -- so the P1 fused round can
+    // run them ONCE over a union view spanning engines. mix is everything
+    // touching this engine's SEQUENCE STATE (GDN role buffers RBuf/SBuf +
+    // convout, KV cache, attention scratch, the kv_kind-branched turbo3
+    // rotates) and stays member-based: member vw/stm, which in solo equal
+    // v.vw/v.stm, so the composed pair emits the bit-identical launch
+    // sequence -- graph capture records the same nodes in the same order
+    // (addendum A8). The fused driver never calls the composed pairs, only
+    // pre/mix/post individually (P1 Task 8: mix takes an explicit stream --
+    // the conductor's -- while width stays member vw, the granted width).
+    void gdn_pre(int il, const LaneView& v) {
+        qx5(v, v.x1, N_EMBD);
+        mm5(v, T(il, "attn_qkv.weight"), v.qkv);
+        mm5(v, T(il, "attn_gate.weight"), v.z);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data,
-                         LANESW(x1),
-                         LANESW(alpha), GDN_HEADS,
-                         N_EMBD, stm, vw);
+                         LANESV(v, x1),
+                         LANESV(v, alpha), GDN_HEADS,
+                         N_EMBD, v.stm, v.vw);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_beta.weight").data,
-                         LANESW(x1),
-                         LANESW(betar), GDN_HEADS,
-                         N_EMBD, stm, vw);
+                         LANESV(v, x1),
+                         LANESV(v, betar), GDN_HEADS,
+                         N_EMBD, v.stm, v.vw);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
-        q27k::gdn_gates3(LANESW(alpha),
-                         LANESW(betar), sa, sdt,
-                         LANESW(g),
-                         LANESW(beta), GDN_HEADS, stm, vw);
+        q27k::gdn_gates3(LANESV(v, alpha),
+                         LANESV(v, betar), sa, sdt,
+                         LANESV(v, g),
+                         LANESV(v, beta), GDN_HEADS, v.stm, v.vw);
+    }
+    // -- split point: sequence state (RBuf/SBuf recurrent roles) begins here;
+    //    weight sweep above reads only the view (design 2026-07-14) --
+    // P1 batching: mix takes an explicit STREAM (the fused round runs every
+    // engine's mix on the conductor stream; solo passes member stm -- same
+    // value, same launch sequence). Width stays MEMBER vw: each engine's mix
+    // walks its OWN granted lanes 0..vw-1, never the union width (the
+    // conductor sets vw per round via set_round_width before the fused round).
+    void gdn_mix(int il, cudaStream_t st) {
+        const float eps = EPS;
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         // P12: per-lane recurrent chain -- role k reads role k-1 (written fresh
         // earlier this round) and writes role k. Only lanes < vw are live; a
         // width-vw graph skips the rest, leaving their (never-read) role buffers
         // untouched. Lane a (role 0, the pending token) always runs.
-        q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, stm); // lane 0
+        q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, st); // lane 0
         for (int L = 1; L < vw; L++)
-            q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, stm);
+            q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, st);
         // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
         q27k::l2norm3(LANESW(convout), 32,
-                      GDN_DIM, eps, stm, vw);
-        q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm); // lane 0
+                      GDN_DIM, eps, st, vw);
+        q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, st); // lane 0
         for (int L = 1; L < vw; L++)
-            q27k::delta_step(SBuf(il, L - 1), SBuf(il, L), convout_L[L], g_L[L], beta_L[L], o_L[L], stm);
+            q27k::delta_step(SBuf(il, L - 1), SBuf(il, L), convout_L[L], g_L[L], beta_L[L], o_L[L], st);
+    }
+    // -- split point: back to the weight sweep (per-lane elementwise + o-proj
+    //    on the view); mix wrote o_L in place, the view aliases it --
+    void gdn_post(int il, const LaneView& v) {
         const float* nw = (const float*)T(il, "ssm_norm.weight").data;
-        q27k::gated_norm3(LANESW(o), nw,
-                          LANESW(z),
-                          LANESW(og), GDN_HEADS, GDN_DIM, eps, stm, vw);
-        qx5(og_L, GDN_V);
-        mm5(T(il, "ssm_out.weight"), y_L);
+        q27k::gated_norm3(LANESV(v, o), nw,
+                          LANESV(v, z),
+                          LANESV(v, og), GDN_HEADS, GDN_DIM, EPS, v.stm, v.vw);
+        qx5(v, v.og, GDN_V);
+        mm5(v, T(il, "ssm_out.weight"), v.y);
+    }
+    void gdn_pair(int il, const LaneView& v) {
+        gdn_pre(il, v);
+        gdn_mix(il, stm);
+        gdn_post(il, v);
     }
 
-    void attn_pair(int il) {
-        int ci = attn_cache_idx[il];
-        qx5(x1_L, N_EMBD);
-        mm5(T(il, "attn_q.weight"), qg_L);
+    void attn_pre(int il, const LaneView& v) {
+        qx5(v, v.x1, N_EMBD);
+        mm5(v, T(il, "attn_q.weight"), v.qg);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
-        for (int L = 0; L < vw; L++)
-            q27k::rmsnorm_heads(qg_L[L], qn, qg_L[L], N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        mm5(T(il, "attn_k.weight"), kbuf_L);
-        for (int L = 0; L < vw; L++)
-            q27k::rmsnorm_heads(kbuf_L[L], kn, kbuf_L[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        mm5(T(il, "attn_v.weight"), vbuf_L);
-        q27k::IP3 P LANESW(d_pos);
-        q27k::rope3(LANESW(qg),
+        for (int L = 0; L < v.vw; L++)
+            q27k::rmsnorm_heads(v.qg[L], qn, v.qg[L], N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, v.stm);
+        mm5(v, T(il, "attn_k.weight"), v.kbuf);
+        for (int L = 0; L < v.vw; L++)
+            q27k::rmsnorm_heads(v.kbuf[L], kn, v.kbuf[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, v.stm);
+        mm5(v, T(il, "attn_v.weight"), v.vbuf);
+        // rope reads the view's per-lane positions (WIP3 -> IP3: same
+        // pointers, const-qualified for the kernel wrapper)
+        q27k::IP3 P{};
+        for (int i = 0; i < W_PLUMB; i++) P.p[i] = v.pos.p[i];
+        q27k::rope3(LANESV(v, qg),
                     N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, P,
-                    FREQ_BASE, stm, vw);
-        q27k::rope3(LANESW(kbuf), N_KV, HEAD_DIM, N_ROT,
-                    HEAD_DIM, P, FREQ_BASE, stm, vw);
+                    FREQ_BASE, v.stm, v.vw);
+        q27k::rope3(LANESV(v, kbuf), N_KV, HEAD_DIM, N_ROT,
+                    HEAD_DIM, P, FREQ_BASE, v.stm, v.vw);
+    }
+    // -- split point: sequence state (KV cache + attention scratch + kv_kind-
+    //    branched turbo3 rotates) begins here (design 2026-07-14) --
+    // P1 batching: explicit stream, member width -- same contract as gdn_mix.
+    void attn_mix(int il, cudaStream_t st) {
+        int ci = attn_cache_idx[il];
+        q27k::IP3 P LANESW(d_pos);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
         // turbo3: rotate all vw Q lanes post-rope (see attn_block); host
         // branch on kv_kind only (init-fixed, graph-capture-safe)
         if (kv_kind == KV_T3)
-            q27k::wht3(LANESW(qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, vw);
+            q27k::wht3(LANESW(qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, st, vw);
         // store vw lanes (disjoint slots); each token's attention only reads
         // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
         if (kv_kind >= KV_T3)
             q27k::kv_store_t3(LANESW(kbuf),
                               LANESW(vbuf), kcache[ci], vcache[ci],
-                              P, N_KV, HEAD_DIM, stm, vw, /*k_plain=*/kv_kind == KV_T3V);
+                              P, N_KV, HEAD_DIM, st, vw, /*k_plain=*/kv_kind == KV_T3V);
         else
             q27k::kv_store3(LANESW(kbuf),
                             LANESW(vbuf), kcache[ci], vcache[ci],
-                            P, N_KV * HEAD_DIM, stm, vw, kv_fp8);
+                            P, N_KV * HEAD_DIM, st, vw, kv_fp8);
         q27k::attn_decode3(LANESW(qg), 2 * HEAD_DIM, kcache[ci],
                            vcache[ci],
                            LANESW(attnout),
-                           scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm, vw, kv_kind);
+                           scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, st, vw, kv_kind);
         // inverse-WHT on all vw pooled outputs BEFORE the sigmoid gate
         if (kv_kind >= KV_T3)
             q27k::wht3(LANESW(attnout),
-                       N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, vw);
-        q27k::sigmoid_gate3(LANESW(attnout),
-                            LANESW(qg), N_HEAD, HEAD_DIM, stm, vw);
-        qx5(attnout_L, N_HEAD * HEAD_DIM);
-        mm5(T(il, "attn_output.weight"), y_L);
+                       N_HEAD, HEAD_DIM, HEAD_DIM, true, st, vw);
+    }
+    // -- split point: back to the weight sweep (sigmoid gate is pure per-lane
+    //    elementwise; mix wrote attnout_L in place, the view aliases it) --
+    void attn_post(int il, const LaneView& v) {
+        q27k::sigmoid_gate3(LANESV(v, attnout),
+                            LANESV(v, qg), N_HEAD, HEAD_DIM, v.stm, v.vw);
+        qx5(v, v.attnout, N_HEAD * HEAD_DIM);
+        mm5(v, T(il, "attn_output.weight"), v.y);
+    }
+    void attn_pair(int il, const LaneView& v) {
+        attn_pre(il, v);
+        attn_mix(il, stm);
+        attn_post(il, v);
     }
 
-    void ffn_pair(int il) {
-        qx5(x1_L, N_EMBD);
-        mm5(T(il, "ffn_gate.weight"), ffn_g_L);
-        mm5(T(il, "ffn_up.weight"), ffn_u_L);
-        q27k::silu_mul3(LANESW(ffn_g),
-                        LANESW(ffn_u), N_FFN, stm, vw);
-        qx5(ffn_g_L, N_FFN);
-        mm5(T(il, "ffn_down.weight"), y_L);
+    // ffn_pair is all-"pre" (design 2026-07-14): every op is a per-lane
+    // weight/elementwise sweep on the view, no sequence state, so it needs no
+    // mix seam -- the P1 fused round calls it whole on the union view.
+    void ffn_pair(int il, const LaneView& v) {
+        qx5(v, v.x1, N_EMBD);
+        mm5(v, T(il, "ffn_gate.weight"), v.ffn_g);
+        mm5(v, T(il, "ffn_up.weight"), v.ffn_u);
+        q27k::silu_mul3(LANESV(v, ffn_g),
+                        LANESV(v, ffn_u), N_FFN, v.stm, v.vw);
+        qx5(v, v.ffn_g, N_FFN);
+        mm5(v, T(il, "ffn_down.weight"), v.y);
     }
 
     // launch sequence for one speculative round (graph-capturable: all state
@@ -1156,42 +1281,58 @@ struct Engine {
         for (int k = 0; k + 1 < W_PLUMB; k++) t.p[k + 1] = d_draft_L[k];
         return t;
     }
-    void spec_verify_forward() {
+    void spec_verify_forward(const LaneView& v) {
+        // P0 batching: the CALLER builds the view (solo: solo_view() -- a
+        // vw/stm snapshot taken exactly when the members were read before),
+        // so the P1 fused round can hand this same forward a union view.
+        // SKELETON MIRROR WARNING (review M3): fused_verify_round in
+        // src/conductor.h mirrors this loop skeleton (embed3 -> per-layer
+        // rmsnorm3/pair/add3/rmsnorm3/ffn_pair/add3 -> output norm/qx5/head
+        // mm5) with per-engine mix sub-launches. Structural changes HERE
+        // MUST be mirrored there and re-gated with fused_smoke (build line
+        // in tools/fused_smoke.cu's header).
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, verify_tokens(),
-                     N_EMBD, LANESW(h), stm,
-                     vw);
-        q27k::CP3 Hc LANESW(h),
-            Yc LANESW(y);
-        q27k::P3 Hm LANESW(h),
-            X1m LANESW(x1);
+        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, v.vtok,
+                     N_EMBD, LANESV(v, h), v.stm,
+                     v.vw);
+        q27k::CP3 Hc LANESV(v, h),
+            Yc LANESV(v, y);
+        q27k::P3 Hm LANESV(v, h),
+            X1m LANESV(v, x1);
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
-            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, stm, vw);
-            if (attn_layer[il]) attn_pair(il);
-            else gdn_pair(il);
-            q27k::add3(Hm, Yc, N_EMBD, stm, vw);
+            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
+            if (attn_layer[il]) attn_pair(il, v);
+            else gdn_pair(il, v);
+            q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
-            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, stm, vw);
-            ffn_pair(il);
-            q27k::add3(Hm, Yc, N_EMBD, stm, vw);
+            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, v.stm, v.vw);
+            ffn_pair(il, v);
+            q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
-        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, stm, vw);
-        qx5(x1_L, N_EMBD);
+        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, v.stm, v.vw);
+        qx5(v, v.x1, N_EMBD);
         const char* vhead = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                              : "output.weight";
-        // lane t's logits live at logits2 + t*VOCAB (the alloc is W_MAX*VOCAB;
-        // only lanes < vw are computed, and only those are ever read).
-        std::array<float*, W_PLUMB> lg{};
-        for (int t = 0; t < W_PLUMB; t++)
-            lg[t] = logits2 + (size_t)(t < W_MAX ? t : 0) * VOCAB;
-        mm5(dm.get(vhead), lg);
+        // lane t's logits live at v.lg[t] (solo: logits2 + t*VOCAB, alloc is
+        // W_MAX*VOCAB; only lanes < vw are computed, and only those are read).
+        mm5(v, dm.get(vhead), v.lg);
     }
 
     // P11: verify half -- batch-5 forward, masked argmax per lane, finish_round.
-    void spec_verify_launches() {
-        spec_verify_forward();
+    // P0 batching: forward + per-lane argmax read the view; the mask pool
+    // (d_mask_pool/d_mask_ids/d_amax) and finish_round stay MEMBER-based --
+    // the tail is per-engine forever (design 2026-07-14).
+    // P1 batching split: the greedy TAIL (per-lane argmax + finish_round)
+    // factored out of spec_verify_launches so the fused round can run ONE
+    // union forward and then each engine's own tail. The tail reads width and
+    // stream from the view (fused: granted width + the conductor stream;
+    // solo: solo_view() where v.vw == vw and v.stm == stm, so the composed
+    // function emits the bit-identical launch sequence -- addendum A8). The
+    // mask pool (d_mask_pool/d_mask_ids/d_amax) and finish_round's commit
+    // state stay MEMBER-based -- the tail is per-engine forever.
+    void spec_verify_tail(const LaneView& v) {
         // P7: slot 0 (the post-pending lane) is the constrained one; the rest
         // keep id -1 (v1 caps acceptance in-grammar instead of chasing
         // draft-dependent states the host cannot know pre-launch).
@@ -1199,9 +1340,9 @@ struct Engine {
         // identical launch sequence in the identical order for any vw, so the
         // captured graphs -- and the tokens they produce -- are unchanged at
         // every width the chain covered.
-        for (int t = 0; t < vw; t++)
-            q27k::argmax_masked(logits2 + (size_t)t * VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, t, d_v_L[t], d_amax, stm);
+        for (int t = 0; t < v.vw; t++)
+            q27k::argmax_masked(v.lg[t], VOCAB, d_mask_pool, mask_words,
+                                d_mask_ids, t, v.dv[t], d_amax, v.stm);
         // P12: a width-vw verify computed columns 0..vw-1; cap acceptance at vw-1
         // drafts so finish never commits an uncomputed lane. vw=5 => max_draft=4.
         q27k::IP3 drafts{};
@@ -1209,7 +1350,11 @@ struct Engine {
         q27k::finish_round(d_P, d_token, drafts,
                            LANESW(d_v),
                            LANESW(x1),
-                           h_next, d_outcome, N_EMBD, d_accept_cap, vw - 1, stm);
+                           h_next, d_outcome, N_EMBD, d_accept_cap, v.vw - 1, v.stm);
+    }
+    void spec_verify_launches(const LaneView& v) {
+        spec_verify_forward(v);
+        spec_verify_tail(v);
     }
 
     // Phase 2: sampled verify tail. Same forward; replace the 5 argmax lanes +
@@ -1217,30 +1362,45 @@ struct Engine {
     // acceptance (k_spec_accept), a resample of the new pending from the stop
     // lane (k_sample_stop -> d_token), and finish keyed on the accepted count n.
     // Draws key Philox on *d_P; greedy graphs stay bitwise (separate graph set).
-    void spec_verify_launches_sampled() {
-        spec_verify_forward();
+    // P0 batching: forward + per-lane nucleus read the view; spec_accept/
+    // sample_stop/finish_sampled stay MEMBER-based (they take logits2 as a
+    // flat base pointer -- per-engine tail state, per-engine forever).
+    // P1 batching split: sampled TAIL, same seam as spec_verify_tail. Width
+    // and stream come from the view (solo: == members, bit-identical); the
+    // flat logits2 base and the accept/finish commit state stay MEMBER-based.
+    void spec_verify_tail_sampled(const LaneView& v) {
         // P14: width-vw sampled verify -- nucleus stats + accept walk over the
         // first vw lanes only (vw=5 monolithic; vw=cap+1 under the gate). The
         // accept walk caps at vw-1 drafts so finish never commits an uncomputed
         // lane. vw=5 => max_draft=4 (the pre-P14 behavior). k_finish_sampled is
         // unchanged: it keys on n<=vw and its src select covers n in 1..5.
-        for (int k = 0; k < vw; k++)
-            q27k::nucleus(logits2 + (size_t)k * VOCAB, VOCAB, d_samp, d_nuc + k * 4, stm);
+        for (int k = 0; k < v.vw; k++)
+            q27k::nucleus(v.lg[k], VOCAB, d_samp, d_nuc + k * 4, v.stm);
         q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
-                          d_accept_cap, vw - 1, VOCAB, d_spec, stm);
-        q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, stm);
+                          d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
+        q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, v.stm);
         q27k::finish_sampled(d_P, d_token, d_spec, d_draft, d_draft2, d_draft3, d_draft4, x1,
-                             x1_L[1], x1_L[2], x1_L[3], x1_L[4], h_next, d_outcome, N_EMBD, stm);
+                             x1_L[1], x1_L[2], x1_L[3], x1_L[4], h_next, d_outcome, N_EMBD,
+                             v.stm);
+    }
+    void spec_verify_launches_sampled(const LaneView& v) {
+        spec_verify_forward(v);
+        spec_verify_tail_sampled(v);
     }
 
     void spec_round_launches() {
         spec_draft_launches();
-        spec_verify_launches();
+        // P0 batching: build the solo view ONCE per round, verify half only --
+        // the draft half never touches mm5/qx5 (Task 2 grep), so it stays
+        // member-based and view-free.
+        const LaneView sv = solo_view();
+        spec_verify_launches(sv);
     }
 
     void spec_sample_round_launches() {
         spec_draft_launches();
-        spec_verify_launches_sampled();
+        const LaneView sv = solo_view();
+        spec_verify_launches_sampled(sv);
     }
 
     void build_spec_graphs() {
@@ -1410,7 +1570,7 @@ struct Engine {
                 CUDA_CHECK(cudaGraphDestroy(gs));
             }
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-            spec_verify_launches();
+            spec_verify_launches(solo_view());
             CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
             CUDA_CHECK(cudaGraphInstantiate(&verify_graph[p], gv, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gv));
@@ -1423,7 +1583,7 @@ struct Engine {
                 vw = W;
                 cudaGraph_t gw;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-                spec_verify_launches();
+                spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
                 CUDA_CHECK(cudaGraphInstantiate(&verify_graph_w[W][p], gw, nullptr, nullptr, 0));
                 CUDA_CHECK(cudaGraphDestroy(gw));
@@ -1435,7 +1595,7 @@ struct Engine {
                 vw = sfx_w;
                 cudaGraph_t gs_;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-                spec_verify_launches();
+                spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gs_));
                 CUDA_CHECK(
                     cudaGraphInstantiate(&verify_graph_w[sfx_w][p], gs_, nullptr, nullptr, 0));
@@ -1469,7 +1629,7 @@ struct Engine {
                 vw = W;
                 cudaGraph_t gw;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
-                spec_verify_launches_sampled();
+                spec_verify_launches_sampled(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
                 CUDA_CHECK(
                     cudaGraphInstantiate(&verify_sample_graph_w[W][p], gw, nullptr, nullptr, 0));
@@ -1676,6 +1836,174 @@ struct Engine {
             fprintf(stderr, "[sfxdbg-oc] n=%d em=", n);
             for (int k = 0; k < n; k++) fprintf(stderr, "%d,", oc[1 + k]);
             fprintf(stderr, " pend=%d sfx_round=%d\n", oc[OUTCOME_INTS - 1], sfx_round ? 1 : 0);
+        }
+        perm = (perm + (n - 1)) % W_MAX;
+        return n;
+    }
+
+    // ---- P1 continuous-batching conductor surface (addendum A4) ----
+    // The conductor drives a fused round through THESE entrypoints plus the
+    // pre/mix/post trio, ffn_pair, solo_view() and the split verify tails --
+    // no friend access, no raw member reaches from conductor.h. Everything
+    // below is host bookkeeping the solo path already runs inside spec_round;
+    // spec_round itself is left untouched (it owns telemetry/adaptive-depth
+    // extras the P1 fixed-ladder conductor does not use).
+    //
+    // Thin named accessors (review M3): every raw member conductor.h reads,
+    // behind a name with a one-line why, so the reach surface stays
+    // greppable and deliberate (A4: a new member need adds an accessor here
+    // with a comment saying why -- never a raw reach from conductor.h).
+    // why: fused members must share ONE weight set -- the union sweep reads
+    // weights through es[0]; build_union_view identity-compares this, and
+    // the fused forward reads embed/norm/head tensors through it.
+    const q27::DeviceModel& shared_dm() const { return dm; }
+    // why: the fused layer loop forks the attn vs GDN pre/mix/post trio per
+    // layer, exactly as spec_verify_forward does.
+    bool is_attn_layer(int il) const { return attn_layer[il]; }
+    // why: the fused head must pick the same output tensor (Q4 fast head vs
+    // fp16) the solo verify picks, or fused logits fork numerically.
+    bool fast_head_on() const { return fast_head; }
+    // why: the union round borrows es[0]'s k_vgemm workspace (A9: sized from
+    // vgemm_ws_bytes_model for W_PLUMB lanes, so any engine's covers any
+    // legal union).
+    float* vgemm_ws() const { return d_vgemm_ws; }
+    // why: build_union_view asserts the granted width was installed
+    // (set_round_width) before the member's mix/tails read it.
+    int round_width() const { return vw; }
+    // why: the conductor records each member's draft_done event on the
+    // stream its draft phase ran on, then makes the fused stream wait on it.
+    cudaStream_t stream() const { return stm; }
+    // why: the conductor D2Hs every member's round outcome itself -- one
+    // sync for the whole batch -- then hands the host copy to
+    // commit_outcome().
+    const int* outcome_dev() const { return d_outcome; }
+    // why: leave() hands the finish reason (stamped by finish_decode) to
+    // the request thread via TokenQueue::close.
+    const char* end_reason() const { return gs.end; }
+    //
+    // Set the granted verify width for the NEXT (eager, fused) round. vw is
+    // capture-time state for the graph zoo, so this must only be called on
+    // the conductor path, never between graph replays.
+    void set_round_width(int w) {
+        assert(w >= 2 && w <= W_MAX);
+        vw = w;
+    }
+    // Draft phase of one GATED round on THIS engine's stm: the P14 dexit
+    // margin loop of spec_round verbatim (per-step draft graphs, D2H margin,
+    // stop at first sub-theta), including the width-floor top-up. Returns the
+    // WANT width (cap+1, floored 2) -- the conductor trims the union, calls
+    // set_round_width(granted), then the fused verify. P1 scope: requires the
+    // gated dexit config (pmin_theta > 0, dexit_on, no tool split).
+    // sampled=true mirrors spec_sample_round's gated dexit branch instead:
+    // first-token bootstrap from the retained prefill logits (samp_first) and
+    // the FIXED sampled ceiling 4 (the sampled tail is 4-draft this phase),
+    // so a sampled member's fused round consumes the identical drafts +
+    // Philox keys its solo round would.
+    // out_cap/out_md (Task 9): this round's margin-run depth and drafting
+    // ceiling, for commit_outcome's telemetry/depthctl mirror -- W alone is
+    // ambiguous at the floor (cap 0 and cap 1 both return W=2).
+    int draft_and_gate(bool sampled = false, int* out_cap = nullptr, int* out_md = nullptr) {
+        assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
+        if (sampled && samp_first) {
+            samp_first = false;
+            q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
+        }
+        const int md_used = sampled ? 4 : (maxd_auto ? dctl.cur : gate_maxd);
+        int cap = 0, launched = 0;
+        for (int k = 0; k < md_used; k++) {
+            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+            launched++;
+            CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
+                                       cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            if (h_draft_margin[k] < pmin_theta) break;
+            cap++;
+        }
+        int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
+        // Width-floor top-up (see spec_round): a width-W verify walks W-1
+        // drafts, so W draft rows must exist. Only fires at cap==0.
+        for (int k = launched; k < W && k < md_used; k++)
+            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+        if (out_cap) *out_cap = cap;
+        if (out_md) *out_md = md_used;
+        return W;
+    }
+    // Suffix branch of one GREEDY round on THIS engine's stm: the fire test +
+    // prep_round + draft-lane H2D staging of spec_round's suffix branch,
+    // verbatim, WITHOUT the verify graph launch (the fused verify replaces
+    // it). Returns the suffix verify width (sfx_width()) when the committed
+    // stream's suffix recurs (match >= sfx_L), else 0 -- the conductor then
+    // falls back to draft_and_gate(). Greedy-only, like the solo branch
+    // (spec_sample_round has no suffix path). Trim may grant less than the
+    // returned width: the verify then walks granted-1 of the staged drafts,
+    // and the extra staged lanes are never read (same contract as the gated
+    // rounds' unread draft rows). Suffix rounds skip the MTP chain, so the
+    // stale-MTP-KV note on suffix_on applies to fused rounds identically.
+    int suffix_propose() {
+        if (!(!tool_split_active && suffix_on && sfx_valid && pmin_theta > 0.f &&
+              h_mask_id0 < 0 &&
+              sfx.propose_with(last_pending, sfx_width() - 1, h_sfx_prop) >= sfx_L))
+            return 0;
+        q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
+                         stm);
+        const int sw = sfx_width();
+        for (int k = 0; k < sw - 1; k++)
+            CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], &h_sfx_prop[k], 4,
+                                       cudaMemcpyHostToDevice, stm));
+        return sw;
+    }
+    // Post-verify host commit for one fused round: EXACTLY what the solo
+    // round does after its outcome sync. Greedy (spec_round): em[]
+    // extraction, last_pending from oc[OUTCOME_INTS-1], suffix arming, perm
+    // advance, PLUS the telemetry/adaptive-depth block -- suffix counters,
+    // gate_cap/gate_n/lane histograms, and the dctl ladder update (Task 9:
+    // Q27_MAXD=auto members MUST feed dctl exactly like spec_round or the
+    // adaptive ceiling drifts between solo and fused serving). Sampled
+    // (spec_sample_round): the sampled outcome layout differs -- pending at
+    // oc[6], no suffix arming, and NO dctl/histogram updates (the sampled
+    // ceiling is fixed at 4; spec_sample_round updates nothing either).
+    // oc = this engine's d_outcome, already on host (the conductor does one
+    // D2H + sync per round for the whole batch). gate_cap/md_used come from
+    // draft_and_gate's out-params (-1 = suffix/none, skips the gated block).
+    // TRIM CLAMP (fused-only divergence, documented): under a trimmed grant,
+    // lanes past vw-1 were never verified, so cap is clamped to vw-1 for the
+    // histograms and for dctl -- `cap >= md` (the fired test) then stays
+    // false and the round contributes no spurious demote evidence for a lane
+    // that never ran. Untrimmed rounds (granted == want) have cap <= vw-1
+    // already, so solo-equivalent traffic is bitwise-identical bookkeeping.
+    int commit_outcome(const int* oc, int* emit, bool sampled = false,
+                       bool sfx_round = false, int gate_cap = -1, int md_used = -1) {
+        int n = oc[0];
+        if (!sampled) {
+            if (sfx_round) {
+                sfx_fired++;
+                sfx_tok += n;
+                // suffix-round ceiling-saturation evidence (see spec_round's
+                // maxd_auto suffix arm for the full rationale)
+                if (maxd_auto && n >= dctl.cur + 1) dctl.update(dctl.cur, dctl.cur, n);
+            } else if (gate_cap >= 0) {
+                int cap = gate_cap < vw - 1 ? gate_cap : vw - 1; // trim clamp
+                gate_cap_hist[cap]++;
+                gate_n_hist[n]++;
+                for (int j = 1; j <= cap; j++) {
+                    gate_lane_fired[j]++;
+                    if (n >= j + 1) gate_lane_acc[j]++;
+                }
+                if (maxd_auto) dctl.update(md_used, cap, n);
+            }
+        }
+        for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
+        if (sampled) {
+            last_pending = oc[6]; // sampled outcome: {n, t1..t5, pending}
+        } else {
+            last_pending = oc[OUTCOME_INTS - 1];
+            sfx_valid = true;
+            if (sfx_dbg) {
+                fprintf(stderr, "[sfxdbg-oc] n=%d em=", n);
+                for (int k = 0; k < n; k++) fprintf(stderr, "%d,", oc[1 + k]);
+                fprintf(stderr, " pend=%d sfx_round=%d\n", oc[OUTCOME_INTS - 1],
+                        sfx_round ? 1 : 0);
+            }
         }
         perm = (perm + (n - 1)) % W_MAX;
         return n;
@@ -2200,6 +2528,10 @@ struct Engine {
     struct GenStats {
         int prompt = 0, hit = 0, ckpt = -1, pf = 0; // tokens
         double pf_ms = 0, dec_ms = 0, cb_ms = 0;    // cb = time inside on_token
+        // (review L3) under Q27_BATCH=1 the sink is the conductor's queue
+        // push: cb_ms then times on_emit + TokenQueue::push on the CONDUCTOR
+        // thread, not the client SSE write (which runs on the request thread
+        // draining the queue and is not timed anywhere).
         // R1b: time parked in on_round_gap calls that actually handed the
         // GPU over (includes the pre-yield drain of our own in-flight
         // chunks), and how many handovers. pf_ms/dec_ms stay wall-inclusive
@@ -2229,16 +2561,250 @@ struct Engine {
     };
     GenStats gs;
 
-    // Prompt + speculative generation. Calls on_token(id) for each generated
-    // token; stop when on_token returns false, n_max hit, or eos. Uses the spec
-    // path (requires build_spec_graphs()). MTP KV warmed during prompt.
-    // stable_len (P8): token index of the stable-prefix boundary (end of the
-    // last input message). The GDN snapshot is taken THERE instead of at the
-    // prompt tail, so the next turn's re-rendered history prefix-matches and
-    // only the per-turn suffix re-prefills. -1 = legacy tail snapshot.
+    // P1 continuous batching: everything generate()'s decode loop carries
+    // ACROSS rounds, gathered so the conductor can drive one round at a time
+    // (decode_step) for several engines. Host bookkeeping only -- no device
+    // state lives here; iteration-locals (em[], n, ...) stay in decode_step.
+    struct DecodeTask {
+        int n_max = 0;   // emit budget (generate()'s n_max)
+        int eos = -1;    // stop token id (-1 = never fires; ids are >= 0)
+        // Per-token sink; false = client-stop. In generate() this holds a
+        // std::ref to the caller's callable (the generate() frame outlives
+        // the loop, and the existing call sites all pass [&] lambdas whose
+        // copies would alias anyway); conductor mode (Task 10) installs an
+        // owning sink instead.
+        std::function<bool(int)> on_token;
+        int emitted = 0; // tokens delivered to on_token so far (return value)
+        int rounds = 0;  // decode rounds run -> gs.rounds at finish
+        int Ph = 0;      // host mirror of the last written position (ctx guard)
+        std::chrono::steady_clock::time_point g0; // decode wall start (dec_ms)
+        // decode-phase park baseline: dec_ms covers decode only, so the
+        // contended-print suffix must use decode-phase gw deltas, not
+        // request totals (prefill parks belong to pf_ms).
+        double gw_pf = 0;  // gs.gw_ms at decode start
+        int yields_pf = 0; // gs.yields at decode start
+        bool sampling = false;           // temp>0: sampled rounds, no tc hooks
+        bool force_plain_sample = false; // Q27_SAMPLE_PLAIN A/B lever
+        bool prof_decode = false; // Q27_PROF_DECODE bracket open; finish closes
+        // Cancellation (consensus addendum A3): the request thread sets this
+        // on SSE write failure / client disconnect / shutdown. Checked at
+        // ROUND BOUNDARIES ONLY (top of decode_step): a cancelled task does
+        // no further GPU work but still runs finish_decode() so GenStats and
+        // teardown land exactly like a natural exit. Nothing sets it yet --
+        // it lands with the struct; consumers arrive with the conductor.
+        std::atomic<bool> cancel{false};
+        // P1 Task 10 [req] telemetry, CONDUCTOR-filled (solo generate()
+        // leaves both 0): bat_members sums the round's member count k over
+        // every decode round this task ran GPU work in (mean batch width =
+        // bat_members / rounds); bat_r2 counts the rounds with k >= 2, i.e.
+        // actually fused. Plain longs on purpose: only the conductor thread
+        // writes them, and the request thread reads them after the queue
+        // closes (the close is the synchronization edge).
+        long bat_members = 0, bat_r2 = 0;
+    };
+
+    // R1b preemption point (no-op when the hook is unset or nobody waits).
+    // Shared by the prefill chunk loops and decode_step; park time goes to
+    // gs.gw_ms/gs.yields wherever it fires.
+    void round_gap() {
+        if (!on_round_gap) return;
+        auto y0 = std::chrono::steady_clock::now();
+        if (on_round_gap()) {
+            gs.gw_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - y0)
+                            .count();
+            gs.yields++;
+        }
+    }
+
+    // Pre-loop decode initialization (the code that sat between generate()'s
+    // prefill epilogue and its round loop). Fills t in place: DecodeTask owns
+    // a std::atomic, so it is neither copyable nor movable -- callers
+    // default-construct one and hand it in. P = prompt.size()-1, the host
+    // position mirror the ctx guard advances.
     template <typename F>
-    int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token,
-                 int stable_len = -1) {
+    void make_decode_task(DecodeTask& t, int n_max, int eos, F& on_token, int P) {
+        // Sampling (temp>0): upload request params once; the sampled path
+        // replaces the greedy spec_round in the loop. Default = spec_sample_round
+        // (Phase 2: sampled depth-4 speculation, fast). Greedy (inv_temp<=0)
+        // leaves d_samp untouched and runs the spec path bitwise. d_pos is NP
+        // here (prefill's last advance), so the first eager draw keys the token
+        // at position NP with kind 0.
+        const bool sampling = samp.inv_temp > 0.f;
+        // Q27_SAMPLE_PLAIN forces the Phase-1 plain sampler (one token/round, no
+        // spec) even under sampling -- the A/B lever for the spec==non-spec
+        // distribution gate (docs/sampling-design.md sec 4).
+        static const bool force_plain_sample = getenv("Q27_SAMPLE_PLAIN") != nullptr;
+        if (sampling) {
+            CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
+            samp_first = true;
+        }
+        t.n_max = n_max;
+        t.eos = eos;
+        t.on_token = std::ref(on_token);
+        t.Ph = P;
+        t.g0 = std::chrono::steady_clock::now();
+        t.gw_pf = gs.gw_ms;
+        t.yields_pf = gs.yields;
+        t.sampling = sampling;
+        t.force_plain_sample = force_plain_sample;
+        // Q27_PROF_DECODE=1: bracket the decode loop with a cudaProfiler
+        // range so `nsys --capture-range=cudaProfilerApi` records ONLY the
+        // decode slice -- prefill otherwise floods the trace (the CLI
+        // --tokens path walks the prompt serially; see BUILDLOG nsys notes).
+        // No-op without a profiler attached; finish_decode() below is the
+        // single exit funnel, so every decode exit path closes the range.
+        t.prof_decode = getenv("Q27_PROF_DECODE") != nullptr;
+        if (t.prof_decode) {
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            (void)cudaProfilerStart();
+        }
+    }
+
+    // Decode epilogue (generate()'s old `done` lambda): closes the optional
+    // profiler bracket, finalizes GenStats, prints [gen-done]. Runs EXACTLY
+    // ONCE per task: from the decode_step call that returns false, or --
+    // when host bookkeeping THREW mid-round under the conductor -- from the
+    // A2 catch epilogue (Conductor::fail_member, conductor.h) with
+    // why="error"; the two are exclusive (every finish_decode call inside
+    // pre_round/post_round/decode_step is followed by a non-throwing
+    // return, so a throwing round cannot have already finished).
+    void finish_decode(DecodeTask& t, const char* why) {
+        if (t.prof_decode) {
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            (void)cudaProfilerStop();
+        }
+        double dt =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t.g0).count();
+        gs.dec = t.emitted;
+        gs.dec_ms = dt * 1000.0;
+        gs.rounds = t.rounds;
+        gs.end = why;
+        // wall-inclusive of yield parks; the suffix keeps a contended
+        // print from reading as a decode regression
+        if (gs.yields > t.yields_pf)
+            fprintf(stderr,
+                    "[gen-done] %s: %d tokens in %.1fs (%.1f t/s; parked %.0fms/%d "
+                    "yields in decode), n_max=%d\n",
+                    why, t.emitted, dt, t.emitted / (dt > 0 ? dt : 1), gs.gw_ms - t.gw_pf,
+                    gs.yields - t.yields_pf, t.n_max);
+        else
+            fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n", why,
+                    t.emitted, dt, t.emitted / (dt > 0 ? dt : 1), t.n_max);
+        // Phase 2 acceptance-vs-temp telemetry (sampled path only; keeps the
+        // greedy [gen-done] line shortbench_suite parses untouched). tokens/
+        // round is the sampled spec acceptance -- it sags as temperature rises.
+        if (t.sampling && !t.force_plain_sample)
+            fprintf(stderr,
+                    "[sample-stats] T=%.3f top_p=%.3f: %.3f tokens/round (%d tok/%d rounds)\n",
+                    samp.inv_temp > 0.f ? 1.0f / samp.inv_temp : 0.f, samp.top_p,
+                    t.rounds > 0 ? (double)t.emitted / t.rounds : 0.0, t.emitted, t.rounds);
+    }
+
+    // Round-boundary pre-checks (the top of generate()'s old loop body).
+    // Returns false when generation is done BEFORE any GPU work -- cancel,
+    // budget, ctx guard -- after running finish_decode(). Factored out of
+    // decode_step (P1 Task 9) so the conductor's fused round loop runs the
+    // IDENTICAL checks per member at each round boundary; decode_step calls
+    // it unchanged, so the solo path is byte-identical.
+    bool pre_round(DecodeTask& t) {
+        // A3: cancellation is a round-boundary event ONLY -- checked here at
+        // the top, before any GPU work, on the same footing (finish_decode +
+        // false) as the natural exits.
+        if (t.cancel.load()) {
+            finish_decode(t, "cancelled");
+            return false;
+        }
+        if (t.emitted >= t.n_max) {
+            finish_decode(t, "n_max");
+            return false;
+        }
+        // ctx guard: a round writes attention-KV rows P+1..P+gate_maxd+1 (and
+        // MTP rows P+1..P+gate_maxd); launching past the reserve would write
+        // beyond the caches and corrupt adjacent allocations (which the prefix
+        // cache would then reuse). Stop instead -- a max-length response ends a
+        // few tokens short of the absolute ceiling rather than corrupting state.
+        if (t.Ph + ctx_round_reserve() > max_ctx) {
+            finish_decode(t, "ctx-guard");
+            return false;
+        }
+        return true;
+    }
+
+    // Post-round host bookkeeping (the tail of generate()'s old loop body):
+    // P15 grammar scan/truncate, suffix-index append, Ph advance, per-token
+    // emission (EOS / client-stop / budget), on_pending, round_gap. Returns
+    // false when generation is done, after running finish_decode(). Factored
+    // out of decode_step (P1 Task 9): the conductor's fused round loop runs
+    // this same bookkeeping per member after commit_outcome(), so tokens,
+    // stop reasons and GenStats land exactly as the solo loop produces them.
+    bool post_round(DecodeTask& t, const int* em, int n) {
+        t.rounds++;
+        // P15 engage-lag fix: let the host grammar scan the whole round
+        // pre-emission; on a mid-round <tool_call> completion, truncate to
+        // the marker token and re-decide the pending under the staged mask.
+        if (!t.sampling && on_round) {
+            int m = on_round(em, n);
+            if (m >= 1 && m <= n) {
+                last_pending = refinish_round(m, n, t.Ph + m);
+                n = m;
+            }
+        }
+        // suffix index tracks the committed stream (post-truncation n);
+        // the pending token rides along virtually in propose_with.
+        if (suffix_on)
+            for (int k = 0; k < n; k++) sfx.append(em[k]);
+        t.Ph += n;
+        for (int k = 0; k < n && t.emitted < t.n_max; k++) {
+            if (em[k] == t.eos) {
+                finish_decode(t, "eos");
+                return false;
+            }
+            auto c0 = std::chrono::steady_clock::now();
+            bool cont = t.on_token(em[k]);
+            gs.cb_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - c0)
+                            .count();
+            if (!cont) {
+                finish_decode(t, "client-stop");
+                return false;
+            }
+            t.emitted++;
+        }
+        if (!t.sampling && on_pending) on_pending(last_pending);
+        round_gap();
+        return true;
+    }
+
+    // One decode round + its host bookkeeping (generate()'s old loop body).
+    // Returns false when generation is done -- budget, ctx guard, EOS,
+    // client-stop, or t.cancel -- after running finish_decode(), so GenStats
+    // and [gen-done] land exactly as the inline loop produced them.
+    // P1 Task 9: pre-checks and post-round bookkeeping are factored into
+    // pre_round()/post_round() above -- the moved code is verbatim, so this
+    // composition is byte-identical -- because the conductor's FUSED round
+    // loop calls those two around fused_verify_round()+commit_outcome() in
+    // place of the solo round below.
+    bool decode_step(DecodeTask& t) {
+        if (!pre_round(t)) return false;
+        int em[W_MAX]; // width-12: spec_round can emit up to 12 tokens
+        int n = t.sampling
+                    ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
+                    : spec_round(em);
+        return post_round(t, em, n);
+    }
+
+    // P1 Task 10 (continuous batching): the prefill/setup half of generate()
+    // -- everything from its entry through the d_P epilogue, moved VERBATIM
+    // so the server's batch mode (Q27_BATCH=1) can run prefill on the request
+    // thread under its own scoped gate lease and hand ONLY the decode loop to
+    // the conductor. Returns false on the refused path (gs.end = "refused",
+    // nothing prefilled); on success *P_out = prompt.size()-1, the host
+    // position mirror make_decode_task() takes. generate() below composes
+    // generate_prefill + make_decode_task + decode_step unchanged, so the
+    // solo path (and the graphs it replays, A8) is byte-identical by
+    // construction -- gated by the canonical/sampled/replay gates as always.
+    bool generate_prefill(const std::vector<int>& prompt, int stable_len, int* P_out) {
         int NP = (int)prompt.size();
         gs = GenStats{};
         gs.prompt = NP;
@@ -2266,7 +2832,7 @@ struct Engine {
             // prior request's token (Security #2); NP>max_ctx overruns the cache.
             fprintf(stderr, "[gen] prompt %d out of range (1..%d) -- refusing\n", NP, max_ctx);
             gs.end = "refused";
-            return 0;
+            return false;
         }
         // 07-05 audit (c), clear-at-claim: a non-CUDA throw between a prior
         // generate() and its tc.end() can leave a stale lane-0 mask +
@@ -2282,17 +2848,6 @@ struct Engine {
                 clear_tool_constraint();
             }
         }
-        // R1b preemption point (no-op when the hook is unset or nobody waits)
-        auto round_gap = [&] {
-            if (!on_round_gap) return;
-            auto y0 = std::chrono::steady_clock::now();
-            if (on_round_gap()) {
-                gs.gw_ms += std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - y0)
-                                .count();
-                gs.yields++;
-            }
-        };
         if (batched_prefill && NP >= 32) {
             // prefix-cache hit: prompt extends the snapshotted prefix -> restore
             // recurrent state and prefill only the new suffix
@@ -2405,112 +2960,30 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
-        // Sampling (temp>0): upload request params once; the sampled path
-        // replaces the greedy spec_round in the loop. Default = spec_sample_round
-        // (Phase 2: sampled depth-4 speculation, fast). Greedy (inv_temp<=0)
-        // leaves d_samp untouched and runs the spec path bitwise. d_pos is NP
-        // here (prefill's last advance), so the first eager draw keys the token
-        // at position NP with kind 0.
-        const bool sampling = samp.inv_temp > 0.f;
-        // Q27_SAMPLE_PLAIN forces the Phase-1 plain sampler (one token/round, no
-        // spec) even under sampling -- the A/B lever for the spec==non-spec
-        // distribution gate (docs/sampling-design.md sec 4).
-        static const bool force_plain_sample = getenv("Q27_SAMPLE_PLAIN") != nullptr;
-        if (sampling) {
-            CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
-            samp_first = true;
-        }
-        int emitted = 0, rounds = 0;
-        auto g0 = std::chrono::steady_clock::now();
-        // decode-phase park baseline: dt below covers decode only, so the
-        // contended-print suffix must use decode-phase gw, not request-total
-        // (prefill parks belong to pf_ms; mixing them over-corrects t/s)
-        const double gw_pf = gs.gw_ms;
-        const int yields_pf = gs.yields;
-        // Q27_PROF_DECODE=1: bracket the decode loop with a cudaProfiler
-        // range so `nsys --capture-range=cudaProfilerApi` records ONLY the
-        // decode slice -- prefill otherwise floods the trace (the CLI
-        // --tokens path walks the prompt serially; see BUILDLOG nsys notes).
-        // No-op without a profiler attached; done() below is the single
-        // exit funnel, so every decode exit path closes the range.
-        const bool prof_decode = getenv("Q27_PROF_DECODE") != nullptr;
-        if (prof_decode) {
-            CUDA_CHECK(cudaStreamSynchronize(stm));
-            (void)cudaProfilerStart();
-        }
-        auto done = [&](const char* why) {
-            if (prof_decode) {
-                CUDA_CHECK(cudaStreamSynchronize(stm));
-                (void)cudaProfilerStop();
-            }
-            double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0)
-                            .count();
-            gs.dec = emitted;
-            gs.dec_ms = dt * 1000.0;
-            gs.rounds = rounds;
-            gs.end = why;
-            // wall-inclusive of yield parks; the suffix keeps a contended
-            // print from reading as a decode regression
-            if (gs.yields > yields_pf)
-                fprintf(stderr,
-                        "[gen-done] %s: %d tokens in %.1fs (%.1f t/s; parked %.0fms/%d "
-                        "yields in decode), n_max=%d\n",
-                        why, emitted, dt, emitted / (dt > 0 ? dt : 1), gs.gw_ms - gw_pf,
-                        gs.yields - yields_pf, n_max);
-            else
-                fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n",
-                        why, emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
-            // Phase 2 acceptance-vs-temp telemetry (sampled path only; keeps the
-            // greedy [gen-done] line shortbench_suite parses untouched). tokens/
-            // round is the sampled spec acceptance -- it sags as temperature rises.
-            if (sampling && !force_plain_sample)
-                fprintf(stderr,
-                        "[sample-stats] T=%.3f top_p=%.3f: %.3f tokens/round (%d tok/%d rounds)\n",
-                        samp.inv_temp > 0.f ? 1.0f / samp.inv_temp : 0.f, samp.top_p,
-                        rounds > 0 ? (double)emitted / rounds : 0.0, emitted, rounds);
-        };
-        // ctx guard: a round writes attention-KV rows P+1..P+gate_maxd+1 (and
-        // MTP rows P+1..P+gate_maxd); launching past the reserve would write
-        // beyond the caches and corrupt adjacent allocations (which the prefix
-        // cache would then reuse). Stop instead -- a max-length response ends a
-        // few tokens short of the absolute ceiling rather than corrupting state.
-        int Ph = P;
-        while (emitted < n_max) {
-            if (Ph + ctx_round_reserve() > max_ctx) { done("ctx-guard"); return emitted; }
-            int em[W_MAX]; // width-12: spec_round can emit up to 12 tokens
-            int n = sampling ? (force_plain_sample ? sample_round(em) : spec_sample_round(em))
-                             : spec_round(em);
-            rounds++;
-            // P15 engage-lag fix: let the host grammar scan the whole round
-            // pre-emission; on a mid-round <tool_call> completion, truncate to
-            // the marker token and re-decide the pending under the staged mask.
-            if (!sampling && on_round) {
-                int m = on_round(em, n);
-                if (m >= 1 && m <= n) {
-                    last_pending = refinish_round(m, n, Ph + m);
-                    n = m;
-                }
-            }
-            // suffix index tracks the committed stream (post-truncation n);
-            // the pending token rides along virtually in propose_with.
-            if (suffix_on)
-                for (int k = 0; k < n; k++) sfx.append(em[k]);
-            Ph += n;
-            for (int k = 0; k < n && emitted < n_max; k++) {
-                if (em[k] == eos) { done("eos"); return emitted; }
-                auto c0 = std::chrono::steady_clock::now();
-                bool cont = on_token(em[k]);
-                gs.cb_ms += std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - c0)
-                                .count();
-                if (!cont) { done("client-stop"); return emitted; }
-                emitted++;
-            }
-            if (!sampling && on_pending) on_pending(last_pending);
-            round_gap();
-        }
-        done("n_max");
-        return emitted;
+        *P_out = P;
+        return true;
+    }
+
+    // Prompt + speculative generation. Calls on_token(id) for each generated
+    // token; stop when on_token returns false, n_max hit, or eos. Uses the spec
+    // path (requires build_spec_graphs()). MTP KV warmed during prompt.
+    // stable_len (P8): token index of the stable-prefix boundary (end of the
+    // last input message). The GDN snapshot is taken THERE instead of at the
+    // prompt tail, so the next turn's re-rendered history prefix-matches and
+    // only the per-turn suffix re-prefills. -1 = legacy tail snapshot.
+    template <typename F>
+    int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token,
+                 int stable_len = -1) {
+        int P = 0;
+        if (!generate_prefill(prompt, stable_len, &P)) return 0;
+        // Decode: pre-loop state lives in DecodeTask, one round per
+        // decode_step (P1: the conductor drives the same step function for
+        // several engines). finish_decode() runs inside the step that
+        // returns false, so every exit path lands its GenStats/[gen-done].
+        DecodeTask t;
+        make_decode_task(t, n_max, eos, on_token, P);
+        while (decode_step(t)) {}
+        return t.emitted;
     }
 
     void build_graph() {
