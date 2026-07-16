@@ -217,7 +217,19 @@ int main(int argc, char** argv) {
             if (!read_equal(backend, *out_a, *out_b, (uint64_t)tokens * N_HEAD * HEAD_DIM * 4, what))
                 return 1;
         }
-        printf("verify: head-major + token-tiled (t2/t4) bit-identical to the untiled GQA kernels\n");
+        // R3: at the production block size the barrier-free kernel must be
+        // bit-identical to the staged kernels (same dequant, dot order, and
+        // fold); other block sizes change the fold and are timing-only here.
+        backend.begin_commands();
+        backend.attention_turbo3_causal_gqa_bf(*qbuf, Q_STRIDE, Q_ROW_STRIDE, *kc[0], *vc[0],
+                                               *out_b, base_len, N_HEAD, N_KV, HEAD_DIM,
+                                               tokens, 1024, SCALE);
+        backend.end_commands();
+        if (!read_equal(backend, *out_a, *out_b, (uint64_t)tokens * N_HEAD * HEAD_DIM * 4,
+                        "barrier-free causal probe bf2 @ block 1024"))
+            return 1;
+        printf("verify: head-major + token-tiled (t2/t4) + barrier-free (bf2 @1024) "
+               "bit-identical to the untiled GQA kernels\n");
     }
 
     // ---- Timing ----
@@ -240,6 +252,7 @@ int main(int argc, char** argv) {
     printf("chunk%-3u gqa       : %8.3f ms/dispatch, %6.1f GB/s logical\n",
            tokens, t_chunk * 1e3, chunk_gb / t_chunk / 1e9);
     if (turbo3) {
+        double t_t2 = 0;
         for (uint32_t tile : {2u, 4u}) {
             const double t_tiled = wall_per_op(backend, reps, [&](uint32_t r) {
                 backend.attention_turbo3_causal_gqa_tiled(*qbuf, Q_STRIDE, Q_ROW_STRIDE,
@@ -247,8 +260,21 @@ int main(int argc, char** argv) {
                                                           base_len, N_HEAD, N_KV, HEAD_DIM,
                                                           tokens, tile, SCALE);
             });
+            if (tile == 2) t_t2 = t_tiled;
             printf("chunk%-3u gqa-t%u    : %8.3f ms/dispatch, %6.1f GB/s logical (%.2fx)\n",
                    tokens, tile, t_tiled * 1e3, chunk_gb / t_tiled / 1e9, t_chunk / t_tiled);
+        }
+        // R3 block sweep: ratios are against the production t2 route (the
+        // deploy decision baseline), not the untiled kernel.
+        for (uint32_t block : {128u, 256u, 512u, 1024u, 2048u}) {
+            const double t_bf = wall_per_op(backend, reps, [&](uint32_t r) {
+                backend.attention_turbo3_causal_gqa_bf(*qbuf, Q_STRIDE, Q_ROW_STRIDE,
+                                                       *kc[r % copies], *vc[r % copies], *out_a,
+                                                       base_len, N_HEAD, N_KV, HEAD_DIM,
+                                                       tokens, block, SCALE);
+            });
+            printf("chunk%-3u gqa-bf2 B%-5u: %8.3f ms/dispatch, %6.1f GB/s logical (%.2fx vs t2)\n",
+                   tokens, block, t_bf * 1e3, chunk_gb / t_bf / 1e9, t_t2 / t_bf);
         }
     }
     return 0;

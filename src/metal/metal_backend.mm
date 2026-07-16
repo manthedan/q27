@@ -228,6 +228,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> attention_turbo3_gqa_hm_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t2_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t4_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_bf2_p;
     id<MTLComputePipelineState> attention_f16_causal_gqa_t2_p;
     // Q27_METAL_GQA_TILE: causal token-tile factor, 1 (untiled A/B lever)
     // or 2 (default; docs/plans/2026-07-15-cache-block-scheduling.md R1b).
@@ -575,6 +576,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_turbo3_gqa_hm_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_hm");
         impl_->attention_turbo3_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t2");
         impl_->attention_turbo3_causal_gqa_t4_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t4");
+        impl_->attention_turbo3_causal_gqa_bf2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_bf2");
         impl_->attention_f16_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa_t2");
         if (const char* env = getenv("Q27_METAL_GQA_TILE"); env && *env) {
             const unsigned long tile = strtoul(env, nullptr, 10);
@@ -1507,6 +1509,61 @@ void MetalBackend::attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32
 
 // Phase-0 R1b probe: token-tiled causal GQA at tile 2 or 4. Interleaved
 // production cache layout; merge kernel reused unchanged.
+// R3 probe entry (bench-only): barrier-free direct-read block-partial causal
+// GQA, token factor 2, with an explicit block-size override — the sweep is
+// the experiment (docs/plans/2026-07-16-r3-barrier-free-attention.md). At
+// block == gqa_block the output is bit-identical to the t2 route.
+void MetalBackend::attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32_t q_stride,
+                                                  uint32_t q_row_stride,
+                                                  const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                                  BackendBuffer& out, uint32_t base_len,
+                                                  uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+                                                  uint32_t tokens, uint32_t block, float scale) {
+    const uint32_t gqa = kv_heads ? q_heads / kv_heads : 0;
+    if (!base_len || !tokens || !kv_heads || q_heads % kv_heads || head_dim != 256 ||
+        gqa < 2 || gqa > 8 || !block || block % 8 ||
+        base_len > UINT32_MAX - tokens)
+        throw std::runtime_error("q27 Metal: invalid bf probe dimensions");
+    const MetalBuffer& qb = metal_buffer(q);
+    const MetalBuffer& kc = metal_buffer(k_cache);
+    const MetalBuffer& vc = metal_buffer(v_cache);
+    MetalBuffer& output = metal_buffer(out);
+    const uint32_t max_seq = base_len + tokens - 1;
+    check_range(qb.size(), 0,
+                ((uint64_t)(tokens - 1) * q_row_stride + (uint64_t)(q_heads - 1) * q_stride + head_dim) * 4,
+                "bf probe Q");
+    const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * 2 * 50;
+    check_range(kc.size(), 0, cache_bytes, "bf probe K cache");
+    check_range(vc.size(), 0, cache_bytes, "bf probe V cache");
+    check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "bf probe output");
+    const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
+    const uint64_t partial_bytes = (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
+    if (!impl_->gqa_partials || impl_->gqa_partials.length < partial_bytes)
+        impl_->gqa_partials = [impl_->device newBufferWithLength:(NSUInteger)partial_bytes
+                                                         options:MTLResourceStorageModePrivate];
+    if (!impl_->gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+    AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
+                                head_dim, block, n_blocks_max, tokens, scale};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_turbo3_causal_gqa_bf2");
+        [enc setComputePipelineState:impl_->attention_turbo3_causal_gqa_bf2_p];
+        [enc setBuffer:qb.handle() offset:0 atIndex:0];
+        [enc setBuffer:kc.handle() offset:0 atIndex:1];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, (tokens + 1) / 2)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+        [enc setComputePipelineState:impl_->attention_gqa_merge_rows_p];
+        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:0];
+        [enc setBuffer:output.handle() offset:0 atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (own) impl_->finish_command("bf probe attention");
+    }
+}
+
 void MetalBackend::attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uint32_t q_stride,
                                                      uint32_t q_row_stride,
                                                      const BackendBuffer& k_cache, const BackendBuffer& v_cache,

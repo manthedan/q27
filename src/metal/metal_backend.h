@@ -173,6 +173,14 @@ class MetalBackend final : public ComputeBackend {
                                         uint32_t q_heads, uint32_t kv_heads,
                                         uint32_t head_dim, float scale);
     // tile must be 2 or 4; interleaved (production-layout) caches.
+    // R3 probe (bench-only): barrier-free direct-read block-partial causal
+    // GQA at token factor 2 with an explicit block-size override.
+    void attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32_t q_stride,
+                                        uint32_t q_row_stride,
+                                        const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                        BackendBuffer& out, uint32_t base_len,
+                                        uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+                                        uint32_t tokens, uint32_t block, float scale);
     void attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uint32_t q_stride,
                                            uint32_t q_row_stride,
                                            const BackendBuffer& k_cache, const BackendBuffer& v_cache,
