@@ -81,7 +81,7 @@ read says mature, prefill closes as mature and the roadmap moves on.
 ## Results (appended post-measurement, same day, M4 16 GB)
 
 **FINAL VERDICT (post-codex corrected methodology): C/Beq = 1.135
-[1.133, 1.137] → the (1.08, 1.15] read fires — NOT mature; exactly ONE
+[1.134, 1.136] → the (1.08, 1.15] read fires — NOT mature; exactly ONE
 targeted kernel round is permitted, aimed at the unpack/conversion ALU.**
 
 ### The verdict flipped in the codex round — recorded honestly
@@ -109,19 +109,28 @@ per-trial paired chunk-aggregate ratios (arms interleaved within each
 trial), CI over the 10 ratio observations, instead of a harmonic
 combination of non-simultaneous per-shape bounds.
 
+A second codex round found two more bias sources, both fixed and
+re-measured: the arm order inside each trial is now rotated (a fixed
+C-first order folds thermal/frequency drift into the same side of every
+paired ratio), and Beq's activation staging loads were split into two
+4-byte half2 loads to match C's two char4 loads (one 8-byte load
+understates load-issue cost). Re-measured verdict: **1.135
+[1.134, 1.136] — unchanged**; the number was already honest, now the
+methodology can prove it.
+
 ### Numbers (8 reps × 10 interleaved trials, ms/dispatch, x_rows 96)
 
 | shape | C | Beq | B | A | C/Beq [95% CI] | C TFLOP/s |
 |---|---|---|---|---|---|---|
-| ffn gate/up [17408×5120] | 6.754 | 5.949 | 6.475 | 4.672 | 1.135 [1.133,1.138] | 2.53 |
-| ffn down [5120×17408] | 6.777 | 5.973 | 7.222 | 4.638 | 1.135 [1.131,1.139] | 2.53 |
-| gdn qkv [10240×5120] | 3.999 | 3.524 | 3.845 | 2.775 | 1.135 [1.132,1.138] | 2.52 |
-| gdn gate [6144×5120] | 2.437 | 2.152 | 2.340 | 1.694 | 1.132 [1.126,1.139] | 2.48 |
-| ssm/attn out [5120×6144] | 2.422 | 2.141 | 2.325 | 1.674 | 1.132 [1.123,1.140] | 2.49 |
-| attn q [12288×5120] | 4.788 | 4.216 | 4.599 | 3.317 | 1.136 [1.133,1.138] | 2.52 |
-| attn k/v [1024×5120] | 0.471 | 0.414 | 0.459 | 0.332 | 1.138 [1.112,1.164] | 2.14 |
-| **aggregate C/Beq** | | | | | **1.135 [1.133, 1.137]** | |
-| aggregate C/B (literal, confounded) | | | | | 1.016 [1.014, 1.018] | |
+| ffn gate/up [17408×5120] | 6.753 | 5.944 | 6.473 | 4.671 | 1.136 [1.134,1.139] | 2.53 |
+| ffn down [5120×17408] | 6.771 | 5.973 | 7.282 | 4.630 | 1.134 [1.131,1.136] | 2.53 |
+| gdn qkv [10240×5120] | 4.000 | 3.526 | 3.829 | 2.778 | 1.134 [1.131,1.138] | 2.52 |
+| gdn gate [6144×5120] | 2.442 | 2.152 | 2.337 | 1.693 | 1.135 [1.128,1.142] | 2.47 |
+| ssm/attn out [5120×6144] | 2.422 | 2.136 | 2.323 | 1.680 | 1.134 [1.130,1.139] | 2.49 |
+| attn q [12288×5120] | 4.783 | 4.217 | 4.587 | 3.319 | 1.134 [1.132,1.136] | 2.53 |
+| attn k/v [1024×5120] | 0.466 | 0.413 | 0.453 | 0.331 | 1.129 [1.109,1.148] | 2.16 |
+| **aggregate C/Beq** | | | | | **1.135 [1.134, 1.136]** | |
+| aggregate C/B (literal, confounded) | | | | | 1.014 [1.013, 1.016] | |
 | aggregate Beq/A (cadence residual) | | | | | 1.276 [1.274, 1.278] | |
 
 The per-shape C/Beq is remarkably uniform (1.13–1.14 everywhere): the

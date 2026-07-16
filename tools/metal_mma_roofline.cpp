@@ -209,7 +209,11 @@ int main(int argc, char** argv) {
         }
 
         for (uint32_t trial = 0; trial < TRIALS; trial++) {
-            for (int arm = 0; arm < N_ARMS; arm++) {
+            // Rotate the arm order per trial so systematic frequency/thermal
+            // drift within a trial doesn't always land on the same side of
+            // each paired ratio (codex P2).
+            for (int k = 0; k < N_ARMS; k++) {
+                const int arm = (k + (int)trial) % N_ARMS;
                 const auto start = std::chrono::steady_clock::now();
                 backend.begin_commands();
                 for (uint32_t r = 0; r < reps; r++) ops[arm]();
