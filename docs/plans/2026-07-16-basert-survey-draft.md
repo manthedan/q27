@@ -282,3 +282,41 @@ codec plan); dispatch table / chain decode / residency sets (CPU-side or
 footprint wins; decode is at 98-99% of bandwidth ceiling); MoE bucket kernels
 (q27 is dense). Metal 4 cooperative tensors: not used by BaseRT at all —
 no portability flag needed.
+
+---
+
+## Probe dispositions (mini, 2026-07-16 afternoon — appended to the draft)
+
+**Probe 1 (f16-accumulate MMA): RAN and PARKED** — aggregate C/F = 1.065
+[1.064, 1.066] vs the pre-registered 1.10 line, per-shape flat; full
+record in 2026-07-16-f16acc-probe.md (numerics caveat included: the
+synthetic bench never stressed the 5e-2 gate).
+
+**Probes 2 and 3: PARKED BY DECOMPOSITION, no new kernels.** The same
+16-trial run re-measured the bounding arms, and the pools these probes
+draw from are now smaller than their own kill lines:
+
+- The ENTIRE unpack/staging plumbing pool is C/Beq = 1.082 [1.081,
+  1.082] (post-byte-LUT). Of that, the char→half converts are C/Cx =
+  1.022. The residual non-convert pool — LUT gathers, staging stores,
+  loop/address machinery — is therefore ≤ ~5.9%, as a hard ceiling.
+- Probe 2 (function-constant K/group-size baking) removes loop bounds
+  and address arithmetic ONLY — it deletes no gather and no store. The
+  inner 8×8 loops already have literal bounds; only the outer 64-K walk
+  has a runtime bound. Its reachable slice of the ≤5.9% pool cannot
+  plausibly clear the probe's own <5% kill line, and a 100%-of-pool
+  outcome is physically excluded because the pool is dominated by the
+  gathers/stores baking keeps. PARK; reopen only if a future kernel
+  round changes the staging shape.
+- Probe 3 (16-element register-tile dequant): q27's byte-LUT unpack
+  already emits 16 staged elements per thread per slab as 4× half4
+  vector stores (the survey's own "check first — may be a no-op" case),
+  and the registers-not-threadgroup variant of this idea is the
+  direct-RHS family, measured 0.43–0.82× (parked with mechanism:
+  cooperative amortization needs Metal-4 tensors). NO-OP / already
+  parked.
+
+Net: the BaseRT survey is fully discharged on the mini side — one probe
+run and parked with numbers, two parked by measured decomposition, all
+other imports pre-answered or adopted elsewhere (KV codec, ds4 snapshot
+priority).
