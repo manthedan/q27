@@ -676,11 +676,18 @@ int test_attention_gqa_straddle() {
 // token counts put a single live token in the last tile, and base 1020
 // puts the tile's staged range across a 1024-block boundary.
 int test_attention_gqa_tiled_parity() {
+    // Pin BOTH backends' tile settings explicitly — if the caller exported
+    // the Q27_METAL_GQA_TILE=1 opt-out, inheriting it would make this gate
+    // compare untiled to untiled and pass vacuously (codex P2, 2026-07-15).
+    const char* caller_tile = getenv("Q27_METAL_GQA_TILE");
+    const std::string saved_tile = caller_tile ? caller_tile : "";
     setenv("Q27_METAL_GQA_THRESHOLD", "1", 1);
+    setenv("Q27_METAL_GQA_TILE", "2", 1);
     q27::MetalBackend tiled;
     setenv("Q27_METAL_GQA_TILE", "1", 1);
     q27::MetalBackend untiled;
-    unsetenv("Q27_METAL_GQA_TILE");
+    if (caller_tile) setenv("Q27_METAL_GQA_TILE", saved_tile.c_str(), 1);
+    else unsetenv("Q27_METAL_GQA_TILE");
     unsetenv("Q27_METAL_GQA_THRESHOLD");
     int failures = 0;
     uint32_t lcg = 112358;
