@@ -44,10 +44,17 @@ arrived), PARKED-AGREED.
    top-20 overlap, per-arm NLL). **Verdict: widths 17/48/96 are
    BIT-IDENTICAL to width 12 at the logit level** (384 positions, all
    metrics exactly zero), and the instrument's negative control
-   (`--prefill serial` baseline) fires at the known chunk-vs-serial class
-   (max|dlogit| 0.279, KL 1.6e-4 nats, 0 flips, 99.17% top-20 overlap) —
+   (`--prefill serial` baseline) fires at the known chunk-vs-serial class —
    the gate can fail, and that control doubles as the first empirical
-   envelope datapoint for the margin-aware contract.
+   envelope datapoint for the margin-aware contract. At the full 384
+   positions: max|dlogit| 0.646, KL mean 1.9e-4 nats, 3 top-1 flips all at
+   baseline margins 0.007–0.02 (tolerance-legitimate under L3; the first
+   96-position control read 0.279/0 flips — smaller sample, same class).
+   Codex round on `dc8f017` hardened the instrument: exit code now carries
+   the verdict (bit-identity expected; expectation inverted under the
+   serial control), n ≥ 96 required so every advertised width actually
+   dispatches, all n+1 token ids vocab-validated before logit indexing,
+   and the spurious `--nll-long` coupling removed.
    Original finding: **CONFIRMED**
    (`metal_engine.h:130`, `metal_engine.cpp:956`): NLL/teacher-forcing
    still slices at `CHUNK_MAX=12`, so widths 48/96 carry only
