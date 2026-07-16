@@ -147,6 +147,7 @@ struct L2RowsArgs { uint32_t heads, head_dim, row_stride, tokens; float eps; };
 struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, position, tokens; float freq_base; };
 struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
 struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
+struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode, head; };
 struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
 struct ArgmaxRowsArgs { uint32_t n, rows; };
 struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
@@ -213,6 +214,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> rope_rows;
     id<MTLComputePipelineState> kv_store_rows;
     id<MTLComputePipelineState> kv_store_turbo3_rows;
+    id<MTLComputePipelineState> kv_store_attrib_rows;
     id<MTLComputePipelineState> attention_causal;
     id<MTLComputePipelineState> attention_turbo3_causal_p;
     id<MTLComputePipelineState> sigmoid_gate_rows;
@@ -233,6 +235,9 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> mma_roofline_b_p;
     id<MTLComputePipelineState> mma_roofline_b_eq_p;
     id<MTLComputePipelineState> mma_roofline_cx_p;
+    id<MTLComputePipelineState> mma_roofline_f_p;
+    // Arm K (function-constant probe): one specialized PSO per baked cols.
+    std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
     id<MTLComputePipelineState> mm_dr_p;
     id<MTLComputePipelineState> mm_dr2_p;
     id<MTLComputePipelineState> x_to_half_t_p;
@@ -536,6 +541,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
             impl_->mma_roofline_b_eq_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b_eq");
             impl_->mma_roofline_cx_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_cx");
+            impl_->mma_roofline_f_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_f");
             impl_->mm_dr_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr");
             impl_->mm_dr2_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr2");
             impl_->x_to_half_t_p = make_pipeline(impl_->device, impl_->library, @"q27_x_int8_to_half_t");
@@ -577,6 +583,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->rope_rows = make_pipeline(impl_->device, impl_->library, @"q27_rope_neox_rows");
         impl_->kv_store_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_rows");
         impl_->kv_store_turbo3_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3_rows");
+        impl_->kv_store_attrib_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_attrib_rows");
         impl_->attention_causal = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal");
         impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
         impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
@@ -1134,9 +1141,61 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
                                 BackendBuffer& y) {
     if (!impl_->mma_roofline_a_p || !impl_->mma_roofline_b_p)
         throw std::runtime_error("q27 Metal: MMA roofline requires Apple GPU family 7 or newer");
-    if ((arm != 'a' && arm != 'b' && arm != 'e' && arm != 'x' && arm != 'd' && arm != '2') || !rows || !cols ||
+    if ((arm != 'a' && arm != 'b' && arm != 'e' && arm != 'x' && arm != 'd' && arm != '2' &&
+         arm != 'f' && arm != 'k') || !rows || !cols ||
         !x_rows || x_rows > 96 || cols % 128)
         throw std::runtime_error("q27 Metal: invalid MMA roofline arguments");
+    // Arms 'f' (f16-accumulate, docs/plans/2026-07-16-f16acc-probe.md) and
+    // 'k' (function-constant cols baking, BaseRT survey probe 2): the
+    // production mm_h operands and grid; 'k' resolves a per-cols
+    // specialized PSO on first use.
+    if (arm == 'f' || arm == 'k') {
+        if (arm == 'k' && !impl_->mma_roofline_k_p.count(cols)) {
+            MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
+            [fc setConstantValue:&cols type:MTLDataTypeUInt atIndex:0];
+            NSError* err = nil;
+            id<MTLFunction> fn = [impl_->library newFunctionWithName:@"q27_mma_roofline_k"
+                                                      constantValues:fc
+                                                               error:&err];
+            id<MTLComputePipelineState> pso =
+                fn ? [impl_->device newComputePipelineStateWithFunction:fn error:&err] : nil;
+            if (!pso)
+                throw std::runtime_error(std::string("q27 Metal: roofline k specialization failed: ") +
+                                         (err ? err.localizedDescription.UTF8String : "unknown"));
+            impl_->mma_roofline_k_p[cols] = pso;
+        }
+        if (!w_scales || !x || !x_scales)
+            throw std::runtime_error("q27 Metal: roofline arm f needs scales and activations");
+        const MetalBuffer& wb = metal_buffer(w_or_seed);
+        const MetalBuffer& ws = metal_buffer(*w_scales);
+        const MetalBuffer& xb = metal_buffer(*x);
+        const MetalBuffer& xs = metal_buffer(*x_scales);
+        MetalBuffer& out = metal_buffer(y);
+        check_range(wb.size(), 0, (uint64_t)rows * cols / 4, "roofline f weights");
+        check_range(ws.size(), 0, (uint64_t)rows * (cols / 128) * 2, "roofline f weight scales");
+        check_range(xb.size(), 0, (uint64_t)x_rows * cols, "roofline f activations");
+        check_range(xs.size(), 0, (uint64_t)x_rows * (cols / 32) * 4, "roofline f activation scales");
+        check_range(out.size(), 0, (uint64_t)rows * x_rows * 4, "roofline f output");
+        MatmulArgs args{rows, cols, x_rows, 1};
+        @autoreleasepool {
+            bool own;
+            auto enc = impl_->encoder_for_operation(
+                own, arm == 'k' ? "q27_mma_roofline_k" : "q27_mma_roofline_f");
+            [enc setComputePipelineState:arm == 'k' ? impl_->mma_roofline_k_p[cols]
+                                                    : impl_->mma_roofline_f_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:ws.handle() offset:0 atIndex:1];
+            [enc setBuffer:xb.handle() offset:0 atIndex:2];
+            [enc setBuffer:xs.handle() offset:0 atIndex:3];
+            [enc setBuffer:out.handle() offset:0 atIndex:4];
+            [enc setBytes:&args length:sizeof(args) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32,
+                                                  (NSUInteger)(x_rows + 15) / 16, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            if (own) impl_->finish_command(arm == 'k' ? "mma roofline k" : "mma roofline f");
+        }
+        return;
+    }
     // Arm 'd' — lever 1 direct-RHS probe (docs/plans/2026-07-16-lever1-
     // direct-rhs.md): w_or_seed = packed T2 weight bytes, x = int8
     // activation values, x_scales = float per-32 scales. Encodes the RHS
@@ -2103,6 +2162,36 @@ void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuf
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
                 threadsPerThreadgroup:MTLSizeMake(128,1,1)];
         if (own) impl_->finish_command("chunked turbo3 KV store");
+    }
+}
+
+void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                            BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                            uint32_t position, uint32_t kv_heads, uint32_t tokens,
+                                            uint32_t mode, uint32_t head) {
+    if (!kv_heads || !tokens || tokens > 96)
+        throw std::runtime_error("q27 Metal: invalid KV attribution store");
+    if (mode != 1 && mode != 2)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K) or 2 (V)");
+    if (head != UINT32_MAX && head >= kv_heads)
+        throw std::runtime_error("q27 Metal: KV attribution head out of range");
+    const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
+    MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
+    const uint64_t row_floats = (uint64_t)kv_heads * 256;
+    check_range(kb.size(), 0, row_floats * tokens * 4, "attrib K rows");
+    check_range(vb.size(), 0, row_floats * tokens * 4, "attrib V rows");
+    check_range(kc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib K cache");
+    check_range(vc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib V cache");
+    TurboAttribArgs args{position, kv_heads, tokens, mode, head};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_f16_attrib_rows");
+        [enc setComputePipelineState:impl_->kv_store_attrib_rows];
+        [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
+        [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
+                threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+        if (own) impl_->finish_command("KV attribution store");
     }
 }
 

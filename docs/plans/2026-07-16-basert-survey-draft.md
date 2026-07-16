@@ -282,3 +282,47 @@ codec plan); dispatch table / chain decode / residency sets (CPU-side or
 footprint wins; decode is at 98-99% of bandwidth ceiling); MoE bucket kernels
 (q27 is dense). Metal 4 cooperative tensors: not used by BaseRT at all —
 no portability flag needed.
+
+---
+
+## Probe dispositions (mini, 2026-07-16 afternoon — appended to the draft)
+
+**Probe 1 (f16-accumulate MMA): RAN and PARKED** — aggregate C/F = 1.065
+[1.064, 1.066] vs the pre-registered 1.10 line, per-shape flat; full
+record in 2026-07-16-f16acc-probe.md (numerics caveat included: the
+synthetic bench never stressed the 5e-2 gate).
+
+**Probe 2: MEASURED and PARKED. Probe 3: T2 no-op / Q4 deferred.**
+(A first "parked by decomposition" framing for probe 2 was REJECTED in
+review — codex P2, correct: loop/address overhead sits on BOTH sides of
+C/Beq, so that ratio cannot bound specialization gains. Bounding-arm
+re-reads kept for context: C/Beq = 1.081 [1.080, 1.082] post-byte-LUT,
+C/Cx = 1.024.)
+
+- Probe 2 (function-constant K/group-size baking) — measured as
+  roofline arm K: the production mm_h with FC_COLS baked as a Metal
+  function constant (per-shape specialized PSO, trip counts and all
+  cols-derived address math become literals), bit-identity gate at
+  tolerance 0 vs C — held exactly on every shape. **Aggregate C/K =
+  1.010 [1.009, 1.011], 18 counterbalanced trials — PARK at the
+  probe's own <5% kill line.** On q27's staged 64-K walk,
+  specializing the outer trip count and cols-derived address math is
+  worth ~1% end-to-end — the measured benefit of what baking removes,
+  with no claim about how much loop machinery the compiler leaves
+  behind. BaseRT's baking presumably pays on their fully-unrolled
+  unpack loops, not on this shape.
+- Probe 3 (16-element register-tile dequant): split disposition. For
+  the T2 production kernel the survey's own "may be a no-op" case
+  holds — the byte-LUT unpack already stages 16 elements per thread
+  per slab as 4× half4 vector stores. The probe's stated Q4 target
+  (`q27_matmul_q4_mm` still expands 16 nibbles to scalar stores —
+  codex file:line) is real but not on the T2 artifact's path at all;
+  Q4 chunk GEMM only becomes production-relevant if DSpark Phase 3
+  integrates the Q4_1 drafter. DEFER to the DSpark Phase-3 decision;
+  revisit with the drafter's actual shapes if it graduates.
+
+Net: the BaseRT survey is fully discharged on the mini side — probes 1
+and 2 run and parked with measured numbers (C/F 1.065, C/K 1.010),
+probe 3 a T2 no-op with its Q4 target deferred to the DSpark Phase-3
+decision, all other imports pre-answered or adopted elsewhere (KV
+codec, ds4 snapshot priority).
