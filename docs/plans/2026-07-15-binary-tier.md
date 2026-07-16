@@ -1,0 +1,219 @@
+# Binary weight tier (Bonsai 1.125 bpw) for the Metal engine
+
+**Status: proposed** (2026-07-15). The ternary plan's non-goals section parked this
+tier behind "after ternary proves out." That precondition is met: gate 3 passed
+(depth-uniform ~2.1–2.3× PPL, 32K), fork parity was byte-identical, T2 serves.
+This plan mirrors `2026-07-14-ternary-tier.md` phase-for-phase; where a step is
+identical to the ternary version it says so instead of restating it.
+
+Source pack: PrismML `Bonsai-27B` (binary {−1,+1} sibling of Ternary-Bonsai,
+same Qwen3.6-27B base, Apache-2.0). GGUF `Q1_0_g128` (ggml type 41 in their
+fork, the type-42 ternary's sibling) at **1.125 bpw deployed**, ~3.9 GB; also
+shipped as `-unpacked` masters and an MLX 1-bit pack. Whitepaper retention:
+**89.5% of FP16** aggregate (ternary: 94.6%) — the quality risk is the whole
+reason Phase 0 exists.
+
+## Motivation
+
+Same wall as the ternary tier, one step further down the ladder. Decode is
+weight-stream-bound; the artifact size *is* the ceiling:
+
+| tier | bpw deployed | artifact | resident ceiling @ ~85 GB/s |
+|------|-------------:|---------:|------------------------------|
+| official | 5.25 | ~17 GB | ~4.6 tok/s (pages on 24 GiB) |
+| ternary T2 | 2.125 | 7.15 GB | ~12.4–12.7 tok/s (measured) |
+| ternary T3 (planned) | 1.75 | ~5.9 GB | ~14+ tok/s (projected) |
+| **binary B1** | **1.125** | **~3.9 GB** | **~20–23 tok/s (projected)** |
+
+Projection basis: T2 resident decode measured 79–81 ms/token with the GEMV at
+~77 ms (84.7% share); halving streamed weight bytes puts the GEMV near ~39 ms
+and the token near ~43 ms if the non-GEMV residual (~3–4 ms) holds. Treat
+20–23 as a band, not a number, until `metal_decode_bench --dtype b1` exists.
+Fixed per-step costs (readback sync, command-buffer turnaround) double in
+relative share at this speed — the GPU-resident greedy feedback loop
+(ds4-survey item 4) pays twice as much on this tier.
+
+**The mini becomes a first-class serving box.** 3.9 GB fits a **single**
+buffer view under the mini's 8.0 GiB `maxBufferLength` (no overlapping-view
+machinery needed), fully wired via the existing residency-set path, with room
+for 262K turbo3 KV (3.4 GiB) beside it in 16 GiB. A full 27B at ~20 tok/s
+with maximum context on the smaller machine is the headline if quality holds.
+
+Three-tier framing: official / ternary / binary is a quality–speed ladder on
+one binary — per-tensor dtype (FORMAT.md) means the artifact chosen at load
+time determines everything; engine, server, gates, benches shared wholesale.
+
+## Known asymmetries (inherited from the ternary tier, plus one)
+
+1. **No MTP head** — same as ternary; greedy + suffix drafting day one.
+   Drafting remains parked per the ternary doc's follow-up 6 resolution
+   (batch-1 Metal spec-decode corroborated as a net loss on low-bandwidth
+   Apple Silicon).
+2. **No byte-exact oracle** — same gate substitute as ternary: (a) bit-exact
+   CPU-reference unit parity for the new kernels, (b) committed-token
+   comparison vs their fork on the same pack (`top_k: 1`, two prompts,
+   16/32/48 tokens — the ternary protocol verbatim), (c) on-device NLL A/B
+   vs the official AND ternary tiers.
+3. **Quality risk is materially higher than ternary's.** 89.5% aggregate
+   retention, and ternary's weakest categories (IFBench, τ²-Bench — exactly
+   our agentic workload) will be weaker still. Hence:
+
+## Phase 0 — validation spike with a written kill criterion (go/no-go)
+
+Run on the **mini** (the 24 GB machine is the daily driver; ~3.9 GB download
+fits easily). Their fork binaries (`prism-b9591-62061f9`) are already
+certified there from the ternary spike.
+
+1. Download the Q1_0 pack; md5 into `CHECKSUMS.md5`; verify tokenizer
+   byte-identity against `qwen36-27b-mtp.tok` (held for ternary; re-verify).
+2. `llama-bench` under their fork, caffeinated: tg128/pp512 — sanity vs the
+   bandwidth projection (expect roughly 2× their ternary 8.41 tok/s on the
+   24 GB M4-class machine).
+3. Quality, cheap paired protocol (validated on ternary): 8K NLL on our
+   wikitext tokens via their tooling, ratio vs the official tier's 8K
+   buckets; plus subjective agentic smoke (tool-call formatting, small edit
+   tasks, instruction adherence — the ternary spike's prompt set).
+
+**Provisional kill criterion (adjust before running, then honor it):**
+- 8K NLL ratio vs official ≤ ~3.5× and agentic smoke coherent → **serving
+  tier**; proceed to Phases 1–4.
+- ~3.5–5× or noticeably degraded-but-usable agentic output → **demote to
+  experimental/throughput tier** (benches, long-context stress, drafter
+  research substrate); build Phases 1–3 anyway only if the throughput use
+  case justifies it — record the decision.
+- > ~5× or agentic collapse (malformed tool calls, incoherent edits) →
+  **no-go**; file findings in this doc, tier stays dead.
+
+Machine rule: Phase 0 lives entirely on the mini under its memory-safe
+policy. The binary pack (3.9 GB) + ternary artifact (7.15 GB) can physically
+coexist on either machine, but **the one-model-load rule stays in force** —
+it exists because of a real crash; amend it only deliberately, with a
+measured pressure test, never implicitly.
+
+## Type-41 encoding — read at source before any repack code
+
+Same discipline as ternary (that plan, "authoritative source" section): read
+`PrismML-Eng/llama.cpp` `block_q1_0` / `quantize_row_q1_0_ref` /
+`dequantize_q1_0` (CPU and Metal) at the pinned tag and document the layout
+HERE before writing repack code. Expected shape (verify, do not assume):
+g128, one fp16 scale + 128 code bits per group (16 code bytes), code
+`c ∈ {0,1}` → `(2c−1)·d`, sequential LSB-first like type 42. Open questions
+the source read must answer: bit order within bytes, scale derivation (amax
+vs mean-abs — QAT pipelines differ), and whether any tensor in the pack uses
+a different dtype mix than the ternary pack's census.
+
+## Phase 1 — format + repack
+
+- `B1_G128` = **dtype 6** in FORMAT.md (5 is reserved for T3_G128). Row data
+  `(cols/128) × 16` bytes; scales fp16 `[rows, cols/128]` — same scale-blob
+  separation as T2. Meta `quant_policy: bonsai-b1-v1`.
+- **Prefer the `-unpacked` masters as the repack source** with the GGUF as a
+  cross-check (both must dequantize identically); this also future-proofs a
+  CUDA binary tier. Unlike ternary there is no illegal code to hard-fail on
+  (both code values are valid), so integrity rests on the unpacked↔GGUF
+  cross-check plus the chunked bit-exact round-trip gate (ternary gate,
+  reused).
+- Pack census (mirror ternary Phase 1): tensor count, which tensors are
+  binary vs F16/Q8, dims vs the ternary pack, MTP layer confirmed absent.
+
+## Phase 2 — Metal kernels
+
+Same skeleton as T2; the select-form dot simplifies — {−1,+1} needs
+`2·Σ_{c=1} y − Σy`: one conditional add per element plus one shared Σy per
+128-group (T2 needs two conditional adds). Deliverables mirror the T2 list:
+
+- `q27_matvec_b1_g128` (float-activation production path; expect the same
+  bandwidth-bound profile — the T2 select-form hit 93 GB/s, and B1 moves
+  half the bytes per column so watch for the issue-rate ceiling returning at
+  1.125 bpw; if it does, the 243-LUT lesson from T3 planning applies in
+  byte-per-lane form: one byte = 8 columns).
+- `q27_matvec_b1_quantized` (int8-x integer-exact parity variant),
+- `q27_matmul_b1_mm` on the (now half-staged) GEMM staging pattern,
+- `q27_embedding_b1`/`_rows` with per-dtype routing,
+- `--dtype b1` modes in `metal_gemv_bench` / `metal_prefill_bench` /
+  `metal_decode_bench`.
+
+Gates: narrow-exact, wide float-path and int-path (threadgroup-spanning row
+clamp, varied scales — the shapes that caught the packed-GEMV scale bug),
+GEMM-tile parity; all in `make test-metal`, green on a clean rebuild
+(stale-binary rule; bump `Q27_SHADER_ABI` only if bindings change — additive
+entry points should keep it).
+
+## Phase 3 — loader/dispatch
+
+`bonsai-b1-v1` branch beside `bonsai-t2-v1` in `validate_architecture()`:
+64 blocks, no MTP (`has_mtp_` gating reused), B1 projections routed to the
+float-x GEMV, chunked prefill on the B1 GEMM, T2's `project`/`project_pair`
+helpers generalized to a dtype switch rather than duplicated. `--validate-only`
+both tiers; single-view whole-mapping + residency on both machines.
+
+## Phase 4 — on-artifact gates + perf
+
+Mirror ternary Phase 3/4: 16/32/48-token greedy byte-identical to their fork
+on the same pack; suffix-drafting committed tokens identical to greedy;
+official-tier canonical smoke unchanged; byte-exact CUDA 16-token gate at
+merge (loader touched). Then `metal_decode_bench --dtype b1` resident ceiling
+vs artifact decode back-to-back at matched thermal state (protocol rule), and
+the 8K→32K NLL ladder (expect the ternary result's shape: depth-uniform
+ratio, buckets tracking content; any depth *interaction* is new information
+and gates long-context serving on this tier).
+
+## Relationship to T3 (scope boundary)
+
+**Binary needs no packing follow-up.** 1.125 bpw is already
+information-theoretically dense for {−1,+1}+scale (128 code bits + 16 scale
+bits per group); there is no base-3-style trick to apply. T3's ~18% stream
+cut is ternary-only. The two streams share only the GEMM staging pattern and
+the per-dtype routing — they do not compete for kernel surface.
+
+## Follow-up (recorded, not scheduled): drafter options for the no-MTP tiers
+
+Two candidate drafters exist if drafting is ever revived on these tiers;
+whitepaper §6 (read 2026-07-15) settles their ranking:
+
+1. **DSpark (their released drafter) — the stronger option at the same
+   cost.** Six-layer block-parallel transformer (DFlash family) conditioned
+   on normalized hidden-state taps from five evenly spaced target layers,
+   K=4 block drafting in one pass, sequential head for intra-block
+   dependencies, confidence head + hardware-aware scheduler verifying only
+   positive-expected-return tokens. Drafter-unique weights ~0.5 GB
+   (embeddings/head shared with target). Measured on H100 greedy: accepted
+   length 3.6–3.7, **1.34×/1.37×** over ternary/binary low-bit-kernels-only.
+   Our `dflash-block-verify-design.md` (CUDA side) already worked out the
+   block-verify economics for exactly this drafter contract.
+2. **Small-sibling 1.7B drafter (our idea, NOT in their roadmap)** — same
+   ~0.5 GB stream per draft token but generic (not trained against the 27B),
+   autoregressive (sequential draft latency where DSpark is block-parallel),
+   and a multi-arch engine project on our side. **Dominated by DSpark at
+   equal byte budget; keep only as a fallback** if DSpark's Metal
+   port/contract proves impractical.
+
+Both stay parked behind the same wall, documented independently by our
+ledger (ternary doc follow-up 6 resolution) and their §9: batch-1
+verification does not amortize on low-bandwidth Apple Silicon; they name
+making DSpark net-positive on-device an open roadmap item. Revive only after
+the GPU-resident sync work (ds4-survey item 4) removes per-round overhead,
+and gate with the mtp-draft-head discipline: offline acceptance/economics
+probe first, zero engine work. For completeness:
+binary-27B-as-drafter-for-ternary-27B was checked and does not pay (0.55×
+stream cost per draft token loses at any realistic acceptance).
+
+## Whitepaper §9 roadmap notes relevant to this tier (read 2026-07-15)
+
+- **"Agentic coding, next":** a Bonsai 27B variant tuned for agentic coding
+  "will follow shortly." Directly targets this tier's biggest quality risk
+  (our workload is their weakest category). If Phase 0 lands in the demote/
+  kill band, re-run the same gates against that variant when it ships before
+  writing the tier off — the artifact is a drop-in for the same dtype.
+- **Sub-2-bit KV is future work for them; we ship it** (turbo3, 1.56
+  bits/value, 32K depth-flat). Native low-bit packing is also their future
+  work (our T3 race). Worth stating: on KV and packing, q27 is ahead of the
+  model vendor's own roadmap; drafters are the one place they're ahead of us.
+
+## Non-goals (this plan)
+
+T3 packing (own plan doc); CUDA binary kernels (Metal first, same as
+ternary); MLX packs (different runtime; the mlx-1bit pack is a benchmark
+comparison target only); AWQ-4bit packs (mainstream-stack repacks, strictly
+dominated by native tiers on our hardware); any amendment of the
+one-model-load rule.
