@@ -62,20 +62,51 @@ with phase B's kernel work).
 - **Shared vocab head:** own `token_embd`/`output` [5120, 248320] (Q4_1) +
   `output_norm` — vocab-identical to the target (the property that killed
   the 1.7B sibling and makes DSpark the only viable drafter).
-- **Markov head:** `markov_head_a [256, 248320]` (type 30 = fork packed) +
-  `markov_head_b [256, 248320]` (Q4_1), rank 256 — the confidence-scheduling
-  prior (whitepaper §6).
+- **Markov head:** `markov_head_a [256, 248320]` (type 30 = **BF16**, see
+  resolved unknowns below) + `markov_head_b [256, 248320]` (Q4_1), rank
+  256 — the confidence-scheduling prior (whitepaper §6).
 - **Confidence head:** `[5376, 1]` + bias — 5376 = 5120 + 256: hidden concat
   markov features (`confidence_head_with_markov = true`). Gates block
   acceptance scheduling.
 - **log-SNR conditioning:** `log_snr_fc1 [128, 5120]` (type 30) + fc2
   [5120, 5120] + biases, clamp [-9, 9] — diffusion-style noise conditioning
   on the mask-fill.
-- **Unknown to resolve from the fork source (Phase 0 residue):** type 30's
-  exact encoding (fork packed format — repack.py precedent: read at source
-  like type 42 was); tap timing (hidden states pre- or post-layernorm at the
-  5 layers); feature-window mode (per-token 128–256 slots vs per-cycle
-  shift — dflash design doc says build per-token).
+- ~~Unknown to resolve from the fork source (Phase 0 residue)~~ **ALL THREE
+  RESOLVED at source (2026-07-16 night, tag prism-b9591-62061f9, shallow
+  clone at `~/prism-fork/src`):**
+  1. **Type 30 = plain `GGML_TYPE_BF16`** (mainline numbering, ggml.h:420) —
+     not a fork packed format. Three BF16 tensors, not two: `log_snr_fc1`,
+     **`log_snr_fc2` [5120,5120]** (contract correction — was assumed Q4_1),
+     `markov_head_a`. All widen exactly to F32 in the repack.
+  2. **Tap timing: the layer's full residual-stream OUTPUT** — `l_out` after
+     attention residual + FFN residual + cvec, BEFORE the next layer's
+     attn_norm (models/qwen35.cpp per-layer tap; capture slots keep caller
+     order, so fc's concat order is the requested [1,16,31,46,61]). The tap
+     is un-normalized; the drafter applies **fc first, then hidden_norm**
+     (models/dspark.cpp:119) — the order question from the contract above is
+     settled the fc-first way. Capture rows use the masked output-row layout
+     and REQUIRE logits/output requested on every tapped row (a prefill-
+     driver obligation; llama-context get_embeddings_capture_ith).
+  3. **Feature staging: incremental per-token, no window, no shift.** One
+     capture row (5×5120 f32) per newly-accepted target token accumulates in
+     `ctx_feat`; each draft round feeds ONLY the new rows (dummy-token batch
+     rows whose embeddings are replaced by the staged features before the
+     residual stream forms) + the block, then crops the drafter KV back to
+     the anchor and clears the staging (common/speculative.cpp draft-dspark
+     impl). The drafter keeps persistent KV over context rows; the only
+     bound is its own ctx 4096.
+- **Port-critical details from the same read:** block position 0 is seeded
+  with the REAL last-accepted token (anchor), NOT mask_token_id — only
+  positions 1..3 are masked; the markov resample is **strictly sequential
+  within the block** (k conditions on the actually-sampled k−1 — the fork
+  comments record that batching it over mask tokens is a bug class that
+  already hit their MLX port); the fork's own CLI/server do NOT engage
+  capture — `tests/test-dspark-real-eval.cpp` / `test-dspark-forward.cpp`
+  are the true reference drivers, so Phase 2 fixtures should ride the test
+  harness, not `--spec-type` on the server.
+- **Contract correction:** `token_embd.weight` is **Q1_0 (type 41, binary)**,
+  not Q4_1 — the shared-vocab embedding rides the fork's binary format. The
+  `output` head IS Q4_1 as recorded.
 
 ## Memory budget (24 GB M4, T2 target)
 
@@ -87,10 +118,27 @@ amendment question from the sibling plan dissolves: this is one target + a
 ## Phase plan (each gated)
 
 0. **This doc + contract** (done above) + fork-source reads for the three
-   unknowns. No GPU.
+   unknowns. No GPU. **DONE 2026-07-16 night — all three resolved, see
+   contract section.**
 1. **Repack:** extend `tools/repack.py` for arch `dspark` (Q4_1 + type-30 at
    source, same lossless discipline as bonsai-t2-v1; hard-fail unknown
-   slots). Gate: bit-exact round-trip, all 79 tensors.
+   slots). Gate: bit-exact round-trip, all 79 tensors. **DONE 2026-07-16
+   night — GATE PASSES: all 79 tensors, every verbatim tensor (46 Q4_1 →
+   dtype 7 `Q4_1_G32`, 1 Q1_0 token_embd → dtype 6 `B1_G128` per the
+   binary-tier plan's pre-registered Phase-1 layout) chunked bit-exact
+   round-trip vs the fork reference dequant; 3 BF16 → F32 exact, RMSE 0.0000
+   on all 79. Artifact `models/binary-bonsai-27b/bonsai-27b-dspark.q27`
+   (1.97 GB; +0.18 GB over source = the exact BF16→F32 widening), md5
+   `ec338c42…` in the dir's CHECKSUMS.md5; source pack md5 re-verified
+   against its recorded checksum before repacking. FORMAT.md documents both
+   new dtypes. Note: dtype 6 is hereby first PRODUCED (drafter token_embd
+   only); the full B1 tier remains the binary plan's own Phase 1. Codex
+   round: P2 fixed (group-divisibility hard-fails were `assert`s, gone
+   under `python -O` — now explicit raises, T2 path included); P1
+   ACCEPTED AS THE PHASE BOUNDARY: `src/loader.{h,cpp}` rejects dtypes
+   > 5, so the artifact is deliberately unloadable until Phase 3's
+   engine work — loader dtype support lands WITH Phase 3, behind this
+   plan's pre-registered gate, not before.**
 2. **Reference gates BEFORE engine work:** the fork runs DSpark on this
    machine (`--spec-type draft-dspark`, 2026-07-15 measurement). Instrument
    or replay it to dump, for a fixed prompt: the 5 tap vectors, fc output,
