@@ -3030,7 +3030,9 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
 // transform. The engine stays on the fp16 attention kernels throughout, so
 // a KL delta against the fp16 baseline is attributable to that one side's
 // quantization alone.
-struct TurboAttribArgs { uint position; uint kv_heads; uint tokens; uint mode; };
+// head selects a single KV head for cell-granular attribution (census);
+// ~0u round-trips every head of the selected side.
+struct TurboAttribArgs { uint position; uint kv_heads; uint tokens; uint mode; uint head; };
 kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
                                           device const float *v [[buffer(1)]],
                                           device half *kc [[buffer(2)]],
@@ -3044,9 +3046,10 @@ kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
         (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
     device half *dst = (group.y ? vc : kc) +
         (ulong)(args.position + token) * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
-    // group.y is uniform across the threadgroup, so this early exit and the
-    // barriers below never diverge within a threadgroup.
-    if (args.mode != (group.y ? 2u : 1u)) { dst[j] = half(src[j]); return; }
+    // group.y and h are uniform across the threadgroup, so this early exit
+    // and the barriers below never diverge within a threadgroup.
+    if (args.mode != (group.y ? 2u : 1u) ||
+        (args.head != ~0u && h != args.head)) { dst[j] = half(src[j]); return; }
     threadgroup float xs[128], red[128];
     xs[j] = src[j]; red[j] = src[j] * src[j];
     threadgroup_barrier(mem_flags::mem_threadgroup);

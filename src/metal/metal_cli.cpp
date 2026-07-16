@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width | --oracle width] [--kv fp16|turbo3] "
-                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v] [--chunk-parity N] "
+                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N] [--chunk-parity N] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--dump-logits file]\n",
                 argv[0]);
@@ -155,7 +155,7 @@ int main(int argc, char** argv) {
         bool eos_gate=false;
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         bool kl_kv = false, kl_self = false;
-        uint32_t kv_attrib = 0;
+        uint32_t kv_attrib = 0, kv_cell = UINT32_MAX;
         uint32_t chunk_parity = 0;
         std::string envelope_mode;
         for (int i = 3; i < argc; i++) {
@@ -167,6 +167,12 @@ int main(int argc, char** argv) {
             else if (arg == "--validate-only") validate_only = true;
             else if (arg == "--kl-kv") kl_kv = true;
             else if (arg == "--kl-kv-self") { kl_kv = true; kl_self = true; }
+            else if (arg == "--kl-kv-cell" && i + 1 < argc) {
+                kv_cell = parse_u32(argv[++i], "--kl-kv-cell");
+                if (kv_cell >= 128)
+                    throw std::runtime_error("--kl-kv-cell must be 0..127 (attn_idx*8 + head*2 + side, side 0=K 1=V)");
+                kl_kv = true;
+            }
             else if (arg == "--kl-kv-k" || arg == "--kl-kv-v") {
                 const uint32_t side = (arg == "--kl-kv-k") ? 1 : 2;
                 if (kv_attrib && kv_attrib != side)
@@ -246,6 +252,8 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--kl-kv builds its own fp16 baseline and turbo3 subject; drop --kv");
         if (kv_attrib && kl_self)
             throw std::runtime_error("--kl-kv-k/--kl-kv-v and --kl-kv-self are mutually exclusive arms");
+        if (kv_cell != UINT32_MAX && (kv_attrib || kl_self))
+            throw std::runtime_error("--kl-kv-cell is its own arm; drop --kl-kv-k/--kl-kv-v/--kl-kv-self");
         if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty())
             throw std::runtime_error("--tokens, --prompt, --nll, or --validate-only is required");
         if (!nll_path.empty() && (mtp_width || suffix_width || oracle_width || sampling.temperature > 0 || !dump_logits.empty()))
@@ -593,13 +601,26 @@ int main(int argc, char** argv) {
             // Attribution arms keep the subject on the fp16 cache and
             // attention kernels; only the store round-trips one side through
             // the turbo3 quantizer, so the KL is that side's error alone.
-            q27::MetalEngine subject(shared, context, !kl_self && !kv_attrib);
-            if (kv_attrib) subject.set_kv_attrib(kv_attrib);
+            q27::MetalEngine subject(shared, context,
+                                     !kl_self && !kv_attrib && kv_cell == UINT32_MAX);
+            char cell_name[48] = {0};
+            if (kv_cell != UINT32_MAX) {
+                // cell id = attn_idx*8 + head*2 + side (side 0=K, 1=V);
+                // attn_idx 0..15 maps to absolute layer attn_idx*4+3.
+                const uint32_t attn_idx = kv_cell >> 3, head = (kv_cell >> 1) & 3;
+                const uint32_t side = (kv_cell & 1) + 1;
+                subject.set_kv_attrib_cell(side, attn_idx * 4 + 3, head);
+                snprintf(cell_name, sizeof cell_name, "turbo3 cell L%u:h%u:%s round-trip",
+                         attn_idx * 4 + 3, head, side == 1 ? "K" : "V");
+            } else if (kv_attrib) {
+                subject.set_kv_attrib(kv_attrib);
+            }
             if (serial_prefill) {
                 baseline.set_chunked_prefill(false);
                 subject.set_chunked_prefill(false);
             }
             const char* subject_name = kl_self ? "fp16 self-check"
+                                     : kv_cell != UINT32_MAX ? cell_name
                                      : kv_attrib == 1 ? "turbo3 K-only round-trip"
                                      : kv_attrib == 2 ? "turbo3 V-only round-trip"
                                      : "turbo3";
