@@ -222,10 +222,14 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> attention_f16_causal_gqa_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_p;
     id<MTLComputePipelineState> attention_gqa_merge_rows_p;
-    // Phase-0 cache-block probes (bench-only, see metal_backend.h).
+    // R1b token-tiled causal GQA (t2 = production route, t4 + hm = bench).
     id<MTLComputePipelineState> attention_turbo3_gqa_hm_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t2_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t4_p;
+    id<MTLComputePipelineState> attention_f16_causal_gqa_t2_p;
+    // Q27_METAL_GQA_TILE: causal token-tile factor, 1 (untiled A/B lever)
+    // or 2 (default; docs/plans/2026-07-15-cache-block-scheduling.md R1b).
+    uint32_t gqa_tile = 2;
     id<MTLComputePipelineState> topk_logits_p;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
@@ -303,18 +307,22 @@ struct MetalBackend::Impl {
         if (!gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
         AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
                                     head_dim, block, n_blocks_max, tokens, scale};
+        // R1b: factor-2 token tiling — bit-identical per token to the untiled
+        // kernels, so the chunk↔decode parity contract is unaffected.
+        const bool tiled = gqa_tile >= 2 && tokens >= 2;
         @autoreleasepool {
             bool own;
-            auto enc = encoder_for_operation(own, turbo3 ? "q27_attention_turbo3_causal_gqa"
-                                                         : "q27_attention_f16_causal_gqa");
-            [enc setComputePipelineState:turbo3 ? attention_turbo3_causal_gqa_p
-                                                : attention_f16_causal_gqa_p];
+            auto enc = encoder_for_operation(own,
+                turbo3 ? (tiled ? "q27_attention_turbo3_causal_gqa_t2" : "q27_attention_turbo3_causal_gqa")
+                       : (tiled ? "q27_attention_f16_causal_gqa_t2" : "q27_attention_f16_causal_gqa"));
+            [enc setComputePipelineState:turbo3 ? (tiled ? attention_turbo3_causal_gqa_t2_p : attention_turbo3_causal_gqa_p)
+                                                : (tiled ? attention_f16_causal_gqa_t2_p : attention_f16_causal_gqa_p)];
             [enc setBuffer:qb.handle() offset:(NSUInteger)q_byte_offset atIndex:0];
             [enc setBuffer:kc.handle() offset:0 atIndex:1];
             [enc setBuffer:vc.handle() offset:0 atIndex:2];
             [enc setBuffer:gqa_partials offset:0 atIndex:3];
             [enc setBytes:&args length:sizeof(args) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, tokens)
+            [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, tiled ? (tokens + 1) / 2 : tokens)
                 threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
             // Same serial encoder: the merge reads the partials the first
             // dispatch wrote; serial compute encoders order dispatches.
@@ -557,6 +565,13 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_turbo3_gqa_hm_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_hm");
         impl_->attention_turbo3_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t2");
         impl_->attention_turbo3_causal_gqa_t4_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t4");
+        impl_->attention_f16_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa_t2");
+        if (const char* env = getenv("Q27_METAL_GQA_TILE"); env && *env) {
+            const unsigned long tile = strtoul(env, nullptr, 10);
+            if (tile != 1 && tile != 2)
+                throw std::runtime_error("q27 Metal: Q27_METAL_GQA_TILE must be 1 or 2");
+            impl_->gqa_tile = (uint32_t)tile;
+        }
         impl_->topk_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_topk_logits");
         if (const char* env = getenv("Q27_METAL_GQA_THRESHOLD"); env && *env)
             impl_->gqa_threshold = (uint32_t)strtoul(env, nullptr, 10);
