@@ -154,9 +154,9 @@ def main():
         # Shared deadline: on the wedge this gate targets, sequential
         # per-thread joins would burn 120 s each and later gates would then
         # stall on their own HTTP timeouts — fail fast and skip them.
-        deadline = time.time() + 120
+        deadline = time.monotonic() + 120
         for t in threads:
-            t.join(max(0.0, deadline - time.time()))
+            t.join(max(0.0, deadline - time.monotonic()))
         wedged = any(t.is_alive() for t in threads)
         if wedged:
             failures.append("Gq: queued request wedged (still blocked at the shared 120 s deadline); "
