@@ -743,20 +743,26 @@ struct Engine {
     }
     const DevTensor& T2(int il, const char* leaf) { return T(il, leaf); }
 
-    void qx(const float* x, int cols) { q27k::quantize_x(x, cols, xq, stm); }
+    void qx(const float* x, int cols) { qx(x, cols, stm); }
+    // P2c: explicit-stream twin -- attn_block's stream form (mtp_attn runs
+    // the MTP attention on the conductor stream in the fused draft step)
+    // quantizes member state on the caller's stream; solo passes stm.
+    void qx(const float* x, int cols, cudaStream_t st) { q27k::quantize_x(x, cols, xq, st); }
 
-    void mm(const DevTensor& w, const float* x, float* out) {
+    void mm(const DevTensor& w, const float* x, float* out) { mm(w, x, out, stm); }
+    // P2c: explicit-stream twin, same contract as qx above.
+    void mm(const DevTensor& w, const float* x, float* out, cudaStream_t st) {
         switch (w.dtype) {
             case DType::Q4_G64:
                 q27k::gemv_q4((const uint8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
-                              w.cols, stm);
+                              w.cols, st);
                 break;
             case DType::Q8_G128:
                 q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
-                              w.cols, stm);
+                              w.cols, st);
                 break;
             case DType::F16:
-                q27k::gemv_f16((const __half*)w.data, x, out, w.rows, w.cols, stm);
+                q27k::gemv_f16((const __half*)w.data, x, out, w.rows, w.cols, st);
                 break;
             default:
                 fprintf(stderr, "mm: unsupported dtype\n");
@@ -785,51 +791,59 @@ struct Engine {
 
     void attn_block(int il, const float* xin, float* yout, void* kc = nullptr,
                     void* vc = nullptr, const int* pos_src = nullptr) {
+        attn_block(il, xin, yout, kc, vc, pos_src, stm);
+    }
+    // P2c: explicit-stream form, same contract as gdn_mix/attn_mix's stream
+    // param -- mtp_attn runs the MTP attention on the conductor stream in the
+    // fused draft step; every other caller comes through the defaulted form
+    // above with member stm (same value, same launch sequence).
+    void attn_block(int il, const float* xin, float* yout, void* kc, void* vc,
+                    const int* pos_src, cudaStream_t st) {
         if (!kc) {
             int ci = attn_cache_idx[il];
             kc = kcache[ci];
             vc = vcache[ci];
         }
         if (!pos_src) pos_src = d_pos;
-        qx(xin, N_EMBD);
-        mm(T(il, "attn_q.weight"), xin, qg);
+        qx(xin, N_EMBD, st);
+        mm(T(il, "attn_q.weight"), xin, qg, st);
         q27k::rmsnorm_heads(qg, (const float*)T(il, "attn_q_norm.weight").data, qg, N_HEAD,
-                            HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        mm(T(il, "attn_k.weight"), xin, kbuf);
+                            HEAD_DIM, 2 * HEAD_DIM, EPS, st);
+        mm(T(il, "attn_k.weight"), xin, kbuf, st);
         q27k::rmsnorm_heads(kbuf, (const float*)T(il, "attn_k_norm.weight").data, kbuf, N_KV,
-                            HEAD_DIM, HEAD_DIM, EPS, stm);
-        mm(T(il, "attn_v.weight"), xin, vbuf);
-        q27k::rope_neox_partial(qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, pos_src, FREQ_BASE, stm);
-        q27k::rope_neox_partial(kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, pos_src, FREQ_BASE, stm);
+                            HEAD_DIM, HEAD_DIM, EPS, st);
+        mm(T(il, "attn_v.weight"), xin, vbuf, st);
+        q27k::rope_neox_partial(qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, pos_src, FREQ_BASE, st);
+        q27k::rope_neox_partial(kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, pos_src, FREQ_BASE, st);
         // turbo3: Q forward-WHT after rope (K's rotation is folded into the
         // store; <WHT q, WHT K> == <q,K>); turbo3v keeps K fp16 => Q raw.
         // Host branches on kv_kind only -- fixed at init, graph-capture-safe.
         if (kv_kind == KV_T3) {
             q27k::P3 qw{{qg}};
-            q27k::wht3(qw, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, 1);
+            q27k::wht3(qw, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, st, 1);
         }
         if (kv_kind >= KV_T3) {
             q27k::CP3 kw{{kbuf}};
             q27k::CP3 vw3{{vbuf}};
             q27k::IP3 pw{{pos_src}};
-            q27k::kv_store_t3(kw, vw3, kc, vc, pw, N_KV, HEAD_DIM, stm, 1,
+            q27k::kv_store_t3(kw, vw3, kc, vc, pw, N_KV, HEAD_DIM, st, 1,
                               /*k_plain=*/kv_kind == KV_T3V);
         } else {
-            q27k::kv_store(kbuf, vbuf, kc, vc, pos_src, N_KV * HEAD_DIM, stm, kv_fp8);
+            q27k::kv_store(kbuf, vbuf, kc, vc, pos_src, N_KV * HEAD_DIM, st, kv_fp8);
         }
         q27k::attn_decode(qg, 2 * HEAD_DIM, kc, vc, attnout, scratch, pos_src,
-                          max_ctx, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), stm,
+                          max_ctx, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), st,
                           kv_kind);
         // turbo3 V accumulates in the rotated basis: one inverse-WHT on the
         // pooled output BEFORE the sigmoid gate (elementwise gate does not
         // commute with the rotation).
         if (kv_kind >= KV_T3) {
             q27k::P3 ow{{attnout}};
-            q27k::wht3(ow, N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, 1);
+            q27k::wht3(ow, N_HEAD, HEAD_DIM, HEAD_DIM, true, st, 1);
         }
-        q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, stm);
-        qx(attnout, N_HEAD * HEAD_DIM);
-        mm(T(il, "attn_output.weight"), attnout, yout);
+        q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, st);
+        qx(attnout, N_HEAD * HEAD_DIM, st);
+        mm(T(il, "attn_output.weight"), attnout, yout, st);
     }
 
     void ffn(int il, const float* xin, float* yout) {
@@ -907,6 +921,208 @@ struct Engine {
     // top1-top2 margin into ONE full-vocab pass -- draft_dst gets the SAME token as
     // the plain argmax (bit-identical tie semantics), margin_dst gets margin()'s
     // value. margin_dst == null keeps the plain argmax for every other caller.
+    // P2c (docs/plans/2026-07-16-batch-p2c-draft-fusion.md): the P0 pattern
+    // applied to the MTP step -- everything one draft step reads or writes
+    // that is PER-LANE sits behind MtpLaneView, so the fused cross-engine
+    // step can point union slot k at any engine's chain state. Solo:
+    // mtp_solo_view() fills lane 0 with this engine's members
+    // (pointer-identical) and pads slots >= vw with lane 0 (never read --
+    // the gemv_*_n `i < nb ? i : 0` convention). Deliberately NOT here: the
+    // MTP attention state (mtp_k/mtp_v, qg/kbuf/vbuf/attnout, scratch) --
+    // step 4 stays member-based (mtp_attn), exactly like the verify mixers.
+    struct MtpLaneView {
+        // per-lane chain state (slot L = one engine's current draft step):
+        // e_hn = embed||hidden concat; x_mtp = residual; x1/y = layer io;
+        // lg = mtp_logits; ffn_g/ffn_u = MLP gate/up scratch
+        std::array<float*, W_PLUMB> e_hn, x_mtp, x1, y, lg, ffn_g, ffn_u;
+        std::array<const float*, W_PLUMB> h_src;  // h_next chain / hs[k]
+        std::array<const int*, W_PLUMB> tok, pos; // tok_src chain, d_pos_m..m7
+        std::array<int*, W_PLUMB> draft_dst;      // d_draft_L slot
+        std::array<float*, W_PLUMB> margin_dst;   // d_draft_margin + k (or null)
+        std::array<q27k::XQuant, W_PLUMB> xq;     // per-engine quant slot
+        std::array<unsigned long long*, W_PLUMB> am_blk1; // argmax_margin scratch
+        std::array<float*, W_PLUMB> am_blk2;
+        std::array<unsigned long long*, W_PLUMB> amax; // plain-argmax scratch
+        int vw;           // live lanes (union k; solo 1)
+        cudaStream_t stm; // stream the step runs on
+        // A1/Task-9 policy, MTP flavor: solo drafts run the dp4a GEMV family,
+        // so the union head mm must NEVER take vgemm. 99 keeps every legal
+        // union width (k <= MAX_K/2 = 8) below the branch; mtp_mm has no
+        // vgemm path at all and asserts the policy (defensive).
+        int gemm_min;
+    };
+    MtpLaneView mtp_solo_view(const float* h_src, const int* tok_src, int* draft_dst,
+                              const int* pos_src, float* margin_dst) {
+        MtpLaneView v{};
+        for (int t = 0; t < W_PLUMB; t++) {
+            v.e_hn[t] = e_hn; v.x_mtp[t] = x_mtp; v.x1[t] = x1; v.y[t] = y;
+            v.lg[t] = mtp_logits; v.ffn_g[t] = ffn_g; v.ffn_u[t] = ffn_u;
+            v.h_src[t] = h_src; v.tok[t] = tok_src; v.pos[t] = pos_src;
+            v.draft_dst[t] = draft_dst; v.margin_dst[t] = margin_dst;
+            v.xq[t] = xq; v.am_blk1[t] = d_am_blk1; v.am_blk2[t] = d_am_blk2;
+            v.amax[t] = d_amax;
+        }
+        v.vw = 1;
+        v.stm = stm;
+        v.gemm_min = 99; // defensive -- see MtpLaneView
+        return v;
+    }
+    // qx5/mm5 twins over the MTP view (A4 thin surface: MtpLaneView shares no
+    // fields with LaneView, so no adapter/friend layer -- two small helpers).
+    void mtp_qx(const MtpLaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
+        q27k::XQ3 q{};
+        q27k::CP3 xs{};
+        for (int i = 0; i < W_PLUMB; i++) {
+            q.q[i] = v.xq[i];
+            xs.p[i] = x[i];
+        }
+        q27k::quantize3(xs, cols, q, v.stm, v.vw);
+    }
+    void mtp_mm(const MtpLaneView& v, const DevTensor& w, const std::array<float*, W_PLUMB>& ys_a) {
+        // the MTP union must stay on the gemv family solo drafts use (view
+        // comment): no vgemm branch BY CONSTRUCTION, assert the policy.
+        assert(v.vw < v.gemm_min && "mtp_mm: union width crossed the vgemm threshold");
+        q27k::XQuant qs[W_PLUMB];
+        float* ys[W_PLUMB];
+        for (int i = 0; i < W_PLUMB; i++) {
+            qs[i] = v.xq[i];
+            ys[i] = ys_a[i];
+        }
+        switch (w.dtype) {
+            case DType::Q4_G64:
+                q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
+                                w.rows, w.cols, v.stm);
+                break;
+            case DType::Q8_G128:
+                q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
+                                w.rows, w.cols, v.stm);
+                break;
+            default:
+                // mirror mm()/mtp_mm1: fail loud on a dtype with no multi-lane
+                // twin (the old bare else silently fed any non-Q4 weight to
+                // the Q8 kernel; every MTP weight is Q4/Q8, so this is a
+                // guard, not a live-path change).
+                fprintf(stderr, "mtp_mm: unsupported dtype\n");
+                exit(1);
+        }
+    }
+    // single-lane mm twin reading the view's lane 0 instead of members. The
+    // P2c DECIDE gate: gemv_*_n has NO nbatch=1 kernel (its switch starts at
+    // 2, and k_gemv_q4 != k_gemv_q4_n<1>), so the solo composition KEEPS the
+    // single-lane kernels -- zero numeric risk, and the captured draft
+    // graphs record the pre-refactor launch sequence verbatim (B-A8).
+    // Multi-lane enters only via the fused union view (vw >= 2, Task 2).
+    void mtp_mm1(const MtpLaneView& v, const DevTensor& w, float* out) {
+        switch (w.dtype) {
+            case DType::Q4_G64:
+                q27k::gemv_q4((const uint8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
+                              w.rows, w.cols, v.stm);
+                break;
+            case DType::Q8_G128:
+                q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
+                              w.rows, w.cols, v.stm);
+                break;
+            default:
+                fprintf(stderr, "mtp_mm1: unsupported dtype\n");
+                exit(1);
+        }
+    }
+    // P2c seams, mirroring the verify split: pre/post are the WEIGHT-SWEEP
+    // halves (anatomy steps 1-3 / 5-6), reading everything through the view;
+    // attn is step 4 (member-based: own MTP KV + attention scratch, explicit
+    // stream like gdn_mix); tail is step 7 (per-lane loop, own buffers via
+    // the view). vw == 1 keeps the single-lane kernels (the mtp_mm1 DECIDE
+    // branch); vw >= 2 exists only for the fused cross-engine step -- the
+    // solo path NEVER takes it. Both are host branches baked per graph
+    // capture, same class as mm5's width branch.
+    void mtp_pre(const MtpLaneView& v) {
+        const int il = 64;
+        const DevTensor& emb = dm.get("token_embd.weight");
+        const float* en = (const float*)T(il, "nextn.enorm.weight").data;
+        const float* hn = (const float*)T(il, "nextn.hnorm.weight").data;
+        if (v.vw == 1) {
+            q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, v.tok[0],
+                               N_EMBD, v.e_hn[0], v.stm);
+            q27k::rmsnorm(v.e_hn[0], en, v.e_hn[0], N_EMBD, EPS, v.stm);
+            q27k::rmsnorm(v.h_src[0], hn, v.e_hn[0] + N_EMBD, N_EMBD, EPS, v.stm);
+            q27k::quantize_x(v.e_hn[0], 2 * N_EMBD, v.xq[0], v.stm);
+            mtp_mm1(v, T(il, "nextn.eh_proj.weight"), v.x_mtp[0]);
+            return;
+        }
+        q27k::IP3 tk LANESV(v, tok);
+        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, tk, N_EMBD,
+                     LANESV(v, e_hn), v.stm, v.vw);
+        q27k::CP3 Ec LANESV(v, e_hn);
+        q27k::P3 Em LANESV(v, e_hn);
+        q27k::rmsnorm3(Ec, en, Em, N_EMBD, EPS, v.stm, v.vw);
+        q27k::P3 E2m{}; // per-lane e_hn + N_EMBD (the hidden half of the concat)
+        for (int i = 0; i < W_PLUMB; i++) E2m.p[i] = v.e_hn[i] + N_EMBD;
+        q27k::rmsnorm3(LANESV(v, h_src), hn, E2m, N_EMBD, EPS, v.stm, v.vw);
+        mtp_qx(v, v.e_hn, 2 * N_EMBD);
+        mtp_mm(v, T(il, "nextn.eh_proj.weight"), v.x_mtp);
+    }
+    // step 4 -- member-based (own MTP KV + attention scratch), explicit
+    // stream: the fused step runs each engine's MTP attention on the
+    // conductor stream; solo passes member stm (same value, same sequence).
+    void mtp_attn(const int* pos_src, cudaStream_t st) {
+        const int il = 64;
+        q27k::rmsnorm(x_mtp, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, st);
+        attn_block(il, x1, y, mtp_k, mtp_v, pos_src, st);
+    }
+    void mtp_post(const MtpLaneView& v) {
+        const int il = 64;
+        const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
+        const float* sn = (const float*)T(il, "nextn.shared_head_norm.weight").data;
+        // drafts use the Q4 head copy when present (verify keeps the Q8 head,
+        // so output remains exactly the faithful model's greedy text)
+        const DevTensor* head = dm.model_has("output_q4.weight")
+                                    ? &dm.get("output_q4.weight")
+                                    : &dm.get("output.weight");
+        if (v.vw == 1) {
+            q27k::add_inplace(v.x_mtp[0], v.y[0], N_EMBD, v.stm);
+            q27k::rmsnorm(v.x_mtp[0], pn, v.x1[0], N_EMBD, EPS, v.stm);
+            // ffn(il, x1, y) unrolled onto the view's lane 0 + stream
+            q27k::quantize_x(v.x1[0], N_EMBD, v.xq[0], v.stm);
+            mtp_mm1(v, T(il, "ffn_gate.weight"), v.ffn_g[0]);
+            mtp_mm1(v, T(il, "ffn_up.weight"), v.ffn_u[0]);
+            q27k::silu_mul(v.ffn_g[0], v.ffn_u[0], v.ffn_g[0], N_FFN, v.stm);
+            q27k::quantize_x(v.ffn_g[0], N_FFN, v.xq[0], v.stm);
+            mtp_mm1(v, T(il, "ffn_down.weight"), v.y[0]);
+            q27k::add_inplace(v.x_mtp[0], v.y[0], N_EMBD, v.stm);
+            q27k::rmsnorm(v.x_mtp[0], sn, v.x1[0], N_EMBD, EPS, v.stm);
+            q27k::quantize_x(v.x1[0], N_EMBD, v.xq[0], v.stm);
+            mtp_mm1(v, *head, v.lg[0]);
+            return;
+        }
+        q27k::P3 Xm LANESV(v, x_mtp);
+        q27k::CP3 Xc LANESV(v, x_mtp);
+        q27k::CP3 Yc LANESV(v, y);
+        q27k::P3 X1m LANESV(v, x1);
+        q27k::add3(Xm, Yc, N_EMBD, v.stm, v.vw);
+        q27k::rmsnorm3(Xc, pn, X1m, N_EMBD, EPS, v.stm, v.vw);
+        mtp_qx(v, v.x1, N_EMBD);
+        mtp_mm(v, T(il, "ffn_gate.weight"), v.ffn_g);
+        mtp_mm(v, T(il, "ffn_up.weight"), v.ffn_u);
+        q27k::silu_mul3(LANESV(v, ffn_g), LANESV(v, ffn_u), N_FFN, v.stm, v.vw);
+        mtp_qx(v, v.ffn_g, N_FFN);
+        mtp_mm(v, T(il, "ffn_down.weight"), v.y);
+        q27k::add3(Xm, Yc, N_EMBD, v.stm, v.vw);
+        q27k::rmsnorm3(Xc, sn, X1m, N_EMBD, EPS, v.stm, v.vw);
+        mtp_qx(v, v.x1, N_EMBD);
+        mtp_mm(v, *head, v.lg);
+    }
+    void mtp_tail(const MtpLaneView& v) {
+        for (int t = 0; t < v.vw; t++) {
+            if (v.margin_dst[t])
+                q27k::argmax_margin(v.lg[t], VOCAB, v.draft_dst[t], v.margin_dst[t],
+                                    v.am_blk1[t], v.am_blk2[t], v.stm);
+            else
+                q27k::argmax(v.lg[t], VOCAB, v.draft_dst[t], v.amax[t], v.stm);
+        }
+    }
+    // solo mtp_forward = composition over mtp_solo_view() -- byte-identical
+    // by construction (the vw == 1 branches launch the pre-refactor kernels
+    // with the pre-refactor arguments in the pre-refactor order).
     void mtp_forward(const float* h_src = nullptr, const int* tok_src = nullptr,
                      int* draft_dst = nullptr, const int* pos_src = nullptr,
                      float* margin_dst = nullptr) {
@@ -914,37 +1130,59 @@ struct Engine {
         if (!tok_src) tok_src = d_token;
         if (!draft_dst) draft_dst = d_draft;
         if (!pos_src) pos_src = d_pos_m;
-        const int il = 64;
-        const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, tok_src, N_EMBD,
-                           e_hn, stm);
-        q27k::rmsnorm(e_hn, (const float*)T(il, "nextn.enorm.weight").data, e_hn, N_EMBD, EPS,
-                      stm);
-        q27k::rmsnorm(h_src, (const float*)T(il, "nextn.hnorm.weight").data, e_hn + N_EMBD,
-                      N_EMBD, EPS, stm);
-        qx(e_hn, 2 * N_EMBD);
-        mm(T(il, "nextn.eh_proj.weight"), e_hn, x_mtp);
-
-        q27k::rmsnorm(x_mtp, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
-        attn_block(il, x1, y, mtp_k, mtp_v, pos_src);
-        q27k::add_inplace(x_mtp, y, N_EMBD, stm);
-        q27k::rmsnorm(x_mtp, (const float*)T(il, "post_attention_norm.weight").data, x1, N_EMBD,
-                      EPS, stm);
-        ffn(il, x1, y);
-        q27k::add_inplace(x_mtp, y, N_EMBD, stm);
-        q27k::rmsnorm(x_mtp, (const float*)T(il, "nextn.shared_head_norm.weight").data, x1,
-                      N_EMBD, EPS, stm);
-        qx(x1, N_EMBD);
-        // drafts use the Q4 head copy when present (verify keeps the Q8 head,
-        // so output remains exactly the faithful model's greedy text)
-        const DevTensor* head = dm.model_has("output_q4.weight")
-                                    ? &dm.get("output_q4.weight")
-                                    : &dm.get("output.weight");
-        mm(*head, x1, mtp_logits);
-        if (margin_dst)
-            q27k::argmax_margin(mtp_logits, VOCAB, draft_dst, margin_dst, d_am_blk1, d_am_blk2, stm);
-        else
-            q27k::argmax(mtp_logits, VOCAB, draft_dst, d_amax, stm);
+        MtpLaneView v = mtp_solo_view(h_src, tok_src, draft_dst, pos_src, margin_dst);
+        mtp_pre(v);
+        mtp_attn(pos_src, stm);
+        mtp_post(v);
+        mtp_tail(v);
+    }
+    // P2c Task 2 (fused draft steps): the per-step CHAIN-POINTER TABLE, the
+    // single source of truth for both the solo capture path
+    // (spec_draft_step_launches below is its composition) and the fused
+    // cross-engine union builder (build_mtp_union_view in conductor.h reads
+    // slot m from engine m's mtp_step_view(step)). Step 0's entries are the
+    // old k==0 mtp_forward args (h_next, d_token, d_draft, d_pos_m,
+    // margin+0); step k>0 chains MTP's own post-head-norm hidden through
+    // hs[k] into draft k+1 at pos_m{k+1}. One table so the two paths can
+    // never drift -- the 8->12 widening's by-name brace-list landmine.
+    // The table itself lives in mtp_step_chain (P2 exit review dedup):
+    // BOTH readers -- mtp_step_view and draft_step_prep's D2D target --
+    // index the same brace lists, so a chain edit lands in one place.
+    struct MtpStepChain {
+        float* h;       // hs[step]: this step's h_src; step+1's D2D target
+        const int* tok; // ts[step]: token the step embeds
+        int* dst;       // ds[step]: draft slot the step's argmax writes
+        const int* pos; // ps[step]: the step's MTP position
+    };
+    MtpStepChain mtp_step_chain(int step) {
+        assert(step >= 0 && step < D_MAX_MTP);
+        float* hs[D_MAX_MTP] = {h_next, h_next2, h_next3, h_next4, h_next5, h_next6, h_next7};
+        const int* ts[D_MAX_MTP] = {d_token, d_draft, d_draft2, d_draft3,
+                                    d_draft4, d_draft5, d_draft6};
+        int* ds[D_MAX_MTP] = {d_draft, d_draft2, d_draft3, d_draft4,
+                              d_draft5, d_draft6, d_draft7};
+        const int* ps[D_MAX_MTP] = {d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4,
+                                    d_pos_m5, d_pos_m6, d_pos_m7};
+        return {hs[step], ts[step], ds[step], ps[step]};
+    }
+    MtpLaneView mtp_step_view(int step) {
+        const MtpStepChain c = mtp_step_chain(step);
+        return mtp_solo_view(c.h, c.tok, c.dst, c.pos, d_draft_margin + step);
+    }
+    // The step's per-engine PREAMBLE, stream-parameterized for the fused
+    // path (solo passes stm): step 0 = prep_round (round bookkeeping --
+    // d_P/d_outcome reset + lane/MTP position staging); step k>0 = the
+    // x1 -> hs[k] chain D2D (MTP's post-head-norm hidden becomes the next
+    // step's h_src). Same relative order as solo: the preamble precedes the
+    // step's first kernel.
+    void draft_step_prep(int step, cudaStream_t st) {
+        if (step == 0) {
+            q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
+                             st);
+            return;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mtp_step_chain(step).h, x1, N_EMBD * 4,
+                                   cudaMemcpyDeviceToDevice, st));
     }
 
     // vw = verify batch width (# lanes: pending + drafts), read at GRAPH-CAPTURE
@@ -1248,18 +1486,19 @@ struct Engine {
         return {{d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_pos_m6, d_pos_m7}};
     }
     void spec_draft_step_launches(int k) {
-        if (k == 0) {
-            q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
-                             stm);
-            mtp_forward(h_next, d_token, d_draft, d_pos_m, d_draft_margin + 0);
-            return;
-        }
-        float* hs[7] = {h_next, h_next2, h_next3, h_next4, h_next5, h_next6, h_next7};
-        const int* ts[7] = {d_token, d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6};
-        int* ds[7] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6, d_draft7};
-        const int* ps[7] = {d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_pos_m6, d_pos_m7};
-        CUDA_CHECK(cudaMemcpyAsync(hs[k], x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        mtp_forward(hs[k], ts[k], ds[k], ps[k], d_draft_margin + k);
+        // P2c: prep + chain selection live in draft_step_prep/mtp_step_view
+        // (ONE pointer table shared with the fused union builder).
+        // Composition is byte-identical to the pre-P2c body: step 0 =
+        // prep_round + the (h_next, d_token, d_draft, d_pos_m, margin+0)
+        // MTP pass; step k>0 = the x1 -> hs[k] D2D + the (hs[k], ts[k],
+        // ds[k], ps[k], margin+k) pass -- same kernels, same args, same
+        // order, so every existing graph capture records the same nodes.
+        draft_step_prep(k, stm);
+        MtpLaneView v = mtp_step_view(k);
+        mtp_pre(v);
+        mtp_attn(v.pos[0], stm);
+        mtp_post(v);
+        mtp_tail(v);
     }
 
     void spec_draft_launches() {
@@ -1873,6 +2112,10 @@ struct Engine {
     // why: the conductor records each member's draft_done event on the
     // stream its draft phase ran on, then makes the fused stream wait on it.
     cudaStream_t stream() const { return stm; }
+    // why: the conductor's interleaved draft loop (P2a) gates each member's
+    // margin reads against ITS OWN theta (draft_and_gate's pmin_theta
+    // compare), per-member because Q27_PMIN is per-engine config.
+    float gate_theta() const { return pmin_theta; }
     // why: the conductor D2Hs every member's round outcome itself -- one
     // sync for the whole batch -- then hands the host copy to
     // commit_outcome().
@@ -1880,6 +2123,19 @@ struct Engine {
     // why: leave() hands the finish reason (stamped by finish_decode) to
     // the request thread via TokenQueue::close.
     const char* end_reason() const { return gs.end; }
+    // why: fused rounds have no spec_round to stamp the Q27_PHASE_STATS
+    // walls, so the conductor stamps them from its cstm event brackets
+    // (SHARED-WALL semantics; fused_round's accumulation comment) -- gated
+    // behind the SAME env latch the solo stamps use.
+    bool phase_stats_on() const { return phase_stats; }
+    // why: the phase fields stay engine-owned (GenStats); the conductor adds
+    // its per-round walls + this member's launched steps through one named
+    // mutator instead of reaching into gs (A4).
+    void phase_stats_add(double draft_ms, double verify_ms, long steps) {
+        gs.draft_ms += draft_ms;
+        gs.verify_ms += verify_ms;
+        gs.draft_steps += steps;
+    }
     //
     // Set the granted verify width for the NEXT (eager, fused) round. vw is
     // capture-time state for the graph zoo, so this must only be called on
@@ -1887,6 +2143,53 @@ struct Engine {
     void set_round_width(int w) {
         assert(w >= 2 && w <= W_MAX);
         vw = w;
+    }
+    // P2a step-granular draft entrypoints: draft_and_gate's margin loop,
+    // exploded so the conductor can interleave step k across all gated
+    // members (each engine's chain stays on its OWN stm; the conductor syncs
+    // and reads margins between steps). draft_and_gate below is EXACTLY these
+    // pieces reassembled -- the solo/smoke paths run the same code, so the
+    // canonical/sampled-seed gates also gate the extraction.
+    //
+    // why: the conductor bootstraps a sampled member's first token once
+    // before its step 0 (draft_and_gate's samp_first block, verbatim).
+    void draft_sample_bootstrap() {
+        if (!samp_first) return;
+        samp_first = false;
+        q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
+    }
+    // why: the conductor hoists each member's drafting ceiling (the
+    // dctl/gate_maxd read at draft_and_gate's top) before its interleaved
+    // loop; also carries draft_and_gate's gated-config precondition.
+    int draft_md_used(bool sampled) const {
+        assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
+        return sampled ? 4 : (maxd_auto ? dctl.cur : gate_maxd);
+    }
+    // why: the conductor launches step k on EVERY active member's stm before
+    // syncing any of them -- graph launch + margin D2H only, deliberately NO
+    // sync (that is the whole overlap).
+    void draft_step_launch(int k) {
+        CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+        CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
+                                   cudaMemcpyDeviceToHost, stm));
+    }
+    // why: the conductor reads step k's margin after ITS stream sync (the
+    // host value is garbage until the caller synced stm past the D2H above).
+    float draft_margin(int k) const { return h_draft_margin[k]; }
+    // P2c: the margin-D2H half of draft_step_launch, stream-parameterized --
+    // fused draft steps run on the conductor stream, so their margins land
+    // via cstm (the caller syncs cstm before reading draft_margin(k)).
+    void draft_margin_d2h(int k, cudaStream_t st) {
+        CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
+                                   cudaMemcpyDeviceToHost, st));
+    }
+    // why: the conductor fires draft_and_gate's width-floor top-up when a
+    // member leaves the interleaved loop. A width-W verify walks W-1 drafts,
+    // so W draft rows must exist; the range is empty except at cap==0
+    // (launched == cap+1 >= W otherwise -- see draft_and_gate).
+    void draft_floor_topup(int launched, int W, int md_used) {
+        for (int k = launched; k < W && k < md_used; k++)
+            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
     }
     // Draft phase of one GATED round on THIS engine's stm: the P14 dexit
     // margin loop of spec_round verbatim (per-step draft graphs, D2H margin,
@@ -1903,27 +2206,20 @@ struct Engine {
     // ceiling, for commit_outcome's telemetry/depthctl mirror -- W alone is
     // ambiguous at the floor (cap 0 and cap 1 both return W=2).
     int draft_and_gate(bool sampled = false, int* out_cap = nullptr, int* out_md = nullptr) {
-        assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
-        if (sampled && samp_first) {
-            samp_first = false;
-            q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
-        }
-        const int md_used = sampled ? 4 : (maxd_auto ? dctl.cur : gate_maxd);
+        if (sampled) draft_sample_bootstrap();
+        const int md_used = draft_md_used(sampled); // asserts the gated config
         int cap = 0, launched = 0;
         for (int k = 0; k < md_used; k++) {
-            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+            draft_step_launch(k);
             launched++;
-            CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
-                                       cudaMemcpyDeviceToHost, stm));
             CUDA_CHECK(cudaStreamSynchronize(stm));
-            if (h_draft_margin[k] < pmin_theta) break;
+            if (draft_margin(k) < pmin_theta) break;
             cap++;
         }
         int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
         // Width-floor top-up (see spec_round): a width-W verify walks W-1
         // drafts, so W draft rows must exist. Only fires at cap==0.
-        for (int k = launched; k < W && k < md_used; k++)
-            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+        draft_floor_topup(launched, W, md_used);
         if (out_cap) *out_cap = cap;
         if (out_md) *out_md = md_used;
         return W;
@@ -2540,6 +2836,18 @@ struct Engine {
         // Q27_PHASE_STATS: summed gated-round draft/verify wall (ms) and MTP
         // draft steps launched, this request. dec_ms - draft_ms - verify_ms =
         // host round-gap + any unattributed (constrained/ungated) rounds.
+        // FUSED rounds (P2 Task 1): the conductor stamps draft_ms/verify_ms
+        // from coarse cstm event brackets with SHARED-WALL semantics -- the
+        // one fused-round wall is attributed IN FULL to EACH member, so
+        // summing phd/phv across concurrently-batched requests DOUBLE-COUNTS
+        // the wall (per-request phd/phv stays the honest "time my rounds
+        // spent in phase X" read). Fused draft_ms is only the cstm-visible
+        // draft TAIL: the draft phase (P2a interleave / P2c fused steps)
+        // runs host-synced per step inside Conductor::draft_widths, BEFORE
+        // the round's ev_round_start is recorded -- so phd brackets just the
+        // unsynced launches between round start and the draft_done waits
+        // (floor top-ups, suffix prep/H2D), never the draft wall itself.
+        // draft_steps is NOT shared: steps THIS member launched.
         double draft_ms = 0, verify_ms = 0;
         long draft_steps = 0;
         // verify wall bucketed by verify width W=cap+1 (floored 2, <=W_MAX)
