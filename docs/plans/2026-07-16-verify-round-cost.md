@@ -1,7 +1,8 @@
 # Verify round cost: cut the flat ~430 ms that prices all speculation
 
-**Status: STAGED, pre-registered — no runs authorized yet.** Machine: mac-mini
-(T2 artifact suffices; every gate here runs on it). Follow-on from Gate 0
+**Status: P0 DONE (2026-07-16, 24 GB M4, Daniel-authorized "go quick") — hypothesis
+CONFIRMED at 97.5%; levers 1–2 stand, lever 3 formally dead. Kernel work not
+started.** Machine: mac-mini (T2 artifact suffices; every gate here runs on it). Follow-on from Gate 0
 (`2026-07-15-sibling-drafter-probe.md` §Gate 0 result): oracle rounds cost
 ~405–445 ms FLAT across verify widths 2..12 — a fixed ~5.1·G overhead that puts
 speculation break-even at ~5 committed tokens/round. Every ms off the round
@@ -32,6 +33,18 @@ STOP and re-rank — the levers below assume it.
 `Q27_MTP_TRACE`) prints per-round: verify-batch wall, cpred read, commit-batch
 (gdn_replay + copies) wall. One `--oracle 12 -n 128` run on the T2 artifact.
 Deliverable: the 430 ms split. Decides lever ranking below; ~2 minutes of GPU.
+
+**P0 result (2026-07-16, 24 GB M4, `logs/roundcost-p0-20260716/`):** round
+424.2 ms mean at w=12 splits **verify batch 412–419 ms (97.5%), prediction
+readback 0.03–0.08 ms, commit batch (gdn_replay + copies) 7–15 ms (~2.3%)**.
+The ≥70% prediction fires with 27 points to spare. Consequences: lever 3
+(sync count) is DEAD — there is ~10 ms total on the table; levers 1–2 hold
+the entire prize and their ranking stands. (Same run: S(12) = 2.207×, third
+consecutive confirmation; state gate PASS, agreement 127/127.) Cross-tier
+note from the same session's official-tier legs: mtp_round on the 17 GiB
+official artifact traces verify ≈ 0.50–0.51 s with draft 0.03–0.09 s and
+commit ≈ 0.01 s — the same shape (verify-batch-dominated), so the levers
+transfer across tiers.
 
 ## Levers (ranked by the hypothesis; each gated)
 

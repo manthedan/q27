@@ -1,0 +1,1 @@
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"<think>\n\n</think>\n\nParis","role":"assistant"}}],"created":1784222759,"id":"chatcmpl-metal","model":"q27-metal","object":"chat.completion","q27_prefix_hit":0,"usage":{"completion_tokens":5,"prompt_tokens":17,"total_tokens":22}}
