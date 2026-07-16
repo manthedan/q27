@@ -1,5 +1,30 @@
 # DSpark port — Phase 0: contract, repack, and gate design (no engine code)
 
+**RESOLVED (2026-07-16 evening, Daniel-authorized Phase-2 legs): the
+pre-registered Phase-3 gate fires PARK — decisively.** Leg B
+(`logs/dspark-phase2-20260716/`, fork harness `test-dspark-real-eval`, T2
+target + drafter, 24 prompts / 712 rounds / 2,285 tokens): **τ = 3.209
+committed/round** (single block + bonus); conditional acceptance is FLAT in
+depth (d(1..4) = 0.772/0.780/0.779/0.778 — mask positions do not decay
+within a block); **P(full block) = 0.365**; category spread is large (chat
+τ 2.40 / reasoning 3.63 / code 4.02). Against the lever-2 curve
+(BE(16) = 4.13 tok/round, G = 89.4 ms): single-block S = 0.78; the chained
+upper bound — generous to DSpark twice over (chained blocks assumed to
+accept at block-1 rates despite strictly degraded features, drafter forward
+cost excluded) — is **E ≤ 4.42 at w=16 → S ≤ 1.07 < the 1.3 bar**. True
+chained acceptance can only be lower, so the park is decisive, not
+marginal. Corroboration: the fork's own stack measures speedup 0.528 on the
+same run — DSpark loses on M4 even at home. Even code-only traffic
+(τ 4.02 < BE 4.13) fails single-block. **Per this plan's own kill line: the
+port parks HERE with the contract recorded; suffix-burst widening (no
+drafter, no acceptance loss) inherits lever 2's win instead.** What is
+banked for any future revisit (M5/M6-class hardware or a stronger drafter):
+the full contract below, the lossless repacked artifact, 7 rounds of
+real-run reference fixtures in the fork's tier-2 ref.bin layout
+(`fixtures/`, checksummed; fork instrumentation diff alongside), the
+harness build recipe, and `tools/dspark_gate_analysis.py` — re-running the
+gate on new hardware is one command per leg.
+
 **Status update (2026-07-16 night): lever 2 LANDED (S(48) = 3.94×,
 2026-07-16-lever2-verify-width.md) and the Phase-3 gate now STRADDLES.**
 The measured curve gives break-even ~4.1 tok/round at w=16 (the chained-
