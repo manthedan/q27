@@ -172,6 +172,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
     id<MTLComputePipelineState> t2_quantized;
+    id<MTLComputePipelineState> t2_quantized_x2;
+    id<MTLComputePipelineState> t2_x2;
     id<MTLComputePipelineState> f16_pair;
     id<MTLComputePipelineState> q4_quantized_matmul;
     id<MTLComputePipelineState> q8_quantized_matmul;
@@ -511,6 +513,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
         impl_->t2_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized");
+        impl_->t2_quantized_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized_x2");
+        impl_->t2_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128_x2");
         impl_->f16_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair");
         // SIMD-scoped matrix multiply is optional on older Intel-family Metal
         // devices. Decode GEMV remains available there; only small-N GEMM is gated.
@@ -978,6 +982,75 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
         [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("quantized matvec");
+    }
+}
+
+// N=2 slot-batched select-form T2 GEMV (multislot Phase 2 probe): the
+// float-activation production serial-decode path with two independent
+// activation/output buffer pairs. Metal-only surface until the probe
+// passes its pre-registered decision line.
+void MetalBackend::matvec_x2(const BackendTensor& weight,
+                             const BackendBuffer& x_a, const BackendBuffer& x_b,
+                             BackendBuffer& y_a, BackendBuffer& y_b) {
+    if (weight.dtype!=DType::T2_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec requires T2 weight");
+    if (!weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
+        weight.cols%128)
+        throw std::runtime_error("q27 Metal: invalid x2 matvec dimensions");
+    check_range(x_a.size(),0,weight.cols*sizeof(float),"x2 matvec input a");
+    check_range(x_b.size(),0,weight.cols*sizeof(float),"x2 matvec input b");
+    check_range(y_a.size(),0,weight.rows*sizeof(float),"x2 matvec output a");
+    check_range(y_b.size(),0,weight.rows*sizeof(float),"x2 matvec output b");
+    const MetalBuffer& data=metal_buffer(*weight.data); const MetalBuffer& ws=metal_buffer(*weight.scales);
+    const MetalBuffer& xa=metal_buffer(x_a); const MetalBuffer& xb=metal_buffer(x_b);
+    MetalBuffer& ya=metal_buffer(y_a); MetalBuffer& yb=metal_buffer(y_b);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/4,"x2 matvec weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/128)*2,"x2 matvec weight scales");
+    MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,8};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own,"q27_matvec_t2_g128_x2");
+        [enc setComputePipelineState:impl_->t2_x2];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xa.handle() offset:0 atIndex:2]; [enc setBuffer:xb.handle() offset:0 atIndex:3];
+        [enc setBuffer:ya.handle() offset:0 atIndex:4]; [enc setBuffer:yb.handle() offset:0 atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("x2 matvec");
+    }
+}
+
+// N=2 slot-batched T2 GEMV (multislot Phase 2 probe): x carries two
+// activation rows ([2, cols] values, [2, cols/32] scales), out is token-
+// major [2, rows] — the matmul_quantized layouts at x_rows=2. Metal-only
+// surface (not on the Backend interface) until the probe passes its
+// pre-registered decision line (docs/plans/2026-07-16-multislot-phase2-
+// probe.md).
+void MetalBackend::matvec_quantized_x2(const BackendTensor& weight,
+                                       const BackendQuantized& x, BackendBuffer& y) {
+    if (weight.dtype!=DType::T2_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec requires T2 weight");
+    if (!weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
+        weight.cols%128)
+        throw std::runtime_error("q27 Metal: invalid x2 matvec dimensions");
+    if ((uint64_t)x.count!=(uint64_t)weight.cols*2 || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec activation mismatch (needs 2 rows)");
+    check_range(y.size(),0,weight.rows*2*4,"x2 matvec output");
+    const MetalBuffer& data=metal_buffer(*weight.data); const MetalBuffer& ws=metal_buffer(*weight.scales);
+    const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales); MetalBuffer& out=metal_buffer(y);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/4,"x2 matvec weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/128)*2,"x2 matvec weight scales");
+    check_range(xv.size(),0,x.count,"x2 matvec values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"x2 matvec activation scales");
+    MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,8};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own,"q27_matvec_t2_quantized_x2");
+        [enc setComputePipelineState:impl_->t2_quantized_x2];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("x2 quantized matvec");
     }
 }
 
