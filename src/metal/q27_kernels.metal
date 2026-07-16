@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 6
+// Q27_SHADER_ABI 7
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
