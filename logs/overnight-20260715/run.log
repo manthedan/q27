@@ -1,0 +1,265 @@
+
+===== [23:06:15] 0. fork binaries =====
+fork.tar.gz
+libggml-base.0.13.1.dylib
+libggml-base.0.dylib
+libggml-base.dylib
+libggml-blas.0.13.1.dylib
+libggml-blas.0.dylib
+libggml-blas.dylib
+libggml-cpu.0.13.1.dylib
+libggml-cpu.0.dylib
+libggml-cpu.dylib
+libggml-metal.0.13.1.dylib
+libggml-metal.0.dylib
+libggml-metal.dylib
+libggml-rpc.0.13.1.dylib
+libggml-rpc.0.dylib
+libggml-rpc.dylib
+libggml.0.13.1.dylib
+libggml.0.dylib
+libggml.dylib
+libllama-batched-bench-impl.dylib
+libllama-bench-impl.dylib
+libllama-cli-impl.dylib
+libllama-common.0.0.9591.dylib
+libllama-common.0.dylib
+libllama-common.dylib
+libllama-completion-impl.dylib
+libllama-fit-params-impl.dylib
+libllama-perplexity-impl.dylib
+libllama-quantize-impl.dylib
+libllama-server-impl.dylib
+
+===== [23:06:15] 1. downloads =====
+/Users/macthedan/projects/q27/models/binary-bonsai-27b:
+total 10930184
+drwxr-xr-x@ 5 macthedan  staff         160 Jul 15 23:06 .
+drwxr-xr-x@ 6 macthedan  staff         192 Jul 15 22:25 ..
+-rw-r--r--@ 1 macthedan  staff  1787468768 Jul 15 22:27 Bonsai-27B-dspark-Q4_1.gguf
+-rw-r--r--@ 1 macthedan  staff  3803452480 Jul 15 22:26 Bonsai-27B-Q1_0.gguf
+-rw-r--r--@ 1 macthedan  staff         115 Jul 15 23:06 CHECKSUMS.md5
+
+/Users/macthedan/projects/q27/models/ternary-bonsai-1.7b:
+total 918856
+drwxr-xr-x@ 4 macthedan  staff        128 Jul 15 22:27 .
+drwxr-xr-x@ 6 macthedan  staff        192 Jul 15 22:25 ..
+-rw-r--r--@ 1 macthedan  staff         64 Jul 15 23:06 CHECKSUMS.md5
+-rw-r--r--@ 1 macthedan  staff  463290464 Jul 15 22:27 Ternary-Bonsai-1.7B-Q2_0.gguf
+
+===== [23:06:25] 2. T2 27B llama-bench baseline (vs recorded 8.41 +/- 1.36 tg128) =====
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.026 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M4)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9  (1009)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 19069.67 MB
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35 27B Q2_0                |   6.66 GiB |    26.90 B | MTL,BLAS   |       4 |           pp512 |         31.03 ± 0.64 |
+| qwen35 27B Q2_0                |   6.66 GiB |    26.90 B | MTL,BLAS   |       4 |           tg128 |          6.21 ± 0.18 |
+
+build: 62061f910 (9591)
+
+===== [23:09:50] 3. B1 27B llama-bench (projection: ~2x T2 if bandwidth-bound in their stack) =====
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.010 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M4)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9  (1009)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 19069.67 MB
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35 27B Q1_0                |   3.53 GiB |    26.90 B | MTL,BLAS   |       4 |           pp512 |         27.35 ± 4.69 |
+| qwen35 27B Q1_0                |   3.53 GiB |    26.90 B | MTL,BLAS   |       4 |           tg128 |          7.05 ± 1.01 |
+
+build: 62061f910 (9591)
+
+===== [23:13:22] 4. B1 perplexity (compare: T2=10.04) =====
+0.00.068.771 I common_init_result: fitting params to device memory ...
+0.00.068.773 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.671.918 W llama_context: n_ctx_seq (512) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.00.715.181 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.00.938.709 I 
+0.00.939.635 I system_info: n_threads = 4 (n_threads_batch = 4) / 10 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | LLAMAFILE = 1 | ACCELERATE = 1 | REPACK = 1 | 
+0.00.939.638 I perplexity: tokenizing the input ..
+0.01.178.594 I perplexity: tokenization took 238.953 ms
+0.01.179.447 I perplexity: calculating perplexity over 24 chunks, n_ctx=512, batch_size=2048, n_seq=4
+1.14.288.395 I perplexity: 73.11 seconds per pass - ETA 7.30 minutes
+[1]9.6245,[2]13.0065,[3]12.3873,[4]11.6393,[5]11.4692,[6]11.9717,[7]12.3198,[8]13.3057,[9]14.3066,[10]14.6984,[11]14.4267,[12]14.5301,[13]15.1426,[14]14.4021,[15]14.1134,[16]14.4463,[17]13.4685,[18]13.5919,[19]13.5157,[20]13.4672,[21]13.0003,[22]12.7834,[23]12.3136,[24]11.6948,
+7.27.355.131 I Final estimate: PPL = 11.6948 +/- 0.42850
+
+
+===== [23:20:49] 5. Ternary-1.7B solo llama-bench (expect ~80-100 tok/s class) =====
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.036 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M4)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9  (1009)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 19069.67 MB
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen3 1.7B Q2_0                | 436.16 MiB |     1.72 B | MTL,BLAS   |       4 |           pp512 |       430.10 ± 14.51 |
+| qwen3 1.7B Q2_0                | 436.16 MiB |     1.72 B | MTL,BLAS   |       4 |           tg128 |         85.11 ± 5.37 |
+
+build: 62061f910 (9591)
+
+===== [23:21:04] 6. speculative sweeps =====
+
+===== [23:21:04] 6.t2 draft-max=4 prompt=agentic =====
+0.00.099.444 I common_init_result: fitting params to device memory ...
+0.00.099.452 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.04.915.652 W llama_context: n_ctx_seq (155136) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.06.001.150 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.13.460.936 I common_init_result: fitting params to device memory ...
+0.13.460.938 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.19.491.147 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.19.788.459 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.19.853.654 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.19.929.272 E main: draft model vocab must closely match target model to use speculation but 0.19.929.276 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128
+
+===== [23:21:24] 6.t2 draft-max=4 prompt=prose =====
+0.00.145.143 I common_init_result: fitting params to device memory ...
+0.00.145.146 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.472.356 W llama_context: n_ctx_seq (155136) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.02.154.653 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.06.627.853 I common_init_result: fitting params to device memory ...
+0.06.627.857 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.12.458.201 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.12.743.727 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.12.826.641 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.12.913.954 E main: draft model vocab must closely match target model to use speculation but 0.12.913.959 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128
+
+===== [23:21:37] 6.t2 draft-max=8 prompt=agentic =====
+0.00.059.094 I common_init_result: fitting params to device memory ...
+0.00.059.097 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.493.750 W llama_context: n_ctx_seq (155136) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.02.155.462 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.06.174.771 I common_init_result: fitting params to device memory ...
+0.06.174.774 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.12.803.223 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.13.089.994 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.13.145.729 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.13.216.834 E main: draft model vocab must closely match target model to use speculation but 0.13.216.837 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128
+
+===== [23:21:51] 6.t2 draft-max=8 prompt=prose =====
+0.00.052.743 I common_init_result: fitting params to device memory ...
+0.00.052.746 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.453.560 W llama_context: n_ctx_seq (155136) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.02.155.795 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.07.041.628 I common_init_result: fitting params to device memory ...
+0.07.041.632 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.14.058.946 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.14.341.036 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.14.396.278 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.14.473.374 E main: draft model vocab must closely match target model to use speculation but 0.14.473.377 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128
+
+===== [23:22:05] 6.b1 draft-max=4 prompt=agentic =====
+0.00.113.897 I common_init_result: fitting params to device memory ...
+0.00.113.899 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.03.075.543 W llama_context: n_ctx_seq (203264) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.04.417.374 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.07.453.360 I common_init_result: fitting params to device memory ...
+0.07.453.363 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.08.604.918 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.09.078.820 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.09.149.238 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.09.233.694 E main: draft model vocab must closely match target model to use speculation but 0.09.233.699 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128
+
+===== [23:22:15] 6.b1 draft-max=4 prompt=prose =====
+0.00.134.355 I common_init_result: fitting params to device memory ...
+0.00.134.358 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.416.265 W llama_context: n_ctx_seq (203264) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.02.240.843 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.04.090.531 I common_init_result: fitting params to device memory ...
+0.04.090.533 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.05.159.697 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.05.562.723 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.05.647.353 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.05.729.634 E main: draft model vocab must closely match target model to use speculation but 0.05.729.639 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128
+
+===== [23:22:21] 6.b1 draft-max=8 prompt=agentic =====
+0.00.124.478 I common_init_result: fitting params to device memory ...
+0.00.124.482 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.371.181 W llama_context: n_ctx_seq (203264) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.02.163.433 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.03.819.528 I common_init_result: fitting params to device memory ...
+0.03.819.530 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.04.833.041 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.05.268.359 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.05.344.678 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.05.418.446 E main: draft model vocab must closely match target model to use speculation but 0.05.418.450 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128
+
+===== [23:22:27] 6.b1 draft-max=8 prompt=prose =====
+0.00.130.091 I common_init_result: fitting params to device memory ...
+0.00.130.096 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.268.167 W llama_context: n_ctx_seq (203264) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.02.011.789 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.03.407.151 I common_init_result: fitting params to device memory ...
+0.03.407.159 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.04.464.282 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.04.885.163 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.04.962.710 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.05.038.205 E main: draft model vocab must closely match target model to use speculation but 0.05.038.208 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128
+
+===== [23:22:32] 7. B1 behavioral probes via llama-server =====
+--- probe json done
+--- probe constraints done
+--- probe codeedit done
+--- probe toolcall done
+probe-codeedit.json: tool_calls=False len=0
+probe-constraints.json: tool_calls=False len=0
+probe-json.json: tool_calls=False len=0
+probe-toolcall.json: tool_calls=True len=0
+
+===== [23:30:16] 8. DSpark flag hunt =====
+--- llama-server:
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache
+--- llama-speculative:
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache
+--- llama-cli:
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache
+--- llama-bench:
+
+===== [23:30:17] 8b. DSpark attempt (t2 target) =====
+0.00.032.557 I common_init_result: fitting params to device memory ...
+0.00.032.558 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.04.136.435 W llama_context: n_ctx_seq (155136) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.04.613.258 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.08.504.660 I common_init_result: fitting params to device memory ...
+0.08.504.664 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.08.514.787 W load: adding 248320 dummy tokens
+0.09.537.087 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.10.480.457 E main: draft model vocab type must match target model to use speculation but 0.10.480.460 E vocab_type_dft = 0 while vocab_type_tgt = 1
+
+===== [23:30:27] DONE Wed Jul 15 23:30:27 PDT 2026 =====

@@ -1,0 +1,7 @@
+--- llama-server:
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache
+--- llama-speculative:
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache
+--- llama-cli:
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache
+--- llama-bench:
