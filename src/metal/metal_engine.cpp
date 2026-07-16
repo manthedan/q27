@@ -410,10 +410,13 @@ uint64_t MetalEngine::fixed_state_bytes(bool chunked) {
     return bytes;
 }
 
-uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block) {
+uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block, bool chunked) {
     const uint64_t b = std::max(block, 1u);
     const uint64_t blocks = 1 + ((uint64_t)std::max(context, 1u) - 1) / b;
-    return (uint64_t)PREFILL_CHUNK_MAX * N_HEAD * blocks * 258 * 4;
+    // Without chunked prefill the causal-GQA path only ever sees one query
+    // token (serial decode), so the widest partial buffer is one row.
+    const uint64_t tokens = chunked ? PREFILL_CHUNK_MAX : 1;
+    return tokens * N_HEAD * blocks * 258 * 4;
 }
 
 std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {

@@ -247,7 +247,7 @@ struct Runtime {
                                +q27::MetalEngine::fixed_state_bytes(e0.chunked_prefill())
                                +(uint64_t)cache_entries*e0.snapshot_bytes();
         const uint64_t shared_term=q27::MetalEngine::gqa_partial_peak(
-                ctx,shared->backend.gqa_block_size());
+                ctx,shared->backend.gqa_block_size(),e0.chunked_prefill());
         for(uint32_t s=1;s<slot_count;s++) {
             const uint64_t need=(uint64_t)(slots.size()+1)*per_slot+shared_term;
             if(need>budget) {
