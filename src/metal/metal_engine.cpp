@@ -367,6 +367,51 @@ void MetalEngine::reset() {
     }
 }
 
+// G6 admission accounting. snapshot_bytes mirrors capture_state()'s
+// allocations at worst case (position_ == max_context_); fixed_state_bytes
+// mirrors the constructor's non-KV buffers (the >= 1 MB class; scalar-sized
+// allocations omitted); gqa_partial_peak mirrors the backend's causal-GQA
+// partial sizing at the widest chunk. Keep paired with those sites.
+uint64_t MetalEngine::snapshot_bytes() const {
+    const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
+                                          : (uint64_t)N_KV * HEAD_DIM * 2;
+    const uint64_t active = (uint64_t)max_context_ * cache_row;
+    const uint64_t attn_layers = N_LAYER / 4, gdn_layers = N_LAYER - attn_layers;
+    uint64_t bytes = gdn_layers * ((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3ull * GDN_CH) * 4;
+    bytes += attn_layers * 2 * active;
+    if (has_mtp_) bytes += 2 * active;
+    bytes += (uint64_t)N_EMBD * 4 + (uint64_t)VOCAB * 4;   // hidden + logits
+    return bytes;
+}
+
+uint64_t MetalEngine::fixed_state_bytes() {
+    const uint64_t attn_layers = N_LAYER / 4, gdn_layers = N_LAYER - attn_layers;
+    // Chunked-prefill f32 rows (ch/cx1/cy, cqg, ckbuf/cvbuf, cattn_out,
+    // cqkv, cz, alpha/beta_raw/g/beta, cconv_out, cdelta_out, cgated_out,
+    // ffn gate+up).
+    const uint64_t chunk_row = (uint64_t)N_EMBD * 3 + 2ull * N_HEAD * HEAD_DIM +
+                               2ull * N_KV * HEAD_DIM + (uint64_t)N_HEAD * HEAD_DIM +
+                               GDN_CH + GDN_V + 4ull * GDN_HEADS + GDN_CH + GDN_V + GDN_V +
+                               2ull * N_FFN;
+    uint64_t bytes = (uint64_t)PREFILL_CHUNK_MAX * chunk_row * 4;
+    // Quantized activation copies (int8 values + f32 scales per 32).
+    bytes += (uint64_t)PREFILL_CHUNK_MAX * (N_EMBD + GDN_V + N_FFN) * 9 / 8;
+    // Verify-width surfaces (lever 2): cfinal_ + clogits_.
+    bytes += (uint64_t)VERIFY_CHUNK_MAX * ((uint64_t)N_EMBD + VOCAB) * 4;
+    // gdn_replay parks (qkv + g + beta per GDN layer).
+    bytes += gdn_layers * (uint64_t)VERIFY_CHUNK_MAX * (GDN_CH + 2ull * GDN_HEADS) * 4;
+    // Live GDN recurrence state (recurrent + conv ring per GDN layer).
+    bytes += gdn_layers * ((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3ull * GDN_CH) * 4;
+    // Serial-path logits + hidden/scratch rows.
+    bytes += (uint64_t)VOCAB * 4 + (uint64_t)N_EMBD * 4 * 4;
+    return bytes;
+}
+
+uint64_t MetalEngine::gqa_partial_peak(uint32_t context) {
+    const uint64_t blocks = 1 + ((uint64_t)std::max(context, 1u) - 1) / 1024;
+    return (uint64_t)PREFILL_CHUNK_MAX * N_HEAD * blocks * 258 * 4;
+}
+
 std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
     backend_.synchronize();
     auto snapshot = std::make_shared<Snapshot>();

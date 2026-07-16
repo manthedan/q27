@@ -20,11 +20,19 @@ Starts the Metal server with --slots 2 and checks:
       (vacuous-gate lesson). Server stderr must show the engage/close pairs.
   G5  wait honesty: /stats reports nonzero busy-arrival gate waits after the
       concurrency phase, and every request was admitted.
+  G6  admission (greedy config only; own server launch): with
+      Q27_METAL_BUDGET_MB sized to fit exactly one slot, /stats must report
+      slots == 1 (the degradation actually fired — the default suite asserts
+      slots == 2, so both directions of the admission decision are
+      exercised), and saturating the single slot's ticket queue must produce
+      at least one HTTP 503 with the documented overloaded_error body while
+      every other request completes identically (no wedge, shared deadline).
 
 Run once with the greedy server and once with --mtp 4 (arg: mtp).
 """
 import http.client
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -66,6 +74,17 @@ def request(prompt, n=64, timeout=600, **extra):
     return data["choices"][0]["text"]
 
 
+def request_raw(prompt, n=64, timeout=600, port=PORT, **extra):
+    """Like request() but returns (status, parsed_body) without raising."""
+    c = http.client.HTTPConnection(HOST, port, timeout=timeout)
+    body = json.dumps({"prompt": prompt, "max_tokens": n, **extra})
+    c.request("POST", "/v1/completions", body, {"Content-Type": "application/json"})
+    r = c.getresponse()
+    data = json.loads(r.read())
+    c.close()
+    return r.status, data
+
+
 def stream_then_cancel(prompt, pieces=3):
     """Read a few SSE chunks then drop the connection mid-generation."""
     c = http.client.HTTPConnection(HOST, PORT, timeout=600)
@@ -88,13 +107,13 @@ def stats():
     return data
 
 
-def wait_ready(proc, deadline=180):
+def wait_ready(proc, deadline=180, port=PORT):
     start = time.time()
     while time.time() - start < deadline:
         if proc.poll() is not None:
             raise RuntimeError("server exited early")
         try:
-            c = http.client.HTTPConnection(HOST, PORT, timeout=2)
+            c = http.client.HTTPConnection(HOST, port, timeout=2)
             c.request("GET", "/health")
             if c.getresponse().status == 200:
                 c.close()
@@ -266,8 +285,69 @@ def main():
         for f in failures:
             print(f"  - {f}")
         return 1
-    gates = "G1/G2/G3/G5" if mtp else "G1/G2/G3/G4/G5"
+    if not mtp and run_g6() != 0:
+        return 1
+    gates = "G1/G2/G3/G5" if mtp else "G1/G2/G3/G4/G5/G6"
     print(f"[{label}] {gates} PASS (solo texts {len(solo_a)}/{len(solo_b)} chars)")
+    return 0
+
+
+def run_g6():
+    """Admission gate: budget fits exactly one slot; queue overflow 503s."""
+    env = dict(os.environ, Q27_METAL_BUDGET_MB="1000")
+    cmd = ["build/q27-metal-server", MODEL, TOK, "--port", str(PORT + 1),
+           "--ctx", "2048", "--slots", "2"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, env=env)
+    failures = []
+    try:
+        wait_ready(proc, port=PORT + 1)
+        c = http.client.HTTPConnection(HOST, PORT + 1, timeout=30)
+        c.request("GET", "/stats")
+        slots = json.loads(c.getresponse().read()).get("slots")
+        c.close()
+        if slots != 1:
+            failures.append(f"G6: budget for one slot admitted {slots} slots "
+                            "(degradation never fired — vacuous)")
+        # Saturate: 1 running + QUEUE_MAX=8 tickets; the overflow must 503.
+        results = {}
+        def run_q(i):
+            try:
+                results[i] = request_raw(PROMPT_A, n=32, port=PORT + 1)
+            except Exception as e:  # noqa: BLE001
+                results[i] = (0, {"error": {"message": str(e), "type": "transport"}})
+        threads = [threading.Thread(target=run_q, args=(i,), daemon=True)
+                   for i in range(12)]
+        for t in threads: t.start()
+        deadline = time.monotonic() + 180
+        for t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+        if any(t.is_alive() for t in threads):
+            failures.append("G6: request wedged at the shared deadline")
+        ok = [d for st, d in results.values() if st == 200]
+        overloaded = [d for st, d in results.values()
+                      if st == 503 and d.get("error", {}).get("type") == "overloaded_error"]
+        other = [(st, d) for st, d in results.values()
+                 if st not in (200, 503)]
+        if not overloaded:
+            failures.append("G6: no 503 overloaded_error despite 12-over-(1 slot + 8 tickets)")
+        if not ok:
+            failures.append("G6: no request completed normally under overload")
+        if other:
+            failures.append(f"G6: unexpected statuses {[st for st, _ in other]}")
+        texts = {d["choices"][0]["text"] for d in ok}
+        if len(texts) > 1:
+            failures.append("G6: successful responses diverged under overload (greedy determinism)")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)
+    if failures:
+        print("[greedy] G6 FAIL:")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"[greedy] G6 PASS (slots=1 under 1000 MB budget, "
+          f"{len(overloaded)} x 503 overloaded_error, {len(ok)} completed)")
     return 0
 
 

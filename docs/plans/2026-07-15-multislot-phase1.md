@@ -8,7 +8,13 @@ constraint action is proven, not assumed — the declared tool name is one
 the model never produces naturally (the few-shot demonstrates get_weather,
 the grammar declares zz_paris_weather_probe; the probe name can only appear
 via the mask), and server stderr must show the engage/close pairs
-(vacuous-gate lesson applied). Remaining residue: G6 admission gate.
+(vacuous-gate lesson applied). G6 (admission) landed the same day
+(2026-07-16-g6-admission.md): full admission accounting (KV + fixed
+engine state + snapshot capacity + GQA partial peak, Q27_METAL_BUDGET_MB
+hook), dedicated 503 overloaded_error — and the gate exposed that the
+queue-overflow error path had been unreachable dead code behind the
+8-worker pool (now 16 > QUEUE_MAX + slots). Phase 1 contract: fully
+discharged.
 Prereqs met: round-2 P0s #1/#2/#3 fixed and gated (`dc8f017` + exit-code
 hardening), triage ordering explicitly unblocks "v1 multislot
 state/scheduling" as the next serving workstream (review-3 Q3: P0 fixes →
