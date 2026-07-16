@@ -48,8 +48,13 @@ transfer across tiers.
 
 ## Levers (ranked by the hypothesis; each gated)
 
-1. **Chunk-GEMM weight-stream efficiency at w ≤ 16 — phase B direct-RHS
-   64-row × 32-token half-tile kernel** (already the standing prefill lever,
+1. **PARKED 2026-07-16 (mac-mini) by its own kill line** — best-mapping
+   probe C/D2 = 0.782 at width 12, i.e. 22% slower than production; two
+   mappings measured, transfer hypothesis from ds4 refuted on plain
+   simdgroup_matrix (their win needs Metal-4 cooperative tensors). Full
+   record: 2026-07-16-lever1-direct-rhs.md. Re-scope per this plan's own
+   line: lever 2 only. ~~Chunk-GEMM weight-stream efficiency at w ≤ 16 —
+   phase B direct-RHS 64-row × 32-token half-tile kernel~~ (already the standing prefill lever,
    ds4-survey item 2 phase B). This is the SAME kernel family the verify chunk
    rides, so it pays twice: prefill wall AND speculation break-even. Target:
    ≥ 2× effective weight stream at width 12 (21 → 40+ GB/s → round ~250 ms →
