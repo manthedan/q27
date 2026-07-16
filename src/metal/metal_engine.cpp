@@ -1741,9 +1741,149 @@ std::vector<uint32_t> MetalEngine::generate_mtp(const std::vector<uint32_t>& pro
     return generate_from_pending(pending, count, width);
 }
 
+// Suffix-burst round (2026-07-16-suffix-burst-verify.md): oracle_round's
+// caller-lane verify chunk + batched head + argmax, then mtp_round's REAL
+// acceptance walk, commit_n/encoded rules, and early-EOS clamp (e765dde) —
+// verbatim semantics, lanes from the CPU-side SuffixDraft instead of the
+// layer-64 draft head. Committed tokens are greedy-identical to the serial
+// walk by the same argument as mtp_round (modulo the documented
+// tolerance-gated chunk-GEMM class).
+uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint32_t* lanes,
+                                   uint32_t live, std::vector<uint32_t>& committed) {
+    if (remaining < 2)
+        throw std::runtime_error("q27 Metal: suffix round needs remaining >= 2 (emit the last token directly)");
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: suffix rounds are unmasked; tool constraints require serial decode");
+    if (live < 2 || live > VERIFY_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: suffix round live width must be 2..VERIFY_CHUNK_MAX");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: suffix round requires chunked prefill");
+    if ((uint64_t)position_ + live > max_context_)
+        throw std::runtime_error("q27 Metal: suffix verify rows exceed context");
+    for (uint32_t lane = 0; lane < live; lane++)
+        if (lanes[lane] >= VOCAB)
+            throw std::runtime_error("q27 Metal: suffix lane token out of range");
+    last_spec_stats_.rounds++;
+    last_spec_stats_.drafted += live - 1;
+    {
+        CommandBatch batch(backend_);
+        chunk_forward(lanes, live, /*verify=*/true);
+        BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
+        backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                        N_EMBD, live, EPS, x5);
+        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
+        batch.finish();
+    }
+    std::vector<uint32_t> predictions(live);
+    backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
+    uint32_t accepted = 0;
+    while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
+    uint32_t commit_n = std::min(accepted + 1, remaining);
+    uint32_t encoded = commit_n == remaining ? commit_n - 1 : commit_n;
+    for (uint32_t i = 0; i < commit_n; i++)
+        if (lanes[i] == eos) {
+            commit_n = i + 1;
+            encoded = i;
+            break;
+        }
+    last_spec_stats_.accepted += commit_n - 1;
+    if (encoded) {
+        CommandBatch batch(backend_);
+        gdn_replay(encoded);
+        backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
+                      *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+        backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
+                      *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+        batch.finish();
+    }
+    position_ += encoded;
+    committed.insert(committed.end(), lanes, lanes + commit_n);
+    // Dispatch evidence for the width gates (vacuous-gate lesson): printed
+    // at the dispatch site, not the driver's bookkeeping.
+    static const bool trace = getenv("Q27_SUFFIX_TRACE") != nullptr;
+    if (trace)
+        fprintf(stderr, "suffix round: live %u accepted %u committed %u\n", live, accepted, commit_n);
+    return predictions[commit_n - 1];
+}
+
 std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& prompt,
-                                                    uint32_t count, uint32_t width,
-                                                    uint32_t minimum_match) {
+                                                   uint32_t count, uint32_t width,
+                                                   uint32_t minimum_match) {
+    if (prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
+    if (width < 2 || width > VERIFY_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: suffix width must be 2..VERIFY_CHUNK_MAX");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: batched suffix requires chunked prefill; use --suffix-serial");
+    // Reject constraints at entry (codex P2): burst rounds argmax unmasked
+    // logits, and a serial-fallback round WOULD mask — a mixed stream is
+    // worse than a loud error. Same contract as GPU-resident greedy.
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: batched suffix refuses active tool constraints; use serial decode");
+    if ((uint64_t)prompt.size() + count > max_context_ + 1)
+        throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
+    uint32_t pending = ingest_prompt(prompt, false, true);
+    last_spec_stats_ = {};
+    last_suffix_stats_ = {};
+    std::vector<int> history(prompt.begin(), prompt.end());
+    SuffixDraft drafter;
+    drafter.reset(history);
+    std::vector<uint32_t> output;
+    output.reserve(count);
+    std::vector<int> proposals(VERIFY_CHUNK_MAX);
+    std::vector<uint32_t> lanes(VERIFY_CHUNK_MAX);
+    std::vector<uint32_t> committed;
+    // EOS sentinel: the CLI drives this path with a never-matching token
+    // when it wants a fixed count; a real eos clamps commits mid-burst.
+    const uint32_t eos = VOCAB; // never matches: lanes are validated < VOCAB
+    while (output.size() < count) {
+        if (output.size() + 1 == count) { output.push_back(pending); break; }
+        const uint32_t remaining = (uint32_t)(count - output.size());
+        // Propose up to width-1 continuation tokens; the verify chunk also
+        // needs one KV row per lane inside the reserved context.
+        uint32_t max_lanes = std::min<uint32_t>(width, remaining);
+        if ((uint64_t)position_ + max_lanes > max_context_)
+            max_lanes = (uint32_t)(max_context_ - position_);
+        int match = 0;
+        if (max_lanes >= 2)
+            match = drafter.propose_with((int)pending, (int)(max_lanes - 1), proposals.data());
+        // Match-capped width (plan contract, codex P2): forward lanes are
+        // bounded by the matched suffix length — proposals past the match
+        // evidence are lag-copy extrapolation, and dispatching them would
+        // make the drafted stats and burst economics measure speculation
+        // beyond what the match justifies.
+        uint32_t live = match >= (int)minimum_match
+                            ? std::min<uint32_t>(max_lanes, (uint32_t)match + 1) : 0;
+        // Full-tile snap-down (lever 2: round cost steps one full weight
+        // stream per 16-token tile): a partial second/third tile pays a
+        // whole stream for < 16 possible tokens — never worth it. 17..31
+        // lanes snap to 16, 33..47 snap to 32.
+        if (live > 16 && live < 32) live = 16;
+        else if (live > 32 && live < 48) live = 32;
+        if (live >= 2) {
+            last_suffix_stats_.burst_rounds++;
+            if (live <= 16) last_suffix_stats_.lanes_le16++;
+            else if (live == 32) last_suffix_stats_.lanes_32++;
+            else last_suffix_stats_.lanes_48++;
+            lanes[0] = pending;
+            for (uint32_t i = 1; i < live; i++) lanes[i] = (uint32_t)proposals[i - 1];
+            committed.clear();
+            pending = suffix_round(remaining, eos, lanes.data(), live, committed);
+            for (uint32_t tok : committed) { output.push_back(tok); drafter.append((int)tok); }
+        } else {
+            last_suffix_stats_.fallback_rounds++;
+            last_spec_stats_.rounds++;
+            output.push_back(pending);
+            drafter.append((int)pending);
+            pending = step(pending);
+        }
+    }
+    return output;
+}
+
+std::vector<uint32_t> MetalEngine::generate_suffix_serial(const std::vector<uint32_t>& prompt,
+                                                          uint32_t count, uint32_t width,
+                                                          uint32_t minimum_match) {
     if(prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
     if(width<2 || width>12) throw std::runtime_error("q27 Metal: suffix width must be 2..12");
     if((uint64_t)prompt.size()+count>max_context_+1)
