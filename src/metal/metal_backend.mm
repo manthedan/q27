@@ -63,7 +63,7 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 6";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 7";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
