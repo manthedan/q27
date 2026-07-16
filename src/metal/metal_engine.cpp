@@ -414,9 +414,12 @@ uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block, bool ch
     const uint64_t b = std::max(block, 1u);
     const uint64_t blocks = 1 + ((uint64_t)std::max(context, 1u) - 1) / b;
     // Without chunked prefill the causal-GQA path only ever sees one query
-    // token (serial decode), so the widest partial buffer is one row.
+    // token (serial decode), so the widest partial buffer is one row. The
+    // buffer grows by allocate-then-replace as context deepens, so the old
+    // and new allocations coexist transiently — charge 2x the final peak
+    // (monotonic growth makes old + new < 2 x new; codex P2).
     const uint64_t tokens = chunked ? PREFILL_CHUNK_MAX : 1;
-    return tokens * N_HEAD * blocks * 258 * 4;
+    return 2 * tokens * N_HEAD * blocks * 258 * 4;
 }
 
 std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
