@@ -234,13 +234,24 @@ int main(int argc, char** argv) {
         // difference <= 1e-3 on all live outputs before any timing.
         {
             std::vector<float> yc(out_floats), yd(out_floats);
+            const std::vector<float> poison(out_floats, 0.0f);
             backend.begin_commands(); ops[C](); backend.end_commands();
             backend.read(*y, 0, yc.data(), out_floats * 4);
             for (int darm : {(int)D, (int)D2}) {
+                // Full-buffer poison: an arm that skips writes must not
+                // inherit C's reference values (codex P2); non-finite
+                // candidate outputs are rejected explicitly — NaN would
+                // otherwise vanish through std::max.
+                backend.write(*y, 0, poison.data(), out_floats * 4);
                 backend.begin_commands(); ops[darm](); backend.end_commands();
                 backend.read(*y, 0, yd.data(), out_floats * 4);
                 double worst = 0;
                 for (uint64_t i = 0; i < out_floats; i++) {
+                    if (!std::isfinite(yd[i])) {
+                        fprintf(stderr, "FAIL: %s — arm %s produced a non-finite output\n",
+                                s.name, ARM_NAMES[darm]);
+                        return 1;
+                    }
                     const double denom = std::max(1.0, (double)std::fabs(yc[i]));
                     worst = std::max(worst, (double)std::fabs(yc[i] - yd[i]) / denom);
                 }
