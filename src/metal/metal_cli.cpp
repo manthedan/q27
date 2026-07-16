@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
     try {
         std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits,nll_path;
         uint32_t count=1,context=128,mtp_width=0,suffix_width=0,oracle_width=0,nll_long=0; q27::SamplingParams sampling;
+        bool eos_gate=false;
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         bool kl_kv = false, kl_self = false;
         uint32_t chunk_parity = 0;
@@ -170,6 +171,7 @@ int main(int argc, char** argv) {
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
             else if (arg == "--suffix" && i + 1 < argc) suffix_width = parse_u32(argv[++i], "--suffix");
             else if (arg == "--oracle" && i + 1 < argc) oracle_width = parse_u32(argv[++i], "--oracle");
+            else if (arg == "--eos-gate") eos_gate = true;
             else if (arg == "--dump-logits" && i + 1 < argc) dump_logits = argv[++i];
             else if (arg == "--temperature" && i + 1 < argc) sampling.temperature=parse_float(argv[++i],"--temperature");
             else if (arg == "--top-p" && i + 1 < argc) sampling.top_p=parse_float(argv[++i],"--top-p");
@@ -198,6 +200,15 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--oracle needs -n >= width+2 for at least one full and one final round");
         if (oracle_width && !dump_logits.empty())
             throw std::runtime_error("--oracle cannot be combined with --dump-logits");
+        if (eos_gate && !mtp_width)
+            throw std::runtime_error("--eos-gate requires --mtp W (it tests the batched-MTP EOS path)");
+        if (eos_gate && (oracle_width || suffix_width || sampling.temperature > 0 || !dump_logits.empty()))
+            throw std::runtime_error("--eos-gate cannot be combined with other modes");
+        // --prefill serial falls back to serial decode and --validate-only
+        // returns before the gate — either would exit 0 without testing the
+        // batched-MTP EOS path (vacuous-gate class, codex P2).
+        if (eos_gate && (serial_prefill || validate_only))
+            throw std::runtime_error("--eos-gate requires the chunked batched-MTP path; drop --prefill serial/--validate-only");
         if(!token_list.empty() && !prompt_text.empty()) throw std::runtime_error("--tokens and --prompt are mutually exclusive");
         if (!nll_path.empty() && (!token_list.empty() || !prompt_text.empty() || validate_only))
             throw std::runtime_error("--nll cannot be combined with --tokens/--prompt/--validate-only");
@@ -480,6 +491,43 @@ int main(int argc, char** argv) {
                     nll.size() / std::chrono::duration<double>(nll_done - nll_start).count(),
                     mean, std::exp(mean));
             return 0;
+        }
+
+        // EOS position-invariant gate (open codex finding, 2026-07-15: batched
+        // MTP commits the accepted prefix before sinks fire, leaving
+        // position/KV/GDN advanced past the last emitted token). Pick a real
+        // mid-stream token from a greedy reference as EOS, replay through the
+        // batched MTP stream, and assert the serial-walk invariant:
+        // emitted == ref[0..k) and position() == prompt + k.
+        if (eos_gate) {
+            uint32_t pending = engine.ingest_prompt(prompt, false, true);
+            std::vector<uint32_t> ref = engine.generate_from_pending(pending, count);
+            uint32_t k = 0;
+            for (uint32_t i = 6; i + 4 < (uint32_t)ref.size(); i++) {
+                bool seen = false;
+                for (uint32_t j = 0; j < i; j++) if (ref[j] == ref[i]) { seen = true; break; }
+                if (!seen) { k = i; break; }
+            }
+            if (!k) throw std::runtime_error("eos-gate: no unique mid-stream token to use as EOS; change prompt/-n");
+            const uint32_t eos = ref[k];
+            const uint32_t pending2 = engine.ingest_prompt(prompt, true, true);
+            if (pending2 != ref[0])
+                throw std::runtime_error("eos-gate: re-ingest diverged from reference pass");
+            std::vector<uint32_t> emitted;
+            q27::MetalEngine::StopCause cause;
+            engine.stream_from_pending(pending2, count, eos, mtp_width,
+                                       [&](uint32_t t) { emitted.push_back(t); return true; }, cause);
+            const bool cause_ok = cause == q27::MetalEngine::StopCause::Eos;
+            const bool text_ok = emitted.size() == k &&
+                                 std::equal(emitted.begin(), emitted.end(), ref.begin());
+            const uint32_t expect_pos = (uint32_t)prompt.size() + k;
+            const bool pos_ok = engine.position() == expect_pos;
+            fprintf(stderr, "eos-gate: k=%u eos=%u | cause %s | emitted %zu (%s) | position %u vs expected %u (%s)\n",
+                    k, eos, cause_ok ? "Eos" : "WRONG", emitted.size(), text_ok ? "match" : "MISMATCH",
+                    engine.position(), expect_pos, pos_ok ? "match" : "ADVANCED PAST EMITTED");
+            const bool ok = cause_ok && text_ok && pos_ok;
+            fprintf(stderr, "eos-gate: %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
         }
 
         // Gate 0 oracle verifier (docs/plans/2026-07-15-sibling-drafter-probe.md):

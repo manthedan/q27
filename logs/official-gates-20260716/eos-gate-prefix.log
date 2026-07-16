@@ -1,0 +1,3 @@
+Metal model ready on Apple M4 in 0.12 s
+eos-gate: k=6 eos=7047 | cause Eos | emitted 6 (match) | position 23 vs expected 21 (ADVANCED PAST EMITTED)
+eos-gate: FAIL
