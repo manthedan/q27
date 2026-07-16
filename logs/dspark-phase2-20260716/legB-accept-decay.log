@@ -1,0 +1,41 @@
+dspark target_layers (5): 1 16 31 46 61
+dspark meta: n_embd=5120 n_vocab=248320 n_capture=5 n_embd_cap=25600 block_size=4 mask_token_id=248319 markov_rank=256
+draft length per round: n_max=4 (block_size=4)
+[ 0][code     ] n_predicted=96   rounds=21   drafted=84    accepted=75    accept=0.893 tau=4.571 ar_tok_s=6.46 sp_tok_s=4.14 speedup=0.641
+[ 1][code     ] n_predicted=96   rounds=25   drafted=100   accepted=71    accept=0.710 tau=3.840 ar_tok_s=6.36 sp_tok_s=3.46 speedup=0.544
+[ 2][code     ] n_predicted=99   rounds=22   drafted=88    accepted=77    accept=0.875 tau=4.500 ar_tok_s=5.42 sp_tok_s=3.19 speedup=0.587
+[ 3][code     ] n_predicted=96   rounds=23   drafted=92    accepted=73    accept=0.793 tau=4.174 ar_tok_s=4.70 sp_tok_s=2.92 speedup=0.622
+[ 4][code     ] n_predicted=97   rounds=28   drafted=112   accepted=69    accept=0.616 tau=3.464 ar_tok_s=4.78 sp_tok_s=2.59 speedup=0.542
+[ 5][code     ] n_predicted=98   rounds=22   drafted=88    accepted=76    accept=0.864 tau=4.455 ar_tok_s=4.32 sp_tok_s=3.16 speedup=0.732
+[ 6][code     ] n_predicted=98   rounds=23   drafted=92    accepted=75    accept=0.815 tau=4.261 ar_tok_s=4.74 sp_tok_s=3.36 speedup=0.708
+[ 7][code     ] n_predicted=99   rounds=30   drafted=120   accepted=69    accept=0.575 tau=3.300 ar_tok_s=4.78 sp_tok_s=2.64 speedup=0.553
+[ 8][chat     ] n_predicted=100  rounds=34   drafted=136   accepted=66    accept=0.485 tau=2.941 ar_tok_s=5.15 sp_tok_s=2.32 speedup=0.450
+[ 9][chat     ] n_predicted=96   rounds=38   drafted=152   accepted=58    accept=0.382 tau=2.526 ar_tok_s=4.54 sp_tok_s=1.57 speedup=0.346
+[10][chat     ] n_predicted=97   rounds=34   drafted=136   accepted=63    accept=0.463 tau=2.853 ar_tok_s=2.33 sp_tok_s=2.10 speedup=0.903
+[11][chat     ] n_predicted=94   rounds=33   drafted=132   accepted=61    accept=0.462 tau=2.848 ar_tok_s=4.70 sp_tok_s=1.93 speedup=0.410
+[12][chat     ] n_predicted=98   rounds=35   drafted=140   accepted=63    accept=0.450 tau=2.800 ar_tok_s=4.64 sp_tok_s=2.10 speedup=0.452
+[13][chat     ] n_predicted=53   rounds=31   drafted=124   accepted=22    accept=0.177 tau=1.710 ar_tok_s=4.40 sp_tok_s=1.26 speedup=0.287
+[14][chat     ] n_predicted=96   rounds=47   drafted=188   accepted=49    accept=0.261 tau=2.043 ar_tok_s=4.22 sp_tok_s=1.56 speedup=0.368
+[15][chat     ] n_predicted=96   rounds=52   drafted=208   accepted=44    accept=0.212 tau=1.846 ar_tok_s=5.06 sp_tok_s=1.38 speedup=0.273
+[16][reasoning] n_predicted=98   rounds=24   drafted=96    accepted=74    accept=0.771 tau=4.083 ar_tok_s=4.66 sp_tok_s=3.14 speedup=0.674
+[17][reasoning] n_predicted=96   rounds=27   drafted=108   accepted=69    accept=0.639 tau=3.556 ar_tok_s=4.97 sp_tok_s=2.84 speedup=0.572
+[18][reasoning] n_predicted=96   rounds=23   drafted=92    accepted=73    accept=0.793 tau=4.174 ar_tok_s=4.76 sp_tok_s=3.47 speedup=0.728
+[19][reasoning] n_predicted=96   rounds=36   drafted=144   accepted=60    accept=0.417 tau=2.667 ar_tok_s=5.02 sp_tok_s=2.28 speedup=0.454
+[20][reasoning] n_predicted=96   rounds=33   drafted=132   accepted=63    accept=0.477 tau=2.909 ar_tok_s=4.96 sp_tok_s=2.36 speedup=0.475
+[21][reasoning] n_predicted=100  rounds=23   drafted=92    accepted=77    accept=0.837 tau=4.348 ar_tok_s=4.83 sp_tok_s=3.53 speedup=0.730
+[22][reasoning] n_predicted=97   rounds=24   drafted=96    accepted=73    accept=0.760 tau=4.042 ar_tok_s=4.59 sp_tok_s=3.27 speedup=0.714
+[23][reasoning] n_predicted=97   rounds=24   drafted=96    accepted=73    accept=0.760 tau=4.042 ar_tok_s=4.70 sp_tok_s=3.31 speedup=0.705
+
+=== per-category ===
+code     : rounds=194   drafted=776    accepted=585    accept=0.7539 tau=4.0155
+chat     : rounds=304   drafted=1216   accepted=426    accept=0.3503 tau=2.4013
+reasoning: rounds=214   drafted=856    accepted=562    accept=0.6565 tau=3.6262
+
+=== accept-by-depth (conditional: given position i was reached) ===
+depth  reached   accepted  accept_i
+1      712       550       0.7725
+2      550       429       0.7800
+3      429       334       0.7786
+4      334       260       0.7784
+
+=== OVERALL: prompts=24 n_predicted=2285 rounds=712 drafted=2848 accepted=1573 accept=0.5523 tau=3.2093 ar_tok_s=4.65 sp_tok_s=2.45 speedup=0.528 ===
