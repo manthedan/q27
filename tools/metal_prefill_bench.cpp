@@ -41,7 +41,7 @@ constexpr uint32_t GDN_HEADS = 48;
 constexpr uint32_t GDN_QK_HEADS = 16;
 constexpr uint32_t GDN_DIM = 128;
 constexpr uint32_t VOCAB = 248320;
-constexpr uint32_t CHUNK_MAX = 12;
+constexpr uint32_t CHUNK_MAX = 96;
 constexpr float EPS = 1e-6f;
 constexpr float FREQ_BASE = 1e7f;
 

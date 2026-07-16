@@ -515,7 +515,10 @@ int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
         backend.read(*yb,0,reference.data()+(size_t)t*rows,rows*4);
     }
     auto all_x=backend.allocate(x.size()*4); backend.write(*all_x,0,x.data(),x.size()*4);
-    for(uint32_t n:{1u,4u,5u,8u,9u,12u}) {
+    // Dispatch the parametrized width too — a repro case that only sizes
+    // buffers without dispatching passes vacuously (codex P2, 2026-07-15).
+    for(uint32_t n:{1u,4u,5u,8u,9u,12u,tokens}) {
+        if(n>tokens) continue;
         auto q=backend.allocate_quantized(n*cols); auto out=backend.allocate((uint64_t)n*rows*4);
         backend.begin_commands(); backend.quantize(*all_x,q); backend.matmul_quantized(weight,q,n,*out); backend.end_commands();
         std::vector<float> got(n*rows); backend.read(*out,0,got.data(),got.size()*4);
@@ -534,7 +537,10 @@ int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
            // Wide-chunk token tiling: full tiles (96 = 6x16) and a partial
            // final tile (20 = 16 + 4) across the same row/col remainders.
            test_matmul_shape(backend,dtype,17,1152,96) ||
-           test_matmul_shape(backend,dtype,9,256,20);
+           test_matmul_shape(backend,dtype,9,256,20) ||
+           // artifact-K repro: width-17 divergence hunt (cols=5120)
+           test_matmul_shape(backend,dtype,33,5120,17) ||
+           test_matmul_shape(backend,dtype,10240,5120,17);
 }
 
 // Production-width GEMV parity. The packed-dot kernels take a vectorized
