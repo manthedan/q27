@@ -377,9 +377,12 @@ struct Runtime {
             if(ec || !std::filesystem::is_directory(sdir))
                 throw std::runtime_error(std::string("Q27_METAL_SNAPSHOT_DIR is not a usable directory: ")+sdir);
             const unsigned char* sha=slots[0]->engine.snapshot_identity();
-            char tag[16];
-            snprintf(tag,sizeof tag,"%02x%02x%02x%02x%c-",sha[0],sha[1],sha[2],sha[3],
-                     turbo3?'t':'f');
+            // Full 160-bit identity in the tag: a truncated prefix could
+            // collide across artifacts sharing a directory and let one
+            // server overwrite another's snapshots (codex P2 on f05ef2d).
+            char tag[48];
+            for(int i=0;i<20;i++) snprintf(tag+2*i,3,"%02x",sha[i]);
+            snprintf(tag+40,sizeof tag-40,"%c-",turbo3?'t':'f');
             snapstore.init(sdir,snap_mb*1024ull*1024ull,tag);
             // A restart over an oversized directory must come back under
             // budget without waiting for the next save (codex P2 on 607160e).
@@ -542,7 +545,14 @@ struct Runtime {
                     hit=disk_len;
                     if(hit==prompt.size()) { pending=engine.pending_from_logits(); restored=true; }
                     snapstore.hits++;
-                } catch(const std::exception&) { engine.reset(); hit=0; restored=false; }
+                } catch(const std::exception&) {
+                    // A bad disk candidate must not cost more than it
+                    // offered: fall back to the in-memory tier before going
+                    // cold (codex P2 on f05ef2d).
+                    engine.reset(); hit=0; pending=0;
+                    restored=slot->cache.restore(engine,prompt,mtp,hit,pending);
+                    if(!restored) hit=0;
+                }
             }
             if((uint64_t)engine.position()+(prompt.size()-hit)>context)
                 throw std::runtime_error("prompt exceeds context");
