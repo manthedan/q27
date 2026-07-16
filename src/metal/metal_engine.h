@@ -70,6 +70,14 @@ class MetalEngine {
     // the stream and interleaves engines; both must advance in lockstep.
     void teacher_force_logits(const uint32_t* tokens, uint32_t count,
                               std::vector<float>& out);
+    // Wide-path variant (round-2 expert P0 #3 gate): encode tokens[0..count)
+    // through the PROMPT-INGESTION chunk width (count 1..PREFILL_CHUNK_MAX;
+    // <= CHUNK_MAX delegates to teacher_force_logits) with the output head
+    // applied in CHUNK_MAX-row slices, exposing every row's logits so
+    // distribution-level gates (NLL/KL/top-k/margin) can cover widths
+    // 17/48/96 — previously only committed-token A/Bs saw the wide path.
+    void teacher_force_logits_wide(const uint32_t* tokens, uint32_t count,
+                                   std::vector<float>& out);
     std::vector<uint32_t> generate_sampled(const std::vector<uint32_t>& prompt,
                                            uint32_t count,const SamplingParams& params);
     std::vector<uint32_t> generate_sampled_from_logits(uint32_t count,
@@ -185,6 +193,7 @@ class MetalEngine {
     // accepted prefix, so no checkpoint, restore, or commit re-encode exists.
     // ctargets_/cnll_ also serve teacher-forced NLL quality gates.
     std::shared_ptr<BackendBuffer> cfinal_, clogits_, cpred_;
+    std::shared_ptr<BackendBuffer> wide_head_stage_;   // lazy, CHUNK_MAX x N_EMBD f32
     std::shared_ptr<BackendBuffer> ctargets_, cnll_;
     std::vector<std::shared_ptr<BackendBuffer>> park_qkv_, park_g_, park_beta_;
     std::shared_ptr<BackendBuffer> discard_recurrent_, discard_ring_;
