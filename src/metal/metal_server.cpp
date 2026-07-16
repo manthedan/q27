@@ -195,6 +195,11 @@ struct Runtime {
     uint64_t slot_next_=0, slot_serving_=0;
     uint32_t queue_waiters=0;
     static constexpr uint32_t QUEUE_MAX=8;
+    // Queue overflow gets its own type so the HTTP layer can answer 503
+    // with the documented overloaded_error body (G6) instead of the shared
+    // 400 path. Streaming requests that overflow after headers are sent
+    // keep the SSE error-event path (status already committed).
+    struct ServerOverloaded : std::runtime_error { using std::runtime_error::runtime_error; };
     // Innermost lock: guards the shared host-side ToolMaskCache (mask
     // construction simulates the whole vocabulary on a miss). Order:
     // route_ | lease_ -> mask_mutex_; never the reverse.
@@ -217,11 +222,32 @@ struct Runtime {
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
         slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
-        // Admission: further slots must fit the device budget (the engine
-        // constructor accounts KV against Shared::cache_bytes and throws on
-        // overcommit — reservation rollback is RAII-safe). A slot that does
-        // not fit degrades the server to fewer slots instead of failing it.
+        // G6 admission (docs/plans/2026-07-16-g6-admission.md): additional
+        // slots must fit the FULL per-slot footprint — KV + fixed engine
+        // state + snapshot capacity x snapshot bytes — plus the backend-
+        // shared GQA partial peak, against the device budget
+        // (Q27_METAL_BUDGET_MB test/override hook; default = half the
+        // recommended working set, the engine KV check's convention). The
+        // engine's own KV check stays underneath as defense in depth; a
+        // budget below even one slot still serves one (never zero).
+        const char* budget_env=getenv("Q27_METAL_BUDGET_MB");
+        const uint64_t budget=budget_env?strtoull(budget_env,nullptr,10)*1024ull*1024ull
+                                        :shared->backend.recommended_working_set_size()/2;
+        const q27::MetalEngine& e0=slots[0]->engine;
+        const uint64_t per_slot=e0.kv_reserved_bytes()+q27::MetalEngine::fixed_state_bytes()
+                               +(uint64_t)cache_entries*e0.snapshot_bytes();
+        const uint64_t shared_term=q27::MetalEngine::gqa_partial_peak(ctx);
         for(uint32_t s=1;s<slot_count;s++) {
+            const uint64_t need=(uint64_t)(slots.size()+1)*per_slot+shared_term;
+            if(need>budget) {
+                fprintf(stderr,"multislot: slot %u admission rejected: %.0f MB needed "
+                        "(%zu+1 slots x %.0f MB/slot + %.0f MB partials) > %.0f MB budget%s; "
+                        "serving with %zu slot(s)\n",
+                        s,need/1048576.0,slots.size(),per_slot/1048576.0,
+                        shared_term/1048576.0,budget/1048576.0,
+                        budget_env?" (Q27_METAL_BUDGET_MB)":"",slots.size());
+                break;
+            }
             try { slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries)); }
             catch(const std::exception& e) {
                 fprintf(stderr,"multislot: slot %u admission failed (%s); serving with %zu slot(s)\n",
@@ -306,7 +332,7 @@ struct Runtime {
             std::unique_lock<std::mutex> lk(route_);
             for(const auto& s:slots) if(s->busy) arrival=phase_name(s->phase);
             if(slot_next_-slot_serving_>=QUEUE_MAX)
-                throw std::runtime_error("server overloaded: request queue is full");
+                throw ServerOverloaded("server overloaded: request queue is full");
             const uint64_t ticket=slot_next_++;
             // Pass the turn on every exit path, or a thrown acquisition
             // would wedge every later ticket.
@@ -648,7 +674,11 @@ int main(int argc,char** argv) {
         // task queue holds accepted connections without limit, so the
         // in-run admission bound alone could never engage — excess requests
         // would pile up behind the workers instead of being rejected.
-        server.new_task_queue=[]{ return new httplib::ThreadPool(8,32); };
+        // 16 workers > QUEUE_MAX + slots: with only 8 workers the ticket-queue
+        // overflow (503) was UNREACHABLE dead code — at most 7 requests could
+        // wait while one generated (G6 found this). The 32-connection accept
+        // queue stays the outer bound.
+        server.new_task_queue=[]{ return new httplib::ThreadPool(16,32); };
         server.Get("/health",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"}});});
         // Wait honesty (Phase 1 contract): per-arrival-phase stats. Gate
         // wait (admission -> first lease) carries the one-quantum bound;
@@ -678,6 +708,7 @@ int main(int argc,char** argv) {
         auto guarded=[&](auto handler) {
             return [&,handler](const httplib::Request& request,httplib::Response& response) {
                 try { handler(json::parse(request.body),response); }
+                catch(const Runtime::ServerOverloaded& e) { json_response(response,{{"error",{{"message",e.what()},{"type","overloaded_error"}}}},503); }
                 catch(const std::exception& e) { json_response(response,{{"error",{{"message",e.what()},{"type","invalid_request_error"}}}},400); }
             };
         };

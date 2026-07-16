@@ -46,6 +46,15 @@ class MetalEngine {
     MetalEngine& operator=(const MetalEngine&) = delete;
     ~MetalEngine();
 
+    // G6 admission accounting (docs/plans/2026-07-16-g6-admission.md).
+    // These mirror the constructor's allocations and capture_state()'s
+    // snapshot composition — keep them paired with those sites.
+    bool has_mtp() const { return has_mtp_; }
+    uint64_t kv_reserved_bytes() const { return engine_cache_bytes_; }
+    uint64_t snapshot_bytes() const;               // worst case at max_context_
+    static uint64_t fixed_state_bytes();           // per-engine non-KV buffers
+    static uint64_t gqa_partial_peak(uint32_t context);  // backend-shared, once
+
     void reset();
     uint32_t step(uint32_t token);
     std::vector<uint32_t> generate(const std::vector<uint32_t>& prompt, uint32_t count);
