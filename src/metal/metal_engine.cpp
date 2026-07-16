@@ -324,9 +324,12 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
         cq5120_ = backend_.allocate_quantized(PREFILL_CHUNK_MAX * N_EMBD);
         cq6144_ = backend_.allocate_quantized(PREFILL_CHUNK_MAX * GDN_V);
         cq17408_ = backend_.allocate_quantized(PREFILL_CHUNK_MAX * N_FFN);
-        cfinal_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
-        clogits_ = alloc_f32((uint64_t)CHUNK_MAX * VOCAB);
-        cpred_ = backend_.allocate((uint64_t)CHUNK_MAX * sizeof(uint32_t));
+        // Verify-width surfaces (lever 2): sized for VERIFY_CHUNK_MAX so
+        // oracle/verify rounds can run past the width-12 NLL/KL contract;
+        // the teacher-force paths keep slicing at CHUNK_MAX regardless.
+        cfinal_ = alloc_f32((uint64_t)VERIFY_CHUNK_MAX * N_EMBD);
+        clogits_ = alloc_f32((uint64_t)VERIFY_CHUNK_MAX * VOCAB);
+        cpred_ = backend_.allocate((uint64_t)VERIFY_CHUNK_MAX * sizeof(uint32_t));
         ctargets_ = backend_.allocate((uint64_t)CHUNK_MAX * sizeof(uint32_t));
         cnll_ = alloc_f32(CHUNK_MAX);
         // Batched MTP verification parks each GDN layer's chunk inputs
@@ -337,9 +340,9 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
         const uint32_t gdn_layers = N_LAYER - N_LAYER / 4;
         park_qkv_.reserve(gdn_layers); park_g_.reserve(gdn_layers); park_beta_.reserve(gdn_layers);
         for (uint32_t i = 0; i < gdn_layers; i++) {
-            park_qkv_.push_back(alloc_f32((uint64_t)CHUNK_MAX * GDN_CH));
-            park_g_.push_back(alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS));
-            park_beta_.push_back(alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS));
+            park_qkv_.push_back(alloc_f32((uint64_t)VERIFY_CHUNK_MAX * GDN_CH));
+            park_g_.push_back(alloc_f32((uint64_t)VERIFY_CHUNK_MAX * GDN_HEADS));
+            park_beta_.push_back(alloc_f32((uint64_t)VERIFY_CHUNK_MAX * GDN_HEADS));
         }
         discard_recurrent_ = alloc_f32((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM);
         discard_ring_ = alloc_f32((uint64_t)3 * GDN_CH);
@@ -614,7 +617,7 @@ void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count, bool ver
     if (!ch_) throw std::runtime_error("q27 Metal: chunked prefill is unavailable");
     // Verify chunks park per-layer inputs in CHUNK_MAX-sized buffers; plain
     // prefill chunks only need the (wider) layer-stack activations.
-    if (!count || count > (verify ? CHUNK_MAX : PREFILL_CHUNK_MAX))
+    if (!count || count > (verify ? VERIFY_CHUNK_MAX : PREFILL_CHUNK_MAX))
         throw std::runtime_error("q27 Metal: invalid chunk size");
     if ((uint64_t)position_ + count > max_context_)
         throw std::runtime_error("q27 Metal: context exhausted");
@@ -951,8 +954,8 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
 // same tokens bit-exactly (both chunk kernels are sequential in-kernel).
 void MetalEngine::oracle_round(const uint32_t* lanes, uint32_t live, bool last,
                                uint32_t* predictions) {
-    if (live < 2 || live > CHUNK_MAX)
-        throw std::runtime_error("q27 Metal: oracle width must be 2..12");
+    if (live < 2 || live > VERIFY_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: oracle width must be 2..VERIFY_CHUNK_MAX");
     if (!chunked_prefill_)
         throw std::runtime_error("q27 Metal: oracle round requires chunked prefill");
     // The verify chunk stores a KV row for every lane, so all `live` rows

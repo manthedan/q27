@@ -174,6 +174,12 @@ class MetalEngine {
     static constexpr uint32_t VOCAB = 248320;
     static constexpr uint32_t CHUNK_MAX = 12;          // MTP verify / NLL / KL width
     static constexpr uint32_t PREFILL_CHUNK_MAX = 96;  // prompt-ingestion width (8x12)
+    // Verify/oracle width ceiling, decoupled from the width-12 NLL/KL
+    // contract exactly as PREFILL_CHUNK_MAX decoupled prompt ingestion
+    // (docs/plans/2026-07-16-lever2-verify-width.md). Sizes cfinal_/
+    // clogits_/cpred_ and the gdn_replay parks; mtp_round stays capped at
+    // CHUNK_MAX until the MTP lane machinery is testable (24 GB rig).
+    static constexpr uint32_t VERIFY_CHUNK_MAX = 48;
     static constexpr uint32_t TOPK_CAPACITY = 1024;
     static constexpr uint32_t RESIDENT_MAX = 8;
     static constexpr float EPS = 1e-6f;
