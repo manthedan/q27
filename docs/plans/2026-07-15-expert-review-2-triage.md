@@ -145,6 +145,12 @@ arrived), PARKED-AGREED.
 
 ## Revised execution order (merging expert order with overtaken items)
 
+> **Superseded 2026-07-15** by round 3
+> (`2026-07-15-expert-review-3-answers.md`), which inserts the one-day
+> A/B/C MMA roofline and the R3 barrier-free attention probe ahead of
+> serving work and promotes N=2 slot-batched linears above the generic
+> verifier. The P0-first rule is unchanged.
+
 1. **P0 correctness**: findings 1–3 (constraint RAII, reservation guard,
    wide NLL/logit gate) + screening-math fix in the cache-block doc.
 2. **Two-slot serving** with finding 6's contract (runtime prefill quantum,
