@@ -145,12 +145,13 @@ int main(int argc, char** argv) {
                 "[-n count] [--ctx count] [--mtp width | --suffix width | --suffix-serial width | --oracle width] [--kv fp16|turbo3] "
                 "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N] [--chunk-parity N] "
                 "[--temperature T --top-p P --top-k K --seed S] "
-                "[--dump-logits file]\n",
+                "[--save-state file | --load-state file] [--dump-logits file]\n",
                 argv[0]);
         return 1;
     }
     try {
         std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits,nll_path;
+        std::string save_state_path, load_state_path;
         uint32_t count=1,context=128,mtp_width=0,suffix_width=0,oracle_width=0,nll_long=0; bool suffix_serial=false; q27::SamplingParams sampling;
         bool eos_gate=false;
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
@@ -191,6 +192,8 @@ int main(int argc, char** argv) {
             }
             else if (arg == "--oracle" && i + 1 < argc) oracle_width = parse_u32(argv[++i], "--oracle");
             else if (arg == "--eos-gate") eos_gate = true;
+            else if (arg == "--save-state" && i + 1 < argc) save_state_path = argv[++i];
+            else if (arg == "--load-state" && i + 1 < argc) load_state_path = argv[++i];
             else if (arg == "--dump-logits" && i + 1 < argc) dump_logits = argv[++i];
             else if (arg == "--temperature" && i + 1 < argc) sampling.temperature=parse_float(argv[++i],"--temperature");
             else if (arg == "--top-p" && i + 1 < argc) sampling.top_p=parse_float(argv[++i],"--top-p");
@@ -237,6 +240,21 @@ int main(int argc, char** argv) {
             if (kl_kv || chunk_parity || turbo3_kv || serial_prefill || !dump_logits.empty())
                 throw std::runtime_error("--envelope is its own instrument; drop --kl-kv/--chunk-parity/--kv turbo3/--prefill serial/--dump-logits");
         }
+        // Prefix snapshots, Phase 1 (docs/plans/2026-07-16-prefix-snapshots.md):
+        // greedy serial generation only — every excluded mode either mutates
+        // state the snapshot doesn't describe (speculative) or changes the
+        // continuation (sampling), which would make the byte-identity gate
+        // vacuous or flaky.
+        if (!save_state_path.empty() && !load_state_path.empty())
+            throw std::runtime_error("--save-state and --load-state are separate runs; pass one");
+        if ((!save_state_path.empty() || !load_state_path.empty()) &&
+            (mtp_width || suffix_width || oracle_width || eos_gate || sampling.temperature > 0 ||
+             !nll_path.empty() || !envelope_mode.empty() || kl_kv || chunk_parity))
+            throw std::runtime_error("--save-state/--load-state are Phase-1 greedy-only; drop speculative/sampling/instrument modes");
+        if (!save_state_path.empty() && token_list.empty() && prompt_text.empty())
+            throw std::runtime_error("--save-state needs --prompt or --tokens (state is saved after ingestion)");
+        if (!load_state_path.empty() && (!token_list.empty() || !prompt_text.empty()))
+            throw std::runtime_error("--load-state restores a prefix; drop --prompt/--tokens");
         if(!token_list.empty() && !prompt_text.empty()) throw std::runtime_error("--tokens and --prompt are mutually exclusive");
         if (!nll_path.empty() && (!token_list.empty() || !prompt_text.empty() || validate_only))
             throw std::runtime_error("--nll cannot be combined with --tokens/--prompt/--validate-only");
@@ -258,8 +276,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--kl-kv-k/--kl-kv-v and --kl-kv-self are mutually exclusive arms");
         if (kv_cell != UINT32_MAX && (kv_attrib || kl_self))
             throw std::runtime_error("--kl-kv-cell is its own arm; drop --kl-kv-k/--kl-kv-v/--kl-kv-self");
-        if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty())
-            throw std::runtime_error("--tokens, --prompt, --nll, or --validate-only is required");
+        if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty() &&
+            load_state_path.empty())
+            throw std::runtime_error("--tokens, --prompt, --nll, --load-state, or --validate-only is required");
         if (!nll_path.empty() && (mtp_width || suffix_width || oracle_width || sampling.temperature > 0 || !dump_logits.empty()))
             throw std::runtime_error("--nll cannot be combined with speculative/sampling/dump modes");
 
@@ -864,12 +883,29 @@ int main(int argc, char** argv) {
             return state_ok ? 0 : 1;
         }
 
-        std::vector<uint32_t> generated = sampling.temperature>0 ? engine.generate_sampled(prompt,count,sampling)
+        std::vector<uint32_t> generated;
+        if (!load_state_path.empty()) {
+            auto t0 = std::chrono::steady_clock::now();
+            const uint32_t pos = engine.load_state(load_state_path);
+            fprintf(stderr, "state: loaded %s in %.3f s (position %u)\n", load_state_path.c_str(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), pos);
+            generated = engine.generate_from_pending(engine.pending_from_logits(), count);
+        } else if (!save_state_path.empty()) {
+            const uint32_t pending = engine.ingest_prompt(prompt, false, true);
+            auto t0 = std::chrono::steady_clock::now();
+            engine.save_state(save_state_path, prompt.data(), (uint32_t)prompt.size());
+            fprintf(stderr, "state: saved %s in %.3f s (position %u)\n", save_state_path.c_str(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                    engine.position());
+            generated = engine.generate_from_pending(pending, count);
+        } else {
+            generated = sampling.temperature>0 ? engine.generate_sampled(prompt,count,sampling)
                                            : mtp_width ? engine.generate_mtp(prompt,count,mtp_width)
                                            : suffix_width ? (suffix_serial
                                                   ? engine.generate_suffix_serial(prompt,count,suffix_width)
                                                   : engine.generate_suffix(prompt,count,suffix_width))
                                                           : engine.generate(prompt,count);
+        }
         if(!dump_logits.empty()) {
             std::vector<float> logits=engine.read_logits();
             FILE* file=fopen(dump_logits.c_str(),"wb");

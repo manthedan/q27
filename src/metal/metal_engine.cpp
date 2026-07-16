@@ -9,7 +9,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+
+#include <CommonCrypto/CommonDigest.h>
 
 namespace q27 {
 namespace {
@@ -185,7 +188,9 @@ void MetalEngine::validate_architecture() const {
 }
 
 std::shared_ptr<MetalEngine::Shared> MetalEngine::open_shared(const std::string& model_path) {
-    return std::make_shared<Shared>(Model::open(model_path));
+    auto shared = std::make_shared<Shared>(Model::open(model_path));
+    shared->path = model_path;
+    return shared;
 }
 
 // Return this engine's KV budget to the mapping so later engines on a
@@ -501,6 +506,200 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
     if(snapshot.logits) backend_.copy(*snapshot.logits,0,*logits_,0,logits_->size());
     batch.finish();
     position_=snapshot.position;
+}
+
+// ---- Prefix snapshots to disk (docs/plans/2026-07-16-prefix-snapshots.md).
+// Format Q27SNAP1 (LE): magic, artifact identity (file size + SHA1 of the
+// first 64 KB), kv dtype, position, token metadata, then length-prefixed
+// blobs in capture_state() order. Plain read/write, never mmap.
+
+namespace {
+
+struct SnapshotHeader {
+    char magic[8];
+    uint64_t artifact_size;
+    unsigned char artifact_sha1[20];
+    uint32_t kv_dtype;      // 0 fp16, 1 turbo3
+    uint32_t position;
+    uint32_t token_count;
+    uint32_t reserved;
+    unsigned char prefix_sha1[20];   // Phase 2 server keying; zeros in Phase 1
+};
+constexpr char SNAP_MAGIC[8] = {'Q','2','7','S','N','A','P','1'};
+
+void snap_write(FILE* f, const void* data, size_t bytes, const std::string& path) {
+    if (fwrite(data, 1, bytes, f) != bytes)
+        throw std::runtime_error("q27 Metal: short write to snapshot: " + path);
+}
+
+void snap_read(FILE* f, void* data, size_t bytes, const std::string& path) {
+    if (fread(data, 1, bytes, f) != bytes)
+        throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
+}
+
+} // namespace
+
+// SHA1 over the whole mapped artifact — the bytes this engine actually
+// computes with. Chunked updates (CC_LONG is 32-bit); cached per Shared.
+const unsigned char* MetalEngine::snapshot_identity() {
+    if (!shared_->snap_sha_ready) {
+        CC_SHA1_CTX ctx;
+        CC_SHA1_Init(&ctx);
+        const unsigned char* base = (const unsigned char*)model_.mapping_base();
+        const uint64_t total = model_.mapping_size();
+        if (!base || !total)
+            throw std::runtime_error("q27 Metal: artifact mapping unavailable for snapshot identity");
+        for (uint64_t off = 0; off < total; off += 256u << 20)
+            CC_SHA1_Update(&ctx, base + off, (CC_LONG)std::min<uint64_t>(256u << 20, total - off));
+        CC_SHA1_Final(shared_->snap_sha1, &ctx);
+        shared_->snap_sha_ready = true;
+    }
+    return shared_->snap_sha1;
+}
+
+void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
+                             uint32_t token_count) {
+    if (token_count && !tokens)
+        throw std::runtime_error("q27 Metal: snapshot token metadata is null");
+    backend_.synchronize();
+    const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
+                                          : (uint64_t)N_KV * HEAD_DIM * 2;
+    const uint64_t active_cache = (uint64_t)position_ * cache_row;
+    const std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) throw std::runtime_error("q27 Metal: cannot create snapshot: " + tmp);
+    std::vector<unsigned char> stage(16u << 20);
+    try {
+        SnapshotHeader h{};
+        memcpy(h.magic, SNAP_MAGIC, sizeof h.magic);
+        h.artifact_size = model_.mapping_size();
+        memcpy(h.artifact_sha1, snapshot_identity(), sizeof h.artifact_sha1);
+        h.kv_dtype = turbo3_kv_ ? 1 : 0;
+        h.position = position_;
+        h.token_count = token_count;
+        snap_write(f, &h, sizeof h, tmp);
+        if (token_count) snap_write(f, tokens, (size_t)token_count * 4, tmp);
+        auto put_blob = [&](const BackendBuffer* src, uint64_t bytes) {
+            snap_write(f, &bytes, sizeof bytes, tmp);
+            for (uint64_t off = 0; off < bytes; off += stage.size()) {
+                const uint64_t n = std::min<uint64_t>(stage.size(), bytes - off);
+                backend_.read(*src, off, stage.data(), n);
+                snap_write(f, stage.data(), n, tmp);
+            }
+        };
+        for (uint32_t i = 0; i < N_LAYER; i++) {
+            const LayerState& s = layers_[i];
+            put_blob(s.recurrent.get(), s.recurrent ? s.recurrent->size() : 0);
+            put_blob(s.ring.get(), s.ring ? s.ring->size() : 0);
+            put_blob(s.k_cache.get(), s.k_cache ? active_cache : 0);
+            put_blob(s.v_cache.get(), s.v_cache ? active_cache : 0);
+        }
+        put_blob(mtp_k_cache_.get(), mtp_k_cache_ ? active_cache : 0);
+        put_blob(mtp_v_cache_.get(), mtp_v_cache_ ? active_cache : 0);
+        put_blob(x1_.get(), x1_->size());
+        put_blob(logits_.get(), logits_->size());
+        if (fflush(f) != 0 || fclose(f) != 0) {
+            f = nullptr;
+            throw std::runtime_error("q27 Metal: cannot finish snapshot: " + tmp);
+        }
+        f = nullptr;
+        if (rename(tmp.c_str(), path.c_str()) != 0)
+            throw std::runtime_error("q27 Metal: cannot move snapshot into place: " + path);
+    } catch (...) {
+        if (f) fclose(f);
+        remove(tmp.c_str());
+        throw;
+    }
+}
+
+uint32_t MetalEngine::load_state(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("q27 Metal: cannot open snapshot: " + path);
+    try {
+        SnapshotHeader h{};
+        snap_read(f, &h, sizeof h, path);
+        if (memcmp(h.magic, SNAP_MAGIC, sizeof h.magic) != 0)
+            throw std::runtime_error("q27 Metal: not a q27 snapshot: " + path);
+        if (h.artifact_size != model_.mapping_size() ||
+            memcmp(h.artifact_sha1, snapshot_identity(), 20) != 0)
+            throw std::runtime_error("q27 Metal: snapshot was taken against a different artifact: " + path);
+        if (h.kv_dtype != (turbo3_kv_ ? 1u : 0u))
+            throw std::runtime_error("q27 Metal: snapshot KV dtype does not match this engine: " + path);
+        if (h.position > max_context_)
+            throw std::runtime_error("q27 Metal: snapshot position exceeds this engine's context: " + path);
+        if (fseeko(f, (off_t)h.token_count * 4, SEEK_CUR) != 0)
+            throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
+        const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
+                                              : (uint64_t)N_KV * HEAD_DIM * 2;
+        const uint64_t active_cache = (uint64_t)h.position * cache_row;
+        // The expected blob sequence, mirrored from save_state. Validating
+        // every length (pass 1) before the first GPU write (pass 2) means a
+        // rejected file never leaves partially-restored state.
+        std::vector<std::pair<BackendBuffer*, uint64_t>> blobs;
+        for (uint32_t i = 0; i < N_LAYER; i++) {
+            LayerState& d = layers_[i];
+            blobs.push_back({d.recurrent.get(), d.recurrent ? d.recurrent->size() : 0});
+            blobs.push_back({d.ring.get(), d.ring ? d.ring->size() : 0});
+            blobs.push_back({d.k_cache.get(), d.k_cache ? active_cache : 0});
+            blobs.push_back({d.v_cache.get(), d.v_cache ? active_cache : 0});
+        }
+        blobs.push_back({mtp_k_cache_.get(), mtp_k_cache_ ? active_cache : 0});
+        blobs.push_back({mtp_v_cache_.get(), mtp_v_cache_ ? active_cache : 0});
+        blobs.push_back({x1_.get(), x1_->size()});
+        blobs.push_back({logits_.get(), logits_->size()});
+        const off_t blob_start = ftello(f);
+        // Real file size up front: fseeko past EOF succeeds silently, so the
+        // walk below could otherwise bless a file truncated inside its FINAL
+        // blob and pass 2 would partially restore (codex P2 on 39d74a0).
+        if (fseeko(f, 0, SEEK_END) != 0)
+            throw std::runtime_error("q27 Metal: cannot read snapshot: " + path);
+        const off_t file_size = ftello(f);
+        if (fseeko(f, blob_start, SEEK_SET) != 0)
+            throw std::runtime_error("q27 Metal: cannot rewind snapshot: " + path);
+        uint64_t expected_end = (uint64_t)blob_start;
+        for (const auto& [buf, bytes] : blobs) {
+            uint64_t stored = 0;
+            snap_read(f, &stored, sizeof stored, path);
+            if (stored != bytes)
+                throw std::runtime_error("q27 Metal: snapshot blob layout does not match this engine: " + path);
+            expected_end += sizeof stored + stored;
+            if (expected_end > (uint64_t)file_size)
+                throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
+            if (fseeko(f, (off_t)stored, SEEK_CUR) != 0)
+                throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
+        }
+        if (expected_end != (uint64_t)file_size)
+            throw std::runtime_error("q27 Metal: trailing bytes after snapshot blobs: " + path);
+        // Pass 2: stream the validated blobs into the live buffers.
+        backend_.synchronize();
+        if (fseeko(f, blob_start, SEEK_SET) != 0)
+            throw std::runtime_error("q27 Metal: cannot rewind snapshot: " + path);
+        std::vector<unsigned char> stage(16u << 20);
+        for (const auto& [buf, bytes] : blobs) {
+            uint64_t stored = 0;
+            snap_read(f, &stored, sizeof stored, path);
+            for (uint64_t off = 0; off < bytes; off += stage.size()) {
+                const uint64_t n = std::min<uint64_t>(stage.size(), bytes - off);
+                snap_read(f, stage.data(), n, path);
+                backend_.write(*buf, off, stage.data(), n);
+            }
+        }
+        fclose(f);
+        position_ = h.position;
+        return position_;
+    } catch (...) {
+        fclose(f);
+        throw;
+    }
+}
+
+uint32_t MetalEngine::pending_from_logits() {
+    CommandBatch batch(backend_);
+    backend_.argmax(*logits_, VOCAB, *token_out_);
+    batch.finish();
+    uint32_t pending = 0;
+    backend_.read(*token_out_, 0, &pending, sizeof pending);
+    return pending;
 }
 
 // Serial-decode projection dispatch: T2 weights route to the float-activation
