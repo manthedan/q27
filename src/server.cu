@@ -1550,8 +1550,14 @@ int main(int argc, char** argv) {
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             json items = json::array();
             int tool_counter = 0;
-            auto [ctx, flush_think, flush_text, flush_tool] =
-                make_item_cbs(items, tool_counter, nullptr);
+            // CUDA 12.0 compat (yukon apt toolkit): structured bindings
+            // cannot be captured by the lambda below pre-C++20 — bind named
+            // references off the tuple instead (behavior-identical).
+            auto item_cbs = make_item_cbs(items, tool_counter, nullptr);
+            auto& ctx = std::get<0>(item_cbs);
+            auto& flush_think = std::get<1>(item_cbs);
+            auto& flush_text = std::get<2>(item_cbs);
+            auto& flush_tool = std::get<3>(item_cbs);
             StreamSplitter sp;
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) {
