@@ -153,6 +153,22 @@ class MetalBackend final : public ComputeBackend {
                                  BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                  uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
                                  float scale) override;
+    // Phase-0 probes for cache-block scheduling R1/R1b — bench-only entry
+    // points (build/metal_attn_bench), never engine-routed; see
+    // docs/plans/2026-07-15-cache-block-scheduling.md. k/v caches hold rows
+    // head-major: (kvh * seq_cap + pos) * 100 bytes.
+    void attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32_t q_stride,
+                                        const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                        BackendBuffer& out, uint32_t seq_len, uint32_t seq_cap,
+                                        uint32_t q_heads, uint32_t kv_heads,
+                                        uint32_t head_dim, float scale);
+    // tile must be 2 or 4; interleaved (production-layout) caches.
+    void attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uint32_t q_stride,
+                                           uint32_t q_row_stride,
+                                           const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                           BackendBuffer& out, uint32_t base_len,
+                                           uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+                                           uint32_t tokens, uint32_t tile, float scale);
     void sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,
                                uint32_t heads, uint32_t head_dim, uint32_t tokens) override;
     void argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows,
