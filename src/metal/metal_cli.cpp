@@ -321,7 +321,7 @@ int main(int argc, char** argv) {
                 double max_abs = 0, sum_abs = 0, max_kl = 0, sum_kl = 0;
                 double ref_nll = 0, subj_nll = 0, max_nll_delta = 0;
                 double min_flip_margin = 1e300, max_flip_margin = 0;
-                uint64_t flips = 0, overlap = 0;
+                uint64_t flips = 0, overlap = 0, rows_differ = 0;
                 uint32_t done = 0;
                 while (done < n) {
                     const uint32_t take = std::min(width, n - done);
@@ -329,9 +329,19 @@ int main(int argc, char** argv) {
                     for (uint32_t r = 0; r < take; r++) {
                         const float* pr = ref.data() + (size_t)(done + r) * vocab;
                         const float* qr = q.data() + (size_t)r * vocab;
+                        // Bytewise row comparison is the identity ground
+                        // truth: a NaN logit makes |pr-qr| NaN, and
+                        // std::max(0, NaN) keeps max_abs at zero, so the
+                        // metrics alone could certify a divergent row.
+                        if (std::memcmp(pr, qr, (size_t)vocab * sizeof(float)) != 0) rows_differ++;
                         double mx = 0;
-                        for (uint32_t v = 0; v < vocab; v++)
+                        for (uint32_t v = 0; v < vocab; v++) {
+                            if (!std::isfinite(pr[v]) || !std::isfinite(qr[v]))
+                                throw std::runtime_error("non-finite logit at position " +
+                                                         std::to_string(done + r) + " (width " +
+                                                         std::to_string(width) + ")");
                             mx = std::max(mx, std::abs((double)pr[v] - (double)qr[v]));
+                        }
                         max_abs = std::max(max_abs, mx); sum_abs += mx;
                         const double kl = q27::forward_kl(pr, qr, vocab);
                         max_kl = std::max(max_kl, kl); sum_kl += kl;
@@ -354,15 +364,17 @@ int main(int argc, char** argv) {
                     }
                     done += take;
                 }
-                printf("width %2u vs 12: max|dlogit| %.6g (mean %.6g), KL mean %.3g max %.3g nats, "
+                printf("width %2u vs 12: rows differing %llu/%u, max|dlogit| %.6g (mean %.6g), "
+                       "KL mean %.3g max %.3g nats, "
                        "top-1 flips %llu/%u (ref margin min %.4g max %.4g), top-20 overlap %.2f%%, "
                        "NLL %.6f vs %.6f (max |dNLL| %.4g)\n",
-                       width, max_abs, sum_abs / n, sum_kl / n, max_kl,
+                       width, (unsigned long long)rows_differ, n, max_abs, sum_abs / n,
+                       sum_kl / n, max_kl,
                        (unsigned long long)flips, n,
                        flips ? min_flip_margin : 0.0, flips ? max_flip_margin : 0.0,
                        100.0 * overlap / ((double)n * 20.0),
                        subj_nll / n, ref_nll / n, max_nll_delta);
-                const bool differs = max_abs != 0.0 || flips != 0;
+                const bool differs = rows_differ != 0;
                 if (serial_prefill ? !differs : differs) gate_fail = true;
             }
             if (gate_fail) {
