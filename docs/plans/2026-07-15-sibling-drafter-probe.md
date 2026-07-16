@@ -1,6 +1,6 @@
 # Sibling-drafter probe: Ternary-Bonsai-1.7B drafting for the 27B tiers
 
-**Status: RESOLVED — 1.7B killed at the vocab gate; DSpark counterpart measured, net loss confirmed as overhead** (2026-07-15 night, see verdict below). This is the P1-style probe gating option 2
+**Status: RESOLVED — 1.7B killed at the vocab gate; DSpark counterpart measured, net loss confirmed as overhead** (2026-07-15 night, see verdict below). **Gate 0 measured 2026-07-16: the >1.25× branch fires — oracle S(12) = 2.2×, round cost flat in w, break-even ~5 tokens/round; see Gate 0 result below.** This is the P1-style probe gating option 2
 of the binary-tier doc's drafter follow-up (`2026-07-15-binary-tier.md`).
 Drafting remains parked per the ternary doc's follow-up 6 resolution; this
 probe costs ~1 hour, zero engine work, and either kills the idea cheaply or
@@ -71,6 +71,52 @@ for all drafters. 1.1–1.25× → insufficient headroom for a sibling. >1.25×
 → proceed to the stack probe below. Note: V(w)/G ties this to the
 wide-chunks GEMM work — no final call on speculation until macro-panel GEMM
 and resident-greedy land (see expert-review-integration).
+
+### Gate 0 result (2026-07-16, 24 GB M4, Daniel-authorized; `logs/oracle-gate0-20260716/`)
+
+Measured with the new `--oracle W` harness (`MetalEngine::oracle_round`:
+mtp_round's batched verify/commit machinery with the layer-64 draft stage
+replaced by a teacher-forced greedy reference — D=0, perfect acceptance, no
+MTP layer required; serial passes bracket the oracle pass, one-step probe
+from both end states is the state-integrity gate). T2 artifact, fp16 KV,
+ctx 512, n=128, resident-greedy serial baseline G = 78–91 ms/tok:
+
+| w  | round ms (warm) | tok/round | S(w) oracle | prompt |
+|----|-----------------|-----------|-------------|--------|
+| 2  | 404.9 | 1.98  | **0.42×** | prose |
+| 4  | 419.0 | 3.97  | **0.79×** | prose |
+| 8  | 434.4 | 7.94  | **1.57×** | prose |
+| 12 | 444.5 | 11.55 | **2.22×** | prose |
+| 12 | 439.2 | 11.55 | **2.20×** | agentic |
+
+(Numbers are the post-codex-review re-run: count-1 token denominator on
+both sides of S(w).) State gate PASS at every width — probe argmax,
+position, and full probe logits within 0.031–0.092 max abs of the serial
+end state (the chunk-vs-serial numeric class; corruption would be orders
+of magnitude larger) — validating verify-chunk + gdn_replay state
+integrity on a no-MTP artifact for the first time. Lane agreement 127/127
+prose, 126/127 agentic (one low-margin chunk-vs-serial flip — the known
+class; instrument proven non-vacuous).
+
+**Verdict: the >1.25× branch fires — verifier economics are NOT
+structurally dead in our engine; the M4 wall is our round overhead, not
+physics.** The load-bearing shape: round cost is FLAT in w (~420–465 ms,
+w=2..12) — a fixed ~5.1·G overhead with near-zero marginal lane cost, so
+S(w) ≈ w·G/430ms and break-even sits at **~5 committed tokens/round**.
+Consequences, priced:
+
+- A perfect 12-deep drafter would give 2.2× today (26.0–26.3 tok/s observed
+  oracle wall vs 11–12.1 serial). That is the current engine ceiling.
+- DSpark's measured M4 acceptance (~2.8 of each 4-block → ~3.8
+  committed/round at block 4) is still a net LOSS at this round cost;
+  a port pays only with multi-block drafting (w≥8 proposals, decaying
+  acceptance) or a cheaper round.
+- The flat 430 ms is the same dispatch/occupancy regime the wide-chunks
+  phase A killed for prefill (12-wide chunks 35 tok/s → 96-wide 48.8);
+  the verify chunk still runs w≤12. Cutting the fixed round cost (wider
+  verify chunk widths, fusing the head/argmax into the verify batch,
+  fewer syncs — currently 2/round) directly lowers the break-even
+  tokens/round and is the next lever BEFORE any drafter work.
 
 ## Decision gates (write results here; honor them)
 

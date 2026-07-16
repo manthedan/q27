@@ -1,0 +1,10 @@
+0.00.124.478 I common_init_result: fitting params to device memory ...
+0.00.124.482 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.371.181 W llama_context: n_ctx_seq (203264) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.02.163.433 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.03.819.528 I common_init_result: fitting params to device memory ...
+0.03.819.530 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.04.833.041 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.05.268.359 W llama_context: n_ctx_seq (4096) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+0.05.344.678 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.05.418.446 E main: draft model vocab must closely match target model to use speculation but 0.05.418.450 E target vocab size 248320 does not match draft vocab size 151669 - difference 96651, max allowed 128

@@ -1,0 +1,9 @@
+0.00.060.359 I common_init_result: fitting params to device memory ...
+0.00.060.361 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.074.264 W llama_context: n_ctx_seq (126976) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.01.580.802 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.04.419.968 I common_init_result: fitting params to device memory ...
+0.04.419.972 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.04.438.311 W load: adding 248320 dummy tokens
+0.05.534.691 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.05.979.417 E main: draft model vocab type must match target model to use speculation but 0.05.979.419 E vocab_type_dft = 0 while vocab_type_tgt = 1
