@@ -38,7 +38,7 @@ else
     # A fresh fingerprint must only ever bless an empty directory — logs
     # from a pre-fingerprint script version would otherwise be silently
     # combined with the new configuration (codex P1 on 6da4db2).
-    if ls "$OUT"/cell_*.log "$OUT"/census_summary.tsv >/dev/null 2>&1; then
+    if ls "$OUT"/cell_*.log >/dev/null 2>&1 || [ -e "$OUT/census_summary.tsv" ]; then
         echo "census: $OUT has unfingerprinted logs from an older run; move it aside" | tee "$OUT/ABORTED"
         exit 1
     fi
