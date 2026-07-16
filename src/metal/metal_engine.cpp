@@ -558,7 +558,7 @@ const unsigned char* MetalEngine::snapshot_identity() {
 }
 
 void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
-                             uint32_t token_count) {
+                             uint32_t token_count, bool logits_resident) {
     if (token_count && !tokens)
         throw std::runtime_error("q27 Metal: snapshot token metadata is null");
     backend_.synchronize();
@@ -577,6 +577,7 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         h.kv_dtype = turbo3_kv_ ? 1 : 0;
         h.position = position_;
         h.token_count = token_count;
+        h.reserved = logits_resident ? 0 : 1;
         snap_write(f, &h, sizeof h, tmp);
         if (token_count) snap_write(f, tokens, (size_t)token_count * 4, tmp);
         auto put_blob = [&](const BackendBuffer* src, uint64_t bytes) {
@@ -687,6 +688,28 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         fclose(f);
         position_ = h.position;
         return position_;
+    } catch (...) {
+        fclose(f);
+        throw;
+    }
+}
+
+MetalEngine::SnapshotInfo MetalEngine::peek_snapshot(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("q27 Metal: cannot open snapshot: " + path);
+    try {
+        SnapshotHeader h{};
+        snap_read(f, &h, sizeof h, path);
+        if (memcmp(h.magic, SNAP_MAGIC, sizeof h.magic) != 0)
+            throw std::runtime_error("q27 Metal: not a q27 snapshot: " + path);
+        SnapshotInfo info;
+        info.position = h.position;
+        info.logits_resident = h.reserved == 0;
+        info.tokens.resize(h.token_count);
+        if (h.token_count)
+            snap_read(f, info.tokens.data(), (size_t)h.token_count * 4, path);
+        fclose(f);
+        return info;
     } catch (...) {
         fclose(f);
         throw;

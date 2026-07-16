@@ -287,7 +287,9 @@ def main():
         return 1
     if not mtp and run_g6() != 0:
         return 1
-    gates = "G1/G2/G3/G5" if mtp else "G1/G2/G3/G4/G5/G6"
+    if not mtp and run_g7() != 0:
+        return 1
+    gates = "G1/G2/G3/G5" if mtp else "G1/G2/G3/G4/G5/G6/G7"
     print(f"[{label}] {gates} PASS (solo texts {len(solo_a)}/{len(solo_b)} chars)")
     return 0
 
@@ -348,6 +350,115 @@ def run_g6():
         return 1
     print(f"[greedy] G6 PASS (slots=1 under 1000 MB budget, "
           f"{len(overloaded)} x 503 overloaded_error, {len(ok)} completed)")
+    return 0
+
+
+def run_g7():
+    """Disk prefix snapshots (Phase 2): a hinted request persists a boundary
+    snapshot; a fresh server process serves a shared-prefix request from
+    disk byte-identically to a cold server; a prompt perturbed inside the
+    prefix misses; a tiny budget evicts. One long haystack, two questions."""
+    import shutil
+    import tempfile
+
+    haystack = " ".join(
+        f"Fact {i}: the {w} subsystem reports nominal telemetry on channel {i * 7 % 31}."
+        for i, w in enumerate(
+            ("attention gdn ffn embed logits sampler tokenizer scheduler cache "
+             "paging residency lease quantum ticket snapshot census roofline "
+             "envelope oracle verify draft commit replay straddle boundary "
+             "prefill decode stream cancel budget admission eviction").split()))
+    q1 = haystack + " QUESTION: which channel does the attention subsystem use?"
+    q2 = haystack + " QUESTION: which subsystem reports on channel zero?"
+    q_miss = "Fact 0X:" + q2[8:]   # perturbed INSIDE the snapshotted prefix
+
+    port = PORT + 2
+    failures = []
+    snapdir = tempfile.mkdtemp(prefix="q27_g7_snap.")
+    colddir = tempfile.mkdtemp(prefix="q27_g7_cold.")
+
+    def launch(env_extra):
+        env = dict(os.environ, **env_extra)
+        proc = subprocess.Popen(
+            ["build/q27-metal-server", MODEL, TOK, "--port", str(port), "--ctx", "2048"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        wait_ready(proc, port=port)
+        return proc
+
+    def snap_stats():
+        c = http.client.HTTPConnection(HOST, port, timeout=30)
+        c.request("GET", "/stats")
+        data = json.loads(c.getresponse().read())
+        c.close()
+        return data.get("snapshots", {})
+
+    def ask(prompt, **extra):
+        st, data = request_raw(prompt, n=24, port=port, **extra)
+        if st != 200:
+            raise RuntimeError(f"G7 request failed: HTTP {st}: {data}")
+        return data["choices"][0]["text"]
+
+    try:
+        # Server 1: hinted request saves a boundary snapshot.
+        proc = launch({"Q27_METAL_SNAPSHOT_DIR": snapdir})
+        try:
+            ask(q1, snapshot=True)
+            s = snap_stats()
+            files = [f for f in os.listdir(snapdir) if f.endswith(".q27snap")]
+            if s.get("disk_saves") != 1 or len(files) != 1:
+                failures.append(f"G7: hinted save did not persist (saves={s.get('disk_saves')}, files={files})")
+        finally:
+            proc.terminate(); proc.wait(timeout=30)
+        # Server 2: FRESH process (empty in-memory cache), same dir — the
+        # shared-prefix question must hit disk; the perturbed prompt must miss.
+        hit_text = miss_text = None
+        proc = launch({"Q27_METAL_SNAPSHOT_DIR": snapdir})
+        try:
+            hit_text = ask(q2)
+            s = snap_stats()
+            if s.get("disk_hits") != 1:
+                failures.append(f"G7: shared-prefix request did not hit disk (hits={s.get('disk_hits')})")
+            miss_text = ask(q_miss)
+            s = snap_stats()
+            if s.get("disk_hits") != 1:
+                failures.append("G7: perturbed-prefix request falsely HIT the snapshot")
+        finally:
+            proc.terminate(); proc.wait(timeout=30)
+        # Server 3: cold reference for the same question (separate empty dir).
+        proc = launch({"Q27_METAL_SNAPSHOT_DIR": colddir})
+        try:
+            cold_text = ask(q2)
+            cold_miss = ask(q_miss)
+        finally:
+            proc.terminate(); proc.wait(timeout=30)
+        if hit_text != cold_text:
+            failures.append("G7: disk-hit continuation diverged from the cold path "
+                            f"(hit {hit_text!r} vs cold {cold_text!r})")
+        if miss_text != cold_miss:
+            failures.append("G7: perturbed-prefix (miss) continuation diverged from cold")
+        # Server 4: eviction under a 1 MB budget — the save happens, then the
+        # directory is brought back under budget (the file is far larger).
+        evdir = tempfile.mkdtemp(prefix="q27_g7_evict.")
+        proc = launch({"Q27_METAL_SNAPSHOT_DIR": evdir, "Q27_METAL_SNAPSHOT_MAX_MB": "1"})
+        try:
+            ask(q1, snapshot=True)
+            total = sum(os.path.getsize(os.path.join(evdir, f)) for f in os.listdir(evdir)
+                        if f.endswith(".q27snap"))
+            if total > 1 * 1024 * 1024:
+                failures.append(f"G7: eviction left {total} bytes under a 1 MB budget")
+        finally:
+            proc.terminate(); proc.wait(timeout=30)
+            shutil.rmtree(evdir, ignore_errors=True)
+    finally:
+        shutil.rmtree(snapdir, ignore_errors=True)
+        shutil.rmtree(colddir, ignore_errors=True)
+    if failures:
+        print("[greedy] G7 FAIL:")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print("[greedy] G7 PASS (hinted save persisted, fresh-process disk hit byte-identical "
+          "to cold, perturbed prefix missed, 1 MB budget evicted)")
     return 0
 
 
