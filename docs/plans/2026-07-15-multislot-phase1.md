@@ -47,6 +47,14 @@ v1 multislot → N=2 slot-batched linears → verify_lanes → learned drafting)
   outside the lease (ToolMaskCache::get simulates the whole vocabulary on
   a miss; the once-per-call engage path stays under the lease, bounded),
   with a dedicated innermost mask_mutex_ guarding the shared host cache.
+- Second codex round: slot release now notify_all (notify_one could wake
+  a non-serving ticket that re-sleeps, wedging the queue with an idle
+  slot). The queue-pressure gate Gq (5 requests over 2 slots) covers the
+  wedge class, and it exposed a metrics conflation fixed the same night:
+  gate wait (admission → first lease; one-quantum bound, measured max
+  83.5 ms under load) is now split from queue wait (arrival → admission;
+  bounded only by QUEUE_MAX generations, measured max ~8 s under 5-over-2
+  pressure, reported per arrival phase and deliberately not bounded).
 
 ## What Phase 1 is (and is not)
 

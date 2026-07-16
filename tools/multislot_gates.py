@@ -137,6 +137,28 @@ def main():
         if results["b"] != solo_b:
             failures.append("G1s: greedy companion diverged under concurrency")
 
+        # Gq: queue pressure — five concurrent requests over two slots force
+        # ticketed waiters; all must complete (a wrong-waiter wakeup wedges
+        # this with an idle slot) and repeats must match solo.
+        results = {}
+        def run_q(i):
+            prompt = PROMPT_A if i % 2 == 0 else PROMPT_B
+            try:
+                results[i] = (prompt, request(prompt, n=16))
+            except Exception as e:  # noqa: BLE001
+                results[i] = (prompt, f"ERROR: {e}")
+        solo_a16 = request(PROMPT_A, n=16)
+        solo_b16 = request(PROMPT_B, n=16)
+        threads = [threading.Thread(target=run_q, args=(i,)) for i in range(5)]
+        for t in threads: t.start()
+        for t in threads: t.join(120)
+        if any(t.is_alive() for t in threads):
+            failures.append("Gq: queued request wedged (thread still alive after 120 s)")
+        for i, (prompt, text) in sorted(results.items()):
+            want = solo_a16 if prompt is PROMPT_A else solo_b16
+            if text != want:
+                failures.append(f"Gq: request {i} diverged or errored under queue pressure")
+
         # G3: cancel mid-stream, then the same request must match solo.
         stream_then_cancel(PROMPT_B)
         time.sleep(1)
@@ -151,14 +173,16 @@ def main():
         if not busy:
             failures.append("G5: no busy-arrival bucket recorded despite concurrent load")
         # The Phase 1 guarantee: at most one active scheduling quantum of
-        # gate wait. The widest quantum is a 96-token prefill chunk (~2 s);
-        # 3 s allows thermal margin. The pre-ticket-lock lease measured
-        # 5491 ms here (starved behind a whole generation), so this bound
-        # is proven able to fail.
+        # GATE wait (slot admission -> first lease). The widest quantum is a
+        # 96-token prefill chunk (~2 s); 3 s allows thermal margin. The
+        # pre-ticket-lock lease measured 5491 ms here (starved behind a
+        # whole generation), so this bound is proven able to fail. QUEUE
+        # wait (arrival -> admission) is a different quantity — bounded by
+        # QUEUE_MAX generations, reported but not bounded here.
         for phase, ws in busy.items():
-            if ws["max_gate_wait_ms"] > 3000:
+            if ws["max_ms"] > 3000:
                 failures.append(f"G5: {phase}-arrival max gate wait "
-                                f"{ws['max_gate_wait_ms']:.0f} ms exceeds one quantum bound")
+                                f"{ws['max_ms']:.0f} ms exceeds one quantum bound")
         print(f"[{label}] /stats: {json.dumps(s)}")
     finally:
         proc.terminate()

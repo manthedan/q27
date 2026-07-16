@@ -199,10 +199,13 @@ struct Runtime {
     // construction simulates the whole vocabulary on a miss). Order:
     // route_ | lease_ -> mask_mutex_; never the reverse.
     std::mutex mask_mutex_;
-    // Gate-wait accounting bucketed by what the competing traffic was doing
-    // at arrival (idle/prefill/decode/verify), guarded by route_.
+    // Wait accounting bucketed by what the competing traffic was doing at
+    // arrival (idle/prefill/decode/verify), guarded by route_. Two distinct
+    // quantities: queue wait (arrival -> slot admission; bounded only by
+    // QUEUE_MAX generations) and gate wait (admission -> first GPU lease;
+    // the Phase 1 one-active-quantum guarantee applies to THIS one).
     struct WaitStats { uint64_t n=0; double sum_ms=0, max_ms=0; };
-    std::map<std::string,WaitStats> wait_stats;
+    std::map<std::string,WaitStats> queue_wait_stats, gate_wait_stats;
     bool constrain_tools=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
@@ -270,7 +273,8 @@ struct Runtime {
         size_t prefix_hit=0;
         Finish finish=Finish::Length;
         std::string stop_sequence; // set when finish==StopSequence
-        double gate_wait_ms=0;     // arrival to first GPU lease
+        double queue_wait_ms=0;    // arrival to slot admission
+        double gate_wait_ms=0;     // slot admission to first GPU lease
         const char* arrival="idle"; // competing slot's phase at arrival
     };
 
@@ -325,19 +329,26 @@ struct Runtime {
             Runtime& rt; Slot& s;
             ~SlotRelease() {
                 { std::lock_guard<std::mutex> lk(rt.route_); s.busy=false; s.phase=Slot::Phase::Idle; }
-                rt.slot_free_.notify_one();
+                // notify_all, not notify_one: only the serving ticket's
+                // waiter can proceed, and notify_one may wake a different
+                // ticket that just re-sleeps — wedging the queue while a
+                // slot sits idle (codex P1 on cdf85b2).
+                rt.slot_free_.notify_all();
             }
         } slot_release{*this,*slot};
         q27::MetalEngine& engine=slot->engine;
 
         // First lease acquisition stamps the gate wait; every engine call
         // below runs under one of these scoped leases.
+        const auto admitted=std::chrono::steady_clock::now();
+        const double queue_wait_ms=
+            std::chrono::duration<double,std::milli>(admitted-arrive).count();
         double gate_wait_ms=-1.0;
         auto lease_now=[&]()->Lease::Guard {
             Lease::Guard gpu(lease_);
             if(gate_wait_ms<0)
                 gate_wait_ms=std::chrono::duration<double,std::milli>(
-                    std::chrono::steady_clock::now()-arrive).count();
+                    std::chrono::steady_clock::now()-admitted).count();
             return gpu;
         };
 
@@ -400,8 +411,10 @@ struct Runtime {
         {
             std::lock_guard<std::mutex> lk(route_);
             slot->phase = mtp ? Slot::Phase::Verify : Slot::Phase::Decode;
-            WaitStats& ws=wait_stats[arrival];
-            ws.n++; ws.sum_ms+=std::max(gate_wait_ms,0.0); ws.max_ms=std::max(ws.max_ms,gate_wait_ms);
+            WaitStats& qs=queue_wait_stats[arrival];
+            qs.n++; qs.sum_ms+=queue_wait_ms; qs.max_ms=std::max(qs.max_ms,queue_wait_ms);
+            WaitStats& gs=gate_wait_stats[arrival];
+            gs.n++; gs.sum_ms+=std::max(gate_wait_ms,0.0); gs.max_ms=std::max(gs.max_ms,gate_wait_ms);
         }
 
         // token -> decode -> UTF-8 boundary gate -> stop-sequence holdback ->
@@ -546,6 +559,7 @@ struct Runtime {
         out.prompt_tokens=(uint32_t)prompt.size();
         out.output_tokens=produced;
         out.prefix_hit=hit;
+        out.queue_wait_ms=queue_wait_ms;
         out.gate_wait_ms=std::max(gate_wait_ms,0.0);
         out.arrival=arrival;
         if(client_gone) out.finish=Finish::Cancelled;
@@ -636,17 +650,28 @@ int main(int argc,char** argv) {
         // would pile up behind the workers instead of being rejected.
         server.new_task_queue=[]{ return new httplib::ThreadPool(8,32); };
         server.Get("/health",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"}});});
-        // Gate-wait honesty (Phase 1 contract): per-arrival-phase wait stats.
+        // Wait honesty (Phase 1 contract): per-arrival-phase stats. Gate
+        // wait (admission -> first lease) carries the one-quantum bound;
+        // queue wait (arrival -> admission) is bounded only by QUEUE_MAX
+        // generations and is reported so nobody mistakes one for the other.
         server.Get("/stats",[&runtime](const httplib::Request&,httplib::Response& r){
-            json buckets=json::object();
+            auto bucket=[](const std::map<std::string,Runtime::WaitStats>& stats){
+                json out=json::object();
+                for(const auto& [phase,ws]:stats)
+                    out[phase]={{"requests",ws.n},
+                                {"mean_ms",ws.n?ws.sum_ms/ws.n:0.0},
+                                {"max_ms",ws.max_ms}};
+                return out;
+            };
+            json gate,queue;
             {
                 std::lock_guard<std::mutex> lk(runtime.route_);
-                for(const auto& [phase,ws]:runtime.wait_stats)
-                    buckets[phase]={{"requests",ws.n},
-                                    {"mean_gate_wait_ms",ws.n?ws.sum_ms/ws.n:0.0},
-                                    {"max_gate_wait_ms",ws.max_ms}};
+                gate=bucket(runtime.gate_wait_stats);
+                queue=bucket(runtime.queue_wait_stats);
             }
-            json_response(r,{{"slots",runtime.slots.size()},{"gate_wait_by_arrival",buckets}});
+            json_response(r,{{"slots",runtime.slots.size()},
+                             {"gate_wait_by_arrival",gate},
+                             {"queue_wait_by_arrival",queue}});
         });
         server.Get("/v1/models",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"object","list"},{"data",json::array({{{"id","q27-metal"},{"object","model"}}})}});});
 
