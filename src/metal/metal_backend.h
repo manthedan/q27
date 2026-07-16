@@ -40,6 +40,16 @@ class MetalBackend final : public ComputeBackend {
     void matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
                                const BackendTensor& b, BackendBuffer& b_out,
                                const BackendQuantized& x) override;
+    // N=2 slot-batched T2 GEMV (Phase 2 probe): x = 2 activation rows
+    // ([2,cols] values / [2,cols/32] scales), y = [2,rows] token-major.
+    // Metal-only surface until the probe passes its decision line.
+    void matvec_quantized_x2(const BackendTensor& weight,
+                             const BackendQuantized& x, BackendBuffer& y);
+    // Select-form float-activation variant (the production serial-decode
+    // path), two independent x/y buffer pairs. Same probe status.
+    void matvec_x2(const BackendTensor& weight,
+                   const BackendBuffer& x_a, const BackendBuffer& x_b,
+                   BackendBuffer& y_a, BackendBuffer& y_b);
     void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
                           uint32_t x_rows,BackendBuffer& y) override;
     void embedding_q8(const BackendTensor& weight, uint32_t token,

@@ -219,6 +219,69 @@ kernel void q27_matvec_t2_g128(
     }
 }
 
+// N=2 slot-batched select-form ternary GEMV (multislot Phase 2 probe): the
+// production serial-decode kernel (q27_matvec_t2_g128) computing two
+// activation vectors in one weight pass. The bit-extraction booleans — the
+// issue-heavy part of the select-form dot — are shared across the rows;
+// activations and outputs stay in separate buffers (no layout coupling).
+// Per-row op order matches the single kernel exactly, so each output is
+// bit-identical to two single dispatches.
+kernel void q27_matvec_t2_g128_x2(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *xa      [[buffer(2)]],
+        device const float *xb      [[buffer(3)]],
+        device       float *out_a   [[buffer(4)]],
+        device       float *out_b   [[buffer(5)]],
+        constant MatvecArgs &args   [[buffer(6)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint ix = lane / 8;              // block in flight (4 per simdgroup)
+    const uint il = (lane % 8) * 16;       // element offset within the block
+    float sumfa[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sumfb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float *ya = xa + ix * 128 + il;
+    device const float *yb = xb + ix * 128 + il;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float yla[16], ylb[16];
+        float sumya = 0.0f, sumyb = 0.0f;
+        for (uint i = 0; i < 16; i++) { yla[i] = ya[i]; sumya += ya[i]; }
+        for (uint i = 0; i < 16; i++) { ylb[i] = yb[i]; sumyb += yb[i]; }
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            device const uchar *qs = weights + (ulong)row * (args.cols / 4) + ib * 32 + il / 4;
+            const float d = float(scales[(ulong)row * nb + ib]);
+            const uchar4 b = *(device const uchar4 *)qs;
+            float alo = 0.0f, ahi = 0.0f, blo = 0.0f, bhi = 0.0f;
+            for (uint i = 0; i < 16; i++) {
+                const bool lo = bool(b[i / 4] & (1u << (2 * (i % 4))));
+                const bool hi = bool(b[i / 4] & (2u << (2 * (i % 4))));
+                alo += select(0.0f, yla[i], lo);
+                ahi += select(0.0f, yla[i], hi);
+                blo += select(0.0f, ylb[i], lo);
+                bhi += select(0.0f, ylb[i], hi);
+            }
+            sumfa[r] += d * (alo + 2.0f * ahi - sumya);
+            sumfb[r] += d * (blo + 2.0f * bhi - sumyb);
+        }
+        ya += 512;
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tota = simd_sum(sumfa[r]);
+        const float totb = simd_sum(sumfb[r]);
+        if (lane == 0 && row0 + r < args.rows) {
+            out_a[row0 + r] = tota;
+            out_b[row0 + r] = totb;
+        }
+    }
+}
+
 // T3_G128: five ternary codes per byte, base-3 (243 values), 26 bytes per
 // 128-column group, scales as T2. The LUT expands a byte into five 2-bit
 // codes (bits 2t..2t+1 = code for slot t); the select-form dot then runs
@@ -976,6 +1039,92 @@ kernel void q27_matvec_t2_quantized(device const uchar *weights [[buffer(0)]],
     }
     acc = simd_sum(acc);
     if (lane == 0) out[row] = acc;
+}
+
+// Dual-row ternary dot: unpack each 2-bit code ONCE, MAC into both rows.
+// The packed-dot GEMV is issue-bound on the unpack (shift/mask/sub per
+// code), not on the weight stream, so sharing the unpack — not the bytes —
+// is where an N=2 batch can win. Integer sums are exact and order-
+// independent, so each row's dot equals the single-row kernel's bit for bit.
+inline void q27_dot16_t2_dual(uint packed, int4 xpa, int4 xpb,
+                              thread int& sa, thread int& sb) {
+    const char4 a0 = as_type<char4>(xpa.x), a1 = as_type<char4>(xpa.y);
+    const char4 a2 = as_type<char4>(xpa.z), a3 = as_type<char4>(xpa.w);
+    const char4 b0 = as_type<char4>(xpb.x), b1 = as_type<char4>(xpb.y);
+    const char4 b2 = as_type<char4>(xpb.z), b3 = as_type<char4>(xpb.w);
+    int w;
+    w = int(packed         & 3u) - 1; sa += w * a0.x; sb += w * b0.x;
+    w = int((packed >>  2) & 3u) - 1; sa += w * a0.y; sb += w * b0.y;
+    w = int((packed >>  4) & 3u) - 1; sa += w * a0.z; sb += w * b0.z;
+    w = int((packed >>  6) & 3u) - 1; sa += w * a0.w; sb += w * b0.w;
+    w = int((packed >>  8) & 3u) - 1; sa += w * a1.x; sb += w * b1.x;
+    w = int((packed >> 10) & 3u) - 1; sa += w * a1.y; sb += w * b1.y;
+    w = int((packed >> 12) & 3u) - 1; sa += w * a1.z; sb += w * b1.z;
+    w = int((packed >> 14) & 3u) - 1; sa += w * a1.w; sb += w * b1.w;
+    w = int((packed >> 16) & 3u) - 1; sa += w * a2.x; sb += w * b2.x;
+    w = int((packed >> 18) & 3u) - 1; sa += w * a2.y; sb += w * b2.y;
+    w = int((packed >> 20) & 3u) - 1; sa += w * a2.z; sb += w * b2.z;
+    w = int((packed >> 22) & 3u) - 1; sa += w * a2.w; sb += w * b2.w;
+    w = int((packed >> 24) & 3u) - 1; sa += w * a3.x; sb += w * b3.x;
+    w = int((packed >> 26) & 3u) - 1; sa += w * a3.y; sb += w * b3.y;
+    w = int((packed >> 28) & 3u) - 1; sa += w * a3.z; sb += w * b3.z;
+    w = int((packed >> 30)      ) - 1; sa += w * a3.w; sb += w * b3.w;
+}
+
+// N=2 slot-batched ternary GEMV (multislot Phase 2 probe): one pass over
+// the weight stream computes two activation rows, sharing the per-code
+// unpack via q27_dot16_t2_dual. Layouts match the MM kernels: x row-major
+// [2, cols], x_scales [2, cols/32], out token-major [2, rows]. Per-row
+// K-striping, scale-multiply order, and simd_sum are IDENTICAL to
+// q27_matvec_t2_quantized, and the integer dots are exact, so each row's
+// output is bit-identical to the single-row kernel. (The fused-pair
+// precedent — two weights, one x — lost on register pressure; here the
+// shared work is the unpack, the actual issue-bound resource.)
+kernel void q27_matvec_t2_quantized_x2(device const uchar *weights [[buffer(0)]],
+                                        device const half *weight_scales [[buffer(1)]],
+                                        device const char *x [[buffer(2)]],
+                                        device const float *x_scales [[buffer(3)]],
+                                        device float *out [[buffer(4)]],
+                                        constant MatvecArgs &args [[buffer(5)]],
+                                        uint group [[threadgroup_position_in_grid]],
+                                        ushort lane [[thread_index_in_simdgroup]],
+                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group * 8 + simdgroup;
+    if (row >= args.rows) return;
+    device const uint2 *w2 = (device const uint2 *)(weights + (ulong)row * (args.cols / 4));
+    device const int4 *xa16 = (device const int4 *)x;
+    device const int4 *xb16 = (device const int4 *)(x + args.cols);
+    device const float *xas = x_scales;
+    device const float *xbs = x_scales + args.cols / 32;
+    const ulong scale_base = (ulong)row * (args.cols / 128);
+    float acc_a = 0.0f, acc_b = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;      // one uint2 = 32 columns
+        const uint2 wp = w2[idx];
+        const uint c = chunk * 1024 + lane * 32;
+        const float ws = float(weight_scales[scale_base + c / 128]);
+        int da = 0, db = 0;
+        q27_dot16_t2_dual(wp.x, xa16[idx * 2],     xb16[idx * 2],     da, db);
+        q27_dot16_t2_dual(wp.y, xa16[idx * 2 + 1], xb16[idx * 2 + 1], da, db);
+        acc_a += float(da) * ws * xas[c / 32];
+        acc_b += float(db) * ws * xbs[c / 32];
+    }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const uchar wp = weights[(ulong)row * (args.cols / 4) + c / 4];
+        const float ws = float(weight_scales[scale_base + c / 128]);
+        const char4 xa = *(device const char4 *)(x + c);
+        const char4 xb = *(device const char4 *)(x + args.cols + c);
+        const int da = (int(wp         & 3u) - 1) * xa.x + (int((wp >> 2) & 3u) - 1) * xa.y +
+                       (int((wp >> 4) & 3u) - 1) * xa.z + (int((wp >> 6)      ) - 1) * xa.w;
+        const int db = (int(wp         & 3u) - 1) * xb.x + (int((wp >> 2) & 3u) - 1) * xb.y +
+                       (int((wp >> 4) & 3u) - 1) * xb.z + (int((wp >> 6)      ) - 1) * xb.w;
+        acc_a += float(da) * ws * xas[c / 32];
+        acc_b += float(db) * ws * xbs[c / 32];
+    }
+    acc_a = simd_sum(acc_a);
+    acc_b = simd_sum(acc_b);
+    if (lane == 0) { out[row] = acc_a; out[args.rows + row] = acc_b; }
 }
 
 // Tiled simdgroup-matrix GEMM (x_rows 1..12) for chunked prefill and
