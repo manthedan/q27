@@ -873,6 +873,14 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
         throw std::runtime_error("q27 Metal: batched MTP requires chunked prefill");
     if (remaining < 2)
         throw std::runtime_error("q27 Metal: MTP round needs remaining >= 2 (emit the last token directly)");
+    // A finished stream must not draft: EOS can arrive as the previous
+    // round's bonus prediction (the server quantum loop hands it straight
+    // back), and drafting past it would waste a full round and pollute the
+    // speculation stats (codex P2). Mirrors the live<2 fallback's EOS skip.
+    if (pending == eos) {
+        committed.push_back(pending);
+        return pending;
+    }
     uint32_t live = std::min(std::min(live_width, width), remaining);
     // The verify chunk stores a KV row for every lane, so it must stay
     // inside the reserved context even before acceptance is known.
@@ -913,10 +921,24 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
     backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
     uint32_t accepted = 0;
     while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
-    const uint32_t commit_n = std::min(accepted + 1, remaining);
+    uint32_t commit_n = std::min(accepted + 1, remaining);
     // The final output token is pushed but never encoded, exactly like
     // the serial walk, so snapshots and continuations stay compatible.
-    const uint32_t encoded = commit_n == remaining ? commit_n - 1 : commit_n;
+    uint32_t encoded = commit_n == remaining ? commit_n - 1 : commit_n;
+    // EOS inside the committed prefix: the stream stops there, so state
+    // must too (codex finding, 2026-07-15; eos-gate 2026-07-16 measured
+    // position advanced past the last emitted token). Hand the caller a
+    // committed slice ending AT the EOS token and encode only the tokens
+    // before it — KV rows past it stay invisible behind position_, GDN
+    // replays only the emitted prefix, exactly like the serial walk. The
+    // CLI's never-matching EOS sentinel leaves this loop inert, so
+    // sentinel-driven runs are bit-identical by construction.
+    for (uint32_t i = 0; i < commit_n; i++)
+        if (lanes[i] == eos) {
+            commit_n = i + 1;
+            encoded = i;
+            break;
+        }
     last_spec_stats_.accepted += commit_n - 1;
     auto commit_start = clock();
     if (encoded) {
