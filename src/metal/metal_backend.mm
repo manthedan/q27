@@ -232,6 +232,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> mma_roofline_a_p;
     id<MTLComputePipelineState> mma_roofline_b_p;
     id<MTLComputePipelineState> mma_roofline_b_eq_p;
+    id<MTLComputePipelineState> mma_roofline_cx_p;
     id<MTLComputePipelineState> attention_f16_causal_gqa_t2_p;
     // Q27_METAL_GQA_TILE: causal token-tile factor, 1 (untiled A/B lever)
     // or 2 (default; docs/plans/2026-07-15-cache-block-scheduling.md R1b).
@@ -530,6 +531,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
             impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
             impl_->mma_roofline_b_eq_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b_eq");
+            impl_->mma_roofline_cx_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_cx");
             if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
                 impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
         }
@@ -1125,8 +1127,8 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
                                 BackendBuffer& y) {
     if (!impl_->mma_roofline_a_p || !impl_->mma_roofline_b_p)
         throw std::runtime_error("q27 Metal: MMA roofline requires Apple GPU family 7 or newer");
-    if ((arm != 'a' && arm != 'b' && arm != 'e') || !rows || !cols || !x_rows || x_rows > 96 ||
-        cols % 128)
+    if ((arm != 'a' && arm != 'b' && arm != 'e' && arm != 'x') || !rows || !cols || !x_rows ||
+        x_rows > 96 || cols % 128)
         throw std::runtime_error("q27 Metal: invalid MMA roofline arguments");
     const MetalBuffer& wb = metal_buffer(w_or_seed);
     MetalBuffer& out = metal_buffer(y);
@@ -1151,15 +1153,22 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
         const MetalBuffer& xb = metal_buffer(*x);
         const MetalBuffer& xs = metal_buffer(*x_scales);
         // 'e' (equal-traffic) reads C's device byte volume: cols/8 halves per
-        // weight row, cols/2 halves per activation row.
-        const uint64_t wdiv = arm == 'e' ? 8 : 1, xdiv = arm == 'e' ? 2 : 1;
-        check_range(wb.size(), 0, (uint64_t)rows * (cols / wdiv) * 2, "roofline b weights");
+        // weight row, cols/2 halves per activation row. 'x' (pre-converted
+        // activations) reads C's packed T2 weight bytes and full half
+        // activations.
+        const uint64_t wbytes = arm == 'e' ? (uint64_t)rows * (cols / 8) * 2
+                              : arm == 'x' ? (uint64_t)rows * cols / 4
+                                           : (uint64_t)rows * cols * 2;
+        const uint64_t xdiv = arm == 'e' ? 2 : 1;
+        check_range(wb.size(), 0, wbytes, "roofline b weights");
         check_range(ws.size(), 0, (uint64_t)rows * (cols / 128) * 2, "roofline b weight scales");
         check_range(xb.size(), 0, (uint64_t)x_rows * (cols / xdiv) * 2, "roofline b activations");
         check_range(xs.size(), 0, (uint64_t)x_rows * (cols / 32) * 4, "roofline b activation scales");
         bool own; auto enc = impl_->encoder_for_operation(own,
-            arm == 'e' ? "q27_mma_roofline_b_eq" : "q27_mma_roofline_b");
-        [enc setComputePipelineState:arm == 'e' ? impl_->mma_roofline_b_eq_p
+            arm == 'e' ? "q27_mma_roofline_b_eq" :
+            arm == 'x' ? "q27_mma_roofline_cx" : "q27_mma_roofline_b");
+        [enc setComputePipelineState:arm == 'e' ? impl_->mma_roofline_b_eq_p :
+                                     arm == 'x' ? impl_->mma_roofline_cx_p
                                                 : impl_->mma_roofline_b_p];
         [enc setBuffer:wb.handle() offset:0 atIndex:0];
         [enc setBuffer:ws.handle() offset:0 atIndex:1];

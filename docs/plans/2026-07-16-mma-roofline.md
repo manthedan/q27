@@ -167,3 +167,41 @@ kernel-structural cost, exactly what a targeted round can attack.
 - Roofline surface stays in tree (bench-only): `q27_mma_roofline_a/b/b_eq`,
   `MetalBackend::mma_roofline`, `tools/metal_mma_roofline.cpp` — one
   command re-establishes the verdict, now with valid statistics.
+
+---
+
+## The authorized round (same day)
+
+Four candidates were built and measured against the roofline harness; two
+landed, two were rejected by their own numbers. Cumulative production-GEMM
+speedup: **5.1%** (C/Beq moved 1.135 → 1.080, C absolute ffn gate/up
+6.753 → 6.616 → ~6.56 ms across steps; final aggregate C ~2.6 TFLOP/s).
+
+| step | change | C/Beq after | outcome |
+|---|---|---|---|
+| 1 | scalar 4-entry LUT trit→half (`q27_t2_half_lut`), deleting int-sub + convert per element | 1.114 | landed (~2%) |
+| 2 | half4 vector stores (4 per tile-slot instead of 16 scalar) | 1.105 | landed (~0.8%) |
+| 3 | byte-LUT: 256-entry `half4` table, one constant gather per 4 trits, deleting the shift/mask chains | 1.080 | landed (~2.2%) |
+| — | half-activation pre-pass ceiling (arm Cx: packed weights + device-half activations) | C/Cx = 1.006 | REJECTED — 0.6% is not worth a kernel + ABI bump |
+| — | K=128 staging (two 64-K sub-tiles per barrier round, flush/fold order unchanged = still bit-identical) | 1.191 (regression) | REJECTED — 16 KB threadgroup footprint costs more occupancy than the halved barrier cadence saves; K=64 stands, bracketed now from both sides (K=32 −4%, K=128 −10%) |
+
+Identity gates for the landed changes: the staged halves are identical
+values, so outputs are bit-identical by construction — verified by
+`test_metal`/`test_metal_ops` and a pre/post artifact A/B (saved pre-round
+binary + pre-round shader via `Q27_METAL_SOURCE` vs the new tree; 113-token
+prompt through two 96-wide chunks + 48 greedy tokens; 215 bytes,
+byte-identical, both arms verified non-vacuous — real generation at
+position 161).
+
+## FINAL disposition
+
+**5.1% < the 8.1% fork-gap bar → prefill closes as MATURE with the attempt
+recorded**, per the adopted round-3 bottom line ("one attribution
+experiment... not an open-ended optimization stream"). The 5.1% ships (it
+is free — bit-identical). Residual attribution for any future round-4
+re-open: remaining C/Beq ≈ 1.08 (byte-extract + constant gathers + staging
+stores + load-issue — the staging structure itself), Beq/A ≈ 1.28
+(flush/barrier cadence, now bracketed: neither K=32 nor K=128 beats K=64),
+C ≈ 2.6 vs A ≈ 3.65 TFLOP/s physical MMA. The fork gap narrows from 7.6%
+to ~2.5–3% at the whole-prefill level (GEMM was 94.3% of prefill time);
+the rest is schedule-level.
