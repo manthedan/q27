@@ -715,6 +715,24 @@ void MetalEngine::mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t
         backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
 }
 
+// Scheduling-quantum prefill (multislot Phase 1): one bounded chunk encode
+// per call. prefill() below drives its chunked loop through this, so the
+// serving scheduler's per-quantum ingestion and whole-prompt ingestion are
+// the same code path by construction.
+void MetalEngine::prefill_chunk(const uint32_t* tokens, uint32_t count) {
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: prefill_chunk requires chunked prefill");
+    if (count < 2 || count > PREFILL_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: prefill chunk must be 2..96 tokens");
+    if ((uint64_t)position_ + count > max_context_)
+        throw std::runtime_error("q27 Metal: prompt exceeds context");
+    for (uint32_t i = 0; i < count; i++)
+        if (tokens[i] >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
+    CommandBatch batch(backend_);
+    encode_chunk(tokens, count);
+    batch.finish();
+}
+
 uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp) {
     if (prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
     if ((uint64_t)position_ + prompt.size() > max_context_)
@@ -732,9 +750,7 @@ uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp
         while (chunkable - serial_begin >= 2) {
             const uint32_t count =
                 (uint32_t)std::min<size_t>(PREFILL_CHUNK_MAX, chunkable - serial_begin);
-            CommandBatch batch(backend_);
-            encode_chunk(prompt.data() + serial_begin, count);
-            batch.finish();
+            prefill_chunk(prompt.data() + serial_begin, count);
             serial_begin += count;
         }
     }
@@ -841,93 +857,112 @@ std::vector<uint32_t> MetalEngine::generate_mtp_batched(uint32_t pending, uint32
     return output;
 }
 
+// One MTP draft/verify/commit round — the scheduling quantum for MTP
+// generation (multislot Phase 1). Extracted verbatim from the streaming
+// loop below, which now drives it, so the CLI/server whole-generation path
+// and the per-quantum scheduler path cannot drift.
+uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t eos,
+                                uint32_t width, uint32_t& live_width,
+                                std::vector<uint32_t>& committed) {
+    if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (!has_mtp_)
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
+    if (width < 2 || width > CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: MTP width must be 2..12");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: batched MTP requires chunked prefill");
+    if (remaining < 2)
+        throw std::runtime_error("q27 Metal: MTP round needs remaining >= 2 (emit the last token directly)");
+    uint32_t live = std::min(std::min(live_width, width), remaining);
+    // The verify chunk stores a KV row for every lane, so it must stay
+    // inside the reserved context even before acceptance is known.
+    if ((uint64_t)position_ + live > max_context_)
+        live = (uint32_t)(max_context_ - position_);
+    if (live < 2) {
+        committed.push_back(pending);
+        if (pending == eos) return pending;
+        return step(pending);
+    }
+    static const bool trace = getenv("Q27_MTP_TRACE") != nullptr;
+    auto clock = [] { return std::chrono::steady_clock::now(); };
+    auto since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    auto draft_start = clock();
+    std::vector<uint32_t> lanes(live);
+    lanes[0] = pending;
+    const BackendBuffer* hidden = x1_.get();
+    for (uint32_t lane = 1; lane < live; lane++) {
+        lanes[lane] = mtp_forward(*hidden, lanes[lane - 1], position_ + lane - 1);
+        hidden = mtp_hidden_out_.get();
+    }
+    last_spec_stats_.rounds++;
+    last_spec_stats_.drafted += live - 1;
+    auto verify_start = clock();
+    {
+        CommandBatch batch(backend_);
+        chunk_forward(lanes.data(), live, /*verify=*/true);
+        BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
+        backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                        N_EMBD, live, EPS, x5);
+        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
+        batch.finish();
+    }
+    std::vector<uint32_t> predictions(live);
+    backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
+    uint32_t accepted = 0;
+    while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
+    const uint32_t commit_n = std::min(accepted + 1, remaining);
+    // The final output token is pushed but never encoded, exactly like
+    // the serial walk, so snapshots and continuations stay compatible.
+    const uint32_t encoded = commit_n == remaining ? commit_n - 1 : commit_n;
+    last_spec_stats_.accepted += commit_n - 1;
+    auto commit_start = clock();
+    if (encoded) {
+        CommandBatch batch(backend_);
+        gdn_replay(encoded);
+        backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
+                      *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+        backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
+                      *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+        batch.finish();
+    }
+    position_ += encoded;
+    if (trace)
+        fprintf(stderr, "mtp round: live %u accepted %u | draft %.2fs verify %.2fs commit %.2fs\n",
+                live, accepted, std::chrono::duration<double>(verify_start - draft_start).count(),
+                std::chrono::duration<double>(commit_start - verify_start).count(), since(commit_start));
+    committed.insert(committed.end(), lanes.begin(), lanes.begin() + commit_n);
+    // Width adaptation is a pure performance control: committed tokens
+    // are width-invariant, matching the recorded 2/4/8/12 gate.
+    live_width = accepted + 1 == live ? std::min(width, live_width + 2)
+                                      : std::max(2u, accepted + 2);
+    return predictions[commit_n - 1];
+}
+
 uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint32_t width,
                                          uint32_t eos, const TokenSink& sink, StopCause& cause) {
     uint32_t emitted = 0;
     cause = StopCause::MaxTokens;
     // commit() streams one token through the sink, stopping on EOS or cancel.
-    // Returns 0 = continue, 1 = EOS reached, 2 = client cancelled.
-    auto commit = [&](uint32_t token) -> int {
-        if (token == eos) { cause = StopCause::Eos; return 1; }
-        if (!sink(token)) { cause = StopCause::Cancelled; return 2; }
+    auto commit = [&](uint32_t token) -> bool {
+        if (token == eos) { cause = StopCause::Eos; return true; }
+        if (!sink(token)) { cause = StopCause::Cancelled; return true; }
         emitted++;
-        return 0;
+        return false;
     };
     // Start narrow and let acceptance widen the window: committed tokens are
     // width-invariant, and a wide first round pays for many serial drafts
     // through a cold draft head before acceptance has been measured once.
     uint32_t live_width = std::min(width, 4u);
+    std::vector<uint32_t> committed;
     while (emitted < count) {
         if (emitted + 1 == count) { commit(pending); return emitted; }
-        const uint32_t remaining = (uint32_t)(count - emitted);
-        uint32_t live = std::min(live_width, remaining);
-        // The verify chunk stores a KV row for every lane, so it must stay
-        // inside the reserved context even before acceptance is known.
-        if ((uint64_t)position_ + live > max_context_)
-            live = (uint32_t)(max_context_ - position_);
-        if (live < 2) {
-            if (commit(pending)) return emitted;
-            if (emitted == count) return emitted;
-            pending = step(pending);
-            continue;
-        }
-        static const bool trace = getenv("Q27_MTP_TRACE") != nullptr;
-        auto clock = [] { return std::chrono::steady_clock::now(); };
-        auto since = [](std::chrono::steady_clock::time_point start) {
-            return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        };
-        auto draft_start = clock();
-        std::vector<uint32_t> lanes(live);
-        lanes[0] = pending;
-        const BackendBuffer* hidden = x1_.get();
-        for (uint32_t lane = 1; lane < live; lane++) {
-            lanes[lane] = mtp_forward(*hidden, lanes[lane - 1], position_ + lane - 1);
-            hidden = mtp_hidden_out_.get();
-        }
-        last_spec_stats_.rounds++;
-        last_spec_stats_.drafted += live - 1;
-        auto verify_start = clock();
-        {
-            CommandBatch batch(backend_);
-            chunk_forward(lanes.data(), live, /*verify=*/true);
-            BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
-            backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
-                                            N_EMBD, live, EPS, x5);
-            backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
-            backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
-            batch.finish();
-        }
-        std::vector<uint32_t> predictions(live);
-        backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
-        uint32_t accepted = 0;
-        while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
-        uint32_t committed = std::min(accepted + 1, remaining);
-        // The final output token is pushed but never encoded, exactly like
-        // the serial walk, so snapshots and continuations stay compatible.
-        const uint32_t encoded = committed == remaining ? committed - 1 : committed;
-        last_spec_stats_.accepted += committed - 1;
-        auto commit_start = clock();
-        if (encoded) {
-            CommandBatch batch(backend_);
-            gdn_replay(encoded);
-            backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
-                          *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
-            backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
-                          *logits_, 0, (uint64_t)VOCAB * sizeof(float));
-            batch.finish();
-        }
-        position_ += encoded;
-        if (trace)
-            fprintf(stderr, "mtp round: live %u accepted %u | draft %.2fs verify %.2fs commit %.2fs\n",
-                    live, accepted, std::chrono::duration<double>(verify_start - draft_start).count(),
-                    std::chrono::duration<double>(commit_start - verify_start).count(), since(commit_start));
-        for (uint32_t i = 0; i < committed; i++)
-            if (commit(lanes[i])) return emitted;
-        pending = predictions[committed - 1];
-        // Width adaptation is a pure performance control: committed tokens
-        // are width-invariant, matching the recorded 2/4/8/12 gate.
-        live_width = accepted + 1 == live ? std::min(width, live_width + 2)
-                                          : std::max(2u, accepted + 2);
+        committed.clear();
+        pending = mtp_round(pending, count - emitted, eos, width, live_width, committed);
+        for (uint32_t token : committed)
+            if (commit(token)) return emitted;
     }
     return emitted;
 }
@@ -1124,6 +1159,11 @@ uint32_t MetalEngine::sample_next(const SamplingParams& params, std::mt19937_64&
         }
     }
     return sample_logits_cpu(read_logits(), params, random);
+}
+
+uint32_t MetalEngine::sample_from_logits(const SamplingParams& params, std::mt19937_64& rng) {
+    validate_sampling(params);
+    return sample_next(params, rng);
 }
 
 std::vector<uint32_t> MetalEngine::generate_sampled_from_logits(uint32_t count,
