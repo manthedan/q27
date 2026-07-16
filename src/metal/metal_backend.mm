@@ -2298,6 +2298,10 @@ uint32_t MetalBackend::gqa_block_size() const {
     return impl_->gqa_block;
 }
 
+bool MetalBackend::gqa_blocked_reachable(uint32_t context) const {
+    return impl_->gqa_threshold != 0 && context >= impl_->gqa_threshold;
+}
+
 uint64_t MetalBackend::max_buffer_length() const {
     return (uint64_t)impl_->device.maxBufferLength;
 }

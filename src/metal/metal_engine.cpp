@@ -411,6 +411,9 @@ uint64_t MetalEngine::fixed_state_bytes(bool chunked) {
 }
 
 uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block, bool chunked) {
+    // Caller passes block == 0 when the blocked GQA route is unreachable
+    // (threshold disabled or context below it): no partials ever allocate.
+    if (!block) return 0;
     const uint64_t b = std::max(block, 1u);
     const uint64_t blocks = 1 + ((uint64_t)std::max(context, 1u) - 1) / b;
     // Without chunked prefill the causal-GQA path only ever sees one query
