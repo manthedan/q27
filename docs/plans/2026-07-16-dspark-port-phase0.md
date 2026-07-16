@@ -1,8 +1,21 @@
 # DSpark port — Phase 0: contract, repack, and gate design (no engine code)
 
-**Status: Phase 0 IN PROGRESS (2026-07-16).** Machine: 24 GB M4 for design/
-repack (CPU); economics decision blocked on the mini's phase B direct-RHS
-round (verify-round-cost plan lever 1).
+**Status: Phase 0 contract DONE; economics path narrowed (2026-07-16 pm).**
+Lever 1 (phase B direct-RHS) PARKED the same afternoon by its own kill line
+(C/D2 = 0.782 at width 12 — 2026-07-16-lever1-direct-rhs.md), so the ~430 ms
+round is NOT coming down via chunk-GEMM efficiency on the M4. The port
+decision now rides verify-round-cost **lever 2 only** (verify width past 12,
+mini's queue): at a flat ~430–465 ms round, single-block DSpark (~3.8
+committed/round) stays a loss; the viable shape is **chained blocks at
+w = 8–16**, whose expected committed tokens/round (~5–6.5 at the fork's
+measured per-block acceptance, decaying with chain depth) sits right at the
+break-even — thin, and decided by measurement, not argument. **Updated gate
+for Phase 3: the post-lever-2 oracle re-sweep must show S at the chained
+width ≥ 1.3× at the acceptance-weighted committed rate before any engine
+work.** If lever 2's curve flattens below that, the port parks here with the
+contract recorded — and suffix-burst widening (which needs no drafter at
+all) inherits lever 2's win instead. Machine: 24 GB M4 for design/repack
+(CPU).
 
 ## Why now, and the pre-registered kill line
 
