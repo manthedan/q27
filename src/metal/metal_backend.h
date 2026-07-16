@@ -212,6 +212,9 @@ class MetalBackend final : public ComputeBackend {
     // Effective causal-GQA block size (Q27_METAL_GQA_BLOCK or 1024): the
     // admission accounting sizes the shared partial buffer from it.
     uint32_t gqa_block_size() const;
+    // Whether the blocked (partials-allocating) GQA route is reachable at
+    // this context: threshold nonzero and context deep enough to route it.
+    bool gqa_blocked_reachable(uint32_t context) const;
     uint64_t max_buffer_length() const;
     uint64_t max_threadgroup_memory_length() const;
     bool supports_quantized_matmul() const;
