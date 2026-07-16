@@ -705,6 +705,16 @@ MetalEngine::SnapshotInfo MetalEngine::peek_snapshot(const std::string& path) {
         SnapshotInfo info;
         info.position = h.position;
         info.logits_resident = h.reserved == 0;
+        // Bound the metadata before allocating: a corrupt header must not
+        // drive a multi-GB resize on the scan path (codex P2 on 607160e).
+        if (h.token_count > 262144)
+            throw std::runtime_error("q27 Metal: snapshot token count exceeds any context: " + path);
+        if (fseeko(f, 0, SEEK_END) != 0)
+            throw std::runtime_error("q27 Metal: cannot read snapshot: " + path);
+        if ((uint64_t)ftello(f) < sizeof h + (uint64_t)h.token_count * 4)
+            throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
+        if (fseeko(f, sizeof h, SEEK_SET) != 0)
+            throw std::runtime_error("q27 Metal: cannot rewind snapshot: " + path);
         info.tokens.resize(h.token_count);
         if (h.token_count)
             snap_read(f, info.tokens.data(), (size_t)h.token_count * 4, path);
