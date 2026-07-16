@@ -43,6 +43,16 @@ EOS, pending==eos early return at the driver).
 - **width policy is full-tile aware**: proposal counts snap DOWN to
   {≤16, 32, 48} boundaries (a 20-lane verify pays the 32-lane weight
   stream; snapping to 16 is strictly better unless the match reaches 32).
+  **Recorded alternative (external review, 2026-07-16, decided by
+  measurement not argument): round UP instead for long matches** — a
+  17–31-lane match verified at 32 pays one extra weight stream
+  (~254 ms ≈ 2.8 serial tokens) for up to 15 more evidence-backed lanes,
+  positive EV when per-lane acceptance is high (exact suffix runs are).
+  v1 ships snap-down (conservative, never regresses); gate 6's burst
+  histogram decides whether match lengths 17–31 carry enough mass to
+  fund the round-up variant. If round-up ever ships it needs its own
+  prefix-invariance gate: committed tokens/state byte-identical with and
+  without the padded tail lanes.
 - The old serial path stays as `--suffix-serial` — it is the A/B control
   and the byte-level reference.
 - Stats grow a burst-length histogram (drafted/accepted per round +
