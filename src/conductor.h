@@ -13,11 +13,15 @@
 // The Conductor (Task 9: registry, round loop, token queues) calls a THIN
 // ENGINE-OWNED surface only: the entrypoints (solo_view()/pre/mix/post/
 // ffn_pair/qx5/mm5/tails/T()/set_round_width/draft_and_gate/suffix_propose/
+// the P2a step-granular draft pieces (draft_sample_bootstrap/draft_md_used/
+// draft_step_launch/draft_margin/draft_floor_topup)/
+// the P2c fused-draft pieces (mtp_step_view/draft_step_prep/mtp_pre/
+// mtp_attn/mtp_post/mtp_tail/draft_margin_d2h)/
 // commit_outcome/pre_round/post_round/decode_step/finish_decode -- the last
 // only from the A2 catch epilogue, fail_member below) plus the named
 // ACCESSORS engine.cuh
 // declares for the conductor (shared_dm/is_attn_layer/fast_head_on/
-// vgemm_ws/round_width/stream/outcome_dev/end_reason, each with a why-
+// vgemm_ws/round_width/stream/gate_theta/outcome_dev/end_reason, each with a why-
 // comment at its declaration). No friends; every raw-member need is met by
 // adding an accessor in engine.cuh, never by reaching into the engine from
 // this header (consensus addendum A4). The trim policy, TokenQueue and the
@@ -158,7 +162,11 @@ private:
 //                            its finish path already ran inside
 //   int  want_width();       draft phase (real: suffix_propose() or
 //                            draft_and_gate() on the member engine's OWN
-//                            stream); returns the want width, >= 2
+//                            stream); returns the want width, >= 2.
+//                            P2a: only the FALLBACK when the draft_widths
+//                            hook below is unset -- the real conductor
+//                            installs the hook so gated members' draft
+//                            steps interleave across engines
 //   bool round_is_suffix();  this round's proposal class (trim + GEMM policy)
 //   void set_granted(int w); install the post-trim width (set_round_width)
 // Hooks (owned by the wrapper):
@@ -191,6 +199,12 @@ struct ConductorCore {
     std::function<bool(MemberT&)> solo_round;
     std::function<void(MemberT**, const int*, const bool*, int, bool*)> fused_round;
     std::function<void(MemberT&)> on_leave;
+    // P2a (optional): batch draft hook -- fills want[] and sfx[] for all k
+    // members at once so the real conductor can interleave the gated
+    // members' draft steps across engines (concurrent draft graphs). When
+    // unset (the CPU unit test, hookless embedders), round() falls back to
+    // the per-member want_width() calls -- the serial P1 behavior.
+    std::function<void(MemberT**, int*, bool*, int)> draft_widths;
 
     void join(MemberT* m) { joins.push_back(m); }
 
@@ -242,10 +256,20 @@ struct ConductorCore {
         MemberT* ms[MAX_K];
         int want[MAX_K];
         bool sfx[MAX_K], done[MAX_K];
-        for (int i = 0; i < k; i++) {
-            ms[i] = members[i];
-            want[i] = ms[i]->want_width();
-            sfx[i] = ms[i]->round_is_suffix();
+        for (int i = 0; i < k; i++) ms[i] = members[i];
+        // Draft phase (P2a): the batch hook interleaves gated members' draft
+        // steps so the engines' chains run concurrently on their own
+        // streams; without it, the per-member calls are the serial path.
+        // Either way this runs strictly AFTER every pre_round() above and
+        // strictly BEFORE trim/set_granted/fused_round below -- the P1
+        // ordering, unchanged.
+        if (draft_widths) {
+            draft_widths(ms, want, sfx, k);
+        } else {
+            for (int i = 0; i < k; i++) {
+                want[i] = ms[i]->want_width();
+                sfx[i] = ms[i]->round_is_suffix();
+            }
         }
         // trim mutates only on overflow (sum > cap): under the cap, granted
         // == want and untrimmed lanes keep the bitwise contract.
@@ -440,10 +464,76 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
 // instead of the greedy argmax tail. The FORWARD is shared by design (both
 // solo graph sets capture the same spec_verify_forward), so sampled and
 // greedy members coexist in one union sweep; only the per-engine tail forks.
+// ev_draft_end (P2 Task 1, nullable -- the smoke driver passes none): a
+// TIMING event recorded on cstm immediately after the draft_done waits, i.e.
+// at the draft->verify phase boundary. Recording an event on an in-order
+// stream adds no ordering and no synchronization; it only timestamps the
+// point where cstm was released to begin verify work.
+
+// P2b (plan 2026-07-15-batch-p2-overlap.md Task 3): mixer fork/join plumbing.
+// The caller (the Conductor) owns k side streams + a fork event + k mix
+// events; fused_verify_round, per mixer layer, records `fork` on cstm after
+// the union pre, launches engine m's mix on side[m] (fenced behind `fork`),
+// records mix[m] on side[m], and makes cstm wait every mix[m] before the
+// union post. nullptr = the P1 serial path (fused_smoke leg B keeps it as
+// the serial reference; legs C/D run the fork through the real Conductor).
+//
+// WHY P2b OVERLAPS WHERE P2a REALIZED ~0%: Task 2 measured the draft-overlap
+// gain at essentially zero because draft steps are WEIGHT-BW-BOUND -- two
+// engines stepping concurrently read the SAME MTP weights and just share one
+// DDR/L2 bandwidth stream, so concurrency buys nothing. The mixers rest on
+// DIFFERENT physics: fdmma verify attention is OCCUPANCY-bound (12.5% occ,
+// documented in the fdmma plan), and the GDN conv/delta chains are small
+// LATENCY-bound kernels; each engine's mix reads and writes ONLY its own
+// sequence state (its KV cache, conv rings, S roles, lane activations -- the
+// B2 audit below), i.e. DIFFERENT memory per engine. Co-resident streams
+// therefore add real parallelism instead of splitting one shared read
+// stream. P2a's lesson ("fusion-or-nothing") applies to weight sweeps;
+// fork/join applies to state chains.
+//
+// B2 ISOLATION AUDIT (2026-07-15 at a01c110, blocking precondition -- every
+// device buffer a mix touches is Engine-owned; nothing DeviceModel-shared is
+// written):
+//   gdn_mix(il, st):  RBuf -> conv_ring[il] / ring_sp[role-1][il] (RW, the
+//     per-lane recurrent conv chain), SBuf -> S[il] / S_sp[role-1][il] (RW,
+//     delta state), qkv/qkv_L (R), convout/convout_L (W then R, l2norm3 in
+//     place), g_L/beta_L (R), o_L (W) -- all Engine members. The ONE shared
+//     read is cw = T(il,"ssm_conv1d.weight").data: a DeviceModel WEIGHT,
+//     read-only at round time (concurrent reads are safe).
+//   attn_mix(il, st): qg_L (RW: wht3 rotates in place, attn reads), kbuf_L/
+//     vbuf_L (R), kcache[ci]/vcache[ci] (W disjoint rows, then R), scratch
+//     (RW, the fd/fdmma partials buffer), attnout_L (W, wht3 inverse in
+//     place), d_pos_L (R) -- all Engine members; NO weight reads at all.
+//   Host-side reads: vw/perm/kv_kind/kv_fp8/max_ctx/attn_cache_idx --
+//     per-engine members, mutated only at init/commit boundaries, never
+//     inside a round.
+//   (a) NO cudaGraphExec launches inside either mix -- plain kernel wrappers
+//       only (conv_step/l2norm3/delta_step/wht3/kv_store3/kv_store_t3/
+//       attn_decode3). The engines' graph execs are per-engine members and
+//       are never launched from the fused round.
+//   (b) host-side statics in the launch path: launch_fdmma_w's per-
+//       instantiation `static bool attr` (fdmma.cuh:415), fd_setattr<CT>'s
+//       (spec3.cu:627), and attn_decode3's one-shot arch/stages_pin/
+//       smem_per_sm/ns_pin/smc statics -- all one-shot cudaFuncSetAttribute
+//       / device-query latches, set on the FIRST launch (engine warm-up /
+//       graph capture, long before any fused round). Every mixer launch
+//       still issues from the SINGLE conductor thread -- the fork is
+//       streams, not threads -- so no host state is ever raced.
+//   (c) NO cudaMalloc/cudaMallocAsync in the round path (grep-verified:
+//       engine allocations live in init/prefill/ckpt_save only; the fused
+//       round allocates nothing).
+struct MixerFork {
+    const cudaStream_t* side; // [k] conductor-owned side streams
+    cudaEvent_t fork;         // recorded on cstm after each union pre
+    const cudaEvent_t* mix;   // [k] recorded on side[m] after engine m's mix
+};
 inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStream_t cstm,
                                const cudaEvent_t* draft_done, const bool* is_suffix,
-                               const bool* sampled = nullptr) {
+                               const bool* sampled = nullptr,
+                               cudaEvent_t ev_draft_end = nullptr,
+                               const MixerFork* mf = nullptr) {
     for (int m = 0; m < k; m++) CUDA_CHECK(cudaStreamWaitEvent(cstm, draft_done[m], 0));
+    if (ev_draft_end) CUDA_CHECK(cudaEventRecord(ev_draft_end, cstm));
     UnionView uv = build_union_view(es, granted, k, cstm, is_suffix);
     const Engine::LaneView& v = uv.view;
     Engine& e0 = *es[0];
@@ -452,16 +542,39 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
                  LANESV(v, h), v.stm, v.vw);
     q27k::CP3 Hc LANESV(v, h), Yc LANESV(v, y);
     q27k::P3 Hm LANESV(v, h), X1m LANESV(v, x1);
+    // P2b: one fork/join per mixer layer. DEVICE-side ordering only (B6):
+    // cudaEventRecord + cudaStreamWaitEvent, never a host sync -- the round's
+    // one host sync stays in the caller. The stream argument is the ONLY
+    // delta vs the serial path: same kernels, same launch params, same
+    // per-engine buffers, so per-lane bytes must be identical (B1 gate).
+    auto mix_all = [&](int il, bool attn) {
+        if (!mf) { // serial P1 path (smoke leg B / embedders without a pool)
+            for (int m = 0; m < k; m++) {
+                if (attn) es[m]->attn_mix(il, cstm);
+                else      es[m]->gdn_mix(il, cstm);
+            }
+            return;
+        }
+        CUDA_CHECK(cudaEventRecord(mf->fork, cstm));
+        for (int m = 0; m < k; m++) {
+            CUDA_CHECK(cudaStreamWaitEvent(mf->side[m], mf->fork, 0));
+            if (attn) es[m]->attn_mix(il, mf->side[m]);
+            else      es[m]->gdn_mix(il, mf->side[m]);
+            CUDA_CHECK(cudaEventRecord(mf->mix[m], mf->side[m]));
+        }
+        for (int m = 0; m < k; m++)
+            CUDA_CHECK(cudaStreamWaitEvent(cstm, mf->mix[m], 0));
+    };
     for (int il = 0; il < N_LAYER; il++) {
         const float* an = (const float*)e0.T(il, "attn_norm.weight").data;
         q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
         if (e0.is_attn_layer(il)) {
             e0.attn_pre(il, v);
-            for (int m = 0; m < k; m++) es[m]->attn_mix(il, cstm);
+            mix_all(il, true);
             e0.attn_post(il, v);
         } else {
             e0.gdn_pre(il, v);
-            for (int m = 0; m < k; m++) es[m]->gdn_mix(il, cstm);
+            mix_all(il, false);
             e0.gdn_post(il, v);
         }
         q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
@@ -489,6 +602,93 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
 }
 
 // ---------------------------------------------------------------------------
+// P2c (docs/plans/2026-07-16-batch-p2c-draft-fusion.md Task 2): fused draft
+// steps -- per step of the interleaved loop, ONE union MTP weight sweep
+// (eh_proj mm + the MTP ffn + the dominant 248320-row head mm) serves every
+// still-active gated member. This is the P0/P1 union pattern applied to
+// mtp_forward: drafts were measured WEIGHT-BW-BOUND (P2a realized ~0 from
+// pure overlap -- concurrent engines just split one DDR/L2 read stream), so
+// the win is one weight read instead of k.
+//
+// Union slot m = engine m's mtp_step_view(step) lane 0 -- the per-step
+// h_src/tok/pos/draft_dst/margin_dst chain pointers (the table lives in
+// Engine::mtp_step_view, SHARED with the solo capture path so the two can
+// never drift). Engines advance in LOCKSTEP through the interleaved loop --
+// every active member enters at step 0 and advances by 1 per iteration --
+// so `step` is shared (the caller asserts launched[m] == step per member).
+// Slots >= k keep es[0]'s solo padding (never read; the gemv_*_n
+// `i < nb ? i : 0` convention).
+inline Engine::MtpLaneView build_mtp_union_view(Engine** es, int k, int step,
+                                                cudaStream_t cstm) {
+    assert(k >= 1 && k <= W_PLUMB); // == ConductorCore MAX_K (static_assert
+                                    // at the Conductor below); MtpLaneView
+                                    // lane arrays are W_PLUMB-slotted
+    // no duplicate engines: a dup would hand two union slots the SAME chain
+    // buffers and the sweep would double-write them
+    for (int a = 0; a < k; a++)
+        for (int b = a + 1; b < k; b++) assert(es[a] != es[b]);
+    // one weight set serves every lane: all members must share the
+    // DeviceModel (the server's shared_model construction)
+    for (int m = 1; m < k; m++) assert(&es[m]->shared_dm() == &es[0]->shared_dm());
+    Engine::MtpLaneView v = es[0]->mtp_step_view(step);
+    for (int m = 1; m < k; m++) {
+        const Engine::MtpLaneView sv = es[m]->mtp_step_view(step);
+        v.e_hn[m] = sv.e_hn[0];       v.x_mtp[m] = sv.x_mtp[0];
+        v.x1[m] = sv.x1[0];           v.y[m] = sv.y[0];
+        v.lg[m] = sv.lg[0];           v.ffn_g[m] = sv.ffn_g[0];
+        v.ffn_u[m] = sv.ffn_u[0];     v.h_src[m] = sv.h_src[0];
+        v.tok[m] = sv.tok[0];         v.pos[m] = sv.pos[0];
+        v.draft_dst[m] = sv.draft_dst[0];
+        v.margin_dst[m] = sv.margin_dst[0];
+        v.xq[m] = sv.xq[0];           v.am_blk1[m] = sv.am_blk1[0];
+        v.am_blk2[m] = sv.am_blk2[0]; v.amax[m] = sv.amax[0];
+    }
+    v.vw = k;
+    v.stm = cstm;
+    v.gemm_min = 99; // A1/Task-9 policy, MTP flavor: solo drafts run the
+                     // dp4a GEMV family, so the union must NEVER take vgemm
+                     // (mtp_mm has no vgemm path and asserts this). Margins
+                     // are BITWISE vs solo, and BOTH halves of that claim are
+                     // ninv-gated (tools/ninv_test.cu): the family tables pin
+                     // multi-lane N-invariance (T/slot), and the SEAM LEG
+                     // (P2 exit review 2026-07-16) pins the other half this
+                     // comment used to assume -- the solo path runs the
+                     // SINGLE-lane kernels (mtp_mm1/qx/rmsnorm/add/embed/
+                     // silu_mul) while the fused step runs the multi-lane
+                     // twins, and the leg measured every pair bitwise-equal
+                     // on both arches (T in {2,4}, payload lane vs junk).
+                     // A regression on either half now fails ninv_test.
+    return v;
+}
+
+// One fused draft step at chain position `step` across engines es[0..k):
+// per-engine prep (step 0: prep_round bookkeeping; step>0: the x1 -> hs[step]
+// chain D2D -- same relative order as solo, the preamble precedes the step's
+// first kernel) -> union mtp_pre (embed/norms + ONE eh_proj sweep) ->
+// per-engine MTP attention -> union mtp_post (ONE ffn + head sweep) ->
+// per-lane argmax_margin tail. Eager, all on cstm -- the solo path keeps its
+// captured per-engine draft graphs untouched.
+// The MTP attentions run SERIAL on cstm, deliberately WITHOUT the P2b
+// side-stream fork/join: each is ONE token's attention against the tiny MTP
+// KV (vs the verify mixers' W lanes), so the per-engine record+wait
+// choreography would cost a comparable wall to what it hides, and the weight
+// sweeps on either side are the actual round wall.
+// The tail runs as the union-view loop: mtp_tail is per-lane already, and
+// the union view carries each engine's OWN argmax scratch
+// (lg/draft_dst/margin_dst/am_blk1/am_blk2 per lane), so lane t launches
+// exactly the solo argmax_margin call with engine t's buffers.
+inline void fused_draft_step(Engine** es, int k, int step, cudaStream_t cstm) {
+    assert(k >= 2); // k==1 stays on the captured solo step graphs (the
+                    // multi-lane kernel family has no nbatch=1 -- Task 1)
+    for (int m = 0; m < k; m++) es[m]->draft_step_prep(step, cstm);
+    Engine::MtpLaneView v = build_mtp_union_view(es, k, step, cstm);
+    es[0]->mtp_pre(v);
+    for (int m = 0; m < k; m++) es[m]->mtp_attn(v.pos[m], cstm);
+    es[0]->mtp_post(v);
+    es[0]->mtp_tail(v);
+}
+
+// ---------------------------------------------------------------------------
 // P1 Task 9: the Conductor -- ONE dedicated thread owning every decode round
 // in batch mode; request threads own everything else (prefill, SSE, slots).
 // Server-agnostic: Task 10 wires request threads to register_member() and
@@ -510,6 +710,11 @@ public:
         int gate_cap = -1, md_used = -1;  // draft_and_gate outs -> commit_outcome
         cudaEvent_t draft_done = nullptr; // recorded on e->stm after drafting
         bool pre_round() { return e->pre_round(*t); }
+        // P2a: the serial draft path. The real conductor installs the
+        // core.draft_widths hook (Conductor::draft_widths below), which
+        // supersedes this per-member call with the interleaved equivalent;
+        // this stays as the core's hookless fallback and the reference
+        // semantics the interleave must (and does -- B8) reproduce.
         int want_width() {
             gate_cap = md_used = -1;
             // mirror spec_round's branch order: the suffix drafter fires
@@ -539,18 +744,65 @@ public:
     // width cap fed to trim_widths (W_MAX; the W16 build raises it).
     explicit Conductor(GpuGate& gate_, int cap_ = W_MAX) : gate(gate_), core(cap_) {
         CUDA_CHECK(cudaStreamCreate(&cstm)); // created ONCE; all fused rounds
-        core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
-        core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
-                                  int k, bool* done) {
-            this->fused_round(ms, granted, sfx, k, done);
-        };
-        core.on_leave = [this](Member& mm) { this->leave(mm); };
-        th = std::thread([this] { run(); });
+        // P2 Task 1: fused-round phase-wall pool -- 3 TIMING events (default
+        // flags, NOT cudaEventDisableTiming), created once and reused every
+        // round. Reuse is sound under the B3 invariant enforced by the
+        // round_active bracket (opened in draft_widths, closed in
+        // fused_round): exactly ONE fused round is in flight per Conductor
+        // (single conductor thread, synchronous round loop -- each round
+        // records, syncs cstm, and reads elapsed before returning), so a
+        // record can never overwrite a timestamp that is still to be read.
+        CUDA_CHECK(cudaEventCreate(&ev_round_start));
+        CUDA_CHECK(cudaEventCreate(&ev_draft_end));
+        CUDA_CHECK(cudaEventCreate(&ev_verify_end));
+        // P2b: conductor-owned mixer side streams + the fork/join event pool
+        // (MixerFork rationale + B2 audit at fused_verify_round). Side
+        // streams are NOT the engines' stms -- the draft_done/stm ordering
+        // contract stays untouched -- and are NonBlocking so they never
+        // implicitly serialize against the legacy default stream.
+        //
+        // EVENT-POOL SIZING (the plan's "justify or size 2x" call): ONE fork
+        // event + MAX_K mix events, REUSED for every mixer layer of every
+        // round. This is legal under documented CUDA semantics WITHOUT any
+        // consumption argument: cudaStreamWaitEvent snapshots the work
+        // captured by the most recent cudaEventRecord AT THE TIME OF THE
+        // WAIT CALL, so a later re-record cannot retarget an already-issued
+        // wait. All records and waits are issued by this single conductor
+        // thread in program order -- layer il's waits are issued before
+        // layer il+1 re-records -- and the B3 round_active guard forbids a
+        // second in-flight round whose records could interleave. Chosen over
+        // a 2x alternating pool because snapshot semantics make "was the
+        // prior wait consumed?" irrelevant, which is the simpler-to-justify
+        // (and assert-backed) invariant.
+        for (int i = 0; i < ConductorCore<Member>::MAX_K; i++) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&side_[i], cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_mix_[i], cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming));
+        // Exception guard (P2 exit review): a std::function assignment or
+        // std::thread construction throw below (bad_alloc / system_error)
+        // would leak every handle just created -- the dtor of an object
+        // whose ctor throws never runs. Tear down + rethrow.
+        try {
+            core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
+            core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
+                                      int k, bool* done) {
+                this->fused_round(ms, granted, sfx, k, done);
+            };
+            core.draft_widths = [this](Member** ms, int* want, bool* sfx, int k) {
+                this->draft_widths(ms, want, sfx, k);
+            };
+            core.on_leave = [this](Member& mm) { this->leave(mm); };
+            th = std::thread([this] { run(); });
+        } catch (...) {
+            destroy_handles();
+            throw;
+        }
     }
     ~Conductor() {
         request_stop();
         th.join();
-        CUDA_CHECK(cudaStreamDestroy(cstm));
+        destroy_handles();
     }
     Conductor(const Conductor&) = delete;
     Conductor& operator=(const Conductor&) = delete;
@@ -632,6 +884,21 @@ public:
     }
 
 private:
+    // Handle teardown shared by the dtor and the ctor's exception guard
+    // (cstm + 3 phase events + MAX_K side streams + MAX_K mix events +
+    // fork). Order mirrors the old dtor body exactly.
+    void destroy_handles() {
+        CUDA_CHECK(cudaEventDestroy(ev_round_start));
+        CUDA_CHECK(cudaEventDestroy(ev_draft_end));
+        CUDA_CHECK(cudaEventDestroy(ev_verify_end));
+        for (int i = 0; i < ConductorCore<Member>::MAX_K; i++) {
+            CUDA_CHECK(cudaStreamDestroy(side_[i]));
+            CUDA_CHECK(cudaEventDestroy(ev_mix_[i]));
+        }
+        CUDA_CHECK(cudaEventDestroy(ev_fork_));
+        CUDA_CHECK(cudaStreamDestroy(cstm));
+    }
+
     // Conductor thread body. GATE-OWNERSHIP INVARIANT (A7): in batch mode
     // the gate holders are EXACTLY this thread (one Lease per decode round)
     // and request threads (prefill chunks). The conductor never blocks on a
@@ -743,23 +1010,243 @@ private:
         return true; // failed member leaves this round
     }
 
+    // P2a: the batch draft phase -- Member::want_width() over all k members,
+    // with the GATED members' margin loops INTERLEAVED so their per-step
+    // draft graphs run concurrently on the engines' own streams (the
+    // sequential host loop was the only serializer; the graphs already
+    // lived on per-engine stms). Suffix members keep suffix_propose as-is
+    // (one-shot host test + prep/H2D staging, no margin loop). Scheduling
+    // only: each engine's stm sees the IDENTICAL call sequence
+    // draft_and_gate would have enqueued, so per-member values and bytes
+    // must match the serial path -- and B1 makes that the gate (the Task 0
+    // refs), not an assumption.
+    //
+    // P2c ON TOP: when >= 2 gated members are still active at a step, the
+    // per-engine graph launches are replaced by ONE eager fused_draft_step
+    // on cstm (union MTP weight sweep -- drafts are weight-BW-bound, so
+    // P2a's overlap realized ~0 and fusion is the lever). The margins are
+    // computed by the same dp4a GEMV family at union width, ninv-proven
+    // bitwise per lane, so the loop arithmetic below is UNCHANGED and B8
+    // still re-derives {cap, W, launched} against draft_and_gate's
+    // semantics. A single remaining active member falls back to its solo
+    // step graphs (no nbatch=1 multi-lane kernels), and top-ups stay solo
+    // by the same argument.
+    //
+    // EQUIVALENCE to draft_and_gate's loop, side by side. draft_and_gate:
+    //   for (k = 0; k < md_used; k++) {
+    //       launch step k; launched++;
+    //       sync stm; if (margin[k] < theta) break;
+    //       cap++;
+    //   }
+    //   W = max(2, cap+1); top-up launches [launched, min(W, md_used));
+    // Interleaved, per gated member i (all active members share the step
+    // counter -- every member enters at step 0 and advances by 1 per
+    // iteration, so `step` IS member i's next k):
+    //   - each iteration launches exactly step `step` on i's stm and
+    //     increments launched[i]  == launch-k + launched++ above;
+    //   - i's stm is synced past step `step`'s D2H before margin read
+    //     == the per-step sync above (extra syncs of OTHER members' stms
+    //     order nothing on i's stm);
+    //   - margin[step] < theta  -> i exits with cap[i] unchanged. cap[i]
+    //     was incremented once per PASSED step 0..step-1, so cap[i] ==
+    //     step == draft_and_gate's cap at its break  (sub-theta break);
+    //   - margin[step] >= theta -> cap[i]++ (== step+1), and i exits iff
+    //     cap[i] == mdu[i]  == the loop bound k+1 < md_used failing after
+    //     cap++  (full run: cap == md_used, launched == md_used);
+    //   - on exit: W = max(2, cap+1) and the top-up range
+    //     [launched, min(W, mdu)) fire with the SAME values -- so the same
+    //     graph launches land on i's stm (margin steps 0..launched-1, then
+    //     top-up steps; the range is empty except at cap==0, where
+    //     launched==1 < W==2 <= mdu).
+    // The margins themselves are computed by the same per-engine graphs on
+    // the same per-engine state, so the break step is identical, hence
+    // {cap, launched, W, md_used} are identical. B8 below re-derives them
+    // from the recorded margins every round and asserts equality.
+    void draft_widths(Member** ms, int* want, bool* sfx, int k) {
+        // B3 bracket OPENS here, not in fused_round() (P2 exit review): the
+        // P2c draft phase below already runs fused work on cstm and
+        // re-records the members' draft_done events, so the one-round-in-
+        // flight invariant the event pools rest on must hold from the FIRST
+        // fused-phase record. core.round() always pairs this hook with
+        // fused_round() (same thread, program order), which asserts the
+        // bracket is open and CLOSES it.
+        assert(!round_active && "B3: fused rounds must not overlap per Conductor");
+        round_active = true;
+        enum { MAX_K = ConductorCore<Member>::MAX_K };
+        int act[MAX_K];                              // gated members still in the loop
+        int cap[MAX_K], launched[MAX_K], mdu[MAX_K]; // per-member loop state
+        int na = 0;
+        for (int i = 0; i < k; i++) {
+            Member& mm = *ms[i];
+            mm.gate_cap = mm.md_used = -1;
+            // mirror spec_round's branch order (== want_width): the suffix
+            // drafter fires before the MTP chain, greedy only, on this
+            // engine's OWN stream. Suffix decisions are host one-shots over
+            // per-engine state, so member i+1's decision landing before
+            // member i's MTP steps reorders nothing observable.
+            if (!mm.sampled) {
+                int sw = mm.e->suffix_propose();
+                if (sw > 0) {
+                    mm.sfx_round = true;
+                    sfx[i] = true;
+                    want[i] = sw;
+                    continue;
+                }
+            }
+            mm.sfx_round = false;
+            sfx[i] = false;
+            // draft_and_gate's preamble, hoisted per member: sampled
+            // bootstrap once before step 0, then the drafting ceiling
+            // (the same dctl/gate_maxd read).
+            if (mm.sampled) mm.e->draft_sample_bootstrap();
+            mdu[i] = mm.e->draft_md_used(mm.sampled);
+            cap[i] = launched[i] = 0;
+            act[na++] = i;
+        }
+        // P2c ORDER FENCE: fused steps run on cstm, but each member's prior
+        // GPU work lives on its OWN stm (the sampled bootstrap enqueued just
+        // above; prefill / solo rounds before the member's first fused
+        // round). One event per member orders cstm behind it. draft_done
+        // doubles as the fence event: this wait is issued before
+        // fused_round() re-records it (single conductor thread, program
+        // order), and cudaStreamWaitEvent snapshots the record at call time
+        // -- the ctor event-pool argument. Skipped at na < 2: the loop below
+        // then never touches cstm (pure P2a solo path on the member's stm).
+        if (na >= 2) {
+            for (int j = 0; j < na; j++) {
+                Member& mm = *ms[act[j]];
+                CUDA_CHECK(cudaEventRecord(mm.draft_done, mm.e->stream()));
+                CUDA_CHECK(cudaStreamWaitEvent(cstm, mm.draft_done, 0));
+            }
+        }
+        // draft_done ORDERING NOTE (P2c): fused_round() records each
+        // member's draft_done on the member's OWN stm after this returns,
+        // and that stays correct -- everything a member contributes OFF cstm
+        // (suffix prep/H2D staging, sampled bootstrap, floor top-ups, the
+        // k==1 fallback steps below) is on its stm and thus captured, while
+        // the fused steps here run ON cstm, the same in-order stream the
+        // verify runs on (and are host-synced per step besides), so the
+        // verify needs no event to see them.
+        for (int step = 0; na > 0; step++) {
+            if (na >= 2) {
+                // P2c: ONE union MTP weight sweep serves every still-active
+                // member at this chain position. When the active set shrinks
+                // the next iteration simply fuses at the smaller na -- ninv
+                // (slot/width invariance of the GEMV lanes) keeps every
+                // remaining member's margins bitwise across the width step.
+                Engine* aes[MAX_K];
+                for (int j = 0; j < na; j++) {
+                    // LOCKSTEP invariant build_mtp_union_view relies on:
+                    // every active member is about to run exactly `step`
+                    assert(launched[act[j]] == step &&
+                           "P2c: active members must be in draft-step lockstep");
+                    aes[j] = ms[act[j]]->e;
+                }
+                fused_draft_step(aes, na, step, cstm);
+                for (int j = 0; j < na; j++) aes[j]->draft_margin_d2h(step, cstm);
+                // ONE sync for all active members' margins (replaces P2a's
+                // per-member stm syncs; B7's argument applies unchanged).
+                CUDA_CHECK(cudaStreamSynchronize(cstm));
+            } else {
+                // Active set is down to ONE member: fall back to its
+                // captured solo step graphs on its OWN stm, exactly the P2a
+                // path -- the multi-lane kernel family has no nbatch=1
+                // instantiation (gemv_*_n starts at 2; Task 1 DECIDE), so a
+                // width-1 "union" cannot run the fused kernels. Ordering vs
+                // the fused steps this member's chain already ran on cstm is
+                // by HOST program order: the per-step cstm sync above
+                // completed them before this launch is issued.
+                ms[act[0]]->e->draft_step_launch(step);
+                CUDA_CHECK(cudaStreamSynchronize(ms[act[0]]->e->stream()));
+            }
+            int keep = 0;
+            for (int j = 0; j < na; j++) {
+                const int i = act[j];
+                Member& mm = *ms[i];
+                launched[i]++; // member i launched step `step` above
+                bool out;
+                if (mm.e->draft_margin(step) < mm.e->gate_theta()) {
+                    out = true; // sub-theta break: cap[i] stays == step
+                } else {
+                    cap[i]++;                   // == step+1
+                    out = cap[i] == mdu[i];     // draft_and_gate's loop bound
+                }
+                if (!out) {
+                    act[keep++] = i; // stable order: syncs stay member-order
+                    continue;
+                }
+                // draft_and_gate's epilogue for this member, at its exit
+                // step: floor W, width-floor top-up on ITS stm, out-params.
+                // P2c top-up fencing: the top-up graphs (rare, cap==0 only)
+                // stay per-engine solo launches on the member's stm; they
+                // read chain state the fused steps wrote on cstm, and that
+                // is safe by HOST program order -- this exit decision runs
+                // strictly after the per-step cstm sync completed those
+                // writes. fused_round() then records draft_done on this stm,
+                // so the verify is fenced behind the top-up as before.
+                int W = cap[i] + 1 < 2 ? 2 : cap[i] + 1;
+                mm.e->draft_floor_topup(launched[i], W, mdu[i]);
+                mm.gate_cap = cap[i];
+                mm.md_used = mdu[i];
+                want[i] = W;
+            }
+            na = keep;
+        }
+        // B8 (always-on; no build defines NDEBUG, so assert is live):
+        // re-derive {cap, W, launched} for every gated member by running
+        // draft_and_gate's arithmetic over the SAME recorded margins
+        // (h_draft_margin persists on the engine; the re-run reads exactly
+        // the prefix this round refreshed, because it breaks at the same
+        // first sub-theta). Any mismatch is an interleave logic bug --
+        // caught here, before it can reach the byte gate.
+        for (int i = 0; i < k; i++) {
+            if (sfx[i]) continue;
+            const Engine& e = *ms[i]->e;
+            int rcap = 0, rlaunched = 0;
+            for (int s = 0; s < mdu[i]; s++) {
+                rlaunched++;
+                if (e.draft_margin(s) < e.gate_theta()) break;
+                rcap++;
+            }
+            int rW = rcap + 1 < 2 ? 2 : rcap + 1;
+            assert(rcap == ms[i]->gate_cap && "B8: interleaved cap != draft_and_gate cap");
+            assert(rW == want[i] && "B8: interleaved W != draft_and_gate W");
+            assert(rlaunched == launched[i] && "B8: interleaved launch count diverged");
+            (void)rcap; (void)rW; (void)rlaunched;
+        }
+    }
+
     // One fused round over k >= 2 members (under the caller's Lease).
-    // Sequence per the plan: drafts already ran inside want_width() on each
+    // Sequence per the plan: drafts already ran inside draft_widths() above
+    // (P2a: gated members' steps interleaved across engines) on each
     // engine's OWN stm; record each draft_done event; fused verify on cstm
     // (which waits on the events); per-engine outcome D2H on cstm + ONE
     // sync; per-member commit_outcome (spec_round's post-outcome mirror,
     // incl. dctl/histograms) + post_round (tokens -> queue via the sink,
     // EOS/budget/client-stop -> done).
-    // TODO(Task 10) telemetry skipped in fused rounds, deliberately:
-    // Q27_PHASE_STATS buckets (gs.draft_ms/draft_steps/verify_ms/vw_ms/vw_n/
-    // sfx_ms/sfx_rounds) -- a fused round's wall is SHARED across members,
-    // so per-engine attribution needs a design call, and [sfxdbg]'s propose
+    // Q27_PHASE_STATS in fused rounds (design call resolved, P2 Task 1):
+    // gs.draft_ms/verify_ms/draft_steps ARE stamped, from coarse cstm event
+    // brackets, with SHARED-WALL semantics -- the one fused wall is
+    // attributed IN FULL to EACH member (see the accumulation loop below).
+    // Still deliberately skipped: the per-width verify buckets vw_ms/vw_n
+    // (a fused verify runs ONE union width; binning it per member width
+    // would misprice the curve), sfx_ms/sfx_rounds, and [sfxdbg]'s propose
     // trace lines. Everything else spec_round mutates (last_pending,
     // sfx_valid/sfx.append, perm, dctl, gate_cap/n/lane hists, sfx_fired/
     // sfx_tok, gs.dec/rounds/cb_ms/end) is mirrored via commit_outcome +
     // post_round.
     void fused_round(Member** ms, const int* granted, const bool* sfx, int k,
                      bool* done) {
+        // B3 invariant, enforced not commented: exactly ONE fused round in
+        // flight per Conductor (single conductor thread, synchronous round
+        // loop). The 3-event phase pool is reused every round on the
+        // strength of this -- each round records, syncs, and reads elapsed
+        // before returning -- so a future pipelining change must trip here
+        // loudly instead of silently corrupting timestamps. The bracket
+        // OPENS in draft_widths() (P2c: the draft phase already records on
+        // cstm/draft_done) and closes at the bottom of this function;
+        // core.round() always runs the two back to back on this thread.
+        assert(round_active && "B3: round bracket must be open (draft_widths runs first)");
         Engine* es[ConductorCore<Member>::MAX_K] = {};
         bool sampled[ConductorCore<Member>::MAX_K] = {};
         cudaEvent_t evs[ConductorCore<Member>::MAX_K] = {};
@@ -769,13 +1256,57 @@ private:
             evs[i] = ms[i]->draft_done;
             CUDA_CHECK(cudaEventRecord(evs[i], es[i]->stream()));
         }
-        fused_verify_round(es, granted, k, cstm, evs, sfx, sampled);
+        // P2 Task 1: coarse per-round phase walls, bracketed by timing
+        // events on cstm (records on an in-order stream do not reorder or
+        // synchronize any work -- they only timestamp):
+        //   ev_round_start .. ev_draft_end = the cstm-visible DRAFT wait
+        //     (ev_draft_end is recorded by fused_verify_round right after
+        //     its draft_done waits). P2a interleaves the margin loops but
+        //     still host-syncs every step (draft_widths above), so this
+        //     span is only the unsynced draft tail (floor top-up launches /
+        //     suffix prep+H2D); the concurrent margin-loop wall lives
+        //     host-side in draft_widths, before ev_round_start exists.
+        //   ev_draft_end .. ev_verify_end = fused VERIFY: union sweep +
+        //     per-engine mixers/tails + the outcome D2H enqueue.
+        CUDA_CHECK(cudaEventRecord(ev_round_start, cstm));
+        // P2b: hand the side-stream pool to the verify round so each
+        // engine's mixers fork off cstm per layer (rationale + audit at
+        // MixerFork / fused_verify_round).
+        MixerFork mfork{side_, ev_fork_, ev_mix_};
+        fused_verify_round(es, granted, k, cstm, evs, sfx, sampled, ev_draft_end, &mfork);
         int oc[ConductorCore<Member>::MAX_K][OUTCOME_INTS];
         for (int i = 0; i < k; i++)
             CUDA_CHECK(cudaMemcpyAsync(oc[i], es[i]->outcome_dev(), OUTCOME_INTS * 4,
                                        cudaMemcpyDeviceToHost, cstm));
+        CUDA_CHECK(cudaEventRecord(ev_verify_end, cstm));
         CUDA_CHECK(cudaStreamSynchronize(cstm)); // ONE sync for the batch
+        float ph_d = 0.f, ph_v = 0.f; // this round's phase walls (ms)
+        CUDA_CHECK(cudaEventElapsedTime(&ph_d, ev_round_start, ev_draft_end));
+        CUDA_CHECK(cudaEventElapsedTime(&ph_v, ev_draft_end, ev_verify_end));
         for (int i = 0; i < k; i++) {
+            // Q27_PHASE_STATS (P2 Task 1), SHARED-WALL semantics: a fused
+            // round has ONE wall, attributed IN FULL to EACH member's gs --
+            // phd/phv answer "how long did THIS request's rounds spend in
+            // each phase" (matching the [req] per-request parse). Summing
+            // phd/phv ACROSS concurrently-batched requests double-counts
+            // the wall. phs stays honest per-member (steps THIS member
+            // launched). Runs BEFORE the try block below for the same
+            // close-edge reason as the bat counters: gs must be final
+            // before any queue op can let the request thread proceed.
+            if (es[i]->phase_stats_on()) {
+                // launched = min(cap+1, md): exact identity with
+                // draft_and_gate's margin loop (a sub-theta break at
+                // step k has counted that step, cap+1; a full run is
+                // md). Excludes floor top-up launches, mirroring the
+                // solo dexit accounting (engine.cuh, gs.draft_steps +=
+                // launched). gate_cap < 0 = suffix round, no MTP steps.
+                long ph_s = 0;
+                if (ms[i]->gate_cap >= 0) {
+                    ph_s = ms[i]->gate_cap + 1;
+                    if (ph_s > ms[i]->md_used) ph_s = ms[i]->md_used;
+                }
+                es[i]->phase_stats_add(ph_d, ph_v, ph_s); // A4 accessor
+            }
             // Task 10 [req] bat= telemetry FIRST: this member's round ran
             // k-wide (k >= 2 by the core's dispatch; on the catch path the
             // GPU work also already ran -- the throw is host bookkeeping).
@@ -807,6 +1338,9 @@ private:
                 done[i] = true;
             }
         }
+        round_active = false; // B3: always reached -- the catch arms above
+                              // swallow host exceptions per member and
+                              // CUDA_CHECK exits the process, never throws
     }
 
     // Done-path epilogue (finish_decode already ran inside pre_round/
@@ -831,6 +1365,15 @@ private:
     ConductorCore<Member> core;             // conductor-thread-only state
     std::vector<std::unique_ptr<Member>> owned; // conductor-thread-only
     cudaStream_t cstm = nullptr;
+    // P2 Task 1 phase-wall pool (TIMING events; ctor/dtor comments) + the
+    // B3 one-round-in-flight invariant flag (conductor-thread-only).
+    cudaEvent_t ev_round_start = nullptr, ev_draft_end = nullptr,
+                ev_verify_end = nullptr;
+    // P2b mixer fork/join pool (ctor comment: sizing justification). Sized
+    // MAX_K, used [0..k) per round; conductor-thread-only like cstm.
+    cudaStream_t side_[ConductorCore<Member>::MAX_K] = {};
+    cudaEvent_t ev_fork_ = nullptr, ev_mix_[ConductorCore<Member>::MAX_K] = {};
+    bool round_active = false;
     std::thread th;
     std::mutex m; // guards join_q + stop (the cross-thread handoff surface)
     std::condition_variable cv;
