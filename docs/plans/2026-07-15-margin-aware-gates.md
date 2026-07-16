@@ -57,6 +57,18 @@ positions, minutes not hours.
    different block sizes change merge fold order — previously unshippable,
    now L2/L3-gated. Bench first on `metal_attn_bench` (wall only), then
    envelope-gate the winner.
+   **[Block-size swept same night via `Q27_METAL_GQA_BLOCK`: FLAT —
+   128/256/512/1024 within ±2% at 32K on decode, chunk, and t2 (2048
+   degrades ~8%). 4× the threadgroups bought nothing: the limiter is
+   within-threadgroup serial cadence, consistent with the R2-restage kill.
+   Nothing to envelope-gate; default stays 1024; adaptive-block-for-
+   shallow-decode is dead for good. Head-grouping {1,2,3} is now expected
+   negative too — smaller groups duplicate tile staging without shortening
+   any per-simdgroup dependency chain — deprioritized below the
+   double-buffered-staging idea (overlap next tile's dequant with current
+   tile's softmax walk, one barrier per tile instead of two; costs +8 KB
+   tgmem unless staged half — an L2/L3 candidate since half staging rounds
+   the dequantized values).]**
 2. **Prefill prescaled-half staging (variant A)** — died on the 3e-4 shape
    suite; the rounding is per-value staging rounding, exactly the class the
    contract bounds empirically. Re-price AFTER the three-roofline
