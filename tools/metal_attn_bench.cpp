@@ -125,8 +125,12 @@ int main(int argc, char** argv) {
         fprintf(stderr, "invalid arguments\n");
         return 1;
     }
-    // Route every depth through the blocked GQA kernels (the probe baseline).
+    // Route every depth through the blocked GQA kernels, and pin the
+    // production causal route to the UNTILED kernel so the "gqa" rows are a
+    // stable factor-1 baseline for the probe ratios (the engine default is
+    // tiled; its in-situ cost is the t2 row).
     setenv("Q27_METAL_GQA_THRESHOLD", "1", 0);
+    setenv("Q27_METAL_GQA_TILE", "1", 0);
 
     q27::MetalBackend backend;
     const bool turbo3 = kv == "turbo3";
@@ -210,7 +214,7 @@ int main(int argc, char** argv) {
             if (!read_equal(backend, *out_a, *out_b, (uint64_t)tokens * N_HEAD * HEAD_DIM * 4, what))
                 return 1;
         }
-        printf("verify: head-major + token-tiled (t2/t4) bit-identical to production GQA\n");
+        printf("verify: head-major + token-tiled (t2/t4) bit-identical to the untiled GQA kernels\n");
     }
 
     // ---- Timing ----
