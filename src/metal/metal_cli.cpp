@@ -437,13 +437,13 @@ int main(int argc, char** argv) {
             q27::MetalEngine base(shared, context, false);
             q27::MetalEngine subj(shared, context, false);
             q27::MetalBackend& bk = base.backend();
-            // Without chunked prefill both engines take the serial per-token
-            // path and the half/blocked/serial pairs collapse to identical
-            // configs — a vacuous all-zero "envelope" (codex P2). Only the
-            // repeat (determinism) class is meaningful there.
-            if (envelope_mode != "repeat" && !base.chunked_prefill())
+            // Without chunked prefill the half and serial pairs collapse to
+            // identical configs — a vacuous all-zero "envelope" (codex P2).
+            // repeat (determinism) and blocked (the GQA threshold routes the
+            // serial attention path too) stay meaningful there.
+            if ((envelope_mode == "half" || envelope_mode == "serial") && !base.chunked_prefill())
                 throw std::runtime_error("--envelope " + envelope_mode +
-                                         " needs the chunked path (Apple GPU family 7+); only 'repeat' runs on this device");
+                                         " needs the chunked path (Apple GPU family 7+); 'repeat' and 'blocked' run on this device");
             const bool mode_half = envelope_mode == "half";
             const bool mode_blocked = envelope_mode == "blocked";
             const bool mode_serial = envelope_mode == "serial";
