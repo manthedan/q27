@@ -967,7 +967,9 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
         weight.dtype!=DType::T2_G128) || !weight.data || !weight.scales)
         throw std::runtime_error("q27 Metal: quantized matmul requires Q4/Q8/T2 weight");
     uint64_t group=weight.dtype==DType::Q4_G64?64:128;
-    if(!x_rows || x_rows>12 || !weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
+    // Wide prefill chunks: the kernels tile tokens 16 per threadgroup on
+    // grid.y (docs/plans/2026-07-15-wide-chunks.md phase A). 96 = 8x12.
+    if(!x_rows || x_rows>96 || !weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
        weight.cols%group || (uint64_t)weight.cols*x_rows>UINT32_MAX || x.count!=weight.cols*x_rows || !x.values || !x.scales)
         throw std::runtime_error("q27 Metal: invalid quantized matmul dimensions");
     check_range(y.size(),0,weight.rows*x_rows*4,"quantized matmul output");
@@ -990,7 +992,7 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,(NSUInteger)(x_rows+15)/16,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
         if(own) impl_->finish_command("quantized simdgroup matmul");
     }
 }
