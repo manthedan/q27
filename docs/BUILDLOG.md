@@ -5713,3 +5713,176 @@ independent codebases converge on the same ~117 t/s MTP ceiling, and q27 is a fu
 is dead on hybrid-GDN (0% reuse) -> re-prefill every turn, plus the litellm hop. q27/llama
 reuse prefix state across turns and convert competitive decode into low wall time. Quality
 engine-independent (11-12/12). Full 5-engine table + vLLM caveats in docs/BENCHMARKING.md.
+
+**2026-07-14 -- EXTERNAL PERF-REVIEW TRIAGE: top-3 items measured, all three priced
+at <=0.5%; the review's value ranking inverted reality.** A 6-item external review
+(tokenizer prefix cache / exact-BPE heap / GPU-side draft-depth / continuous batching /
+ckpt traffic / reset clears) triaged by measurement before building anything.
+
+(1) Review #3 "keep draft-depth decisions on the GPU" (claimed strongest single-request
+lever): dexit A/B on vanilla qwen (fp8, PMIN=0.5, MAXD=auto, codegen+echo replays,
+scratchpad/dexit_ab.sh, phd/phv/phs from [req]): per-draft-step wall 818us with
+Q27_DEXIT=1 (launch+D2H+sync EVERY step) vs 810us with Q27_DEXIT=0 (monolithic, one
+sync) on codegen; echo 820 vs 813 (det=OK). The entire per-step launch+sync+pageable-
+staging overhead is ~8us/step = ~2-3ms/request = 0.15% of decode wall. A device-side
+continuation flag / conditional graph node has nothing to recover; dexit's win is
+SKIPPING steps (283 vs 405 launched, +4-6% tps), already shipped as default. NO-GO.
+
+(2) Review #1/#2 (cache tokenized prefixes; exact priority-queue BPE): whole-prompt
+re-encode measured at 2.8-3.7M tok/s (scratchpad/tok_bench.cpp on real replay prompts):
+22ms @61K-tok prompt, 9ms @26K; server-side [req] tok_ms=12 @26.8K agrees. A perfect
+prefix cache saves ~20ms of TTFT per turn on a maxed conversation -- <1% of any real
+turn. The BPE loop is O(word^2) per WORD, words are whitespace-delimited and tiny; the
+1024-byte cap only rechunks degenerate no-whitespace blobs (deliberate, 94e645a). LOW,
+not built.
+
+(3) Decode wall split, codegen @26.8K warm (the serving shape): verify 83% / draft 15% /
+suffix 2.5% / residual ~0. The wall is the verify round's weight GEMV -- already at the
+07-13 SOL floor (k_vgemm). No review item touches it.
+
+(4) Review #5 ckpt traffic: ~150MB async D2H per checkpoint every 4096 tok on the
+compute stream = ~100ms inside an 8.2s cold 26.8K prefill (1.2%); warm turns snapshot-hit
+(pf=1, ckpt never fires). Review #6 reset() clears: cold-path only, single-digit ms; the
+full-clear is deliberate (graph-capture state match, width-12 fix). Both LOW.
+
+(5) Review #4 continuous batching across slots: the only structurally real item --
+aggregate throughput under CC subagent fan-out. Scheduler+kernel refactor, needs a
+design pass; filed, not started.
+
+Hygiene noted, not built: h_draft_margin / oc[] / h_sfx_prop are pageable (each async
+copy takes a staging hop) -- but that cost is already inside the measured 8us/step, so
+pinning is worth ~1ms/request at best. Prefill datapoint banked: 3258 t/s @26.8K fp8
+cold. METHOD (again): measure before building -- the review's "highest value" item was
+worth 0.15% and its "smaller wins" were already priced into an 8us number.
+
+**2026-07-15 -- CONTINUOUS BATCHING P1 -- 2-slot aggregate A/B.** The headline
+gate (plan Task 11): Q27_BATCH=1 conductor vs the FIFO-interleave baseline.
+METHOD: codegen+docs accept payloads at max_tokens 512 (longer decode window =
+cleaner overlap), fired concurrently, 1 warmup pass + 3 measured reps, fresh
+q27-server-w16 per leg (fp8 KV, PMIN 0.5, MAXD auto, 32K x 2 slots), aggregate
+= summed dec / concurrent-window wall, median of 3 (tools/batch_ab.sh).
+
+MEASURED: **1.21x -- MISSES the 1.3x bar** (design projection ~1.4x). Not tuned;
+attributed (below) and shipped honest -- P2/P3 exist for exactly these levers.
+- A FIFO:            169.1 t/s agg (169.1/169.1/169.1; per-req 85.0/88.6)
+- B batched:         204.0 t/s agg (204.0/205.9/200.6; per-req 102.6/107.6;
+                     bat=2.0, 159 fused rounds/req -- batching engaged)
+- C batched+GEMM=1:  201.0 t/s agg -> C/B = -1.5%. The always-vgemm union sweep
+  is FASTER per round (27.9 vs 29.9 ms) but loses tok/round (2.99 vs 3.22; its
+  tolerance-class text is different traffic). The A1 solo-matching family
+  policy costs nothing at 2 slots -- keep it.
+- D solo regression (A10): BATCH=1 solo p50 vs BATCH=0: codegen -0.06%, docs
+  +0.00% -- the conductor k==1 fallthrough is free. PASS.
+
+ATTRIBUTION (diagnostic reps with Q27_PHASE_STATS=1 + Q27_BATCH_DBG=1, one per
+leg, unmeasured): baseline is honest -- under FIFO each request's GPU-active
+round is exactly solo pace (phd+phv = 18.2 ms/round == solo warmup; dec_ms
+36.4 ms/round-pair with yields=159 = pure serialization, zero interleave tax).
+Fused k=2 round wall = 29.9 ms vs the design price 26.0 (serial drafts 2x2.8 +
+fused weights ~11.3 + serial mixers 2x4.6 -> 1.40x). The +3.9 ms/round excess
+is the whole miss (36.4/29.9 = 1.22x observed). The plan's three suspects:
+(a) serial mixers: present AS PRICED, 9.1/29.9 = 30% of the round (plan said
+    ~27%). Not the miss; the P2 side-stream lever is worth ~4.6 ms/round.
+(c) serial drafts: as priced (5.6 ms). P2 draft-fusion lever ~2.8 ms.
+(b) the unpriced +3.9 ms splits in two, both measured: ~2.0 ms = the GEMV
+    family scaling worse at union widths 7-12 than the flat weights price
+    (leg C's family swap recovers exactly 2.0 ms of round wall); ~1.9 ms =
+    eager-launch/sync tax of the fused body (~1100 launches/round vs solo's
+    ONE graph launch; C residual after priced components = 1.9). P3
+    shape-graphs + P2 family/width tuning. Trim is NOT a factor (4/159 dbg
+    rounds, all 16->11s suffix; unions <=12 vs cap 16 otherwise), and the
+    conductor is NOT a factor (D = 0%; B codegen's 12-round solo tail runs
+    phv 15.8 ms/rnd ~= solo 15.4).
+Post-P2/P3 arithmetic from these walls: 29.9 - 4.6 (mixers) - 1.9 (graphs)
+- 2.8 (draft fusion) ~= 20.6 ms -> ~1.75x, consistent with the design's P2
+projection (~1.7x). The 1.3x bar is reachable with the mixer lever alone.
+
+TEXTS (greedy): docs A == B byte-identical 3/3 (all-gated, untrimmed --
+bitwise contract holds). codegen B forks vs A at bytes 673/429/425 across
+reps == the documented pre-existing w16-vs-w12 suffix-width fork (Task 10:
+672 cold / 428 warm), entering ONLY via the 16->11s trimmed suffix rounds
+(A1 policy fork); rep-to-rep md5s differ because join alignment + cumulative
+depthctl move the trim point. dec=512 on every request, every leg. C forks
+both payloads (vgemm tolerance family, priced) but is rep-deterministic.
+Task 9 TODO check: fused rounds have no phd/phv wall buckets -- fully-fused
+[req] prints clean zeros (phd=0.0 phv=0.0 phs=0), solo-tail rounds fill
+normally, no garbage fields.
+Sanitizer (review-fix pass, 07-15): memcheck 0 errors with FULL allocation
+tracking at a small footprint (w16 server, Q27_BATCH=1 fp8, 8K x 2 slots,
+2 concurrent ~240-token prompts x 64 tokens, 32 fused k=2 rounds, bat=2.0
+both [req] lines; scratchpad/t12_san/sanitizer.small.log) -- the 32K w16
+config OOMs memcheck's own tracking (documented limitation, standing
+kernel-filtered+memory-capped rule).
+
+**2026-07-15 -- CONTINUOUS BATCHING P1: LIVE CC VALIDATION = PASS (stability +
+same-shape quality), merged to master f45a9ad and pushed.** Method: two
+thunderdome CC tasks (T2=bench-collab-server, T5=bench-task-queue) run
+CONCURRENTLY against the batched server, then an identical-shape control with
+Q27_BATCH=0. Vanilla qwen, W12 build, fp8, 2 slots x 49152 (the w16 build's
+2-slot shape maxes at 2x32K on 32GB -- too small for CC tasks, which grew past
+33K by turn ~17 and crashed the first attempt at that shape; W12 2x48K is the
+CC-viable batch-serving config until P2 re-prices).
+
+  leg                       task-queue      collab-server   med tps  errors
+  Q27_BATCH=1 (concurrent)  0.301 completed 0.551 completed 191.4    0
+  Q27_BATCH=0 (same shape)  0.289 completed 0.303 CRASHED   148.7    0
+
+Batched leg: 180 reqs, ZERO end=error / [req-error] / 5xx, server survived the
+full window, 53 reqs with fused rounds (mean width 1.98, deepest bat=2.0,24).
+Same-shape scores equal-or-better with batching ON (control even drew a crash
+basin on collab-server); absolute scores sit below the 131K-era bands on BOTH
+legs -- that is the 2x48K compaction squeeze (26 vs 8 ctx-limit 400s), a
+context-shape effect, not a batching effect. n=1/leg, tie-lottery caveats
+apply; the byte-level correctness claims rest on the Task 10 gates, not on
+these scores. OPS notes: two same-second `thunderdome run` invocations race on
+the results/latest symlink (stagger >=2s); first validation attempt at w16
+2x32K died at the ctx wall, not in the engine (17 clean reqs then repeated
+"prompt is too long" 400s CC could not compact out of at that window).
+Q27_BATCH stays DEFAULT-OFF; flip is a product call now that stability is
+proven -- P2 (mixer overlap, ~1.75x arithmetic) is the remaining perf lever.
+
+**2026-07-15 -- TURBO3 KV x CONTINUOUS BATCHING: VALIDATED (correctness +
+stability + capacity); quality scare at n=1 RETIRED by n=3 (lottery); perf
+tax measured.** Rerun of the CC validation with Q27_KV=turbo3. Gates first:
+fused_smoke honors caller-pinned Q27_KV (94e3684) and ALL legs pass
+byte-identical under turbo3 (solo/fused/conductor/A2-error); then the Task-10
+byte-identity gate under turbo3 (all-gated concurrent replay, suffix off,
+scratchpad/t3_byteident/): 4/4 streams byte-identical to solo, cold AND warm,
+with heavy fusion (bat=2.0,65). The fused path is bytewise sane on turbo3.
+
+CAPACITY: turbo3's 2.56x smaller rows turn the W12 2-slot shape from 2x48K
+(fp8) into 2x96K on 32GB (29.6GB used) -- ZERO ctx-limit 400s across every
+turbo3 CC run (fp8 2x48K drew 8-26 per run). The compaction squeeze that
+capped the fp8 CC validation is gone.
+
+QUALITY (n=3/leg, medians, batched vs same-shape control): task-queue 0.577
+vs 0.540, collab-server 0.287 vs 0.568. Directions MIXED, within-leg spreads
+dominate (task-queue batched spans 0.215-0.607; rep1's alarming 0.215/0.272-
+vs-0.540/0.631 gap inverted at rep2) -- per the standing statistical register
+(n<=9/leg cannot separate binary tables) this is the documented basin
+lottery, NOT a batching effect. CC-agent crashes appeared in BOTH legs and in
+the fp8 control too (eval-artifact class). Absolute turbo3 scores pool below
+the fp8-131K-era bands (0.78-0.85) -- turbo3-vs-fp8 quality remains an OPEN
+dedicated question (the pending PPL+needle gate from the 07-11 port), NOT
+answerable from these shape-confounded runs.
+
+PERF TAX: turbo3 cold prefill 1483 t/s vs fp8 3258 (2.2x slower, 26.8K
+payload); batched-leg per-request decode med 113 t/s (t3 attention dequant +
+P1 serial mixers compound). Stability: ~900 batched requests across the day,
+zero end=error / [req-error] / 5xx, zero server crashes.
+
+SERVING GUIDANCE: fp8 W12 2x48K stays the CC batch-serving default (faster,
+quality-known); Q27_KV=turbo3 is the capacity lever when >48K/slot matters
+more than speed. OPS: bare `wait` in a script that backgrounded the server
+waits forever (use explicit pids); pkill -f self-matches the invoking shell
+(use pkill -x -- relearned the hard way).
+
+**2026-07-15 addendum -- turbo3 2-slot AGGREGATE (batch_ab, w16 2x32K, same
+shape/payloads as the fp8 measurement):** FIFO 159.2 -> batched 197.6 t/s
+aggregate = 1.24x (fp8: 169.1 -> 204.0 = 1.21x). turbo3 batched aggregate
+lands within ~3% of fp8's despite the t3 attention tax -- the tax hits solo
+throughput too, so the batching RATIO is slightly better. Per-request medians
+99.4/102.2 batched vs 80.0/85.1 FIFO. bat_med=2.0, 154 fused rounds/req, 2
+trim events; one codegen rep-3 text fork (suffix-trim class, docs 3/3
+identical) -- the documented tolerance classes, nothing new. batch_ab.sh KV
+now env-overridable (KV=turbo3).

@@ -1,0 +1,8 @@
+depth 0.92: HIT  (31362 prompt tok, 1376.3s) answer: '<think>\n\n</think>\n\n88231'
+depth 0.78: HIT  (31362 prompt tok, 1381.0s) answer: "<think>\n\n</think>\n\nThe secret passphrase for the blue vault is 'cobalt-fern-42'."
+depth 0.70: HIT  (31362 prompt tok, 1346.0s) answer: '<think>\n\n</think>\n\nThe maintenance code for the orbital elevator is 917403.'
+depth 0.60: HIT  (31364 prompt tok, 1378.1s) answer: '<think>\n\n</think>\n\nXanthoria parietina'
+depth 0.35: HIT  (31365 prompt tok, 1381.0s) answer: '<think>\n\n</think>\n\nThe registration number of the airship Peregrine is ZK-4471.'
+depth 0.10: HIT  (31363 prompt tok, 1377.1s) answer: '<think>\n\n</think>\n\nBramblewick'
+needle 32K: 6/6
+needle exit: 0

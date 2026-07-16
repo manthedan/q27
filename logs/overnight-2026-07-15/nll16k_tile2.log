@@ -1,0 +1,16 @@
+Metal model ready on Apple M4 in 6.15 s
+nll-long: 16384 tokens, single pass, no resets (turbo3 KV)
+  nll pos 384/16383  nll pos 768/16383  nll pos 1152/16383  nll pos 1536/16383  nll pos 1920/16383  nll pos 2052: running mean 2.2477 (ppl 9.466)
+  nll pos 2304/16383  nll pos 2688/16383  nll pos 3072/16383  nll pos 3456/16383  nll pos 3840/16383  nll pos 4104: running mean 2.4508 (ppl 11.598)
+  nll pos 4224/16383  nll pos 4608/16383  nll pos 4992/16383  nll pos 5376/16383  nll pos 5760/16383  nll pos 6144/16383  nll pos 6144: running mean 2.5905 (ppl 13.337)
+  nll pos 6528/16383  nll pos 6912/16383  nll pos 7296/16383  nll pos 7680/16383  nll pos 8064/16383  nll pos 8196: running mean 2.6159 (ppl 13.680)
+  nll pos 8448/16383  nll pos 8832/16383  nll pos 9216/16383  nll pos 9600/16383  nll pos 9984/16383  nll pos 10248: running mean 2.5375 (ppl 12.648)
+  nll pos 10368/16383  nll pos 10752/16383  nll pos 11136/16383  nll pos 11520/16383  nll pos 11904/16383  nll pos 12288/16383  nll pos 12288: running mean 2.4403 (ppl 11.477)
+  nll pos 12672/16383  nll pos 13056/16383  nll pos 13440/16383  nll pos 13824/16383  nll pos 14208/16383  nll pos 14340: running mean 2.3321 (ppl 10.300)
+  nll pos 14592/16383  nll pos 14976/16383  nll pos 15360/16383  nll pos 15744/16383  nll pos 16128/16383
+nll-long wall: 737.72 s (22.21 tok/s), overall mean NLL 2.3138 PPL 10.113
+long-context NLL by target position (16384 tokens, no resets):
+  0-2k    : mean NLL 2.2503  PPL    9.491  (n=2047)
+  2k-8k   : mean NLL 2.7390  PPL   15.471  (n=6144)
+  8k-16k  : mean NLL 2.0108  PPL    7.470  (n=8192)
+tile2 exit: 0

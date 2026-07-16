@@ -1,0 +1,5 @@
+Metal model ready on Apple M4 in 5.17 s
+oracle w=12: G 82.65/84.81 ms/tok (serial 12.10/11.79 tok/s), 11 rounds, 11.55 tok/round
+oracle w=12: round 439.51 ms mean, 439.18 ms warm (first 442.78), oracle wall 26.27 tok/s
+oracle w=12: S(w) = 2.199x mean, 2.201x warm | agreement 126/127 (99.2%)
+oracle w=12: state gate PASS (probe 17 vs 17, position 222 vs 222, logits max|d| 0.09174)

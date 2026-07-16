@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <chrono>
@@ -24,6 +25,7 @@
 #include "engine.cuh"
 #include "tokenizer.h"
 #include "api_common.h"
+#include "conductor.h"
 #include "toolgram.h"
 #include "toolconstrain.h"
 #include "../third_party/httplib.h"
@@ -582,6 +584,178 @@ int main(int argc, char** argv) {
         };
     };
 
+    // ------------------------------------------------------------------
+    // P1 continuous batching (Q27_BATCH=1, default OFF). One Conductor owns
+    // every decode round; request threads keep slot claim + tokenize +
+    // prefill (under their own scoped gate lease) and drain a per-request
+    // TokenQueue into the existing consumer lambdas. Q27_BATCH unset/0:
+    // `conductor` stays null and every call site runs the pre-batch path
+    // byte-for-byte (the batch branches below are additive). Batch mode
+    // requires the gated dexit serving config (Q27_PMIN>0 + dexit, the CC
+    // profile defaults above): the fused round's draft_and_gate() asserts
+    // it. Constrained-CAPPED members (h_mask_id0 >= 0, --constrain-tools
+    // engaged without Q27_TOOL_SPLIT) take the gated round SHAPE under
+    // fusion where solo runs the full-width monolithic graph -- the mask +
+    // accept-cap still apply in the per-engine tail, a documented P1
+    // divergence class, not a gate target.
+    // Lifecycle (review pass 2, VERIFIED against the vendored httplib
+    // 0.18.3): conductor.reset() at main's end runs only after srv.listen()
+    // returns, and listen_internal() calls task_queue->shutdown()
+    // (third_party/httplib.h:6821), which joins EVERY ThreadPool worker --
+    // in-flight handler threads included -- before returning (t.join(),
+    // httplib.h:789); svr.stop() itself only closes the listen socket
+    // (:6337-6346). So no request thread can reach register_member() after
+    // the reset, and the conductor's M4 refusal stays an embedder guard,
+    // not a server path.
+    std::unique_ptr<q27::Conductor> conductor;
+    {
+        const char* e = getenv("Q27_BATCH");
+        if (e && atoi(e) != 0) {
+            // Batch-mode config validation (review M2), mirroring the
+            // gemm_min guardrail's refuse-to-run posture (engine.cuh "THE
+            // GUARDRAIL"): the conductor's draft_and_gate() asserts the
+            // gated-dexit greedy-spec config PER ROUND -- i.e. deep into
+            // serving, on a live request. Check the env strings HERE, before
+            // the Conductor exists, with logic identical to the engine's own
+            // parses (build_spec_graphs / make_decode_task /
+            // set_tool_constraint -- the engine reads them later, so parse
+            // the raw strings the same way it will).
+            const char* pm = getenv("Q27_PMIN"); // engine: atof; gate iff > 0
+            if (!pm || atof(pm) <= 0) {
+                fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the gated draft "
+                                "(Q27_PMIN > 0; it is %s). Set Q27_PMIN=0.5 or drop Q27_BATCH.\n",
+                        pm ? pm : "unset");
+                exit(1);
+            }
+            const char* de = getenv("Q27_DEXIT"); // engine: atoi != 0, default on
+            if (de && atoi(de) == 0) {
+                fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the dexit draft "
+                                "loop (Q27_DEXIT=%s disables it). Drop Q27_DEXIT or Q27_BATCH.\n",
+                        de);
+                exit(1);
+            }
+            if (getenv("Q27_SAMPLE_PLAIN")) { // engine: presence-only
+                fprintf(stderr, "q27-server: FATAL -- Q27_SAMPLE_PLAIN (any value) forces the "
+                                "plain sampler, which has no fused path. Drop it or Q27_BATCH.\n");
+                exit(1);
+            }
+            if (getenv("Q27_TOOL_SPLIT")) { // engine: presence-only
+                fprintf(stderr, "q27-server: FATAL -- Q27_TOOL_SPLIT (any value) enables the "
+                                "split constrained rounds, which have no fused path. Drop it "
+                                "or Q27_BATCH.\n");
+                exit(1);
+            }
+            conductor = std::make_unique<q27::Conductor>(gpu_gate);
+            fprintf(stderr, "continuous batching: ON (Q27_BATCH=1, union cap %d)\n", W_MAX);
+        }
+    }
+    // Batch-mode generation driver shared by every generate() call site.
+    // Wiring contract (plan Task 10 + addenda A3/A7):
+    //  - PREFILL runs on THIS request thread under the scoped lease below,
+    //    with the caller's round_gap yield hook still installed -- cold
+    //    prefills time-slice against conductor decode rounds at chunk
+    //    granularity exactly as before;
+    //  - the lease dies at the inner scope's end: from there the CONDUCTOR
+    //    owns decode GPU arbitration (A7: a request thread must never hold
+    //    the gate while blocked on a TokenQueue, or decode deadlocks);
+    //  - on_round_gap is cleared BEFORE registration (Task 9 invariant: the
+    //    conductor's per-round lease release IS the yield; a member yielding
+    //    the conductor's own lease from inside post_round would break the
+    //    one-Lease-per-round structure);
+    //  - on_emit (nullable) runs on the CONDUCTOR thread inside post_round,
+    //    between the on_round scan and on_pending -- the /v1/messages paths
+    //    route tc.on_id there, so grammar feeding keeps its exact solo
+    //    ordering AND the P7 mask-pool invariant survives: every mask-pool
+    //    mutation site (tc.apply/on_drafts/on_pending -> mask_pool_add,
+    //    set_tool_constraint/set_tool_masks5) still runs while the GPU gate
+    //    is held -- now by the conductor's round lease (the "mutated only
+    //    from generation callbacks, which run while holding the GPU gate"
+    //    invariant at the tool_mask_cache declaration above);
+    //  - THIS thread drains the queue into on_token (the unchanged consumer
+    //    bodies). on_token returning false (client disconnect) sets t.cancel
+    //    (A3) and the drain continues until the queue closes, so the member
+    //    always finishes conductor-side teardown before this frame (tc, SSE
+    //    sinks, hooks) unwinds. tc.end()'s constraint clear then runs on an
+    //    engine the conductor has already left -- gate-less, but it is
+    //    exactly the microsecond async-copy class GpuGate::Lease documents
+    //    as exempt, and it is stream-ordered ahead of the slot's next work.
+    // Returns t.emitted -- solo generate()'s return value for every natural
+    // finish (on cancel it counts tokens delivered before the cut).
+    // err_out (nullable): receives the queue's error slot when the member
+    // FAILED (A2 host-exception unwind or the M4 registration refusal)
+    // instead of finishing -- the caller's honest-surfacing hook (500 when
+    // nothing was emitted / Anthropic SSE error event); gs.end="error" is
+    // stamped either way so the [req] line never reports a failed
+    // generation as a normal finish.
+    auto batch_generate = [&](Engine& eng, const std::vector<int>& prompt, int nm,
+                              std::function<bool(int)> on_token,
+                              std::function<void(int)> on_emit, int stable_len, double& qw,
+                              const ReqTrace& rt, Engine::DecodeTask& t,
+                              std::string* err_out) -> int {
+        q27::TokenQueue q;
+        {
+            q27::GpuGate::Lease lk(gpu_gate);
+            qw = ms_since(rt.t0);
+            int P = 0;
+            if (!eng.generate_prefill(prompt, stable_len, &P)) {
+                eng.on_round_gap = nullptr;
+                return 0; // refused; gs.end already stamped for req_log
+            }
+            eng.on_round_gap = nullptr; // Task 9 invariant (contract above)
+            // sink is replaced by register_member; the queue carries tokens
+            eng.make_decode_task(t, nm, EOS, on_token, P);
+        } // lease released: decode arbitration belongs to the conductor
+        conductor->register_member(&eng, &t, &q, std::move(on_emit));
+        bool client_gone = false;
+        std::vector<int> ids;
+        try {
+            while (q.pop(ids)) {
+                for (int id : ids)
+                    if (!client_gone && !on_token(id)) {
+                        client_gone = true;
+                        t.cancel.store(true); // A3: takes effect at a round boundary
+                    }
+                ids.clear();
+            }
+        } catch (...) {
+            // A2 mirror: never unwind past the drain while the conductor
+            // still owns the member (its hooks reference this frame).
+            // Cancel, drain to close, then let HookGuard & co. run.
+            t.cancel.store(true);
+            ids.clear();
+            while (q.pop(ids)) ids.clear();
+            throw;
+        }
+        // Error surfacing (review pass 2): a non-null error slot means the
+        // A2 unwind failed the queue (host exception in this member's
+        // bookkeeping) or registration was refused (M4) -- no normal finish
+        // reason exists. Stamp gs.end for the [req] line (the A2 path
+        // already stamped it conductor-side via finish_decode; the refusal
+        // path never reached a finish), log the what() -- the queue copy is
+        // the ONLY place it survives -- and hand it to the caller. Safe to
+        // touch eng.gs here: the queue observed closed, the conductor's
+        // fail() was its last access to this request's state (close-edge
+        // rule, conductor.h fail_member).
+        if (const char* err = q.error_or_null()) {
+            eng.gs.end = "error";
+            fprintf(stderr, "[req-error] rid=%ld %s\n", rt.rid, err);
+            if (err_out) *err_out = err;
+        }
+        return t.emitted;
+    };
+    // Batch-mode [req] telemetry: mean members-per-round across this
+    // request's decode rounds + how many of its rounds ran fused (k >= 2),
+    // from the conductor-filled DecodeTask counters. Appended LAST (after
+    // the sfx/ph/tg optionals; reqlog parsers stop at end=) and empty when
+    // Q27_BATCH is off, so the default [req] line is byte-identical.
+    auto bat_stats = [&conductor](const Engine::DecodeTask& t) -> std::string {
+        if (!conductor) return std::string();
+        char b[48];
+        snprintf(b, sizeof b, " bat=%.1f,%ld",
+                 t.rounds > 0 ? (double)t.bat_members / t.rounds : 0.0, t.bat_r2);
+        return std::string(b);
+    };
+
     httplib::Server srv;
     srv.set_logger([](const httplib::Request& req, const httplib::Response& res) {
         fprintf(stderr, "[http] %s %s -> %d\n", req.method.c_str(), req.path.c_str(),
@@ -694,7 +868,10 @@ int main(int argc, char** argv) {
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             eng.samp = parse_sample(body);
-            q27::GpuGate::Lease lk(gpu_gate);
+            // Q27_BATCH: solo keeps the whole-call lease; batch mode scopes
+            // its prefill lease inside batch_generate (A7) and re-stamps qw.
+            std::optional<q27::GpuGate::Lease> lk;
+            if (!conductor) lk.emplace(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
             // re-clamp to the routed slot (rows P+1..P+gate_maxd+1 must stay
@@ -702,13 +879,30 @@ int main(int argc, char** argv) {
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             std::string text;
             q27::Utf8Gate ugate;
-            int n = eng.generate(prompt, n_max, EOS, [&](int id) {
+            auto on_tok = [&](int id) {
                 text += ugate.feed(tok.decode_one(id));
                 return true;
-            });
+            };
+            Engine::DecodeTask bt;
+            std::string berr;
+            int n = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr, -1,
+                                               qw, rt, bt, &berr)
+                              : eng.generate(prompt, n_max, EOS, on_tok);
             eng.on_round_gap = nullptr;
             text += ugate.flush();
-            req_log(rt, qw, eng, sl.id);
+            req_log(rt, qw, eng, sl.id, bat_stats(bt));
+            // batch error surfacing (review pass 2): nothing emitted = an
+            // honest 500 in the OpenAI error envelope; if tokens WERE
+            // produced, keep the 200 with the partial text -- end=error is
+            // already in the [req] line either way.
+            if (!berr.empty() && n == 0) {
+                res.status = 500;
+                res.set_content(json{{"error", {{"message", berr},
+                                                {"type", "api_error"}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             json choice;
             if (chat)
                 choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
@@ -734,7 +928,8 @@ int main(int argc, char** argv) {
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 eng.samp = samp;
-                q27::GpuGate::Lease lk(gpu_gate);
+                std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
+                if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
@@ -752,11 +947,20 @@ int main(int argc, char** argv) {
                     return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
                                 {"model", served_name}, {"choices", json::array({choice})}};
                 };
-                int produced = eng.generate(prompt, nm, EOS, [&](int id) {
+                auto on_tok = [&](int id) {
                     // empty pieces (control tokens, gate holdbacks) still probe
                     // the socket so a disconnected client stops generation
                     return send(piece_chunk(ugate.feed(tok.decode_one(id))));
-                });
+                };
+                Engine::DecodeTask bt;
+                // TODO(batch error surfacing): on a failed queue (A2) this
+                // stream just ends with a normal finish_reason -- the OpenAI
+                // SSE shape has no standard mid-stream error event, so none
+                // is invented; end=error lands in the [req] line and
+                // [req-error] carries the what().
+                int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
+                                                          -1, qw, rt, bt, nullptr)
+                                         : eng.generate(prompt, nm, EOS, on_tok);
                 eng.on_round_gap = nullptr;
                 std::string tailp = ugate.flush();
                 if (!tailp.empty()) send(piece_chunk(tailp));
@@ -771,7 +975,7 @@ int main(int argc, char** argv) {
                     send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
                               {"model", served_name}, {"choices", json::array({fchoice})}});
                 }
-                req_log(rt, qw, eng, sl.id);
+                req_log(rt, qw, eng, sl.id, bat_stats(bt));
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
                 sink.done();
@@ -866,7 +1070,8 @@ int main(int argc, char** argv) {
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
             eng.samp = parse_sample(body);
-            q27::GpuGate::Lease lk(gpu_gate);
+            std::optional<q27::GpuGate::Lease> lk; // solo whole-call hold; batch
+            if (!conductor) lk.emplace(gpu_gate);  // leases inside batch_generate
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
@@ -891,17 +1096,39 @@ int main(int argc, char** argv) {
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             if (tc.enabled)
                 eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-            int n = eng.generate(prompt, n_max, EOS, [&](int id) {
-                tc.on_id(id);
+            auto on_tok = [&](int id) {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                 return true;
-            }, stable_len);
+            };
+            Engine::DecodeTask bt;
+            std::string berr;
+            // batch: tc.on_id rides on_emit -- the CONDUCTOR thread, between
+            // scan_round and on_pending, its exact solo slot (driver contract)
+            int n = conductor
+                        ? batch_generate(eng, prompt, n_max, on_tok,
+                                         [&](int id) { tc.on_id(id); }, stable_len, qw,
+                                         rt, bt, &berr)
+                        : eng.generate(prompt, n_max, EOS, [&](int id) {
+                              tc.on_id(id);
+                              return on_tok(id);
+                          }, stable_len);
             tc.end();
             eng.on_pending = nullptr;
             eng.on_drafts = nullptr;
             eng.on_round = nullptr;
             eng.on_round_gap = nullptr;
-            req_log(rt, qw, eng, sl.id, tg_stats(tc));
+            req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
+            // batch error surfacing (review pass 2): nothing emitted = an
+            // honest 500 in the Anthropic error envelope (api_error, NOT
+            // invalid_request_error: 400s tell Claude Code to compact/give
+            // up, 500s are retryable). Tokens produced = keep the 200 with
+            // partial content; end=error is in the [req] line either way.
+            if (!berr.empty() && n == 0) {
+                res.status = 500;
+                res.set_content(q27::anthropic_error_json("api_error", berr),
+                                "application/json");
+                return;
+            }
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
@@ -961,7 +1188,8 @@ int main(int argc, char** argv) {
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
                 eng.samp = samp;
-                q27::GpuGate::Lease lk(gpu_gate);
+                std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
+                if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
@@ -1057,17 +1285,28 @@ int main(int argc, char** argv) {
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
                 if (tc.enabled)
                     eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
-                int produced = eng.generate(prompt, nm, EOS, [&](int id) {
-                    tc.on_id(id);
+                auto on_tok = [&](int id) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
                     return alive; // stop generating once the client has disconnected
-                }, stable_len);
+                };
+                Engine::DecodeTask bt;
+                std::string berr;
+                // batch: tc.on_id rides on_emit (conductor thread, solo slot);
+                // a dead client flips `alive` -> the drain cancels (A3)
+                int produced = conductor
+                                   ? batch_generate(eng, prompt, nm, on_tok,
+                                                    [&](int id) { tc.on_id(id); },
+                                                    stable_len, qw, rt, bt, &berr)
+                                   : eng.generate(prompt, nm, EOS, [&](int id) {
+                                         tc.on_id(id);
+                                         return on_tok(id);
+                                     }, stable_len);
                 tc.end();
                 eng.on_pending = nullptr;
                 eng.on_drafts = nullptr;
                 eng.on_round = nullptr;
                 eng.on_round_gap = nullptr;
-                req_log(rt, qw, eng, sl.id, tg_stats(tc));
+                req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
                 for (auto& [ch, t] : sp.feed(ugate.flush())) emit_seg(ch, t);
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
@@ -1107,6 +1346,16 @@ int main(int argc, char** argv) {
                                                {"content_block", {{"type", "text"}, {"text", ""}}}});
                 }
                 close_block();
+                // batch error surfacing (review pass 2): the Anthropic SSE
+                // shape has a first-class `error` event -- emit it through
+                // the existing ev() writer (envelope = anthropic_error_json's
+                // shape) so clients learn the generation FAILED instead of
+                // reading a silent early end_turn. message_delta/message_stop
+                // still follow: error-aware clients abort at the event,
+                // naive ones still get a well-formed stream.
+                if (!berr.empty())
+                    ev("error", {{"type", "error"},
+                                 {"error", {{"type", "api_error"}, {"message", berr}}}});
                 const char* sr = any_call ? "tool_use"
                                           : (produced >= nm ? "max_tokens" : "end_turn");
                 ev("message_delta", {{"type", "message_delta"},
@@ -1294,7 +1543,8 @@ int main(int argc, char** argv) {
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             eng.samp = parse_sample(body);
-            q27::GpuGate::Lease lk(gpu_gate);
+            std::optional<q27::GpuGate::Lease> lk; // solo whole-call hold; batch
+            if (!conductor) lk.emplace(gpu_gate);  // leases inside batch_generate
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
@@ -1318,12 +1568,28 @@ int main(int argc, char** argv) {
                 }
             };
             q27::Utf8Gate ugate;
-            int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
+            auto on_tok = [&](int id) {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                 return true;
-            });
+            };
+            Engine::DecodeTask bt;
+            std::string berr;
+            int produced = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr,
+                                                      -1, qw, rt, bt, &berr)
+                                     : eng.generate(prompt, n_max, EOS, on_tok);
             eng.on_round_gap = nullptr;
-            req_log(rt, qw, eng, sl.id);
+            req_log(rt, qw, eng, sl.id, bat_stats(bt));
+            // batch error surfacing (review pass 2): nothing emitted = 500
+            // (retryable-class for codex; 400 is fatal, header comment).
+            // Tokens produced = keep the 200 with partial items.
+            if (!berr.empty() && produced == 0) {
+                res.status = 500;
+                res.set_content(json{{"error", {{"code", "internal_error"},
+                                                {"message", berr}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!ctx->tool_buf.empty()) flush_tool();
@@ -1347,7 +1613,8 @@ int main(int argc, char** argv) {
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 eng.samp = samp;
-                q27::GpuGate::Lease lk(gpu_gate);
+                std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
+                if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
@@ -1467,12 +1734,22 @@ int main(int argc, char** argv) {
                 };
                 StreamSplitter sp;
                 q27::Utf8Gate ugate;
-                int produced = eng.generate(prompt, nm, EOS, [&](int id) {
+                auto on_tok = [&](int id) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                     return alive; // stop generating once the client has disconnected
-                });
+                };
+                Engine::DecodeTask bt;
+                // TODO(batch error surfacing): no mid-stream error event is
+                // emitted here -- codex-rs (v0.143) keys only off the item /
+                // completed types this handler already sends and defines no
+                // error shape we could mirror without inventing protocol;
+                // end=error lands in the [req] line and [req-error] carries
+                // the what().
+                int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
+                                                          -1, qw, rt, bt, nullptr)
+                                         : eng.generate(prompt, nm, EOS, on_tok);
                 eng.on_round_gap = nullptr;
-                req_log(rt, qw, eng, sl.id);
+                req_log(rt, qw, eng, sl.id, bat_stats(bt));
                 for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
                 for (auto& [ch, t] : sp.flush()) route(ch, t);
                 if (!tool_buf.empty()) flush_tool();
@@ -1535,5 +1812,10 @@ int main(int argc, char** argv) {
     fprintf(stderr, "q27-server listening on http://%s:%d (ctx %d, %s head)\n", host.c_str(),
             port, ctx, fast ? "fast" : "faithful");
     srv.listen(host.c_str(), port);
+    // P1 Task 10 shutdown: stop the conductor (its thread cancels + closes
+    // any remaining members) and join it BEFORE the engines it drives tear
+    // down with `slots` at scope exit.
+    if (conductor) conductor->request_stop();
+    conductor.reset();
     return 0;
 }
