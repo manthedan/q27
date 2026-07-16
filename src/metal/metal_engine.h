@@ -34,6 +34,9 @@ class MetalEngine {
         // second engine cannot pass the per-engine budget check while the
         // pair overcommits the device (codex review finding, 2026-07-15).
         uint64_t cache_bytes = 0;
+        // Artifact path, kept for the disk-snapshot identity hash
+        // (docs/plans/2026-07-16-prefix-snapshots.md).
+        std::string path;
         explicit Shared(Model&& opened) : model(std::move(opened)) {}
     };
     static std::shared_ptr<Shared> open_shared(const std::string& model_path);
@@ -152,6 +155,18 @@ class MetalEngine {
 
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
+    // Prefix snapshots to disk (docs/plans/2026-07-16-prefix-snapshots.md,
+    // Phase 1): the capture/restore composition streamed through host
+    // memory with plain file I/O (no mmap — ds4's lesson). save writes
+    // path.tmp then renames; load validates the whole file structure
+    // (magic, artifact identity, kv dtype, position, every blob length)
+    // before the first GPU write, so a rejected file never leaves mixed
+    // state. tokens are prefix metadata for the Phase-2 server keying.
+    void save_state(const std::string& path, const uint32_t* tokens, uint32_t token_count);
+    uint32_t load_state(const std::string& path);   // returns restored position
+    // Re-run the resident-logits argmax (same GPU kernel as prompt
+    // ingestion) so generation after load_state resumes byte-identically.
+    uint32_t pending_from_logits();
 
     // Constrained tool decoding (BasicToolConstrainer engine surface): an
     // append-only device pool of uint32 legal-token bitsets. mask_pool_add
