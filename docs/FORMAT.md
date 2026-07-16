@@ -57,6 +57,33 @@ reduction axis for every matmul weight in this model.
   `ssm_conv1d` stay F32. No MTP layer (`blk.64.*`) and no `output_q4.weight` alias —
   the loader must tolerate their absence (greedy + suffix drafting only).
 
+### B1_G128 (binary weights, dtype 6)
+- binary codes, group size 128: element `i` of a row -> byte `i/8`, 1 bit at
+  offset `i%8` (**sequential, LSB-first**, same convention as T2); bit `b`
+  decodes to `(2b-1) * scale`, i.e. `{-scale, +scale}`. Every code is valid —
+  integrity rests on the repack round-trip gate, not an illegal-code check.
+- scales: fp16, `[rows, cols/128]`, separate contiguous blob (as T2_G128)
+- effective 1.125 bpw; produced losslessly (byte-copy) from the PrismML fork's
+  ggml type 41 ("Q1_0", 18-byte `{fp16 d; u8 qs[16]}` blocks) — layout read at
+  source, tag prism-b9591-62061f9 (`dequantize_row_q1_0`); see
+  docs/plans/2026-07-15-binary-tier.md. First produced by the dspark drafter
+  repack (`token_embd.weight` only); the full B1 tier remains that plan's
+  Phase 1.
+
+### Q4_1_G32 (dspark drafter, dtype 7, `quant_policy: dspark-q41-v1`)
+- asymmetric 4-bit, group size 32: nibble `q ∈ [0,15]` decodes to `q*d + m`;
+  packing keeps the mainline ggml Q4_1 order verbatim — byte `j` of a group
+  holds element `j` (**low nibble**) and element `j+16` (high nibble). Note
+  this differs from Q4_G64's even/odd nibble split.
+- scales: fp16 `{d, m}` **pairs**, one per group, `[rows, cols/32, 2]`
+  contiguous blob (8.5 KB per 4096-column row); effective 5.0 bpw
+- produced losslessly (byte-copy of code bytes) from mainline ggml type 3
+  blocks (20-byte `{fp16 d; fp16 m; u8 qs[16]}`), layout confirmed at the fork
+  tag (`dequantize_row_q4_1`). Used by the dspark drafter pack: Q4_1 tensors
+  byte-copied, `token_embd` B1_G128, BF16 heads widened exactly to F32, norms/
+  biases F32; no `blk.64.*`, no `output_q4.weight` alias. See
+  docs/plans/2026-07-16-dspark-port-phase0.md for the drafter contract.
+
 ### T3_G128 (experimental, parked — no artifacts produced)
 - base-3 recode of T2: 5 codes per byte (`c0 + 3c1 + 9c2 + 27c3 + 81c4`,
   byte ∈ [0,242]), 26 bytes per 128-column group (byte 25 carries columns

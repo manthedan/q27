@@ -170,6 +170,21 @@ the source read must answer: bit order within bytes, scale derivation (amax
 vs mean-abs — QAT pipelines differ), and whether any tensor in the pack uses
 a different dtype mix than the ternary pack's census.
 
+**READ 2026-07-16 night (tag prism-b9591-62061f9, `~/prism-fork/src`),
+decode side confirmed exactly as expected:** `block_q1_0` = 18-byte
+`{fp16 d; u8 qs[16]}` per 128 (ggml-common.h:180–184); bit `j` lives at
+`qs[j/8]` offset `j%8` — **sequential LSB-first**, same convention as type
+42 — and decodes `bit ? d : -d` (dequantize_row_q1_0, ggml-quants.c:419).
+Bit-order question answered; the scale-derivation question (amax vs
+mean-abs) remains open but is only needed for PRODUCING packs — repack is
+decode-only. **Phase 1's B1_G128 layout (dtype 6) is now implemented and
+first produced** by the dspark drafter repack (`repack_b1` in
+tools/repack.py: verbatim code bytes + split fp16 scale blob, chunked
+bit-exact round-trip gate; the dspark pack's `token_embd.weight`,
+248320×5120, passes). The full-tier repack of `Bonsai-27B-Q1_0.gguf` and
+the census/cross-check against the `-unpacked` masters remain this plan's
+own Phase 1 work.
+
 ## Phase 1 — format + repack
 
 - `B1_G128` = **dtype 6** in FORMAT.md (5 is reserved for T3_G128). Row data
