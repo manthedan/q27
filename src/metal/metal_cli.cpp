@@ -437,6 +437,13 @@ int main(int argc, char** argv) {
             q27::MetalEngine base(shared, context, false);
             q27::MetalEngine subj(shared, context, false);
             q27::MetalBackend& bk = base.backend();
+            // Without chunked prefill both engines take the serial per-token
+            // path and the half/blocked/serial pairs collapse to identical
+            // configs — a vacuous all-zero "envelope" (codex P2). Only the
+            // repeat (determinism) class is meaningful there.
+            if (envelope_mode != "repeat" && !base.chunked_prefill())
+                throw std::runtime_error("--envelope " + envelope_mode +
+                                         " needs the chunked path (Apple GPU family 7+); only 'repeat' runs on this device");
             const bool mode_half = envelope_mode == "half";
             const bool mode_blocked = envelope_mode == "blocked";
             const bool mode_serial = envelope_mode == "serial";
@@ -535,7 +542,20 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "  flip @%u: baseline margin %.4g, rho %.3g\n",
                         flips[i].pos, flips[i].margin, flips[i].rho);
             if (flips.size() > 16) fprintf(stderr, "  ... %zu more flips\n", flips.size() - 16);
+            // Declared hard alarms from the contract: severe FINITE
+            // divergence must fail too, not just NaN/contradiction (codex P1).
+            const double hard_maxd = 2.0, hard_kl = 0.05;
+            const double run_maxd = *std::max_element(m_maxd.begin(), m_maxd.end());
+            const double run_kl = *std::max_element(m_kl.begin(), m_kl.end());
             bool alarm = nan_alarms || contradictions;
+            if (run_maxd > hard_maxd) {
+                fprintf(stderr, "envelope: HARD ALARM max|d| %.4g > %.1f\n", run_maxd, hard_maxd);
+                alarm = true;
+            }
+            if (run_kl > hard_kl) {
+                fprintf(stderr, "envelope: HARD ALARM KL %.4g > %.2f\n", run_kl, hard_kl);
+                alarm = true;
+            }
             if (envelope_mode == "repeat") {
                 double repeat_max = *std::max_element(m_maxd.begin(), m_maxd.end());
                 if (repeat_max != 0.0) {
