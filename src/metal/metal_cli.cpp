@@ -156,6 +156,7 @@ int main(int argc, char** argv) {
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         bool kl_kv = false, kl_self = false;
         uint32_t chunk_parity = 0;
+        std::string envelope_mode;
         for (int i = 3; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--tokens" && i + 1 < argc) token_list = argv[++i];
@@ -166,6 +167,7 @@ int main(int argc, char** argv) {
             else if (arg == "--kl-kv") kl_kv = true;
             else if (arg == "--kl-kv-self") { kl_kv = true; kl_self = true; }
             else if (arg == "--chunk-parity" && i + 1 < argc) chunk_parity = parse_u32(argv[++i], "--chunk-parity");
+            else if (arg == "--envelope" && i + 1 < argc) envelope_mode = argv[++i];
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
@@ -209,10 +211,19 @@ int main(int argc, char** argv) {
         // batched-MTP EOS path (vacuous-gate class, codex P2).
         if (eos_gate && (serial_prefill || validate_only))
             throw std::runtime_error("--eos-gate requires the chunked batched-MTP path; drop --prefill serial/--validate-only");
+        if (!envelope_mode.empty()) {
+            if (envelope_mode != "half" && envelope_mode != "blocked" &&
+                envelope_mode != "serial" && envelope_mode != "repeat")
+                throw std::runtime_error("--envelope must be half|blocked|serial|repeat");
+            if (nll_path.empty())
+                throw std::runtime_error("--envelope rides the --nll FILE input path");
+            if (kl_kv || chunk_parity || turbo3_kv || serial_prefill || !dump_logits.empty())
+                throw std::runtime_error("--envelope is its own instrument; drop --kl-kv/--chunk-parity/--kv turbo3/--prefill serial/--dump-logits");
+        }
         if(!token_list.empty() && !prompt_text.empty()) throw std::runtime_error("--tokens and --prompt are mutually exclusive");
         if (!nll_path.empty() && (!token_list.empty() || !prompt_text.empty() || validate_only))
             throw std::runtime_error("--nll cannot be combined with --tokens/--prompt/--validate-only");
-        if (!nll_path.empty() && !nll_long && !chunk_parity)
+        if (!nll_path.empty() && !nll_long && !chunk_parity && envelope_mode.empty())
             throw std::runtime_error("--nll currently requires --nll-long N (chunked llama-ppl mode is CUDA-only)");
         if (nll_long && nll_path.empty())
             throw std::runtime_error("--nll-long requires --nll FILE");
@@ -408,6 +419,157 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (!envelope_mode.empty()) {
+            // Envelope instrument (docs/plans/2026-07-16-envelope-instrument.md):
+            // two engines, one mapping, teacher-forced in lockstep; the mode
+            // picks the same-model reduction-order pair. Metrics per Q6:
+            // whole-vocab max|d|/RMS as diagnostics, KL, top-1 flips with
+            // baseline margin, and the margin certificate rho over the union
+            // of both top-64 sets (flip certified impossible when rho < 1, so
+            // an observed flip below 1 is a self-contradiction alarm).
+            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            const uint32_t n_want = nll_long ? nll_long : 2048;
+            if (tokens.size() > (size_t)n_want + 1) tokens.resize((size_t)n_want + 1);
+            if (tokens.size() < 13) throw std::runtime_error("--envelope needs at least 13 tokens");
+            if (tokens.size() - 1 > context)
+                throw std::runtime_error("--envelope sequence exceeds --ctx; raise --ctx");
+            auto shared = q27::MetalEngine::open_shared(model_path);
+            q27::MetalEngine base(shared, context, false);
+            q27::MetalEngine subj(shared, context, false);
+            q27::MetalBackend& bk = base.backend();
+            // Without chunked prefill the half and serial pairs collapse to
+            // identical configs — a vacuous all-zero "envelope" (codex P2).
+            // repeat (determinism) and blocked (the GQA threshold routes the
+            // serial attention path too) stay meaningful there.
+            if ((envelope_mode == "half" || envelope_mode == "serial") && !base.chunked_prefill())
+                throw std::runtime_error("--envelope " + envelope_mode +
+                                         " needs the chunked path (Apple GPU family 7+); 'repeat' and 'blocked' run on this device");
+            const bool mode_half = envelope_mode == "half";
+            const bool mode_blocked = envelope_mode == "blocked";
+            const bool mode_serial = envelope_mode == "serial";
+            fprintf(stderr, "Metal model ready on %s (envelope mode %s, two engines, one mapping)\n",
+                    bk.name().c_str(), envelope_mode.c_str());
+            const uint32_t vocab = q27::MetalEngine::vocabulary_size();
+            const uint32_t n = (uint32_t)tokens.size() - 1;
+            std::vector<float> p, q;
+            std::vector<double> m_maxd(n), m_rms(n), m_kl(n), m_rho(n);
+            struct Flip { uint32_t pos; double margin, rho; };
+            std::vector<Flip> flips;
+            uint32_t nan_alarms = 0, contradictions = 0;
+            // Top-64 index extraction (descending by logit).
+            auto top64 = [&](const float* z, std::vector<uint32_t>& out) {
+                out.resize(vocab);
+                for (uint32_t v = 0; v < vocab; v++) out[v] = v;
+                std::partial_sort(out.begin(), out.begin() + 64, out.end(),
+                                  [&](uint32_t x, uint32_t y) { return z[x] > z[y]; });
+                out.resize(64);
+            };
+            std::vector<uint32_t> ta, tb;
+            uint32_t done = 0, chunk_index = 0;
+            while (done < n) {
+                const uint32_t take = std::min(12u, n - done);
+                if (mode_half) bk.set_gemm_half(true);
+                if (mode_blocked) bk.set_gqa_threshold(1);
+                base.teacher_force_logits(tokens.data() + done, take, p);
+                if (mode_half) bk.set_gemm_half(false);
+                if (mode_blocked) bk.set_gqa_threshold(0);
+                if (mode_serial) {
+                    // Serial arm: one step per position, logits read per step.
+                    q.resize((size_t)take * vocab);
+                    for (uint32_t r = 0; r < take; r++) {
+                        subj.step(tokens[done + r]);
+                        std::vector<float> row = subj.read_logits();
+                        std::copy(row.begin(), row.end(), q.begin() + (size_t)r * vocab);
+                    }
+                } else {
+                    subj.teacher_force_logits(tokens.data() + done, take, q);
+                }
+                for (uint32_t r = 0; r < take; r++) {
+                    const uint32_t pos = done + r;
+                    const float* pr = p.data() + (size_t)r * vocab;
+                    const float* qr = q.data() + (size_t)r * vocab;
+                    double maxd = 0.0, sum2 = 0.0;
+                    uint32_t a = 0, b = 0;
+                    bool nan = false;
+                    for (uint32_t v = 0; v < vocab; v++) {
+                        if (!std::isfinite(pr[v]) || !std::isfinite(qr[v])) nan = true;
+                        const double d = std::fabs((double)pr[v] - qr[v]);
+                        if (d > maxd) maxd = d;
+                        sum2 += d * d;
+                        if (pr[v] > pr[a]) a = v;
+                        if (qr[v] > qr[b]) b = v;
+                    }
+                    if (nan) nan_alarms++;
+                    m_maxd[pos] = maxd;
+                    m_rms[pos] = std::sqrt(sum2 / vocab);
+                    m_kl[pos] = q27::forward_kl(pr, qr, vocab);
+                    top64(pr, ta); top64(qr, tb);
+                    double rho_max = 0.0;
+                    auto consider = [&](uint32_t j) {
+                        if (j == a) return;
+                        const double gap = (double)pr[a] - pr[j];
+                        const double err = std::fabs((double)pr[a] - qr[a]) +
+                                           std::fabs((double)pr[j] - qr[j]);
+                        const double rho = gap > 0.0 ? err / gap : 1e30;
+                        if (rho > rho_max) rho_max = rho;
+                    };
+                    for (uint32_t j : ta) consider(j);
+                    for (uint32_t j : tb) consider(j);
+                    m_rho[pos] = rho_max;
+                    if (a != b) {
+                        // Baseline margin between its top-1 and the subject's winner.
+                        flips.push_back({pos, (double)pr[a] - pr[b], rho_max});
+                        if (rho_max < 1.0) contradictions++;
+                    }
+                }
+                done += take;
+                if (++chunk_index % 16 == 0) fprintf(stderr, "  envelope pos %u/%u\r", done, n);
+            }
+            fprintf(stderr, "\n");
+            auto quantiles = [&](std::vector<double> v, const char* name) {
+                std::sort(v.begin(), v.end());
+                auto pick = [&](double f) { return v[std::min(v.size() - 1, (size_t)(f * v.size()))]; };
+                fprintf(stderr, "envelope %-9s p50 %.4g  p90 %.4g  p99 %.4g  p99.5 %.4g  max %.4g\n",
+                        name, pick(0.50), pick(0.90), pick(0.99), pick(0.995), v.back());
+            };
+            fprintf(stderr, "envelope[%s]: %u positions, %zu top-1 flips, %u NaN alarms, %u contradictions\n",
+                    envelope_mode.c_str(), n, flips.size(), nan_alarms, contradictions);
+            quantiles(m_maxd, "max|d|");
+            quantiles(m_rms, "RMS");
+            quantiles(m_kl, "KL");
+            quantiles(m_rho, "rho");
+            for (size_t i = 0; i < flips.size() && i < 16; i++)
+                fprintf(stderr, "  flip @%u: baseline margin %.4g, rho %.3g\n",
+                        flips[i].pos, flips[i].margin, flips[i].rho);
+            if (flips.size() > 16) fprintf(stderr, "  ... %zu more flips\n", flips.size() - 16);
+            // Declared hard alarms from the contract: severe FINITE
+            // divergence must fail too, not just NaN/contradiction (codex P1).
+            const double hard_maxd = 2.0, hard_kl = 0.05;
+            const double run_maxd = *std::max_element(m_maxd.begin(), m_maxd.end());
+            const double run_kl = *std::max_element(m_kl.begin(), m_kl.end());
+            bool alarm = nan_alarms || contradictions;
+            if (run_maxd > hard_maxd) {
+                fprintf(stderr, "envelope: HARD ALARM max|d| %.4g > %.1f\n", run_maxd, hard_maxd);
+                alarm = true;
+            }
+            if (run_kl > hard_kl) {
+                fprintf(stderr, "envelope: HARD ALARM KL %.4g > %.2f\n", run_kl, hard_kl);
+                alarm = true;
+            }
+            if (envelope_mode == "repeat") {
+                double repeat_max = *std::max_element(m_maxd.begin(), m_maxd.end());
+                if (repeat_max != 0.0) {
+                    fprintf(stderr, "envelope: REPEAT NONZERO (max %.4g) — determinism broken\n", repeat_max);
+                    alarm = true;
+                } else {
+                    fprintf(stderr, "envelope: repeat exactly zero at every position (determinism holds)\n");
+                }
+            }
+            if (alarm) { fprintf(stderr, "envelope: ALARM — see above\n"); return 1; }
+            fprintf(stderr, "envelope: instrument clean (quantiles above are the class constants)\n");
+            return 0;
+        }
+
         if (kl_kv) {
             std::vector<uint32_t> tokens = load_token_file(nll_path);
             if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
@@ -591,21 +753,22 @@ int main(int argc, char** argv) {
 
             // State gate: probe argmax and position must match, and the full
             // probe logits must sit inside the known chunk-vs-serial numeric
-            // class. Tolerance calibrated to the MEASURED class envelope, not
-            // to a handful of observations: the 384-position --chunk-parity
-            // serial control read max|dlogit| 0.646 (2026-07-15 round-2 P0
-            // entry), and a prompt on this rig measured 0.337 where the first
-            // three observations were 0.03-0.09 — the earlier 0.25 tolerance
-            // false-failed inside the class. Real state corruption (missing
-            // KV rows, broken gdn_replay) moves logits by orders of magnitude
-            // and flips the probe argmax/position, so 0.7 (envelope + margin)
-            // keeps the gate able to fail.
+            // class. Tolerance calibrated to the MEASURED class envelope
+            // (--envelope serial, 2,048 wikitext2 positions,
+            // 2026-07-16-envelope-instrument.md): p99.5 = 0.646, corpus max
+            // = 1.393 — the earlier 0.25 (three observations) and 0.7
+            // (384-position control max, which turned out to be the class
+            // p99.5) both false-fail inside the class at corpus scale. Real
+            // state corruption (missing KV rows, broken gdn_replay) moves
+            // logits by orders of magnitude and flips the probe
+            // argmax/position, so 1.5 (above corpus max) keeps the gate able
+            // to fail.
             double probe_max_diff = 0.0;
             for (size_t v = 0; v < serial_probe_logits.size(); v++)
                 probe_max_diff = std::max(probe_max_diff,
                                           (double)std::fabs(oracle_probe_logits[v] - serial_probe_logits[v]));
             const bool state_ok = oracle_probe == serial_probe && oracle_end_pos == serial_end_pos &&
-                                  probe_max_diff < 0.7;
+                                  probe_max_diff < 1.5;
             const double g_ms = (g1_ms + g2_ms) / 2.0;
             double total = 0.0;
             for (double v : round_ms) total += v;

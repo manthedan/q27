@@ -2302,6 +2302,14 @@ bool MetalBackend::gqa_blocked_reachable(uint32_t context) const {
     return impl_->gqa_threshold != 0 && context >= impl_->gqa_threshold;
 }
 
+void MetalBackend::set_gemm_half(bool enabled) {
+    impl_->gemm_half = enabled;
+}
+
+void MetalBackend::set_gqa_threshold(uint32_t threshold) {
+    impl_->gqa_threshold = threshold;
+}
+
 uint64_t MetalBackend::max_buffer_length() const {
     return (uint64_t)impl_->device.maxBufferLength;
 }
