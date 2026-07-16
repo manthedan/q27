@@ -74,9 +74,26 @@ class MetalEngine {
     std::vector<uint32_t> generate(const std::vector<uint32_t>& prompt, uint32_t count);
     std::vector<uint32_t> generate_mtp(const std::vector<uint32_t>& prompt,
                                        uint32_t count, uint32_t width);
+    // Batched suffix-burst verification (2026-07-16-suffix-burst-verify.md):
+    // SuffixDraft proposals through the VERIFY_CHUNK_MAX-wide verify chunk
+    // with mtp_round's acceptance/commit semantics. width 2..VERIFY_CHUNK_MAX;
+    // rounds with match < minimum_match fall back to one serial step.
     std::vector<uint32_t> generate_suffix(const std::vector<uint32_t>& prompt,
                                           uint32_t count, uint32_t width,
                                           uint32_t minimum_match = 12);
+    // The pre-lever-2 serial walk (one step() per proposal): the batched
+    // path's A/B control and byte-level reference. width 2..12.
+    std::vector<uint32_t> generate_suffix_serial(const std::vector<uint32_t>& prompt,
+                                                 uint32_t count, uint32_t width,
+                                                 uint32_t minimum_match = 12);
+    // Suffix-burst diagnostics for the last generate_suffix run: rounds that
+    // fell back to serial, and fired-burst lane counts by full-tile bucket.
+    struct SuffixStats {
+        uint64_t fallback_rounds = 0;
+        uint64_t burst_rounds = 0;
+        uint64_t lanes_le16 = 0, lanes_32 = 0, lanes_48 = 0; // dispatched live widths
+    };
+    SuffixStats last_suffix_stats() const { return last_suffix_stats_; }
     uint32_t ingest_prompt(const std::vector<uint32_t>& tokens, bool warm_mtp,
                            bool reset_first = true);
     std::vector<uint32_t> generate_from_pending(uint32_t pending, uint32_t count,
@@ -158,6 +175,11 @@ class MetalEngine {
     // final round of a generation: the final token is committed but never
     // encoded, exactly like mtp_round/serial semantics.
     void oracle_round(const uint32_t* lanes, uint32_t live, bool last, uint32_t* predictions);
+    // Suffix-burst round: oracle_round's caller-lane verify machinery with
+    // mtp_round's real acceptance walk and early-EOS clamp. lanes[0] must be
+    // the pending token; live = 2..VERIFY_CHUNK_MAX. Returns the next pending.
+    uint32_t suffix_round(uint32_t remaining, uint32_t eos, const uint32_t* lanes,
+                          uint32_t live, std::vector<uint32_t>& committed);
 
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
@@ -260,6 +282,7 @@ class MetalEngine {
     uint64_t engine_cache_bytes_ = 0;
     uint32_t position_ = 0;
     SpecStats last_spec_stats_;
+    SuffixStats last_suffix_stats_;
     std::unordered_map<std::string, BackendTensor>& weights_;
     std::vector<LayerState> layers_;
 

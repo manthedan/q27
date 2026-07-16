@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
-                "[-n count] [--ctx count] [--mtp width | --suffix width | --oracle width] [--kv fp16|turbo3] "
+                "[-n count] [--ctx count] [--mtp width | --suffix width | --suffix-serial width | --oracle width] [--kv fp16|turbo3] "
                 "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N] [--chunk-parity N] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--save-state file | --load-state file] [--dump-logits file]\n",
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
     try {
         std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits,nll_path;
         std::string save_state_path, load_state_path;
-        uint32_t count=1,context=128,mtp_width=0,suffix_width=0,oracle_width=0,nll_long=0; q27::SamplingParams sampling;
+        uint32_t count=1,context=128,mtp_width=0,suffix_width=0,oracle_width=0,nll_long=0; bool suffix_serial=false; q27::SamplingParams sampling;
         bool eos_gate=false;
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         bool kl_kv = false, kl_self = false;
@@ -185,7 +185,11 @@ int main(int argc, char** argv) {
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
-            else if (arg == "--suffix" && i + 1 < argc) suffix_width = parse_u32(argv[++i], "--suffix");
+            else if ((arg == "--suffix" || arg == "--suffix-serial") && i + 1 < argc) {
+                if (suffix_width) throw std::runtime_error("--suffix and --suffix-serial are mutually exclusive");
+                suffix_width = parse_u32(argv[++i], arg.c_str());
+                suffix_serial = arg == "--suffix-serial";
+            }
             else if (arg == "--oracle" && i + 1 < argc) oracle_width = parse_u32(argv[++i], "--oracle");
             else if (arg == "--eos-gate") eos_gate = true;
             else if (arg == "--save-state" && i + 1 < argc) save_state_path = argv[++i];
@@ -897,7 +901,9 @@ int main(int argc, char** argv) {
         } else {
             generated = sampling.temperature>0 ? engine.generate_sampled(prompt,count,sampling)
                                            : mtp_width ? engine.generate_mtp(prompt,count,mtp_width)
-                                           : suffix_width ? engine.generate_suffix(prompt,count,suffix_width)
+                                           : suffix_width ? (suffix_serial
+                                                  ? engine.generate_suffix_serial(prompt,count,suffix_width)
+                                                  : engine.generate_suffix(prompt,count,suffix_width))
                                                           : engine.generate(prompt,count);
         }
         if(!dump_logits.empty()) {
@@ -921,6 +927,13 @@ int main(int argc, char** argv) {
             fprintf(stderr,"speculation: %llu rounds, %llu drafts, %llu accepted (%.1f%%)\n",
                     (unsigned long long)spec.rounds,(unsigned long long)spec.drafted,
                     (unsigned long long)spec.accepted,spec.drafted?100.0*spec.accepted/spec.drafted:0.0);
+        if(suffix_width && !suffix_serial) {
+            auto sfx=engine.last_suffix_stats();
+            fprintf(stderr,"suffix bursts: %llu fired (%llu @<=16 lanes, %llu @32, %llu @48), %llu serial-fallback rounds\n",
+                    (unsigned long long)sfx.burst_rounds,(unsigned long long)sfx.lanes_le16,
+                    (unsigned long long)sfx.lanes_32,(unsigned long long)sfx.lanes_48,
+                    (unsigned long long)sfx.fallback_rounds);
+        }
         return 0;
     } catch (const std::exception& error) {
         fprintf(stderr, "%s\n", error.what());
