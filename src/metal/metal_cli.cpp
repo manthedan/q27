@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
         if(!token_list.empty() && !prompt_text.empty()) throw std::runtime_error("--tokens and --prompt are mutually exclusive");
         if (!nll_path.empty() && (!token_list.empty() || !prompt_text.empty() || validate_only))
             throw std::runtime_error("--nll cannot be combined with --tokens/--prompt/--validate-only");
-        if (!nll_path.empty() && !nll_long)
+        if (!nll_path.empty() && !nll_long && !chunk_parity)
             throw std::runtime_error("--nll currently requires --nll-long N (chunked llama-ppl mode is CUDA-only)");
         if (nll_long && nll_path.empty())
             throw std::runtime_error("--nll-long requires --nll FILE");
@@ -201,6 +201,8 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--kl-kv rides the --nll FILE --nll-long N input path");
         if (chunk_parity && nll_path.empty())
             throw std::runtime_error("--chunk-parity rides the --nll FILE input path");
+        if (chunk_parity && nll_long)
+            throw std::runtime_error("--chunk-parity takes its position count from its own argument; drop --nll-long");
         if (chunk_parity && kl_kv)
             throw std::runtime_error("--chunk-parity and --kl-kv are separate instruments");
         if (kl_kv && turbo3_kv)
@@ -235,6 +237,19 @@ int main(int argc, char** argv) {
             if (tokens.size() < 2) throw std::runtime_error("--chunk-parity needs at least two tokens");
             const uint32_t n = std::min<uint32_t>(chunk_parity, (uint32_t)tokens.size() - 1);
             if (n > context) throw std::runtime_error("--chunk-parity N exceeds --ctx; raise --ctx");
+            // Every advertised width must dispatch at least one full-width
+            // chunk, or the report claims coverage that never ran.
+            if (n < 96)
+                throw std::runtime_error("--chunk-parity needs >= 96 positions to exercise widths {17,48,96}; "
+                                         "token file/N gives " + std::to_string(n));
+            // Targets tokens[1..n] index logits directly in nll_of below;
+            // the engines validate only the encoded tokens, so reject
+            // out-of-vocabulary ids up front.
+            const uint32_t vocab = q27::MetalEngine::vocabulary_size();
+            for (uint32_t i = 0; i <= n; i++)
+                if (tokens[i] >= vocab)
+                    throw std::runtime_error("token id " + std::to_string(tokens[i]) +
+                                             " out of vocabulary at position " + std::to_string(i));
             auto shared = q27::MetalEngine::open_shared(model_path);
             q27::MetalEngine baseline(shared, context, turbo3_kv);
             q27::MetalEngine subject(shared, context, turbo3_kv);
@@ -249,7 +264,6 @@ int main(int argc, char** argv) {
                     std::chrono::duration<double>(ready - start).count(),
                     turbo3_kv ? "turbo3" : "fp16",
                     serial_prefill ? ", SERIAL baseline = negative control" : "");
-            const uint32_t vocab = q27::MetalEngine::vocabulary_size();
             fprintf(stderr, "chunk-parity: %u positions, widths {17,48,96} vs width-12 baseline\n", n);
 
             // Canonical width-12 logits, one pass, kept in host memory
@@ -293,6 +307,14 @@ int main(int argc, char** argv) {
                 return idx;
             };
 
+            // The exit code carries the verdict so scripts can gate on it.
+            // The wide path's contract is bit-identity with the width-12
+            // baseline; if that is ever intentionally relaxed, this gate is
+            // re-priced under the margin-aware contract, not silently
+            // loosened. The serial negative control inverts the expectation:
+            // the instrument itself fails if the known chunk-vs-serial
+            // rounding class does not appear at every width.
+            bool gate_fail = false;
             for (uint32_t width : {17u, 48u, 96u}) {
                 subject.reset();
                 std::vector<float> q;
@@ -340,7 +362,18 @@ int main(int argc, char** argv) {
                        flips ? min_flip_margin : 0.0, flips ? max_flip_margin : 0.0,
                        100.0 * overlap / ((double)n * 20.0),
                        subj_nll / n, ref_nll / n, max_nll_delta);
+                const bool differs = max_abs != 0.0 || flips != 0;
+                if (serial_prefill ? !differs : differs) gate_fail = true;
             }
+            if (gate_fail) {
+                fprintf(stderr, serial_prefill
+                        ? "chunk-parity: FAIL — negative control did not fire at every width\n"
+                        : "chunk-parity: FAIL — wide path diverged from the width-12 baseline\n");
+                return 1;
+            }
+            fprintf(stderr, serial_prefill
+                    ? "chunk-parity: negative control fired at every width (instrument healthy)\n"
+                    : "chunk-parity: PASS — widths {17,48,96} bit-identical to the width-12 baseline\n");
             return 0;
         }
 
