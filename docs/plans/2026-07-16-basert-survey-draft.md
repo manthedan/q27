@@ -305,10 +305,12 @@ C/Cx = 1.024.)
   cols-derived address math become literals), bit-identity gate at
   tolerance 0 vs C — held exactly on every shape. **Aggregate C/K =
   1.010 [1.009, 1.011], 18 counterbalanced trials — PARK at the
-  probe's own <5% kill line.** On q27's staged 64-K walk, outer trip
-  count + cols-derived address arithmetic are ~1% of kernel time;
-  BaseRT's baking presumably pays on their fully-unrolled unpack
-  loops, not on this shape.
+  probe's own <5% kill line.** On q27's staged 64-K walk,
+  specializing the outer trip count and cols-derived address math is
+  worth ~1% end-to-end — the measured benefit of what baking removes,
+  with no claim about how much loop machinery the compiler leaves
+  behind. BaseRT's baking presumably pays on their fully-unrolled
+  unpack loops, not on this shape.
 - Probe 3 (16-element register-tile dequant): split disposition. For
   the T2 production kernel the survey's own "may be a no-op" case
   holds — the byte-LUT unpack already stages 16 elements per thread
@@ -320,7 +322,7 @@ C/Cx = 1.024.)
   revisit with the drafter's actual shapes if it graduates.
 
 Net: the BaseRT survey is fully discharged on the mini side — probes 1
-and 2 run and parked with measured numbers (C/F 1.066, C/K 1.010),
+and 2 run and parked with measured numbers (C/F 1.065, C/K 1.010),
 probe 3 a T2 no-op with its Q4 target deferred to the DSpark Phase-3
 decision, all other imports pre-answered or adopted elsewhere (KV
 codec, ds4 snapshot priority).
