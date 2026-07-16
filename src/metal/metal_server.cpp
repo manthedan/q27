@@ -188,8 +188,17 @@ struct Runtime {
     std::mutex route_;
     std::condition_variable slot_free_;
     Lease lease_;
+    // Slot admission is ticketed too: a bare condition_variable lets a
+    // newly arriving handler barge past an awakened waiter and starve it
+    // (codex P2 on d243f92); tickets hand slots out in arrival order, and
+    // the ticket spread doubles as the queue bound.
+    uint64_t slot_next_=0, slot_serving_=0;
     uint32_t queue_waiters=0;
     static constexpr uint32_t QUEUE_MAX=8;
+    // Innermost lock: guards the shared host-side ToolMaskCache (mask
+    // construction simulates the whole vocabulary on a miss). Order:
+    // route_ | lease_ -> mask_mutex_; never the reverse.
+    std::mutex mask_mutex_;
     // Gate-wait accounting bucketed by what the competing traffic was doing
     // at arrival (idle/prefill/decode/verify), guarded by route_.
     struct WaitStats { uint64_t n=0; double sum_ms=0, max_ms=0; };
@@ -292,10 +301,18 @@ struct Runtime {
         {
             std::unique_lock<std::mutex> lk(route_);
             for(const auto& s:slots) if(s->busy) arrival=phase_name(s->phase);
-            if(queue_waiters>=QUEUE_MAX)
+            if(slot_next_-slot_serving_>=QUEUE_MAX)
                 throw std::runtime_error("server overloaded: request queue is full");
+            const uint64_t ticket=slot_next_++;
+            // Pass the turn on every exit path, or a thrown acquisition
+            // would wedge every later ticket.
+            struct TurnPass {
+                Runtime& rt;
+                ~TurnPass() { rt.slot_serving_++; rt.slot_free_.notify_all(); }
+            } turn{*this};
             queue_waiters++;
             slot_free_.wait(lk,[&]{
+                if(slot_serving_!=ticket) return false;
                 for(const auto& s:slots) if(!s->busy) return true;
                 return false;
             });
@@ -480,8 +497,28 @@ struct Runtime {
                 if(cur==eos_id) { cause=q27::MetalEngine::StopCause::Eos; break; }
                 if(!deliver(cur)) break;
                 if(produced==count) break;
+                if(tc.enabled && tc.active) {
+                    // Pre-materialize the advanced state's mask OUTSIDE the
+                    // lease: ToolMaskCache::get simulates the whole vocabulary
+                    // on a miss (codex P2 on d243f92), which must not extend
+                    // the other slot's wait. Same peek-advance the CUDA flow's
+                    // on_pending uses; apply() below then hits the cache. The
+                    // engage path (scan_round) still builds its entry mask
+                    // under the lease — once per tool call, bounded.
+                    q27::ToolGrammar peek=tc.tg;
+                    bool ok=true;
+                    for(char c:tokenizer.decode_one((int)cur))
+                        if(!peek.advance(c)) { ok=false; break; }
+                    if(ok && !peek.closed()) {
+                        std::lock_guard<std::mutex> mk(mask_mutex_);
+                        mask_cache.get(peek);
+                    }
+                }
                 auto gpu=lease_now();
                 if(tc.enabled) {
+                    // mask_mutex_ inside the lease guards the shared host
+                    // cache against a concurrent slot's prewarm above.
+                    std::lock_guard<std::mutex> mk(mask_mutex_);
                     const int tid=(int)cur;
                     tc.scan_round(&tid,1);
                     tc.on_id(tid);
@@ -587,9 +624,17 @@ int main(int argc,char** argv) {
         if(port>65535) throw std::runtime_error("port out of range");
         if(width && (width<2 || width>12)) throw std::runtime_error("MTP width must be 2..12");
         if(constrain_tools && width) throw std::runtime_error("--constrain-tools requires serial decode; drop --mtp (verify-lane masks are not wired on Metal)");
-        if(slot_count<1 || slot_count>4) throw std::runtime_error("--slots must be 1..4");
+        // Phase 1's latency guarantee (wait <= one active quantum) only
+        // holds with one competing slot; >2 needs the scheduler and the
+        // width/stats model extended first (codex P2 on d243f92).
+        if(slot_count<1 || slot_count>2) throw std::runtime_error("--slots must be 1..2 in multislot Phase 1");
         Runtime runtime(model,tok,context,turbo3,width,prefix_entries,constrain_tools,slot_count);
         httplib::Server server;
+        // Bound the accept-side queue (codex P1 on d243f92): the default
+        // task queue holds accepted connections without limit, so the
+        // in-run admission bound alone could never engage — excess requests
+        // would pile up behind the workers instead of being rejected.
+        server.new_task_queue=[]{ return new httplib::ThreadPool(8,32); };
         server.Get("/health",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"}});});
         // Gate-wait honesty (Phase 1 contract): per-arrival-phase wait stats.
         server.Get("/stats",[&runtime](const httplib::Request&,httplib::Response& r){

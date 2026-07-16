@@ -29,13 +29,24 @@ v1 multislot → N=2 slot-batched linears → verify_lanes → learned drafting)
   bound. The lease is a FIFO ticket lock for exactly this reason, and G5
   asserts max busy-arrival gate wait ≤ 3 s (bound proven able to fail by
   the pre-ticket measurement).
-- Deviations from the sketch below: bounded queue is a waiter cap
-  (QUEUE_MAX=8 → error, surfaces as HTTP 400 through the shared error
-  path; a dedicated 503 is a follow-up); admission = engine-ctor budget
-  check with graceful slot-count degradation (snapshot-capacity and GQA
-  partial-peak terms remain TODO with G6); MTP-warm prompt ingestion is
-  one coarse quantum (engine-internal token-serial loop), documented and
-  visible in the wait metrics.
+- Deviations from the sketch below: bounded queue = a ticketed FIFO
+  admission (ticket spread caps at QUEUE_MAX=8 → error through the shared
+  400 path; dedicated 503 is a follow-up) plus a bounded httplib task
+  queue (8 workers, 32 queued connections) so excess load is rejected at
+  the accept side rather than piling up unbounded (codex P1); admission =
+  engine-ctor budget check with graceful slot-count degradation
+  (snapshot-capacity and GQA partial-peak terms remain TODO with G6);
+  MTP-warm prompt ingestion is one coarse quantum (engine-internal
+  token-serial loop), documented and visible in the wait metrics.
+- Codex round on the landing commit (1 P1 + 3 P2, all fixed same night):
+  accept-side queue bounded (above); `--slots` capped at 2 — the
+  one-competing-quantum guarantee doesn't extend to 3+ slots without a
+  scheduler/width/stats redesign; slot handoff ticketed — a bare
+  condition_variable lets a newcomer barge past an awakened waiter;
+  constrained decode pre-materializes the advanced grammar state's mask
+  outside the lease (ToolMaskCache::get simulates the whole vocabulary on
+  a miss; the once-per-call engage path stays under the lease, bounded),
+  with a dedicated innermost mask_mutex_ guarding the shared host cache.
 
 ## What Phase 1 is (and is not)
 
