@@ -168,8 +168,19 @@ class MetalEngine {
     // (magic, artifact identity, kv dtype, position, every blob length)
     // before the first GPU write, so a rejected file never leaves mixed
     // state. tokens are prefix metadata for the Phase-2 server keying.
-    void save_state(const std::string& path, const uint32_t* tokens, uint32_t token_count);
+    // logits_resident=false marks a snapshot taken mid-prefill (chunk path):
+    // its state is exact but the resident logits row is stale, so a resume
+    // may continue ingestion from token[position] onward but must never
+    // derive a pending token from the stored logits.
+    void save_state(const std::string& path, const uint32_t* tokens, uint32_t token_count,
+                    bool logits_resident = true);
     uint32_t load_state(const std::string& path);   // returns restored position
+    // Header-only inspection for prefix keying (server): position, stored
+    // token ids, and the logits-resident flag. Validates magic only — the
+    // full structural validation happens on load_state.
+    struct SnapshotInfo { uint32_t position = 0; bool logits_resident = true;
+                          std::vector<uint32_t> tokens; };
+    static SnapshotInfo peek_snapshot(const std::string& path);
     // Re-run the resident-logits argmax (same GPU kernel as prompt
     // ingestion) so generation after load_state resumes byte-identically.
     uint32_t pending_from_logits();

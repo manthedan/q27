@@ -7,11 +7,13 @@
 #include "../../third_party/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <functional>
 #include <list>
 #include <map>
@@ -19,6 +21,8 @@
 #include <mutex>
 #include <random>
 #include <stdexcept>
+
+#include <CommonCrypto/CommonDigest.h>
 #include <string>
 #include <vector>
 
@@ -132,6 +136,84 @@ class PrefixCache {
     size_t capacity_; std::list<Entry> entries_;
 };
 
+// Disk snapshot store (prefix snapshots Phase 2, docs/plans/2026-07-16-
+// prefix-snapshots.md): token-prefix keyed — the server tokenizes every
+// prompt itself, so "the snapshot's stored token ids are a prefix of this
+// request's tokens" is exact and has no BPE-boundary hazard (recorded
+// design deviation from ds4's byte-SHA1, which exists for stateless
+// clients that retokenize). Files are named by the SHA1 of the token
+// bytes, so an identical prefix overwrites rather than duplicates. LRU by
+// mtime; hits touch the file. All file I/O runs OUTSIDE the GPU lease;
+// only save_state/load_state (which read/write GPU buffers) go under it.
+class DiskSnapshotStore {
+  public:
+    void init(std::string dir, uint64_t max_bytes) { dir_=std::move(dir); max_bytes_=max_bytes; }
+    bool enabled() const { return !dir_.empty(); }
+
+    // Longest stored token prefix of `prompt`. Full-length matches whose
+    // logits are stale (mid-prefill saves) are skipped: state would be
+    // exact but no pending token could be derived.
+    bool best_match(const std::vector<uint32_t>& prompt,std::string& path_out,uint32_t& len_out) {
+        if(!enabled()) return false;
+        std::lock_guard<std::mutex> lk(m_);
+        std::string best; uint32_t best_len=0;
+        std::error_code ec;
+        for(const auto& e:std::filesystem::directory_iterator(dir_,ec)) {
+            if(!e.is_regular_file() || e.path().extension()!=".q27snap") continue;
+            q27::MetalEngine::SnapshotInfo info;
+            try { info=q27::MetalEngine::peek_snapshot(e.path().string()); }
+            catch(...) { continue; }   // corrupt/foreign file: never a hit
+            // Saves record exactly the encoded prefix; anything else is not
+            // resumable by token matching.
+            if(info.position!=info.tokens.size()) continue;
+            if(info.tokens.empty() || info.tokens.size()>prompt.size()) continue;
+            if(info.tokens.size()==prompt.size() && !info.logits_resident) continue;
+            if(info.tokens.size()<=best_len) continue;
+            if(std::equal(info.tokens.begin(),info.tokens.end(),prompt.begin())) {
+                best=e.path().string(); best_len=(uint32_t)info.tokens.size();
+            }
+        }
+        if(best.empty()) return false;
+        std::filesystem::last_write_time(best,std::filesystem::file_time_type::clock::now(),ec);
+        path_out=std::move(best); len_out=best_len;
+        return true;
+    }
+
+    std::string path_for(const uint32_t* tokens,uint32_t count) const {
+        unsigned char sha[20];
+        CC_SHA1(tokens,(CC_LONG)(count*4),sha);
+        char hex[41];
+        for(int i=0;i<20;i++) snprintf(hex+2*i,3,"%02x",sha[i]);
+        return dir_+"/"+hex+".q27snap";
+    }
+
+    // Budget enforcement: oldest-first until the directory fits. The
+    // just-written file is deletable too — the budget is a hard cap, and
+    // the gate asserts the total never exceeds it.
+    void evict_past_budget() {
+        if(!enabled() || !max_bytes_) return;
+        std::lock_guard<std::mutex> lk(m_);
+        struct F { std::string path; uint64_t size; std::filesystem::file_time_type mtime; };
+        std::vector<F> files; uint64_t total=0;
+        std::error_code ec;
+        for(const auto& e:std::filesystem::directory_iterator(dir_,ec)) {
+            if(!e.is_regular_file() || e.path().extension()!=".q27snap") continue;
+            const uint64_t sz=(uint64_t)e.file_size(ec);
+            files.push_back({e.path().string(),sz,e.last_write_time(ec)});
+            total+=sz;
+        }
+        std::sort(files.begin(),files.end(),[](const F& a,const F& b){ return a.mtime<b.mtime; });
+        for(const auto& f:files) {
+            if(total<=max_bytes_) break;
+            if(std::filesystem::remove(f.path,ec)) total-=f.size;
+        }
+    }
+
+    std::atomic<uint64_t> hits{0}, saves{0};
+  private:
+    std::string dir_; uint64_t max_bytes_=0; std::mutex m_;
+};
+
 struct Runtime {
     q27::Tokenizer tokenizer;
     std::shared_ptr<q27::MetalEngine::Shared> shared;
@@ -215,6 +297,7 @@ struct Runtime {
     bool constrain_tools=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
+    DiskSnapshotStore snapstore;
 
     Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
             uint32_t width,size_t cache_entries,bool constrain,uint32_t slot_count)
@@ -267,6 +350,29 @@ struct Runtime {
                         s,e.what(),slots.size());
                 break;
             }
+        }
+        // Prefix snapshots Phase 2: opt-in via Q27_METAL_SNAPSHOT_DIR;
+        // budget via Q27_METAL_SNAPSHOT_MAX_MB (validated, fail-loud, same
+        // class as Q27_METAL_BUDGET_MB; default 8192 MB). The artifact
+        // identity hash (~3 s over the 7 GB mapping) is primed HERE, at
+        // startup, so the first hinted request never stalls the lease on it.
+        if(const char* sdir=getenv("Q27_METAL_SNAPSHOT_DIR"); sdir && *sdir) {
+            uint64_t snap_mb=8192;
+            if(const char* smax=getenv("Q27_METAL_SNAPSHOT_MAX_MB"); smax && *smax) {
+                char* end=nullptr; errno=0;
+                const unsigned long long mb=strtoull(smax,&end,10);
+                if(errno || end==smax || *end || !mb || mb>(1ull<<24))
+                    throw std::runtime_error("Q27_METAL_SNAPSHOT_MAX_MB must be an integer 1..16777216");
+                snap_mb=(uint64_t)mb;
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(sdir,ec);
+            if(ec || !std::filesystem::is_directory(sdir))
+                throw std::runtime_error(std::string("Q27_METAL_SNAPSHOT_DIR is not a usable directory: ")+sdir);
+            snapstore.init(sdir,snap_mb*1024ull*1024ull);
+            slots[0]->engine.snapshot_identity();
+            fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB\n",
+                    sdir,(unsigned long long)snap_mb);
         }
         if(constrain_tools) {
             vocab_bytes_v=tokenizer.vocab_bytes();
@@ -332,7 +438,8 @@ struct Runtime {
                 const q27::SamplingParams& sampling,
                 const std::vector<std::string>& stops,
                 const std::function<bool(const std::string&)>& emit,
-                const std::vector<std::string>& tool_names={}) {
+                const std::vector<std::string>& tool_names={},
+                bool snapshot_hint=false) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         q27::validate_sampling(sampling);
         const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
@@ -393,7 +500,14 @@ struct Runtime {
 
         // ---- prompt ingestion, one quantum per chunk ----
         size_t hit=0; uint32_t pending=0;
-        bool restored=false;
+        bool restored=false, saved_snapshot=false;
+        // Disk lookup runs before taking the lease (pure file I/O); only
+        // the resulting load_state goes under it. MTP requests stay on the
+        // cold path: lane warming state is not part of the snapshot
+        // contract in this phase.
+        std::string disk_path; uint32_t disk_len=0;
+        const bool disk_ok=!mtp && snapstore.enabled() &&
+                           snapstore.best_match(prompt,disk_path,disk_len);
         {
             auto gpu=lease_now();
             // Round-2 expert P0 #1 (leak across requests): defensive entry
@@ -401,8 +515,27 @@ struct Runtime {
             engine.set_tool_constraint(-1);
             restored=slot->cache.restore(engine,prompt,mtp,hit,pending);
             if(!restored) { engine.reset(); hit=0; }
+            if(!restored && disk_ok && disk_len>0) {
+                // A stale or vanished file is a cold start, never an error.
+                try {
+                    engine.load_state(disk_path);
+                    hit=disk_len;
+                    if(hit==prompt.size()) { pending=engine.pending_from_logits(); restored=true; }
+                    snapstore.hits++;
+                } catch(const std::exception&) { engine.reset(); hit=0; }
+            }
             if((uint64_t)engine.position()+(prompt.size()-hit)>context)
                 throw std::runtime_error("prompt exceeds context");
+        }
+        // Hinted save target: a stable boundary — trim a 32-token tail
+        // (the question-specific suffix) and align down to a 96-token
+        // prefill-chunk boundary. Reached exactly by capping one chunk's
+        // width; skipped when the restored prefix already covers it.
+        size_t save_at=0;
+        if(snapshot_hint && !mtp && snapstore.enabled() && engine.chunked_prefill() &&
+           prompt.size()>32+96) {
+            const size_t target=(prompt.size()-32)/96*96;
+            if(target>hit) save_at=target;
         }
         std::vector<uint32_t> suffix(prompt.begin()+hit,prompt.end());
         if(!suffix.empty()) {
@@ -418,10 +551,21 @@ struct Runtime {
                 const size_t chunkable=suffix.size()-1;
                 while(chunkable-i>=2) {
                     const uint32_t width=quantum_width(slot);
-                    const uint32_t take=(uint32_t)std::min<size_t>(width,chunkable-i);
+                    uint32_t take=(uint32_t)std::min<size_t>(width,chunkable-i);
+                    if(save_at && hit+i<save_at)
+                        take=(uint32_t)std::min<size_t>(take,save_at-(hit+i));
                     auto gpu=lease_now();
                     engine.prefill_chunk(suffix.data()+i,take);
                     i+=take;
+                    if(save_at && hit+i==save_at) {
+                        // Mid-prefill state is exact but the logits row is
+                        // stale — recorded in the file so a same-length
+                        // request can never derive a pending token from it.
+                        engine.save_state(snapstore.path_for(prompt.data(),(uint32_t)save_at),
+                                          prompt.data(),(uint32_t)save_at,false);
+                        snapstore.saves++;
+                        save_at=0; saved_snapshot=true;
+                    }
                 }
                 // Serial tail: at most one leftover chunkable token plus the
                 // final token, which produces the logits and pending id —
@@ -432,6 +576,8 @@ struct Runtime {
                 }
             }
         }
+        // LRU enforcement is pure file I/O — outside the lease.
+        if(saved_snapshot) snapstore.evict_past_budget();
         // Fail oversize generations before emitting anything, exactly like
         // the whole-generation streaming calls used to.
         if((uint64_t)engine.position()+(count?count-1:0)>context)
@@ -714,7 +860,10 @@ int main(int argc,char** argv) {
             }
             json_response(r,{{"slots",runtime.slots.size()},
                              {"gate_wait_by_arrival",gate},
-                             {"queue_wait_by_arrival",queue}});
+                             {"queue_wait_by_arrival",queue},
+                             {"snapshots",{{"enabled",runtime.snapstore.enabled()},
+                                           {"disk_hits",(uint64_t)runtime.snapstore.hits},
+                                           {"disk_saves",(uint64_t)runtime.snapstore.saves}}}});
         });
         server.Get("/v1/models",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"object","list"},{"data",json::array({{{"id","q27-metal"},{"object","model"}}})}});});
 
@@ -745,7 +894,7 @@ int main(int argc,char** argv) {
                 std::string text;
                 auto outcome=runtime.run(ids,n,sampling,stops,
                     [&](const std::string& piece){ text+=piece; return true; },
-                    tool_names_from(body));
+                    tool_names_from(body),body.value("snapshot",false));
                 json choice = chat
                     ? json{{"index",0},{"message",{{"role","assistant"},{"content",text}}},{"finish_reason",openai_finish(outcome.finish)}}
                     : json{{"index",0},{"text",text},{"finish_reason",openai_finish(outcome.finish)}};
@@ -758,15 +907,16 @@ int main(int argc,char** argv) {
             }
             r.set_header("Content-Type","text/event-stream");
             const std::vector<std::string> tnames=tool_names_from(body);
+            const bool snap_hint=body.value("snapshot",false);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,chat,objd,id,created,tnames](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,chat,objd,id,created,tnames,snap_hint](size_t,httplib::DataSink& sink)->bool {
                     try {
                         auto emit=[&](const std::string& piece)->bool {
                             std::string s=q27::sse_data(
                                 q27::openai_stream_chunk(chat,id,objd,created,"q27-metal",piece));
                             return sink.write(s.data(),s.size());
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint);
                         // Terminal chunk with a real finish_reason before [DONE]
                         // (parity with server.cu security-review fix #7).
                         std::string fin=q27::sse_data(q27::openai_stream_final_chunk(
@@ -806,7 +956,7 @@ int main(int argc,char** argv) {
                 std::string text;
                 auto outcome=runtime.run(ids,n,sampling,stops,
                     [&](const std::string& piece){ text+=piece; return true; },
-                    tool_names_from(body));
+                    tool_names_from(body),body.value("snapshot",false));
                 json out={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
                     {"content",json::array({{{"type","text"},{"text",text}}})},
                     {"stop_reason",anthropic_stop(outcome.finish)},
@@ -818,8 +968,9 @@ int main(int argc,char** argv) {
             }
             r.set_header("Content-Type","text/event-stream");
             const std::vector<std::string> tnames=tool_names_from(body);
+            const bool snap_hint=body.value("snapshot",false);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,mid,tnames](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,mid,tnames,snap_hint](size_t,httplib::DataSink& sink)->bool {
                     auto ev=[&](const char* name,const json& j){ std::string s=q27::sse_event(name,j); return sink.write(s.data(),s.size()); };
                     try {
                         json msg={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
@@ -840,7 +991,7 @@ int main(int argc,char** argv) {
                             return ev("content_block_delta",{{"type","content_block_delta"},{"index",0},
                                 {"delta",{{"type","text_delta"},{"text",piece}}}});
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint);
                         ev("content_block_stop",{{"type","content_block_stop"},{"index",0}});
                         ev("message_delta",{{"type","message_delta"},
                             {"delta",{{"stop_reason",anthropic_stop(outcome.finish)},
@@ -873,7 +1024,7 @@ int main(int argc,char** argv) {
                 std::string text;
                 auto outcome=runtime.run(ids,n,sampling,stops,
                     [&](const std::string& piece){ text+=piece; return true; },
-                    tool_names_from(body));
+                    tool_names_from(body),body.value("snapshot",false));
                 json_response(r,{{"id",rid},{"object","response"},{"model","q27-metal"},{"status","completed"},
                     {"output_text",text},
                     {"output",json::array({{{"type","message"},{"id",mid},{"role","assistant"},{"status","completed"},
@@ -885,8 +1036,9 @@ int main(int argc,char** argv) {
             }
             r.set_header("Content-Type","text/event-stream");
             const std::vector<std::string> tnames=tool_names_from(body);
+            const bool snap_hint=body.value("snapshot",false);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,rid,mid,tnames](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,rid,mid,tnames,snap_hint](size_t,httplib::DataSink& sink)->bool {
                     auto ev=[&](const json& j){ std::string s=q27::sse_event(j.value("type",std::string("x")),j); return sink.write(s.data(),s.size()); };
                     try {
                         // Gate the run on the opening writes and probe the
@@ -907,7 +1059,7 @@ int main(int argc,char** argv) {
                             return ev({{"type","response.output_text.delta"},{"item_id",mid},
                                 {"output_index",0},{"content_index",0},{"delta",piece}});
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint);
                         ev({{"type","response.output_text.done"},{"item_id",mid},{"output_index",0},{"content_index",0},{"text",text}});
                         ev({{"type","response.content_part.done"},{"item_id",mid},{"output_index",0},{"content_index",0},
                             {"part",{{"type","output_text"},{"text",text},{"annotations",json::array()}}}});

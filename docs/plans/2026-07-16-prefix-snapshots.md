@@ -1,7 +1,6 @@
 # Prefix snapshots to disk — ds4 survey item 5 / review-2 residue (P3)
 
-Status: PRE-REGISTERED. Phase 1 in progress (engine serializer + gates);
-Phase 2 (server keying/LRU) blocked on Phase 1's gates.
+Status: Phases 1 AND 2 LANDED same day, all gates PASS (results below).
 Parents: 2026-07-15-ds4-survey.md §5 (disk-KV design, adopt nearly
 wholesale), 2026-07-15-expert-review-2-triage.md (stable-boundary
 snapshots; the needle runs re-prefilled the same 31K haystack — ~23 min
@@ -56,18 +55,34 @@ T2 artifact has no MTP layer).
    measured ratio is under 10× something is wrong — investigate before
    Phase 2).
 
-## Phase 2 — server keying + LRU (after gates, likely next session)
+## Phase 2 — server keying + LRU (opened same evening)
 
-ds4-wholesale: key = SHA1 of the rendered byte prefix; snapshot saved at
-stable boundaries (align position down to a 96-token prefill-chunk
-boundary and trim a 32-token tail — the BPE-boundary dodge); dir with
-LRU eviction under Q27_METAL_SNAPSHOT_DIR / _MAX_MB env knobs
-(validated, fail-loud, same class as Q27_METAL_BUDGET_MB); request hint
-field opt-in first (app hints + LRU is v1 per the triage). G7 gate in
-tools/multislot_gates.py: hit path byte-identical to cold path, miss on
-one-byte prefix change, eviction under a tiny budget, admission
-accounting extended (snapshot files are disk, NOT resident — the G6
-per-slot term is unchanged; only the in-memory snapshot cache counts).
+Design deviation from ds4, recorded with the why: ds4 keys on the SHA1
+of the RENDERED BYTE prefix because stateless clients retokenize —
+their server never sees tokens, so byte identity plus a
+chunk-align/tail-trim heuristic is their only defense against
+BPE-boundary drift. q27's server tokenizes every prompt itself, so the
+snapshot's stored token ids allow EXACT token-prefix matching: a hit is
+"the snapshot's token list is a prefix of this request's token list",
+which has no BPE-boundary hazard by construction. The byte-SHA1 header
+slot stays reserved for a future stateless-client path.
+
+Mechanics: snapshots saved by request hint (`"snapshot": true` on the
+request — app hints + LRU is v1 per the triage) at a stable boundary:
+position aligned down to a 96-token prefill-chunk boundary after
+trimming a 32-token tail (still adopted — it cuts the question-specific
+suffix so the shared haystack prefix is what persists). On admit, scan
+Q27_METAL_SNAPSHOT_DIR headers (cheap: header + token ids only), pick
+the LONGEST matching token prefix, load, and continue prompt ingestion
+for the remaining tokens through the normal quantum path. LRU: touch
+files on hit (mtime), evict oldest past Q27_METAL_SNAPSHOT_MAX_MB
+(validated env, fail-loud, same class as Q27_METAL_BUDGET_MB).
+
+G7 gate in tools/multislot_gates.py: hit path byte-identical to cold
+path; a prompt differing inside the snapshotted prefix must MISS;
+eviction under a tiny budget; admission accounting unchanged (snapshot
+files are disk, NOT resident — the G6 per-slot term does not grow;
+only the in-memory snapshot cache counts).
 
 Non-goals (recorded): tool-call byte replay (ds4's exact-byte map) —
 follows the constrain-tools work, not this; cross-machine snapshot
@@ -104,3 +119,27 @@ turbo3↔fp16 snapshot conversion (dtype is part of identity).
 
 Phase 2 (server keying, boundary policy, LRU, G7 gate) is now unblocked;
 it remains queued behind the KV-codec census on this rig's schedule.
+
+## Phase 2 results (same evening) — G7 PASS on first run
+
+Implementation: `DiskSnapshotStore` in the server (token-prefix
+best-match over header peeks, SHA1-of-token-bytes filenames so identical
+prefixes overwrite, mtime LRU, all file I/O outside the GPU lease);
+hinted saves land mid-prefill at align96(len−32) by capping one chunk's
+width, recorded with the stale-logits flag so a same-length request can
+never derive a pending token from them; full-length disk hits derive
+pending via the ingestion argmax kernel; MTP requests stay cold (lane
+warming is outside the snapshot contract). Env: Q27_METAL_SNAPSHOT_DIR
+opt-in, Q27_METAL_SNAPSHOT_MAX_MB validated fail-loud (default 8192).
+The artifact identity hash is primed at server startup so the first
+hinted request never stalls the lease. `/stats` gains
+snapshots.{enabled,disk_hits,disk_saves}.
+
+G7 (tools/multislot_gates.py, four fresh server processes): hinted save
+persisted exactly one file; a fresh process answered the shared-prefix
+question from disk **byte-identically to a cold server** — which also
+empirically confirms that resuming at a 96-aligned boundary is
+partition-invariant with respect to the cold path's chunk widths; a
+prompt perturbed inside the snapshotted prefix missed and still answered
+byte-identically to cold; a 1 MB budget evicted the (300 MB-class) file
+after the save. Full suite G1–G7 re-run for regressions.
