@@ -171,6 +171,16 @@ class MetalEngine {
     MetalBackend& backend() { return backend_; }
     bool chunked_prefill() const { return chunked_prefill_; }
     void set_chunked_prefill(bool enabled);
+    // KV-codec attribution knob (kl-kv instrument): 0 = off, 1 = round-trip
+    // K through the turbo3 quantizer at store time, 2 = V. The engine keeps
+    // its fp16 cache and attention kernels, so the resulting KL against an
+    // fp16 baseline isolates one side's quantization error. fp16-KV engines
+    // only; set before any tokens are encoded.
+    void set_kv_attrib(uint32_t mode);
+    // Cell-granular variant (sensitivity census): restrict the round-trip
+    // to one attention layer (absolute index, layer%4==3) and one KV head.
+    // UINT32_MAX for layer/head widens that axis back to "all".
+    void set_kv_attrib_cell(uint32_t mode, uint32_t layer, uint32_t head);
 
   private:
     static constexpr uint32_t N_LAYER = 64;
@@ -211,6 +221,9 @@ class MetalEngine {
     MetalBackend& backend_;
     uint32_t max_context_;
     bool turbo3_kv_;
+    uint32_t kv_attrib_ = 0;
+    uint32_t kv_attrib_layer_ = UINT32_MAX;
+    uint32_t kv_attrib_head_ = UINT32_MAX;
     uint64_t engine_cache_bytes_ = 0;
     uint32_t position_ = 0;
     SpecStats last_spec_stats_;

@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width | --oracle width] [--kv fp16|turbo3] "
-                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self] [--chunk-parity N] "
+                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N] [--chunk-parity N] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--dump-logits file]\n",
                 argv[0]);
@@ -155,6 +155,7 @@ int main(int argc, char** argv) {
         bool eos_gate=false;
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         bool kl_kv = false, kl_self = false;
+        uint32_t kv_attrib = 0, kv_cell = UINT32_MAX;
         uint32_t chunk_parity = 0;
         std::string envelope_mode;
         for (int i = 3; i < argc; i++) {
@@ -166,6 +167,18 @@ int main(int argc, char** argv) {
             else if (arg == "--validate-only") validate_only = true;
             else if (arg == "--kl-kv") kl_kv = true;
             else if (arg == "--kl-kv-self") { kl_kv = true; kl_self = true; }
+            else if (arg == "--kl-kv-cell" && i + 1 < argc) {
+                kv_cell = parse_u32(argv[++i], "--kl-kv-cell");
+                if (kv_cell >= 128)
+                    throw std::runtime_error("--kl-kv-cell must be 0..127 (attn_idx*8 + head*2 + side, side 0=K 1=V)");
+                kl_kv = true;
+            }
+            else if (arg == "--kl-kv-k" || arg == "--kl-kv-v") {
+                const uint32_t side = (arg == "--kl-kv-k") ? 1 : 2;
+                if (kv_attrib && kv_attrib != side)
+                    throw std::runtime_error("--kl-kv-k and --kl-kv-v are alternative arms; pass one");
+                kl_kv = true; kv_attrib = side;
+            }
             else if (arg == "--chunk-parity" && i + 1 < argc) chunk_parity = parse_u32(argv[++i], "--chunk-parity");
             else if (arg == "--envelope" && i + 1 < argc) envelope_mode = argv[++i];
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
@@ -237,6 +250,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--chunk-parity and --kl-kv are separate instruments");
         if (kl_kv && turbo3_kv)
             throw std::runtime_error("--kl-kv builds its own fp16 baseline and turbo3 subject; drop --kv");
+        if (kv_attrib && kl_self)
+            throw std::runtime_error("--kl-kv-k/--kl-kv-v and --kl-kv-self are mutually exclusive arms");
+        if (kv_cell != UINT32_MAX && (kv_attrib || kl_self))
+            throw std::runtime_error("--kl-kv-cell is its own arm; drop --kl-kv-k/--kl-kv-v/--kl-kv-self");
         if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty())
             throw std::runtime_error("--tokens, --prompt, --nll, or --validate-only is required");
         if (!nll_path.empty() && (mtp_width || suffix_width || oracle_width || sampling.temperature > 0 || !dump_logits.empty()))
@@ -581,16 +598,37 @@ int main(int argc, char** argv) {
             // differ only in KV representation, teacher-forced in lockstep.
             auto shared = q27::MetalEngine::open_shared(model_path);
             q27::MetalEngine baseline(shared, context, false);
-            q27::MetalEngine subject(shared, context, !kl_self);
+            // Attribution arms keep the subject on the fp16 cache and
+            // attention kernels; only the store round-trips one side through
+            // the turbo3 quantizer, so the KL is that side's error alone.
+            q27::MetalEngine subject(shared, context,
+                                     !kl_self && !kv_attrib && kv_cell == UINT32_MAX);
+            char cell_name[48] = {0};
+            if (kv_cell != UINT32_MAX) {
+                // cell id = attn_idx*8 + head*2 + side (side 0=K, 1=V);
+                // attn_idx 0..15 maps to absolute layer attn_idx*4+3.
+                const uint32_t attn_idx = kv_cell >> 3, head = (kv_cell >> 1) & 3;
+                const uint32_t side = (kv_cell & 1) + 1;
+                subject.set_kv_attrib_cell(side, attn_idx * 4 + 3, head);
+                snprintf(cell_name, sizeof cell_name, "turbo3 cell L%u:h%u:%s round-trip",
+                         attn_idx * 4 + 3, head, side == 1 ? "K" : "V");
+            } else if (kv_attrib) {
+                subject.set_kv_attrib(kv_attrib);
+            }
             if (serial_prefill) {
                 baseline.set_chunked_prefill(false);
                 subject.set_chunked_prefill(false);
             }
+            const char* subject_name = kl_self ? "fp16 self-check"
+                                     : kv_cell != UINT32_MAX ? cell_name
+                                     : kv_attrib == 1 ? "turbo3 K-only round-trip"
+                                     : kv_attrib == 2 ? "turbo3 V-only round-trip"
+                                     : "turbo3";
             auto ready = std::chrono::steady_clock::now();
             fprintf(stderr, "Metal model ready on %s in %.2f s (two engines, one mapping: fp16 baseline vs %s)\n",
                     baseline.backend().name().c_str(),
                     std::chrono::duration<double>(ready - start).count(),
-                    kl_self ? "fp16 self-check" : "turbo3");
+                    subject_name);
             const uint32_t vocab = q27::MetalEngine::vocabulary_size();
             const uint32_t n = (uint32_t)tokens.size() - 1;
             fprintf(stderr, "kl-kv: %u positions, single pass, no resets\n", n);
@@ -617,8 +655,35 @@ int main(int argc, char** argv) {
             if (n >= 12) fprintf(stderr, "\n");
             print_kl_buckets(kl);
             double mean = 0.0, peak = 0.0;
-            for (double v : kl) { mean += v; if (v > peak) peak = v; }
+            uint32_t peak_pos = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                mean += kl[i];
+                if (kl[i] > peak) { peak = kl[i]; peak_pos = i; }
+            }
             mean /= n;
+            // Tail report (KV-codec step 1): the mean is depth-flat but the
+            // tail is heavy — p99/max and run structure are the graduation
+            // metrics for the scaling and allocation arms, not the mean.
+            std::vector<double> sorted(kl);
+            std::sort(sorted.begin(), sorted.end());
+            auto quantile = [&](double p) {
+                return sorted[std::min((size_t)((double)n * p), (size_t)n - 1)];
+            };
+            fprintf(stderr, "kl-kv tail: p50 %.4g  p90 %.4g  p99 %.4g  p99.5 %.4g  max %.4g @pos %u\n",
+                    quantile(0.50), quantile(0.90), quantile(0.99), quantile(0.995), peak, peak_pos);
+            for (double thr : {0.1, 0.5}) {
+                uint32_t above = 0, runs = 0, cur = 0, longest = 0, longest_at = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    if (kl[i] > thr) {
+                        if (!cur) runs++;
+                        cur++; above++;
+                        if (cur > longest) { longest = cur; longest_at = i + 1 - cur; }
+                    } else cur = 0;
+                }
+                fprintf(stderr, "kl-kv runs >%.1f: %u positions, %u runs, longest %u", thr, above, runs, longest);
+                if (longest) fprintf(stderr, " @pos %u", longest_at);
+                fprintf(stderr, "\n");
+            }
             fprintf(stderr, "kl-kv wall: %.2f s (%.2f pos/s through both engines), overall mean KL %.6g nats, max %.6g\n",
                     std::chrono::duration<double>(kl_done - kl_start).count(),
                     n / std::chrono::duration<double>(kl_done - kl_start).count(),
