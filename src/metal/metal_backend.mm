@@ -235,6 +235,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> mma_roofline_b_p;
     id<MTLComputePipelineState> mma_roofline_b_eq_p;
     id<MTLComputePipelineState> mma_roofline_cx_p;
+    id<MTLComputePipelineState> mma_roofline_f_p;
     id<MTLComputePipelineState> mm_dr_p;
     id<MTLComputePipelineState> mm_dr2_p;
     id<MTLComputePipelineState> x_to_half_t_p;
@@ -538,6 +539,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
             impl_->mma_roofline_b_eq_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b_eq");
             impl_->mma_roofline_cx_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_cx");
+            impl_->mma_roofline_f_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_f");
             impl_->mm_dr_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr");
             impl_->mm_dr2_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr2");
             impl_->x_to_half_t_p = make_pipeline(impl_->device, impl_->library, @"q27_x_int8_to_half_t");
@@ -1137,9 +1139,42 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
                                 BackendBuffer& y) {
     if (!impl_->mma_roofline_a_p || !impl_->mma_roofline_b_p)
         throw std::runtime_error("q27 Metal: MMA roofline requires Apple GPU family 7 or newer");
-    if ((arm != 'a' && arm != 'b' && arm != 'e' && arm != 'x' && arm != 'd' && arm != '2') || !rows || !cols ||
+    if ((arm != 'a' && arm != 'b' && arm != 'e' && arm != 'x' && arm != 'd' && arm != '2' &&
+         arm != 'f') || !rows || !cols ||
         !x_rows || x_rows > 96 || cols % 128)
         throw std::runtime_error("q27 Metal: invalid MMA roofline arguments");
+    // Arm 'f' — f16-accumulate probe (docs/plans/2026-07-16-f16acc-probe.md):
+    // the production mm_h operands and grid, half accumulators inside.
+    if (arm == 'f') {
+        if (!w_scales || !x || !x_scales)
+            throw std::runtime_error("q27 Metal: roofline arm f needs scales and activations");
+        const MetalBuffer& wb = metal_buffer(w_or_seed);
+        const MetalBuffer& ws = metal_buffer(*w_scales);
+        const MetalBuffer& xb = metal_buffer(*x);
+        const MetalBuffer& xs = metal_buffer(*x_scales);
+        MetalBuffer& out = metal_buffer(y);
+        check_range(wb.size(), 0, (uint64_t)rows * cols / 4, "roofline f weights");
+        check_range(ws.size(), 0, (uint64_t)rows * (cols / 128) * 2, "roofline f weight scales");
+        check_range(xb.size(), 0, (uint64_t)x_rows * cols, "roofline f activations");
+        check_range(xs.size(), 0, (uint64_t)x_rows * (cols / 32) * 4, "roofline f activation scales");
+        check_range(out.size(), 0, (uint64_t)rows * x_rows * 4, "roofline f output");
+        MatmulArgs args{rows, cols, x_rows, 1};
+        @autoreleasepool {
+            bool own; auto enc = impl_->encoder_for_operation(own, "q27_mma_roofline_f");
+            [enc setComputePipelineState:impl_->mma_roofline_f_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:ws.handle() offset:0 atIndex:1];
+            [enc setBuffer:xb.handle() offset:0 atIndex:2];
+            [enc setBuffer:xs.handle() offset:0 atIndex:3];
+            [enc setBuffer:out.handle() offset:0 atIndex:4];
+            [enc setBytes:&args length:sizeof(args) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32,
+                                                  (NSUInteger)(x_rows + 15) / 16, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            if (own) impl_->finish_command("mma roofline f");
+        }
+        return;
+    }
     // Arm 'd' — lever 1 direct-RHS probe (docs/plans/2026-07-16-lever1-
     // direct-rhs.md): w_or_seed = packed T2 weight bytes, x = int8
     // activation values, x_scales = float per-32 scales. Encodes the RHS
