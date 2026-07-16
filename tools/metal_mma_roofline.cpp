@@ -5,14 +5,23 @@
 // speedup with GEMM at 94.3% of prefill GPU time. This tool measures, at
 // identical production geometry (dispatch grid, 32x16 tiles, 64-K walk,
 // edge clamps, physical MMA count):
-//   C  the full production T2 GEMM (q27_matmul_t2_mm_h via matmul_quantized)
-//   B  the same kernel with half operands from device — no packed unpack,
-//      no int8->half; B-C isolates unpack/conversion machinery
-//   A  the same MMA sequence from tiles filled once — no staging, no
-//      barriers, no flushes; A-B isolates staging/barrier/flush cadence
-// Verdict comes from the LOWER 95% confidence bound of R = t_C / t_B
-// (10 trials, t-distribution), never a best run. Memory-safe: synthetic
-// buffers only (~250 MiB peak), no model mmap.
+//   C   the full production T2 GEMM (q27_matmul_t2_mm_h via matmul_quantized)
+//   Beq the same kernel with the unpack/int8->half ALU deleted at EQUAL
+//       device traffic (loads C's byte volume, replicates into the same
+//       staging stores) — the decision arm: C/Beq isolates plumbing ALU
+//   B   the expert-literal arm: half operands at production layout (8x the
+//       weight bytes of C) — reported as the traffic-confounded companion;
+//       on bandwidth-sensitive shapes it can only understate headroom
+//   A   the same MMA sequence from tiles filled once — no staging, no
+//       barriers, no flushes; A vs Beq isolates staging/barrier/flush cadence
+// Statistics (codex round on the landing commit): per-trial chunk-aggregate
+// ratios R_t = sum_i(count_i * tC_i,t) / sum_i(count_i * tBeq_i,t) over 10
+// interleaved trials, 95% CI on the mean of R_t. Declaring NO headroom
+// requires the UPPER bound <= 1.08; declaring headroom requires the LOWER
+// bound above the line; anything straddling is reported inconclusive.
+// Anti-vacuity: outputs are zero-poisoned before every arm and must come
+// back finite and nonzero. Memory-safe: synthetic buffers only (~250 MiB
+// peak), no model mmap.
 
 #include "metal_backend.h"
 
@@ -51,29 +60,19 @@ const Shape SHAPES[] = {
     {"attn q       [12288x5120]", 12288, 5120, 16},
     {"attn k/v     [1024x5120]",  1024, 5120, 32},
 };
+constexpr size_t N_SHAPES = sizeof(SHAPES) / sizeof(Shape);
+enum Arm { C = 0, BEQ = 1, B = 2, A = 3, N_ARMS = 4 };
+const char* ARM_NAMES[N_ARMS] = {"C", "Beq", "B", "A"};
 
 struct Stat { double mean, lo, hi; };
 
-Stat measure(q27::MetalBackend& backend, uint32_t reps,
-             const std::function<void()>& op) {
-    // Warmup: clock ramp + first-touch, outside the timer.
-    backend.begin_commands(); op(); backend.end_commands();
-    backend.begin_commands(); op(); backend.end_commands();
-    double trials[TRIALS];
-    for (uint32_t t = 0; t < TRIALS; t++) {
-        const auto start = std::chrono::steady_clock::now();
-        backend.begin_commands();
-        for (uint32_t r = 0; r < reps; r++) op();
-        backend.end_commands();
-        trials[t] = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - start).count() / reps;
-    }
+Stat stat_of(const std::vector<double>& v) {
     double mean = 0;
-    for (double v : trials) mean += v;
-    mean /= TRIALS;
+    for (double x : v) mean += x;
+    mean /= v.size();
     double var = 0;
-    for (double v : trials) var += (v - mean) * (v - mean);
-    const double ci = T9_975 * std::sqrt(var / (TRIALS - 1)) / std::sqrt((double)TRIALS);
+    for (double x : v) var += (x - mean) * (x - mean);
+    const double ci = T9_975 * std::sqrt(var / (v.size() - 1)) / std::sqrt((double)v.size());
     return {mean, mean - ci, mean + ci};
 }
 
@@ -115,8 +114,15 @@ std::shared_ptr<q27::BackendBuffer> upload_halves(q27::MetalBackend& backend, ui
     return buf;
 }
 
-bool output_sane(q27::MetalBackend& backend, q27::BackendBuffer& out, uint64_t floats,
-                 const char* what) {
+// Zero-poison then run one dispatch: the arm must overwrite the poison with
+// finite, nonzero values, so a silently-vacuous arm (bad binding, early
+// return) cannot inherit a previous arm's output (codex P2).
+bool arm_sane(q27::MetalBackend& backend, q27::BackendBuffer& out, uint64_t floats,
+              const std::vector<float>& zeros, const char* what,
+              const std::function<void()>& op) {
+    backend.write(out, 0, zeros.data(),
+                  std::min<uint64_t>(floats, zeros.size()) * 4);
+    backend.begin_commands(); op(); backend.end_commands();
     std::vector<float> v(std::min<uint64_t>(floats, 4096));
     backend.read(out, 0, v.data(), v.size() * 4);
     bool nonzero = false;
@@ -124,7 +130,7 @@ bool output_sane(q27::MetalBackend& backend, q27::BackendBuffer& out, uint64_t f
         if (!std::isfinite(f)) { fprintf(stderr, "FAIL: %s output not finite\n", what); return false; }
         if (f != 0.0f) nonzero = true;
     }
-    if (!nonzero) { fprintf(stderr, "FAIL: %s output all zero (vacuous arm)\n", what); return false; }
+    if (!nonzero) { fprintf(stderr, "FAIL: %s left the zero poison (vacuous arm)\n", what); return false; }
     return true;
 }
 
@@ -138,8 +144,8 @@ int main(int argc, char** argv) {
     // would silently swap arm C to the float-staging kernel.
     setenv("Q27_METAL_GEMM_HALF", "1", 1);
     q27::MetalBackend backend;
-    printf("backend: %s — A/B/C MMA roofline, x_rows %u, %u reps x %u trials, "
-           "lower-95%%-CB verdicts\n", backend.name().c_str(), X_ROWS, reps, TRIALS);
+    printf("backend: %s — A/B/C MMA roofline, x_rows %u, %u reps x %u interleaved trials\n",
+           backend.name().c_str(), X_ROWS, reps, TRIALS);
     printf("excluded: gdn alpha/beta [48x5120] x96 (~0.15%% of chunk FLOPs); output head "
            "(serial-path 12-row slices)\n");
 
@@ -153,10 +159,14 @@ int main(int argc, char** argv) {
         backend.end_commands();
     }
 
-    printf("%-28s %9s %9s %9s | %-15s %-15s %8s\n",
-           "shape", "C ms", "B ms", "A ms", "C/B [lo,hi]", "B/A [lo,hi]", "C TFLOPs");
-    double agg_w = 0, agg_cb = 0, agg_cb_lo = 0;
-    for (const Shape& s : SHAPES) {
+    // Per-shape, per-arm, per-trial times. Trials interleave arms (C, Beq,
+    // B, A within each trial) so thermal/clock drift lands on all arms, and
+    // the per-trial chunk aggregate is a paired ratio.
+    std::vector<std::vector<std::vector<double>>> t(
+        N_SHAPES, std::vector<std::vector<double>>(N_ARMS));
+
+    for (size_t si = 0; si < N_SHAPES; si++) {
+        const Shape& s = SHAPES[si];
         std::vector<uint8_t> t2data;
         std::vector<uint16_t> t2scales;
         q27::BackendTensor wt2 = upload_t2(backend, s, t2data, t2scales);
@@ -168,55 +178,93 @@ int main(int argc, char** argv) {
         backend.write(*xfb, 0, xf.data(), xf.size() * 4);
         q27::BackendQuantized xq = backend.allocate_quantized(X_ROWS * s.cols);
         backend.quantize(*xfb, xq);
-        // B operands: half weights/activations/weight-scales, float x-scales.
+        // B operands: half weights/activations at production layout.
         auto wh = upload_halves(backend, (uint64_t)s.rows * s.cols, true);
-        auto wsh = upload_halves(backend, (uint64_t)s.rows * (s.cols / 128), false);
         auto xh = upload_halves(backend, (uint64_t)X_ROWS * s.cols, true);
+        // Beq operands: C's device byte volume (cols/8 halves per weight
+        // row, cols/2 per activation row).
+        auto whe = upload_halves(backend, (uint64_t)s.rows * (s.cols / 8), true);
+        auto xhe = upload_halves(backend, (uint64_t)X_ROWS * (s.cols / 2), true);
+        auto wsh = upload_halves(backend, (uint64_t)s.rows * (s.cols / 128), false);
         std::vector<float> xs1((uint64_t)X_ROWS * (s.cols / 32), 1.0f);
         auto xsb = backend.allocate(xs1.size() * 4);
         backend.write(*xsb, 0, xs1.data(), xs1.size() * 4);
         auto seed = upload_halves(backend, 32 * 64 + 64 * 16, true);
         auto y = backend.allocate((uint64_t)s.rows * X_ROWS * 4);
 
-        // Anti-vacuity: run each arm once, outputs must be finite + nonzero.
-        backend.begin_commands();
-        backend.matmul_quantized(wt2, xq, X_ROWS, *y);
-        backend.end_commands();
-        if (!output_sane(backend, *y, (uint64_t)s.rows * X_ROWS, "arm C")) return 1;
-        backend.begin_commands();
-        backend.mma_roofline('b', s.rows, s.cols, X_ROWS, *wh, wsh.get(), xh.get(), xsb.get(), *y);
-        backend.end_commands();
-        if (!output_sane(backend, *y, (uint64_t)s.rows * X_ROWS, "arm B")) return 1;
-        backend.begin_commands();
-        backend.mma_roofline('a', s.rows, s.cols, X_ROWS, *seed, nullptr, nullptr, nullptr, *y);
-        backend.end_commands();
-        if (!output_sane(backend, *y, (uint64_t)s.rows * X_ROWS, "arm A")) return 1;
+        const std::function<void()> ops[N_ARMS] = {
+            [&] { backend.matmul_quantized(wt2, xq, X_ROWS, *y); },
+            [&] { backend.mma_roofline('e', s.rows, s.cols, X_ROWS, *whe, wsh.get(), xhe.get(), xsb.get(), *y); },
+            [&] { backend.mma_roofline('b', s.rows, s.cols, X_ROWS, *wh, wsh.get(), xh.get(), xsb.get(), *y); },
+            [&] { backend.mma_roofline('a', s.rows, s.cols, X_ROWS, *seed, nullptr, nullptr, nullptr, *y); },
+        };
 
-        const Stat c = measure(backend, reps, [&] { backend.matmul_quantized(wt2, xq, X_ROWS, *y); });
-        const Stat b = measure(backend, reps, [&] {
-            backend.mma_roofline('b', s.rows, s.cols, X_ROWS, *wh, wsh.get(), xh.get(), xsb.get(), *y);
-        });
-        const Stat a = measure(backend, reps, [&] {
-            backend.mma_roofline('a', s.rows, s.cols, X_ROWS, *seed, nullptr, nullptr, nullptr, *y);
-        });
-        // Physical MMA count: tgs x cols simdgroup-MMAs, 1024 FLOPs each.
-        const double tgs = (double)((s.rows + 31) / 32) * ((X_ROWS + 15) / 16);
-        const double flops = tgs * s.cols * 1024.0;
-        const double cb = c.mean / b.mean, cb_lo = c.lo / b.hi, cb_hi = c.hi / b.lo;
-        const double ba = b.mean / a.mean, ba_lo = b.lo / a.hi, ba_hi = b.hi / a.lo;
-        printf("%-28s %9.3f %9.3f %9.3f | %.3f [%.3f,%.3f] %.3f [%.3f,%.3f] %8.2f\n",
-               s.name, c.mean * 1e3, b.mean * 1e3, a.mean * 1e3,
-               cb, cb_lo, cb_hi, ba, ba_lo, ba_hi, flops / c.mean / 1e12);
-        const double w = c.mean * s.per_chunk_count;   // C-time share weighting
-        agg_w += w;
-        agg_cb += w / cb;
-        agg_cb_lo += w / cb_lo;
+        // Anti-vacuity gates (zero-poisoned per arm), then warmup.
+        const uint64_t out_floats = (uint64_t)s.rows * X_ROWS;
+        std::vector<float> zeros(std::min<uint64_t>(out_floats, 4096), 0.0f);
+        for (int arm = 0; arm < N_ARMS; arm++)
+            if (!arm_sane(backend, *y, out_floats, zeros, ARM_NAMES[arm], ops[arm])) return 1;
+        for (int arm = 0; arm < N_ARMS; arm++) {
+            backend.begin_commands(); ops[arm](); backend.end_commands();
+        }
+
+        for (uint32_t trial = 0; trial < TRIALS; trial++) {
+            // Rotate the arm order per trial so systematic frequency/thermal
+            // drift within a trial doesn't always land on the same side of
+            // each paired ratio (codex P2).
+            for (int k = 0; k < N_ARMS; k++) {
+                const int arm = (k + (int)trial) % N_ARMS;
+                const auto start = std::chrono::steady_clock::now();
+                backend.begin_commands();
+                for (uint32_t r = 0; r < reps; r++) ops[arm]();
+                backend.end_commands();
+                t[si][arm].push_back(std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count() / reps);
+            }
+        }
     }
-    const double R = agg_w / agg_cb, R_lo = agg_w / agg_cb_lo;
-    printf("aggregate B/C headroom R = %.3f (lower 95%% CB %.3f), C-time-weighted\n", R, R_lo);
-    const char* verdict = R_lo <= 1.08 ? "<=1.08: no unpack/staging headroom — M4 prefill MMA is MATURE at this schedule"
-                        : R_lo <= 1.15 ? "1.08-1.15: permit exactly ONE targeted kernel round"
-                                       : ">1.15: real implementation headroom — pursue";
-    printf("pre-registered verdict (on the lower CB): %s\n", verdict);
+
+    printf("%-28s %9s %9s %9s %9s | %-18s %8s\n",
+           "shape", "C ms", "Beq ms", "B ms", "A ms", "C/Beq [95% CI]", "C TFLOPs");
+    for (size_t si = 0; si < N_SHAPES; si++) {
+        const Shape& s = SHAPES[si];
+        const Stat c = stat_of(t[si][C]), beq = stat_of(t[si][BEQ]);
+        const Stat b = stat_of(t[si][B]), a = stat_of(t[si][A]);
+        std::vector<double> ratio(TRIALS);
+        for (uint32_t k = 0; k < TRIALS; k++) ratio[k] = t[si][C][k] / t[si][BEQ][k];
+        const Stat r = stat_of(ratio);
+        const double tgs = (double)((s.rows + 31) / 32) * ((X_ROWS + 15) / 16);
+        printf("%-28s %9.3f %9.3f %9.3f %9.3f | %.3f [%.3f,%.3f] %8.2f\n",
+               s.name, c.mean * 1e3, beq.mean * 1e3, b.mean * 1e3, a.mean * 1e3,
+               r.mean, r.lo, r.hi, tgs * s.cols * 1024.0 / c.mean / 1e12);
+    }
+
+    // Chunk-aggregate paired ratios per trial (valid CI: one ratio
+    // observation per trial, arms measured back-to-back inside the trial).
+    auto agg_ratio = [&](Arm num, Arm den) {
+        std::vector<double> r(TRIALS);
+        for (uint32_t k = 0; k < TRIALS; k++) {
+            double tn = 0, td = 0;
+            for (size_t si = 0; si < N_SHAPES; si++) {
+                tn += SHAPES[si].per_chunk_count * t[si][num][k];
+                td += SHAPES[si].per_chunk_count * t[si][den][k];
+            }
+            r[k] = tn / td;
+        }
+        return stat_of(r);
+    };
+    const Stat Req = agg_ratio(C, BEQ), Rb = agg_ratio(C, B), Rba = agg_ratio(BEQ, A);
+    printf("aggregate C/Beq (decision arm)      : %.3f [%.3f, %.3f]\n", Req.mean, Req.lo, Req.hi);
+    printf("aggregate C/B   (expert-literal arm): %.3f [%.3f, %.3f]  (traffic-confounded, "
+           "conservative)\n", Rb.mean, Rb.lo, Rb.hi);
+    printf("aggregate Beq/A (cadence residual)  : %.3f [%.3f, %.3f]\n", Rba.mean, Rba.lo, Rba.hi);
+    // No-headroom needs the UPPER bound under the line; headroom needs the
+    // LOWER bound above it; anything else is inconclusive (codex P1).
+    const char* verdict =
+        Req.hi <= 1.08 ? "upper bound <= 1.08: no unpack/staging headroom — M4 prefill MMA is MATURE at this schedule"
+      : Req.lo >  1.15 ? "lower bound > 1.15: real implementation headroom — pursue"
+      : Req.lo >  1.08 ? "lower bound in (1.08, 1.15]: permit exactly ONE targeted kernel round"
+                       : "INCONCLUSIVE: CI straddles the 1.08 line — tighten (more trials) before deciding";
+    printf("pre-registered verdict (C/Beq): %s\n", verdict);
     return 0;
 }

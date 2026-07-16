@@ -80,55 +80,90 @@ read says mature, prefill closes as mature and the roadmap moves on.
 
 ## Results (appended post-measurement, same day, M4 16 GB)
 
-**VERDICT: B/C ≤ 1.08 → STOP. M4 prefill MMA is classified MATURE at this
-schedule.** Aggregate R = t_C/t_B = **1.010**, lower 95% CB **0.992**
-(C-time-weighted across the production mix). The unpack + int8→half
-machinery the fork doesn't carry costs ~1% — the 8.1% GEMM speedup needed
-to close the 48.79 → 52.48 fork gap is not there. Per the adopted bottom
-line, the prefill-maturity decision is closed; the remaining gap is
-schedule-level, not implementation debt in the T2 plumbing.
+**FINAL VERDICT (post-codex corrected methodology): C/Beq = 1.135
+[1.134, 1.136] → the (1.08, 1.15] read fires — NOT mature; exactly ONE
+targeted kernel round is permitted, aimed at the unpack/conversion ALU.**
 
-### Numbers (8 reps × 10 trials, ms/dispatch, x_rows 96)
+### The verdict flipped in the codex round — recorded honestly
 
-| shape | C | B | A | C/B [95% CI] | B/A [95% CI] | C TFLOP/s |
+The first measurement (landing commit 048fd31) read "mature": aggregate
+t_C/t_B = 1.010, lower CB 0.992. Codex raised two P1s that overturned it:
+
+1. **Arm B was traffic-confounded.** Half operands at production layout
+   stream 8× the weight bytes of C's packed T2; on ffn_down that traffic
+   made B *slower* than C (0.913), dragging the aggregate toward 1 and
+   masking the unpack cost. Fix: arm **Beq** loads exactly C's device byte
+   volume (one half2 = 4 B per weight tile-slot, one half4 = 8 B per
+   activation tile-slot), replicates into the same staging stores, keeps
+   barriers/MMA/flush identical — C/Beq isolates plumbing ALU at equal
+   traffic. The expert-literal B stays reported as the confounded
+   companion (C/B = 1.016 [1.014, 1.018]).
+2. **Wrong confidence-bound direction.** Declaring "no headroom" requires
+   the UPPER bound ≤ 1.08 (the lower bound only ever establishes
+   headroom); the tool now has an explicit inconclusive zone.
+
+Plus two P2s, both fixed: outputs are zero-poisoned before every arm's
+anti-vacuity check (an arm that silently writes nothing can no longer
+inherit the previous arm's output), and the aggregate CI is now valid —
+per-trial paired chunk-aggregate ratios (arms interleaved within each
+trial), CI over the 10 ratio observations, instead of a harmonic
+combination of non-simultaneous per-shape bounds.
+
+A second codex round found two more bias sources, both fixed and
+re-measured: the arm order inside each trial is now rotated (a fixed
+C-first order folds thermal/frequency drift into the same side of every
+paired ratio), and Beq's activation staging loads were split into two
+4-byte half2 loads to match C's two char4 loads (one 8-byte load
+understates load-issue cost). Re-measured verdict: **1.135
+[1.134, 1.136] — unchanged**; the number was already honest, now the
+methodology can prove it.
+
+### Numbers (8 reps × 10 interleaved trials, ms/dispatch, x_rows 96)
+
+| shape | C | Beq | B | A | C/Beq [95% CI] | C TFLOP/s |
 |---|---|---|---|---|---|---|
-| ffn gate/up [17408×5120] | 6.955 | 6.662 | 4.780 | 1.044 [1.036,1.052] | 1.394 [1.380,1.408] | 2.46 |
-| ffn down [5120×17408] | 6.916 | 7.575 | 4.826 | **0.913** [0.893,0.934] | 1.570 [1.532,1.608] | 2.47 |
-| gdn qkv [10240×5120] | 4.214 | 4.005 | 2.892 | 1.052 [1.032,1.073] | 1.385 [1.350,1.421] | 2.39 |
-| gdn gate [6144×5120] | 2.531 | 2.447 | 1.754 | 1.034 [1.007,1.063] | 1.395 [1.347,1.445] | 2.39 |
-| ssm/attn out [5120×6144] | 2.519 | 2.415 | 1.737 | 1.043 [1.005,1.083] | 1.391 [1.345,1.438] | 2.40 |
-| attn q [12288×5120] | 5.025 | 4.817 | 3.479 | 1.043 [1.025,1.062] | 1.385 [1.356,1.414] | 2.40 |
-| attn k/v [1024×5120] | 0.484 | 0.482 | 0.337 | 1.006 [0.892,1.132] | 1.429 [1.315,1.550] | 2.08 |
-| **aggregate** | | | | **1.010 (lo 0.992)** | | |
+| ffn gate/up [17408×5120] | 6.753 | 5.944 | 6.473 | 4.671 | 1.136 [1.134,1.139] | 2.53 |
+| ffn down [5120×17408] | 6.771 | 5.973 | 7.282 | 4.630 | 1.134 [1.131,1.136] | 2.53 |
+| gdn qkv [10240×5120] | 4.000 | 3.526 | 3.829 | 2.778 | 1.134 [1.131,1.138] | 2.52 |
+| gdn gate [6144×5120] | 2.442 | 2.152 | 2.337 | 1.693 | 1.135 [1.128,1.142] | 2.47 |
+| ssm/attn out [5120×6144] | 2.422 | 2.136 | 2.323 | 1.680 | 1.134 [1.130,1.139] | 2.49 |
+| attn q [12288×5120] | 4.783 | 4.217 | 4.587 | 3.319 | 1.134 [1.132,1.136] | 2.53 |
+| attn k/v [1024×5120] | 0.466 | 0.413 | 0.453 | 0.331 | 1.129 [1.109,1.148] | 2.16 |
+| **aggregate C/Beq** | | | | | **1.135 [1.134, 1.136]** | |
+| aggregate C/B (literal, confounded) | | | | | 1.014 [1.013, 1.016] | |
+| aggregate Beq/A (cadence residual) | | | | | 1.276 [1.274, 1.278] | |
 
-Anti-vacuity gates passed (all arms finite + nonzero); CIs are tight
-except the small attn k/v shape, whose weight in the aggregate is minor.
-ffn down's B < C is the pre-registered conservative direction realized:
-half weights stream 8× the device bytes of packed T2, and at [5120,17408]
-geometry that traffic actually bites — meaning production's packed
-streaming is a net WIN there, not debt. Even the most optimistic per-shape
-upper bound (1.13, attn k/v) stays under the 1.15 pursue line.
+The per-shape C/Beq is remarkably uniform (1.13–1.14 everywhere): the
+plumbing tax is a fixed fraction of tile work, independent of shape — a
+kernel-structural cost, exactly what a targeted round can attack.
 
-### Attribution reading (A/B), recorded for the file
+### What the one permitted round should target
 
-B/A ≈ 1.39–1.57: staging + barriers + per-64-K flush cadence holds
-~28–36% of arm B's wall — production runs ~2.4 TFLOP/s of physical MMA
-against a ~3.5 TFLOP/s shape-specific ceiling (arm A). Per the expert
-table that names "barriers / tile movement / accumulator folding" as the
-residual problem — but the pre-registered lever ordering permits barrier
-work only on a measured *production arrival-stall*, and the adopted
-bottom line stands: one attribution experiment, not an open-ended
-optimization stream. The K=128 flush-cadence probe condition ("plumbing
-accounts for >8–10%") is NOT met (plumbing = 1%), and prescaled-half
-variant A stays closed (B/C does not implicate raw-int staging). Recorded
-as the known shape of the remaining headroom should a future round-4
-expert review choose to re-open it with a stall measurement.
+- The 13.5% is the per-tile unpack + convert ALU: 16 shift/mask/sub →
+  int→half conversions per weight uint, plus 8 char→half conversions per
+  activation slot. Primary candidate: **bit-pattern trit→half unpack** —
+  a trit's half encoding is one of three constants (0xBC00/0x0000/0x3C00),
+  so a select/LUT construction can replace the int→half convert chain.
+  Activation-side char→half is the secondary target.
+- The K=128 flush-cadence probe condition ("plumbing accounts for
+  >8–10%") is now MET (13.5%) — it may ride the same round if the unpack
+  fix alone doesn't clear the fork-gap arithmetic (needs 8.1%).
+- Prescaled-half variant A stays closed unless the round's own
+  measurement implicates the activation-staging side specifically.
+- Beq/A = 1.276: staging/barrier/flush cadence still holds ~28% at equal
+  MMA count (C runs ~2.5 TFLOP/s physical MMA vs A's ~3.65 ceiling), but
+  the barrier lever stays gated on a measured production arrival-stall,
+  per the round-3 ordering.
+- The expert contract is explicit: this is ONE round with the fork-gap
+  arithmetic as its bar (8.1% GEMM-kernel speedup ≈ the measured 13.5%
+  budget minus whatever is irreducible), not an open-ended stream. If the
+  round lands short, prefill closes as mature with the attempt recorded.
 
 ### Consequences
 
-- **Prefill maturity: DECIDED (mature).** The margin-aware program item
-  "re-price prescaled-half variant A after the roofline" resolves to
-  CLOSED — the roofline does not implicate raw-int staging.
-- Roofline surface stays in tree (bench-only): `q27_mma_roofline_a/b`,
+- **Prefill maturity: NOT yet decided mature** — the 048fd31 "mature"
+  read is retracted (methodology, not measurement noise). One targeted
+  unpack round is authorized by the pre-registered table.
+- Roofline surface stays in tree (bench-only): `q27_mma_roofline_a/b/b_eq`,
   `MetalBackend::mma_roofline`, `tools/metal_mma_roofline.cpp` — one
-  command re-establishes the verdict on other hardware.
+  command re-establishes the verdict, now with valid statistics.
