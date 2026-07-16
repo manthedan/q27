@@ -10,6 +10,14 @@ Starts the Metal server with --slots 2 and checks:
       exactly the text they return solo.
   G3  cancel: a client that disconnects mid-stream leaves no state behind —
       the same request re-run afterwards returns the solo text.
+  G4  constraint isolation (greedy config only): a grammar-constrained tool
+      request on one slot runs concurrently with a plain request on the
+      other; the plain text must equal solo (a leaked mask zeroes almost the
+      whole vocabulary — divergence would be dramatic), the constrained text
+      must equal ITS solo run, and constraint action is proven, not assumed:
+      the declared tool name is one the model never produces naturally, so
+      it can only appear in the output if the mask steered decoding
+      (vacuous-gate lesson). Server stderr must show the engage/close pairs.
   G5  wait honesty: /stats reports nonzero busy-arrival gate waits after the
       concurrency phase, and every request was admitted.
 
@@ -19,6 +27,7 @@ import http.client
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -32,6 +41,17 @@ PROMPT_A = ("The measurement discipline that keeps a kernel project honest is si
 PROMPT_B = ("A scheduling quantum is the unit of GPU work between opportunities to yield. "
             "If the quantum is a whole prefill, a concurrent decode stream waits seconds; "
             "if it is one chunk, the wait is bounded by")
+
+# G4: the few-shot demonstrates get_weather, but the DECLARED tool is a name
+# the model would never produce on its own — it can only appear via the mask.
+PROMPT_TOOL = ("You are an assistant with one tool.\n"
+               "User: What is the weather in Berlin?\n"
+               'Assistant: <tool_call>{"name": "get_weather", "arguments": '
+               '{"city": "Berlin"}}</tool_call>\n'
+               "User: What is the weather in Paris?\n"
+               "Assistant:")
+TOOL_NAME = "zz_paris_weather_probe"
+TOOLS = [{"type": "function", "function": {"name": TOOL_NAME}}]
 
 
 def request(prompt, n=64, timeout=600, **extra):
@@ -90,8 +110,13 @@ def main():
            "--ctx", "2048", "--slots", "2"]
     if mtp:
         cmd += ["--mtp", "4"]
+    else:
+        # G4 needs the constrainer; it only affects requests that pass tools,
+        # so the other gates run unchanged. (--constrain-tools rejects --mtp.)
+        cmd += ["--constrain-tools"]
     label = "mtp4" if mtp else "greedy"
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stderr_file = tempfile.NamedTemporaryFile(prefix="multislot_gates_", suffix=".log")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_file)
     failures = []
     try:
         wait_ready(proc)
@@ -171,6 +196,41 @@ def main():
                 print(f"  - {f}")
             return 1
 
+        # G4: constrained tool decode on one slot, plain decode on the other.
+        if not mtp:
+            solo_t = request(PROMPT_TOOL, n=48, tools=TOOLS)
+            if f'"{TOOL_NAME}"' not in solo_t:
+                failures.append("G4: declared tool name absent from solo constrained "
+                                "output — mask never steered decoding (vacuous)")
+            for round_no in range(2):
+                results = {}
+                def run_t(name, prompt, kw):
+                    try:
+                        results[name] = request(prompt, **kw)
+                    except Exception as e:  # noqa: BLE001
+                        results[name] = f"ERROR: {e}"
+                tt = threading.Thread(target=run_t, args=("t", PROMPT_TOOL,
+                                                          {"n": 48, "tools": TOOLS}))
+                tp = threading.Thread(target=run_t, args=("b", PROMPT_B, {}))
+                tt.start(); tp.start(); tt.join(); tp.join()
+                if results["t"] != solo_t:
+                    failures.append(f"G4 round {round_no}: constrained request diverged "
+                                    "under concurrency")
+                if results["b"] != solo_b:
+                    failures.append(f"G4 round {round_no}: plain request diverged beside "
+                                    "a constrained slot (mask leak class)")
+            stderr_file.flush()
+            srv_log = open(stderr_file.name, errors="replace").read()
+            engaged = srv_log.count("[toolgram] engaged")
+            closed = srv_log.count("[toolgram] call closed")
+            disengaged = srv_log.count("[toolgram] disengaged")
+            if engaged < 3 or closed < 3:
+                failures.append(f"G4: expected >=3 engage/close pairs in server stderr, "
+                                f"saw engaged={engaged} closed={closed}")
+            if disengaged:
+                failures.append(f"G4: {disengaged} grammar disengage(s) — constraint "
+                                "broke mid-call")
+
         # G3: cancel mid-stream, then the same request must match solo.
         stream_then_cancel(PROMPT_B)
         time.sleep(1)
@@ -199,13 +259,15 @@ def main():
     finally:
         proc.terminate()
         proc.wait(timeout=30)
+        stderr_file.close()
 
     if failures:
         print(f"[{label}] FAIL:")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print(f"[{label}] G1/G2/G3/G5 PASS (solo texts {len(solo_a)}/{len(solo_b)} chars)")
+    gates = "G1/G2/G3/G5" if mtp else "G1/G2/G3/G4/G5"
+    print(f"[{label}] {gates} PASS (solo texts {len(solo_a)}/{len(solo_b)} chars)")
     return 0
 
 

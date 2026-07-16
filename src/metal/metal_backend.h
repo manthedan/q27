@@ -40,6 +40,24 @@ class MetalBackend final : public ComputeBackend {
     void matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
                                const BackendTensor& b, BackendBuffer& b_out,
                                const BackendQuantized& x) override;
+    // N=2 slot-batched T2 GEMV (Phase 2 probe): x = 2 activation rows
+    // ([2,cols] values / [2,cols/32] scales), y = [2,rows] token-major.
+    // Metal-only surface until the probe passes its decision line.
+    void matvec_quantized_x2(const BackendTensor& weight,
+                             const BackendQuantized& x, BackendBuffer& y);
+    // Select-form float-activation variant (the production serial-decode
+    // path), two independent x/y buffer pairs. Same probe status.
+    void matvec_x2(const BackendTensor& weight,
+                   const BackendBuffer& x_a, const BackendBuffer& x_b,
+                   BackendBuffer& y_a, BackendBuffer& y_b);
+    // A/B/C MMA roofline probe (bench-only): arm 'a' = MMA-core ceiling
+    // (w_or_seed = opaque tile seed, other pointers null), arm 'b' =
+    // half-plumbing (half weights/scales/activations, float x scales).
+    // Same dispatch grid and tile geometry as the production T2 GEMM.
+    void mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t x_rows,
+                      const BackendBuffer& w_or_seed, const BackendBuffer* w_scales,
+                      const BackendBuffer* x, const BackendBuffer* x_scales,
+                      BackendBuffer& y);
     void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
                           uint32_t x_rows,BackendBuffer& y) override;
     void embedding_q8(const BackendTensor& weight, uint32_t token,
@@ -163,6 +181,14 @@ class MetalBackend final : public ComputeBackend {
                                         uint32_t q_heads, uint32_t kv_heads,
                                         uint32_t head_dim, float scale);
     // tile must be 2 or 4; interleaved (production-layout) caches.
+    // R3 probe (bench-only): barrier-free direct-read block-partial causal
+    // GQA at token factor 2 with an explicit block-size override.
+    void attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32_t q_stride,
+                                        uint32_t q_row_stride,
+                                        const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                        BackendBuffer& out, uint32_t base_len,
+                                        uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+                                        uint32_t tokens, uint32_t block, float scale);
     void attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uint32_t q_stride,
                                            uint32_t q_row_stride,
                                            const BackendBuffer& k_cache, const BackendBuffer& v_cache,
