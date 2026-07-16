@@ -1057,6 +1057,52 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
     }
 }
 
+void MetalEngine::teacher_force_logits_wide(const uint32_t* tokens, uint32_t count,
+                                            std::vector<float>& out) {
+    if (!count || count > PREFILL_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: teacher_force_logits_wide takes 1..96 tokens");
+    if (count <= CHUNK_MAX) { teacher_force_logits(tokens, count, out); return; }
+    if (!chunked_prefill_ || !ch_)
+        throw std::runtime_error("q27 Metal: wide teacher forcing requires chunked prefill");
+    if ((uint64_t)position_ + count > max_context_)
+        throw std::runtime_error("q27 Metal: teacher-forced chunk exceeds context");
+    for (uint32_t i = 0; i < count; i++)
+        if (tokens[i] >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
+    out.resize((size_t)count * VOCAB);
+    if (!wide_head_stage_)
+        wide_head_stage_ = backend_.allocate((uint64_t)CHUNK_MAX * N_EMBD * sizeof(float));
+    {
+        CommandBatch batch(backend_);
+        chunk_forward(tokens, count);
+        batch.finish();
+    }
+    position_ += count;
+    // Head in CHUNK_MAX-row slices: cfinal_/clogits_ are CHUNK_MAX-sized, so
+    // each slice's hidden rows are staged to offset 0 first (backend ops take
+    // whole buffers). The head math per row is identical to the narrow path;
+    // any divergence this instrument reports comes from chunk_forward width.
+    for (uint32_t s0 = 0; s0 < count; s0 += CHUNK_MAX) {
+        const uint32_t slice = std::min(CHUNK_MAX, count - s0);
+        {
+            CommandBatch batch(backend_);
+            backend_.copy(*ch_, (uint64_t)s0 * N_EMBD * sizeof(float),
+                          *wide_head_stage_, 0, (uint64_t)slice * N_EMBD * sizeof(float));
+            BackendQuantized x5 = quantized_view(cq5120_, slice * N_EMBD);
+            backend_.rmsnorm_rows_quantized(*wide_head_stage_, weight("output_norm.weight"),
+                                            *cfinal_, N_EMBD, slice, EPS, x5);
+            backend_.matmul_quantized(weight("output.weight"), x5, slice, *clogits_);
+            batch.finish();
+        }
+        backend_.read(*clogits_, 0, out.data() + (size_t)s0 * VOCAB,
+                      (uint64_t)slice * VOCAB * sizeof(float));
+    }
+    // Serial logits buffer stays coherent with the last encoded row, as the
+    // narrow chunk path guarantees (clogits_ still holds the final slice).
+    const uint32_t last_row = (count - 1) % CHUNK_MAX;
+    backend_.copy(*clogits_, (uint64_t)last_row * VOCAB * sizeof(float),
+                  *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+}
+
 // GPU-assisted sampling: when top-k is active and within the radix-select
 // range, extract the candidate over-set on the GPU and read back ~k pairs
 // instead of the full 600 KB logits vector. A candidate count above

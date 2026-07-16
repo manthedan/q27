@@ -37,7 +37,18 @@ arrived), PARKED-AGREED.
    shape: constructor-local reservation guard (RAII, commit-at-end), plus
    an underflow assert on subtraction. Single-threaded `Shared` — no
    atomics needed.
-3. **Wide prefill path not covered by NLL/KL gates. CONFIRMED**
+3. **Wide prefill path not covered by NLL/KL gates. FIXED (same night)** —
+   `teacher_force_logits_wide` (chunk_forward at widths to 96, head in
+   12-row slices) + `--chunk-parity` (two engines, one mapping; per-position
+   max/mean logit delta, forward KL, top-1 flips with baseline margin,
+   top-20 overlap, per-arm NLL). **Verdict: widths 17/48/96 are
+   BIT-IDENTICAL to width 12 at the logit level** (384 positions, all
+   metrics exactly zero), and the instrument's negative control
+   (`--prefill serial` baseline) fires at the known chunk-vs-serial class
+   (max|dlogit| 0.279, KL 1.6e-4 nats, 0 flips, 99.17% top-20 overlap) —
+   the gate can fail, and that control doubles as the first empirical
+   envelope datapoint for the margin-aware contract.
+   Original finding: **CONFIRMED**
    (`metal_engine.h:130`, `metal_engine.cpp:956`): NLL/teacher-forcing
    still slices at `CHUNK_MAX=12`, so widths 48/96 carry only
    committed-token A/Bs — decision-level, not distribution-level, coverage.
