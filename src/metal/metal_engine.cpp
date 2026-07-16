@@ -967,6 +967,14 @@ void MetalEngine::oracle_round(const uint32_t* lanes, uint32_t live, bool last,
             throw std::runtime_error("q27 Metal: oracle lane token out of range");
     last_spec_stats_.rounds++;
     last_spec_stats_.drafted += live - 1;
+    // Round-anatomy trace (verify-round-cost plan P0): verify batch vs
+    // prediction readback vs commit batch, per round.
+    static const bool trace = getenv("Q27_ORACLE_TRACE") != nullptr;
+    auto clock = [] { return std::chrono::steady_clock::now(); };
+    auto ms_since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+    auto verify_start = clock();
     {
         CommandBatch batch(backend_);
         chunk_forward(lanes, live, /*verify=*/true);
@@ -977,7 +985,11 @@ void MetalEngine::oracle_round(const uint32_t* lanes, uint32_t live, bool last,
         backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
         batch.finish();
     }
+    const double verify_ms = trace ? ms_since(verify_start) : 0.0;
+    auto read_start = clock();
     backend_.read(*cpred_, 0, predictions, live * sizeof(uint32_t));
+    const double read_ms = trace ? ms_since(read_start) : 0.0;
+    auto commit_start = clock();
     // Teacher-forced commit of every lane; the final output token of a
     // generation is never encoded, exactly like the serial walk.
     const uint32_t encoded = last ? live - 1 : live;
@@ -992,6 +1004,9 @@ void MetalEngine::oracle_round(const uint32_t* lanes, uint32_t live, bool last,
         batch.finish();
     }
     position_ += encoded;
+    if (trace)
+        fprintf(stderr, "oracle round: live %u | verify %.2f ms read %.2f ms commit %.2f ms\n",
+                live, verify_ms, read_ms, ms_since(commit_start));
 }
 
 uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint32_t width,
