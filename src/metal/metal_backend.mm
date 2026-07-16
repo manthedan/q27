@@ -1865,7 +1865,7 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
     check_range(kc.size(), 0, cache_bytes, "chunked attention K cache");
     check_range(vc.size(), 0, cache_bytes, "chunked attention V cache");
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked attention output");
-    if (base_len > UINT32_MAX - tokens - 1024)
+    if (base_len > UINT32_MAX - tokens - impl_->gqa_block)
         throw std::runtime_error("q27 Metal: chunked attention sequence too large");
     // Each chunk row must take the same path serial decode takes at that
     // row's sequence length, or chunked prefill and serial ingestion diverge
@@ -1915,7 +1915,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
     check_range(kc.size(), 0, cache_bytes, "chunked turbo3 K cache");
     check_range(vc.size(), 0, cache_bytes, "chunked turbo3 V cache");
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked turbo3 attention output");
-    if (base_len > UINT32_MAX - tokens - 1024)
+    if (base_len > UINT32_MAX - tokens - impl_->gqa_block)
         throw std::runtime_error("q27 Metal: chunked turbo3 attention sequence too large");
     // Each chunk row must take the same path serial decode takes at that
     // row's sequence length, or chunked prefill and serial ingestion diverge
