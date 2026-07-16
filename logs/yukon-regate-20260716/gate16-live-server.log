@@ -1,0 +1,7 @@
+CUDA : ' Paris.\n\n<think>\n\n</think>\n\nThat is correct. Paris is the capital and'
+Metal: ' Paris.\n\n<think>\n\n</think>\n\nThat is correct. Paris is the capital and'
+CUDA sha256 : 6c1d43280dfab663d7d8be5228c6b30a6c268b43a3a971d66b2686476dc1d0cc
+Metal sha256: 6c1d43280dfab663d7d8be5228c6b30a6c268b43a3a971d66b2686476dc1d0cc
+Metal model ready on Apple M4 in 0.10 s
+16 tokens in 19.36 s (0.83 tok/s), position 20
+PASS: CUDA and Metal committed text match exactly
