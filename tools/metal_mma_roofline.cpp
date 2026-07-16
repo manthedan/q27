@@ -38,8 +38,8 @@ using q27::DType;
 
 namespace {
 
-constexpr uint32_t TRIALS = 16;
-constexpr double T_CRIT = 2.131;  // t-distribution, 15 dof, two-sided 95%
+constexpr uint32_t TRIALS = 18;
+constexpr double T_CRIT = 2.110;  // t-distribution, 17 dof, two-sided 95%
 
 struct Shape {
     const char* name;
@@ -67,8 +67,8 @@ constexpr size_t N_SHAPES = sizeof(SHAPES) / sizeof(Shape);
 // D = lever 1 direct-RHS probe (64x32 weight-staged tile, RHS read from
 // device via simdgroup_load, int8->half K-major pre-pass charged to the
 // arm; docs/plans/2026-07-16-lever1-direct-rhs.md).
-enum Arm { C = 0, BEQ = 1, B = 2, A = 3, CX = 4, D = 5, D2 = 6, F = 7, N_ARMS = 8 };
-const char* ARM_NAMES[N_ARMS] = {"C", "Beq", "B", "A", "Cx", "D", "D2", "F"};
+enum Arm { C = 0, BEQ = 1, B = 2, A = 3, CX = 4, D = 5, D2 = 6, F = 7, K = 8, N_ARMS = 9 };
+const char* ARM_NAMES[N_ARMS] = {"C", "Beq", "B", "A", "Cx", "D", "D2", "F", "K"};
 static_assert(TRIALS % N_ARMS == 0,
               "trial count must be a multiple of the arm count so the rotated "
               "arm order is fully counterbalanced (codex P2)");
@@ -224,6 +224,8 @@ int main(int argc, char** argv) {
                                        xq.values.get(), xq.scales.get(), *y); },
             [&] { backend.mma_roofline('f', s.rows, s.cols, X_ROWS, *wt2raw, wsh.get(),
                                        xq.values.get(), xq.scales.get(), *y); },
+            [&] { backend.mma_roofline('k', s.rows, s.cols, X_ROWS, *wt2raw, wsh.get(),
+                                       xq.values.get(), xq.scales.get(), *y); },
         };
 
         // Anti-vacuity gates (zero-poisoned per arm), then warmup.
@@ -239,12 +241,14 @@ int main(int argc, char** argv) {
             const std::vector<float> poison(out_floats, 0.0f);
             backend.begin_commands(); ops[C](); backend.end_commands();
             backend.read(*y, 0, yc.data(), out_floats * 4);
-            for (int darm : {(int)D, (int)D2, (int)F}) {
+            for (int darm : {(int)D, (int)D2, (int)F, (int)K}) {
                 // Arm F is the f16-accumulate probe: slab-bounded half
                 // rounding is expected, real error — gated at 5e-2 and
                 // REPORTED (a probe read, docs/plans/2026-07-16-f16acc-
-                // probe.md), where D/D2 remain near-exact at 1e-3.
-                const double tol = darm == (int)F ? 5e-2 : 1e-3;
+                // probe.md), where D/D2 remain near-exact at 1e-3. Arm K
+                // bakes only trip counts (same ops, same order) and must
+                // be BIT-IDENTICAL to C.
+                const double tol = darm == (int)F ? 5e-2 : darm == (int)K ? 0.0 : 1e-3;
                 // Full-buffer poison: an arm that skips writes must not
                 // inherit C's reference values (codex P2); non-finite
                 // candidate outputs are rejected explicitly — NaN would
@@ -330,6 +334,7 @@ int main(int argc, char** argv) {
     const Stat Rd = agg_ratio(C, D);
     const Stat Rd2 = agg_ratio(C, D2);
     const Stat Rf = agg_ratio(C, F);
+    const Stat Rk = agg_ratio(C, K);
     printf("aggregate C/Beq (decision arm)      : %.3f [%.3f, %.3f]\n", Req.mean, Req.lo, Req.hi);
     printf("aggregate C/B   (expert-literal arm): %.3f [%.3f, %.3f]  (traffic-confounded, "
            "conservative)\n", Rb.mean, Rb.lo, Rb.hi);
@@ -348,6 +353,13 @@ int main(int argc, char** argv) {
       : Rf.hi <= 1.10 ? "upper bound <= 1.10: PARK — accumulator width is not the M4 MMA issue limiter"
                       : "INCONCLUSIVE: CI straddles the 1.10 line — extend trials once before parking";
     printf("f16-acc probe verdict (C/F): %s\n", fv);
+    printf("aggregate C/K   (function-constant bake): %.3f [%.3f, %.3f]\n", Rk.mean, Rk.lo, Rk.hi);
+    // BaseRT survey probe 2 kill line: <5% -> not worth PSO-cache complexity.
+    const char* kv2 =
+        Rk.lo >= 1.05 ? "lower bound >= 1.05: GRADUATE — specialize the production chunk-GEMM PSOs per model load"
+      : Rk.hi <= 1.05 ? "upper bound <= 1.05: PARK — trip-count baking is not worth the PSO-cache complexity"
+                      : "INCONCLUSIVE: CI straddles the 1.05 line — extend trials once before parking";
+    printf("function-constant probe verdict (C/K): %s\n", kv2);
     if (X_ROWS <= 16) {
         // Lever 1 decision (docs/plans/2026-07-16-lever1-direct-rhs.md):
         // verify-shape verdict on the lower 95% CB, park line 1.3x.

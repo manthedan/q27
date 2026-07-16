@@ -236,6 +236,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> mma_roofline_b_eq_p;
     id<MTLComputePipelineState> mma_roofline_cx_p;
     id<MTLComputePipelineState> mma_roofline_f_p;
+    // Arm K (function-constant probe): one specialized PSO per baked cols.
+    std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
     id<MTLComputePipelineState> mm_dr_p;
     id<MTLComputePipelineState> mm_dr2_p;
     id<MTLComputePipelineState> x_to_half_t_p;
@@ -1140,12 +1142,28 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
     if (!impl_->mma_roofline_a_p || !impl_->mma_roofline_b_p)
         throw std::runtime_error("q27 Metal: MMA roofline requires Apple GPU family 7 or newer");
     if ((arm != 'a' && arm != 'b' && arm != 'e' && arm != 'x' && arm != 'd' && arm != '2' &&
-         arm != 'f') || !rows || !cols ||
+         arm != 'f' && arm != 'k') || !rows || !cols ||
         !x_rows || x_rows > 96 || cols % 128)
         throw std::runtime_error("q27 Metal: invalid MMA roofline arguments");
-    // Arm 'f' — f16-accumulate probe (docs/plans/2026-07-16-f16acc-probe.md):
-    // the production mm_h operands and grid, half accumulators inside.
-    if (arm == 'f') {
+    // Arms 'f' (f16-accumulate, docs/plans/2026-07-16-f16acc-probe.md) and
+    // 'k' (function-constant cols baking, BaseRT survey probe 2): the
+    // production mm_h operands and grid; 'k' resolves a per-cols
+    // specialized PSO on first use.
+    if (arm == 'f' || arm == 'k') {
+        if (arm == 'k' && !impl_->mma_roofline_k_p.count(cols)) {
+            MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
+            [fc setConstantValue:&cols type:MTLDataTypeUInt atIndex:0];
+            NSError* err = nil;
+            id<MTLFunction> fn = [impl_->library newFunctionWithName:@"q27_mma_roofline_k"
+                                                      constantValues:fc
+                                                               error:&err];
+            id<MTLComputePipelineState> pso =
+                fn ? [impl_->device newComputePipelineStateWithFunction:fn error:&err] : nil;
+            if (!pso)
+                throw std::runtime_error(std::string("q27 Metal: roofline k specialization failed: ") +
+                                         (err ? err.localizedDescription.UTF8String : "unknown"));
+            impl_->mma_roofline_k_p[cols] = pso;
+        }
         if (!w_scales || !x || !x_scales)
             throw std::runtime_error("q27 Metal: roofline arm f needs scales and activations");
         const MetalBuffer& wb = metal_buffer(w_or_seed);
@@ -1160,8 +1178,11 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
         check_range(out.size(), 0, (uint64_t)rows * x_rows * 4, "roofline f output");
         MatmulArgs args{rows, cols, x_rows, 1};
         @autoreleasepool {
-            bool own; auto enc = impl_->encoder_for_operation(own, "q27_mma_roofline_f");
-            [enc setComputePipelineState:impl_->mma_roofline_f_p];
+            bool own;
+            auto enc = impl_->encoder_for_operation(
+                own, arm == 'k' ? "q27_mma_roofline_k" : "q27_mma_roofline_f");
+            [enc setComputePipelineState:arm == 'k' ? impl_->mma_roofline_k_p[cols]
+                                                    : impl_->mma_roofline_f_p];
             [enc setBuffer:wb.handle() offset:0 atIndex:0];
             [enc setBuffer:ws.handle() offset:0 atIndex:1];
             [enc setBuffer:xb.handle() offset:0 atIndex:2];
@@ -1171,7 +1192,7 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32,
                                                   (NSUInteger)(x_rows + 15) / 16, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-            if (own) impl_->finish_command("mma roofline f");
+            if (own) impl_->finish_command(arm == 'k' ? "mma roofline k" : "mma roofline f");
         }
         return;
     }
