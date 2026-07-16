@@ -13,6 +13,13 @@ T=models/qwen36-27b-mtp/qwen36-27b-mtp.tok
 LOG=logs/overnight-2026-07-15
 mkdir -p "$LOG"
 
+# Stale-binary rule: rebuild every artifact-facing binary against the
+# current shader before any gate (the ABI check makes staleness fatal, not
+# silent — but a stale-yet-ABI-compatible binary would still skip new
+# routing, e.g. the R1b tiled dispatch this batch exists to measure).
+make build/q27-metal build/q27-metal-server > "$LOG/rebuild.log" 2>&1 || {
+    echo "rebuild failed" > "$LOG/DONE"; exit 1; }
+
 # --- 1. needle full pass ---
 ./build/q27-metal-server "$M" "$T" --ctx 32768 --kv turbo3 --port 8117 \
     > "$LOG/needle_server.log" 2>&1 &
