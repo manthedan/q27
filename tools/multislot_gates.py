@@ -149,15 +149,27 @@ def main():
                 results[i] = (prompt, f"ERROR: {e}")
         solo_a16 = request(PROMPT_A, n=16)
         solo_b16 = request(PROMPT_B, n=16)
-        threads = [threading.Thread(target=run_q, args=(i,)) for i in range(5)]
+        threads = [threading.Thread(target=run_q, args=(i,), daemon=True) for i in range(5)]
         for t in threads: t.start()
-        for t in threads: t.join(120)
-        if any(t.is_alive() for t in threads):
-            failures.append("Gq: queued request wedged (thread still alive after 120 s)")
+        # Shared deadline: on the wedge this gate targets, sequential
+        # per-thread joins would burn 120 s each and later gates would then
+        # stall on their own HTTP timeouts — fail fast and skip them.
+        deadline = time.time() + 120
+        for t in threads:
+            t.join(max(0.0, deadline - time.time()))
+        wedged = any(t.is_alive() for t in threads)
+        if wedged:
+            failures.append("Gq: queued request wedged (still blocked at the shared 120 s deadline); "
+                            "skipping remaining gates")
         for i, (prompt, text) in sorted(results.items()):
             want = solo_a16 if prompt is PROMPT_A else solo_b16
             if text != want:
                 failures.append(f"Gq: request {i} diverged or errored under queue pressure")
+        if wedged:
+            print(f"[{label}] FAIL:")
+            for f in failures:
+                print(f"  - {f}")
+            return 1
 
         # G3: cancel mid-stream, then the same request must match solo.
         stream_then_cancel(PROMPT_B)
