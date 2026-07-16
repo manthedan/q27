@@ -26,8 +26,9 @@ python3 tools/needle_32k.py http://127.0.0.1:8117 > "$LOG/needle.log" 2>&1
 echo "needle exit: $?" >> "$LOG/needle.log"
 kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null
 
-# --- 2. 16K NLL wall A/B (tiled arm first) ---
-./build/q27-metal "$M" "$T" --nll data/wikitext2-test.tokens.bin \
+# --- 2. 16K NLL wall A/B (tiled arm first; both arms pinned explicitly so
+# an inherited Q27_METAL_GQA_TILE can't make the arms identical) ---
+Q27_METAL_GQA_TILE=2 ./build/q27-metal "$M" "$T" --nll data/wikitext2-test.tokens.bin \
     --nll-long 16384 --ctx 16384 --kv turbo3 > "$LOG/nll16k_tile2.log" 2>&1
 echo "tile2 exit: $?" >> "$LOG/nll16k_tile2.log"
 
