@@ -2,13 +2,19 @@
 
 A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090 (also supports 3090). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
 
-> **Metal fork status:** baseline 64-layer greedy decode, bounded command-batched
-> prefill, MTP widths 2/4/8/12, prefix snapshots, sampling/server APIs, and
-> FP16/turbo3 KV are wired and tested on Apple Silicon (`build/q27-metal`). The
-> 16-token canonical continuation matches CUDA exactly and post-prompt logits
-> have cosine 0.9999. CUDA remains the optimized production/reference backend;
-> matrix prefill, long-context quality gates, and performance parity remain.
-> See [`docs/METAL_PROGRESS.md`](docs/METAL_PROGRESS.md).
+> **Metal fork status (2026-07-16):** the base-M4 kernel frontier is closed by
+> measurement — layer-major prefill to width 96 (T2 ~47 tok/s, MATURE), decode
+> at 98–99% of the resident GEMV ceiling, factor-2 token-tiled causal GQA
+> attention (~2× at depth), batched verification to width 48 (oracle
+> S(48) = 3.94×), batched MTP and suffix-burst speculation, two-slot serving
+> with admission accounting, disk prefix snapshots (~450× vs re-prefill), and
+> FP16/turbo3 KV with 32K NLL/needle quality gates — all byte- or
+> envelope-gated against the serial walk (`build/q27-metal`,
+> `build/q27-metal-server`). CUDA remains the behavioral reference. Ternary
+> (T2, 7.15 GB) and official (17 GiB) tiers serve; binary B1 is quality-GO,
+> kernel-pending. See [`docs/METAL_PROGRESS.md`](docs/METAL_PROGRESS.md) —
+> the "Current state" table there is the accurate summary; negative results
+> are recorded with mechanisms.
 
 ## Why this is interesting
 
@@ -194,7 +200,14 @@ fp16-MMA verify (h16) and fp16/turbo3 KV.
 
 24GB cards (3090-class): build `make build/q27-server-w8` as well --
 `Q27_W_MAX=8` shrinks the fixed VRAM stack so the server fits; the
-default width-12 build OOMs at graph setup on 24GB. Serve it with
+default width-12 build OOMs at graph setup on 24GB. **Known regression
+(2026-07-16): the post-conductor-merge server OOMs in
+`cudaGraphInstantiate` on 24GB even at w8/ctx 4096 — the added
+conductor/P2c graph families grew the fixed graph footprint. A
+pre-merge w8 build still serves; the merged CLI passes the canonical
+gate. Fix direction: lazy/conditional graph instantiation when
+`Q27_BATCH=0`. Until fixed, treat merged-server 3090 support as
+broken.** Serve it with
 `Q27_KV=turbo3` for 131K context (fp16 KV caps ~32K there). The card
 must be otherwise idle: ~2.7GB of other resident VRAM is the difference
 between boot and OOM.

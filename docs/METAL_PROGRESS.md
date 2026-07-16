@@ -1,9 +1,74 @@
 # Metal implementation progress
 
-**Updated:** 2026-07-14  
-**Test device:** Apple M4, 24 GiB unified memory, 17.8 GiB recommended Metal working set
+**Updated:** 2026-07-16
+**Test devices:** Apple M4 24 GiB (official + T2 tiers) and mac-mini M4 16 GiB (T2)
 
-This is the execution ledger for the Metal port. CUDA remains the behavioral reference. “Baseline” means the end-to-end operation exists and has local CPU/synthetic coverage; it does not mean the optimized CUDA-equivalent gate has passed.
+This file is two things: a **current-state summary** (this section — kept
+accurate) and an **append-only chronicle** of dated entries below (the
+authoritative record; every claim here cites an entry there). CUDA remains
+the behavioral reference. The old checkpoint ledger and "mature-decode
+critical path" sections further down are HISTORICAL (2026-07-14 vintage) —
+do not read them as current.
+
+## Current state (2026-07-16 night)
+
+### Shipped and gated (base M4, T2 tier unless noted)
+
+| Area | State | Headline number |
+|---|---|---|
+| Prompt ingestion | Layer-major chunks to width 96; **prefill MATURE** (byte-LUT round spent; every reopening lever parked by measurement) | T2 ~47.2 tok/s |
+| Serial decode | GPU-resident greedy (K=8 steps/command buffer) | 98–99.2% of resident GEMV ceiling |
+| Attention | R1b factor-2 token-tiled causal GQA + GQA KV reuse shipped | ~2× at 16–32K; −19.9% matched 16K NLL wall |
+| Verification | `VERIFY_CHUNK_MAX = 48`, decoupled from the width-12 NLL/KL contract; round cost flat per 16-token tile, sweet spots w ∈ {16, 32, 48} | oracle S(48) = 3.94× |
+| MTP | Batched verify ≤ 12 (widening = 24 GB residue); early-EOS clamp fixed + gated | 58.5% acceptance, official tier |
+| Suffix bursts | Batched verification implemented (match-capped, full-tile snap, serial control kept); **correctness gates staged, economics pending** | traffic prior: cctx fires L≥12 at 35% |
+| Multislot | Phase 1 complete: 2 slots, FIFO ticket lease, 96/48/12 quanta, full admission accounting, dedicated 503, gates G1–G6 | busy-arrival wait ≤ 84 ms |
+| Snapshots | Phase 1 shipped: disk save/load, byte-identical fresh-process resume | ~450× vs re-prefill (0.12 s vs ~52 s) |
+| Quality | 32K turbo3 NLL depth-flat; needles 6/6 at 32K; `--kl-kv` + `--envelope` instruments | PPL 5.318; KL mean 0.0115 nats (tail max 2.83 = KV-codec P1 target) |
+| Tiers | Official 17 GiB (MTP) + T2 7.15 GB serve; **B1 quality GO** (PPL ~1.16× vs T2), kernel Phase 0B pending; dspark drafter pack repacked losslessly (dtypes 6/7) | — |
+
+### Parked by measurement (mechanism recorded in the chronicle entry)
+
+Slot-batched N=2 decode (1.093 vs 1.31 line — select-form GEMV already at
+~89 GB/s, second row flips it issue-bound) · head-major KV (1.00×) · K/V
+restaging (0.76×) · barrier-free attention (0.47–0.53× — dequant sharing,
+not barriers, was R1b's win) · direct-RHS chunk GEMM (0.78× — needs
+Metal-4 cooperative tensors) · f16-accumulate MMA (1.065 vs 1.10) ·
+function-constant baking (1.010) · T3 packing (decode-bound) · 1.7B
+sibling drafter (vocab lineage) · **DSpark port (measured τ = 3.209 vs
+break-even 4.13; chain upper bound S ≤ 1.07 vs the 1.3 gate — decisive;
+fixtures + one-command re-gate banked for M5/M6)** · slim verifiers
+(verify batch = 97.5% of round cost).
+
+### Known blockers and debt
+
+- **Merged CUDA `q27-server` OOMs in `cudaGraphInstantiate` on the 24 GB
+  3090** (w8, ctx 4096 and 16384) — release blocker; pre-merge w8 build
+  still serves; fix direction: lazy/conditional graph families under
+  `Q27_BATCH=0`. README carries the caveat.
+- Official-tier multislot MTP gates (G1/G2/G3/G5 with real speculation
+  rounds) not yet run — 24 GB machine residue.
+- Envelope constants PROVISIONAL (one nonzero pair per class; two-variant
+  + holdout ensemble queued).
+- Server: queued streaming requests cannot cancel before slot admission
+  (no writability probe during `slot_free_` wait); slot selection is
+  first-idle with no prefix-match probe (belongs with snapshots Phase 2).
+
+### Active work
+
+KV-codec P1 (mini: tail instrumentation → KVarN scaling → 128-cell census
+→ RoPE-pair simulation) · snapshots Phase 2 (server keying, boundary
+policy, LRU) · suffix-burst gates (staged, awaiting go) + economics leg
+(quiet machine) · official-tier timing legs (quiet machine) · B1 Phase 0B
+(next new performance workstream).
+
+---
+
+## Checkpoint ledger (HISTORICAL — 2026-07-14 vintage, superseded above)
+
+“Baseline” below meant the end-to-end operation existed with local
+CPU/synthetic coverage at that date; statuses and "remaining" notes are
+frozen history — the chronicle records what happened since.
 
 | # | Checkpoint | Status | Evidence / remaining gate |
 |---|------------|--------|---------------------------|
@@ -209,7 +274,15 @@ Remaining high-impact work, reordered by measured leverage: (1) prefill: Instrum
 
 **Suffix-burst batched verification implemented — the post-park speculation lever, correctness gates staged (2026-07-16 night, 24 GB machine; runs await Daniel's go).** Pre-registered plan `2026-07-16-suffix-burst-verify.md`. The standing `--suffix` path was measured to be a scaffold, not a speedup: every proposal verified by an individual serial `step()`, width capped at 12 for no kernel reason — acceptance saved zero wall time. New `suffix_round` = oracle_round's caller-lane verify machinery + `mtp_round`'s acceptance walk and early-EOS clamp verbatim (e765dde semantics inherited); `generate_suffix` is now the batched driver — SuffixDraft lanes (CPU, pennies), serial-step fallback below minimum_match so neutral traffic pays nothing, **match-capped width** (forward lanes ≤ matched suffix length; lag-copy extrapolation past the evidence is not dispatched), and **full-tile snap-down** (17–31 → 16, 33–47 → 32, per lever 2's flat-per-16-tile round structure). Old serial walk preserved as `--suffix-serial` (the A/B control); burst histogram + `Q27_SUFFIX_TRACE` dispatch-site evidence. Codex round, 3 findings all fixed: remaining<2 underflow guard (P1), match-cap contract (P2), tool-constraint rejection at driver entry and in the round — burst argmax is unmasked, same contract as GPU-resident greedy (P2); no state/position/KV divergence found vs the serial walk. Suites green. Gates 2–4 staged in `tools/suffix_burst_gates_2026-07-16.sh` (T2, byte-identity vs serial + dispatch-evidence widths >12 + live-walk rejection evidence + neutral-traffic silence); economics gate 6 pre-registered at ≥1.15× repetition-heavy / ≤2% neutral, quiet machine. Traffic prior from SuffixDraft Phase 0 stands: cctx fires L≥12 at 35% of positions (AL 11.5), docs ~0% — the customer is agentic/code traffic, and with prefix snapshots (mini, same evening) landing alongside, the agentic serving story is now snapshots for TTFT + suffix bursts for decode.
 
-## Mature-decode critical path
+**External review pair triaged; documentation surfaces de-staled (2026-07-16 late night, 24 GB machine).** Daniel supplied a two-pass external review (second pass pinned at f4f9ea1 — six hours and four landings stale). Triage: its four biggest calls were overtaken same-day by measurement (DSpark fixtures → we ran them, PARK; generic suffix verifier → implemented; prefix snapshots → mini shipped Phase 1 incl. the disk persistence it filed under P2; BaseRT audit → all three probes parked). **Two new server findings VERIFIED in source and adopted as debt:** queued streaming requests cannot cancel before slot admission (metal_server.cpp `slot_free_` wait has no writability probe — a disconnected client holds its ticket until first write), and slot selection is first-idle with no prefix-match probe (forfeits conversation affinity; belongs with snapshots Phase 2). Also adopted: the 3090 merged-server OOM elevated to release blocker with the lazy-graph-family fix direction; official-tier multislot MTP gates re-confirmed as 24 GB residue with a nonzero-speculation-rounds assert; multi-position teacher-forced probes for the oracle state gate (queued with the envelope ensemble); "don't widen verify past 48 on curve shape alone"; and one genuinely new suffix idea — round-UP-to-tile for 17–31-length matches — recorded in the suffix plan with gate 6's histogram as the decider (v1 stays snap-down). **De-staling executed:** METAL_PROGRESS.md gained a maintained Current-state section (shipped/parked/blockers/active) and the 2026-07-14 checkpoint ledger + critical-path sections are marked HISTORICAL; README's Metal blockquote rewritten to the current truth and the 3090 section now carries the merged-server OOM caveat. House note: the review's model-free multislot stress-suite recommendation (fake backend, randomized schedules, wedge/fairness/cleanup asserts) is endorsed and queued as a workstream — the recent bug classes were all host-level.
+
+## Mature-decode critical path (HISTORICAL — 2026-07-14 checklist, superseded)
+
+Frozen history: every item below either completed or was superseded; the
+"remaining" notes inside them are stale. Current priorities live in the
+**Current state → Active work** section at the top; the chronicle entries
+below this section are the authoritative record. Kept for provenance —
+this was the ordering discipline that got the port to maturity.
 
 The remaining work should proceed in this order; isolated kernel wins do not close a checkpoint until the engine schedules them end-to-end.
 
