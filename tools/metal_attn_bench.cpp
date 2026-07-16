@@ -128,9 +128,12 @@ int main(int argc, char** argv) {
     // Route every depth through the blocked GQA kernels, and pin the
     // production causal route to the UNTILED kernel so the "gqa" rows are a
     // stable factor-1 baseline for the probe ratios (the engine default is
-    // tiled; its in-situ cost is the t2 row).
-    setenv("Q27_METAL_GQA_THRESHOLD", "1", 0);
-    setenv("Q27_METAL_GQA_TILE", "1", 0);
+    // tiled; its in-situ cost is the t2 row). Overwrite any inherited
+    // values — an exported TILE=2 would make baseline and t2 the same
+    // kernel, an exported THRESHOLD=0 would measure the legacy kernels
+    // (codex P2, 2026-07-15).
+    setenv("Q27_METAL_GQA_THRESHOLD", "1", 1);
+    setenv("Q27_METAL_GQA_TILE", "1", 1);
 
     q27::MetalBackend backend;
     const bool turbo3 = kv == "turbo3";
