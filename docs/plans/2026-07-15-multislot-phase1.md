@@ -2,6 +2,13 @@
 
 Status: IMPLEMENTED same night — engine quantum surface + slot runtime
 landed; gates G1/G2/G3/G5 (and a sampled-arm G1s) pass on the T2 artifact.
+G4 (constraint isolation) landed the next morning: constrained tool decode
+on one slot beside plain decode on the other, both byte-identical to solo;
+constraint action is proven, not assumed — the declared tool name is one
+the model never produces naturally (the few-shot demonstrates get_weather,
+the grammar declares zz_paris_weather_probe; the probe name can only appear
+via the mask), and server stderr must show the engage/close pairs
+(vacuous-gate lesson applied). Remaining residue: G6 admission gate.
 Prereqs met: round-2 P0s #1/#2/#3 fixed and gated (`dc8f017` + exit-code
 hardening), triage ordering explicitly unblocks "v1 multislot
 state/scheduling" as the next serving workstream (review-3 Q3: P0 fixes →

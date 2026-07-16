@@ -172,6 +172,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
     id<MTLComputePipelineState> t2_quantized;
+    id<MTLComputePipelineState> t2_quantized_x2;
+    id<MTLComputePipelineState> t2_x2;
     id<MTLComputePipelineState> f16_pair;
     id<MTLComputePipelineState> q4_quantized_matmul;
     id<MTLComputePipelineState> q8_quantized_matmul;
@@ -226,6 +228,9 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> attention_turbo3_gqa_hm_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t2_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t4_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_bf2_p;
+    id<MTLComputePipelineState> mma_roofline_a_p;
+    id<MTLComputePipelineState> mma_roofline_b_p;
     id<MTLComputePipelineState> attention_f16_causal_gqa_t2_p;
     // Q27_METAL_GQA_TILE: causal token-tile factor, 1 (untiled A/B lever)
     // or 2 (default; docs/plans/2026-07-15-cache-block-scheduling.md R1b).
@@ -511,6 +516,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
         impl_->t2_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized");
+        impl_->t2_quantized_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized_x2");
+        impl_->t2_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128_x2");
         impl_->f16_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair");
         // SIMD-scoped matrix multiply is optional on older Intel-family Metal
         // devices. Decode GEMV remains available there; only small-N GEMM is gated.
@@ -519,6 +526,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
+            impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
+            impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
             if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
                 impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
         }
@@ -571,6 +580,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_turbo3_gqa_hm_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_hm");
         impl_->attention_turbo3_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t2");
         impl_->attention_turbo3_causal_gqa_t4_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t4");
+        impl_->attention_turbo3_causal_gqa_bf2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_bf2");
         impl_->attention_f16_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa_t2");
         if (const char* env = getenv("Q27_METAL_GQA_TILE"); env && *env) {
             const unsigned long tile = strtoul(env, nullptr, 10);
@@ -981,6 +991,75 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
     }
 }
 
+// N=2 slot-batched select-form T2 GEMV (multislot Phase 2 probe): the
+// float-activation production serial-decode path with two independent
+// activation/output buffer pairs. Metal-only surface until the probe
+// passes its pre-registered decision line.
+void MetalBackend::matvec_x2(const BackendTensor& weight,
+                             const BackendBuffer& x_a, const BackendBuffer& x_b,
+                             BackendBuffer& y_a, BackendBuffer& y_b) {
+    if (weight.dtype!=DType::T2_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec requires T2 weight");
+    if (!weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
+        weight.cols%128)
+        throw std::runtime_error("q27 Metal: invalid x2 matvec dimensions");
+    check_range(x_a.size(),0,weight.cols*sizeof(float),"x2 matvec input a");
+    check_range(x_b.size(),0,weight.cols*sizeof(float),"x2 matvec input b");
+    check_range(y_a.size(),0,weight.rows*sizeof(float),"x2 matvec output a");
+    check_range(y_b.size(),0,weight.rows*sizeof(float),"x2 matvec output b");
+    const MetalBuffer& data=metal_buffer(*weight.data); const MetalBuffer& ws=metal_buffer(*weight.scales);
+    const MetalBuffer& xa=metal_buffer(x_a); const MetalBuffer& xb=metal_buffer(x_b);
+    MetalBuffer& ya=metal_buffer(y_a); MetalBuffer& yb=metal_buffer(y_b);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/4,"x2 matvec weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/128)*2,"x2 matvec weight scales");
+    MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,8};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own,"q27_matvec_t2_g128_x2");
+        [enc setComputePipelineState:impl_->t2_x2];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xa.handle() offset:0 atIndex:2]; [enc setBuffer:xb.handle() offset:0 atIndex:3];
+        [enc setBuffer:ya.handle() offset:0 atIndex:4]; [enc setBuffer:yb.handle() offset:0 atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("x2 matvec");
+    }
+}
+
+// N=2 slot-batched T2 GEMV (multislot Phase 2 probe): x carries two
+// activation rows ([2, cols] values, [2, cols/32] scales), out is token-
+// major [2, rows] — the matmul_quantized layouts at x_rows=2. Metal-only
+// surface (not on the Backend interface) until the probe passes its
+// pre-registered decision line (docs/plans/2026-07-16-multislot-phase2-
+// probe.md).
+void MetalBackend::matvec_quantized_x2(const BackendTensor& weight,
+                                       const BackendQuantized& x, BackendBuffer& y) {
+    if (weight.dtype!=DType::T2_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec requires T2 weight");
+    if (!weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
+        weight.cols%128)
+        throw std::runtime_error("q27 Metal: invalid x2 matvec dimensions");
+    if ((uint64_t)x.count!=(uint64_t)weight.cols*2 || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: x2 matvec activation mismatch (needs 2 rows)");
+    check_range(y.size(),0,weight.rows*2*4,"x2 matvec output");
+    const MetalBuffer& data=metal_buffer(*weight.data); const MetalBuffer& ws=metal_buffer(*weight.scales);
+    const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales); MetalBuffer& out=metal_buffer(y);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/4,"x2 matvec weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/128)*2,"x2 matvec weight scales");
+    check_range(xv.size(),0,x.count,"x2 matvec values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"x2 matvec activation scales");
+    MatvecArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,8};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own,"q27_matvec_t2_quantized_x2");
+        [enc setComputePipelineState:impl_->t2_quantized_x2];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if(own) impl_->finish_command("x2 quantized matvec");
+    }
+}
+
 // Two independent packed-dot dispatches now beat a fused pair kernel: the
 // rewritten GEMV is weight-stream-bound, so sharing the (cached) activation
 // bytes buys nothing, while the fused kernel's doubled register pressure
@@ -1030,6 +1109,59 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
         [enc setBytes:&args length:sizeof(args) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,(NSUInteger)(x_rows+15)/16,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
         if(own) impl_->finish_command("quantized simdgroup matmul");
+    }
+}
+
+// A/B/C MMA roofline probe entries (bench-only, docs/plans/2026-07-16-mma-
+// roofline.md): same dispatch grid and MatmulArgs as the production T2
+// GEMM. Arm 'b' takes half operands + half weight scales + float
+// activation scales; arm 'a' takes only the opaque tile seed. Never
+// engine-routed.
+void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t x_rows,
+                                const BackendBuffer& w_or_seed, const BackendBuffer* w_scales,
+                                const BackendBuffer* x, const BackendBuffer* x_scales,
+                                BackendBuffer& y) {
+    if (!impl_->mma_roofline_a_p || !impl_->mma_roofline_b_p)
+        throw std::runtime_error("q27 Metal: MMA roofline requires Apple GPU family 7 or newer");
+    if ((arm != 'a' && arm != 'b') || !rows || !cols || !x_rows || x_rows > 96 || cols % 128)
+        throw std::runtime_error("q27 Metal: invalid MMA roofline arguments");
+    const MetalBuffer& wb = metal_buffer(w_or_seed);
+    MetalBuffer& out = metal_buffer(y);
+    check_range(out.size(), 0, (uint64_t)rows * x_rows * 4, "roofline output");
+    MatmulArgs args{rows, cols, x_rows, 1};
+    @autoreleasepool {
+        if (arm == 'a') {
+            check_range(wb.size(), 0, (32 * 64 + 64 * 16) * 2, "roofline seed");
+            bool own; auto enc = impl_->encoder_for_operation(own, "q27_mma_roofline_a");
+            [enc setComputePipelineState:impl_->mma_roofline_a_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:out.handle() offset:0 atIndex:1];
+            [enc setBytes:&args length:sizeof(args) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            if (own) impl_->finish_command("mma roofline a");
+            return;
+        }
+        if (!w_scales || !x || !x_scales)
+            throw std::runtime_error("q27 Metal: roofline arm b needs scales and activations");
+        const MetalBuffer& ws = metal_buffer(*w_scales);
+        const MetalBuffer& xb = metal_buffer(*x);
+        const MetalBuffer& xs = metal_buffer(*x_scales);
+        check_range(wb.size(), 0, (uint64_t)rows * cols * 2, "roofline b weights");
+        check_range(ws.size(), 0, (uint64_t)rows * (cols / 128) * 2, "roofline b weight scales");
+        check_range(xb.size(), 0, (uint64_t)x_rows * cols * 2, "roofline b activations");
+        check_range(xs.size(), 0, (uint64_t)x_rows * (cols / 32) * 4, "roofline b activation scales");
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_mma_roofline_b");
+        [enc setComputePipelineState:impl_->mma_roofline_b_p];
+        [enc setBuffer:wb.handle() offset:0 atIndex:0];
+        [enc setBuffer:ws.handle() offset:0 atIndex:1];
+        [enc setBuffer:xb.handle() offset:0 atIndex:2];
+        [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (own) impl_->finish_command("mma roofline b");
     }
 }
 
@@ -1434,6 +1566,61 @@ void MetalBackend::attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32
 
 // Phase-0 R1b probe: token-tiled causal GQA at tile 2 or 4. Interleaved
 // production cache layout; merge kernel reused unchanged.
+// R3 probe entry (bench-only): barrier-free direct-read block-partial causal
+// GQA, token factor 2, with an explicit block-size override — the sweep is
+// the experiment (docs/plans/2026-07-16-r3-barrier-free-attention.md). At
+// block == gqa_block the output is bit-identical to the t2 route.
+void MetalBackend::attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32_t q_stride,
+                                                  uint32_t q_row_stride,
+                                                  const BackendBuffer& k_cache, const BackendBuffer& v_cache,
+                                                  BackendBuffer& out, uint32_t base_len,
+                                                  uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+                                                  uint32_t tokens, uint32_t block, float scale) {
+    const uint32_t gqa = kv_heads ? q_heads / kv_heads : 0;
+    if (!base_len || !tokens || !kv_heads || q_heads % kv_heads || head_dim != 256 ||
+        gqa < 2 || gqa > 8 || !block || block % 8 ||
+        base_len > UINT32_MAX - tokens)
+        throw std::runtime_error("q27 Metal: invalid bf probe dimensions");
+    const MetalBuffer& qb = metal_buffer(q);
+    const MetalBuffer& kc = metal_buffer(k_cache);
+    const MetalBuffer& vc = metal_buffer(v_cache);
+    MetalBuffer& output = metal_buffer(out);
+    const uint32_t max_seq = base_len + tokens - 1;
+    check_range(qb.size(), 0,
+                ((uint64_t)(tokens - 1) * q_row_stride + (uint64_t)(q_heads - 1) * q_stride + head_dim) * 4,
+                "bf probe Q");
+    const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * 2 * 50;
+    check_range(kc.size(), 0, cache_bytes, "bf probe K cache");
+    check_range(vc.size(), 0, cache_bytes, "bf probe V cache");
+    check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "bf probe output");
+    const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
+    const uint64_t partial_bytes = (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
+    if (!impl_->gqa_partials || impl_->gqa_partials.length < partial_bytes)
+        impl_->gqa_partials = [impl_->device newBufferWithLength:(NSUInteger)partial_bytes
+                                                         options:MTLResourceStorageModePrivate];
+    if (!impl_->gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+    AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
+                                head_dim, block, n_blocks_max, tokens, scale};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_turbo3_causal_gqa_bf2");
+        [enc setComputePipelineState:impl_->attention_turbo3_causal_gqa_bf2_p];
+        [enc setBuffer:qb.handle() offset:0 atIndex:0];
+        [enc setBuffer:kc.handle() offset:0 atIndex:1];
+        [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, (tokens + 1) / 2)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+        [enc setComputePipelineState:impl_->attention_gqa_merge_rows_p];
+        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:0];
+        [enc setBuffer:output.handle() offset:0 atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (own) impl_->finish_command("bf probe attention");
+    }
+}
+
 void MetalBackend::attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uint32_t q_stride,
                                                      uint32_t q_row_stride,
                                                      const BackendBuffer& k_cache, const BackendBuffer& v_cache,
