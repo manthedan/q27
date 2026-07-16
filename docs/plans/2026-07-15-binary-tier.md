@@ -90,6 +90,35 @@ coexist on either machine, but **the one-model-load rule stays in force** —
 it exists because of a real crash; amend it only deliberately, with a
 measured pressure test, never implicitly.
 
+### Phase 0B — synthetic kernel economics (split adopted per expert reviews 2–3)
+
+The vendor-stack quality gates above are **Phase 0A** (make them
+machine-checkable per the review-2 triage, finding 7: exact-JSON, native
+tool call, instruction task, code edit with tests, planted edge case,
+long-context retrieval, 8K NLL vs BOTH official and T2 — report B1/T2, not
+only B1/official). **Phase 0B** runs in parallel, before any repack or
+engine work: B1 GEMV + embedding only, in `metal_gemv_bench`, benchmarking
+all three dot structures from the round-3 answers doc §Q4 —
+
+1. positive-mask select (baseline): `scale·(2·Σ_pos − Σy)`, one conditional
+   accumulate per element;
+2. float sign-bit XOR: flip the IEEE sign bit from the weight bit — exact
+   for finite activations, no Σy correction;
+3. int8 bitplane + popcount: 8 and+popcounts per 32 columns, with the
+   activation preprocessing (int8 quant + bitplane transpose + Σx, fused)
+   **inside the measured time**.
+
+**Pre-registered kill lines (expert's, endorsed): the metric is production
+projection-mix WALL-TIME ratio T_B1/T_T2 — never effective GB/s alone.**
+≤0.60 with predicted full token ≤50 ms → strong GO (the 20 tok/s thesis
+holds). 0.60–0.72 → conditional GO, only if Phase 0A quality lands
+materially closer to T2 than the 89.5% retention suggests. >0.72 → kill the
+20–23 serving headline (ratio 0.60 requires ~85% of T2's ~93 GB/s stream ≈
+79 GB/s; practical early kill line ~70 GB/s across the full projection
+mix). A candidate that wins only when preprocessing is excluded from
+measurement is a kill, not a pass. After integration, rerun resident K=8 —
+the fixed orchestration share doubles as tokens get cheaper.
+
 ## Type-41 encoding — read at source before any repack code
 
 Same discipline as ternary (that plan, "authoritative source" section): read
@@ -122,11 +151,11 @@ Same skeleton as T2; the select-form dot simplifies — {−1,+1} needs
 `2·Σ_{c=1} y − Σy`: one conditional add per element plus one shared Σy per
 128-group (T2 needs two conditional adds). Deliverables mirror the T2 list:
 
-- `q27_matvec_b1_g128` (float-activation production path; expect the same
-  bandwidth-bound profile — the T2 select-form hit 93 GB/s, and B1 moves
-  half the bytes per column so watch for the issue-rate ceiling returning at
-  1.125 bpw; if it does, the 243-LUT lesson from T3 planning applies in
-  byte-per-lane form: one byte = 8 columns).
+- `q27_matvec_b1_g128` (float-activation production path; structure chosen
+  by Phase 0B's three-candidate bench — positive-mask select, sign-XOR, or
+  bitplane-popcount. B1 moves half T2's bytes per column, so the issue-rate
+  ceiling returns as the central risk at 1.125 bpw; Phase 0B's wall-time
+  kill lines catch it before any engine wiring).
 - `q27_matvec_b1_quantized` (int8-x integer-exact parity variant),
 - `q27_matmul_b1_mm` on the (now half-staged) GEMM staging pattern,
 - `q27_embedding_b1`/`_rows` with per-dtype routing,
