@@ -24,9 +24,11 @@ logits, position) streamed through host memory to a file with plain
 write/read — ds4's explicit no-mmap lesson adopted (no new VM mappings
 on a process already mapping a 7 GB artifact).
 
-Format Q27SNAP1 (LE): magic+version, artifact identity (file size +
-SHA1 of the first 64 KB of the artifact — cheap, catches
-wrong-model/wrong-quant loads), kv dtype flag, position,
+Format Q27SNAP1 (LE): magic+version, artifact identity (mapping size +
+SHA1 over the WHOLE mapped artifact — the bytes the engine actually
+opened, immune to same-size checkpoint swaps and pathname races; lazy,
+cached per Shared, ~2 s once and only when snapshots are used — codex
+P1+P2 on the landing commit), kv dtype flag, position,
 token count + token ids (prefix identity for Phase 2), reserved
 byte-prefix SHA1 slot (zeros in Phase 1), then per-layer blobs with
 per-blob byte lengths. Fail-loud on any mismatch: magic, identity,
@@ -82,16 +84,23 @@ turbo3↔fp16 snapshot conversion (dtype is part of identity).
    to the uninterrupted reference, 64 greedy tokens, BOTH kv dtypes
    (fp16 and turbo3). Deep-prefix re-check at position 2,346: 32
    continuation tokens byte-identical from a fresh process.
-2. **Reject matrix:** truncated file, corrupted artifact identity,
-   wrong kv dtype, position > context — all four throw with specific
-   messages and generate nothing (pass-1 length validation runs before
-   the first GPU write, so no partial restore is possible).
+2. **Reject matrix:** truncated header, truncation inside the FINAL
+   blob (the fseeko-past-EOF hole codex caught on the landing commit —
+   pass 1 now checks the computed end offset against the real file
+   size), corrupted artifact identity, wrong kv dtype, position >
+   context — all throw with specific messages and generate nothing
+   before the first GPU write, so no partial restore is possible.
 3. **Round-trip wall (ctx 4096, 2,346-token War-and-Peace prefix):**
    snapshot 311.7 MB; save 0.236 s (~1.3 GB/s), load 0.116 s
    (~2.7 GB/s) vs ~52 s to re-prefill the same prefix — **~450×**,
    comfortably past the ≥100× expectation. At the 31K needle-haystack
    scale this projects to the ~23 min → seconds class the triage
-   predicted.
+   predicted. After the whole-artifact identity hardening (codex P1),
+   the FIRST snapshot operation in a process additionally pays a
+   one-time ~3.3 s SHA1 over the 7.15 GB mapping (cached per Shared) —
+   amortized to nothing in a long-lived server, and a cold
+   single-use CLI load is still ~15× over re-prefill at 2.3K (the
+   margin grows linearly with prefix depth).
 
 Phase 2 (server keying, boundary policy, LRU, G7 gate) is now unblocked;
 it remains queued behind the KV-codec census on this rig's schedule.
