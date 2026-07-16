@@ -517,7 +517,8 @@ int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
     auto all_x=backend.allocate(x.size()*4); backend.write(*all_x,0,x.data(),x.size()*4);
     // Dispatch the parametrized width too — a repro case that only sizes
     // buffers without dispatching passes vacuously (codex P2, 2026-07-15).
-    for(uint32_t n:{1u,4u,5u,8u,9u,12u,tokens}) {
+    // 17/33 exercise partial second/third 16-token tiles on grid.y.
+    for(uint32_t n:{1u,4u,5u,8u,9u,12u,17u,33u,tokens}) {
         if(n>tokens) continue;
         auto q=backend.allocate_quantized(n*cols); auto out=backend.allocate((uint64_t)n*rows*4);
         backend.begin_commands(); backend.quantize(*all_x,q); backend.matmul_quantized(weight,q,n,*out); backend.end_commands();
@@ -540,7 +541,15 @@ int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
            test_matmul_shape(backend,dtype,9,256,20) ||
            // artifact-K repro: width-17 divergence hunt (cols=5120)
            test_matmul_shape(backend,dtype,33,5120,17) ||
-           test_matmul_shape(backend,dtype,10240,5120,17);
+           test_matmul_shape(backend,dtype,10240,5120,17) ||
+           // Row remainder past a full 32-row tile (100 = 3x32 + 4), token
+           // remainder past two 16-token tiles (33), and exact fits (64).
+           // cols stays moderate: the Q4/Q8 kernels stage pre-scaled fp32
+           // activations, so high-cancellation cols=5120 outputs amplify
+           // ordinary rounding past the gate (the exact-int T2 paths get
+           // their 5120 coverage from the width-17 artifact repros above).
+           test_matmul_shape(backend,dtype,100,1152,33) ||
+           test_matmul_shape(backend,dtype,64,128,64);
 }
 
 // Production-width GEMV parity. The packed-dot kernels take a vectorized
