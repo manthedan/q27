@@ -54,3 +54,35 @@ or shape-suite failures — record and keep A.
 
 MTP verify width changes; sampled-path chunking; CUDA parity; ds4's
 Metal-4 cooperative tensors (M5/M6-gated).
+
+## Outcomes (2026-07-15)
+
+**Phase A: landed, 1.39×** (35.09 → 48.79 tok/s at chunk 96 on the 384-token
+synthetic T2 mix; 48 saturates). Committed tokens byte-identical to serial
+and to the pre-widening chunked path at widths 17 and 96. Commit `9bf49c6`
+plus the ABI 6→7 bump (codex finding on the review of 9bf49c6).
+
+**Phase B: killed by its own criterion — 0.96×, kernel removed.** The
+64-row × 32-token kernel (`q27_matmul_t2_mm_w`: K-stage 32 = one
+activation-scale group, fold order bit-matched to `_h`, Wt 4 KB + Xt 2 KB +
+Sc 8 KB, 256 threads) was built, passed the full shape suite with the wide
+widths genuinely dispatched (17/33/64/96, row remainders 100/64), and
+measured 46.94–47.00 vs 48.81–48.86 tok/s for `_h` across repeated A/Bs —
+stable, not noise. Attribution kills the premise, not the execution: at
+chunk 96 the GEMM is 94.3% of GPU time but the effective weight stream is
+3.3 GB/s against ~100 GB/s machine bandwidth — **prefill is MMA/ALU-bound,
+not DRAM-bound, so doubling tokens-per-weight-byte buys nothing here**, and
+the finer flush/barrier cadence (per 32-K instead of per 64-K) costs 4%.
+ds4's direct-RHS win presupposes DRAM-bound prefill (M5-class MMA
+throughput); it does not transfer to the M4. Both kernels sit at the same
+~2.5 TFLOP effective MMA plateau — the remaining 7% to the fork's pp512
+52.48 is not GEMM-tile-shape addressable; half *accumulators* would be the
+2× ALU lever but already failed the numerics ladder (see
+2026-07-15-gemm-half-staging.md). Kept from the attempt: the widened shape
+suite (widths 17/33 in the dispatch loop; row/token remainder shapes
+100×1152×33 and 64×128×64 — cols kept moderate because the pre-scaled fp32
+staging in Q4/Q8 amplifies cancellation rounding past the 3e-4 gate at
+cols=5120, found when the new shape tripped Q8).
+
+**Phase C: not entered** — its trigger (bounds-branch overhead in the
+profile) is absent; the profile shows raw MMA dominance.
