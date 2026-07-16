@@ -1,5 +1,17 @@
 # DSpark port — Phase 0: contract, repack, and gate design (no engine code)
 
+**Status update (2026-07-16 night): lever 2 LANDED (S(48) = 3.94×,
+2026-07-16-lever2-verify-width.md) and the Phase-3 gate now STRADDLES.**
+The measured curve gives break-even ~4.1 tok/round at w=16 (the chained-
+block width class); the expected chained-block committed rate 5–6.5 puts
+S ≈ 1.2–1.57× — straddling the pre-registered 1.3× line. Arithmetic can no
+longer decide go/park: the deciding number is the fork's measured per-block
+acceptance decay, which is exactly what **Phase 2's reference fixtures**
+produce. Phase 0 residue + Phases 1–2 therefore proceed as planned (CPU-
+only, this machine); Phase 3 stays blocked until the fixture-measured
+acceptance-weighted rate is plugged into the lever-2 curve. Full triage:
+2026-07-16-paper-scan-triage.md §DSpark.
+
 **Status: Phase 0 contract DONE; economics path narrowed (2026-07-16 pm).**
 Lever 1 (phase B direct-RHS) PARKED the same afternoon by its own kill line
 (C/D2 = 0.782 at width 12 — 2026-07-16-lever1-direct-rhs.md), so the ~430 ms
