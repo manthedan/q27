@@ -229,6 +229,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t2_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_t4_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_bf2_p;
+    id<MTLComputePipelineState> mma_roofline_a_p;
+    id<MTLComputePipelineState> mma_roofline_b_p;
     id<MTLComputePipelineState> attention_f16_causal_gqa_t2_p;
     // Q27_METAL_GQA_TILE: causal token-tile factor, 1 (untiled A/B lever)
     // or 2 (default; docs/plans/2026-07-15-cache-block-scheduling.md R1b).
@@ -524,6 +526,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
+            impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
+            impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
             if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
                 impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
         }
@@ -1105,6 +1109,59 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
         [enc setBytes:&args length:sizeof(args) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,(NSUInteger)(x_rows+15)/16,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
         if(own) impl_->finish_command("quantized simdgroup matmul");
+    }
+}
+
+// A/B/C MMA roofline probe entries (bench-only, docs/plans/2026-07-16-mma-
+// roofline.md): same dispatch grid and MatmulArgs as the production T2
+// GEMM. Arm 'b' takes half operands + half weight scales + float
+// activation scales; arm 'a' takes only the opaque tile seed. Never
+// engine-routed.
+void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t x_rows,
+                                const BackendBuffer& w_or_seed, const BackendBuffer* w_scales,
+                                const BackendBuffer* x, const BackendBuffer* x_scales,
+                                BackendBuffer& y) {
+    if (!impl_->mma_roofline_a_p || !impl_->mma_roofline_b_p)
+        throw std::runtime_error("q27 Metal: MMA roofline requires Apple GPU family 7 or newer");
+    if ((arm != 'a' && arm != 'b') || !rows || !cols || !x_rows || x_rows > 96 || cols % 128)
+        throw std::runtime_error("q27 Metal: invalid MMA roofline arguments");
+    const MetalBuffer& wb = metal_buffer(w_or_seed);
+    MetalBuffer& out = metal_buffer(y);
+    check_range(out.size(), 0, (uint64_t)rows * x_rows * 4, "roofline output");
+    MatmulArgs args{rows, cols, x_rows, 1};
+    @autoreleasepool {
+        if (arm == 'a') {
+            check_range(wb.size(), 0, (32 * 64 + 64 * 16) * 2, "roofline seed");
+            bool own; auto enc = impl_->encoder_for_operation(own, "q27_mma_roofline_a");
+            [enc setComputePipelineState:impl_->mma_roofline_a_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:out.handle() offset:0 atIndex:1];
+            [enc setBytes:&args length:sizeof(args) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            if (own) impl_->finish_command("mma roofline a");
+            return;
+        }
+        if (!w_scales || !x || !x_scales)
+            throw std::runtime_error("q27 Metal: roofline arm b needs scales and activations");
+        const MetalBuffer& ws = metal_buffer(*w_scales);
+        const MetalBuffer& xb = metal_buffer(*x);
+        const MetalBuffer& xs = metal_buffer(*x_scales);
+        check_range(wb.size(), 0, (uint64_t)rows * cols * 2, "roofline b weights");
+        check_range(ws.size(), 0, (uint64_t)rows * (cols / 128) * 2, "roofline b weight scales");
+        check_range(xb.size(), 0, (uint64_t)x_rows * cols * 2, "roofline b activations");
+        check_range(xs.size(), 0, (uint64_t)x_rows * (cols / 32) * 4, "roofline b activation scales");
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_mma_roofline_b");
+        [enc setComputePipelineState:impl_->mma_roofline_b_p];
+        [enc setBuffer:wb.handle() offset:0 atIndex:0];
+        [enc setBuffer:ws.handle() offset:0 atIndex:1];
+        [enc setBuffer:xb.handle() offset:0 atIndex:2];
+        [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (own) impl_->finish_command("mma roofline b");
     }
 }
 

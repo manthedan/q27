@@ -1539,6 +1539,177 @@ kernel void q27_matmul_t2_mm_h(
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
 
+// ---- A/B/C MMA roofline probes (bench-only, docs/plans/2026-07-16-mma-
+// roofline.md). Same dispatch grid, tile geometry, edge clamps, and
+// physical MMA count as q27_matmul_t2_mm_h (arm C); never engine-routed.
+
+// Arm B — half-plumbing roofline: the mm_h body with the packed-trit
+// unpack and int8->half conversion deleted. Operands are already half in
+// device memory and stage into the same threadgroup tiles with the same
+// store pattern, barriers, MMA loops, and per-64-K ws*xs scale-fold flush.
+// B - C isolates unpack/conversion machinery only.
+kernel void q27_mma_roofline_b(
+        device const half *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const half *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const half *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + xloc;
+    device const half *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            device const half4 *wp4 = (device const half4 *)(wsrc + c0 + wcb);
+            threadgroup half *dst = Wt + wrow * 64 + wcb;
+            const half4 w0 = wp4[0], w1 = wp4[1], w2 = wp4[2], w3 = wp4[3];
+            dst[0]  = w0.x; dst[1]  = w0.y; dst[2]  = w0.z; dst[3]  = w0.w;
+            dst[4]  = w1.x; dst[5]  = w1.y; dst[6]  = w1.z; dst[7]  = w1.w;
+            dst[8]  = w2.x; dst[9]  = w2.y; dst[10] = w2.z; dst[11] = w2.w;
+            dst[12] = w3.x; dst[13] = w3.y; dst[14] = w3.z; dst[15] = w3.w;
+        }
+        {
+            device const half4 *xp4 = (device const half4 *)(xsrc + c0 + xcb);
+            const half4 xa = xp4[0], xb = xp4[1];
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = xa.x; dst[1 * 16] = xa.y;
+            dst[2 * 16] = xa.z; dst[3 * 16] = xa.w;
+            dst[4 * 16] = xb.x; dst[5 * 16] = xb.y;
+            dst[6 * 16] = xb.z; dst[7 * 16] = xb.w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Arm A — MMA-core roofline: tiles filled once from an opaque device seed
+// (defeats constant folding), then the SAME per-64-K MMA loop count with
+// accumulators carried across the whole K walk (the acc dependency chain
+// defeats dead-code elimination), one final fold + store with the same
+// row/token edge guards. No per-tile staging, no barriers, no flushes:
+// A - B isolates staging/barrier/flush cadence at equal MMA count.
+kernel void q27_mma_roofline_a(
+        device const half *seed [[buffer(0)]],
+        device float *out [[buffer(1)]], constant MatmulArgs &args [[buffer(2)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 64];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;
+    if (row0 >= args.rows) return;
+    for (uint i = tid; i < 32 * 64; i += 128) Wt[i] = seed[i];
+    for (uint i = tid; i < 64 * 16; i += 128) Xt[i] = seed[32 * 64 + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // one-time fill
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    threadgroup float *sc = Sc + sg * 64;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+    }
+    // Single fold: acc0's tile through per-simdgroup scratch, plus a direct
+    // dependency on acc1..acc3 via their stored diagonals so no accumulator
+    // chain is dead.
+    simdgroup_store(acc0, sc, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    float r = sc[lane];
+    simdgroup_store(acc1, sc, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    r += sc[lane + 32];
+    simdgroup_store(acc2, sc, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    r += sc[lane];
+    simdgroup_store(acc3, sc, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    r += sc[lane + 32];
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = r;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = r + 1.0f;
+}
+
 // Constrained tool decoding: clear grammar-illegal logits to -inf under a
 // uint32 bitset mask (bit set = legal), so GPU argmax, top-k extraction,
 // and the CPU sampling fallback all see only legal tokens.
