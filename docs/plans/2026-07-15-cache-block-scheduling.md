@@ -280,6 +280,13 @@ while streaming 5.12× the bytes.**
   tokens-per-stage beyond 2 without more registers. Both are post-R1b
   measurements; the ceiling here is large (fp16 parity says ~5× headroom
   before bytes matter even for fp16).
+  **[Measured same night: the restage probe (t2 + K-then-V in one 8 KB
+  tile, verified bit-identical) ran 0.76× vs t2 at 32K — the two extra
+  barriers per 8-row tile cost more than doubled residency buys, so
+  threadgroup residency is NOT the limiter either; the barrier-and-
+  serial-row cadence itself is. Kernel removed. Any future R2 attempt
+  should attack barrier cadence / dependency chains (double-buffered
+  staging, wider row tiles), not memory footprint.]**
 
 ## Risks
 
