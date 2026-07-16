@@ -1959,11 +1959,13 @@ kernel void q27_mma_roofline_b_eq(
     for (uint c0 = 0; c0 < args.cols; c0 += 64) {
         {
             const half2 w2 = *(device const half2 *)(wsrc + (c0 + wcb) / 8);
-            threadgroup half *dst = Wt + wrow * 64 + wcb;
-            dst[0]  = w2.x; dst[1]  = w2.y; dst[2]  = w2.x; dst[3]  = w2.y;
-            dst[4]  = w2.x; dst[5]  = w2.y; dst[6]  = w2.x; dst[7]  = w2.y;
-            dst[8]  = w2.y; dst[9]  = w2.x; dst[10] = w2.y; dst[11] = w2.x;
-            dst[12] = w2.y; dst[13] = w2.x; dst[14] = w2.y; dst[15] = w2.x;
+            // Vector stores mirroring the production staging (codex P1: the
+            // control must not fall behind the kernel it isolates).
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = half4(w2.x, w2.y, w2.x, w2.y);
+            dst[1] = half4(w2.x, w2.y, w2.x, w2.y);
+            dst[2] = half4(w2.y, w2.x, w2.y, w2.x);
+            dst[3] = half4(w2.y, w2.x, w2.y, w2.x);
         }
         {
             // Two 4-byte loads, matching C's two char4 loads per slot
@@ -2062,23 +2064,13 @@ kernel void q27_mma_roofline_cx(
     for (uint c0 = 0; c0 < args.cols; c0 += 64) {
         {
             const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
-            threadgroup half *dst = Wt + wrow * 64 + wcb;
-            dst[0]  = as_type<half>(q27_t2_half_lut[wp         & 3u]);
-            dst[1]  = as_type<half>(q27_t2_half_lut[(wp >>  2) & 3u]);
-            dst[2]  = as_type<half>(q27_t2_half_lut[(wp >>  4) & 3u]);
-            dst[3]  = as_type<half>(q27_t2_half_lut[(wp >>  6) & 3u]);
-            dst[4]  = as_type<half>(q27_t2_half_lut[(wp >>  8) & 3u]);
-            dst[5]  = as_type<half>(q27_t2_half_lut[(wp >> 10) & 3u]);
-            dst[6]  = as_type<half>(q27_t2_half_lut[(wp >> 12) & 3u]);
-            dst[7]  = as_type<half>(q27_t2_half_lut[(wp >> 14) & 3u]);
-            dst[8]  = as_type<half>(q27_t2_half_lut[(wp >> 16) & 3u]);
-            dst[9]  = as_type<half>(q27_t2_half_lut[(wp >> 18) & 3u]);
-            dst[10] = as_type<half>(q27_t2_half_lut[(wp >> 20) & 3u]);
-            dst[11] = as_type<half>(q27_t2_half_lut[(wp >> 22) & 3u]);
-            dst[12] = as_type<half>(q27_t2_half_lut[(wp >> 24) & 3u]);
-            dst[13] = as_type<half>(q27_t2_half_lut[(wp >> 26) & 3u]);
-            dst[14] = as_type<half>(q27_t2_half_lut[(wp >> 28) & 3u]);
-            dst[15] = as_type<half>(q27_t2_half_lut[wp >> 30        ]);
+            // Exact copy of the production weight staging (codex P2: Cx must
+            // differ from C only on the activation side).
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+            dst[3] = q27_t2_half4_lut[wp >> 24         ];
         }
         {
             const half4 xa = *(device const half4 *)(xsrc + c0 + xcb);
