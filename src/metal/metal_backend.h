@@ -209,6 +209,9 @@ class MetalBackend final : public ComputeBackend {
     void profile_reset();
 
     uint64_t recommended_working_set_size() const;
+    // Effective causal-GQA block size (Q27_METAL_GQA_BLOCK or 1024): the
+    // admission accounting sizes the shared partial buffer from it.
+    uint32_t gqa_block_size() const;
     uint64_t max_buffer_length() const;
     uint64_t max_threadgroup_memory_length() const;
     bool supports_quantized_matmul() const;

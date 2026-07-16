@@ -2,6 +2,7 @@
 #include "stream_format.h"
 #include "../tokenizer.h"
 #include "../toolconstrain.h"
+#include <cerrno>
 #include "../../third_party/httplib.h"
 #include "../../third_party/json.hpp"
 
@@ -231,12 +232,22 @@ struct Runtime {
         // engine's own KV check stays underneath as defense in depth; a
         // budget below even one slot still serves one (never zero).
         const char* budget_env=getenv("Q27_METAL_BUDGET_MB");
-        const uint64_t budget=budget_env?strtoull(budget_env,nullptr,10)*1024ull*1024ull
-                                        :shared->backend.recommended_working_set_size()/2;
+        uint64_t budget=shared->backend.recommended_working_set_size()/2;
+        if(budget_env) {
+            // Fail loud on a malformed override: "-1" through strtoull would
+            // wrap to an effectively unlimited budget and bypass the gate.
+            char* end=nullptr; errno=0;
+            const unsigned long long mb=strtoull(budget_env,&end,10);
+            if(errno || end==budget_env || *end || !mb || mb>(1ull<<24))
+                throw std::runtime_error("Q27_METAL_BUDGET_MB must be an integer 1..16777216");
+            budget=(uint64_t)mb*1024ull*1024ull;
+        }
         const q27::MetalEngine& e0=slots[0]->engine;
-        const uint64_t per_slot=e0.kv_reserved_bytes()+q27::MetalEngine::fixed_state_bytes()
+        const uint64_t per_slot=e0.kv_reserved_bytes()
+                               +q27::MetalEngine::fixed_state_bytes(e0.chunked_prefill())
                                +(uint64_t)cache_entries*e0.snapshot_bytes();
-        const uint64_t shared_term=q27::MetalEngine::gqa_partial_peak(ctx);
+        const uint64_t shared_term=q27::MetalEngine::gqa_partial_peak(
+                ctx,shared->backend.gqa_block_size());
         for(uint32_t s=1;s<slot_count;s++) {
             const uint64_t need=(uint64_t)(slots.size()+1)*per_slot+shared_term;
             if(need>budget) {
