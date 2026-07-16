@@ -191,6 +191,21 @@ std::shared_ptr<MetalEngine::Shared> MetalEngine::open_shared(const std::string&
 // still-live Shared are not falsely rejected (codex sweep finding).
 MetalEngine::~MetalEngine() { shared_->cache_bytes -= engine_cache_bytes_; }
 
+int MetalEngine::mask_pool_add(const void* bits) {
+    constexpr uint64_t words = ((uint64_t)VOCAB + 31) / 32;
+    if (!bits) throw std::runtime_error("q27 Metal: null constraint mask");
+    if (mask_pool_used >= MASK_POOL_CAP) return -1;
+    if (!mask_pool_) mask_pool_ = backend_.allocate(words * 4 * MASK_POOL_CAP);
+    backend_.write(*mask_pool_, (uint64_t)mask_pool_used * words * 4, bits, words * 4);
+    return mask_pool_used++;
+}
+
+void MetalEngine::set_tool_constraint(int mask_id) {
+    if (mask_id >= mask_pool_used)
+        throw std::runtime_error("q27 Metal: constraint mask id out of range");
+    active_mask_ = mask_id < 0 ? -1 : mask_id;
+}
+
 namespace {
 std::shared_ptr<MetalEngine::Shared> require_shared(std::shared_ptr<MetalEngine::Shared> shared) {
     if (!shared) throw std::runtime_error("q27 Metal: null shared context");
@@ -251,8 +266,11 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     topk_values_ = alloc_f32(TOPK_CAPACITY);
     topk_indices_ = backend_.allocate(TOPK_CAPACITY * sizeof(uint32_t));
     topk_count_ = backend_.allocate(sizeof(uint32_t));
+    token_ring_ = backend_.allocate(RESIDENT_MAX * sizeof(uint32_t));
     if (const char* env = getenv("Q27_METAL_GPU_SAMPLE"); env && *env)
         gpu_sample_ = strtoul(env, nullptr, 10) != 0;
+    if (const char* env = getenv("Q27_METAL_RESIDENT"); env && *env)
+        resident_ = strtoul(env, nullptr, 10) != 0;
     if (has_mtp_) {
         mtp_embed_norm_ = alloc_f32(N_EMBD); mtp_hidden_norm_ = alloc_f32(N_EMBD);
         mtp_concat_ = alloc_f32(2 * N_EMBD); mtp_x_ = alloc_f32(N_EMBD);
@@ -456,10 +474,13 @@ void MetalEngine::ffn(uint32_t layer) {
     project(ffn_down_w, *ffn_gate_, q17408_, *y_);
 }
 
-void MetalEngine::encode_token(uint32_t token, bool produce_logits) {
-    if (token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
+void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_from_device) {
+    if (!token_from_device && token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
     if (position_ >= max_context_) throw std::runtime_error("q27 Metal: context exhausted");
-    backend_.embedding_q8(weight("token_embd.weight"), token, *h_);
+    if (token_from_device)
+        backend_.embedding_from_device(weight("token_embd.weight"), *token_out_, *h_);
+    else
+        backend_.embedding_q8(weight("token_embd.weight"), token, *h_);
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         backend_.rmsnorm_quantized(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
         if (attention_layer(layer)) attention_block(layer); else gdn_block(layer);
@@ -474,6 +495,9 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits) {
         backend_.rmsnorm(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS);
     if (produce_logits) {
         project(weight("output.weight"), *x1_, q5120_, *logits_);
+        if (active_mask_ >= 0)
+            backend_.mask_logits(*logits_, *mask_pool_,
+                                 (uint64_t)active_mask_ * (((uint64_t)VOCAB + 31) / 32) * 4, VOCAB);
         backend_.argmax(*logits_, VOCAB, *token_out_);
     }
     position_++;
@@ -613,6 +637,29 @@ void MetalEngine::gdn_replay(uint32_t count) {
                              *park_g_[slot], *park_beta_[slot], *cdelta_out_,
                              GDN_HEADS, GDN_QK_HEADS, GDN_DIM, count);
     }
+}
+
+// K chained greedy steps in one command buffer: each step's embedding reads
+// the token id the previous argmax wrote (docs/plans/2026-07-15-resident-greedy.md),
+// and an in-batch copy archives every id into token_ring_ for one readback.
+// Refuses to run under an active tool constraint — grammar feeding is a
+// host-per-token loop by construction.
+uint32_t MetalEngine::decode_resident(uint32_t pending, uint32_t* out, uint32_t k) {
+    if (pending >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
+    if (!k || k > RESIDENT_MAX) throw std::runtime_error("q27 Metal: resident slice must be 1..8");
+    if (active_mask_ >= 0) throw std::runtime_error("q27 Metal: resident decode under tool constraint");
+    backend_.write(*token_out_, 0, &pending, sizeof(pending));
+    {
+        CommandBatch batch(backend_);
+        for (uint32_t i = 0; i < k; i++) {
+            encode_token(0, true, true);
+            backend_.copy(*token_out_, 0, *token_ring_, (uint64_t)i * sizeof(uint32_t),
+                          sizeof(uint32_t));
+        }
+        batch.finish();
+    }
+    backend_.read(*token_ring_, 0, out, (uint64_t)k * sizeof(uint32_t));
+    return out[k - 1];
 }
 
 uint32_t MetalEngine::step(uint32_t token) {
@@ -1099,6 +1146,16 @@ std::vector<uint32_t> MetalEngine::generate_from_pending(uint32_t pending, uint3
     if (!mtp_width) {
         if (!count) return output;
         output.push_back(pending);
+        if (resident_ && active_mask_ < 0) {
+            uint32_t ids[RESIDENT_MAX];
+            while (output.size() < count) {
+                const uint32_t take = std::min<uint32_t>(RESIDENT_MAX,
+                                                         (uint32_t)(count - output.size()));
+                pending = decode_resident(pending, ids, take);
+                output.insert(output.end(), ids, ids + take);
+            }
+            return output;
+        }
         for (uint32_t i=1;i<count;i++) { pending=step(pending); output.push_back(pending); }
         return output;
     }

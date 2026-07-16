@@ -403,6 +403,37 @@ kernel void q27_embedding_t2(
     out[gid] = float(int(code) - 1) * float(scales[si]);
 }
 
+// GPU-resident greedy decode: identical embedding lookups, but the token id
+// comes from the device buffer the previous step's argmax wrote, so chained
+// steps need no CPU sync. A corrupt id past the vocabulary reads garbage,
+// never out of bounds (argmax only writes ids < n).
+kernel void q27_embedding_q8_dev(
+        device const char *weights [[buffer(0)]],
+        device const half *scales  [[buffer(1)]],
+        device float *out          [[buffer(2)]],
+        device const uint *token   [[buffer(3)]],
+        constant uint &cols        [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const ulong wi = (ulong)token[0] * cols + gid;
+    const ulong si = (ulong)token[0] * (cols / 128) + gid / 128;
+    out[gid] = float(weights[wi]) * float(scales[si]);
+}
+
+kernel void q27_embedding_t2_dev(
+        device const uchar *weights [[buffer(0)]],
+        device const half *scales   [[buffer(1)]],
+        device float *out           [[buffer(2)]],
+        device const uint *token    [[buffer(3)]],
+        constant uint &cols         [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const ulong wi = (ulong)token[0] * cols + gid;
+    const uint code = (weights[wi >> 2] >> ((wi & 3) * 2)) & 3;
+    const ulong si = (ulong)token[0] * (cols / 128) + gid / 128;
+    out[gid] = float(int(code) - 1) * float(scales[si]);
+}
+
 kernel void q27_rmsnorm(
         device const float *x [[buffer(0)]],
         device const float *w [[buffer(1)]],
@@ -1349,6 +1380,17 @@ kernel void q27_matmul_t2_mm_h(
     if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
     if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Constrained tool decoding: clear grammar-illegal logits to -inf under a
+// uint32 bitset mask (bit set = legal), so GPU argmax, top-k extraction,
+// and the CPU sampling fallback all see only legal tokens.
+kernel void q27_mask_logits(device float *logits [[buffer(0)]],
+                            device const uint *mask [[buffer(1)]],
+                            constant uint &n [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    if (!((mask[gid >> 5] >> (gid & 31)) & 1u)) logits[gid] = -INFINITY;
 }
 
 // ---- Chunked layer-major prefill (2..12 tokens per dispatch) ----

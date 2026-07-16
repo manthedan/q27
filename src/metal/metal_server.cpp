@@ -1,6 +1,7 @@
 #include "metal_engine.h"
 #include "stream_format.h"
 #include "../tokenizer.h"
+#include "../toolconstrain.h"
 #include "../../third_party/httplib.h"
 #include "../../third_party/json.hpp"
 
@@ -62,6 +63,21 @@ std::vector<std::pair<std::string,std::string>> messages_from(const json& body) 
     return messages;
 }
 
+// Tool names for constrained decoding: OpenAI shape (tools[].function.name)
+// and Anthropic shape (tools[].name) both accepted.
+std::vector<std::string> tool_names_from(const json& body) {
+    std::vector<std::string> names;
+    if(!body.contains("tools") || !body["tools"].is_array()) return names;
+    for(const auto& t:body["tools"]) {
+        if(!t.is_object()) continue;
+        if(t.contains("function") && t["function"].is_object() && t["function"].contains("name"))
+            names.push_back(t["function"].value("name",""));
+        else if(t.contains("name")) names.push_back(t.value("name",""));
+    }
+    names.erase(std::remove(names.begin(),names.end(),std::string()),names.end());
+    return names;
+}
+
 // OpenAI `stop` (string or array of strings) / Anthropic `stop_sequences`
 // (array). Empty strings are dropped -- they would match at every position.
 std::vector<std::string> parse_stops(const json& body, const char* key) {
@@ -117,10 +133,25 @@ struct Runtime {
     PrefixCache cache;
     uint32_t mtp_width;
     std::mutex mutex;
+    // Constrained tool decoding (--constrain-tools): shared mask cache +
+    // per-slot device-pool map, exactly the CUDA server's shape. The whole
+    // runtime is engine-mutex-serialized, so no extra locking.
+    bool constrain_tools=false;
+    std::vector<std::string> vocab_bytes_v;
+    q27::ToolMaskCache mask_cache;
+    std::vector<int> host2dev;
 
     Runtime(const std::string& model,const std::string& tok,uint32_t context,bool turbo3,
-            uint32_t width,size_t cache_entries)
-        :tokenizer(tok),engine(check_vocab(model),context,turbo3),cache(cache_entries),mtp_width(width){}
+            uint32_t width,size_t cache_entries,bool constrain)
+        :tokenizer(tok),engine(check_vocab(model),context,turbo3),cache(cache_entries),mtp_width(width),
+         constrain_tools(constrain) {
+        if(constrain_tools) {
+            vocab_bytes_v=tokenizer.vocab_bytes();
+            mask_cache.init(&vocab_bytes_v,tokenizer.token_id("</tool_call>"));
+            fprintf(stderr,"constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
+                    tokenizer.token_id("<tool_call>"),tokenizer.token_id("</tool_call>"));
+        }
+    }
 
     std::string check_vocab(const std::string& model) {
         if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
@@ -148,7 +179,8 @@ struct Runtime {
     Outcome run(const std::vector<uint32_t>& prompt,uint32_t count,
                 const q27::SamplingParams& sampling,
                 const std::vector<std::string>& stops,
-                const std::function<bool(const std::string&)>& emit) {
+                const std::function<bool(const std::string&)>& emit,
+                const std::vector<std::string>& tool_names={}) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         std::lock_guard<std::mutex> lock(mutex);
         q27::validate_sampling(sampling);
@@ -173,7 +205,20 @@ struct Runtime {
         q27::StopBuffer stopbuf(stops);
         const uint32_t eos_id=(uint32_t)tokenizer.eos();
         bool client_gone=false, stop_hit=false;
+        // Constrained tool decoding: trigger detection + grammar feeding on
+        // the serial token stream (rounds are single tokens on this path, so
+        // the CUDA engage-lag truncation degenerates to plain sequencing: the
+        // constraint set here masks the NEXT token's logits inside step()).
+        q27::BasicToolConstrainer<q27::MetalEngine,q27::Tokenizer> tc;
+        tc.eng=&engine; tc.tok=&tokenizer; tc.cache=&mask_cache; tc.host2dev=&host2dev;
+        tc.enabled=constrain_tools && !tool_names.empty() && sampling.temperature==0.0f && !mtp_width;
+        tc.begin(tool_names);
         auto sink=[&](uint32_t token)->bool {
+            if(tc.enabled) {
+                const int tid=(int)token;
+                tc.scan_round(&tid,1);
+                tc.on_id(tid);
+            }
             bool stopped=false;
             std::string safe=stopbuf.feed(ugate.feed(tokenizer.decode_one((int)token)),stopped);
             if(!emit(safe)) { client_gone=true; return false; }
@@ -194,6 +239,9 @@ struct Runtime {
             if(!tail.empty()) emit(tail);
             if(stopped) stop_hit=true;
         }
+
+        tc.end();
+        engine.set_tool_constraint(-1); // never leak a mask into the next request
 
         Outcome out;
         out.prompt_tokens=(uint32_t)prompt.size();
@@ -253,12 +301,12 @@ void json_response(httplib::Response& response,const json& value,int status=200)
 
 int main(int argc,char** argv) {
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12] [--kv fp16|turbo3] [--prefix-entries N]\n",argv[0]);
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools]\n",argv[0]);
         return 1;
     }
     try {
         std::string model=argv[1],tok=argv[2],host="127.0.0.1";
-        uint32_t port=8080,context=8192,width=0,prefix_entries=1; bool turbo3=false;
+        uint32_t port=8080,context=8192,width=0,prefix_entries=1; bool turbo3=false; bool constrain_tools=false;
         for(int i=3;i<argc;i++) {
             std::string arg=argv[i];
             if(arg=="--host" && i+1<argc) host=argv[++i];
@@ -267,11 +315,13 @@ int main(int argc,char** argv) {
             else if(arg=="--mtp" && i+1<argc) width=parse_u32(argv[++i],"--mtp");
             else if(arg=="--prefix-entries" && i+1<argc) prefix_entries=parse_u32(argv[++i],"--prefix-entries");
             else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
+            else if(arg=="--constrain-tools") constrain_tools=true;
             else throw std::runtime_error("unknown/incomplete argument: "+arg);
         }
         if(port>65535) throw std::runtime_error("port out of range");
         if(width && (width<2 || width>12)) throw std::runtime_error("MTP width must be 2..12");
-        Runtime runtime(model,tok,context,turbo3,width,prefix_entries);
+        if(constrain_tools && width) throw std::runtime_error("--constrain-tools requires serial decode; drop --mtp (verify-lane masks are not wired on Metal)");
+        Runtime runtime(model,tok,context,turbo3,width,prefix_entries,constrain_tools);
         httplib::Server server;
         server.Get("/health",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"}});});
         server.Get("/v1/models",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"object","list"},{"data",json::array({{{"id","q27-metal"},{"object","model"}}})}});});
@@ -301,7 +351,8 @@ int main(int argc,char** argv) {
             if(!stream) {
                 std::string text;
                 auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ text+=piece; return true; });
+                    [&](const std::string& piece){ text+=piece; return true; },
+                    tool_names_from(body));
                 json choice = chat
                     ? json{{"index",0},{"message",{{"role","assistant"},{"content",text}}},{"finish_reason",openai_finish(outcome.finish)}}
                     : json{{"index",0},{"text",text},{"finish_reason",openai_finish(outcome.finish)}};
@@ -313,15 +364,16 @@ int main(int argc,char** argv) {
                 return;
             }
             r.set_header("Content-Type","text/event-stream");
+            const std::vector<std::string> tnames=tool_names_from(body);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,chat,objd,id,created](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,chat,objd,id,created,tnames](size_t,httplib::DataSink& sink)->bool {
                     try {
                         auto emit=[&](const std::string& piece)->bool {
                             std::string s=q27::sse_data(
                                 q27::openai_stream_chunk(chat,id,objd,created,"q27-metal",piece));
                             return sink.write(s.data(),s.size());
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames);
                         // Terminal chunk with a real finish_reason before [DONE]
                         // (parity with server.cu security-review fix #7).
                         std::string fin=q27::sse_data(q27::openai_stream_final_chunk(
@@ -360,7 +412,8 @@ int main(int argc,char** argv) {
             if(!wants_stream(body)) {
                 std::string text;
                 auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ text+=piece; return true; });
+                    [&](const std::string& piece){ text+=piece; return true; },
+                    tool_names_from(body));
                 json out={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
                     {"content",json::array({{{"type","text"},{"text",text}}})},
                     {"stop_reason",anthropic_stop(outcome.finish)},
@@ -371,8 +424,9 @@ int main(int argc,char** argv) {
                 return;
             }
             r.set_header("Content-Type","text/event-stream");
+            const std::vector<std::string> tnames=tool_names_from(body);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,mid](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,mid,tnames](size_t,httplib::DataSink& sink)->bool {
                     auto ev=[&](const char* name,const json& j){ std::string s=q27::sse_event(name,j); return sink.write(s.data(),s.size()); };
                     try {
                         json msg={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
@@ -393,7 +447,7 @@ int main(int argc,char** argv) {
                             return ev("content_block_delta",{{"type","content_block_delta"},{"index",0},
                                 {"delta",{{"type","text_delta"},{"text",piece}}}});
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames);
                         ev("content_block_stop",{{"type","content_block_stop"},{"index",0}});
                         ev("message_delta",{{"type","message_delta"},
                             {"delta",{{"stop_reason",anthropic_stop(outcome.finish)},
@@ -425,7 +479,8 @@ int main(int argc,char** argv) {
             if(!wants_stream(body)) {
                 std::string text;
                 auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ text+=piece; return true; });
+                    [&](const std::string& piece){ text+=piece; return true; },
+                    tool_names_from(body));
                 json_response(r,{{"id",rid},{"object","response"},{"model","q27-metal"},{"status","completed"},
                     {"output_text",text},
                     {"output",json::array({{{"type","message"},{"id",mid},{"role","assistant"},{"status","completed"},
@@ -436,8 +491,9 @@ int main(int argc,char** argv) {
                 return;
             }
             r.set_header("Content-Type","text/event-stream");
+            const std::vector<std::string> tnames=tool_names_from(body);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,rid,mid](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,rid,mid,tnames](size_t,httplib::DataSink& sink)->bool {
                     auto ev=[&](const json& j){ std::string s=q27::sse_event(j.value("type",std::string("x")),j); return sink.write(s.data(),s.size()); };
                     try {
                         // Gate the run on the opening writes and probe the
@@ -458,7 +514,7 @@ int main(int argc,char** argv) {
                             return ev({{"type","response.output_text.delta"},{"item_id",mid},
                                 {"output_index",0},{"content_index",0},{"delta",piece}});
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames);
                         ev({{"type","response.output_text.done"},{"item_id",mid},{"output_index",0},{"content_index",0},{"text",text}});
                         ev({{"type","response.content_part.done"},{"item_id",mid},{"output_index",0},{"content_index",0},
                             {"part",{{"type","output_text"},{"text",text},{"annotations",json::array()}}}});
