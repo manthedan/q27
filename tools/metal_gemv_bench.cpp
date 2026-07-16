@@ -75,13 +75,23 @@ q27::BackendTensor upload_synthetic(q27::MetalBackend& backend, const Shape& s,
 // The aggregate s_k weights each shape by its per-token production byte
 // share (ffn x3 x64 layers, gdn qkv x48, ssm_out x48, head x1).
 int run_slot2_probe(q27::MetalBackend& backend, int reps) {
+    // The exact per-token production projection mix (metal_engine.cpp weight
+    // shapes; counts: 48 GDN layers, 16 attention layers, 64 FFN, 1 head).
+    // Orientation matters — [5120,17408] and [17408,5120] have different
+    // row-group occupancy and inner-loop length (codex P2, 2026-07-16).
     struct ProbeShape { Shape shape; double per_token_count; };
     const ProbeShape probes[] = {
-        {{"ffn gate/up/down [17408x5120]", 17408, 5120, DType::T2_G128, false}, 192},
-        {{"gdn qkv          [10240x5120]", 10240, 5120, DType::T2_G128, false}, 48},
-        {{"ssm/attn out     [5120x6144]",  5120, 6144, DType::T2_G128, false}, 48},
-        {{"output head      [248320x5120]", 248320, 5120, DType::T2_G128, false}, 1},
+        {{"ffn gate/up   [17408x5120]", 17408, 5120, DType::T2_G128, false}, 128},
+        {{"ffn down      [5120x17408]", 5120, 17408, DType::T2_G128, false}, 64},
+        {{"gdn qkv       [10240x5120]", 10240, 5120, DType::T2_G128, false}, 48},
+        {{"gdn gate      [6144x5120]",  6144, 5120, DType::T2_G128, false}, 48},
+        {{"ssm/attn out  [5120x6144]",  5120, 6144, DType::T2_G128, false}, 64},
+        {{"attn q        [12288x5120]", 12288, 5120, DType::T2_G128, false}, 16},
+        {{"attn k/v      [1024x5120]",  1024, 5120, DType::T2_G128, false}, 32},
+        {{"output head   [248320x5120]", 248320, 5120, DType::T2_G128, false}, 1},
     };
+    printf("excluded from the mix: gdn alpha/beta [48x5120] x96 (~0.15%% of per-token "
+           "weight bytes, dispatch-overhead-dominated)\n");
     printf("q* = quantized packed-dot family (chunked-path kernel; NOT serial decode)\n");
     printf("f* = float select-form family (q27_matvec_t2_g128 = production serial decode)\n");
     printf("%-30s %8s %8s %8s %6s | %8s %8s %6s\n",
@@ -97,7 +107,7 @@ int run_slot2_probe(q27::MetalBackend& backend, int reps) {
         // pair buffer once (32-blocks never straddle rows, so per-row
         // quantization of the same floats yields identical bytes).
         std::vector<float> x2(2 * (size_t)s.cols);
-        for (size_t i = 0; i < x2.size(); i++) x2[i] = (float)((i % 23) - 11) / 11.0f;
+        for (size_t i = 0; i < x2.size(); i++) x2[i] = (float)((int)(i % 23) - 11) / 11.0f;
         auto xb2 = backend.allocate(x2.size() * sizeof(float));
         backend.write(*xb2, 0, x2.data(), x2.size() * sizeof(float));
         q27::BackendQuantized xq2 = backend.allocate_quantized(2 * s.cols);
@@ -287,7 +297,7 @@ int main(int argc, char** argv) {
         if (shape.pair) weight_b = upload_synthetic(backend, shape, data_b, scales_b);
 
         std::vector<float> x(shape.cols);
-        for (uint32_t i = 0; i < shape.cols; i++) x[i] = (float)((i % 19) - 9) / 9.0f;
+        for (uint32_t i = 0; i < shape.cols; i++) x[i] = (float)((int)(i % 19) - 9) / 9.0f;
         auto xb = backend.allocate(x.size() * sizeof(float));
         backend.write(*xb, 0, x.data(), x.size() * sizeof(float));
         q27::BackendQuantized xq = backend.allocate_quantized(shape.cols);

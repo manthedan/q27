@@ -63,10 +63,22 @@ against the same lines before Phase 2 is declared shipped.
 
 ## Results (appended post-measurement, same morning, M4 16 GB)
 
-**VERDICT: PARK.** Aggregate s_k on the production kernel family = **1.081**,
-far below the 1.31 park line. Implied e2e ceiling 1/(0.85/1.081 + 0.15) ≈
-**1.07×**. Phase 2 slot-batched linears are parked on this hardware; the
-probe cost one bench session and zero integration work.
+**VERDICT: PARK.** Aggregate s_k on the production kernel family = **1.093**
+(post-codex corrected bench, see below), far below the 1.31 park line.
+Implied e2e ceiling 1/(0.85/1.093 + 0.15) ≈ **1.08×**. Phase 2 slot-batched
+linears are parked on this hardware; the probe cost one bench session and
+zero integration work.
+
+**Codex round on the probe commit (2 P2s, both fixed and re-measured):**
+(1) the shape table substituted equal-byte orientations and a partial mix —
+replaced with the exact production projection mix (8 shapes, true
+orientations, per-token counts from the engine's weight table; gdn
+alpha/beta [48×5120]×96 excluded explicitly, ~0.15% of bytes); (2) the
+activation fill wrapped unsigned (`(i % 23) - 11` on `size_t`), so the
+byte-identity gate had run with degenerate never-negative activations —
+fixed with a signed cast (and the same-class pre-existing fill in the main
+bench table fixed too). Corrected numbers below; the verdict did not move
+(1.081 → 1.093).
 
 ### Baseline correction (recorded honestly)
 
@@ -78,15 +90,19 @@ corrected to the select-form family (arms fA/fC added, same pre-registered
 lines); both families are reported. `tools/metal_gemv_bench.cpp --slot2`
 reproduces everything, including the byte-identity gates.
 
-### Numbers (30 reps, ms/op)
+### Numbers (30 reps, ms/op; corrected bench — full production mix, signed activations)
 
-| shape | qA 2×1 | qB mm2 | qC x2 | s_kq | fA 2×1 | fC x2 | s_kf |
+| shape (per-token count) | qA 2×1 | qB mm2 | qC x2 | s_kq | fA 2×1 | fC x2 | s_kf |
 |---|---|---|---|---|---|---|---|
-| ffn gate/up/down [17408×5120] | 1.323 | 1.154 | 1.123 | 1.178 | 0.520 | 0.478 | 1.089 |
-| gdn qkv [10240×5120] | 0.783 | 0.690 | 0.666 | 1.174 | 0.314 | 0.281 | 1.118 |
-| ssm/attn out [5120×6144] | 0.474 | 0.430 | 0.406 | 1.168 | 0.164 | 0.181 | **0.905** |
-| output head [248320×5120] | 18.598 | 15.867 | 15.863 | 1.172 | 7.535 | 6.571 | 1.147 |
-| **aggregate (byte-weighted)** | | | | **1.177** | | | **1.081** |
+| ffn gate/up [17408×5120] (×128) | 1.318 | 1.153 | 1.126 | 1.171 | 0.530 | 0.476 | 1.114 |
+| ffn down [5120×17408] (×64) | 1.321 | 1.195 | 1.126 | 1.173 | 0.536 | 0.489 | 1.095 |
+| gdn qkv [10240×5120] (×48) | 0.778 | 0.687 | 0.670 | 1.160 | 0.334 | 0.286 | 1.165 |
+| gdn gate [6144×5120] (×48) | 0.478 | 0.439 | 0.404 | 1.183 | 0.199 | 0.185 | 1.079 |
+| ssm/attn out [5120×6144] (×64) | 0.477 | 0.432 | 0.408 | 1.171 | 0.166 | 0.184 | **0.905** |
+| attn q [12288×5120] (×16) | 0.940 | 0.833 | 0.798 | 1.177 | 0.383 | 0.342 | 1.122 |
+| attn k/v [1024×5120] (×32) | 0.091 | 0.110 | 0.076 | 1.195 | 0.050 | 0.045 | 1.121 |
+| output head [248320×5120] (×1) | 18.594 | 15.855 | 15.865 | 1.172 | 7.374 | 6.556 | 1.125 |
+| **aggregate (byte-weighted)** | | | | **1.171** | | | **1.093** |
 
 Identity: both x2 kernels byte-identical to their single-row kernels on all
 shapes (memcmp'd before any timing was accepted).
@@ -97,8 +113,8 @@ Variant history on the quantized family: naive dual-dot 1.169; shared-unpack
 
 ### Why the ceiling's premise is false on M4
 
-- The select-form production GEMV streams ~**91 GB/s** effective (23.7 MB
-  ffn tensor in 0.260 ms/row) — near the M4 bandwidth roof, i.e. the single
+- The select-form production GEMV streams ~**89 GB/s** effective (23.7 MB
+  ffn tensor in 0.265 ms/row) — near the M4 bandwidth roof, i.e. the single
   kernel sits at the compute/bandwidth **balance point**, not deep in
   bandwidth-bound territory.
 - Batching two rows halves weight bytes per slot-token but doubles the
@@ -111,7 +127,7 @@ Variant history on the quantized family: naive dual-dot 1.169; shared-unpack
   still loses to the select-form pair by ~2×.
 
 S₂ = 2/(α·f + 2(1−f)) ≈ 1.74 assumed α ≈ 1 (batched linear ≈ one single).
-Measured α ≈ 2/1.081 ≈ 1.85. The lever needs α ≲ 1.4 to clear the deploy
+Measured α ≈ 2/1.093 ≈ 1.83. The lever needs α ≲ 1.4 to clear the deploy
 line; no candidate in this kernel family gets there.
 
 ### Residue (recorded, not scheduled)
