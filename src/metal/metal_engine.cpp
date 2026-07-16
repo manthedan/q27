@@ -941,6 +941,59 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
     return predictions[commit_n - 1];
 }
 
+// Gate 0 oracle round: mtp_round with the layer-64 draft stage replaced by
+// caller-supplied reference lanes and the acceptance walk replaced by a
+// teacher-forced full commit. The verify chunk, batched output head,
+// per-lane argmax, and gdn_replay commit are shared verbatim, so the round
+// cost is exactly V(w)+O(w) — what a perfect drafter would pay. Because the
+// committed tokens ARE the lanes, KV rows written during the verify chunk
+// are all real and the replayed GDN state matches a serial walk over the
+// same tokens bit-exactly (both chunk kernels are sequential in-kernel).
+void MetalEngine::oracle_round(const uint32_t* lanes, uint32_t live, bool last,
+                               uint32_t* predictions) {
+    if (live < 2 || live > CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: oracle width must be 2..12");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: oracle round requires chunked prefill");
+    // The verify chunk stores a KV row for every lane, so all `live` rows
+    // must fit the reserved context even on a `last` round whose final
+    // token never advances position_ — unlike the serial walk, which can
+    // end at max_context_+1 because it never encodes the final token.
+    // --oracle therefore needs --ctx >= prompt+count, one more than serial.
+    if ((uint64_t)position_ + live > max_context_)
+        throw std::runtime_error("q27 Metal: oracle verify rows exceed context; --oracle needs --ctx >= prompt+count");
+    for (uint32_t lane = 0; lane < live; lane++)
+        if (lanes[lane] >= VOCAB)
+            throw std::runtime_error("q27 Metal: oracle lane token out of range");
+    last_spec_stats_.rounds++;
+    last_spec_stats_.drafted += live - 1;
+    {
+        CommandBatch batch(backend_);
+        chunk_forward(lanes, live, /*verify=*/true);
+        BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
+        backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                        N_EMBD, live, EPS, x5);
+        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
+        batch.finish();
+    }
+    backend_.read(*cpred_, 0, predictions, live * sizeof(uint32_t));
+    // Teacher-forced commit of every lane; the final output token of a
+    // generation is never encoded, exactly like the serial walk.
+    const uint32_t encoded = last ? live - 1 : live;
+    last_spec_stats_.accepted += live - 1;
+    if (encoded) {
+        CommandBatch batch(backend_);
+        gdn_replay(encoded);
+        backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
+                      *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+        backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
+                      *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+        batch.finish();
+    }
+    position_ += encoded;
+}
+
 uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint32_t width,
                                          uint32_t eos, const TokenSink& sink, StopCause& cause) {
     uint32_t emitted = 0;

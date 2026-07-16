@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
-                "[-n count] [--ctx count] [--mtp width | --suffix width] [--kv fp16|turbo3] "
+                "[-n count] [--ctx count] [--mtp width | --suffix width | --oracle width] [--kv fp16|turbo3] "
                 "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self] [--chunk-parity N] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--dump-logits file]\n",
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     }
     try {
         std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits,nll_path;
-        uint32_t count=1,context=128,mtp_width=0,suffix_width=0,nll_long=0; q27::SamplingParams sampling;
+        uint32_t count=1,context=128,mtp_width=0,suffix_width=0,oracle_width=0,nll_long=0; q27::SamplingParams sampling;
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         bool kl_kv = false, kl_self = false;
         uint32_t chunk_parity = 0;
@@ -169,6 +169,7 @@ int main(int argc, char** argv) {
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
             else if (arg == "--suffix" && i + 1 < argc) suffix_width = parse_u32(argv[++i], "--suffix");
+            else if (arg == "--oracle" && i + 1 < argc) oracle_width = parse_u32(argv[++i], "--oracle");
             else if (arg == "--dump-logits" && i + 1 < argc) dump_logits = argv[++i];
             else if (arg == "--temperature" && i + 1 < argc) sampling.temperature=parse_float(argv[++i],"--temperature");
             else if (arg == "--top-p" && i + 1 < argc) sampling.top_p=parse_float(argv[++i],"--top-p");
@@ -186,10 +187,17 @@ int main(int argc, char** argv) {
             }
             else throw std::runtime_error("unknown/incomplete argument: " + arg);
         }
-        if (mtp_width && suffix_width) throw std::runtime_error("--mtp and --suffix are mutually exclusive");
+        if ((mtp_width != 0) + (suffix_width != 0) + (oracle_width != 0) > 1)
+            throw std::runtime_error("--mtp, --suffix, and --oracle are mutually exclusive");
         q27::validate_sampling(sampling);
-        if(sampling.temperature>0 && (mtp_width || suffix_width))
+        if(sampling.temperature>0 && (mtp_width || suffix_width || oracle_width))
             throw std::runtime_error("sampling cannot be combined with speculative modes");
+        if (oracle_width && (oracle_width < 2 || oracle_width > 12))
+            throw std::runtime_error("--oracle width must be 2..12");
+        if (oracle_width && count < oracle_width + 2)
+            throw std::runtime_error("--oracle needs -n >= width+2 for at least one full and one final round");
+        if (oracle_width && !dump_logits.empty())
+            throw std::runtime_error("--oracle cannot be combined with --dump-logits");
         if(!token_list.empty() && !prompt_text.empty()) throw std::runtime_error("--tokens and --prompt are mutually exclusive");
         if (!nll_path.empty() && (!token_list.empty() || !prompt_text.empty() || validate_only))
             throw std::runtime_error("--nll cannot be combined with --tokens/--prompt/--validate-only");
@@ -209,7 +217,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--kl-kv builds its own fp16 baseline and turbo3 subject; drop --kv");
         if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty())
             throw std::runtime_error("--tokens, --prompt, --nll, or --validate-only is required");
-        if (!nll_path.empty() && (mtp_width || suffix_width || sampling.temperature > 0 || !dump_logits.empty()))
+        if (!nll_path.empty() && (mtp_width || suffix_width || oracle_width || sampling.temperature > 0 || !dump_logits.empty()))
             throw std::runtime_error("--nll cannot be combined with speculative/sampling/dump modes");
 
         auto start = std::chrono::steady_clock::now();
@@ -472,6 +480,103 @@ int main(int argc, char** argv) {
                     nll.size() / std::chrono::duration<double>(nll_done - nll_start).count(),
                     mean, std::exp(mean));
             return 0;
+        }
+
+        // Gate 0 oracle verifier (docs/plans/2026-07-15-sibling-drafter-probe.md):
+        // can batched verification pay AT ALL on this hardware? Replay a known
+        // greedy continuation as free draft proposals (D=0, perfect acceptance)
+        // through the batched verify rounds and price them against the
+        // production serial rate. Serial passes bracket the oracle pass so
+        // thermal drift is visible in the two G values, and a one-step probe
+        // from both end states is the can-fail state-integrity gate.
+        if (oracle_width) {
+            auto clock_now = [] { return std::chrono::steady_clock::now(); };
+            auto ms_between = [](std::chrono::steady_clock::time_point a,
+                                 std::chrono::steady_clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            // Pass 1: serial reference at the production greedy rate
+            // (resident chaining included when enabled).
+            uint32_t pending = engine.ingest_prompt(prompt, false, true);
+            auto s0 = clock_now();
+            std::vector<uint32_t> ref = engine.generate_from_pending(pending, count);
+            auto s1 = clock_now();
+            const double g1_ms = ms_between(s0, s1) / (count - 1);
+            const uint32_t serial_probe = engine.step(ref.back());
+            const uint32_t serial_end_pos = engine.position();
+            const std::vector<float> serial_probe_logits = engine.read_logits();
+
+            // Pass 2: oracle rounds over the reference at width W.
+            const uint32_t pending2 = engine.ingest_prompt(prompt, false, true);
+            if (pending2 != ref[0])
+                throw std::runtime_error("oracle: prompt re-ingest diverged from pass 1 (prefill nondeterminism)");
+            std::vector<uint32_t> preds(oracle_width);
+            std::vector<double> round_ms;
+            unsigned long long agree = 0, agree_den = 0;
+            uint32_t emitted = 0;
+            while (emitted < count) {
+                const uint32_t live = std::min<uint32_t>(oracle_width, count - emitted);
+                if (live < 2) { emitted++; continue; }  // final token: committed, never encoded
+                const bool last_round = (emitted + live == count);
+                auto r0 = clock_now();
+                engine.oracle_round(ref.data() + emitted, live, last_round, preds.data());
+                round_ms.push_back(ms_between(r0, clock_now()));
+                // Observational agreement: verify argmax vs the serial
+                // reference, including the bonus lane when a next reference
+                // token exists. Never acted on — commit is teacher-forced.
+                for (uint32_t k = 0; k + 1 < live; k++) { agree_den++; agree += preds[k] == ref[emitted + k + 1]; }
+                if (emitted + live < count) { agree_den++; agree += preds[live - 1] == ref[emitted + live]; }
+                emitted += live;
+            }
+            const uint32_t oracle_probe = engine.step(ref.back());
+            const uint32_t oracle_end_pos = engine.position();
+            const std::vector<float> oracle_probe_logits = engine.read_logits();
+
+            // Pass 3: serial re-measure to bracket thermal/clock drift.
+            const uint32_t pending3 = engine.ingest_prompt(prompt, false, true);
+            auto s2 = clock_now();
+            std::vector<uint32_t> ref2 = engine.generate_from_pending(pending3, count);
+            auto s3 = clock_now();
+            const double g2_ms = ms_between(s2, s3) / (count - 1);
+            if (ref2 != ref)
+                throw std::runtime_error("oracle: serial re-measure diverged from pass 1 (nondeterminism)");
+
+            // State gate: probe argmax and position must match, and the full
+            // probe logits must sit inside the known chunk-vs-serial numeric
+            // class (~1e-3 abs). Real state corruption (missing KV rows,
+            // broken gdn_replay) moves logits by orders of magnitude more,
+            // so the 0.25 tolerance keeps the gate able to fail without
+            // tripping on benign accumulation-order differences.
+            double probe_max_diff = 0.0;
+            for (size_t v = 0; v < serial_probe_logits.size(); v++)
+                probe_max_diff = std::max(probe_max_diff,
+                                          (double)std::fabs(oracle_probe_logits[v] - serial_probe_logits[v]));
+            const bool state_ok = oracle_probe == serial_probe && oracle_end_pos == serial_end_pos &&
+                                  probe_max_diff < 0.25;
+            const double g_ms = (g1_ms + g2_ms) / 2.0;
+            double total = 0.0;
+            for (double v : round_ms) total += v;
+            const double mean_ms = total / round_ms.size();
+            double warm_total = 0.0;
+            for (size_t r = 1; r < round_ms.size(); r++) warm_total += round_ms[r];
+            const double warm_ms = round_ms.size() > 1 ? warm_total / (round_ms.size() - 1) : mean_ms;
+            // count-1 tokens are attributable to the timed rounds: ref[0]
+            // was free from prefill in BOTH passes (serial times count-1
+            // steps), and a count%width==1 tail singleton is committed
+            // without a round. Same denominator on both sides of S(w).
+            const double tok_per_round = (double)(count - 1) / round_ms.size();
+            fprintf(stderr, "oracle w=%u: G %.2f/%.2f ms/tok (serial %.2f/%.2f tok/s), %zu rounds, %.2f tok/round\n",
+                    oracle_width, g1_ms, g2_ms, 1000.0 / g1_ms, 1000.0 / g2_ms,
+                    round_ms.size(), tok_per_round);
+            fprintf(stderr, "oracle w=%u: round %.2f ms mean, %.2f ms warm (first %.2f), oracle wall %.2f tok/s\n",
+                    oracle_width, mean_ms, warm_ms, round_ms[0], 1000.0 * tok_per_round / mean_ms);
+            fprintf(stderr, "oracle w=%u: S(w) = %.3fx mean, %.3fx warm | agreement %llu/%llu (%.1f%%)\n",
+                    oracle_width, tok_per_round * g_ms / mean_ms, tok_per_round * g_ms / warm_ms,
+                    agree, agree_den, agree_den ? 100.0 * agree / agree_den : 0.0);
+            fprintf(stderr, "oracle w=%u: state gate %s (probe %u vs %u, position %u vs %u, logits max|d| %.4g)\n",
+                    oracle_width, state_ok ? "PASS" : "FAIL",
+                    oracle_probe, serial_probe, oracle_end_pos, serial_end_pos, probe_max_diff);
+            return state_ok ? 0 : 1;
         }
 
         std::vector<uint32_t> generated = sampling.temperature>0 ? engine.generate_sampled(prompt,count,sampling)
