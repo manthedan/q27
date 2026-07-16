@@ -167,8 +167,12 @@ int main(int argc, char** argv) {
             else if (arg == "--validate-only") validate_only = true;
             else if (arg == "--kl-kv") kl_kv = true;
             else if (arg == "--kl-kv-self") { kl_kv = true; kl_self = true; }
-            else if (arg == "--kl-kv-k") { kl_kv = true; kv_attrib = 1; }
-            else if (arg == "--kl-kv-v") { kl_kv = true; kv_attrib = 2; }
+            else if (arg == "--kl-kv-k" || arg == "--kl-kv-v") {
+                const uint32_t side = (arg == "--kl-kv-k") ? 1 : 2;
+                if (kv_attrib && kv_attrib != side)
+                    throw std::runtime_error("--kl-kv-k and --kl-kv-v are alternative arms; pass one");
+                kl_kv = true; kv_attrib = side;
+            }
             else if (arg == "--chunk-parity" && i + 1 < argc) chunk_parity = parse_u32(argv[++i], "--chunk-parity");
             else if (arg == "--envelope" && i + 1 < argc) envelope_mode = argv[++i];
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
