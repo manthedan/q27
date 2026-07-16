@@ -1,10 +1,41 @@
 # Multislot Phase 1 — two-slot serving on one mapping (2026-07-15)
 
-Status: DESIGN — implementation starting. Prereqs met: round-2 P0s #1/#2/#3
-fixed and gated (`dc8f017` + exit-code hardening), triage ordering explicitly
-unblocks "v1 multislot state/scheduling" as the next serving workstream
-(review-3 Q3: P0 fixes → v1 multislot → N=2 slot-batched linears →
-verify_lanes → learned drafting).
+Status: IMPLEMENTED same night — engine quantum surface + slot runtime
+landed; gates G1/G2/G3/G5 (and a sampled-arm G1s) pass on the T2 artifact.
+Prereqs met: round-2 P0s #1/#2/#3 fixed and gated (`dc8f017` + exit-code
+hardening), triage ordering explicitly unblocks "v1 multislot
+state/scheduling" as the next serving workstream (review-3 Q3: P0 fixes →
+v1 multislot → N=2 slot-batched linears → verify_lanes → learned drafting).
+
+## Implementation notes (added post-landing)
+
+- Engine surface: `prefill_chunk` (prefill() now drives its own loop
+  through it), `mtp_round` (extracted verbatim; `stream_mtp_batched` and
+  `generate_mtp_batched` now sit on it, so whole-run and per-quantum MTP
+  share one code path), `sample_from_logits` (request-owned RNG).
+  Pre/post-refactor A/B: greedy fp16 and greedy turbo3 48-token runs
+  byte-identical. **MTP arm NOT coverable on this rig** — the T2 Bonsai
+  artifact carries no MTP layer (the first "identical" readout was two
+  empty error outputs; vacuous-gate lesson re-learned, retracted). The
+  measured MTP quantum gate (G2-MTP + G1-MTP) is queued for the 24 GB
+  machine's artifact.
+- Server: `Runtime::run()` signature unchanged (all six HTTP call sites
+  untouched); slots + FIFO ticket-lock lease + width policy + /stats
+  live inside Runtime. `host2dev` moved into Slot (per-engine mask pool);
+  the host-side mask cache stays shared.
+- **Fairness finding (measured):** with a plain `std::mutex` lease, the
+  decoding slot's release/deliver/reacquire loop starved the competing
+  slot for a whole generation — 5,491 ms gate wait vs the ~2 s quantum
+  bound. The lease is a FIFO ticket lock for exactly this reason, and G5
+  asserts max busy-arrival gate wait ≤ 3 s (bound proven able to fail by
+  the pre-ticket measurement).
+- Deviations from the sketch below: bounded queue is a waiter cap
+  (QUEUE_MAX=8 → error, surfaces as HTTP 400 through the shared error
+  path; a dedicated 503 is a follow-up); admission = engine-ctor budget
+  check with graceful slot-count degradation (snapshot-capacity and GQA
+  partial-peak terms remain TODO with G6); MTP-warm prompt ingestion is
+  one coarse quantum (engine-internal token-serial loop), documented and
+  visible in the wait metrics.
 
 ## What Phase 1 is (and is not)
 

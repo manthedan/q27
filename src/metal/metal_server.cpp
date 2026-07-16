@@ -7,12 +7,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <functional>
 #include <list>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -129,22 +133,90 @@ class PrefixCache {
 
 struct Runtime {
     q27::Tokenizer tokenizer;
-    q27::MetalEngine engine;
-    PrefixCache cache;
+    std::shared_ptr<q27::MetalEngine::Shared> shared;
+    // One request slot = one engine on the shared mapping plus its private
+    // prefix cache, scheduling phase, and constraint device-pool map (each
+    // engine owns its own mask pool, so host mask id -> pool slot is
+    // per-slot state; the host-side mask cache stays shared).
+    struct Slot {
+        q27::MetalEngine engine;
+        PrefixCache cache;
+        std::vector<int> host2dev;
+        bool busy=false;
+        enum class Phase { Idle, Prefill, Decode, Verify } phase=Phase::Idle;
+        Slot(std::shared_ptr<q27::MetalEngine::Shared> s,uint32_t ctx,bool turbo3,size_t entries)
+            :engine(std::move(s),ctx,turbo3),cache(entries) {}
+    };
+    std::vector<std::unique_ptr<Slot>> slots;
     uint32_t mtp_width;
-    std::mutex mutex;
-    // Constrained tool decoding (--constrain-tools): shared mask cache +
-    // per-slot device-pool map, exactly the CUDA server's shape. The whole
-    // runtime is engine-mutex-serialized, so no extra locking.
+    uint32_t context;
+    // Lock order (multislot Phase 1 contract, docs/plans/2026-07-15-
+    // multislot-phase1.md): route_ before lease_ — and in fact the two are
+    // never held together. route_ guards slot assignment, phases, waiter
+    // count, and wait stats, and is never held across GPU work; lease_
+    // serializes every engine call (slots alias one Shared command queue)
+    // and is held for one scheduling quantum at a time.
+    //
+    // The lease is a FIFO ticket lock, not a plain mutex: std::mutex makes
+    // no fairness promise, and a tight decode loop (release, deliver,
+    // reacquire) starves the other slot for a whole generation under it
+    // (measured 5.5 s gate wait on the first two-slot run). Ticket order
+    // caps the wait at one active quantum, which is the Phase 1 guarantee.
+    struct Lease {
+        std::mutex m;
+        std::condition_variable cv;
+        uint64_t next=0, serving=0;
+        struct Guard {
+            Lease* l=nullptr;
+            Guard()=default;
+            explicit Guard(Lease& lease):l(&lease) {
+                std::unique_lock<std::mutex> lk(l->m);
+                const uint64_t ticket=l->next++;
+                l->cv.wait(lk,[&]{ return l->serving==ticket; });
+            }
+            Guard(Guard&& o) noexcept :l(o.l) { o.l=nullptr; }
+            Guard& operator=(Guard&&)=delete;
+            Guard(const Guard&)=delete;
+            Guard& operator=(const Guard&)=delete;
+            ~Guard() {
+                if(!l) return;
+                { std::lock_guard<std::mutex> lk(l->m); l->serving++; }
+                l->cv.notify_all();
+            }
+        };
+    };
+    std::mutex route_;
+    std::condition_variable slot_free_;
+    Lease lease_;
+    uint32_t queue_waiters=0;
+    static constexpr uint32_t QUEUE_MAX=8;
+    // Gate-wait accounting bucketed by what the competing traffic was doing
+    // at arrival (idle/prefill/decode/verify), guarded by route_.
+    struct WaitStats { uint64_t n=0; double sum_ms=0, max_ms=0; };
+    std::map<std::string,WaitStats> wait_stats;
     bool constrain_tools=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
-    std::vector<int> host2dev;
 
-    Runtime(const std::string& model,const std::string& tok,uint32_t context,bool turbo3,
-            uint32_t width,size_t cache_entries,bool constrain)
-        :tokenizer(tok),engine(check_vocab(model),context,turbo3),cache(cache_entries),mtp_width(width),
-         constrain_tools(constrain) {
+    Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
+            uint32_t width,size_t cache_entries,bool constrain,uint32_t slot_count)
+        :tokenizer(tok),mtp_width(width),context(ctx),constrain_tools(constrain) {
+        if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
+            throw std::runtime_error("tokenizer/model vocabulary mismatch");
+        shared=q27::MetalEngine::open_shared(model);
+        slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
+        // Admission: further slots must fit the device budget (the engine
+        // constructor accounts KV against Shared::cache_bytes and throws on
+        // overcommit — reservation rollback is RAII-safe). A slot that does
+        // not fit degrades the server to fewer slots instead of failing it.
+        for(uint32_t s=1;s<slot_count;s++) {
+            try { slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries)); }
+            catch(const std::exception& e) {
+                fprintf(stderr,"multislot: slot %u admission failed (%s); serving with %zu slot(s)\n",
+                        s,e.what(),slots.size());
+                break;
+            }
+        }
         if(constrain_tools) {
             vocab_bytes_v=tokenizer.vocab_bytes();
             mask_cache.init(&vocab_bytes_v,tokenizer.token_id("</tool_call>"));
@@ -153,10 +225,30 @@ struct Runtime {
         }
     }
 
-    std::string check_vocab(const std::string& model) {
-        if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
-            throw std::runtime_error("tokenizer/model vocabulary mismatch");
-        return model;
+    static const char* phase_name(Slot::Phase p) {
+        switch(p) {
+            case Slot::Phase::Prefill: return "prefill";
+            case Slot::Phase::Decode: return "decode";
+            case Slot::Phase::Verify: return "verify";
+            default: return "idle";
+        }
+    }
+
+    // Prefill width policy (Phase 1 contract): the width is a runtime
+    // policy, not an engine constant. 96 when nothing competes, 48 when the
+    // competing traffic is itself prefilling, 12 when a latency-sensitive
+    // stream (decode/MTP verify) or a queued request is waiting for the GPU.
+    uint32_t quantum_width(const Slot* self) {
+        std::lock_guard<std::mutex> lk(route_);
+        bool other_busy=false, other_latency=false;
+        for(const auto& s:slots) {
+            if(s.get()==self || !s->busy) continue;
+            other_busy=true;
+            if(s->phase!=Slot::Phase::Prefill) other_latency=true;
+        }
+        if(other_latency || queue_waiters>0) return 12;
+        if(other_busy) return 48;
+        return 96;
     }
 
     // How generation ended. Stop == the model emitted EOS (finish_reason
@@ -169,88 +261,239 @@ struct Runtime {
         size_t prefix_hit=0;
         Finish finish=Finish::Length;
         std::string stop_sequence; // set when finish==StopSequence
+        double gate_wait_ms=0;     // arrival to first GPU lease
+        const char* arrival="idle"; // competing slot's phase at arrival
     };
 
     // Single generation core shared by streaming and non-streaming paths.
     // `emit(piece)` receives UTF-8-safe, stop-sequence-trimmed text as it is
-    // produced and returns false when the client has gone away. The Metal
-    // engine is serialized, so the mutex is held for the whole generation
-    // exactly as the CUDA server holds its per-slot lease.
+    // produced and returns false when the client has gone away.
+    //
+    // Multislot Phase 1: a request claims an idle slot (engine + prefix
+    // cache), then makes progress one scheduling quantum at a time — one
+    // prefill chunk at the policy width, one decode step, or one MTP
+    // draft/verify/commit round per GPU lease — so a concurrent request on
+    // the other slot waits at most one active quantum, never a whole
+    // generation. Text delivery (decode/UTF-8/stop gates/emit) runs outside
+    // the lease: a slow client can stall its own stream, not the GPU.
     Outcome run(const std::vector<uint32_t>& prompt,uint32_t count,
                 const q27::SamplingParams& sampling,
                 const std::vector<std::string>& stops,
                 const std::function<bool(const std::string&)>& emit,
                 const std::vector<std::string>& tool_names={}) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
-        std::lock_guard<std::mutex> lock(mutex);
-        // Round-2 expert P0 #1 (leak across requests): an engine exception
-        // mid-generation used to skip constraint cleanup, so the next request
-        // decoded under the previous request's mask. Defensive reset at entry
-        // covers any pre-fix leak; the scope-exit guard below covers every
-        // exit path from here on.
-        engine.set_tool_constraint(-1);
         q27::validate_sampling(sampling);
         const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
-        size_t hit=0; uint32_t pending=0;
-        if(cache.restore(engine,prompt,mtp,hit,pending)) {
-            if(hit<prompt.size()) {
-                std::vector<uint32_t> suffix(prompt.begin()+hit,prompt.end());
-                pending=engine.ingest_prompt(suffix,mtp,false);
+        const auto arrive=std::chrono::steady_clock::now();
+
+        // ---- slot acquisition (route_ only; never held across GPU work) ----
+        Slot* slot=nullptr;
+        const char* arrival="idle";
+        {
+            std::unique_lock<std::mutex> lk(route_);
+            for(const auto& s:slots) if(s->busy) arrival=phase_name(s->phase);
+            if(queue_waiters>=QUEUE_MAX)
+                throw std::runtime_error("server overloaded: request queue is full");
+            queue_waiters++;
+            slot_free_.wait(lk,[&]{
+                for(const auto& s:slots) if(!s->busy) return true;
+                return false;
+            });
+            queue_waiters--;
+            for(const auto& s:slots) if(!s->busy) { slot=s.get(); break; }
+            slot->busy=true;
+            slot->phase=Slot::Phase::Prefill;
+        }
+        struct SlotRelease {
+            Runtime& rt; Slot& s;
+            ~SlotRelease() {
+                { std::lock_guard<std::mutex> lk(rt.route_); s.busy=false; s.phase=Slot::Phase::Idle; }
+                rt.slot_free_.notify_one();
             }
-        } else pending=engine.ingest_prompt(prompt,mtp,true);
+        } slot_release{*this,*slot};
+        q27::MetalEngine& engine=slot->engine;
+
+        // First lease acquisition stamps the gate wait; every engine call
+        // below runs under one of these scoped leases.
+        double gate_wait_ms=-1.0;
+        auto lease_now=[&]()->Lease::Guard {
+            Lease::Guard gpu(lease_);
+            if(gate_wait_ms<0)
+                gate_wait_ms=std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-arrive).count();
+            return gpu;
+        };
+
+        // ---- prompt ingestion, one quantum per chunk ----
+        size_t hit=0; uint32_t pending=0;
+        bool restored=false;
+        {
+            auto gpu=lease_now();
+            // Round-2 expert P0 #1 (leak across requests): defensive entry
+            // reset; the scope-exit guard below covers every later exit path.
+            engine.set_tool_constraint(-1);
+            restored=slot->cache.restore(engine,prompt,mtp,hit,pending);
+            if(!restored) { engine.reset(); hit=0; }
+            if((uint64_t)engine.position()+(prompt.size()-hit)>context)
+                throw std::runtime_error("prompt exceeds context");
+        }
+        std::vector<uint32_t> suffix(prompt.begin()+hit,prompt.end());
+        if(!suffix.empty()) {
+            if(mtp || !engine.chunked_prefill()) {
+                // MTP warming is token-serial inside the engine (each token
+                // needs its final hidden state), so this path stays one
+                // coarse quantum — a known Phase 1 limitation, documented in
+                // the plan; the wait metrics expose it honestly.
+                auto gpu=lease_now();
+                pending=engine.ingest_prompt(suffix,mtp,false);
+            } else {
+                size_t i=0;
+                const size_t chunkable=suffix.size()-1;
+                while(chunkable-i>=2) {
+                    const uint32_t width=quantum_width(slot);
+                    const uint32_t take=(uint32_t)std::min<size_t>(width,chunkable-i);
+                    auto gpu=lease_now();
+                    engine.prefill_chunk(suffix.data()+i,take);
+                    i+=take;
+                }
+                // Serial tail: at most one leftover chunkable token plus the
+                // final token, which produces the logits and pending id —
+                // mirrors MetalEngine::prefill()'s tail exactly.
+                for(;i<suffix.size();i++) {
+                    auto gpu=lease_now();
+                    pending=engine.step(suffix[i]);
+                }
+            }
+        }
+        // Fail oversize generations before emitting anything, exactly like
+        // the whole-generation streaming calls used to.
+        if((uint64_t)engine.position()+(count?count-1:0)>context)
+            throw std::runtime_error("generation exceeds context");
         // Cache the prompt state before generation mutates it. One entry costs
         // about 151 MiB for GDN state, so the default capacity is deliberately 1.
-        if(cache.prepare_insert(prompt,mtp))
-            cache.insert(prompt,mtp,pending,engine.capture_state());
+        // Cancelled requests never reach another insert, so post-cancel MTP
+        // lane state is structurally non-cacheable (Phase 1 cancel invariant).
+        // prepare_insert can release an evicted snapshot's GPU buffers, so it
+        // stays under the lease alongside capture_state.
+        {
+            auto gpu=lease_now();
+            if(slot->cache.prepare_insert(prompt,mtp))
+                slot->cache.insert(prompt,mtp,pending,engine.capture_state());
+        }
+        {
+            std::lock_guard<std::mutex> lk(route_);
+            slot->phase = mtp ? Slot::Phase::Verify : Slot::Phase::Decode;
+            WaitStats& ws=wait_stats[arrival];
+            ws.n++; ws.sum_ms+=std::max(gate_wait_ms,0.0); ws.max_ms=std::max(ws.max_ms,gate_wait_ms);
+        }
 
         // token -> decode -> UTF-8 boundary gate -> stop-sequence holdback ->
-        // emit. Returning false from the engine sink stops generation, whether
-        // because the client left (client_gone) or a stop sequence completed
-        // (stop_hit). The two are distinguished for finish-reason reporting.
+        // emit, all outside the GPU lease. deliver() returns false to stop
+        // generation, either because the client left (client_gone) or a stop
+        // sequence completed (stop_hit); the two are distinguished for
+        // finish-reason reporting.
         q27::Utf8Gate ugate;
         q27::StopBuffer stopbuf(stops);
         const uint32_t eos_id=(uint32_t)tokenizer.eos();
         bool client_gone=false, stop_hit=false;
+        uint32_t produced=0;
+        q27::MetalEngine::StopCause cause=q27::MetalEngine::StopCause::MaxTokens;
+        auto deliver=[&](uint32_t token)->bool {
+            bool stopped=false;
+            std::string safe=stopbuf.feed(ugate.feed(tokenizer.decode_one((int)token)),stopped);
+            if(!emit(safe)) { client_gone=true; cause=q27::MetalEngine::StopCause::Cancelled; return false; }
+            if(stopped) { stop_hit=true; cause=q27::MetalEngine::StopCause::Cancelled; return false; }
+            produced++;
+            return true;
+        };
         // Constrained tool decoding: trigger detection + grammar feeding on
         // the serial token stream (rounds are single tokens on this path, so
         // the CUDA engage-lag truncation degenerates to plain sequencing: the
         // constraint set here masks the NEXT token's logits inside step()).
         q27::BasicToolConstrainer<q27::MetalEngine,q27::Tokenizer> tc;
-        tc.eng=&engine; tc.tok=&tokenizer; tc.cache=&mask_cache; tc.host2dev=&host2dev;
+        tc.eng=&engine; tc.tok=&tokenizer; tc.cache=&mask_cache; tc.host2dev=&slot->host2dev;
         tc.enabled=constrain_tools && !tool_names.empty() && sampling.temperature==0.0f && !mtp_width;
-        tc.begin(tool_names);
+        {
+            auto gpu=lease_now();
+            tc.begin(tool_names);
+        }
         // Scope-exit constraint cleanup: runs on normal return, client
         // disconnect, and engine exceptions alike, and never throws (a
-        // cleanup failure must not mask the original exception).
+        // cleanup failure must not mask the original exception). Takes its
+        // own lease — the per-quantum leases are all released by then.
         struct ConstraintCleanup {
+            Runtime& rt;
             q27::BasicToolConstrainer<q27::MetalEngine,q27::Tokenizer>& tc;
             q27::MetalEngine& engine;
             ~ConstraintCleanup() {
-                try { tc.end(); engine.set_tool_constraint(-1); } catch(...) {}
+                try {
+                    Lease::Guard gpu(rt.lease_);
+                    tc.end();
+                    engine.set_tool_constraint(-1);
+                } catch(...) {}
             }
-        } constraint_cleanup{tc,engine};
-        auto sink=[&](uint32_t token)->bool {
-            if(tc.enabled) {
-                const int tid=(int)token;
-                tc.scan_round(&tid,1);
-                tc.on_id(tid);
-                // Restage the ADVANCED grammar state's mask (codex P1): on_id
-                // moves tc.tg but stages nothing, so without this every step
-                // after the first constrained token decodes under the previous
-                // state's legal set. The CUDA server does this via on_pending;
-                // the serial flow applies tg directly.
-                if(tc.active) tc.apply(tc.tg);
+        } constraint_cleanup{*this,tc,engine};
+
+        // ---- generation, one quantum per lease ----
+        if(sampling.temperature>0.0f) {
+            std::mt19937_64 rng(sampling.seed);
+            while(produced<count) {
+                uint32_t token;
+                {
+                    auto gpu=lease_now();
+                    token=engine.sample_from_logits(sampling,rng);
+                }
+                if(token==eos_id) { cause=q27::MetalEngine::StopCause::Eos; break; }
+                if(!deliver(token)) break;
+                if(produced==count) break;
+                auto gpu=lease_now();
+                engine.step(token);
             }
+        } else if(mtp && engine.chunked_prefill()) {
+            uint32_t live_width=std::min(mtp_width,4u);
+            std::vector<uint32_t> committed;
             bool stopped=false;
-            std::string safe=stopbuf.feed(ugate.feed(tokenizer.decode_one((int)token)),stopped);
-            if(!emit(safe)) { client_gone=true; return false; }
-            if(stopped) { stop_hit=true; return false; }
-            return true;
-        };
-        q27::MetalEngine::StopCause cause=q27::MetalEngine::StopCause::MaxTokens;
-        uint32_t produced = sampling.temperature>0.0f
-            ? engine.stream_sampled_from_logits(count,eos_id,sampling,sink,cause)
-            : engine.stream_from_pending(pending,count,eos_id,mtp?mtp_width:0,sink,cause);
+            while(!stopped && produced<count) {
+                if(produced+1==count) {
+                    if(pending!=eos_id) deliver(pending);
+                    else cause=q27::MetalEngine::StopCause::Eos;
+                    break;
+                }
+                committed.clear();
+                {
+                    auto gpu=lease_now();
+                    pending=engine.mtp_round(pending,count-produced,eos_id,mtp_width,
+                                             live_width,committed);
+                }
+                for(uint32_t token:committed) {
+                    if(token==eos_id) { cause=q27::MetalEngine::StopCause::Eos; stopped=true; break; }
+                    if(!deliver(token)) { stopped=true; break; }
+                }
+            }
+        } else {
+            // Serial greedy walk (also the constrained-decode path): emit the
+            // pending token, then each step yields the next. The constraint
+            // ops for the token just emitted run under the same lease as the
+            // step they mask, exactly as the old in-sink sequencing did.
+            uint32_t cur=pending;
+            while(produced<count) {
+                if(cur==eos_id) { cause=q27::MetalEngine::StopCause::Eos; break; }
+                if(!deliver(cur)) break;
+                if(produced==count) break;
+                auto gpu=lease_now();
+                if(tc.enabled) {
+                    const int tid=(int)cur;
+                    tc.scan_round(&tid,1);
+                    tc.on_id(tid);
+                    // Restage the ADVANCED grammar state's mask (codex P1):
+                    // on_id moves tc.tg but stages nothing, so without this
+                    // every step after the first constrained token decodes
+                    // under the previous state's legal set.
+                    if(tc.active) tc.apply(tc.tg);
+                }
+                cur=engine.step(cur);
+            }
+        }
         // Flush the boundary gates: a dangling multi-byte tail becomes U+FFFD,
         // and any text held back as a possible stop-sequence prefix is real
         // output once the stream ends without matching.
@@ -266,6 +509,8 @@ struct Runtime {
         out.prompt_tokens=(uint32_t)prompt.size();
         out.output_tokens=produced;
         out.prefix_hit=hit;
+        out.gate_wait_ms=std::max(gate_wait_ms,0.0);
+        out.arrival=arrival;
         if(client_gone) out.finish=Finish::Cancelled;
         else if(stop_hit) {
             out.finish=Finish::StopSequence;
@@ -320,12 +565,13 @@ void json_response(httplib::Response& response,const json& value,int status=200)
 
 int main(int argc,char** argv) {
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools]\n",argv[0]);
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N]\n",argv[0]);
         return 1;
     }
     try {
         std::string model=argv[1],tok=argv[2],host="127.0.0.1";
-        uint32_t port=8080,context=8192,width=0,prefix_entries=1; bool turbo3=false; bool constrain_tools=false;
+        uint32_t port=8080,context=8192,width=0,prefix_entries=1,slot_count=2;
+        bool turbo3=false; bool constrain_tools=false;
         for(int i=3;i<argc;i++) {
             std::string arg=argv[i];
             if(arg=="--host" && i+1<argc) host=argv[++i];
@@ -333,6 +579,7 @@ int main(int argc,char** argv) {
             else if(arg=="--ctx" && i+1<argc) context=parse_u32(argv[++i],"--ctx");
             else if(arg=="--mtp" && i+1<argc) width=parse_u32(argv[++i],"--mtp");
             else if(arg=="--prefix-entries" && i+1<argc) prefix_entries=parse_u32(argv[++i],"--prefix-entries");
+            else if(arg=="--slots" && i+1<argc) slot_count=parse_u32(argv[++i],"--slots");
             else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
             else if(arg=="--constrain-tools") constrain_tools=true;
             else throw std::runtime_error("unknown/incomplete argument: "+arg);
@@ -340,9 +587,22 @@ int main(int argc,char** argv) {
         if(port>65535) throw std::runtime_error("port out of range");
         if(width && (width<2 || width>12)) throw std::runtime_error("MTP width must be 2..12");
         if(constrain_tools && width) throw std::runtime_error("--constrain-tools requires serial decode; drop --mtp (verify-lane masks are not wired on Metal)");
-        Runtime runtime(model,tok,context,turbo3,width,prefix_entries,constrain_tools);
+        if(slot_count<1 || slot_count>4) throw std::runtime_error("--slots must be 1..4");
+        Runtime runtime(model,tok,context,turbo3,width,prefix_entries,constrain_tools,slot_count);
         httplib::Server server;
         server.Get("/health",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"}});});
+        // Gate-wait honesty (Phase 1 contract): per-arrival-phase wait stats.
+        server.Get("/stats",[&runtime](const httplib::Request&,httplib::Response& r){
+            json buckets=json::object();
+            {
+                std::lock_guard<std::mutex> lk(runtime.route_);
+                for(const auto& [phase,ws]:runtime.wait_stats)
+                    buckets[phase]={{"requests",ws.n},
+                                    {"mean_gate_wait_ms",ws.n?ws.sum_ms/ws.n:0.0},
+                                    {"max_gate_wait_ms",ws.max_ms}};
+            }
+            json_response(r,{{"slots",runtime.slots.size()},{"gate_wait_by_arrival",buckets}});
+        });
         server.Get("/v1/models",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"object","list"},{"data",json::array({{{"id","q27-metal"},{"object","model"}}})}});});
 
         auto guarded=[&](auto handler) {
@@ -552,7 +812,8 @@ int main(int argc,char** argv) {
                 });
         }));
 
-        fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u)\n",host.c_str(),port,context,turbo3?"turbo3":"fp16",width);
+        fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u, slots=%zu)\n",
+                host.c_str(),port,context,turbo3?"turbo3":"fp16",width,runtime.slots.size());
         if(!server.listen(host.c_str(),(int)port)) throw std::runtime_error("server listen failed");
         return 0;
     } catch(const std::exception& e) { fprintf(stderr,"%s\n",e.what()); return 1; }
