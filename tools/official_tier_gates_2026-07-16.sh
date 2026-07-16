@@ -57,10 +57,21 @@ done
 ./build/q27-metal-server "$M" "$T" --ctx 4096 --port 8121 > "$LOG/server.log" 2>&1 &
 SRV=$!
 i=0; until curl -s -o /dev/null http://127.0.0.1:8121/health; do
-  i=$((i+1)); [ $i -gt 120 ] && break; sleep 2; done
-req() { curl -s http://127.0.0.1:8121/v1/chat/completions -H 'Content-Type: application/json' \
+  i=$((i+1))
+  if [ $i -gt 120 ]; then
+    echo "EOS RERUN: SERVER NEVER HEALTHY (gate NOT run)" > "$LOG/eos_gate.verdict"
+    kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; exit 1
+  fi
+  sleep 2; done
+req() { curl -sf http://127.0.0.1:8121/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Reply with exactly the word done and nothing else."}],"temperature":0,"top_k":1,"max_tokens":512}'; }
-req > "$LOG/eos1.json"; req > "$LOG/eos2.json"
+# Empty/failed responses would cmp as identical — the vacuous-empty class.
+# Require curl success AND nonempty bodies before any comparison (codex P2).
+if ! req > "$LOG/eos1.json" || ! req > "$LOG/eos2.json" \
+   || ! [ -s "$LOG/eos1.json" ] || ! [ -s "$LOG/eos2.json" ]; then
+  echo "EOS RERUN: REQUEST FAILED OR EMPTY (gate NOT run)" > "$LOG/eos_gate.verdict"
+  kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; exit 1
+fi
 curl -s http://127.0.0.1:8121/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Name the capital of France, one word."}],"temperature":0,"top_k":1,"max_tokens":64}' > "$LOG/post_eos.json"
 if cmp -s "$LOG/eos1.json" "$LOG/eos2.json"; then echo "EOS RERUN: identical" > "$LOG/eos_gate.verdict"
