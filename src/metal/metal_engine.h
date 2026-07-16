@@ -125,6 +125,16 @@ class MetalEngine {
     // is sample_from_logits + step under one GPU lease. The RNG belongs to
     // the request, not the engine, so interleaved slots stay reproducible.
     uint32_t sample_from_logits(const SamplingParams& params, std::mt19937_64& rng);
+    // Gate 0 oracle round (sibling-drafter-probe doc): one batched verify
+    // round with the draft stage removed — `lanes` are caller-supplied
+    // reference tokens (lanes[0] = pending), commit is teacher-forced to all
+    // `live` lanes so verifier economics are measured at perfect acceptance
+    // (D=0) with no drafter in the loop. Works on artifacts without an MTP
+    // layer. Writes the per-lane argmax verdicts to `predictions[live]`
+    // (observational agreement only — never acted on). `last` marks the
+    // final round of a generation: the final token is committed but never
+    // encoded, exactly like mtp_round/serial semantics.
+    void oracle_round(const uint32_t* lanes, uint32_t live, bool last, uint32_t* predictions);
 
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
