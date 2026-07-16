@@ -1,0 +1,84 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index fc4b8f8..498dc40 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -907,6 +907,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
+     std::vector<int32_t> i_batch_beg;
+     std::vector<int32_t> i_batch_end;
+ 
++    // q27 fixture dump (LLAMA_DSPARK_DUMP=<dir>): per-round real-run fixtures
++    // in test-dspark-forward's --tier2 ref.bin layout (ctx rows staged THIS
++    // round, incremental semantics) + one extension block: the post-markov
++    // sampled proposal ids. Instrumentation only; no behavior change.
++    const char * dump_dir = std::getenv("LLAMA_DSPARK_DUMP");
++    int          dump_round = 0;
++
+     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq)
+         , params(params.draft)
+@@ -1227,6 +1234,15 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
+             }
+             n_cache[seq_id] = start;
+ 
++            // q27 fixture dump: stash this round's staged rows before they are
++            // cleared (the logits/proposals half is written after the resample).
++            std::vector<float>   dump_feat;
++            std::vector<int32_t> dump_pos;
++            if (dump_dir) {
++                dump_feat = feat;
++                dump_pos.assign(pos.begin(), pos.end());
++            }
++
+             feat.clear();
+             pos.clear();
+             rows_since_accept[seq_id] = 0; // this round's rows were just consumed
+@@ -1389,6 +1405,37 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
+                 prev_token = best_id; // chain the SAMPLED token, never mask_token_id
+             }
+ 
++            if (dump_dir) {
++                // tier-2 ref.bin layout + extension: sampled proposal ids.
++                // logits_base is still the block's dense buffer (no decode has
++                // run since); draft input ids are anchor + (block_size-1) masks.
++                char path[1024];
++                snprintf(path, sizeof(path), "%s/round-%04d-seq%d.bin", dump_dir, dump_round++, (int) seq_id);
++                if (FILE * df = fopen(path, "wb")) {
++                    const int32_t hdr[4] = { (int32_t) dump_pos.size(), (int32_t) n_embd_cap,
++                                             (int32_t) block_size, (int32_t) n_vocab };
++                    fwrite(hdr, sizeof(int32_t), 4, df);
++                    fwrite(dump_pos.data(), sizeof(int32_t), dump_pos.size(), df);
++                    fwrite(dump_feat.data(), sizeof(float), dump_feat.size(), df);
++                    std::vector<int32_t> din((size_t) block_size, (int32_t) mask_token_id);
++                    din[0] = (int32_t) dp.id_last;
++                    fwrite(din.data(), sizeof(int32_t), din.size(), df);
++                    std::vector<int32_t> dpos((size_t) block_size);
++                    for (int32_t k = 0; k < block_size; ++k) dpos[(size_t) k] = (int32_t) (start + k);
++                    fwrite(dpos.data(), sizeof(int32_t), dpos.size(), df);
++                    fwrite(logits_base, sizeof(float), (size_t) block_size * (size_t) n_vocab, df);
++                    // extension block: post-markov sampled proposals (may be
++                    // shorter than block_size only on the n_min continue below,
++                    // which never reaches here with defaults)
++                    const int32_t n_prop = (int32_t) result.size();
++                    fwrite(&n_prop, sizeof(int32_t), 1, df);
++                    fwrite(result.data(), sizeof(llama_token), result.size(), df);
++                    fclose(df);
++                } else {
++                    LOG_ERR("%s: LLAMA_DSPARK_DUMP: failed to open %s\n", __func__, path);
++                }
++            }
++
+             if (result.size() < (size_t) params.n_min) {
+                 continue; // dp.result stays empty: treated as a failed draft this round
+             }
+diff --git a/ggml/src/gguf.cpp b/ggml/src/gguf.cpp
+index 5e19861..0387449 100644
+--- a/ggml/src/gguf.cpp
++++ b/ggml/src/gguf.cpp
+@@ -8,6 +8,7 @@
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cerrno>
+ #include <cstring>
+ #include <map>
+ #include <new>

@@ -1,0 +1,17 @@
+dspark target_layers (5): 1 16 31 46 61
+dspark meta: n_embd=5120 n_vocab=248320 n_capture=5 n_embd_cap=25600 block_size=4 mask_token_id=248319 markov_rank=256
+loaded 1 prompts from fixture-prompt.jsonl, chat-templated
+draft length per round: n_max=4 (block_size=4)
+[ 0][eval-jsonl] n_predicted=35   rounds=7    drafted=28    accepted=28    accept=1.000 tau=5.000 ar_tok_s=3.72 sp_tok_s=4.17 speedup=1.123
+
+=== per-category ===
+eval-jsonl: rounds=7     drafted=28     accepted=28     accept=1.0000 tau=5.0000
+
+=== accept-by-depth (conditional: given position i was reached) ===
+depth  reached   accepted  accept_i
+1      7         7         1.0000
+2      7         7         1.0000
+3      7         7         1.0000
+4      7         7         1.0000
+
+=== OVERALL: prompts=1 n_predicted=35 rounds=7 drafted=28 accepted=28 accept=1.0000 tau=5.0000 ar_tok_s=3.72 sp_tok_s=4.17 speedup=1.123 ===
