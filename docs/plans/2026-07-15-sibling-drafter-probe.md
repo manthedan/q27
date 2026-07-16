@@ -60,6 +60,18 @@ runs serialized with any other GPU work).
    decision should never be made with their H100 table alone. If the flag
    or pack cannot be found in an hour, record that and move on.
 
+## Gate 0 (added 2026-07-15, expert review): oracle verifier test, our engine
+
+Before weighing ANY drafter, measure whether verification can pay at all on
+this hardware: feed the target's own known future tokens as free proposals
+(D=0, perfect acceptance) through our batched verify and record
+S(w) = A·G / (V(w)+O(w)) and the raw V(w)/G curve at w={1,2,4,8,12,16}.
+Oracle <1.05× → verifier economics structurally dead; close the question
+for all drafters. 1.1–1.25× → insufficient headroom for a sibling. >1.25×
+→ proceed to the stack probe below. Note: V(w)/G ties this to the
+wide-chunks GEMM work — no final call on speculation until macro-panel GEMM
+and resident-greedy land (see expert-review-integration).
+
 ## Decision gates (write results here; honor them)
 
 - **Acceptance ≥ ~0.75 per step AND net ≥ +25% tok/s in their stack** →
