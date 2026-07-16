@@ -2394,6 +2394,185 @@ kernel void q27_attention_gqa_merge_rows(device const float *partials [[buffer(0
         out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = acc[i] * inv;
 }
 
+// ---- Phase-0 probes: cache-block scheduling R1/R1b candidates ----
+// (docs/plans/2026-07-15-cache-block-scheduling.md). Bench-only — dispatched
+// by build/metal_attn_bench through dedicated backend entry points, never
+// engine-routed. They graduate to production (with store-side and snapshot
+// plumbing) only if the Phase-0 gates pass; otherwise they are removed.
+
+// R1 probe: head-major turbo3 KV layout. Identical math and staging order to
+// q27_attention_turbo3_gqa — only the cache addressing changes. Rows of one
+// KV head are contiguous ((kvh * seq_cap + pos) * 100 bytes), so a
+// (kvh, blk) threadgroup streams one ~102 KB run instead of 100 B picks at
+// 400 B stride. Output must be bit-identical to the interleaved kernel on
+// relaid-out data (the bench memcmps before timing).
+struct AttentionGqaHmArgs {
+    uint q_stride; uint seq_len; uint seq_cap; uint q_heads; uint kv_heads;
+    uint head_dim; uint block; uint n_blocks; float scale;
+};
+
+kernel void q27_attention_turbo3_gqa_hm(device const float *q [[buffer(0)]],
+                                         device const uchar *kc [[buffer(1)]],
+                                         device const uchar *vc [[buffer(2)]],
+                                         device float *partials [[buffer(3)]],
+                                         constant AttentionGqaHmArgs &args [[buffer(4)]],
+                                         uint2 group [[threadgroup_position_in_grid]],
+                                         ushort lane [[thread_index_in_simdgroup]],
+                                         ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint kvh = group.x, blk = group.y;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || blk >= args.n_blocks || sg >= gqa) return;
+    const uint p0 = blk * args.block;
+    const uint p1 = min(p0 + args.block, args.seq_len);
+    const uint qh = kvh * gqa + sg;
+    device const float *qh_ptr = q + (ulong)qh * args.q_stride;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+
+    threadgroup float Kt[8][256], Vt[8][256];
+    float acc[8];
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    device const uchar *khead = kc + (ulong)kvh * args.seq_cap * 100;
+    device const uchar *vhead = vc + (ulong)kvh * args.seq_cap * 100;
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * 256; idx += threads) {
+            const uint r = idx >> 8, d = idx & 255;
+            device const uchar *kb = khead + (ulong)(t0 + r) * 100;
+            device const uchar *vb = vhead + (ulong)(t0 + r) * 100;
+            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            float partial = 0.0f;
+            for (uint d = lane; d < 256; d += 32) partial += qh_ptr[d] * Kt[r][d];
+            const float score = simd_sum(partial) * args.scale;
+            const float m_new = max(m, score);
+            const float correction = exp(m - m_new);
+            const float weight = exp(score - m_new);
+            l = l * correction + weight;
+            for (uint d = lane, i = 0; d < 256; d += 32, i++)
+                acc[i] = acc[i] * correction + weight * Vt[r][d];
+            m = m_new;
+        }
+    }
+    device float *ph = partials + ((ulong)qh * args.n_blocks + blk) * 258;
+    if (lane == 0) { ph[0] = m; ph[1] = l; }
+    for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[i];
+}
+
+// R1b probe: token-tiled causal GQA. TF chunk tokens share one (kvh, blk)
+// threadgroup: each staged 8-row tile is dequantized once and every resident
+// token's per-simdgroup online softmax walks it in token order — the KV
+// device stream and dequant ALU divide by TF while each token's arithmetic
+// sequence is unchanged, so per-token output is bit-identical to
+// q27_attention_turbo3_causal_gqa (the bench memcmps before timing).
+// Causality: position rows at or past a token's visible sequence are skipped
+// per token; only the tile containing a token's own boundary diverges across
+// the TF tokens. Partials land at the same per-token slots, so the existing
+// merge kernel is reused unchanged.
+template <uint TF>
+inline void turbo3_causal_gqa_tiled_body(device const float *q,
+                                          device const uchar *kc,
+                                          device const uchar *vc,
+                                          device float *partials,
+                                          constant AttentionGqaCausalArgs &args,
+                                          uint3 group, ushort lane, ushort sg,
+                                          threadgroup float (*Kt)[256],
+                                          threadgroup float (*Vt)[256]) {
+    const uint kvh = group.x, blk = group.y, tile0 = group.z * TF;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
+    const uint live = min(TF, args.tokens - tile0);
+    const uint p0 = blk * args.block;
+    const uint seq_last = args.base_len + tile0 + live - 1;   // deepest token's visible length
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
+    const uint qh = kvh * gqa + sg;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+    device const float *qp[TF];
+    for (uint f = 0; f < TF; f++)
+        qp[f] = q + (ulong)(tile0 + min(f, live - 1)) * args.q_row_stride + (ulong)qh * args.q_stride;
+
+    float acc[TF][8];
+    float m[TF], l[TF];
+    for (uint f = 0; f < TF; f++) {
+        m[f] = -INFINITY; l[f] = 0.0f;
+        for (uint i = 0; i < 8; i++) acc[f][i] = 0.0f;
+    }
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * 256; idx += threads) {
+            const uint r = idx >> 8, d = idx & 255;
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            const uint pos = t0 + r;
+            float partial[TF];
+            for (uint f = 0; f < TF; f++) partial[f] = 0.0f;
+            for (uint d = lane; d < 256; d += 32) {
+                const float k = Kt[r][d];
+                for (uint f = 0; f < TF; f++) partial[f] += qp[f][d] * k;
+            }
+            float corr[TF], w[TF];
+            bool vis[TF];
+            for (uint f = 0; f < TF; f++) {
+                vis[f] = f < live && pos < args.base_len + tile0 + f;
+                corr[f] = 1.0f; w[f] = 0.0f;
+                if (vis[f]) {
+                    const float score = simd_sum(partial[f]) * args.scale;
+                    const float m_new = max(m[f], score);
+                    corr[f] = exp(m[f] - m_new);            // first iteration: exp(-inf) = 0
+                    w[f] = exp(score - m_new);
+                    l[f] = l[f] * corr[f] + w[f];
+                    m[f] = m_new;
+                }
+            }
+            for (uint d = lane, i = 0; d < 256; d += 32, i++) {
+                const float v = Vt[r][d];
+                for (uint f = 0; f < TF; f++)
+                    if (vis[f]) acc[f][i] = acc[f][i] * corr[f] + w[f] * v;
+            }
+        }
+    }
+    for (uint f = 0; f < live; f++) {
+        if (p0 >= args.base_len + tile0 + f) continue;    // merge never reads this slot
+        device float *ph = partials +
+            (((ulong)(tile0 + f) * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+        if (lane == 0) { ph[0] = m[f]; ph[1] = l[f]; }
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[f][i];
+    }
+}
+
+kernel void q27_attention_turbo3_causal_gqa_t2(device const float *q [[buffer(0)]],
+        device const uchar *kc [[buffer(1)]], device const uchar *vc [[buffer(2)]],
+        device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Kt[8][256], Vt[8][256];
+    turbo3_causal_gqa_tiled_body<2>(q, kc, vc, partials, args, group, lane, sg, Kt, Vt);
+}
+
+kernel void q27_attention_turbo3_causal_gqa_t4(device const float *q [[buffer(0)]],
+        device const uchar *kc [[buffer(1)]], device const uchar *vc [[buffer(2)]],
+        device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Kt[8][256], Vt[8][256];
+    turbo3_causal_gqa_tiled_body<4>(q, kc, vc, partials, args, group, lane, sg, Kt, Vt);
+}
+
 // Top-k candidate extraction for GPU-assisted sampling: a 16-bit radix
 // select finds a threshold whose over-set contains the true top-k, then
 // compacts (value, index) pairs so the host reads ~k candidates instead of

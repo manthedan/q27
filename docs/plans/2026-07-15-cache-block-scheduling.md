@@ -228,12 +228,68 @@ model load at a time, `caffeinate -dims` on every long run.
   waste to reclaim.
 - CUDA parity for any of this (Metal-first, as with the tier work).
 
+## Phase 0 results (2026-07-15 night, mac-mini)
+
+`build/metal_attn_bench` (synthetic caches, SLC defeated by cycling ≥256 MiB
+of cache copies, probes memcmp'd bit-identical against the production GQA
+kernels before timing; threshold forced to 1 so all depths route GQA):
+
+| seq | decode gqa | decode hm | chunk12 gqa | chunk12 t2 | chunk12 t4 |
+|---|---:|---:|---:|---:|---:|
+| 4K   | 1.72 ms (1.9 GB/s) | 0.98× | 9.10 ms  | 1.75× | 1.13× |
+| 8K   | 2.31 ms (2.8)      | 1.00× | 17.29 ms | 1.89× | 1.32× |
+| 32K  | 6.44 ms (4.1)      | 1.00× | 66.54 ms | 2.01× | 1.44× |
+| 128K | 23.38 ms (4.5)     | 1.01× | 263.4 ms | 2.06× | 1.51× |
+
+fp16 at 32K: decode 6.75 ms, chunk12 67.6 ms — **the same wall as turbo3
+while streaming 5.12× the bytes.**
+
+**Verdicts:**
+
+- **R1 (head-major layout): PARKED.** 1.00× at every depth including 128K
+  fully-DRAM streams. The granule/stride hypothesis behind the 35 GB/s
+  figure is refuted — the interleaved layout costs nothing, because the
+  kernels are nowhere near the stream bound (risk #1 below fired).
+- **The kernels are latency/occupancy-bound, not bandwidth-bound.** Turbo3
+  logical bandwidth plateaus at 4.5–4.8 GB/s; fp16 pays no wall for 5× the
+  bytes; back-of-envelope ALU is ~6% of the M4's issue rate. The suspect
+  is residency: Kt+Vt tiles are 16 KB of threadgroup memory → 2
+  threadgroups/core, ~120 resident simdgroups machine-wide, against a
+  barrier-stage-barrier + 8-serial-rows structure (simd_sum + 2 exp
+  dependency chains per row) that thin occupancy cannot hide.
+- **Cost-model correction (the important number):** chunk attention at
+  depth is ~10× this plan's estimate. At mean-8K depth the chunk kernel
+  costs 17.3 ms/dispatch → 23 ms/token across 16 layers — 38% of the 16K
+  NLL's measured 60.5 ms/token, which now adds up (weights ~27, GDN/other
+  ~10). The "3.0 ms/token at mean-8K" derivation assumed byte-bound
+  kernels; the 15.2 ms legacy-vs-GQA delta was an occupancy delta, not 5
+  stream-units. R1b's prize is correspondingly ~10× larger than the table
+  above suggested: ~−19% total NLL wall at 16K, more at 32K.
+- **R1b (token-tiled causal): PROCEED at factor 2.** 1.89× / 2.01× / 2.06×
+  at 8K/32K/128K — meets its ≥2× gate at 32K+. Factor 4 is strictly worse
+  (1.32–1.51×; register pressure eats the staging amortization) and is
+  rejected. The t2 probe kernel is bit-identical per token by construction
+  and by memcmp, so graduation keeps the chunk↔decode parity contract.
+- **Shallow-decode occupancy (missing item 2):** confirmed poor (1.9 GB/s
+  at 4K vs 4.5 at 128K) but per the table above sub-32K decode remains
+  ≤13% of T2 token time — still not worth an adaptive block size.
+- **R2 candidate surfaced (not in the original plan):** halve the
+  threadgroup-memory footprint to double residency — stage K, score all 8
+  rows, restage V over the same 8 KB, apply. Preserves per-token arithmetic
+  order exactly (bit-parity survives). Second candidate: raise
+  tokens-per-stage beyond 2 without more registers. Both are post-R1b
+  measurements; the ceiling here is large (fp16 parity says ~5× headroom
+  before bytes matter even for fp16).
+
 ## Risks
 
 - The 35 GB/s attribution is derived, not measured per-dispatch; if Phase 0
   shows the GQA kernels already near the stream bound (i.e. the 16K delta
   was occupancy or dequant ALU), R1's prize shrinks toward zero — that is
   exactly what Phase 0 exists to find out before ~10 kernels get touched.
+  **[Fired, in the opposite direction: the kernels are so far from the
+  stream bound that the layout is irrelevant and the tiling prize is ~10×
+  the estimate. R1 parked, R1b proceeds, see Phase 0 results.]**
 - R1 touches every turbo3 KV reader including the legacy sub-threshold
   kernels; a missed reader decodes garbage that only artifact gates catch —
   the parity suite must cover both sides of the threshold and the straddle

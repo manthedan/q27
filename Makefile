@@ -67,6 +67,11 @@ build/metal_prefill_bench: tools/metal_prefill_bench.cpp src/metal/metal_backend
 	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal tools/metal_prefill_bench.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp \
 	        -framework Foundation -framework Metal -o $@
+build/metal_attn_bench: tools/metal_attn_bench.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
+                        src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal tools/metal_attn_bench.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp \
+	        -framework Foundation -framework Metal -o $@
 
 else
 test-metal:
