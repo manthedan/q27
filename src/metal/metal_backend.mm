@@ -230,6 +230,12 @@ struct MetalBackend::Impl {
     // Q27_METAL_GQA_TILE: causal token-tile factor, 1 (untiled A/B lever)
     // or 2 (default; docs/plans/2026-07-15-cache-block-scheduling.md R1b).
     uint32_t gqa_tile = 2;
+    // Q27_METAL_GQA_BLOCK: positions per (kvh, block) threadgroup. Default
+    // 1024; smaller blocks trade merge work for threadgroup count — the
+    // occupancy lever the latency-bound Phase-0 finding points at. Changing
+    // it changes the merge fold order (margin-aware-gates contract class),
+    // and chunk↔decode parity holds at any single value.
+    uint32_t gqa_block = 1024;
     id<MTLComputePipelineState> topk_logits_p;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
@@ -255,7 +261,7 @@ struct MetalBackend::Impl {
                                 const MetalBuffer& kc, const MetalBuffer& vc,
                                 MetalBuffer& output, uint32_t seq_len, uint32_t q_heads,
                                 uint32_t kv_heads, uint32_t head_dim, float scale) {
-        const uint32_t block = 1024;
+        const uint32_t block = gqa_block;
         const uint32_t n_blocks = 1 + (seq_len - 1) / block;   // seq_len >= 1 host-checked
         const uint32_t gqa = q_heads / kv_heads;
         const uint64_t partial_bytes = (uint64_t)q_heads * n_blocks * 258 * 4;
@@ -295,7 +301,7 @@ struct MetalBackend::Impl {
                                        uint32_t base_len, uint32_t q_heads, uint32_t kv_heads,
                                        uint32_t head_dim, uint32_t tokens, float scale,
                                        uint64_t q_byte_offset, uint64_t out_byte_offset) {
-        const uint32_t block = 1024;
+        const uint32_t block = gqa_block;
         const uint32_t max_seq = base_len + tokens - 1;     // overflow host-checked
         const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
         const uint32_t gqa = q_heads / kv_heads;
@@ -571,6 +577,14 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             if (tile != 1 && tile != 2)
                 throw std::runtime_error("q27 Metal: Q27_METAL_GQA_TILE must be 1 or 2");
             impl_->gqa_tile = (uint32_t)tile;
+        }
+        if (const char* env = getenv("Q27_METAL_GQA_BLOCK"); env && *env) {
+            const unsigned long block = strtoul(env, nullptr, 10);
+            // Power of two in [128, 4096]: kernels stage 8-row tiles, and the
+            // straddle split assumes the threshold is block-aligned-agnostic.
+            if (block < 128 || block > 4096 || (block & (block - 1)))
+                throw std::runtime_error("q27 Metal: Q27_METAL_GQA_BLOCK must be a power of two in [128, 4096]");
+            impl_->gqa_block = (uint32_t)block;
         }
         impl_->topk_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_topk_logits");
         if (const char* env = getenv("Q27_METAL_GQA_THRESHOLD"); env && *env)
@@ -1388,7 +1402,7 @@ void MetalBackend::attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32
     check_range(kc.size(), 0, cache_bytes, "hm probe K cache");
     check_range(vc.size(), 0, cache_bytes, "hm probe V cache");
     check_range(output.size(), 0, (uint64_t)q_heads * head_dim * 4, "hm probe output");
-    const uint32_t block = 1024;
+    const uint32_t block = impl_->gqa_block;
     const uint32_t n_blocks = 1 + (seq_len - 1) / block;
     const uint64_t partial_bytes = (uint64_t)q_heads * n_blocks * 258 * 4;
     if (!impl_->gqa_partials || impl_->gqa_partials.length < partial_bytes)
@@ -1443,7 +1457,7 @@ void MetalBackend::attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uin
     check_range(kc.size(), 0, cache_bytes, "tiled probe K cache");
     check_range(vc.size(), 0, cache_bytes, "tiled probe V cache");
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "tiled probe output");
-    const uint32_t block = 1024;
+    const uint32_t block = impl_->gqa_block;
     const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
     const uint64_t partial_bytes = (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
     if (!impl_->gqa_partials || impl_->gqa_partials.length < partial_bytes)
