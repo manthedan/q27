@@ -670,6 +670,81 @@ int test_attention_gqa_straddle() {
     return failures;
 }
 
+// R1b tiled-route parity: the factor-2 token-tiled causal GQA kernels must
+// be bit-identical to the untiled kernels for every token. Two backends
+// (tile 2 vs Q27_METAL_GQA_TILE=1) attend over the same cache bytes; odd
+// token counts put a single live token in the last tile, and base 1020
+// puts the tile's staged range across a 1024-block boundary.
+int test_attention_gqa_tiled_parity() {
+    setenv("Q27_METAL_GQA_THRESHOLD", "1", 1);
+    q27::MetalBackend tiled;
+    setenv("Q27_METAL_GQA_TILE", "1", 1);
+    q27::MetalBackend untiled;
+    unsetenv("Q27_METAL_GQA_TILE");
+    unsetenv("Q27_METAL_GQA_THRESHOLD");
+    int failures = 0;
+    uint32_t lcg = 112358;
+    auto uniform = [&]() { lcg = lcg * 1664525u + 1013904223u; return (float)(lcg >> 8) / 8388608.0f - 1.0f; };
+    constexpr uint32_t qh = 24, kvh = 4, dim = 256, stride = 2 * dim;
+    const uint32_t q_row_stride = qh * stride;
+    const float scale = 1.0f / 16.0f;
+
+    struct Case { uint32_t base, tokens; };
+    for (const Case c : {Case{1020, 7}, Case{2040, 12}, Case{130, 1}}) {
+        const uint32_t max_seq = c.base + c.tokens - 1;
+        std::vector<float> q((uint64_t)c.tokens * q_row_stride);
+        for (auto& value : q) value = uniform() * 1.5f;
+        for (const bool turbo3 : {false, true}) {
+            const uint64_t row_bytes = turbo3 ? (uint64_t)kvh * 2 * 50
+                                              : (uint64_t)kvh * dim * 2;
+            // Build the cache once (on the tiled backend's store kernels),
+            // then attend over the same bytes on both backends.
+            auto kc_t = tiled.allocate(max_seq * row_bytes);
+            auto vc_t = tiled.allocate(max_seq * row_bytes);
+            for (uint32_t p = 0; p < max_seq; p++) {
+                std::vector<float> k(kvh * dim), v(kvh * dim);
+                const float magnitude = (p % 3 == 0) ? 2.5f : 0.4f;
+                for (auto& value : k) value = uniform() * magnitude;
+                for (auto& value : v) value = uniform() * 3.0f;
+                auto kb = upload_buffer(tiled, k), vb = upload_buffer(tiled, v);
+                tiled.begin_commands();
+                if (turbo3) tiled.kv_store_turbo3(*kb, *vb, *kc_t, *vc_t, p, kvh);
+                else tiled.kv_store_f16(*kb, *vb, *kc_t, *vc_t, p, kvh * dim);
+                tiled.end_commands();
+            }
+            std::vector<uint8_t> kbytes(max_seq * row_bytes), vbytes(max_seq * row_bytes);
+            tiled.read(*kc_t, 0, kbytes.data(), kbytes.size());
+            tiled.read(*vc_t, 0, vbytes.data(), vbytes.size());
+            auto kc_u = untiled.allocate(kbytes.size()); untiled.write(*kc_u, 0, kbytes.data(), kbytes.size());
+            auto vc_u = untiled.allocate(vbytes.size()); untiled.write(*vc_u, 0, vbytes.data(), vbytes.size());
+
+            auto run = [&](q27::MetalBackend& backend, q27::BackendBuffer& kcache,
+                           q27::BackendBuffer& vcache) {
+                auto qb = upload_buffer(backend, q);
+                auto out = backend.allocate((uint64_t)c.tokens * qh * dim * 4);
+                backend.begin_commands();
+                if (turbo3) backend.attention_turbo3_causal(*qb, stride, q_row_stride, kcache, vcache,
+                                                            *out, c.base, qh, kvh, dim, c.tokens, scale);
+                else backend.attention_f16_causal(*qb, stride, q_row_stride, kcache, vcache,
+                                                  *out, c.base, qh, kvh, dim, c.tokens, scale);
+                backend.end_commands();
+                return read_f32(backend, *out, (uint64_t)c.tokens * qh * dim);
+            };
+            const auto got_tiled = run(tiled, *kc_t, *vc_t);
+            const auto got_untiled = run(untiled, *kc_u, *vc_u);
+            if (std::memcmp(got_tiled.data(), got_untiled.data(),
+                            got_tiled.size() * sizeof(float)) != 0) {
+                size_t i = 0;
+                while (i < got_tiled.size() && got_tiled[i] == got_untiled[i]) i++;
+                fprintf(stderr, "gqa tiled parity %s base=%u tokens=%u first diff at %zu: tiled %.9g untiled %.9g\n",
+                        turbo3 ? "turbo3" : "f16", c.base, c.tokens, i, got_tiled[i], got_untiled[i]);
+                failures++;
+            }
+        }
+    }
+    return failures;
+}
+
 // GPU top-k candidate extraction: the radix-select over-set must contain
 // the exact top-k (value desc, index asc tie-break), stay within capacity
 // on realistic logits, and signal fallback (count > capacity) on
@@ -1310,6 +1385,7 @@ int main() {
                        test_attention_production_shape(backend) +
                        test_turbo3(backend) + test_turbo3_production_shape(backend) +
                        test_attention_gqa_path() + test_attention_gqa_straddle() +
+                       test_attention_gqa_tiled_parity() +
                        test_topk(backend) + test_mask_logits(backend) +
                        test_gdn(backend) + test_chunked(backend);
         if (failures) { fprintf(stderr, "Metal ops: %d failure(s)\n", failures); return 1; }
