@@ -362,7 +362,9 @@ void MetalEngine::set_kv_attrib(uint32_t mode) {
         throw std::runtime_error("q27 Metal: KV attribution mode must be 0 (off), 1 (K), or 2 (V)");
     if (mode && turbo3_kv_)
         throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
-    if (mode && position_)
+    // Any change after rows are cached — including turning attribution off —
+    // would leave a mixed cache behind position_ (codex P2).
+    if (mode != kv_attrib_ && position_)
         throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
     kv_attrib_ = mode;
 }
