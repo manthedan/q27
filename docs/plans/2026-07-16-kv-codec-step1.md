@@ -54,7 +54,8 @@ attribution baseline for steps 2–4.
 
 ## Results (appended post-measurement, same afternoon, M4 16 GB)
 
-8,192 wikitext2 positions per arm, ctx 8192, current default route:
+8,191 wikitext2 positions per arm (`--nll-long 8192`; the KL path
+encodes n−1), ctx 8192, current default route:
 
 | arm | mean KL | p99 / p99.5 | max (nats) | runs >0.1 | runs >0.5 |
 |---|---|---|---|---|---|

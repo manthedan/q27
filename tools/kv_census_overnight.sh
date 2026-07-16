@@ -19,10 +19,24 @@ mkdir -p "$OUT"
 make "$BIN" || { echo "census: BUILD FAILED, aborting" | tee "$OUT/ABORTED"; exit 1; }
 
 # Pin the numeric route explicitly with overwrite — inherited env knobs can
-# collapse arms onto one kernel (codex P2 on eaee44b). These are today's
-# defaults; the census is defined against this route.
+# collapse arms onto one kernel (codex P2 on eaee44b) or silently change the
+# attention fold order (codex P2 on d6ebfa5). These are today's defaults;
+# the census is defined against this route.
 export Q27_METAL_GEMM_HALF=1
 export Q27_METAL_GQA_TILE=2
+export Q27_METAL_GQA_THRESHOLD=2048
+export Q27_METAL_GQA_BLOCK=1024
+
+# Run fingerprint: resuming after ANY identity change (source, artifact,
+# corpus, route pins, position count) must not mix logs from two different
+# experiments into one summary (codex P1 on d6ebfa5).
+FP="$(git rev-parse HEAD 2>/dev/null || echo nogit) $(md5 -q "$BIN") $(md5 -q "$MODEL") $(md5 -q "$CORPUS") gemm_half=$Q27_METAL_GEMM_HALF tile=$Q27_METAL_GQA_TILE thr=$Q27_METAL_GQA_THRESHOLD blk=$Q27_METAL_GQA_BLOCK nll_long=2049 ctx=2048"
+if [ -f "$OUT/fingerprint" ]; then
+    [ "$(cat "$OUT/fingerprint")" = "$FP" ] ||
+        { echo "census: fingerprint mismatch — $OUT holds a different experiment; move it aside" | tee "$OUT/ABORTED"; exit 1; }
+else
+    echo "$FP" > "$OUT/fingerprint"
+fi
 
 # Canary: the instrument must be exactly zero against itself.
 "$BIN" "$MODEL" "$TOK" --nll "$CORPUS" --nll-long 128 --ctx 256 --kl-kv-self 2>&1 |
@@ -32,8 +46,10 @@ export Q27_METAL_GQA_TILE=2
 for cell in $(seq 0 127); do
     log=$(printf "%s/cell_%03d.log" "$OUT" "$cell")
     [ -s "$log" ] && grep -q "overall mean KL" "$log" && continue  # resumable
+    # 2049 tokens => 2,048 evaluated positions (the KL path encodes n-1;
+    # codex P2 on d6ebfa5).
     caffeinate -i "$BIN" "$MODEL" "$TOK" --nll "$CORPUS" \
-        --nll-long 2048 --ctx 2048 --kl-kv-cell "$cell" > "$log" 2>&1
+        --nll-long 2049 --ctx 2048 --kl-kv-cell "$cell" > "$log" 2>&1
     grep -q "overall mean KL" "$log" ||
         { echo "census: cell $cell FAILED (see $log), aborting" | tee "$OUT/ABORTED"; exit 1; }
 done

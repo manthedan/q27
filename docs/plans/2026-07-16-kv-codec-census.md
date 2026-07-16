@@ -20,9 +20,13 @@ cells smoke nonzero-small (L3:h0:K 2.1e-4, L51:h0:V 1.7e-4 at 128 pos).
 
 ## Run plan
 
-`tools/kv_census_overnight.sh`: 128 cells × 2,048 wikitext2 positions,
-ctx 2048, one process per cell, resumable, rebuild-at-top + pinned env
-(Q27_METAL_GEMM_HALF=1, Q27_METAL_GQA_TILE=2 — the current default
+`tools/kv_census_overnight.sh`: 128 cells × 2,048 wikitext2 positions
+(2,049 tokens — the KL path encodes n−1; codex P2), ctx 2048, one
+process per cell, resumable behind a run fingerprint (HEAD + binary +
+artifact + corpus + route pins; codex P1 — a resume after any identity
+change refuses rather than mixing experiments), rebuild-at-top + all
+four route knobs pinned with overwrite (Q27_METAL_GEMM_HALF=1,
+GQA_TILE=2, GQA_THRESHOLD=2048, GQA_BLOCK=1024 — the current default
 route, same as step 1's calibration), self-check canary, fail-loud per
 cell. ~5.3 h ⇒ overnight batch per the standing rule. Output:
 logs/kv_census/census_summary.tsv (cell, layer, head, side, mean, p99,
