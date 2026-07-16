@@ -34,6 +34,15 @@ class MetalEngine {
         // second engine cannot pass the per-engine budget check while the
         // pair overcommits the device (codex review finding, 2026-07-15).
         uint64_t cache_bytes = 0;
+        // Artifact path, kept for diagnostics, plus the disk-snapshot
+        // identity: SHA1 over the WHOLE mapped artifact — the bytes this
+        // process actually opened, immune to pathname swaps — computed
+        // lazily on first snapshot use and cached (~2 s for 7 GB), never
+        // on ordinary engine startup (docs/plans/2026-07-16-prefix-
+        // snapshots.md; codex P1+P2 on 39d74a0).
+        std::string path;
+        unsigned char snap_sha1[20] = {};
+        bool snap_sha_ready = false;
         explicit Shared(Model&& opened) : model(std::move(opened)) {}
     };
     static std::shared_ptr<Shared> open_shared(const std::string& model_path);
@@ -174,6 +183,19 @@ class MetalEngine {
 
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
+    // Prefix snapshots to disk (docs/plans/2026-07-16-prefix-snapshots.md,
+    // Phase 1): the capture/restore composition streamed through host
+    // memory with plain file I/O (no mmap — ds4's lesson). save writes
+    // path.tmp then renames; load validates the whole file structure
+    // (magic, artifact identity, kv dtype, position, every blob length)
+    // before the first GPU write, so a rejected file never leaves mixed
+    // state. tokens are prefix metadata for the Phase-2 server keying.
+    void save_state(const std::string& path, const uint32_t* tokens, uint32_t token_count);
+    uint32_t load_state(const std::string& path);   // returns restored position
+    // Re-run the resident-logits argmax (same GPU kernel as prompt
+    // ingestion) so generation after load_state resumes byte-identically.
+    uint32_t pending_from_logits();
+    const unsigned char* snapshot_identity();   // 20-byte SHA1, whole mapping, cached
 
     // Constrained tool decoding (BasicToolConstrainer engine surface): an
     // append-only device pool of uint32 legal-token bitsets. mask_pool_add
