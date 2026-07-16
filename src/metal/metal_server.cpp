@@ -218,6 +218,12 @@ struct Runtime {
                 const int tid=(int)token;
                 tc.scan_round(&tid,1);
                 tc.on_id(tid);
+                // Restage the ADVANCED grammar state's mask (codex P1): on_id
+                // moves tc.tg but stages nothing, so without this every step
+                // after the first constrained token decodes under the previous
+                // state's legal set. The CUDA server does this via on_pending;
+                // the serial flow applies tg directly.
+                if(tc.active) tc.apply(tc.tg);
             }
             bool stopped=false;
             std::string safe=stopbuf.feed(ugate.feed(tokenizer.decode_one((int)token)),stopped);
