@@ -90,6 +90,45 @@ coexist on either machine, but **the one-model-load rule stays in force** —
 it exists because of a real crash; amend it only deliberately, with a
 measured pressure test, never implicitly.
 
+### Phase 0A results (2026-07-15 night, 24 GB M4 — Daniel-authorized overnight batch, `logs/overnight-20260715/`)
+
+Two sessions, ratios within-session (machine under desktop load in session
+B: T2 tg128 6.21 vs 8.59 in session A vs 8.41 recorded quiet):
+
+- **Throughput (their stack): B1 is NOT bandwidth-bound — their Q1_0
+  kernel is issue-bound on M4.** Session A: B1 tg128 `10.05 ± 0.27` vs T2
+  `8.59 ± 1.02` (**1.17×**); session B: `7.05 ± 1.01` vs `6.21 ± 0.18`
+  (1.14×). At 0.53× the bytes (3.53 vs 6.66 GiB) a bandwidth-bound kernel
+  would give ~1.9×; effective stream is ~35 GB/s vs T2's ~57 in the same
+  stack. B1 pp512 `32.64 ± 3.99` (also below T2's 52.5 — their prefill
+  pays the unpack too). **Consequence: their stack is not the B1 ceiling,
+  and the q27 Phase 0B kernel prize is larger than the in-stack numbers
+  suggest** — the whitepaper's "native low-bit kernels are future work"
+  framing is corroborated at 1.125 bpw, same lesson as our T3 kill but on
+  their side of the fence.
+- **Wikitext-2 PPL (ctx-512 × 24 chunks, identical protocol to the ternary
+  spike): `11.69 ± 0.43`** vs T2's `10.04 ± 0.36` → **B1/T2 ≈ 1.16×**, a
+  far gentler increment than the whitepaper's aggregate-retention gap
+  (89.5 vs 94.6) implied. Vs the official tier (~4.90–5.32, protocol
+  indicative): ~2.2–2.4× — comfortably inside the ≤ ~3.5× serving-tier
+  band of the provisional kill criterion.
+- **Behavioral probes: 4/4 PASS** (greedy, their llama-server; thinking
+  mode cannot be disabled on this build — 1024-token budgets truncate
+  inside the thinking phase, 6144 clears it; a footgun for any scripted
+  gate on this stack). Native tool call: correct function, exact args, no
+  leakage. JSON-only: machine-checked exact (keys/types/arity, no fences,
+  no prose). 7-constraint list: every constraint honored. Code edit
+  (planted touching-intervals case): correct fix (`s <= out[-1][1]`),
+  code only. Prompts are reconstructions of the ternary-spike categories,
+  not the identical strings (originals weren't recorded — they are now,
+  in `logs/overnight-20260715/run.sh`).
+
+**Phase 0A verdict: GO on quality.** PPL sits in the serving-tier band
+(~2.2–2.4× official, 1.16× over T2), the agentic-shaped probes are clean,
+and the increment over the already-resident T2 tier is small. The tier's
+fate now rests on Phase 0B kernel economics (below) — their issue-bound
+kernel means the in-stack 1.17× is a floor argument, not a ceiling one.
+
 ### Phase 0B — synthetic kernel economics (split adopted per expert reviews 2–3)
 
 The vendor-stack quality gates above are **Phase 0A** (make them
