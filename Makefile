@@ -57,6 +57,11 @@ build/metal_gemv_bench: tools/metal_gemv_bench.cpp src/metal/metal_backend.mm sr
 	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal tools/metal_gemv_bench.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp \
 	        -framework Foundation -framework Metal -o $@
+build/metal_mma_roofline: tools/metal_mma_roofline.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
+                        src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal tools/metal_mma_roofline.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp \
+	        -framework Foundation -framework Metal -o $@
 build/metal_decode_bench: tools/metal_decode_bench.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
                         src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal tools/metal_decode_bench.cpp \
