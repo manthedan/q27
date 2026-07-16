@@ -384,7 +384,7 @@ uint64_t MetalEngine::snapshot_bytes() const {
     return bytes;
 }
 
-uint64_t MetalEngine::fixed_state_bytes() {
+uint64_t MetalEngine::fixed_state_bytes(bool chunked) {
     const uint64_t attn_layers = N_LAYER / 4, gdn_layers = N_LAYER - attn_layers;
     // Chunked-prefill f32 rows (ch/cx1/cy, cqg, ckbuf/cvbuf, cattn_out,
     // cqkv, cz, alpha/beta_raw/g/beta, cconv_out, cdelta_out, cgated_out,
@@ -393,22 +393,26 @@ uint64_t MetalEngine::fixed_state_bytes() {
                                2ull * N_KV * HEAD_DIM + (uint64_t)N_HEAD * HEAD_DIM +
                                GDN_CH + GDN_V + 4ull * GDN_HEADS + GDN_CH + GDN_V + GDN_V +
                                2ull * N_FFN;
-    uint64_t bytes = (uint64_t)PREFILL_CHUNK_MAX * chunk_row * 4;
+    // Live GDN recurrence state (recurrent + conv ring per GDN layer) +
+    // serial-path logits + hidden/scratch rows: allocated on every device.
+    uint64_t bytes = gdn_layers * ((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3ull * GDN_CH) * 4;
+    bytes += (uint64_t)VOCAB * 4 + (uint64_t)N_EMBD * 4 * 4;
+    if (!chunked) return bytes;   // pre-Apple7: no chunk/verify/replay buffers
+    bytes += (uint64_t)PREFILL_CHUNK_MAX * chunk_row * 4;
     // Quantized activation copies (int8 values + f32 scales per 32).
     bytes += (uint64_t)PREFILL_CHUNK_MAX * (N_EMBD + GDN_V + N_FFN) * 9 / 8;
     // Verify-width surfaces (lever 2): cfinal_ + clogits_.
     bytes += (uint64_t)VERIFY_CHUNK_MAX * ((uint64_t)N_EMBD + VOCAB) * 4;
     // gdn_replay parks (qkv + g + beta per GDN layer).
     bytes += gdn_layers * (uint64_t)VERIFY_CHUNK_MAX * (GDN_CH + 2ull * GDN_HEADS) * 4;
-    // Live GDN recurrence state (recurrent + conv ring per GDN layer).
-    bytes += gdn_layers * ((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3ull * GDN_CH) * 4;
-    // Serial-path logits + hidden/scratch rows.
-    bytes += (uint64_t)VOCAB * 4 + (uint64_t)N_EMBD * 4 * 4;
+    // Verify-chunk discard state slots (one shared pair per engine).
+    bytes += ((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3ull * GDN_CH) * 4;
     return bytes;
 }
 
-uint64_t MetalEngine::gqa_partial_peak(uint32_t context) {
-    const uint64_t blocks = 1 + ((uint64_t)std::max(context, 1u) - 1) / 1024;
+uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block) {
+    const uint64_t b = std::max(block, 1u);
+    const uint64_t blocks = 1 + ((uint64_t)std::max(context, 1u) - 1) / b;
     return (uint64_t)PREFILL_CHUNK_MAX * N_HEAD * blocks * 258 * 4;
 }
 

@@ -52,8 +52,12 @@ class MetalEngine {
     bool has_mtp() const { return has_mtp_; }
     uint64_t kv_reserved_bytes() const { return engine_cache_bytes_; }
     uint64_t snapshot_bytes() const;               // worst case at max_context_
-    static uint64_t fixed_state_bytes();           // per-engine non-KV buffers
-    static uint64_t gqa_partial_peak(uint32_t context);  // backend-shared, once
+    // Per-engine non-KV buffers; the chunk/verify/replay terms exist only
+    // when chunked prefill is available (pre-Apple7 devices skip them).
+    static uint64_t fixed_state_bytes(bool chunked);
+    // Backend-shared causal-GQA partial buffer at the widest chunk, sized
+    // from the backend's EFFECTIVE block (Q27_METAL_GQA_BLOCK-aware).
+    static uint64_t gqa_partial_peak(uint32_t context, uint32_t block);
 
     void reset();
     uint32_t step(uint32_t token);

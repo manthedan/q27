@@ -2294,6 +2294,10 @@ uint64_t MetalBackend::recommended_working_set_size() const {
     return (uint64_t)impl_->device.recommendedMaxWorkingSetSize;
 }
 
+uint32_t MetalBackend::gqa_block_size() const {
+    return impl_->gqa_block;
+}
+
 uint64_t MetalBackend::max_buffer_length() const {
     return (uint64_t)impl_->device.maxBufferLength;
 }
