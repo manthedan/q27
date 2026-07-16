@@ -300,23 +300,20 @@ draw from are now smaller than their own kill lines:
   1.082] (post-byte-LUT). Of that, the char→half converts are C/Cx =
   1.022. The residual non-convert pool — LUT gathers, staging stores,
   loop/address machinery — is therefore ≤ ~5.9%, as a hard ceiling.
-- Probe 2 (function-constant K/group-size baking) removes loop bounds
-  and address arithmetic ONLY — it deletes no gather and no store. The
-  inner 8×8 loops already have literal bounds; only the outer 64-K walk
-  has a runtime bound. Its reachable slice of the ≤5.9% pool cannot
-  plausibly clear the probe's own <5% kill line, and a 100%-of-pool
-  outcome is physically excluded because the pool is dominated by the
-  gathers/stores baking keeps. PARK; reopen only if a future kernel
-  round changes the staging shape.
-- Probe 3 (16-element register-tile dequant): q27's byte-LUT unpack
-  already emits 16 staged elements per thread per slab as 4× half4
-  vector stores (the survey's own "check first — may be a no-op" case),
-  and the registers-not-threadgroup variant of this idea is the
-  direct-RHS family, measured 0.43–0.82× (parked with mechanism:
-  cooperative amortization needs Metal-4 tensors). NO-OP / already
-  parked.
-
-Net: the BaseRT survey is fully discharged on the mini side — one probe
-run and parked with numbers, two parked by measured decomposition, all
-other imports pre-answered or adopted elsewhere (KV codec, ds4 snapshot
-priority).
+- Probe 2 (function-constant K/group-size baking): a first
+  park-by-decomposition attempt was REJECTED in review (codex P2,
+  correct): loop/address overhead sits on BOTH sides of C/Beq, so that
+  ratio cannot bound specialization gains. Measured properly instead —
+  roofline arm K: the production mm_h with FC_COLS baked as a Metal
+  function constant (per-shape specialized PSO, trip counts and all
+  cols-derived address math become literals), bit-identity required vs
+  C before timing. Verdict below.
+- Probe 3 (16-element register-tile dequant): split disposition. For
+  the T2 production kernel the survey's own "may be a no-op" case
+  holds — the byte-LUT unpack already stages 16 elements per thread
+  per slab as 4× half4 vector stores. The probe's stated Q4 target
+  (`q27_matmul_q4_mm` still expands 16 nibbles to scalar stores —
+  codex file:line) is real but not on the T2 artifact's path at all;
+  Q4 chunk GEMM only becomes production-relevant if DSpark Phase 3
+  integrates the Q4_1 drafter. DEFER to the DSpark Phase-3 decision;
+  revisit with the drafter's actual shapes if it graduates.
