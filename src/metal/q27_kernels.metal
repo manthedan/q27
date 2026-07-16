@@ -1694,12 +1694,15 @@ kernel void q27_mma_roofline_b_eq(
             dst[12] = w2.y; dst[13] = w2.x; dst[14] = w2.y; dst[15] = w2.x;
         }
         {
-            const half4 x4 = *(device const half4 *)(xsrc + (c0 + xcb) / 2);
+            // Two 4-byte loads, matching C's two char4 loads per slot
+            // (codex P2: one 8-byte load would understate load-issue cost).
+            const half2 xa2 = *(device const half2 *)(xsrc + (c0 + xcb) / 2);
+            const half2 xb2 = *(device const half2 *)(xsrc + (c0 + xcb) / 2 + 2);
             threadgroup half *dst = Xt + xcb * 16 + xloc;
-            dst[0 * 16] = x4.x; dst[1 * 16] = x4.y;
-            dst[2 * 16] = x4.z; dst[3 * 16] = x4.w;
-            dst[4 * 16] = x4.w; dst[5 * 16] = x4.z;
-            dst[6 * 16] = x4.y; dst[7 * 16] = x4.x;
+            dst[0 * 16] = xa2.x; dst[1 * 16] = xa2.y;
+            dst[2 * 16] = xb2.x; dst[3 * 16] = xb2.y;
+            dst[4 * 16] = xb2.y; dst[5 * 16] = xb2.x;
+            dst[6 * 16] = xa2.y; dst[7 * 16] = xa2.x;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float wsA = float(weight_scales[wsrowA + c0 / 128]);
