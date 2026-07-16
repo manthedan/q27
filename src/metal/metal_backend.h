@@ -215,6 +215,11 @@ class MetalBackend final : public ComputeBackend {
     // Whether the blocked (partials-allocating) GQA route is reachable at
     // this context: threshold nonzero and context deep enough to route it.
     bool gqa_blocked_reachable(uint32_t context) const;
+    // Envelope-instrument hooks (docs/plans/2026-07-16-envelope-instrument.md):
+    // flip the backend-global reduction-order knobs between two engines'
+    // lockstep passes. Instrument use only — production reads the env once.
+    void set_gemm_half(bool enabled);
+    void set_gqa_threshold(uint32_t threshold);
     uint64_t max_buffer_length() const;
     uint64_t max_threadgroup_memory_length() const;
     bool supports_quantized_matmul() const;
