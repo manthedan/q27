@@ -1001,21 +1001,22 @@ kernel void q27_matmul_q4_mm(
         device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
         device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
         device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
-        uint group [[threadgroup_position_in_grid]],
+        uint2 group [[threadgroup_position_in_grid]],
         uint tid [[thread_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float Wt[32 * 64];   // [row within tile][col within K-tile]
     threadgroup float Xt[64 * 16];   // [col within K-tile][token], prescaled
     threadgroup float Sc[4 * 128];   // per-simdgroup flush scratch
-    const uint row0 = group * 32;
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
     if (row0 >= args.rows) return;
     const uint rlast = args.rows - 1;
     // Staging assignments: one weight row / 16 columns and one token /
     // 8 transposed columns per thread.
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 2);
-    const uint xtok = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + tid % 16, xcb = (tid / 16) * 8;
     const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
     const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
@@ -1082,7 +1083,7 @@ kernel void q27_matmul_q4_mm(
         acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
-    const uint tokA = lane % 8, tokB = 8 + lane % 8;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
     if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
     if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
     if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
@@ -1093,19 +1094,20 @@ kernel void q27_matmul_q8_mm(
         device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
         device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
         device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
-        uint group [[threadgroup_position_in_grid]],
+        uint2 group [[threadgroup_position_in_grid]],
         uint tid [[thread_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float Wt[32 * 64];
     threadgroup float Xt[64 * 16];
     threadgroup float Sc[4 * 128];
-    const uint row0 = group * 32;
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
     if (row0 >= args.rows) return;
     const uint rlast = args.rows - 1;
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const char *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
-    const uint xtok = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + tid % 16, xcb = (tid / 16) * 8;
     const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
     const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
@@ -1161,7 +1163,7 @@ kernel void q27_matmul_q8_mm(
         acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
-    const uint tokA = lane % 8, tokB = 8 + lane % 8;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
     if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
     if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
     if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
@@ -1176,19 +1178,20 @@ kernel void q27_matmul_t2_mm(
         device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
         device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
         device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
-        uint group [[threadgroup_position_in_grid]],
+        uint2 group [[threadgroup_position_in_grid]],
         uint tid [[thread_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float Wt[32 * 64];
     threadgroup float Xt[64 * 16];
     threadgroup float Sc[4 * 128];
-    const uint row0 = group * 32;
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
     if (row0 >= args.rows) return;
     const uint rlast = args.rows - 1;
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
-    const uint xtok = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + tid % 16, xcb = (tid / 16) * 8;
     const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
     const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
@@ -1251,7 +1254,7 @@ kernel void q27_matmul_t2_mm(
         acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
-    const uint tokA = lane % 8, tokB = 8 + lane % 8;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
     if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
     if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
     if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
@@ -1273,19 +1276,20 @@ kernel void q27_matmul_t2_mm_h(
         device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
         device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
         device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
-        uint group [[threadgroup_position_in_grid]],
+        uint2 group [[threadgroup_position_in_grid]],
         uint tid [[thread_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup half Wt[32 * 64];
     threadgroup half Xt[64 * 16];
     threadgroup float Sc[4 * 256];
-    const uint row0 = group * 32;
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
     if (row0 >= args.rows) return;
     const uint rlast = args.rows - 1;
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
-    const uint xtok = tid % 16, xcb = (tid / 16) * 8;
+    const uint xtok = tok0 + tid % 16, xcb = (tid / 16) * 8;
     const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
     const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
@@ -1298,7 +1302,7 @@ kernel void q27_matmul_t2_mm_h(
     simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     float4 racc = 0.0f;
     threadgroup float *sc = Sc + sg * 256;
-    const uint tokA = lane % 8, tokB = 8 + lane % 8;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
     for (uint c0 = 0; c0 < args.cols; c0 += 64) {
         {
             const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);

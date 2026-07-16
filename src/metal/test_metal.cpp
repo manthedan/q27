@@ -486,8 +486,7 @@ int test_t3_wide(q27::MetalBackend& backend) {
 // per the width-gated fast-path lesson: a gate shape must actually enter
 // the fast path it gates.
 int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
-                      uint32_t rows,uint32_t cols) {
-    constexpr uint32_t tokens=12;
+                      uint32_t rows,uint32_t cols,uint32_t tokens=12) {
     std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:
                               dtype==q27::DType::T2_G128?(size_t)rows*cols/4:(size_t)rows*cols,0);
     for(uint32_t r=0;r<rows;r++) for(uint32_t c=0;c<cols;c++) {
@@ -531,7 +530,11 @@ int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
 int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
     return test_matmul_shape(backend,dtype,9,256) ||
            test_matmul_shape(backend,dtype,9,1024) ||
-           test_matmul_shape(backend,dtype,17,1152);
+           test_matmul_shape(backend,dtype,17,1152) ||
+           // Wide-chunk token tiling: full tiles (96 = 6x16) and a partial
+           // final tile (20 = 16 + 4) across the same row/col remainders.
+           test_matmul_shape(backend,dtype,17,1152,96) ||
+           test_matmul_shape(backend,dtype,9,256,20);
 }
 
 // Production-width GEMV parity. The packed-dot kernels take a vectorized
