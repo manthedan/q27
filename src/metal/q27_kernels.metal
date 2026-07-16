@@ -1016,7 +1016,8 @@ kernel void q27_matmul_q4_mm(
     // 8 transposed columns per thread.
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 2);
-    const uint xtok = tok0 + tid % 16, xcb = (tid / 16) * 8;
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
     const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
     const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
@@ -1056,7 +1057,7 @@ kernel void q27_matmul_q4_mm(
             const float xs = xvalid ? x_scales[xsbase + (c0 + xcb) / 32] : 0.0f;
             const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
             const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
-            threadgroup float *dst = Xt + xcb * 16 + xtok;
+            threadgroup float *dst = Xt + xcb * 16 + xloc;
             dst[0 * 16] = float(xa.x) * xs; dst[1 * 16] = float(xa.y) * xs;
             dst[2 * 16] = float(xa.z) * xs; dst[3 * 16] = float(xa.w) * xs;
             dst[4 * 16] = float(xb.x) * xs; dst[5 * 16] = float(xb.y) * xs;
@@ -1107,7 +1108,8 @@ kernel void q27_matmul_q8_mm(
     const uint rlast = args.rows - 1;
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const char *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
-    const uint xtok = tok0 + tid % 16, xcb = (tid / 16) * 8;
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
     const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
     const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
@@ -1136,7 +1138,7 @@ kernel void q27_matmul_q8_mm(
             const float xs = xvalid ? x_scales[xsbase + (c0 + xcb) / 32] : 0.0f;
             const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
             const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
-            threadgroup float *dst = Xt + xcb * 16 + xtok;
+            threadgroup float *dst = Xt + xcb * 16 + xloc;
             dst[0 * 16] = float(xa.x) * xs; dst[1 * 16] = float(xa.y) * xs;
             dst[2 * 16] = float(xa.z) * xs; dst[3 * 16] = float(xa.w) * xs;
             dst[4 * 16] = float(xb.x) * xs; dst[5 * 16] = float(xb.y) * xs;
@@ -1191,7 +1193,8 @@ kernel void q27_matmul_t2_mm(
     const uint rlast = args.rows - 1;
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
-    const uint xtok = tok0 + tid % 16, xcb = (tid / 16) * 8;
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
     const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
     const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
@@ -1227,7 +1230,7 @@ kernel void q27_matmul_t2_mm(
             const float xs = xvalid ? x_scales[xsbase + (c0 + xcb) / 32] : 0.0f;
             const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
             const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
-            threadgroup float *dst = Xt + xcb * 16 + xtok;
+            threadgroup float *dst = Xt + xcb * 16 + xloc;
             dst[0 * 16] = float(xa.x) * xs; dst[1 * 16] = float(xa.y) * xs;
             dst[2 * 16] = float(xa.z) * xs; dst[3 * 16] = float(xa.w) * xs;
             dst[4 * 16] = float(xb.x) * xs; dst[5 * 16] = float(xb.y) * xs;
@@ -1289,7 +1292,8 @@ kernel void q27_matmul_t2_mm_h(
     const uint rlast = args.rows - 1;
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
-    const uint xtok = tok0 + tid % 16, xcb = (tid / 16) * 8;
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
     const bool xvalid = xtok < args.x_rows;
     device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
     const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
@@ -1327,7 +1331,7 @@ kernel void q27_matmul_t2_mm_h(
         {
             const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
             const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
-            threadgroup half *dst = Xt + xcb * 16 + xtok;
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
             // Raw int8 values: exact in half. The per-token 32-group scale
             // folds at the flush below; invalid token slots stage clamped
             // real values whose outputs are never stored.
@@ -1405,7 +1409,7 @@ kernel void q27_mask_logits(device float *logits [[buffer(0)]],
 // stay sequential across the chunk inside a single dispatch and commit
 // their state once per chunk.
 
-struct EmbedRowsArgs { uint cols; uint count; uint tokens[12]; };
+struct EmbedRowsArgs { uint cols; uint count; uint tokens[96]; };
 kernel void q27_embedding_q8_rows(
         device const char *weights [[buffer(0)]],
         device const half *scales  [[buffer(1)]],

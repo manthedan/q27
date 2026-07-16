@@ -137,7 +137,7 @@ struct AttentionGqaArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_di
 struct AttentionGqaCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, block, n_blocks_max, tokens; float scale; };
 struct TopkArgs { uint32_t n, k, capacity; };
 struct DeltaArgs { uint32_t value_heads, qk_heads, head_dim; };
-struct EmbedRowsArgs { uint32_t cols, count, tokens[12]; };
+struct EmbedRowsArgs { uint32_t cols, count, tokens[96]; };
 struct RowsNormArgs { uint32_t n, rows, groups; float eps; };
 struct MatvecPairRowsArgs { uint32_t rows_a, rows_b, cols, tokens; };
 struct GatesRowsArgs { uint32_t heads, tokens; };
@@ -1442,7 +1442,7 @@ void MetalBackend::gated_norm_gdn(const BackendBuffer& x, const BackendTensor& w
 
 void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t* tokens,
                                       uint32_t count, BackendBuffer& out) {
-    if (!tokens || !count || count > 12)
+    if (!tokens || !count || count > 96)
         throw std::runtime_error("q27 Metal: chunked embedding requires 1..12 tokens");
     const bool t2 = weight.dtype == DType::T2_G128;
     if ((weight.dtype != DType::Q8_G128 && !t2) || !weight.data || !weight.scales ||
@@ -1509,7 +1509,7 @@ void MetalBackend::matvec_f16_pair_rows(const BackendTensor& a, BackendBuffer& a
     if (a.dtype != DType::F16 || b.dtype != DType::F16 || a.cols != b.cols || !a.data || !b.data ||
         !a.rows || !b.rows || !a.cols || a.rows > UINT32_MAX || b.rows > UINT32_MAX || a.cols > UINT32_MAX)
         throw std::runtime_error("q27 Metal: chunked F16 matvec pair requires compatible F16 weights");
-    if (!rows || rows > 12) throw std::runtime_error("q27 Metal: chunked F16 matvec pair requires 1..12 rows");
+    if (!rows || rows > 96) throw std::runtime_error("q27 Metal: chunked F16 matvec pair requires 1..96 rows");
     check_range(x.size(), 0, (uint64_t)rows * a.cols * 4, "chunked matvec input");
     check_range(a_out.size(), 0, (uint64_t)rows * a.rows * 4, "chunked matvec output A");
     check_range(b_out.size(), 0, (uint64_t)rows * b.rows * 4, "chunked matvec output B");
@@ -1535,7 +1535,7 @@ void MetalBackend::gdn_gates_rows(const BackendBuffer& alpha, const BackendBuffe
                                   const BackendTensor& ssm_a, const BackendTensor& ssm_dt,
                                   BackendBuffer& g, BackendBuffer& beta,
                                   uint32_t heads, uint32_t tokens) {
-    if (!heads || !tokens || tokens > 12) throw std::runtime_error("q27 Metal: invalid chunked GDN gates");
+    if (!heads || !tokens || tokens > 96) throw std::runtime_error("q27 Metal: invalid chunked GDN gates");
     const MetalBuffer& ar = metal_buffer(alpha); const MetalBuffer& br = metal_buffer(beta_raw);
     const MetalBuffer& a = tensor_data(ssm_a, DType::F32, "chunked GDN a");
     const MetalBuffer& dt = tensor_data(ssm_dt, DType::F32, "chunked GDN dt");
@@ -1563,7 +1563,7 @@ void MetalBackend::conv_chunk(const BackendBuffer& ring_src, BackendBuffer& ring
                               const BackendBuffer& qkv,
                               const BackendTensor& conv_weight, BackendBuffer& out,
                               uint32_t channels, uint32_t tokens) {
-    if (!channels || !tokens || tokens > 12) throw std::runtime_error("q27 Metal: invalid chunked convolution");
+    if (!channels || !tokens || tokens > 96) throw std::runtime_error("q27 Metal: invalid chunked convolution");
     const MetalBuffer& rs = metal_buffer(ring_src); MetalBuffer& rd = metal_buffer(ring_dst);
     const MetalBuffer& q = metal_buffer(qkv);
     const MetalBuffer& w = tensor_data(conv_weight, DType::F32, "chunked GDN convolution");
@@ -1591,7 +1591,7 @@ void MetalBackend::delta_chunk(const BackendBuffer& state_src, BackendBuffer& st
                                const BackendBuffer& g, const BackendBuffer& beta,
                                BackendBuffer& out, uint32_t value_heads, uint32_t qk_heads,
                                uint32_t head_dim, uint32_t tokens) {
-    if (head_dim != 128 || qk_heads != 16 || !tokens || tokens > 12 ||
+    if (head_dim != 128 || qk_heads != 16 || !tokens || tokens > 96 ||
         impl_->delta_chunked.maxTotalThreadsPerThreadgroup < 512)
         throw std::runtime_error("q27 Metal: unsupported chunked DeltaNet shape");
     const MetalBuffer& ss = metal_buffer(state_src); MetalBuffer& sd = metal_buffer(state_dst);
@@ -1620,7 +1620,7 @@ void MetalBackend::delta_chunk(const BackendBuffer& state_src, BackendBuffer& st
 
 void MetalBackend::l2norm_rows(BackendBuffer& x, uint32_t heads, uint32_t head_dim,
                                uint32_t row_stride, uint32_t tokens, float eps) {
-    if (!heads || !tokens || tokens > 12 || row_stride < heads * head_dim)
+    if (!heads || !tokens || tokens > 96 || row_stride < heads * head_dim)
         throw std::runtime_error("q27 Metal: invalid chunked l2norm");
     MetalBuffer& input = metal_buffer(x);
     check_range(input.size(), 0, ((uint64_t)(tokens - 1) * row_stride + (uint64_t)heads * head_dim) * 4,
@@ -1639,7 +1639,7 @@ void MetalBackend::l2norm_rows(BackendBuffer& x, uint32_t heads, uint32_t head_d
 void MetalBackend::rope_neox_rows(BackendBuffer& x, uint32_t heads, uint32_t head_dim,
                                   uint32_t n_rot, uint32_t stride, uint32_t row_stride,
                                   uint32_t position, uint32_t tokens, float freq_base) {
-    if (!n_rot || n_rot > head_dim || (n_rot & 1) || !tokens || tokens > 12)
+    if (!n_rot || n_rot > head_dim || (n_rot & 1) || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked RoPE dimensions");
     MetalBuffer& input = metal_buffer(x);
     check_range(input.size(), 0,
@@ -1658,7 +1658,7 @@ void MetalBackend::rope_neox_rows(BackendBuffer& x, uint32_t heads, uint32_t hea
 void MetalBackend::kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer& v,
                                      BackendBuffer& k_cache, BackendBuffer& v_cache,
                                      uint32_t position, uint32_t row_length, uint32_t tokens) {
-    if (!tokens || tokens > 12) throw std::runtime_error("q27 Metal: invalid chunked KV store");
+    if (!tokens || tokens > 96) throw std::runtime_error("q27 Metal: invalid chunked KV store");
     const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
     MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
     check_range(kb.size(), 0, (uint64_t)row_length * tokens * 4, "chunked K rows");
@@ -1680,7 +1680,7 @@ void MetalBackend::kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer
 void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
                                         BackendBuffer& k_cache, BackendBuffer& v_cache,
                                         uint32_t position, uint32_t kv_heads, uint32_t tokens) {
-    if (!kv_heads || !tokens || tokens > 12)
+    if (!kv_heads || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked turbo3 KV store");
     const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
     MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
@@ -1709,7 +1709,7 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
                                         uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
                                         float scale) {
     if (!base_len || !kv_heads || q_heads % kv_heads || !head_dim || head_dim > 256 ||
-        !tokens || tokens > 12)
+        !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked attention dimensions");
     const MetalBuffer& qb = metal_buffer(q); const MetalBuffer& kc = metal_buffer(k_cache);
     const MetalBuffer& vc = metal_buffer(v_cache);
@@ -1759,7 +1759,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
                                            BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                            uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
                                            float scale) {
-    if (!base_len || !kv_heads || q_heads % kv_heads || head_dim != 256 || !tokens || tokens > 12)
+    if (!base_len || !kv_heads || q_heads % kv_heads || head_dim != 256 || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked turbo3 attention dimensions");
     const MetalBuffer& qb = metal_buffer(q); const MetalBuffer& kc = metal_buffer(k_cache);
     const MetalBuffer& vc = metal_buffer(v_cache);
@@ -1805,7 +1805,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
 
 void MetalBackend::sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,
                                          uint32_t heads, uint32_t head_dim, uint32_t tokens) {
-    if (!heads || !head_dim || !tokens || tokens > 12)
+    if (!heads || !head_dim || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked sigmoid gate");
     MetalBuffer& o = metal_buffer(out); const MetalBuffer& gates = metal_buffer(qg);
     const uint64_t n = (uint64_t)heads * head_dim * tokens;

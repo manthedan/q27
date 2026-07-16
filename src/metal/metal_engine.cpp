@@ -287,27 +287,27 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     // so no probability scratch exists on any path at any context length.
     chunked_prefill_ = backend_.supports_quantized_matmul();
     if (chunked_prefill_) {
-        ch_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
-        cx1_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
-        cy_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
-        cqg_ = alloc_f32((uint64_t)CHUNK_MAX * 2 * N_HEAD * HEAD_DIM);
-        ckbuf_ = alloc_f32((uint64_t)CHUNK_MAX * N_KV * HEAD_DIM);
-        cvbuf_ = alloc_f32((uint64_t)CHUNK_MAX * N_KV * HEAD_DIM);
-        cattn_out_ = alloc_f32((uint64_t)CHUNK_MAX * N_HEAD * HEAD_DIM);
-        cqkv_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_CH);
-        cz_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_V);
-        calpha_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
-        cbeta_raw_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
-        cg_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
-        cbeta_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_HEADS);
-        cconv_out_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_CH);
-        cdelta_out_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_V);
-        cgated_out_ = alloc_f32((uint64_t)CHUNK_MAX * GDN_V);
-        cffn_gate_ = alloc_f32((uint64_t)CHUNK_MAX * N_FFN);
-        cffn_up_ = alloc_f32((uint64_t)CHUNK_MAX * N_FFN);
-        cq5120_ = backend_.allocate_quantized(CHUNK_MAX * N_EMBD);
-        cq6144_ = backend_.allocate_quantized(CHUNK_MAX * GDN_V);
-        cq17408_ = backend_.allocate_quantized(CHUNK_MAX * N_FFN);
+        ch_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
+        cx1_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
+        cy_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
+        cqg_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * 2 * N_HEAD * HEAD_DIM);
+        ckbuf_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_KV * HEAD_DIM);
+        cvbuf_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_KV * HEAD_DIM);
+        cattn_out_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_HEAD * HEAD_DIM);
+        cqkv_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_CH);
+        cz_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_V);
+        calpha_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_HEADS);
+        cbeta_raw_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_HEADS);
+        cg_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_HEADS);
+        cbeta_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_HEADS);
+        cconv_out_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_CH);
+        cdelta_out_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_V);
+        cgated_out_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * GDN_V);
+        cffn_gate_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_FFN);
+        cffn_up_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_FFN);
+        cq5120_ = backend_.allocate_quantized(PREFILL_CHUNK_MAX * N_EMBD);
+        cq6144_ = backend_.allocate_quantized(PREFILL_CHUNK_MAX * GDN_V);
+        cq17408_ = backend_.allocate_quantized(PREFILL_CHUNK_MAX * N_FFN);
         cfinal_ = alloc_f32((uint64_t)CHUNK_MAX * N_EMBD);
         clogits_ = alloc_f32((uint64_t)CHUNK_MAX * VOCAB);
         cpred_ = backend_.allocate((uint64_t)CHUNK_MAX * sizeof(uint32_t));
@@ -595,7 +595,10 @@ void MetalEngine::ffn_chunk(uint32_t layer, uint32_t count) {
 
 void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count, bool verify) {
     if (!ch_) throw std::runtime_error("q27 Metal: chunked prefill is unavailable");
-    if (!count || count > CHUNK_MAX) throw std::runtime_error("q27 Metal: invalid chunk size");
+    // Verify chunks park per-layer inputs in CHUNK_MAX-sized buffers; plain
+    // prefill chunks only need the (wider) layer-stack activations.
+    if (!count || count > (verify ? CHUNK_MAX : PREFILL_CHUNK_MAX))
+        throw std::runtime_error("q27 Metal: invalid chunk size");
     if ((uint64_t)position_ + count > max_context_)
         throw std::runtime_error("q27 Metal: context exhausted");
     for (uint32_t i = 0; i < count; i++)
@@ -711,7 +714,7 @@ uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp
         const size_t chunkable = prompt.size() - 1;
         while (chunkable - serial_begin >= 2) {
             const uint32_t count =
-                (uint32_t)std::min<size_t>(CHUNK_MAX, chunkable - serial_begin);
+                (uint32_t)std::min<size_t>(PREFILL_CHUNK_MAX, chunkable - serial_begin);
             CommandBatch batch(backend_);
             encode_chunk(prompt.data() + serial_begin, count);
             batch.finish();

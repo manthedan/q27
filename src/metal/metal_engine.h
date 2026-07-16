@@ -127,7 +127,8 @@ class MetalEngine {
     static constexpr uint32_t GDN_QK_HEADS = 16;
     static constexpr uint32_t GDN_DIM = 128;
     static constexpr uint32_t VOCAB = 248320;
-    static constexpr uint32_t CHUNK_MAX = 12;
+    static constexpr uint32_t CHUNK_MAX = 12;          // MTP verify / NLL / KL width
+    static constexpr uint32_t PREFILL_CHUNK_MAX = 96;  // prompt-ingestion width (8x12)
     static constexpr uint32_t TOPK_CAPACITY = 1024;
     static constexpr uint32_t RESIDENT_MAX = 8;
     static constexpr float EPS = 1e-6f;
