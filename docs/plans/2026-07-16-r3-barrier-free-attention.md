@@ -58,6 +58,59 @@ largest and R1b won 2×).
 
 ---
 
-## Results (appended post-measurement)
+## Results (appended post-measurement, same morning, M4 16 GB)
 
-(pending)
+**VERDICT: PARK R3 entirely.** bf2 runs at **0.47–0.53× of the production
+t2 route** (i.e. ~2× slower) at every block size and both depths — far
+below the 1.10 park line. The H2×T1 escape condition ("bf2 loses at equal
+B but the sweep shows block-size sensitivity") is explicitly NOT met: the
+sweep is flat (16K: 33.4–37.0 ms across B=128–2048; 32K: 66.3–73.1 ms), so
+the serial-chain/barrier term the variant order was designed to chase is
+~nil and H2×T1 does not proceed.
+
+### Numbers (`metal_attn_bench`, turbo3 chunk 12, ms/dispatch)
+
+| arm | 16K | 32K |
+|---|---|---|
+| untiled gqa (staged, barriers) | 34.325 | 68.343 |
+| **t2 (production)** | **17.647** | **34.245** |
+| t4 | 25.359 | 49.034 |
+| bf2 B=128 | 33.426 (0.53×) | 66.550 (0.51×) |
+| bf2 B=256 | 33.467 (0.53×) | 66.256 (0.52×) |
+| bf2 B=512 | 33.996 (0.52×) | 66.879 (0.51×) |
+| bf2 B=1024 | 35.106 (0.50×) | 69.245 (0.49×) |
+| bf2 B=2048 | 36.967 (0.48×) | 73.110 (0.47×) |
+
+Identity: bf2 @ B=1024 memcmp-equal to the staged kernels (both depths) —
+the kernel is correct, just slow. Decode head-major control unchanged
+(1.00–1.01×).
+
+### The round-3 Q2 hypothesis inverts
+
+bf2 lands at the **untiled** kernel's wall time almost exactly. Reading:
+
+- **Staging + two barriers per 8-row tile cost ~nothing on M4.** bf2
+  deletes them and gains zero; the block sweep says shorter serial softmax
+  chains and more independent partials buy zero too (slightly negative —
+  merge fold overhead grows).
+- **R1b's 2× was dequant/stream sharing, not barrier amortization**: t2
+  halves per-token dequant + KV traffic (each staged row serves 2 tokens ×
+  6 heads). bf2 gives sharing up entirely — each simdgroup dequantizes
+  every row itself (6× per token-pair vs 1× staged), and that duplicated
+  dequant ALU costs exactly the factor the stream sharing had won.
+- The "latency-tolerant byte range" premise held for *bytes* (fp16 5.12×
+  bytes at no wall) but does not extend to *per-element dequant issue
+  cost*, which scales with gqa × tokens/TF and is the actual wall.
+
+### Residue (recorded, not scheduled)
+
+- If more attention headroom is wanted, the direction is MORE sharing per
+  dequant, not less synchronization: e.g. staging dequantized tiles in
+  half (halves threadgroup traffic; the GEMM half-staging lever's sibling)
+  or a register-disciplined t3 (t4 lost to spills, but t3 with 25% less
+  register pressure than t4 is unexplored).
+- The 3-loop barrier-cost calibration bench is superseded: bf2-vs-staged
+  at equal B *is* that measurement, and it read ~zero barrier cost.
+- Probe surface stays in tree (bench-only, `attention_turbo3_causal_gqa_bf`
+  + `--seq`-driven sweep in `metal_attn_bench`) as the negative-result
+  witness and for a one-shot re-run on other hardware.

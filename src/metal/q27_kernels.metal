@@ -2703,6 +2703,97 @@ inline void turbo3_causal_gqa_tiled_body(device const float *q,
     }
 }
 
+// R3 probe: barrier-free direct-read block-partial causal GQA attention
+// (docs/plans/2026-07-16-r3-barrier-free-attention.md). The tiled body with
+// the threadgroup staging and both barriers deleted: each lane dequantizes
+// its 8 K dims and 8 V dims per position directly from device into
+// registers, in the same element order (d = lane + 32·i) as the staged
+// kernels — so per-token arithmetic is unchanged and the output is
+// bit-identical to the t2 kernel at equal block size (the bench memcmps
+// before timing). Six simdgroups per threadgroup, one per GQA query head,
+// share nothing; each KV row is read gqa times (~600 B vs 100 B staged),
+// inside the byte range the fp16 A/B proved latency-tolerant. Block size
+// arrives via args.block (host override on the probe entry) — the sweep is
+// the experiment.
+template <uint TF>
+inline void turbo3_causal_gqa_bf_body(device const float *q,
+                                       device const uchar *kc,
+                                       device const uchar *vc,
+                                       device float *partials,
+                                       constant AttentionGqaCausalArgs &args,
+                                       uint3 group, ushort lane, ushort sg) {
+    const uint kvh = group.x, blk = group.y, tile0 = group.z * TF;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
+    const uint live = min(TF, args.tokens - tile0);
+    const uint p0 = blk * args.block;
+    const uint seq_last = args.base_len + tile0 + live - 1;   // deepest token's visible length
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
+    const uint qh = kvh * gqa + sg;
+    device const float *qp[TF];
+    for (uint f = 0; f < TF; f++)
+        qp[f] = q + (ulong)(tile0 + min(f, live - 1)) * args.q_row_stride + (ulong)qh * args.q_stride;
+
+    float acc[TF][8];
+    float m[TF], l[TF];
+    for (uint f = 0; f < TF; f++) {
+        m[f] = -INFINITY; l[f] = 0.0f;
+        for (uint i = 0; i < 8; i++) acc[f][i] = 0.0f;
+    }
+    for (uint pos = p0; pos < p1; pos++) {
+        device const uchar *kb = kc + ((ulong)pos * args.kv_heads + kvh) * 2 * 50;
+        device const uchar *vb = vc + ((ulong)pos * args.kv_heads + kvh) * 2 * 50;
+        float kv[8], vv[8];
+        for (uint d = lane, i = 0; d < 256; d += 32, i++)
+            kv[i] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+        for (uint d = lane, i = 0; d < 256; d += 32, i++)
+            vv[i] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        float partial[TF];
+        for (uint f = 0; f < TF; f++) partial[f] = 0.0f;
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) {
+            const float k = kv[i];
+            for (uint f = 0; f < TF; f++) partial[f] += qp[f][d] * k;
+        }
+        float corr[TF], w[TF];
+        bool vis[TF];
+        for (uint f = 0; f < TF; f++) {
+            vis[f] = f < live && pos < args.base_len + tile0 + f;
+            corr[f] = 1.0f; w[f] = 0.0f;
+            if (vis[f]) {
+                const float score = simd_sum(partial[f]) * args.scale;
+                const float m_new = max(m[f], score);
+                corr[f] = exp(m[f] - m_new);            // first iteration: exp(-inf) = 0
+                w[f] = exp(score - m_new);
+                l[f] = l[f] * corr[f] + w[f];
+                m[f] = m_new;
+            }
+        }
+        for (uint i = 0; i < 8; i++) {
+            const float v = vv[i];
+            for (uint f = 0; f < TF; f++)
+                if (vis[f]) acc[f][i] = acc[f][i] * corr[f] + w[f] * v;
+        }
+    }
+    for (uint f = 0; f < live; f++) {
+        if (p0 >= args.base_len + tile0 + f) continue;    // merge never reads this slot
+        device float *ph = partials +
+            (((ulong)(tile0 + f) * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+        if (lane == 0) { ph[0] = m[f]; ph[1] = l[f]; }
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[f][i];
+    }
+}
+
+kernel void q27_attention_turbo3_causal_gqa_bf2(device const float *q [[buffer(0)]],
+        device const uchar *kc [[buffer(1)]], device const uchar *vc [[buffer(2)]],
+        device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    turbo3_causal_gqa_bf_body<2>(q, kc, vc, partials, args, group, lane, sg);
+}
+
 kernel void q27_attention_turbo3_causal_gqa_t2(device const float *q [[buffer(0)]],
         device const uchar *kc [[buffer(1)]], device const uchar *vc [[buffer(2)]],
         device float *partials [[buffer(3)]],
