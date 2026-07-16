@@ -147,6 +147,7 @@ struct L2RowsArgs { uint32_t heads, head_dim, row_stride, tokens; float eps; };
 struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, position, tokens; float freq_base; };
 struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
 struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
+struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode; };
 struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
 struct ArgmaxRowsArgs { uint32_t n, rows; };
 struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
@@ -213,6 +214,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> rope_rows;
     id<MTLComputePipelineState> kv_store_rows;
     id<MTLComputePipelineState> kv_store_turbo3_rows;
+    id<MTLComputePipelineState> kv_store_attrib_rows;
     id<MTLComputePipelineState> attention_causal;
     id<MTLComputePipelineState> attention_turbo3_causal_p;
     id<MTLComputePipelineState> sigmoid_gate_rows;
@@ -577,6 +579,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->rope_rows = make_pipeline(impl_->device, impl_->library, @"q27_rope_neox_rows");
         impl_->kv_store_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_rows");
         impl_->kv_store_turbo3_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3_rows");
+        impl_->kv_store_attrib_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_attrib_rows");
         impl_->attention_causal = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal");
         impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
         impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
@@ -2103,6 +2106,34 @@ void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuf
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
                 threadsPerThreadgroup:MTLSizeMake(128,1,1)];
         if (own) impl_->finish_command("chunked turbo3 KV store");
+    }
+}
+
+void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
+                                            BackendBuffer& k_cache, BackendBuffer& v_cache,
+                                            uint32_t position, uint32_t kv_heads, uint32_t tokens,
+                                            uint32_t mode) {
+    if (!kv_heads || !tokens || tokens > 96)
+        throw std::runtime_error("q27 Metal: invalid KV attribution store");
+    if (mode != 1 && mode != 2)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K) or 2 (V)");
+    const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
+    MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
+    const uint64_t row_floats = (uint64_t)kv_heads * 256;
+    check_range(kb.size(), 0, row_floats * tokens * 4, "attrib K rows");
+    check_range(vb.size(), 0, row_floats * tokens * 4, "attrib V rows");
+    check_range(kc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib K cache");
+    check_range(vc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib V cache");
+    TurboAttribArgs args{position, kv_heads, tokens, mode};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_f16_attrib_rows");
+        [enc setComputePipelineState:impl_->kv_store_attrib_rows];
+        [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
+        [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
+                threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+        if (own) impl_->finish_command("KV attribution store");
     }
 }
 
