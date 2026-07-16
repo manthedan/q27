@@ -183,6 +183,12 @@ struct Runtime {
                 const std::vector<std::string>& tool_names={}) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         std::lock_guard<std::mutex> lock(mutex);
+        // Round-2 expert P0 #1 (leak across requests): an engine exception
+        // mid-generation used to skip constraint cleanup, so the next request
+        // decoded under the previous request's mask. Defensive reset at entry
+        // covers any pre-fix leak; the scope-exit guard below covers every
+        // exit path from here on.
+        engine.set_tool_constraint(-1);
         q27::validate_sampling(sampling);
         const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
         size_t hit=0; uint32_t pending=0;
@@ -213,6 +219,16 @@ struct Runtime {
         tc.eng=&engine; tc.tok=&tokenizer; tc.cache=&mask_cache; tc.host2dev=&host2dev;
         tc.enabled=constrain_tools && !tool_names.empty() && sampling.temperature==0.0f && !mtp_width;
         tc.begin(tool_names);
+        // Scope-exit constraint cleanup: runs on normal return, client
+        // disconnect, and engine exceptions alike, and never throws (a
+        // cleanup failure must not mask the original exception).
+        struct ConstraintCleanup {
+            q27::BasicToolConstrainer<q27::MetalEngine,q27::Tokenizer>& tc;
+            q27::MetalEngine& engine;
+            ~ConstraintCleanup() {
+                try { tc.end(); engine.set_tool_constraint(-1); } catch(...) {}
+            }
+        } constraint_cleanup{tc,engine};
         auto sink=[&](uint32_t token)->bool {
             if(tc.enabled) {
                 const int tid=(int)token;
@@ -245,9 +261,6 @@ struct Runtime {
             if(!tail.empty()) emit(tail);
             if(stopped) stop_hit=true;
         }
-
-        tc.end();
-        engine.set_tool_constraint(-1); // never leak a mask into the next request
 
         Outcome out;
         out.prompt_tokens=(uint32_t)prompt.size();

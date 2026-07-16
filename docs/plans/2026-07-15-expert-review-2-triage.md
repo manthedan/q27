@@ -11,7 +11,11 @@ arrived), PARKED-AGREED.
 
 ## P0 — confirmed correctness findings (fix before further server/multislot work)
 
-1. **Tool-constraint mask can leak across requests. CONFIRMED**
+1. **Tool-constraint mask can leak across requests. FIXED (same night)** —
+   defensive `set_tool_constraint(-1)` at request entry + a non-throwing
+   scope-exit guard (`tc.end()` + mask clear) covering every exit path.
+   The prescribed sink-throw byte-compare gate and backend failpoint remain
+   follow-ups. Original finding: **CONFIRMED**
    (`metal_server.cpp:249-250`). Cleanup (`tc.end()`,
    `set_tool_constraint(-1)`) runs only on the normal return path; engine
    exceptions mid-generation (backend `runtime_error`s) skip it, the mutex
@@ -21,7 +25,11 @@ arrived), PARKED-AGREED.
    from the token sink after grammar engagement, then run a clean
    unconstrained request and byte-compare against a fresh engine; add a
    backend failpoint (`throw_after_dispatch`) for the realistic path.
-2. **Shared KV reservation not constructor-exception-safe. CONFIRMED**
+2. **Shared KV reservation not constructor-exception-safe. FIXED (same
+   night)** — constructor-local RAII reservation guard (rolls back unless
+   the constructor completes) + underflow assert in the destructor.
+   Failure-injection gate remains a follow-up (needs a backend failpoint).
+   Original finding: **CONFIRMED**
    (`metal_engine.cpp:233-236`): `shared_->cache_bytes` is incremented
    before ~15 subsequent allocations; a constructor throw never runs the
    destructor (~line 192), leaving a phantom reservation that rejects later
