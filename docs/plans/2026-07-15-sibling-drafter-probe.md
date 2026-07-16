@@ -1,6 +1,6 @@
 # Sibling-drafter probe: Ternary-Bonsai-1.7B drafting for the 27B tiers
 
-**Status: proposed** (2026-07-15). This is the P1-style probe gating option 2
+**Status: RESOLVED — 1.7B killed at the vocab gate; DSpark counterpart measured, net loss confirmed as overhead** (2026-07-15 night, see verdict below). This is the P1-style probe gating option 2
 of the binary-tier doc's drafter follow-up (`2026-07-15-binary-tier.md`).
 Drafting remains parked per the ternary doc's follow-up 6 resolution; this
 probe costs ~1 hour, zero engine work, and either kills the idea cheaply or
@@ -85,6 +85,53 @@ and resident-greedy land (see expert-review-integration).
 - **Acceptance < ~0.6 on the agentic mix** → kill the 1.7B option
   permanently (drafter quality, not overhead, is the binding constraint);
   DSpark or nothing for these tiers.
+
+## Phase 0 verdict (2026-07-15 night, 24 GB M4, fork `prism-b9591-62061f9`)
+
+Run as part of the overnight vendor-stack batch (`logs/overnight-20260715/`,
+Daniel-authorized). All comparisons within-session — the machine was under
+desktop load (T2 tg128 measured 6.21 tonight vs 8.59/8.41 quiet), so ratios,
+not absolute rates, are the results.
+
+**Step 2 vocab gate: FAIL — the 1.7B option is dead permanently, on
+lineage, not economics.** `Ternary-Bonsai-1.7B` is built on the *old*
+Qwen3-1.7B base: vocab 151,669 vs the 27B's 248,320 (fork error: "difference
+96651, max allowed 128"), n_ctx_train 32K vs 262K, arch tag `qwen3` vs
+`qwen35`. Draft tokens can never be target-valid; no acceptance or
+scheduling result can rescue it. PrismML ships no small model on the
+Qwen3.6 vocab (checked their HF org 2026-07-15) — if one ever appears, only
+the vocab gate needs re-running. Solo numbers for the record: 1.7B tg128
+85–98 tok/s (both sessions), right in the predicted band.
+
+**Step 6 DSpark counterpart probe: ran — first known DSpark-on-Apple-Silicon
+measurement.** Findings:
+
+- The drafter pack is NOT unlisted: `Bonsai-27B-dspark-Q4_1.gguf` (and
+  `-bf16`) ship inside `prism-ml/Bonsai-27B-gguf` next to the binary pack.
+- Force-enable path: `llama-server --spec-type draft-dspark
+  --spec-draft-n-max 4` (must equal the drafter's block size). The
+  `llama-speculative` example binary cannot run it — a generic vocab-type
+  guard fires before the dspark path (the pack carries no vocab of its own;
+  the fork adds 248,320 dummy tokens, then vocab_type 0≠1 rejects).
+- Observed drafter contract at load (matches whitepaper §6):
+  block_size=4, n_capture=5 hidden-state taps, n_embd=5120, shared
+  n_vocab=248320, mask_token 248319, markov_rank=256.
+- Measured, T2 target, greedy, 256 tokens, matched no-drafter server
+  baseline back-to-back: acceptance **70.4%** agentic (188/267 drafted;
+  ~2.8 of each 4-block) / **55.6%** prose — vs their H100 accepted length
+  3.6–3.7. Net throughput **0.56× / 0.51×** (2.89 vs 5.18 tok/s agentic;
+  2.36 vs 4.63 prose). **A ~2× slowdown despite healthy acceptance.**
+
+**Decision (per the pre-registered gates): the middle branch fires.** The
+batch-1 Apple Silicon wall is now measured on our hardware with their own
+trained drafter: acceptance is fine, per-round verification overhead is the
+binding cost — in *their* stack. Park ALL drafting, DSpark included; DSpark
+is now the only viable drafter shape for these tiers (vocab compatibility),
+so any future revival is a DSpark port question, never a sibling. Revisit
+only after GPU-resident sync work lands AND the oracle verifier test
+(Gate 0) shows a budget in OUR engine — our per-round overhead differs from
+their stack's, so tonight's 0.5× does not bind the q27 engine forever, but
+the burden of proof is now squarely on Gate 0.
 
 ## If funded: the engine project (own plan doc, not this one)
 
