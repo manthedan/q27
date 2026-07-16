@@ -99,6 +99,33 @@ class MetalEngine {
                                         const SamplingParams& params,
                                         const TokenSink& sink, StopCause& cause);
 
+    // Scheduling-quantum surface (multislot Phase 1,
+    // docs/plans/2026-07-15-multislot-phase1.md): each call submits bounded
+    // GPU work so a serving scheduler can interleave engines on one Shared.
+    //
+    // prefill_chunk encodes 2..PREFILL_CHUNK_MAX prompt tokens through the
+    // layer-major chunk path without producing logits. Chunk-boundary
+    // placement is quality-neutral (--chunk-parity gate: widths 17/48/96
+    // bit-identical to 12), so the caller picks any width per call; the
+    // final prompt token still goes through step() to produce logits and
+    // the pending token, exactly like prefill()'s serial tail.
+    void prefill_chunk(const uint32_t* tokens, uint32_t count);
+    // One MTP draft/verify/commit round (one scheduling quantum). Appends
+    // the committed tokens (always starting with `pending`) to `committed`;
+    // the caller emits them and stops at `eos` itself — tokens after an EOS
+    // were already encoded when the verify chunk ran, exactly as in the
+    // streaming commit loop. Adapts live_width in place (callers initialize
+    // it to min(width, 4)) and returns the next pending token. When context
+    // or `remaining` (>= 2, bounds committed tokens) leaves no room to
+    // verify, falls back to one serial step — skipped when `pending` is EOS
+    // so a finished stream never encodes past its end.
+    uint32_t mtp_round(uint32_t pending, uint32_t remaining, uint32_t eos, uint32_t width,
+                       uint32_t& live_width, std::vector<uint32_t>& committed);
+    // Sample one token from the current logits; the sampled-decode quantum
+    // is sample_from_logits + step under one GPU lease. The RNG belongs to
+    // the request, not the engine, so interleaved slots stay reproducible.
+    uint32_t sample_from_logits(const SamplingParams& params, std::mt19937_64& rng);
+
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
 
