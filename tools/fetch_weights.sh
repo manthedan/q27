@@ -44,10 +44,14 @@ if [ ! -f "$GGUF" ] || [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" != "$SRC_SHA
     for attempt in resume clean; do
         [ "$attempt" = "clean" ] && { echo "fetch: retrying with a clean download"; rm -f "$GGUF"; }
         echo "fetch: downloading $FILE (7.2 GB) from $REPO @ ${REV:0:12} ($attempt)"
+        # A transport failure preserves the partial file for the next run's
+        # resume; only a COMPLETED download with a wrong checksum triggers
+        # the clean restart (codex P2 — transient errors must not discard
+        # gigabytes of good partial data).
         curl -L --fail --continue-at - \
-            "https://huggingface.co/$REPO/resolve/$REV/$FILE" -o "$GGUF" || true
-        [ -f "$GGUF" ] &&
-            [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" = "$SRC_SHA" ] && break
+            "https://huggingface.co/$REPO/resolve/$REV/$FILE" -o "$GGUF" ||
+            { echo "fetch: download interrupted — re-run to resume from the partial file"; exit 1; }
+        [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" = "$SRC_SHA" ] && break
         [ "$attempt" = "clean" ] &&
             { echo "fetch: source GGUF sha256 MISMATCH after clean download — aborting"; exit 1; }
     done
