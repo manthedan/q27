@@ -37,14 +37,26 @@ Candidate release artifact:
     ternary-bonsai-27b-t2.q27  7,154,196,992 bytes
     sha256 25392b471d2e5c55798c2ea77d8b53fbbd1f720318e5ff23bd8c49e5d378e549
 
-Distribution channel should be Hugging Face Hub (a 7.15 GB single file
-exceeds GitHub Releases' 2 GB/file cap). Publish with: Apache-2.0
-license + NOTICE preserving PrismML/Qwen attribution and stating the
-modification ("repacked GGUF Q2_0 -> q27 T2_G128, codes byte-identical,
-scales separated; no MTP head"), the source GGUF's checksum, the repack
-command (tools/repack.py, quant_policy bonsai-t2-v1) and its bit-match
-gate, measured quality numbers (NLL/PPL and the kl-kv calibration), and
-the tokenizer (.tok) alongside. Treat published artifacts as IMMUTABLE:
-prefix snapshots (Q27SNAP1) pin the artifact byte-exactly, so any
+**Decision (2026-07-16): q27 does not redistribute weights.** The repack
+is a lossless, deterministic container transform of PrismML's published
+pack, so users fetch from the source and repack locally:
+
+    tools/fetch_weights.sh
+
+The script pins the upstream revision (upstream verified live:
+huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf, license apache-2.0,
+ungated; commit 20e435f5), verifies the source GGUF against HF's LFS
+sha256, repacks (CPU-only, ~1-3 min on Apple silicon, memory-bounded —
+the byte-copy + ternary scan + bit-exact round-trip gate; the 7.2 GB
+download dominates), verifies the artifact against the published q27
+digest, and exports the tokenizer from the same GGUF. Deps: python3
+with numpy + gguf (checked, with the pip command printed).
+
+Own HF uploads are warranted only for artifacts that do NOT exist
+upstream (e.g. a future binary-tier or KV-codec pack we produce) or if
+upstream hosting disappears. If that day comes: Apache-2.0 + NOTICE
+preserving PrismML/Qwen attribution, modification statement, source
+checksum, repro command, measured quality numbers — and IMMUTABILITY:
+prefix snapshots (Q27SNAP1) pin the artifact byte-exactly, so a
 re-upload with different bytes silently invalidates user snapshot
-directories — version a changed artifact instead of replacing it.
+directories; version a changed artifact, never replace it.
