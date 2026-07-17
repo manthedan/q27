@@ -69,6 +69,23 @@ void conv_step(const float* ring_src, float* ring_dst, const float* qkv, const f
 void delta_step(const float* S_src, float* S_dst, const float* conv_out, const float* g,
                 const float* beta, float* o, cudaStream_t st = 0);
 
+// P3 T2 TABLE TWINS (capture plan docs/plans/2026-07-16-batch-p3-capture.md):
+// identical math / launch geometry / per-thread access pattern to conv_step /
+// delta_step; the ONLY delta is pointer provenance. The role ring/state
+// pointers resolve ON DEVICE as tab[(role + *d_perm) % wmax] from a
+// once-uploaded per-layer pointer ring (tab = engine table + il*W_MAX), so a
+// captured fused round no longer bakes the host-resolved (role+perm)%W_MAX
+// pointers and one graph exec serves every perm rotation (T3). Table reads
+// are plain global loads of two pointers at thread start -- NOT dynamically
+// indexed __grid_constant__ struct params (the P10 spill class); ptxas gate:
+// spill 0, register delta reviewed vs the originals.
+void conv_step_t(float* const* ring_tab, const int* d_perm, int role_in, int role_out,
+                 int wmax, const float* qkv, const float* convw, float* out, int channels,
+                 cudaStream_t st = 0);
+void delta_step_t(float* const* S_tab, const int* d_perm, int role_in, int role_out,
+                  int wmax, const float* conv_out, const float* g, const float* beta,
+                  float* o, cudaStream_t st = 0);
+
 // out[h*128+d] = rms_norm(o_h)[d] * w[d] * silu(z[h*128+d])   (DeltaNet gated norm)
 void gated_norm_gdn(const float* o, const float* w, const float* z, float* out, int n_heads,
                     int head_dim, float eps, cudaStream_t st = 0);

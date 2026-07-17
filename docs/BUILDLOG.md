@@ -5932,3 +5932,177 @@ of ceiling unrealized; fdmma smem suspected), eager launch (~1.9ms, P3).
 Plans: docs/plans/2026-07-15-batch-p2-overlap.md +
 2026-07-16-batch-p2c-draft-fusion.md. Exit phase (reviews, CC sanity,
 merge) next; Q27_BATCH remains default-off.
+
+**2026-07-16 -- P3 S1: real-round capture byte spike + key census. Byte gate
+PASS (16/16 like-composition positions, 623 replayed rounds); census at the
+bar (28 keys/KV, top-16 ~85%, alphabet fits LRU-32) -- GO for T3 approach
+A.** Q27_P3_SPIKE=1 env hack (written, gated, REVERTED -- not merged; diff +
+full evidence in scratchpad/p3_s1/): Conductor::fused_round wrapped the REAL
+fused_verify_round in stream capture EVERY fused round -- draft_done waits
+hoisted onto cstm before BeginCapture (waits on externally-recorded events
+are capture-illegal), phase-timing records hoisted outside,
+BeginCapture(Relaxed) -> the whole verify body incl. the P2b side-stream
+fork/join (T0's proven topology) -> EndCapture -> Instantiate -> launch the
+exec for the SAME round (capture-without-execute; the round happens once,
+via replay); outcome D2Hs + the one host sync stay outside behind the graph
+launch; destroy per round after the sync. No capture rejection ever fired:
+623/623 rounds (both KVs, mixed suffix+gated and trim-active shapes
+included, up to 3574 nodes) captured, instantiated and replayed clean.
+BYTES: master-refs procedure (batch_ab LEGS=B REPS=1 MAXTOK=512, fp8 +
+turbo3, systemd-run, GPU idle-checked) vs scratchpad/p2_baseline/refs.md5
+(trailing-newline md5 convention): turbo3 8/8 EXACT; fp8 dbg pass 4/4 EXACT;
+fp8 measured leg drew the known docs-first arrival composition and matches
+the like-composition pre-spike reference (p2_exit/fp8: codegen 905c96d5,
+docs a9f1e759) bitwise -- an arrival fork reproduced exactly, not a capture
+leak. Zero byte deviations anywhere = no capture-semantics state leak.
+COSTS (fresh capture per round, throwaway pattern): body+capture ~1.0-1.1ms
++ EndCapture ~0.03 + instantiate ~1.4-1.6ms (first-call ~9ms) = ~2.4-2.7ms
+median/round at 2462 (fp8) / 2526 (t3) median nodes; T0's 3.5ms @2192
+number was the warmup-inclusive analog. Served aggregate under the spike:
+fp8 220.4 vs 221.6 eager (-0.5%), t3 209.0 vs 214.6 (-2.6%) -- the replay
+saving (~3.5-4.3ms arithmetic) nearly pays the every-round capture tax
+already, live corroboration that cached execs (tax -> first-sight only)
+clear the T4 bar arithmetic. CENSUS (9 Bdbg logs: p2c_t3, p2_exit x3, p2_t4
+x2, p3_s1 x2; key = engine tuple + granted width vector + sfx class + gemm
+family + sampled mask + kv_kind): fp8 795 rounds / 28 distinct keys, top-16
+= 84.9%, top-32 = 100%; turbo3 611 / 28, top-16 = 85.3%, top-32 = 100%.
+Sampled mask (0,0) throughout (greedy payloads); gemm family gemv99
+throughout (29 mixed suffix+gated rounds, no all-suffix round observed);
+kv_kind partitions the table per server config; engine tuple constant (0,1)
+by the md5 composition witness -- NOTE the [gen] prefill-start order is NOT
+that witness (p2_exit/t3 dbg: docs-first [gen], canonical bytes). VERDICT:
+per-KV top-16 sits at the ~85% bar, and the stronger fact decides -- the
+full per-KV alphabet (28) fits the T3 LRU-32 with headroom, so steady-state
+hit rate is 100% after ~28 first-sight captures (~2.4ms each, warmup-class).
+GO: T1 gates pass, proceed to T2 (conv/delta table twins) + T3 approach A
+(whole-round shape-keyed exec cache); fallback D (segmented capture) NOT
+triggered. T3 caveat banked: a mid-server composition flip (member re-join)
+flips the tuple and can double the live alphabet past 32; LRU + cheap
+recapture keeps it benign, revisit the cap under multi-tenant churn.
+
+**2026-07-16 -- P3 T4: THE BAR PASSES. fp8 1.41x / turbo3 1.40x (bar 1.38x),
+solo regression 0.00%.** Full battery at 3500a9c: clean rebuild; test_kernels/
+test_conductor/ninv (NINV+SEAM+TWIN legs, both arches) ALL PASS; canonical +
+sampled-seed EXACT; fused_smoke all legs incl. the graph leg, fp16+turbo3;
+master refs graphs-ON 32/32 EXACT (B4 x2 both KVs, all canonical
+composition); memcheck small-footprint with Q27_BATCH_GRAPH=1: 0 errors, 64
+fused graph-replay rounds under the tool. THE BAR (batch_ab REPS=3 legs
+A/B/D, MAXTOK=512):
+
+  KV       leg A    leg B (graphs)  ratio   solo delta
+  fp8      168.8    237.5 t/s       1.41x   +0.00/+0.00%
+  turbo3   158.7    221.6 t/s       1.40x   +0.00/-0.06%
+
+The P3 arc: eager dispatch tax measured 3.4 ms/round (2,610 launches x
+~1.66us GPU starvation, nsys attribution) -> T2 table twins make rounds
+perm-invariant (+0.2-0.3 ms eager cost, accepted) -> T3 shape-keyed LRU-32
+exec cache (28-key alphabet, 100% steady-state hits, always-on stale-key
+guard, first-sight capture ~10 ms warmup-class) -> steady phv/round -2.9 ms
+-> aggregate 221.6 -> 237.5 (fp8). T5 draft micro-graphs SKIPPED (bar
+exceeded; the +0.27 ms draft pool stays on the shelf). Cumulative
+continuous-batching arc at 2 slots: FIFO 1.00x -> P1 1.21x -> P2 1.31x ->
+P3 1.41x (fp8; turbo3 1.40x), solo cost zero at every stage, byte-identity
+to the P2 references held through every phase. Landing at the top of the
+design workflow's 1.39-1.44x projection. Remaining shelf: mixer
+co-residency (~3.5 ms, the biggest unexplored pool), draft pool 0.27 ms,
+twins' 0.2-0.3 ms eager cost (moot under graphs -- rounds replay).
+
+**2026-07-16 -- P4 MIXER CO-RESIDENCY: MEASURED NO-GO (closed-architectural,
+nothing built).** The post-P3 shelf said ~3.5 ms of unrealized mixer overlap.
+Attribution (nsys, scratchpad/p4_measure/ATTRIBUTION.md) decomposed it: the
+figure was mostly LAUNCH TAX DOUBLE-COUNTED -- P3's graphs already harvested
+the GDN share (loss 1.04 -> 0.16 ms/round, node-level profile) -- leaving a
+true residual of ~0.7-0.8 ms/round concentrated in fdmma/fd2 WAVE
+SERIALIZATION: each engine's verify attention fills exactly one full GPU
+wave by design (ns=85 x 4 heads = 340 CTAs = 2/SM x 170 SMs, third CTA
+forbidden by regs AND smem), so two engines board only in each other's
+drain tails. The one candidate lever (k-aware half-wave split, ns=85/k) was
+mechanism-probed at ns=42 vs 85 on like-shape fused rounds (trajectory-clean;
+fd2 controls identical): co-residency becomes TOTAL (both/min 53% -> 98%,
+wall collapses onto max) BUT per-kernel time inflates 1.3-1.6x (each engine
+streams its KV pass through half the machine), netting -13.7 us/window =
+~0.10 ms/round live -- 3-4x short of the +1.5% bar, at the price of the
+batched-vs-solo bitwise gate on attn rounds. The free end-to-end spike
+(process-wide NS=42 batch_ab) was discarded as confounded: the tolerance
+fork re-rolled the codegen trajectory (dec 512->397, fused rounds 159->72),
+a caution for any future numeric-knob A/B. CLOSING PHYSICS, completing the
+P2 lesson: weight-BW-bound work -> fusion only; state-latency-bound work ->
+overlap; SATURATED work (attn KV streaming at depth) -> neither. The
+continuous-batching campaign ends at fp8 1.41x / turbo3 1.40x (2 slots,
+solo 0%), with the residual ~0.6 ms/round booked closed-architectural and
+the remaining shelf (draft pool 0.27 ms, kernel-fusion node floor ~0.3 ms)
+priced below build cost.
+
+**2026-07-16 -- P3 LIVE CC A/B: graphs vs eager on real agentic traffic =
+TRANSFERS. Depth-matched fused phv/round -4.9 to -5.5 ms (-17 to -19%),
+fused tps +15-17%; solo untouched; zero errors both legs. One live finding:
+the CC key alphabet (44+) outruns the LRU-32 cap -- churn is benign.**
+Method: two thunderdome CC tasks (T2 collab-server + T5 task-queue, one pair
+per leg, staggered 15 s) driven CONCURRENTLY at the same server, same day,
+same build (master 765933d, build/q27-server W12), same shape: Q27_KV=turbo3
+Q27_MAXD=auto Q27_BATCH=1, 2 slots x 98304, --no-think --fast-head, port
+8081, systemd unit q27-eval; leg GRAPHS adds Q27_BATCH_GRAPH=1, leg EAGER
+omits it (GRAPHS ran first). Both legs +Q27_PHASE_STATS=1 +Q27_BATCH_DBG=1
+(phv + gcache/bat telemetry). Per the 07-15 CC-validation register: CC
+trajectories fork on wall-clock bytes, so WALLS AND SCORES ARE
+TRAJECTORY-CONFOUNDED; the engine's own [req] lines are the currency.
+Evidence: scratchpad/p3_cc_ab/{graphs,eager}/ (journal + req.lines +
+harness logs + analyze.py/bucket.py).
+
+STABILITY (gate 1): both legs ZERO end=error / [req-error] / 5xx; servers
+survived and stopped clean; GRAPHS 92 reqs (92 eos; http 92x200+2x404 HEAD
+probes), EAGER 138 reqs (137 eos, 1 n_max; 138x200+2x404). GCACHE (GRAPHS):
+rounds=954 hits=822 misses=132 evictions=100 guard_trips=0 (86.2% hit).
+The "misses ~= alphabet, 0 trips" expectation HALF-held: gt=0, but live CC
+drew 44+ distinct keys (vs the batch_ab census's 28) -- maxd-auto width
+churn on real traffic is richer than bench payloads, the LRU-32 cap binds
+and ~88 of the misses are eviction-churn recaptures. Benign: recapture tax
+~132 x 2.4 ms ~= 0.3 s across the 42 s fused window (<1%), and the hit rate
+held 86%. Q27_BATCH_GRAPH_CAP is the knob if multi-tenant traffic ever
+widens this (cap 64 would swallow the observed alphabet).
+
+THE COMPARISON (fused traffic, [req] currency). Raw distributions
+(trajectory-confounded mixes -- GRAPHS drew SHORT trajectories, EAGER long,
+see scores): fused (bat>=1.5) tps med/p75/max GRAPHS 132.5/140.0/177.0
+(n=36) vs EAGER 123.3/147.4/190.6 (n=95); fully-fused (bat=2.0) phv/round
+weighted GRAPHS 24.23 ms (1193 rounds) vs EAGER 30.31 ms (9692 rounds).
+The de-confounded cut -- fully-fused reqs bucketed by prompt depth, with
+tok/round verified matched (3.7-4.3 both legs, GRAPHS wider at [30-40K)):
+
+  ctx bucket    phv/round(w)  GRAPHS vs EAGER      tps med          phv/token
+  [20K,30K)     23.80 vs 29.33  (-5.5ms, -18.9%)   132.4 vs 114.6   6.41 vs 7.52
+  [30K,40K)     24.95 vs 29.87  (-4.9ms, -16.5%)   137.9 vs 117.8   5.76 vs 7.39
+  [40K,60K)*    26.98 vs 30.82  (-3.8ms)           151.0 vs 129.6   5.87 vs 7.15
+  [60K,100K)*   28.57 vs 31.55  (-3.0ms)           125.8 vs 120.5   4.80 vs 6.66
+  (* GRAPHS side of the deep buckets = the same-shape P3-exit CC sanity
+  dataset (graphs ON, long trajectories) -- this leg's short draw produced
+  no fused traffic past 40K; two independent graphs datasets agree at
+  every matched depth.)
+
+VERDICT: P3 TRANSFERS. Live fused rounds save 3.0-5.5 ms/round depth-matched
+(T4 bench arithmetic said -2.9 steady; mid-depth live rounds beat it --
+md-auto runs deeper draft chains per round than the w16 bench shape, so a
+round carries more launches for the graph to erase), fused-window tps +15-17%
+at matched depth (bench aggregate increment was +9.8% turbo3). Solo tps:
+raw medians 202.5 vs 232.2 look like a gap but do NOT replicate -- depth-
+matched buckets split both directions ([40-60K) 213.8 vs 235.2, [60-100K)
+261.6 vs 270.1, and the prior graphs sanity drew 266.8 at [40-60K), ABOVE
+eager) -- mix noise, consistent with T4's solo delta 0.00% (graphs only
+touch fused rounds). Aggregate tokens/overlap-window (801 vs 985 tok/s) is
+NOT comparable: dec_ms window reconstruction compresses gate waits and the
+fused samples differ 8x in size; descriptive only, non-load-bearing.
+
+SCORES (descriptive, basin-lottery caveat -- n=1/task/leg cannot separate
+anything): GRAPHS T2 0.287 (completed, 87 s, 36 turns) / T5 0.607
+(completed, 180 s); EAGER T2 0.530 (completed, 1160 s) / T5 0.615
+(completed, 960 s); prior same-shape graphs sanity T2 0.565 / T5 0.575.
+All four completed, zero crashes = the only score-shaped signal. The
+lottery cut BOTH ways on walls (GRAPHS leg drew 87/180 s, EAGER 1160/960 s)
+-- which is exactly why walls and scores are not the currency here. Context
+for the running table: 07-15 turbo3 CC validation (P1-era batching, same
+2x96K capacity): per-req decode med 113 t/s, ~900 reqs 0 errors; this A/B's
+fused medians (GRAPHS 132.5 live vs that 113) also carry P2's fusion gains,
+not graphs alone. Serving call stands: Q27_BATCH default-off is a product
+call, but when batching is on, Q27_BATCH_GRAPH=1 is now validated live --
+stability clean, solo-neutral, and the fused-round win is real on agentic
+traffic.

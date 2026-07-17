@@ -142,6 +142,9 @@ void gdn_gates(const float* alpha_raw, const float* beta_raw, const float* ssm_a
     CUDA_CHECK(cudaGetLastError());
 }
 
+// MIRROR WARNING (P3 exit review M2): k_conv_step_t below is a TABLE TWIN of
+// this body -- any arithmetic change here MUST be mirrored there and re-gated
+// with ninv's TWIN leg (bitwise, both arches), or the fused path diverges.
 __global__ void k_conv_step(const float* __restrict__ rin, float* __restrict__ rout,
                             const float* __restrict__ qkv, const float* __restrict__ w,
                             float* __restrict__ out, int channels) {
@@ -167,9 +170,46 @@ void conv_step(const float* ring_src, float* ring_dst, const float* qkv, const f
     CUDA_CHECK(cudaGetLastError());
 }
 
+// P3 T2 TABLE TWIN of k_conv_step (see blocks.cuh): body copied verbatim, the
+// only change is where rin/rout come from -- two plain global pointer loads
+// from the per-layer table, indexed by the device perm scalar. Same grid,
+// same thread mapping, same accumulation order, same per-thread access
+// pattern on the ring/qkv/weight data.
+__global__ void k_conv_step_t(float* const* __restrict__ rtab, const int* __restrict__ dperm,
+                              int role_in, int role_out, int wmax,
+                              const float* __restrict__ qkv, const float* __restrict__ w,
+                              float* __restrict__ out, int channels) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int p = *dperm;
+    const float* __restrict__ rin = rtab[(role_in + p) % wmax];
+    float* __restrict__ rout = rtab[(role_out + p) % wmax];
+    const float* wc = w + (size_t)c * 4; // [channels][4], taps contiguous
+    float r0 = rin[c], r1 = rin[channels + c], r2 = rin[2 * channels + c], x = qkv[c];
+#if Q27_CONV_OLDEST_FIRST
+    float acc = r0 * wc[0] + r1 * wc[1] + r2 * wc[2] + x * wc[3];
+#else
+    float acc = r0 * wc[3] + r1 * wc[2] + r2 * wc[1] + x * wc[0];
+#endif
+    out[c] = acc / (1.0f + expf(-acc)); // silu
+    rout[c] = r1;
+    rout[channels + c] = r2;
+    rout[2 * channels + c] = x;
+}
+
+void conv_step_t(float* const* ring_tab, const int* d_perm, int role_in, int role_out,
+                 int wmax, const float* qkv, const float* convw, float* out, int channels,
+                 cudaStream_t st) {
+    k_conv_step_t<<<(channels + 255) / 256, 256, 0, st>>>(ring_tab, d_perm, role_in, role_out,
+                                                          wmax, qkv, convw, out, channels);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Gated delta rule, one token. Block per v-head, 512 threads = (i-tile: 4) x (j: 128).
 // The i-reductions (pred = k^T S, o = q^T S) parallelize across 4 tiles of 32 i each;
 // consecutive threads hit consecutive j -> coalesced on S[i*SK + j].
+// MIRROR WARNING (P3 exit review M2): k_delta_step_t is a TABLE TWIN of this
+// body -- mirror any change there and re-gate with ninv's TWIN leg.
 __global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__ Sdst,
                              const float* __restrict__ conv,
                              const float* __restrict__ g, const float* __restrict__ beta,
@@ -240,6 +280,82 @@ __global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__
 void delta_step(const float* S_src, float* S_dst, const float* conv_out, const float* g,
                 const float* beta, float* o, cudaStream_t st) {
     k_delta_step<<<48, 512, 0, st>>>(S_src, S_dst, conv_out, g, beta, o);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// P3 T2 TABLE TWIN of k_delta_step (see blocks.cuh): body copied verbatim,
+// the only change is where Ssrc/Sdst come from -- two plain global pointer
+// loads from the per-layer table, indexed by the device perm scalar. Same
+// 48x512 launch, same i-tile/j mapping, same accumulation order, same sreg
+// register residency.
+__global__ void k_delta_step_t(float* const* __restrict__ Stab, const int* __restrict__ dperm,
+                               int role_in, int role_out, int wmax,
+                               const float* __restrict__ conv,
+                               const float* __restrict__ g, const float* __restrict__ beta,
+                               float* __restrict__ o) {
+    const int p = *dperm;
+    const float* __restrict__ Ssrc = Stab[(role_in + p) % wmax];
+    float* __restrict__ Sdst = Stab[(role_out + p) % wmax];
+    constexpr int SK = 128;
+    const int h = blockIdx.x;
+    const int j = threadIdx.x & (SK - 1);   // 0..127
+    const int it = threadIdx.x >> 7;        // 0..3
+    const int i0 = it * 32;
+#if Q27_GDN_HEAD_TILE
+    const int qk = h % 16;
+#else
+    const int qk = h / 3;
+#endif
+    __shared__ float sq[SK], sk[SK], part[4][SK], dj[SK];
+    const float scale = rsqrtf((float)SK);
+    if (it == 0) {
+        sq[j] = conv[qk * SK + j] * scale;
+        sk[j] = conv[2048 + qk * SK + j];
+    }
+    __syncthreads();
+
+    const float decay = expf(g[h]);
+    const float* Si = Ssrc + (size_t)h * SK * SK;
+    float* So = Sdst + (size_t)h * SK * SK;
+
+    float sreg[32];
+    float pred = 0.f;
+#pragma unroll
+    for (int k = 0; k < 32; k++) {
+        int i = i0 + k;
+        float s = Si[i * SK + j] * decay;
+        sreg[k] = s;
+        pred += sk[i] * s;
+    }
+    part[it][j] = pred;
+    __syncthreads();
+    if (it == 0) {
+        float p2 = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+        float vj = conv[4096 + h * SK + j];
+        dj[j] = beta[h] * (vj - p2);
+    }
+    __syncthreads();
+
+    float d = dj[j];
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < 32; k++) {
+        int i = i0 + k;
+        float s = sreg[k] + sk[i] * d;
+        So[i * SK + j] = s;
+        acc += sq[i] * s;
+    }
+    part[it][j] = acc;
+    __syncthreads();
+    if (it == 0)
+        o[h * SK + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+}
+
+void delta_step_t(float* const* S_tab, const int* d_perm, int role_in, int role_out,
+                  int wmax, const float* conv_out, const float* g, const float* beta,
+                  float* o, cudaStream_t st) {
+    k_delta_step_t<<<48, 512, 0, st>>>(S_tab, d_perm, role_in, role_out, wmax, conv_out, g,
+                                       beta, o);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -48,6 +48,19 @@
 // memcmp. EITHER verdict is a valid result -- a DIFFER downgrades the
 // documented claim to tolerance-class (A1 flavor); do not touch the kernels.
 //
+// TWIN LEG (P3 T2, docs/plans/2026-07-16-batch-p3-capture.md): conv_step/
+// delta_step vs their TABLE TWINS conv_step_t/delta_step_t (blocks.cuh) --
+// the capture-plan kernels whose role pointers resolve ON DEVICE from a
+// [layer][W_MAX] pointer table + perm scalar instead of host-resolved
+// (role+perm)%W_MAX params. Identical seeded ring/S state feeds two replicas
+// through the full per-lane recurrent chain gdn_mix runs (lane-0 in-place,
+// lane L reads role L-1 writes role L, l2norm3 between conv and delta),
+// table+perm set so the twins resolve the very buffers the host resolution
+// picks. BITWISE memcmp over every role ring, every S state and every live
+// convout/o lane, W in {2,5,12} x perm in {0,5,11} x 3 layers. UNLIKE the
+// tables above, a mismatch here is DOA for the P3 capture plan -- no
+// tolerance class, no A1 downgrade: the twins ship only if bitwise.
+//
 // Usage: ninv_test [model.q27]   (default: the canonical qwen36-27b-mtp)
 #include <cmath>
 #include <cstdint>
@@ -459,6 +472,187 @@ static void seam_leg(q27::DeviceModel& dm, const q27::DevTensor& w_down,
     CUDA_CHECK(cudaFree(d_tok));
 }
 
+// ---------------------------------------------------------------------------
+// TWIN LEG (file-header comment): conv_step/delta_step vs the P3 T2 table
+// twins, full recurrent chain, bitwise. Standalone state -- touches none of
+// the payload/junk machinery above except h_scratch-style staging.
+
+static void twin_leg() {
+    // Mirrors the engine's GDN geometry (engine.cuh): GDN_CH channels,
+    // 48 v-heads x 128, ring = [3][CH]. WMAXT mirrors the default W_MAX=12
+    // ring modulus (the twins take it as a runtime param).
+    const int CH = 10240, HEADS = 48, SKD = 128, WMAXT = 12, NLT = 3;
+    const int64_t RINGN = 3 * (int64_t)CH;
+    const int64_t SN = (int64_t)HEADS * SKD * SKD;
+    const int64_t ON = (int64_t)HEADS * SKD;
+
+    printf("\n== twin: conv/delta table twins vs originals (recurrent chain, bitwise) ==\n");
+
+    // two replicas (orig path / twin path) of the per-layer role state
+    static float *ring_o[NLT][12], *ring_t[NLT][12], *S_o[NLT][12], *S_t[NLT][12];
+    float *convo_o[12], *convo_t[12], *oo_o[12], *oo_t[12];
+    float *qkv_in[12], *g_in[12], *beta_in[12], *w4;
+    for (int il = 0; il < NLT; il++)
+        for (int ph = 0; ph < WMAXT; ph++) {
+            CUDA_CHECK(cudaMalloc(&ring_o[il][ph], RINGN * 4));
+            CUDA_CHECK(cudaMalloc(&ring_t[il][ph], RINGN * 4));
+            CUDA_CHECK(cudaMalloc(&S_o[il][ph], SN * 4));
+            CUDA_CHECK(cudaMalloc(&S_t[il][ph], SN * 4));
+        }
+    for (int L = 0; L < WMAXT; L++) {
+        CUDA_CHECK(cudaMalloc(&convo_o[L], CH * 4));
+        CUDA_CHECK(cudaMalloc(&convo_t[L], CH * 4));
+        CUDA_CHECK(cudaMalloc(&oo_o[L], ON * 4));
+        CUDA_CHECK(cudaMalloc(&oo_t[L], ON * 4));
+        CUDA_CHECK(cudaMalloc(&qkv_in[L], CH * 4));
+        CUDA_CHECK(cudaMalloc(&g_in[L], HEADS * 4));
+        CUDA_CHECK(cudaMalloc(&beta_in[L], HEADS * 4));
+    }
+    CUDA_CHECK(cudaMalloc(&w4, (size_t)CH * 4 * 4));
+
+    // device table, engine layout: flat [2][NLT][WMAXT] float*, ring half
+    // then S half, entry [il][ph] = twin replica buffer ph (exactly what
+    // RBuf/SBuf return for (role+perm)%W_MAX == ph). Uploaded ONCE.
+    float** d_tab;
+    int* d_perm;
+    {
+        std::vector<float*> htab(2 * (size_t)NLT * WMAXT);
+        for (int il = 0; il < NLT; il++)
+            for (int ph = 0; ph < WMAXT; ph++) {
+                htab[(size_t)il * WMAXT + ph] = ring_t[il][ph];
+                htab[(size_t)NLT * WMAXT + (size_t)il * WMAXT + ph] = S_t[il][ph];
+            }
+        CUDA_CHECK(cudaMalloc(&d_tab, htab.size() * sizeof(float*)));
+        CUDA_CHECK(cudaMemcpy(d_tab, htab.data(), htab.size() * sizeof(float*),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_perm, 4));
+    }
+
+    std::vector<float> big(SN);
+    const int WS[] = {2, 5, 12}, PERMS[] = {0, 5, 11};
+    long leg_diffs = 0;
+
+    for (int wi = 0; wi < 3; wi++)
+        for (int pi = 0; pi < 3; pi++) {
+            const int W = WS[wi], perm = PERMS[pi];
+            const uint32_t base = 0x73A1u ^ (uint32_t)(W << 16) ^ (uint32_t)(perm << 8);
+            // identical seeded state into BOTH replicas; fresh per config
+            // (the chain mutates state, configs must not couple)
+            for (int il = 0; il < NLT; il++)
+                for (int ph = 0; ph < WMAXT; ph++) {
+                    fill_rand(big.data(), RINGN, base + 101u * (uint32_t)(il * 16 + ph), 0.8f);
+                    CUDA_CHECK(cudaMemcpy(ring_o[il][ph], big.data(), RINGN * 4,
+                                          cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(ring_t[il][ph], big.data(), RINGN * 4,
+                                          cudaMemcpyHostToDevice));
+                    fill_rand(big.data(), SN, base + 977u * (uint32_t)(il * 16 + ph), 0.6f);
+                    CUDA_CHECK(cudaMemcpy(S_o[il][ph], big.data(), SN * 4,
+                                          cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(S_t[il][ph], big.data(), SN * 4,
+                                          cudaMemcpyHostToDevice));
+                }
+            for (int L = 0; L < WMAXT; L++) { // shared read-only per-lane inputs
+                fill_rand(big.data(), CH, base + 3u * (uint32_t)L + 1u, 0.9f);
+                CUDA_CHECK(cudaMemcpy(qkv_in[L], big.data(), CH * 4, cudaMemcpyHostToDevice));
+                fill_rand(big.data(), HEADS, base + 3u * (uint32_t)L + 2u, 1.0f);
+                CUDA_CHECK(cudaMemcpy(g_in[L], big.data(), HEADS * 4, cudaMemcpyHostToDevice));
+                fill_rand(big.data(), HEADS, base + 3u * (uint32_t)L + 3u, 1.0f);
+                CUDA_CHECK(cudaMemcpy(beta_in[L], big.data(), HEADS * 4,
+                                      cudaMemcpyHostToDevice));
+            }
+            fill_rand(big.data(), (int64_t)CH * 4, base + 0xC0FFEEu, 0.5f);
+            CUDA_CHECK(cudaMemcpy(w4, big.data(), (size_t)CH * 4 * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_perm, &perm, 4, cudaMemcpyHostToDevice));
+
+            long diffs = 0;
+            int64_t mu = 0;
+            for (int il = 0; il < NLT; il++) {
+                // per-path output poison: "kernel wrote nothing" can't pass
+                for (int L = 0; L < W; L++) {
+                    CUDA_CHECK(cudaMemset(convo_o[L], 0xAA, CH * 4));
+                    CUDA_CHECK(cudaMemset(convo_t[L], 0xBB, CH * 4));
+                    CUDA_CHECK(cudaMemset(oo_o[L], 0xAA, ON * 4));
+                    CUDA_CHECK(cudaMemset(oo_t[L], 0xBB, ON * 4));
+                }
+                // l2norm3 lane lists (both paths run the SAME kernel on their
+                // own convout replicas; junk pointers pad the dead slots)
+                q27k::P3 lo{}, lt{};
+                for (int s = 0; s < W_PLUMB; s++) { lo.p[s] = d_junk_y[s]; lt.p[s] = d_junk_y[s]; }
+                for (int L = 0; L < W; L++) { lo.p[L] = convo_o[L]; lt.p[L] = convo_t[L]; }
+
+                // ORIGINAL path: host-resolved roles, gdn_mix's exact chain
+                auto RB = [&](int role) { return ring_o[il][(role + perm) % WMAXT]; };
+                auto SB = [&](int role) { return S_o[il][(role + perm) % WMAXT]; };
+                q27k::conv_step(RB(0), RB(0), qkv_in[0], w4, convo_o[0], CH, 0); // lane 0
+                for (int L = 1; L < W; L++)
+                    q27k::conv_step(RB(L - 1), RB(L), qkv_in[L], w4, convo_o[L], CH, 0);
+                q27k::l2norm3(lo, 32, SKD, 1e-6f, 0, W);
+                q27k::delta_step(SB(0), SB(0), convo_o[0], g_in[0], beta_in[0], oo_o[0], 0);
+                for (int L = 1; L < W; L++)
+                    q27k::delta_step(SB(L - 1), SB(L), convo_o[L], g_in[L], beta_in[L],
+                                     oo_o[L], 0);
+
+                // TWIN path: device-resolved roles (table + perm scalar)
+                float* const* tR = d_tab + (size_t)il * WMAXT;
+                float* const* tS = d_tab + (size_t)NLT * WMAXT + (size_t)il * WMAXT;
+                q27k::conv_step_t(tR, d_perm, 0, 0, WMAXT, qkv_in[0], w4, convo_t[0], CH, 0);
+                for (int L = 1; L < W; L++)
+                    q27k::conv_step_t(tR, d_perm, L - 1, L, WMAXT, qkv_in[L], w4, convo_t[L],
+                                      CH, 0);
+                q27k::l2norm3(lt, 32, SKD, 1e-6f, 0, W);
+                q27k::delta_step_t(tS, d_perm, 0, 0, WMAXT, convo_t[0], g_in[0], beta_in[0],
+                                   oo_t[0], 0);
+                for (int L = 1; L < W; L++)
+                    q27k::delta_step_t(tS, d_perm, L - 1, L, WMAXT, convo_t[L], g_in[L],
+                                       beta_in[L], oo_t[L], 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                // live per-lane outputs, per layer (buffers are reused across
+                // layers exactly like the engine's convout/o)
+                for (int L = 0; L < W; L++) {
+                    diffs += seam_cmp(convo_o[L], convo_t[L], CH, &mu);
+                    diffs += seam_cmp(oo_o[L], oo_t[L], ON, &mu);
+                }
+            }
+            // final role state, EVERY physical buffer (untouched roles hold
+            // the identical seed bytes; touched ones are the chain's writes)
+            for (int il = 0; il < NLT; il++)
+                for (int ph = 0; ph < WMAXT; ph++) {
+                    diffs += seam_cmp(ring_o[il][ph], ring_t[il][ph], RINGN, &mu);
+                    diffs += seam_cmp(S_o[il][ph], S_t[il][ph], SN, &mu);
+                }
+            printf("  twin chain  W=%2d perm=%2d layers=%d  diffs=%ld  %s", W, perm, NLT,
+                   diffs, diffs == 0 ? "PASS" : "FAIL");
+            if (diffs) printf("  (max %lld ulp)", (long long)mu);
+            printf("\n");
+            CHECK(diffs == 0, "twin chain W=%d perm=%d: %ld floats differ (DOA for P3 capture)",
+                  W, perm, diffs);
+            leg_diffs += diffs;
+        }
+    if (leg_diffs == 0) printf("TWIN BITWISE: ALL PASS\n");
+    else printf("TWIN BITWISE: FAIL (%ld diffs -- DOA, do not proceed to T3)\n", leg_diffs);
+
+    for (int il = 0; il < NLT; il++)
+        for (int ph = 0; ph < WMAXT; ph++) {
+            CUDA_CHECK(cudaFree(ring_o[il][ph]));
+            CUDA_CHECK(cudaFree(ring_t[il][ph]));
+            CUDA_CHECK(cudaFree(S_o[il][ph]));
+            CUDA_CHECK(cudaFree(S_t[il][ph]));
+        }
+    for (int L = 0; L < WMAXT; L++) {
+        CUDA_CHECK(cudaFree(convo_o[L]));
+        CUDA_CHECK(cudaFree(convo_t[L]));
+        CUDA_CHECK(cudaFree(oo_o[L]));
+        CUDA_CHECK(cudaFree(oo_t[L]));
+        CUDA_CHECK(cudaFree(qkv_in[L]));
+        CUDA_CHECK(cudaFree(g_in[L]));
+        CUDA_CHECK(cudaFree(beta_in[L]));
+    }
+    CUDA_CHECK(cudaFree(w4));
+    CUDA_CHECK(cudaFree(d_tab));
+    CUDA_CHECK(cudaFree(d_perm));
+}
+
 int main(int argc, char** argv) {
     const char* path =
         argc > 1 ? argv[1] : "/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27";
@@ -547,6 +741,11 @@ int main(int argc, char** argv) {
     // flag, launch_bounds retier, kernel edit) must fail this binary, not
     // silently downgrade the fused-vs-solo margin claim.
     fails += seam_pairs_differ;
+
+    // P3 T2: conv/delta table twins vs originals (file-header TWIN LEG note).
+    // CHECK() inside feeds `fails` directly -- a twin mismatch is a hard
+    // failure (DOA for the capture plan), not an A1 tolerance downgrade.
+    twin_leg();
 
     if (fails == 0) printf("NINV ALL PASS\n");
     else printf("ninv_test: %d FAILURES -- finding, not a bug: contract downgrades per A1\n",
