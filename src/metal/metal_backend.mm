@@ -72,6 +72,13 @@ NSString* load_kernel_source() {
         [candidates addObject:[NSString stringWithUTF8String:override_path]];
     [candidates addObject:@"src/metal/q27_kernels.metal"];
     [candidates addObject:@"./src/metal/q27_kernels.metal"];
+#ifdef Q27_SHADER_PATH
+    // Installed-binary fallback (Homebrew packaging): the formula bakes its
+    // share-dir shader path at build time, so binaries work from any cwd.
+    // The relative candidates above still win inside a source checkout, and
+    // the ABI tag check below applies to every candidate equally.
+    [candidates addObject:@Q27_SHADER_PATH];
+#endif
 
     for (NSString* path in candidates) {
         if (![files fileExistsAtPath:path]) continue;
