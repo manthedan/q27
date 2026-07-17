@@ -1,0 +1,11 @@
+Metal model ready on Apple M4 in 6.24 s (two engines, one mapping: fp16 baseline vs turbo3 cell L55:h2:V round-trip)
+kl-kv: 2048 positions, single pass, no resets
+  kl pos 384/2048  kl pos 768/2048  kl pos 1152/2048  kl pos 1536/2048  kl pos 1920/2048  kl pos 2048: running mean 0.000178007 nats
+
+kl-kv tail: p50 5.41e-05  p90 0.0002511  p99 0.002055  p99.5 0.004697  max 0.03989 @pos 191
+kl-kv runs >0.1: 0 positions, 0 runs, longest 0
+kl-kv runs >0.5: 0 positions, 0 runs, longest 0
+kl-kv wall: 141.69 s (14.45 pos/s through both engines), overall mean KL 0.000178007 nats, max 0.0398939
+KV forward-KL vs fp16 baseline by target position (2049 tokens, no resets):
+  0-2k    : mean KL 0.000178043 nats  max 0.0398939  (n=2047)
+  2k-8k   : mean KL 0.0001041 nats  max 0.0001041  (n=1)

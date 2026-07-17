@@ -55,10 +55,20 @@ for cell in $(seq 0 127); do
     [ -s "$log" ] && grep -q "overall mean KL" "$log" && continue  # resumable
     # 2049 tokens => 2,048 evaluated positions (the KL path encodes n-1;
     # codex P2 on d6ebfa5).
-    caffeinate -i "$BIN" "$MODEL" "$TOK" --nll "$CORPUS" \
-        --nll-long 2049 --ctx 2048 --kl-kv-cell "$cell" > "$log" 2>&1
-    grep -q "overall mean KL" "$log" ||
-        { echo "census: cell $cell FAILED (see $log), aborting" | tee "$OUT/ABORTED"; exit 1; }
+    # One retry per cell: a transient GPU fault must not kill the whole
+    # unattended batch (2026-07-16: cell 32 aborted the first census run at
+    # ~pos 1920 with a command-buffer page fault). A cell that fails TWICE
+    # is a real problem and still aborts loud.
+    for attempt in 1 2; do
+        caffeinate -i "$BIN" "$MODEL" "$TOK" --nll "$CORPUS" \
+            --nll-long 2049 --ctx 2048 --kl-kv-cell "$cell" > "$log" 2>&1
+        grep -q "overall mean KL" "$log" && break
+        [ "$attempt" = 1 ] &&
+            { mv "$log" "$log.attempt1"
+              echo "census: cell $cell attempt 1 failed (see $log.attempt1), retrying once"; }
+    done
+    grep -q "overall mean KL" "$log" 2>/dev/null ||
+        { echo "census: cell $cell FAILED twice (see $log), aborting" | tee "$OUT/ABORTED"; exit 1; }
 done
 
 # Summary TSV: cell, layer, head, side, mean, p99, p99.5, max, max_pos
