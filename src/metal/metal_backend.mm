@@ -63,7 +63,7 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 11";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 12";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -168,7 +168,7 @@ struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
 struct ArgmaxRowsArgs { uint32_t n, rows; };
 struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
 struct AttentionCausalWinArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, out_row_stride; float scale; };
-struct KvStoreHeadRowsArgs { uint32_t position, src_stride, row_length, tokens; };
+struct KvStoreHeadRowsArgs { uint32_t position, src_stride, row_length, tokens, codec; };
 
 } // namespace
 
@@ -2421,9 +2421,12 @@ void MetalBackend::kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer
 void MetalBackend::kv_store_f16_head_rows_side(const BackendBuffer& k, const BackendBuffer& v,
                                                uint32_t head_offset_elems, uint32_t src_stride,
                                                BackendBuffer& k_side, BackendBuffer& v_side,
-                                               uint32_t position, uint32_t row_length, uint32_t tokens) {
+                                               uint32_t position, uint32_t row_length, uint32_t tokens,
+                                               uint32_t codec) {
     if (!tokens || tokens > 96 || !row_length || row_length > src_stride)
         throw std::runtime_error("q27 Metal: invalid KV side store");
+    if (codec > 1)
+        throw std::runtime_error("q27 Metal: KV side store codec must be 0 (fp16) or 1 (e4m3)");
     const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
     MetalBuffer& kc = metal_buffer(k_side); MetalBuffer& vc = metal_buffer(v_side);
     const uint64_t src_off = (uint64_t)head_offset_elems * 4;
@@ -2432,7 +2435,7 @@ void MetalBackend::kv_store_f16_head_rows_side(const BackendBuffer& k, const Bac
     check_range(vb.size(), src_off, src_need, "KV side store V rows");
     check_range(kc.size(), (uint64_t)position * row_length * 2, (uint64_t)row_length * tokens * 2, "K side cache");
     check_range(vc.size(), (uint64_t)position * row_length * 2, (uint64_t)row_length * tokens * 2, "V side cache");
-    KvStoreHeadRowsArgs args{position, src_stride, row_length, tokens};
+    KvStoreHeadRowsArgs args{position, src_stride, row_length, tokens, codec};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_f16_head_rows");
         [enc setComputePipelineState:impl_->kv_store_head_rows];

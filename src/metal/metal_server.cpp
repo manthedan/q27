@@ -391,7 +391,8 @@ struct Runtime {
         // and snapshot_bytes() prices them, so no capacity override exists
         // anymore. Informational note only.
         if(slots.front()->engine.kv_fp16_except())
-            fprintf(stderr,"q27 Metal server: KV fp16 exception cells active (Q27_METAL_KV_FP16_CELLS); side caches ride prefix/disk snapshots (v2)\n");
+            fprintf(stderr,"q27 Metal server: KV exception cells active (Q27_METAL_KV_FP16_CELLS, side codec %s); side caches ride prefix/disk snapshots (v2)\n",
+                    slots.front()->engine.kv_side_codec()?"e4m3":"fp16");
         // G6 admission (docs/plans/2026-07-16-g6-admission.md): additional
         // slots must fit the FULL per-slot footprint — KV + this slot's own
         // GQA partials (per-engine since audit E2, charged inside
@@ -467,7 +468,9 @@ struct Runtime {
             for(int i=0;i<20;i++) { snprintf(hex,3,"%02x",sha[i]); tag+=hex; }
             tag+=turbo3?'t':'f';
             if(slots[0]->engine.kv_fp16_except()) {
-                tag+='x';
+                // 'x' = fp16 sides, 'y' = e4m3 sides: codec is config
+                // identity, so the two must miss each other's files.
+                tag+=slots[0]->engine.kv_side_codec()?'y':'x';
                 const uint8_t* masks=slots[0]->engine.kv_fp16_head_masks();
                 for(int i=0;i<16;i++) tag+="0123456789abcdef"[masks[i]&15];
             }

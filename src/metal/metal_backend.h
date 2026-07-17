@@ -188,10 +188,14 @@ class MetalBackend final : public ComputeBackend {
     // attention over that head's query-head window against the side cache,
     // overwriting the production dispatch's output rows. Head offsets ride
     // the buffer bindings; production kernels and shader ABI untouched.
+    // codec 0 stores fp16; codec 1 rounds each value onto the e4m3 grid
+    // first (hot-cells arm, 2026-07-17-kv-e4m3-hot-cells.md) — still
+    // stored as half, values-exact for a real 1-byte e4m3 side cache.
     void kv_store_f16_head_rows_side(const BackendBuffer& k, const BackendBuffer& v,
                                      uint32_t head_offset_elems, uint32_t src_stride,
                                      BackendBuffer& k_side, BackendBuffer& v_side,
-                                     uint32_t position, uint32_t row_length, uint32_t tokens);
+                                     uint32_t position, uint32_t row_length, uint32_t tokens,
+                                     uint32_t codec = 0);
     void attention_f16_window(const BackendBuffer& q, uint32_t q_stride, uint32_t qh_start,
                               const BackendBuffer& k_side, const BackendBuffer& v_side,
                               BackendBuffer& out, uint32_t seq_len,

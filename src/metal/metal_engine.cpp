@@ -333,6 +333,25 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
             fprintf(stderr, "q27 Metal: Q27_METAL_KV_FP16_CELLS ignored on an fp16-KV engine (cells already fp16)\n");
         }
     }
+    // Side-cache codec (hot-cells arm): e4m3 rounds the excepted cells'
+    // rows onto the fp8 grid at store time — partial fidelity instead of
+    // full fp16, at the real e4m3 side format's byte price. Meaningless
+    // without an exception list, so that combination is rejected loudly
+    // rather than silently ignored.
+    if (const char* codec_env = getenv("Q27_METAL_KV_CELLS_CODEC")) {
+        const std::string codec(codec_env);
+        if (codec != "fp16" && codec != "e4m3")
+            throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC must be fp16 or e4m3");
+        if (codec == "e4m3") {
+            if (kv_fp16_except_)
+                kv_fp16_side_codec_ = 1;
+            else if (!getenv("Q27_METAL_KV_FP16_CELLS"))
+                throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC=e4m3 needs Q27_METAL_KV_FP16_CELLS (nothing to encode)");
+            // else: fp16-KV engine — the cells env was ignored above (with
+            // its note), so the codec rides along ignored too; the kl-kv
+            // baseline engine shares the subject's process environment.
+        }
+    }
     const uint64_t total_cache_bytes =
         (16ull + (has_mtp_ ? 1 : 0)) * 2 * max_context_ * cache_row_bytes
         + partial_bytes + kv_side_bytes;
@@ -795,7 +814,8 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         h.kv_dtype = turbo3_kv_ ? 1 : 0;
         h.position = position_;
         h.token_count = token_count;
-        h.reserved = (logits_resident ? 0u : 1u) | (kv_fp16_except_ ? 2u : 0u);
+        h.reserved = (logits_resident ? 0u : 1u) | (kv_fp16_except_ ? 2u : 0u)
+                   | (kv_fp16_side_codec_ ? 4u : 0u);
         snap_write(f, &h, sizeof h, tmp);
         if (token_count) snap_write(f, tokens, (size_t)token_count * 4, tmp);
         auto put_blob = [&](const BackendBuffer* src, uint64_t bytes) {
@@ -916,6 +936,12 @@ uint32_t MetalEngine::load_state(const std::string& path) {
             throw std::runtime_error(kv_fp16_except_
                 ? "q27 Metal: snapshot carries no KV fp16 exception side rows but this engine needs them (Q27_METAL_KV_FP16_CELLS): " + path
                 : "q27 Metal: snapshot carries KV fp16 exception side rows but this engine has none: " + path);
+        // Side codec is config identity too (bit 2): an fp16-side snapshot
+        // continued under e4m3 stores (or vice versa) would mix codec
+        // histories silently. Binaries older than the hot-cells arm ignore
+        // this bit — recorded cross-version caveat.
+        if (bool(h.reserved & 4) != (kv_fp16_side_codec_ != 0))
+            throw std::runtime_error("q27 Metal: snapshot side-cache codec does not match this engine (Q27_METAL_KV_CELLS_CODEC): " + path);
         if (fseeko(f, (off_t)h.token_count * 4, SEEK_CUR) != 0)
             throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
         const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
@@ -1134,7 +1160,7 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
             for (const KvFp16Side& s : side)
                 backend_.kv_store_f16_head_rows_side(*kbuf_, *vbuf_, s.head * HEAD_DIM,
                                                      N_KV * HEAD_DIM, *s.k, *s.v,
-                                                     pos, HEAD_DIM, 1);
+                                                     pos, HEAD_DIM, 1, kv_fp16_side_codec_);
         }
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
                                   *attn_out_, pos + 1, N_HEAD, N_KV,
@@ -1282,7 +1308,7 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
             for (const KvFp16Side& s : side)
                 backend_.kv_store_f16_head_rows_side(*ckbuf_, *cvbuf_, s.head * HEAD_DIM,
                                                      N_KV * HEAD_DIM, *s.k, *s.v,
-                                                     position_, HEAD_DIM, count);
+                                                     position_, HEAD_DIM, count, kv_fp16_side_codec_);
         }
         backend_.attention_turbo3_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                          *state.k_cache, *state.v_cache,
