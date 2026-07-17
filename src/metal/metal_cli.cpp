@@ -300,11 +300,11 @@ int main(int argc, char** argv) {
         if (chunk_parity && kl_kv)
             throw std::runtime_error("--chunk-parity and --kl-kv are separate instruments");
         if (kl_kv && turbo3_kv)
-            throw std::runtime_error("--kl-kv builds its own fp16 baseline and turbo3 subject; drop --kv");
+            throw std::runtime_error("--kl-kv builds its own fp16 baseline and subject; drop --kv");
         if (kv_attrib && kl_self)
-            throw std::runtime_error("--kl-kv-k/--kl-kv-v and --kl-kv-self are mutually exclusive arms");
+            throw std::runtime_error("--kl-kv-k/--kl-kv-v/--kl-kv-fp8 and --kl-kv-self are mutually exclusive arms");
         if (kv_cell != UINT32_MAX && (kv_attrib || kl_self))
-            throw std::runtime_error("--kl-kv-cell is its own arm; drop --kl-kv-k/--kl-kv-v/--kl-kv-self");
+            throw std::runtime_error("--kl-kv-cell is its own arm; drop --kl-kv-k/--kl-kv-v/--kl-kv-fp8/--kl-kv-self");
         if (!kv_stats_out.empty() && (kv_attrib || kl_self || kv_cell != UINT32_MAX ||
                                       kv_rt_scale32 || !kv_rt_feature.empty()))
             throw std::runtime_error("--kl-kv-stats is its own pass; drop other kl-kv arms/modifiers");

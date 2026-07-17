@@ -971,6 +971,8 @@ int test_kv_e4m3_store(q27::MetalBackend& backend) {
         {-1.0e6f, -448.0f},
         {-1.0625f, -1.0f},
         {448.0f, 448.0f},
+        {-0.0f, -0.0f},                   // signed zero preserved (bit check below)
+        {-0.0009765625f, -0.0f},          // negative underflow keeps the sign
     };
     std::vector<float> k(dim), v(dim);
     const size_t ng = sizeof golden / sizeof golden[0];
@@ -1002,7 +1004,16 @@ int test_kv_e4m3_store(q27::MetalBackend& backend) {
             if (failures > 4) return failures;
         }
     }
-    printf("e4m3 fp8 KV store: golden ties/saturation/subnormals + full-binade sweep exact on both sides\n");
+    // Float equality treats +0 == -0, so the signed-zero goldens need raw
+    // half bits: k carries -0 (0x8000); v = -k flips it to +0 (0x0000)
+    // (codex P3 on 0ec418c).
+    for (uint32_t d = ng - 2; d < ng; d++)
+        if (kh[d] != 0x8000u || vh[d] != 0x0000u) {
+            fprintf(stderr, "e4m3 signed zero[%u]: k bits %04x want 8000, v bits %04x want 0000\n",
+                    d, kh[d], vh[d]);
+            failures++;
+        }
+    printf("e4m3 fp8 KV store: golden ties/saturation/subnormals/signed zero + full-binade sweep exact on both sides\n");
     return failures;
 }
 
