@@ -40,8 +40,10 @@ import threading
 import time
 
 HOST, PORT = "127.0.0.1", 8123
-MODEL = "models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27"
-TOK = "models/qwen36-27b-mtp/qwen36-27b-mtp.tok"
+# Official-tier runs override via env (the MTP gates' real target artifact);
+# defaults stay T2 so the mini's rig is unchanged.
+MODEL = os.environ.get("Q27_GATE_MODEL", "models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27")
+TOK = os.environ.get("Q27_GATE_TOK", "models/qwen36-27b-mtp/qwen36-27b-mtp.tok")
 
 PROMPT_A = ("The measurement discipline that keeps a kernel project honest is simple to state "
             "and hard to keep: pre-register the kill criterion, pin every environment knob, "
@@ -270,10 +272,35 @@ def main():
         # whole generation), so this bound is proven able to fail. QUEUE
         # wait (arrival -> admission) is a different quantity — bounded by
         # QUEUE_MAX generations, reported but not bounded here.
+        # The quantum bound is tier- and mode-dependent: greedy chunked
+        # prefill's widest quantum is a 96-token chunk (~2 s on T2; 3 s with
+        # margin). MTP prompt warming is token-serial and deliberately ONE
+        # quantum for the whole suffix (documented Phase 1 limitation), so on
+        # the official tier (~3.6 tok/s serial ingest, ~150-token prompts) a
+        # legitimate quantum reaches ~40 s; 45 s bounds it while still
+        # failing the starvation class (waiting behind a whole generation:
+        # ingestion + 96 decode tokens ≈ 70 s+). Official-tier MTP measured
+        # 11.9 s max here (2026-07-16).
+        # Default stays the strict T2 chunk bound in BOTH modes (codex P2:
+        # a mode-keyed 45 s would mask T2 starvation on the default rig);
+        # official-tier MTP invocations pass Q27_GATE_QUANTUM_MS=45000.
+        quantum_bound_ms = int(os.environ.get("Q27_GATE_QUANTUM_MS", "3000"))
         for phase, ws in busy.items():
-            if ws["max_ms"] > 3000:
+            if ws["max_ms"] > quantum_bound_ms:
                 failures.append(f"G5: {phase}-arrival max gate wait "
-                                f"{ws['max_ms']:.0f} ms exceeds one quantum bound")
+                                f"{ws['max_ms']:.0f} ms exceeds one quantum bound "
+                                f"({quantum_bound_ms} ms)")
+        # Nonzero-speculation assert (external-review adoption, 2026-07-16):
+        # byte-identity under --mtp means nothing if speculation never
+        # engaged. committed > rounds is unfakeable — a serial fallback
+        # commits exactly one token per round.
+        if mtp:
+            spec = s.get("speculation", {})
+            if not spec.get("rounds"):
+                failures.append("MTP: zero speculation rounds — the gate ran vacuously")
+            elif spec.get("committed", 0) <= spec["rounds"]:
+                failures.append(f"MTP: {spec['committed']} committed over {spec['rounds']} "
+                                "rounds — no drafts ever accepted, gate vacuous")
         print(f"[{label}] /stats: {json.dumps(s)}")
     finally:
         proc.terminate()

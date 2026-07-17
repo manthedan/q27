@@ -333,3 +333,115 @@ the dspark work, 2026-07-16); the open work is engine integration
 (loader dtype 6 → backend tensors → c1 kernel as `matvec` for B1
 weights) and then the Phase 0A machine-checkable quality gates on the
 real artifact through our own engine.
+
+## Phases 1–3 results (2026-07-16 night, 24 GB M4)
+
+**Phase 1 — repack: DONE.** `tools/repack.py` detects the binary pack by
+tensor type (arch string is plain `qwen35`, same as ternary), emits
+`quant_policy: bonsai-b1-v1` + b1 meta keys, hard-fails any source type
+other than Q1_0/F32, and skips the MTP head alias. Census: 851 tensors =
+498 Q1_0 + 353 F32 — name set and every shape identical to the ternary
+pack; no blk.64. Full repack of `Bonsai-27B-Q1_0.gguf` →
+`bonsai-27b-b1.q27` (3.79 GB): all 498 lossless byte-copies, RMSE 0.0000,
+chunked round-trip gate green. Residue: the `-unpacked` masters
+cross-check (preferred source rule) — the masters live on the mini; the
+GGUF-sourced pack is bit-faithful to the GGUF by construction, and the
+cross-check gates only vendor packing errors. Registered for the mini's
+queue, not skipped silently.
+
+**Phase 2 — kernels: DONE.** Production surface mirrors T2 exactly:
+`q27_matvec_b1_g128` (select-form, promoted from the Phase 0B c1 winner),
+`q27_matvec_b1_quantized` (int8-x integer-exact), `q27_matmul_b1_mm`
+(half-staged LUT GEMM like T2's production route), `q27_embedding_b1`
+/`_dev`/`_rows`; per-dtype routing behind the existing backend entry
+points; `Q27_SHADER_ABI` unchanged (additive only). Tests mirror the T2
+battery in `test_metal.cpp` — narrow-exact, wide float/int with
+threadgroup-spanning rows and nonuniform scales, GEMM tile parity,
+embedding parity — all green in `make test-metal`.
+
+**Phase 3 — loader/dispatch: DONE.** `B1_G128 = 6` in the DType registry;
+`validate_architecture` generalizes `ternary` to a bonsai pair (policy
+string selects the tier dtype; both assert 64 blocks / no MTP / group
+128); `project`/`project_pair` and the quantize-skip sites key on a
+shared `is_bonsai_dtype` — B1 rides the float-activation select path
+end-to-end, chunked prefill included. `--validate-only` green on both
+bonsai packs.
+
+**First light + Phase 4 (partial):** "The capital of France is" → " Paris."
+— 13.5 tok/s on the very first cold, contended, untuned run (Phase 0B
+projection: ~23 tok/s at bandwidth parity). Suffix byte-identity battery
+(serial vs `--suffix-serial`/w16/w32/w48) passes on the B1 pack with
+bursts firing. Phase 4 residue, registered: vendor-fork byte gate (needs
+the fork binary — mini), official-tier canonical smoke + CUDA byte gate
+at merge, `metal_decode_bench` resident-vs-artifact at matched thermal
+state and the 8K→32K NLL ladder (quiet machine), Phase 0A quality gates
+re-run through OUR engine (the vendor-stack numbers stand in until then).
+
+## Phase 0A-q27 — quality battery through OUR engine (pre-registered 2026-07-16 night, before running)
+
+The vendor-stack Phase 0A numbers stand in until the same qualities are
+shown through our own engine on our own pack. Legs, gates written before
+any run:
+
+1. **NLL ratio leg**: `--nll data/wikitext2-test.tokens.bin --nll-long
+   8192 --ctx 8192` (single pass, no resets), identical invocation on B1,
+   T2, and the official tier, one load at a time. GATES: B1/T2 PPL ratio
+   in **[1.05, 1.30]** (vendor-stack protocol measured 1.16×; a ratio
+   outside the band means the repack or kernels changed quality, not the
+   model — investigate before any serving claim). B1/official ≤ **3.5×**
+   (the Phase 0 serving-tier band, carried verbatim).
+2. **Behavioral probes**: the four RECORDED Phase 0A prompts
+   (`logs/overnight-20260715/run.sh` probe set: json / constraints /
+   codeedit / native toolcall) through OUR server on the B1 pack, greedy,
+   max_tokens 6144 (the vendor run's thinking-budget lesson), toolcall
+   via `--constrain-tools` serial. Machine-checked: JSON parses with
+   exact keys/types/arity and no fences; constraints list obeys all seven;
+   code edit contains the boundary fix; tool call names get_weather with
+   city Taipei. GATE: **4/4**; any malformed tool call or JSON is a FAIL
+   (agentic collapse criterion carried from Phase 0).
+3. **Decode economics** (`metal_decode_bench` on the B1 artifact,
+   back-to-back with resident ceiling, matched thermal state): BANDS —
+   artifact decode ≥ **18 tok/s strong** (Phase 0B parity projection
+   20–23), **15–18 conditional** (issue-bound residue, fund one kernel
+   look), < **15 investigate before serving claims** (T2 serves at ~11;
+   a B1 below 15 fails to clear the tier's reason to exist by margin).
+
+Machine: quiet 24 GB M4 (Daniel's go this window covers the runs).
+Correctness legs tolerate contention; leg 3 is timing and runs last,
+alone. RESULTS below when run.
+
+### Phase 0A-q27 RESULTS (2026-07-16 night, quiet 24 GB M4, Daniel's go)
+
+1. **NLL ratio leg: BOTH GATES PASS.** 8K single-pass wikitext-2, identical
+   invocations: B1 PPL 14.311, T2 13.559, official 6.267 →
+   **B1/T2 = 1.055** (band [1.05, 1.30]; vendor-protocol was 1.16 — the
+   gap compresses at long context) and **B1/official = 2.28×** (band
+   ≤ 3.5×, matching the vendor's ~2.2–2.4× indicative). The pack and
+   kernels reproduce vendor quality through our engine.
+   (`logs/b1-quality-20260716/nll-*.out`)
+2. **Behavioral probes: 4/4 PASS** (recorded Phase 0A prompts through our
+   server, machine-checked): json exact keys/types/arity no fences;
+   constraints all seven honored (checker initially demanded `1.`-style
+   delimiters, model used bare numbers — checker corrected, output was
+   compliant as written); codeedit exact boundary fix (`s <=
+   out[-1][1]`), code only; toolcall correct function + exact args — after
+   fixing a REAL Metal-server gap the probe exposed (tools were never
+   rendered into the prompt; see 2026-07-17-parity-audit-triage.md).
+3. **Decode economics: CONDITIONAL band.** Artifact decode **17.28 /
+   17.09 tok/s** (two warm 128-token runs) vs the pre-registered bands —
+   below the ≥18 strong line, well above the 15 floor. Resident ceiling
+   (`metal_decode_bench --dtype b1`, added tonight; corrected same night
+   for a codex-caught guard bug that left the engine-skipped activation
+   quantization in the b1 route): **19.39 tok/s at 69.9 GB/s** effective
+   vs T2's same-bench 11.54 at 78.5 — artifact runs at 89% of its
+   ceiling (paging residue), and the B1 kernel streams at 0.89 of T2's
+   rate at full-decode width (Phase 0B measured GEMV-only
+   parity; the residue is issue-rate at decode's dispatch mix). Per the
+   band: **fund one kernel look** — registered as the B1 select kernel's
+   round 2, quiet-machine regated, ship line ≥ 18 tok/s artifact decode.
+
+**Phase 0A-q27 verdict: B1 is a serving tier through our own stack** —
+quality reproduced (1.055× T2, 2.28× official), agentic probes clean,
+17+ tok/s today (1.5× T2's 11.5) with a funded path to 18+. Remaining
+Phase 4 residue unchanged: vendor-fork byte gate + unpacked-masters
+cross-check (mini), NLL ladder 8K→32K, CUDA byte gate at merge.

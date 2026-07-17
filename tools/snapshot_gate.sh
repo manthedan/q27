@@ -1,9 +1,10 @@
 #!/bin/zsh
 # Prefix-snapshot Phase 1 gates (docs/plans/2026-07-16-prefix-snapshots.md):
 # fresh-process byte identity for both KV dtypes, then the reject matrix
-# (truncated file, corrupted identity, wrong dtype, position > context).
-# Every reject case must FAIL LOUD and leave generation able to error out
-# before any state mutation.
+# (truncated file, corrupted identity, wrong dtype, position > context),
+# then the crash-consistency legs (k3 audit B1/E2) driven by the engine's
+# Q27_METAL_SNAP_CRASH failpoints. Every reject case must FAIL LOUD and
+# leave generation able to error out before any state mutation.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -61,5 +62,49 @@ printf '\xff\xff\xff\xff' | dd of="$TMP/badid.snap" bs=1 seek=20 count=4 conv=no
 expect_reject "corrupted artifact identity" "$BIN" "$MODEL" "$TOK" --load-state "$TMP/badid.snap" -n 4 --ctx $CTX
 expect_reject "wrong kv dtype" "$BIN" "$MODEL" "$TOK" --load-state "$SNAP" -n 4 --ctx $CTX --kv turbo3
 expect_reject "position exceeds context" "$BIN" "$MODEL" "$TOK" --load-state "$SNAP" -n 4 --ctx 4
+
+# Crash-consistency legs (k3 audit B1/E2). Q27_METAL_SNAP_CRASH makes
+# save_state _exit(42) (a) after the last blob write, BEFORE the content
+# fsync — the target path must be absent (fresh path) or still the previous
+# intact snapshot, and a leftover .tmp is ignorable — or (b) after the
+# rename + directory fsync — the snapshot must load and continue
+# byte-identically to an uncrashed save.
+CRASH="$TMP/crash.snap"
+crash_save() {
+    Q27_METAL_SNAP_CRASH=$1 "$BIN" "$MODEL" "$TOK" --prompt "$PROMPT" -n $N --ctx $CTX --kv fp16 \
+        --save-state "$CRASH" > "$TMP/crash.$1.out" 2>&1
+}
+
+rm -f "$CRASH" "$CRASH.tmp"
+crash_save before-fsync; rc=$?
+if [ $rc -ne 42 ]; then
+    echo "FAIL[crash]: before-fsync failpoint exited $rc, expected 42"; fails=$((fails+1))
+elif [ -e "$CRASH" ]; then
+    echo "FAIL[crash]: before-fsync crash left a target snapshot"; fails=$((fails+1))
+else
+    echo "PASS[crash]: before-fsync crash left no target snapshot (.tmp ignorable)"
+fi
+
+cp "$SNAP" "$CRASH"
+crash_save before-fsync; rc=$?
+"$BIN" "$MODEL" "$TOK" --load-state "$CRASH" -n $N --ctx $CTX --kv fp16 > "$TMP/crash.prev" 2>"$TMP/crash.prev.err"
+if [ $rc -ne 42 ]; then
+    echo "FAIL[crash]: before-fsync failpoint (re-save) exited $rc, expected 42"; fails=$((fails+1))
+elif [ "$(gen "$TMP/ref.fp16")" = "$(gen "$TMP/crash.prev")" ]; then
+    echo "PASS[crash]: before-fsync crash left the previous snapshot intact and loadable"
+else
+    echo "FAIL[crash]: crashed re-save corrupted the previous snapshot"; fails=$((fails+1))
+fi
+
+rm -f "$CRASH" "$CRASH.tmp"
+crash_save after-rename; rc=$?
+"$BIN" "$MODEL" "$TOK" --load-state "$CRASH" -n $N --ctx $CTX --kv fp16 > "$TMP/crash.b" 2>"$TMP/crash.b.err"
+if [ $rc -ne 42 ]; then
+    echo "FAIL[crash]: after-rename failpoint exited $rc, expected 42"; fails=$((fails+1))
+elif [ "$(gen "$TMP/ref.fp16")" = "$(gen "$TMP/crash.b")" ]; then
+    echo "PASS[crash]: after-rename crash loads and continues byte-identically to an uncrashed save"
+else
+    echo "FAIL[crash]: after-rename snapshot missing, unloadable, or continuation diverged"; fails=$((fails+1))
+fi
 
 if [ $fails -eq 0 ]; then echo "snapshot gate: ALL PASS"; else echo "snapshot gate: $fails FAILURE(S)"; exit 1; fi

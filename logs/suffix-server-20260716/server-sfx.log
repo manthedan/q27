@@ -1,0 +1,15 @@
+q27 Metal server listening on http://127.0.0.1:18091 (ctx=4096, kv=fp16, mtp=0, slots=2)
+suffix round: live 32 accepted 31 committed 32
+suffix round: live 48 accepted 47 committed 48
+suffix round: live 16 accepted 15 committed 16
+suffix round: live 13 accepted 3 committed 4
+suffix round: live 13 accepted 0 committed 1
+suffix round: live 13 accepted 2 committed 3
+suffix round: live 13 accepted 12 committed 13
+suffix round: live 16 accepted 15 committed 16
+suffix round: live 32 accepted 7 committed 8
+suffix round: live 13 accepted 12 committed 13
+suffix round: live 16 accepted 10 committed 11
+suffix round: live 13 accepted 8 committed 9
+suffix round: live 13 accepted 12 committed 13
+suffix round: live 16 accepted 10 committed 11

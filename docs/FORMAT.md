@@ -66,9 +66,13 @@ reduction axis for every matmul weight in this model.
 - effective 1.125 bpw; produced losslessly (byte-copy) from the PrismML fork's
   ggml type 41 ("Q1_0", 18-byte `{fp16 d; u8 qs[16]}` blocks) — layout read at
   source, tag prism-b9591-62061f9 (`dequantize_row_q1_0`); see
-  docs/plans/2026-07-15-binary-tier.md. First produced by the dspark drafter
-  repack (`token_embd.weight` only); the full B1 tier remains that plan's
-  Phase 1.
+  docs/plans/2026-07-15-binary-tier.md. Used by the dspark drafter pack
+  (`token_embd.weight` only) and by the full binary tier
+  (`quant_policy: bonsai-b1-v1`): every Q1_0 tensor byte-copied, all other
+  tensors must be F32 (repack.py hard-fails otherwise — there is no illegal
+  code value, so strictness plus the round-trip gate is the integrity story).
+  No MTP layer (`blk.64.*`) and no `output_q4.weight` alias — greedy + suffix
+  drafting only, as the ternary tier.
 
 ### Q4_1_G32 (dspark drafter, dtype 7, `quant_policy: dspark-q41-v1`)
 - asymmetric 4-bit, group size 32: nibble `q ∈ [0,15]` decodes to `q*d + m`;

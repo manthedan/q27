@@ -13,6 +13,8 @@
 
 namespace q27 {
 
+class SuffixDraft;
+
 class MetalEngine {
   public:
     struct Snapshot;
@@ -81,18 +83,40 @@ class MetalEngine {
     std::vector<uint32_t> generate(const std::vector<uint32_t>& prompt, uint32_t count);
     std::vector<uint32_t> generate_mtp(const std::vector<uint32_t>& prompt,
                                        uint32_t count, uint32_t width);
+    // Verify/oracle width ceiling, decoupled from the width-12 NLL/KL
+    // contract exactly as PREFILL_CHUNK_MAX decoupled prompt ingestion
+    // (docs/plans/2026-07-16-lever2-verify-width.md). Sizes cfinal_/
+    // clogits_/cpred_ and the gdn_replay parks; mtp_round stays capped at
+    // CHUNK_MAX until the MTP lane machinery is testable (24 GB rig).
+    static constexpr uint32_t VERIFY_CHUNK_MAX = 48;
+    // Default drafter engage threshold: rounds whose longest suffix match is
+    // shorter fall back to one serial step (Phase-0 sim: shorter thresholds
+    // trade acceptance for round overhead on burst-hostile text).
+    static constexpr uint32_t SUFFIX_MIN_MATCH = 12;
     // Batched suffix-burst verification (2026-07-16-suffix-burst-verify.md):
     // SuffixDraft proposals through the VERIFY_CHUNK_MAX-wide verify chunk
     // with mtp_round's acceptance/commit semantics. width 2..VERIFY_CHUNK_MAX;
     // rounds with match < minimum_match fall back to one serial step.
     std::vector<uint32_t> generate_suffix(const std::vector<uint32_t>& prompt,
                                           uint32_t count, uint32_t width,
-                                          uint32_t minimum_match = 12);
+                                          uint32_t minimum_match = SUFFIX_MIN_MATCH);
     // The pre-lever-2 serial walk (one step() per proposal): the batched
     // path's A/B control and byte-level reference. width 2..12.
     std::vector<uint32_t> generate_suffix_serial(const std::vector<uint32_t>& prompt,
                                                  uint32_t count, uint32_t width,
-                                                 uint32_t minimum_match = 12);
+                                                 uint32_t minimum_match = SUFFIX_MIN_MATCH);
+    // One suffix-burst driver round (the generate_suffix loop body, extracted
+    // for the server's quantum loop): propose from the drafter, match-cap and
+    // snap-down the width, then either a suffix_round burst or one serial
+    // fallback step. Fills committed with the round's tokens (>= 1, clamped at
+    // eos exactly like mtp_round — pass the REAL eos id here; generate_suffix
+    // passes a never-matching sentinel to run to a fixed count) and returns
+    // the next pending token. remaining must be >= 2 (the caller emits the
+    // final token directly). burst, when non-null, reports whether this
+    // round dispatched a batched verify (server /stats attribution).
+    uint32_t suffix_step(SuffixDraft& drafter, uint32_t pending, uint32_t remaining,
+                         uint32_t eos, uint32_t width, uint32_t minimum_match,
+                         std::vector<uint32_t>& committed, bool* burst = nullptr);
     // Suffix-burst diagnostics for the last generate_suffix run: rounds that
     // fell back to serial, and fired-burst lane counts by full-tile bucket.
     struct SuffixStats {
@@ -106,6 +130,9 @@ class MetalEngine {
     std::vector<uint32_t> generate_from_pending(uint32_t pending, uint32_t count,
                                                 uint32_t mtp_width = 0);
     std::vector<float> read_logits();
+    // x1_ readback — the hidden row capture_state/save_state persist — for
+    // the --chunk-parity hidden-row leg (k3 audit A1/E3).
+    void read_hidden(std::vector<float>& out);
     // Teacher-forced NLL for tokens[0..N): returns N-1 values where
     // result[i] = -log P(tokens[i+1] | tokens[0..i]). Uses layer-major
     // chunked encode + batched output head when available.
@@ -272,12 +299,6 @@ class MetalEngine {
     static constexpr uint32_t VOCAB = 248320;
     static constexpr uint32_t CHUNK_MAX = 12;          // MTP verify / NLL / KL width
     static constexpr uint32_t PREFILL_CHUNK_MAX = 96;  // prompt-ingestion width (8x12)
-    // Verify/oracle width ceiling, decoupled from the width-12 NLL/KL
-    // contract exactly as PREFILL_CHUNK_MAX decoupled prompt ingestion
-    // (docs/plans/2026-07-16-lever2-verify-width.md). Sizes cfinal_/
-    // clogits_/cpred_ and the gdn_replay parks; mtp_round stays capped at
-    // CHUNK_MAX until the MTP lane machinery is testable (24 GB rig).
-    static constexpr uint32_t VERIFY_CHUNK_MAX = 48;
     static constexpr uint32_t TOPK_CAPACITY = 1024;
     static constexpr uint32_t RESIDENT_MAX = 8;
     static constexpr float EPS = 1e-6f;
@@ -366,14 +387,14 @@ class MetalEngine {
                       const BackendTensor& b, BackendBuffer& b_out,
                       const BackendBuffer& x_float, const BackendQuantized& xq);
     void gdn_block(uint32_t layer);
-    void attention_block(uint32_t layer);
+    void attention_block(uint32_t layer, uint32_t pos);
     void ffn(uint32_t layer);
-    void encode_token(uint32_t token, bool produce_logits, bool token_from_device = false);
+    void encode_token(uint32_t token, bool produce_logits, bool token_from_device = false,
+                      uint32_t pos_offset = 0);
     void gdn_chunk(uint32_t layer, uint32_t count, bool verify);
     void attention_chunk(uint32_t layer, uint32_t count);
     void ffn_chunk(uint32_t layer, uint32_t count);
     void chunk_forward(const uint32_t* tokens, uint32_t count, bool verify = false);
-    void encode_chunk(const uint32_t* tokens, uint32_t count);
     static uint32_t gdn_slot(uint32_t layer) { return layer - (layer + 1) / 4; }
     void gdn_replay(uint32_t count);
     std::vector<uint32_t> generate_mtp_batched(uint32_t pending, uint32_t count,

@@ -71,3 +71,30 @@ recorded decisions, and one genuinely new workstream (E6). Its two HIGH
 severities don't survive verification — the pattern to keep: severity
 claims about "silent corruption" get proven or retracted before they
 drive work. Nothing in the audit contradicts the shipped gates.
+
+---
+
+## Fix-batch results (2026-07-16 night, same session; local machine)
+
+Four MORE audit claims fell during implementation, each verified in
+source: **A6/E1 was stale** — bind-time logical-extent enforcement
+already exists at every enumerable tensor bind site (`tensor_limit` on
+`data_size`/`scales_size` from all three upload paths, plus loader-side
+declared-size equality, in-mapping bounds, and blob-overlap rejection);
+the actual gap was test coverage, closed with a failing-capable negative
+test (short data_size and short scales_size must throw; well-formed
+controls pass). **E11 was factually wrong** — both `delta_step` and
+`delta_chunk` already throw on non-(128,16) shapes. **E5's load-time
+refusal REJECTED** — odd-nb T3 is a *tested* slow path (`test_t3_wide`,
+cols=1152), so refusing it would reject provably-correct shapes; kernel
+comment instead. **B5's `[command cancel]` is not a real MTLCommandBuffer
+API** — contract comment is the whole fix. Landed: A2 min-k defensive
+bound, E8 argmax/topk stress tests (all-−inf, tie storm, odd-n,
+boundary-exact-k), A1/E7 barrier + corrected comment, E3 mutation
+contract, E12/B5 comments, C2 PARKED markers. Codex: zero findings.
+Suites green. E2 assigned to the mini (tasks/mini-e2-gqa-partials.md).
+Scorecard for the audit after full verification: both HIGHs refuted, one
+"unimplemented P1" already implemented, one host-guard claim wrong, one
+suggested API nonexistent, one refusal would have broken a tested shape —
+against real contributions E6 (Q4/Q8 GEMV leg, queued), E8 (tests,
+landed), E10/E2 (queued in the right lanes).

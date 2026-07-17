@@ -118,3 +118,73 @@ Cross-request suffix indexes (per-request stream only, as today); CUDA-side
 changes (upstream has its own speculation); sampled-temperature suffix
 verification (greedy-only, as the serial path today); any drafter-model
 revival (parked with prejudice this morning).
+
+---
+
+## RESULTS (2026-07-16 night, quiet 24 GB M4, Daniel-provided quiet window) — SHIP LINE MET
+
+Gates 2–4 + 6 all PASS (`logs/suffix-gates-20260716/verdicts.txt`):
+byte identity across --suffix-serial 12 / --suffix 16/32/48 and both
+corrected arms; dispatch-traced live lanes ≥16/≥32; stats reconcile.
+Two staged verdicts failed on prompt construction, not engine behavior,
+and were re-run corrected: a perfectly-repeating prompt cannot yield
+rejection evidence by construction (fixed with a numbered-list prompt —
+10 drafts / 3 accepted, walk provably live, bytes identical), and the
+canonical prompt's own 96-token continuation self-repeats so its 3
+bursts were CORRECT firings (16.4 tok/s, bytes identical); the
+docs-class silence claim was re-tested with narrative prose — 0 bursts,
+95/95 fallback, wall −0.1%.
+
+**Gate 6 economics: repetition-heavy 2.34× (25.38 vs 10.85 tok/s,
+96 tokens in 3 rounds, 0 fallbacks) vs the 1.15× bar; neutral −0.1% vs
+the ≤2% bar.** Single-run protocol on a quiet machine; margins are 15×
+and 20× the bars respectively, re-measurement not required for the ship
+decision. Gate-6 burst histogram note for the round-up-to-tile
+alternative: the rep run fired 1×≤16 + 1×32 + 1×48 — matches snapped to
+full tiles naturally on this traffic; no evidence yet that 17–31-length
+matches carry mass; round-up stays unfunded.
+
+**Next: gate 5 — live EOS through the stream/server suffix integration
+(now unlocked), and server plumbing so agentic traffic actually rides
+the batched path.**
+
+### Server integration + gate 5 results (2026-07-16 night, 24 GB M4)
+
+Shipped: `--suffix W` on `q27-metal-server` (mutually exclusive with
+`--mtp` and `--constrain-tools`, greedy-only like the MTP branch). The
+engine loop body is extracted verbatim into `MetalEngine::suffix_step`
+(propose → match-cap → snap-down → burst or serial fallback, one round
+per call); `generate_suffix` now drives it, and the server's generation
+loop gained a fourth branch mirroring the MTP branch's one-round-per-lease
+quantum discipline. The drafter is per-request CPU state seeded from the
+FULL prompt (including restored prefixes, which never pass through the
+step loop). `/stats` speculation grew `suffix_bursts`/`suffix_fallbacks`
+so a server whose traffic never rides the batched path is visible.
+
+- **Refactor identity (CLI)**: all six pre-refactor arms from
+  `logs/suffix-gates-20260716` byte-identical post-refactor
+  (serial/sfx-serial/w16/w32/w48 on the repetition prompt, serial+w48 on
+  neutral; `logs/suffix-server-20260716`). Same 3 bursts on the w48 arm.
+- **Server A/B**: five greedy arms (repetition, QA, chat-template,
+  instruct-repeat, few-shot copy) byte-identical between `--suffix 48`
+  and the serial server; repetition arm delta showed bursts fired and
+  committed > rounds (the unfakeable signal — 297 committed / 201
+  rounds across the suffix-server request set).
+- **Gate 5, live EOS**: the QA arm stops with `finish_reason: stop` on
+  BOTH servers at the same byte (" Paris"), through the suffix branch's
+  new pending==eos driver clamp — the real eos id rides into
+  `suffix_round`'s lane clamp exactly as registered. The strong-form
+  composition (eos landing mid-burst on the same request as fired
+  bursts) was probed twice and is unreachable on this model's chat
+  style (T2 CoT-rambles instruct prompts to length); the clamp code
+  path is pending-value-dependent only, so the QA evidence covers the
+  new code. Recorded honestly, not claimed.
+- **Cross-tier**: the same identity battery passes on the fresh B1 pack
+  (`logs/b1-firstlight-20260716`), bursts firing — the lever is
+  tier-agnostic as designed.
+
+**Gate 5 verdict: PASS.** All six registered gates now closed. Residue:
+suffix-mode variant of the multislot gate harness (G1–G3/G5 under
+two-slot contention with `--suffix`) — registered, not run; and the
+economics on real agentic traffic (tool-call loops via the server) ride
+the standing quiet-machine protocol.

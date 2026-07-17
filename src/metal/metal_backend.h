@@ -45,11 +45,12 @@ class MetalBackend final : public ComputeBackend {
                                const BackendQuantized& x) override;
     // N=2 slot-batched T2 GEMV (Phase 2 probe): x = 2 activation rows
     // ([2,cols] values / [2,cols/32] scales), y = [2,rows] token-major.
-    // Metal-only surface until the probe passes its decision line.
+    // PARKED by measurement (2026-07-16): aggregate s_k 1.093 vs the 1.31
+    // decision line — bench-only reference surface, never engine-routed.
     void matvec_quantized_x2(const BackendTensor& weight,
                              const BackendQuantized& x, BackendBuffer& y);
     // Select-form float-activation variant (the production serial-decode
-    // path), two independent x/y buffer pairs. Same probe status.
+    // path), two independent x/y buffer pairs. Same PARKED status.
     void matvec_x2(const BackendTensor& weight,
                    const BackendBuffer& x_a, const BackendBuffer& x_b,
                    BackendBuffer& y_a, BackendBuffer& y_b);
@@ -239,6 +240,11 @@ class MetalBackend final : public ComputeBackend {
     // Envelope-instrument hooks (docs/plans/2026-07-16-envelope-instrument.md):
     // flip the backend-global reduction-order knobs between two engines'
     // lockstep passes. Instrument use only — production reads the env once.
+    // CONTRACT: these are BACKEND-scoped, not per-engine. Engines sharing
+    // one backend (Shared mapping) see every flip; only one engine may
+    // mutate them, and never while another engine's pass is in flight —
+    // the envelope instrument flips them sequentially by design. Concurrent
+    // flips would corrupt any A/B attribution riding on them.
     void set_gemm_half(bool enabled);
     void set_gqa_threshold(uint32_t threshold);
     uint64_t max_buffer_length() const;

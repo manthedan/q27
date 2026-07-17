@@ -10,6 +10,9 @@ Usage:
 Ternary source packs (PrismML fork "Q2_0", ggml type 42) are detected
 automatically and repacked losslessly to T2_G128 (quant_policy bonsai-t2-v1);
 see docs/FORMAT.md and docs/plans/2026-07-14-ternary-tier.md for the encoding.
+Binary source packs (fork "Q1_0", ggml type 41, non-dspark arch) likewise
+repack losslessly to B1_G128 (quant_policy bonsai-b1-v1);
+see docs/plans/2026-07-15-binary-tier.md.
 """
 import argparse
 import json
@@ -274,22 +277,28 @@ def main():
     dspark = arch == "dspark"
     if dspark and ternary:
         raise ValueError("dspark pack unexpectedly contains ternary (Q2_0) tensors")
+    binary = not dspark and any(t.tensor_type.name == "Q1_0" for t in r.tensors)
+    if binary and ternary:
+        raise ValueError("pack unexpectedly contains both binary (Q1_0) and ternary (Q2_0) tensors")
 
     meta = {"q27_version": VERSION,
             "quant_policy": args.tag or ("dspark-q41-v1" if dspark
                                          else "bonsai-t2-v1" if ternary
+                                         else "bonsai-b1-v1" if binary
                                          else "v1.4" if args.q8 else "v1.3"),
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
     if ternary:
         meta["group_t2"] = GROUP_T2
         meta["t2_codes"] = "0=-1,1=0,2=+1;3 forbidden"
         meta["t2_slot_order"] = "seq-lsb-first"
-    if dspark:
-        # Verbatim fork encodings; see repack_b1/repack_q41 docstrings and the
-        # dspark Phase-0 plan. BF16 sources widen exactly to F32.
+    if dspark or binary:
+        # Verbatim fork Q1_0 encoding; see the repack_b1 docstring and the
+        # binary-tier plan.
         meta["group_b1"] = GROUP_B1
         meta["b1_codes"] = "1=+d,0=-d"
         meta["b1_bit_order"] = "seq-lsb-first"
+    if dspark:
+        # Verbatim mainline Q4_1 encoding; BF16 sources widen exactly to F32.
         meta["group_q41"] = GROUP_Q41
         meta["q41_scales"] = "{d,m} fp16 pairs per group"
         meta["q41_nibble_order"] = "low=elems 0-15, high=elems 16-31"
@@ -325,8 +334,8 @@ def main():
 
     extra = []
     for t in r.tensors:
-        if t.name == "output.weight" and not ternary and not dspark:
-            extra.append(("output_q4.weight", t))  # MTP draft head copy; no MTP in ternary/dspark packs
+        if t.name == "output.weight" and not ternary and not dspark and not binary:
+            extra.append(("output_q4.weight", t))  # MTP draft head copy; no MTP in ternary/binary/dspark packs
     class _Alias:
         def __init__(self, name, t):
             self.name, self.tensor_type, self.data, self.shape = name, t.tensor_type, t.data, t.shape
@@ -338,7 +347,7 @@ def main():
         verbatim = None  # (dtype, repack_fn) for lossless byte-copy source types
         if t.tensor_type.name == "Q2_0":
             verbatim = (DTYPE_T2, repack_t2)
-        elif dspark and t.tensor_type.name == "Q1_0":
+        elif (dspark or binary) and t.tensor_type.name == "Q1_0":
             verbatim = (DTYPE_B1, repack_b1)
         elif dspark and t.tensor_type.name == "Q4_1":
             verbatim = (DTYPE_Q41, repack_q41)
@@ -365,6 +374,9 @@ def main():
         if ternary and t.tensor_type.name != "F32":
             raise ValueError(f"{t.name}: unexpected source type {t.tensor_type.name} in a "
                              f"ternary pack (expected Q2_0 or F32 only)")
+        if binary and t.tensor_type.name != "F32":
+            raise ValueError(f"{t.name}: unexpected source type {t.tensor_type.name} in a "
+                             f"binary pack (expected Q1_0 or F32 only)")
         if dspark and t.tensor_type.name not in ("F32", "BF16"):
             raise ValueError(f"{t.name}: unexpected source type {t.tensor_type.name} in the "
                              f"dspark pack (expected Q4_1, Q1_0, BF16, or F32 only)")
