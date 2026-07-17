@@ -743,8 +743,9 @@ int run_official_probe(q27::MetalBackend& backend, int reps, int q4_candidate) {
         return 0;
     }
     if (ratio >= 0.90) {
-        printf("verdict: KILL the rewrite (R >= 0.90) — even perfect parity buys <= 11%% "
-               "wall, below the cost of a kernel round plus regate\n");
+        printf("verdict: R >= 0.90 — no rewrite round funded (the 2026-07-17 q4 round "
+               "shipped the r4 restructure at this line; remaining headroom is below the "
+               "cost of a round plus regate)\n");
     } else if (ratio >= 0.80) {
         printf("verdict: CONDITIONAL (0.80 <= R < 0.90) — no full round; fund a targeted "
                "fix only if a single mix-dominant shape\n(>= 20%% of per-token bytes) sits "

@@ -63,7 +63,7 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 8";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 9";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -266,11 +266,11 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> b1_signxor_p;
     id<MTLComputePipelineState> b1_popcount_p;
     id<MTLComputePipelineState> b1_x_prep_p;
-    // Q4-round candidate PSOs (bench-only): built on first matvec_q4_probe
-    // use (the roofline-k pattern), so production startup never creates them.
+    // Q4-round retained comparison arm (bench-only): built on first
+    // matvec_q4_probe use (the roofline-k pattern), so production startup
+    // never creates it. r4 was promoted into q4_quantized; the q8 twin was
+    // killed by measurement (2026-07-17 round doc).
     id<MTLComputePipelineState> q4_r2_p;
-    id<MTLComputePipelineState> q4_r4_p;
-    id<MTLComputePipelineState> q8_r4_p;
     // Arm K (function-constant probe): one specialized PSO per baked cols.
     std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
     id<MTLComputePipelineState> mm_dr_p;
@@ -1090,7 +1090,10 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
         [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        // Q4 runs the promoted 4-rows-per-simdgroup kernel (32 rows/group,
+        // q4 round 2026-07-17); the other dtypes keep 1 row/simdgroup.
+        const NSUInteger rpg = weight.dtype==DType::Q4_G64 ? 32 : 8;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+rpg-1)/rpg,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("quantized matvec");
     }
 }
@@ -1509,22 +1512,19 @@ void MetalBackend::matvec_q4_probe(int candidate, const BackendTensor& weight,
             label = "q27_matvec_q4_quantized_r2";
             break;
         case 3:
-            if (!impl_->q4_r4_p)
-                impl_->q4_r4_p = make_pipeline(impl_->device, impl_->library,
-                                               @"q27_matvec_q4_quantized_r4");
-            pso = impl_->q4_r4_p;
-            label = "q27_matvec_q4_quantized_r4";
+            // r4 was PROMOTED into the production kernel (q4 round
+            // 2026-07-17) — alias so recorded A/B invocations keep working.
+            pso = impl_->q4_quantized;
+            label = "q27_matvec_q4_quantized";
             break;
         default:
-            if (!impl_->q8_r4_p)
-                impl_->q8_r4_p = make_pipeline(impl_->device, impl_->library,
-                                               @"q27_matvec_q8_quantized_r4");
-            pso = impl_->q8_r4_p;
-            label = "q27_matvec_q8_quantized_r4";
-            break;
+            throw std::runtime_error("q27 Metal: q4 probe candidate 4 (q8 r4 twin) was "
+                "KILLED by measurement — regressed the head shape "
+                "(docs/plans/2026-07-17-q4-rewrite-round.md RESULTS)");
     }
-    // Rows per 256-thread group: production 8 simdgroups x 1 row; r2 x2; r4 x4.
-    const uint32_t rows_per_group = candidate == 1 ? 8 : candidate == 2 ? 16 : 32;
+    // Rows per 256-thread group: post-promotion Q4 production runs 4 rows
+    // per simdgroup (32/group); Q8 production and legacy stay 1 (8/group).
+    const uint32_t rows_per_group = candidate == 2 ? 16 : q8 ? 8 : 32;
     MatvecArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, label);
