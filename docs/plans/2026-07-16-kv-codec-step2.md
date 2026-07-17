@@ -53,3 +53,44 @@ and the codec effort moves to step 4's structured allocation (Block-GTQ
 shape) with the census's cell targets. Secondary read: scale32 alone
 approaching the bar would say the half-rounded scale is the defect —
 a much cheaper production fix than any per-feature machinery.
+
+## Results (2026-07-17 00:05, 16 GB mini — NO ARM GRADUATES, park is final)
+
+8,191 positions/arm, ctx 8192, pinned route, fingerprinted
+(logs/kv_step2/); stats-pass KL-zero canary and 128-pos self-check both
+exact-zero.
+
+| arm | mean KL | p99 | p99.5 | max | vs bar (0.50 / 0.021) |
+|---|---|---|---|---|---|
+| step-1 K baseline | 0.00677 | 0.064 | 0.118 | 2.52 @1000 | — |
+| k_scale32 | 0.00680 | 0.066 | 0.110 | 2.86 @1000 | FAIL / FAIL |
+| k_feature | 0.00706 | 0.068 | 0.108 | 0.756 @4256 | FAIL / FAIL |
+| k_both | 0.00711 | 0.080 | 0.119 | 0.688 @7719 | FAIL / FAIL |
+
+Reads:
+- **Secondary read answered decisively NO:** scale32 leaves the tail
+  untouched (max 2.86 at the same position; the +0.34 over baseline is
+  the near-tie route envelope, same class as the step-1 GEMM_HALF
+  attribution). The half-rounded scale is not the defect.
+- **Feature normalization kills the pos-1000 event specifically**
+  (max 2.52 → 0.756, argmax moves to 4256; k_both moves it again to
+  7719) but the tail BODY never moves: p99 stays 0.066–0.080 vs bar
+  0.021 across all arms. Fixing the worst spike surfaces the next
+  ~0.7-nat spike elsewhere — the K tail is a broad population of
+  near-tie positions, not one scale artifact.
+- **k_both is not additive:** worse p99 than either lever alone
+  (0.080) at the highest mean (+5%). Composing scaling levers buys
+  nothing.
+- Means all in band — no arm bought its tail cut by fattening the body.
+
+**Verdict (per pre-registration, final):** fixed whole-corpus oracle
+scales are the strongest version of the KVarN hypothesis and they miss
+the max bar by 1.4× and the p99 bar by 3×+ — no calibration-free
+online estimate can do better. K-side scaling levers are PARKED. What
+remains live for the codec effort is step 4's structured allocation
+shaped by the census: a ~4-cell exception list (L7 h1 K+V, L63 h2/h3 V,
+~3% of KV bytes), validated jointly (census read 4: per-cell
+sensitivities overstate joint damage 2.3×). Given the small footprint
+of the exception list and the parked scaling levers, step 4 should be
+sized as a cheap targeted probe (keep the listed cells fp16, measure
+both-sides KL) before any Block-GTQ machinery is built.

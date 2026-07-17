@@ -1,0 +1,8 @@
+step-1 K baseline: mean 0.00677  p99 0.064  p99.5 0.118  max 2.52 @pos 1000
+graduation bar: max <= 0.50 OR p99 <= 0.021, at mean within [0.00609, 0.00745]
+k_scale32  kl-kv tail: p50 0.002205  p90 0.01198  p99 0.06597  p99.5 0.1095  max 2.863 @pos 1000
+k_scale32  kl-kv wall: 652.26 s (12.56 pos/s through both engines), overall mean KL 0.00679803 nats, max 2.86325
+k_feature  kl-kv tail: p50 0.002589  p90 0.01502  p99 0.06756  p99.5 0.1076  max 0.7561 @pos 4256
+k_feature  kl-kv wall: 646.47 s (12.67 pos/s through both engines), overall mean KL 0.00706138 nats, max 0.756062
+k_both     kl-kv tail: p50 0.002562  p90 0.01462  p99 0.0796  p99.5 0.1189  max 0.688 @pos 7719
+k_both     kl-kv wall: 661.00 s (12.39 pos/s through both engines), overall mean KL 0.00710868 nats, max 0.688001
