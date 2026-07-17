@@ -58,6 +58,17 @@ class MetalBackend final : public ComputeBackend {
                       const BackendBuffer& w_or_seed, const BackendBuffer* w_scales,
                       const BackendBuffer* x, const BackendBuffer* x_scales,
                       BackendBuffer& y);
+    // B1 Phase 0B probe (bench-only, docs/plans/2026-07-15-binary-tier.md):
+    // candidate 1 select / 2 sign-XOR / 3 int8 bitplane+popcount, raw
+    // buffers, no DType. Candidate 3 dispatches its activation preprocess
+    // (int8 quantize + bitplane transpose + group sums) before the dot, so
+    // both land inside any timed region; scratch holds its planes + aux
+    // ((cols/128)*136 bytes) and is ignored by candidates 1-2. Never
+    // engine-routed.
+    void matvec_b1_probe(int candidate, uint32_t rows, uint32_t cols,
+                         const BackendBuffer& bits, const BackendBuffer& scales,
+                         const BackendBuffer& x, BackendBuffer* scratch,
+                         BackendBuffer& y);
     void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
                           uint32_t x_rows,BackendBuffer& y) override;
     void embedding_q8(const BackendTensor& weight, uint32_t token,

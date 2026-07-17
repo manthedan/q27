@@ -247,6 +247,10 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> mma_roofline_b_eq_p;
     id<MTLComputePipelineState> mma_roofline_cx_p;
     id<MTLComputePipelineState> mma_roofline_f_p;
+    id<MTLComputePipelineState> b1_select_p;
+    id<MTLComputePipelineState> b1_signxor_p;
+    id<MTLComputePipelineState> b1_popcount_p;
+    id<MTLComputePipelineState> b1_x_prep_p;
     // Arm K (function-constant probe): one specialized PSO per baked cols.
     std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
     id<MTLComputePipelineState> mm_dr_p;
@@ -534,6 +538,10 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->t2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128");
         impl_->t3 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t3_g128");
         impl_->mask_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_mask_logits");
+        impl_->b1_select_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_select");
+        impl_->b1_signxor_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_signxor");
+        impl_->b1_popcount_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_popcount");
+        impl_->b1_x_prep_p = make_pipeline(impl_->device, impl_->library, @"q27_b1_x_prep");
         impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
@@ -1306,6 +1314,70 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         if (own) impl_->finish_command("mma roofline b");
+    }
+}
+
+// B1 Phase 0B probe (bench-only): raw bits/scales buffers, no DType.
+// Candidate 3 encodes its activation preprocess and the dot on the same
+// serial encoder, so a timed dispatch always pays the preprocessing (the
+// plan's kill rule: a candidate that wins only with preprocessing excluded
+// is a kill).
+void MetalBackend::matvec_b1_probe(int candidate, uint32_t rows, uint32_t cols,
+                                   const BackendBuffer& bits, const BackendBuffer& scales,
+                                   const BackendBuffer& x, BackendBuffer* scratch,
+                                   BackendBuffer& y) {
+    if (candidate < 1 || candidate > 3 || !rows || !cols || cols % 128)
+        throw std::runtime_error("q27 Metal: invalid b1 probe arguments");
+    const uint32_t nb = cols / 128;
+    const MetalBuffer& wb = metal_buffer(bits);
+    const MetalBuffer& ws = metal_buffer(scales);
+    const MetalBuffer& xb = metal_buffer(x);
+    MetalBuffer& out = metal_buffer(y);
+    check_range(wb.size(), 0, (uint64_t)rows * cols / 8, "b1 probe bits");
+    check_range(ws.size(), 0, (uint64_t)rows * nb * 2, "b1 probe scales");
+    check_range(xb.size(), 0, (uint64_t)cols * 4, "b1 probe activations");
+    check_range(out.size(), 0, (uint64_t)rows * 4, "b1 probe output");
+    MatvecArgs args{rows, cols, 8};
+    @autoreleasepool {
+        if (candidate == 3) {
+            if (!scratch) throw std::runtime_error("q27 Metal: b1 popcount needs scratch");
+            MetalBuffer& sb = metal_buffer(*scratch);
+            // planes: nb*32 uints; aux: nb float2, aux base kept 8-aligned.
+            const uint64_t planes_bytes = (uint64_t)nb * 32 * 4;
+            check_range(sb.size(), 0, planes_bytes + (uint64_t)nb * 8, "b1 probe scratch");
+            bool own; auto enc = impl_->encoder_for_operation(own, "q27_matvec_b1_popcount");
+            [enc setComputePipelineState:impl_->b1_x_prep_p];
+            [enc setBuffer:xb.handle() offset:0 atIndex:0];
+            [enc setBuffer:sb.handle() offset:0 atIndex:1];
+            [enc setBuffer:sb.handle() offset:(NSUInteger)planes_bytes atIndex:2];
+            [enc setBytes:&args length:sizeof(args) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(nb, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            // Same serial encoder: the dot reads what the preprocess wrote.
+            [enc setComputePipelineState:impl_->b1_popcount_p];
+            [enc setBuffer:wb.handle() offset:0 atIndex:0];
+            [enc setBuffer:ws.handle() offset:0 atIndex:1];
+            [enc setBuffer:sb.handle() offset:0 atIndex:2];
+            [enc setBuffer:sb.handle() offset:(NSUInteger)planes_bytes atIndex:3];
+            [enc setBuffer:out.handle() offset:0 atIndex:4];
+            [enc setBytes:&args length:sizeof(args) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 7) / 8, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            if (own) impl_->finish_command("b1 popcount probe");
+            return;
+        }
+        const bool sel = candidate == 1;
+        bool own; auto enc = impl_->encoder_for_operation(
+            own, sel ? "q27_matvec_b1_select" : "q27_matvec_b1_signxor");
+        [enc setComputePipelineState:sel ? impl_->b1_select_p : impl_->b1_signxor_p];
+        [enc setBuffer:wb.handle() offset:0 atIndex:0];
+        [enc setBuffer:ws.handle() offset:0 atIndex:1];
+        [enc setBuffer:xb.handle() offset:0 atIndex:2];
+        [enc setBuffer:out.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command(sel ? "b1 select probe" : "b1 signxor probe");
     }
 }
 

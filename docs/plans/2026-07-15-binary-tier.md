@@ -300,3 +300,36 @@ ternary); MLX packs (different runtime; the mlx-1bit pack is a benchmark
 comparison target only); AWQ-4bit packs (mainstream-stack repacks, strictly
 dominated by native tiers on our hardware); any amendment of the
 one-model-load rule.
+
+---
+
+## Phase 0B RESULTS (2026-07-16 night, 24 GB M4, Daniel-authorized "do 5"; not a guaranteed-quiet machine — verdicts sit far from band edges, quiet re-run optional)
+
+`./build/metal_gemv_bench --b1`, production projection mix, reference =
+production T2 select-form float matvec, correctness-gated before timing
+(c1/c2 vs double CPU reference ≤1e-3; c3 vs its own int8 model ≤1e-3,
+float-reference gap 0.115 reported as the quantization cost; nonuniform
+fp16 scales after codex killed the uniform-1.0 vacuous-gate variant).
+
+| candidate | mix wall ratio T_B1/T_T2 | band |
+|---|---|---|
+| c1 positive-mask select | **0.504** | **STRONG GO** |
+| c2 float sign-XOR | 1.306 | **KILL** |
+| c3 int8 bitplane+popcount (preprocess timed) | **0.500** | **STRONG GO** |
+
+Physics: B1 streams half of T2's weight bytes in half the wall —
+bandwidth parity with the production kernel (~93 GB/s class). Predicted
+full B1 token ≈ 0.50 × 85.5 ms ≈ 43 ms ≈ 23 tok/s → the ≤50 ms GO
+condition holds; **the 20–23 tok/s serving headline survives Phase 0B.**
+c2 is measured dead: the unconditional sign-flip add chain loses 2.6× to
+the select form (no correction term saved it). c1 (simplest, exact float
+math, no preprocessing) is the integration candidate; c3's win costs an
+int8 quantization (0.115 max rel vs float) for no wall advantage at these
+shapes — park it as the fallback if c1's select ever becomes issue-bound
+at other occupancies.
+
+Next per plan: Phase 1 repack exists already (dtype 6 B1_G128 shipped in
+the dspark work, 2026-07-16); the open work is engine integration
+(loader dtype 6 → backend tensors → c1 kernel as `matvec` for B1
+weights) and then the Phase 0A machine-checkable quality gates on the
+real artifact through our own engine.

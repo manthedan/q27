@@ -411,6 +411,182 @@ kernel void q27_matvec_t3_g128(
     }
 }
 
+// ---- B1 Phase 0B probe kernels (bench-only, never engine-routed) ----
+// B1_G128 (FORMAT.md): 1 bit per element, LSB-first sequential within the
+// row (element i -> byte i/8, bit i%8); bit ? +d : -d, one fp16 scale d per
+// 128 columns. Three dot structures under test, pre-registered bands in
+// docs/plans/2026-07-15-binary-tier.md §Phase 0B. Candidates 1-2 reuse the
+// T2 kernel's shape: 4 rows per simdgroup, 4 blocks in flight, the 16-float
+// activation slice held in registers across rows; a lane's 16 elements are
+// 2 weight bytes, ushort-aligned by construction (row stride cols/8 is a
+// multiple of 16, il/8 is even).
+
+// Candidate 1 — select-form: sum(±y) = 2*sum_bit1(y) - sum(y). One
+// conditional accumulate per element, same select idiom as production T2.
+kernel void q27_matvec_b1_select(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint ix = lane / 8;              // block in flight (4 per simdgroup)
+    const uint il = (lane % 8) * 16;       // element offset within the block
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float *yb = x + ix * 128 + il;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float yl[16];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 16; i++) { yl[i] = yb[i]; sumy += yb[i]; }
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            const ushort b = *(device const ushort *)(weights + (ulong)row * (args.cols / 8) +
+                                                      ib * 16 + il / 8);
+            const float d = float(scales[(ulong)row * nb + ib]);
+            float acc_pos = 0.0f;
+            for (uint i = 0; i < 16; i++)
+                acc_pos += select(0.0f, yl[i], bool(b & (1u << i)));
+            sumf[r] += d * (2.0f * acc_pos - sumy);
+        }
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// Candidate 2 — IEEE sign-bit XOR: ±y materialized by flipping y's sign bit
+// from the weight bit (bit==1 -> +y, bit==0 -> -y). Unconditional
+// accumulate, no sum(y) correction term. Exact for all finite y (a flipped
+// -0.0 contributes +0.0; float addition of signed zeros never perturbs a
+// finite accumulator).
+kernel void q27_matvec_b1_signxor(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint nb = args.cols / 128;
+    const uint ix = lane / 8;              // block in flight (4 per simdgroup)
+    const uint il = (lane % 8) * 16;       // element offset within the block
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float *yb = x + ix * 128 + il;
+    for (uint ib = ix; ib < nb; ib += 4) {
+        uint yl[16];   // activation bits, sign flip applied bitwise below
+        for (uint i = 0; i < 16; i++) yl[i] = as_type<uint>(yb[i]);
+        for (uint r = 0; r < 4; r++) {
+            const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+            const uint b = *(device const ushort *)(weights + (ulong)row * (args.cols / 8) +
+                                                    ib * 16 + il / 8);
+            const float d = float(scales[(ulong)row * nb + ib]);
+            float acc = 0.0f;
+            for (uint i = 0; i < 16; i++)
+                acc += as_type<float>(yl[i] ^ ((~(b >> i) & 1u) << 31));
+            sumf[r] += d * acc;
+        }
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// Candidate 3 activation preprocessing — int8-domain offset quantization,
+// bitplane transpose, per-group sums. One 128-thread threadgroup per
+// 128-column group g:
+//   s_g   = max|x|/127 (0 if the group is all zero)
+//   u_i   = clamp(round(x_i/s_g) + 128, 0, 255)   (128 when s_g == 0)
+//   planes[g*32 + p*4 + w] = bit p of u over word w (columns w*32..w*32+31,
+//                            bit position = column%32, via simd_ballot)
+//   aux[g] = { s_g, sum(u) }
+// The dot kernel then reconstructs x_i ~= s_g*(u_i - 128) exactly in the
+// int8 model; the quantization error vs float activations is the candidate's
+// accuracy cost and is gated separately in the bench.
+kernel void q27_b1_x_prep(
+        device const float  *x      [[buffer(0)]],
+        device       uint   *planes [[buffer(1)]],
+        device       float2 *aux    [[buffer(2)]],
+        constant MatvecArgs &args   [[buffer(3)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort tid                   [[thread_index_in_threadgroup]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    const float xv = x[group * 128 + tid];
+    // Two threadgroup arrays: sum partials are written while other threads
+    // may still be reading the max partials (no barrier between the phases).
+    threadgroup float pmax[4], psum[4];
+    float amax = simd_max(fabs(xv));
+    if (lane == 0) pmax[simdgroup] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = max(max(pmax[0], pmax[1]), max(pmax[2], pmax[3]));
+    const float s = amax / 127.0f;
+    const uint u = s > 0.0f ? uint(clamp(round(xv / s) + 128.0f, 0.0f, 255.0f)) : 128u;
+    for (uint p = 0; p < 8; p++) {
+        const uint m = uint(uint64_t(simd_ballot(bool((u >> p) & 1u))));
+        if (lane == 0) planes[group * 32 + p * 4 + simdgroup] = m;
+    }
+    float sumu = simd_sum(float(u));
+    if (lane == 0) psum[simdgroup] = sumu;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0)
+        aux[group] = float2(s, psum[0] + psum[1] + psum[2] + psum[3]);
+}
+
+// Candidate 3 — int8 bitplane + popcount dot. Per 32-column word: 8
+// AND+popcounts of the weight-bit word against the 8 activation bitplanes,
+// plane p weighted 2^p. With w_i in {-1,+1} = 2b_i - 1 and
+// x_i ~= s*(u_i - 128):
+//   sum_i w_i*x_i = 2*sum_{b_i=1} x_i - sum_i x_i
+//                 = s*( 2*(sum_p 2^p*popc(b & u_p) - 128*popc(b))
+//                       - (sum(u) - 128*128) )
+// One simdgroup per row (8 rows per threadgroup), lanes stride the groups;
+// all popcount math stays in uint until the one float scale per group.
+kernel void q27_matvec_b1_popcount(
+        device const uint   *weights [[buffer(0)]],
+        device const half   *scales  [[buffer(1)]],
+        device const uint   *planes  [[buffer(2)]],
+        device const float2 *aux     [[buffer(3)]],
+        device       float  *out     [[buffer(4)]],
+        constant MatvecArgs &args    [[buffer(5)]],
+        uint group                    [[threadgroup_position_in_grid]],
+        ushort lane                   [[thread_index_in_simdgroup]],
+        ushort simdgroup              [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group * 8 + simdgroup;
+    if (row >= args.rows) return;
+    const uint nb = args.cols / 128;
+    const ulong wbase = (ulong)row * (args.cols / 32);
+    float sum = 0.0f;
+    for (uint g = lane; g < nb; g += 32) {
+        uint planesum = 0, wpop = 0;
+        for (uint w = 0; w < 4; w++) {
+            const uint wb = weights[wbase + g * 4 + w];
+            wpop += popcount(wb);
+            for (uint p = 0; p < 8; p++)
+                planesum += popcount(wb & planes[g * 32 + p * 4 + w]) << p;
+        }
+        const float2 sa = aux[g];
+        const float d = float(scales[(ulong)row * nb + g]);
+        sum += d * sa.x * (2.0f * (float(int(planesum) - int(128 * wpop))) -
+                           (sa.y - 16384.0f));
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) out[row] = sum;
+}
+
 struct VectorArgs {
     uint n;
     uint groups;

@@ -9,9 +9,12 @@
 
 #include "metal_backend.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -209,11 +212,201 @@ int run_slot2_probe(q27::MetalBackend& backend, int reps) {
     return 0;
 }
 
+// B1 Phase 0B — synthetic kernel economics (docs/plans/2026-07-15-binary-
+// tier.md). Three B1 dot structures against the production T2 select-form
+// float matvec on the per-token projection mix; the decision metric is the
+// production-mix WALL-TIME ratio T_B1/T_T2 (never effective GB/s alone),
+// candidate 3's activation preprocessing on the clock by construction
+// (matvec_b1_probe encodes it before the dot). Pre-registered bands:
+// <=0.60 strong GO, 0.60-0.72 conditional GO, >0.72 kill.
+int run_b1_probe(q27::MetalBackend& backend, int reps) {
+    struct ProbeShape { Shape shape; double per_token_count; };
+    const ProbeShape probes[] = {
+        {{"ffn gate/up   [17408x5120]", 17408, 5120, DType::T2_G128, false}, 128},
+        {{"ffn down      [5120x17408]", 5120, 17408, DType::T2_G128, false}, 64},
+        {{"gdn qkv       [10240x5120]", 10240, 5120, DType::T2_G128, false}, 48},
+        {{"gdn gate      [6144x5120]",  6144, 5120, DType::T2_G128, false}, 48},
+        {{"ssm/attn out  [5120x6144]",  5120, 6144, DType::T2_G128, false}, 64},
+        {{"attn q        [12288x5120]", 12288, 5120, DType::T2_G128, false}, 16},
+        {{"attn k/v      [1024x5120]",  1024, 5120, DType::T2_G128, false}, 32},
+        {{"output head   [248320x5120]", 248320, 5120, DType::T2_G128, false}, 1},
+    };
+    printf("B1 probe: reference arm = production T2 select-form float matvec; "
+           "c1 = select, c2 = sign-XOR, c3 = int8 bitplane+popcount (preprocess on the clock)\n");
+    printf("%-30s %8s %8s %8s %8s | %6s %6s %6s\n",
+           "shape", "t2 ms", "c1 ms", "c2 ms", "c3 ms", "r1", "r2", "r3");
+    double t2_wall = 0.0, b1_wall[3] = {0.0, 0.0, 0.0};
+    double c3_float_err_max = 0.0;
+    for (const ProbeShape& p : probes) {
+        const Shape& s = p.shape;
+        const uint32_t nb = s.cols / 128;
+        // Reference arm: synthetic T2 tensor through the production kernel.
+        std::vector<uint8_t> t2_data;
+        std::vector<uint16_t> t2_scales;
+        q27::BackendTensor t2w = upload_synthetic(backend, s, t2_data, t2_scales);
+
+        // B1 arm: raw bits + NONUNIFORM per-(row,group) fp16 scales, all
+        // exactly representable (0.5..2.0 step 0.25) so the CPU double refs
+        // stay exact — uniform 1.0 scales would leave a wrong/ignored scale
+        // index invisible to the gate (codex P2).
+        static const uint16_t kScaleBits[7] = {0x3800, 0x3a00, 0x3c00, 0x3d00,
+                                               0x3e00, 0x3f00, 0x4000};
+        static const float kScaleVal[7] = {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+        auto scale_idx = [](uint32_t r, uint32_t g) { return (r * 31u + g) % 7u; };
+        std::vector<uint8_t> bits((uint64_t)s.rows * s.cols / 8);
+        for (size_t i = 0; i < bits.size(); i++) bits[i] = (uint8_t)(i * 2654435761u >> 24);
+        std::vector<uint16_t> bscales((uint64_t)s.rows * nb);
+        for (uint32_t r = 0; r < s.rows; r++)
+            for (uint32_t g = 0; g < nb; g++)
+                bscales[(uint64_t)r * nb + g] = kScaleBits[scale_idx(r, g)];
+        auto bitsb = backend.allocate(bits.size());
+        backend.write(*bitsb, 0, bits.data(), bits.size());
+        auto scalesb = backend.allocate(bscales.size() * sizeof(uint16_t));
+        backend.write(*scalesb, 0, bscales.data(), bscales.size() * sizeof(uint16_t));
+        std::vector<float> x(s.cols);
+        for (uint32_t i = 0; i < s.cols; i++) x[i] = (float)((int)(i % 23) - 11) / 11.0f;
+        auto xb = backend.allocate(x.size() * sizeof(float));
+        backend.write(*xb, 0, x.data(), x.size() * sizeof(float));
+        auto scratch = backend.allocate((uint64_t)nb * 136);
+        auto yt2 = backend.allocate((uint64_t)s.rows * sizeof(float));
+        std::shared_ptr<q27::BackendBuffer> yc[3];
+        for (int c = 0; c < 3; c++) yc[c] = backend.allocate((uint64_t)s.rows * sizeof(float));
+
+        // CPU references. Float ref (double accumulate): bit ? +x : -x.
+        // Int8 model mirrors q27_b1_x_prep / _popcount: float s = amax/127,
+        // u = clamp(round(x/s)+128, 0..255), contributions accumulated per
+        // group with the same correction terms (integer-exact popcount math).
+        std::vector<float> gs(nb), gsumu(nb);
+        std::vector<int> u8((uint64_t)s.cols);
+        for (uint32_t g = 0; g < nb; g++) {
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 128; i++) amax = std::max(amax, std::fabs(x[g * 128 + i]));
+            const float sc = amax / 127.0f;
+            float sumu = 0.0f;
+            for (uint32_t i = 0; i < 128; i++) {
+                const float xv = x[g * 128 + i];
+                const int u = sc > 0.0f
+                    ? (int)std::fmin(std::fmax(std::round(xv / sc) + 128.0f, 0.0f), 255.0f)
+                    : 128;
+                u8[g * 128 + i] = u;
+                sumu += (float)u;
+            }
+            gs[g] = sc;
+            gsumu[g] = sumu;
+        }
+        std::vector<double> ref(s.rows), ref8(s.rows);
+        for (uint32_t r = 0; r < s.rows; r++) {
+            double acc = 0.0, acc8 = 0.0;
+            const uint64_t rb = (uint64_t)r * s.cols / 8;
+            for (uint32_t g = 0; g < nb; g++) {
+                double gpos = 0.0, gsum = 0.0;
+                long dotu = 0, wpop = 0;
+                for (uint32_t i = 0; i < 128; i++) {
+                    const uint32_t col = g * 128 + i;
+                    const bool bit = bits[rb + col / 8] >> (col % 8) & 1;
+                    gsum += x[col];
+                    if (bit) { gpos += x[col]; dotu += u8[col]; wpop++; }
+                }
+                const double d = kScaleVal[scale_idx(r, g)];
+                acc += d * (2.0 * gpos - gsum);
+                acc8 += d * (double)gs[g] *
+                        (2.0 * (double)(dotu - 128 * wpop) - ((double)gsumu[g] - 16384.0));
+            }
+            ref[r] = acc;
+            ref8[r] = acc8;
+        }
+
+        // Correctness gates before any timing.
+        for (int c = 1; c <= 3; c++) {
+            backend.begin_commands();
+            backend.matvec_b1_probe(c, s.rows, s.cols, *bitsb, *scalesb, *xb,
+                                    scratch.get(), *yc[c - 1]);
+            backend.end_commands();
+        }
+        std::vector<float> y1(s.rows), y2(s.rows), y3(s.rows);
+        backend.read(*yc[0], 0, y1.data(), s.rows * sizeof(float));
+        backend.read(*yc[1], 0, y2.data(), s.rows * sizeof(float));
+        backend.read(*yc[2], 0, y3.data(), s.rows * sizeof(float));
+        // A ±1-weight row dot is a random walk, so |ref| can land near zero
+        // on some row; a pure relative gate would false-fail on float noise
+        // there. Floor the denominator at 1e-3 of the row's input magnitude
+        // (sum|x|, row-independent here): float accumulation noise stays
+        // orders below it, a single flipped bit changes the dot by O(|x|)
+        // and still trips the gate.
+        double sum_abs_x = 0.0;
+        for (uint32_t i = 0; i < s.cols; i++) sum_abs_x += std::fabs(x[i]);
+        const double denom_floor = 1e-3 * sum_abs_x;
+        double e1 = 0.0, e12 = 0.0, e3 = 0.0, e3f = 0.0;
+        bool nonzero = false;
+        for (uint32_t r = 0; r < s.rows; r++) {
+            const double d1 = std::fabs(y1[r] - ref[r]) / std::fmax(std::fabs(ref[r]), denom_floor);
+            const double d12 =
+                std::fabs((double)y1[r] - y2[r]) / std::fmax(std::fabs(ref[r]), denom_floor);
+            const double d3 =
+                std::fabs(y3[r] - ref8[r]) / std::fmax(std::fabs(ref8[r]), denom_floor);
+            const double d3f =
+                std::fabs(y3[r] - ref[r]) / std::fmax(std::fabs(ref[r]), denom_floor);
+            e1 = std::fmax(e1, d1);
+            e12 = std::fmax(e12, d12);
+            e3 = std::fmax(e3, d3);
+            e3f = std::fmax(e3f, d3f);
+            if (y1[r] != 0.0f) nonzero = true;
+        }
+        c3_float_err_max = std::fmax(c3_float_err_max, e3f);
+        if (e1 > 1e-3 || e12 > 1e-3 || e3 > 1e-3) {
+            fprintf(stderr, "FAIL: %s — b1 correctness gate (c1 vs ref %.2e, c2 vs c1 %.2e, "
+                    "c3 vs int8 model %.2e; bound 1e-3)\n", s.name, e1, e12, e3);
+            return 1;
+        }
+        if (!nonzero || (s.rows > 1 && y1[0] == y1[1])) {
+            fprintf(stderr, "FAIL: %s — b1 anti-vacuity (zero or row-identical output)\n", s.name);
+            return 1;
+        }
+
+        auto time_arm = [&](int arm) {
+            auto body = [&](int count) {
+                backend.begin_commands();
+                for (int i = 0; i < count; i++) {
+                    if (arm == 0) backend.matvec(t2w, *xb, *yt2);
+                    else backend.matvec_b1_probe(arm, s.rows, s.cols, *bitsb, *scalesb, *xb,
+                                                 scratch.get(), *yc[arm - 1]);
+                }
+                backend.end_commands();
+            };
+            body(2); // warmup / first touch
+            auto start = std::chrono::steady_clock::now();
+            body(reps);
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count() / reps;
+        };
+        const double t2_ms = time_arm(0) * 1e3;
+        const double c_ms[3] = {time_arm(1) * 1e3, time_arm(2) * 1e3, time_arm(3) * 1e3};
+        printf("%-30s %8.3f %8.3f %8.3f %8.3f | %6.3f %6.3f %6.3f\n", s.name, t2_ms,
+               c_ms[0], c_ms[1], c_ms[2], c_ms[0] / t2_ms, c_ms[1] / t2_ms, c_ms[2] / t2_ms);
+        t2_wall += p.per_token_count * t2_ms;
+        for (int c = 0; c < 3; c++) b1_wall[c] += p.per_token_count * c_ms[c];
+    }
+    printf("identity: c1/c2 match the float reference and each other, c3 matches its int8 "
+           "model, all <= 1e-3 max rel; c3 vs float reference max rel %.3e (quantization "
+           "cost, reported not gated)\n", c3_float_err_max);
+    printf("production-mix wall ratio T_B1/T_T2 (the pre-registered metric):\n");
+    const char* cname[3] = {"c1 select", "c2 sign-XOR", "c3 popcount"};
+    for (int c = 0; c < 3; c++) {
+        const double r = b1_wall[c] / t2_wall;
+        printf("  %-12s %.3f  -> %s\n", cname[c], r,
+               r <= 0.60 ? "STRONG GO (<=0.60)"
+               : r <= 0.72 ? "conditional GO (0.60-0.72; needs Phase 0A quality margin)"
+                           : "KILL (>0.72)");
+    }
+    printf("per-token T2 wall over the mix: %.1f ms\n", t2_wall);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     int reps = 20;
-    bool t2 = false, t3 = false, slot2 = false;
+    bool t2 = false, t3 = false, slot2 = false, b1 = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--dtype" && i + 1 < argc) {
@@ -223,10 +416,12 @@ int main(int argc, char** argv) {
             else if (d != "q4q8") { fprintf(stderr, "invalid --dtype (q4q8|t2|t3)\n"); return 1; }
         } else if (arg == "--slot2") {
             slot2 = true;
+        } else if (arg == "--b1") {
+            b1 = true;
         } else if (!arg.empty() && arg[0] != '-') {
             reps = atoi(arg.c_str());
         } else {
-            fprintf(stderr, "usage: %s [reps] [--dtype q4q8|t2|t3] [--slot2]\n", argv[0]);
+            fprintf(stderr, "usage: %s [reps] [--dtype q4q8|t2|t3] [--slot2] [--b1]\n", argv[0]);
             return 1;
         }
     }
@@ -283,6 +478,7 @@ int main(int argc, char** argv) {
     }
 
     if (slot2) return run_slot2_probe(backend, reps);
+    if (b1) return run_b1_probe(backend, reps);
 
     double total_seconds = 0.0, total_bytes = 0.0;
     for (size_t si = 0; si < n_shapes; si++) {
