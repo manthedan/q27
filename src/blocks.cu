@@ -402,7 +402,16 @@ void add_inplace(float* x, const float* y, int n, cudaStream_t st) {
 __device__ __forceinline__ unsigned long long am_pack(float v, int idx) {
     unsigned u = __float_as_uint(v);
     u = (u & 0x80000000u) ? ~u : (u | 0x80000000u); // monotonic float->uint map
-    return ((unsigned long long)u << 32) | (unsigned)idx;
+    // Low 32 bits carry the BITWISE-INVERTED index: under the max/atomicMax
+    // reductions, exact value ties then resolve to the LOWEST index — the
+    // backend-independent tie rule (Metal argmax and CPU max_element agree;
+    // parity audit 2026-07-17). The per-thread strided scans use strict >,
+    // which already keeps each thread's lowest index.
+    return ((unsigned long long)u << 32) | (unsigned)~idx;
+}
+
+__device__ __forceinline__ int am_unpack_idx(unsigned long long p) {
+    return (int)~(unsigned)(p & 0xffffffffull);
 }
 
 // Exact inverse of am_pack's monotonic map (recovers the packed float value).
@@ -434,7 +443,7 @@ __global__ void k_argmax(const float* __restrict__ x, int n,
 }
 
 __global__ void k_argmax_extract(const unsigned long long* best, int* out) {
-    *out = (int)(unsigned)(*best & 0xffffffffull);
+    *out = am_unpack_idx(*best);
 }
 
 void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cudaStream_t st) {
@@ -506,7 +515,7 @@ __global__ void k_top2_finalize(const unsigned long long* __restrict__ blk1,
         __syncthreads();
     }
     if (t == 0) {
-        tok[0] = (int)(unsigned)(s1[0] & 0xffffffffull);
+        tok[0] = am_unpack_idx(s1[0]);
         margin_out[0] = am_unpack_val(s1[0]) - s2[0];
     }
 }

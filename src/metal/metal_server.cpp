@@ -1,6 +1,7 @@
 #include "metal_engine.h"
 #include "stream_format.h"
 #include "../suffixdraft.h"
+#include "../tool_preamble.h"
 #include "../tokenizer.h"
 #include "../toolconstrain.h"
 #include <cerrno>
@@ -70,6 +71,17 @@ std::vector<std::pair<std::string,std::string>> messages_from(const json& body) 
         if(!role.empty()) messages.push_back({role,content});
     }
     if(messages.empty()) throw std::runtime_error("messages are empty");
+    // Tools preamble parity with the CUDA server (api_common.h,
+    // chatml_prompt's merged_system behavior — preamble first, then the
+    // client's system text): --constrain-tools only masks decoding, so
+    // without the schema in the system text the model can never call a
+    // function. The B1 probe battery found this Metal-side gap
+    // (parity audit follow-up, 2026-07-17).
+    if(body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
+        const std::string preamble=q27::tools_preamble(body["tools"]);
+        if(messages[0].first=="system") messages[0].second=preamble+"\n\n"+messages[0].second;
+        else messages.insert(messages.begin(),{"system",preamble});
+    }
     return messages;
 }
 

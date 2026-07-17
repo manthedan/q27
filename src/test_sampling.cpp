@@ -52,6 +52,41 @@ int main() {
         catch(const std::runtime_error&) { short_rejected=true; }
         if(!short_rejected) return 1;
     }
+
+    // Top-p boundary ties stay in the nucleus (parity audit 2026-07-17,
+    // CUDA keeps every token at or above its threshold): three exact-tie
+    // logits at top_p=0.5 must ALL be reachable — the pre-fix prefix
+    // truncation kept two and could never sample the third.
+    {
+        std::vector<float> tied={0.0f,0.0f,0.0f,-100.0f};
+        q27::SamplingParams p{1.0f,0.5f,0,9001};
+        bool seen[3]={false,false,false};
+        std::mt19937_64 r(p.seed);
+        for(int i=0;i<300;i++) {
+            uint32_t tok=q27::sample_logits_cpu(tied,p,r);
+            if(tok>2) { fprintf(stderr,"top-p tie: sampled outside the tied set (%u)\n",tok); return 1; }
+            seen[tok]=true;
+        }
+        if(!(seen[0]&&seen[1]&&seen[2])) { fprintf(stderr,"top-p tie: a boundary-tied token is unreachable\n"); return 1; }
+        std::vector<uint32_t> ids={0,1,2,3};
+        std::mt19937_64 r2(p.seed);
+        bool cseen[3]={false,false,false};
+        for(int i=0;i<300;i++) {
+            uint32_t tok=q27::sample_candidates_cpu(tied,ids,4,p,r2);
+            if(tok>2) { fprintf(stderr,"top-p tie (candidates): sampled outside the tied set (%u)\n",tok); return 1; }
+            cseen[tok]=true;
+        }
+        if(!(cseen[0]&&cseen[1]&&cseen[2])) { fprintf(stderr,"top-p tie (candidates): a boundary-tied token is unreachable\n"); return 1; }
+        // Draw-for-draw identity across the two paths WITH ties in the
+        // nucleus (codex P2): same seed, same token, every draw — requires
+        // the full path's index-ascending tie order.
+        std::mt19937_64 rf(p.seed),rc(p.seed);
+        for(int i=0;i<300;i++) {
+            uint32_t want=q27::sample_logits_cpu(tied,p,rf);
+            uint32_t got=q27::sample_candidates_cpu(tied,ids,4,p,rc);
+            if(want!=got) { fprintf(stderr,"top-p tie: paths diverge at iter %d (%u vs %u)\n",i,want,got); return 1; }
+        }
+    }
     puts("CPU sampling: PASS");
     return 0;
 }

@@ -601,8 +601,13 @@ static void test_argmax_top2() {
     CUDA_CHECK(cudaMalloc(&d_blk1, 128 * 8));
     CUDA_CHECK(cudaMalloc(&d_blk2, 128 * 4));
     CUDA_CHECK(cudaMalloc(&d_scr, 8));
-    double worst_tok = 0, worst_cpu = 0, worst_kern = 0;
+    double worst_tok = 0, worst_cpu = 0, worst_kern = 0, worst_tie = 0;
     auto run_case = [&](std::vector<float>& logits) {
+        // Backend-independent tie rule (parity audit 2026-07-17): exact
+        // value ties select the LOWEST index, matching Metal argmax and
+        // CPU max_element. Every case asserts it, not just the tie cases.
+        int lowest = 0;
+        for (int i = 1; i < N; i++) if (logits[i] > logits[lowest]) lowest = i;
         float m1 = -1e30f, m2 = -1e30f;
         for (int i = 0; i < N; i++) {
             float v = logits[i];
@@ -622,6 +627,7 @@ static void test_argmax_top2() {
         float kmargin;
         CUDA_CHECK(cudaMemcpy(&kmargin, d_margin2, 4, cudaMemcpyDeviceToHost));
         worst_tok = std::max(worst_tok, (double)std::abs(ftok - atok));
+        worst_tie = std::max(worst_tie, (double)std::abs(atok - lowest));
         // exact float equality: any nonzero diff is a bug (both are pure selection)
         worst_cpu = std::max(worst_cpu, fmargin == cpu_margin ? 0.0 : 1.0);
         worst_kern = std::max(worst_kern, fmargin == kmargin ? 0.0 : 1.0);
@@ -632,6 +638,8 @@ static void test_argmax_top2() {
     { std::vector<float> l = rand_vec(N, 17); l[N - 1] = 1e4f; run_case(l); }    // max@last
     { std::vector<float> l = rand_vec(N, 23); l[100] = 5e3f; l[200000] = 5e3f;   // dup max
       run_case(l); }
+    { std::vector<float> l = rand_vec(N, 29); l[7] = 5e3f; l[8] = 5e3f; l[N - 2] = 5e3f;
+      run_case(l); }                                                // triple tie, adjacent pair
     CUDA_CHECK(cudaFree(d_x));
     CUDA_CHECK(cudaFree(d_margin));
     CUDA_CHECK(cudaFree(d_margin2));
@@ -641,6 +649,7 @@ static void test_argmax_top2() {
     CUDA_CHECK(cudaFree(d_blk2));
     CUDA_CHECK(cudaFree(d_scr));
     check("argmax_top2 token == argmax()", worst_tok, 0.5);
+    check("argmax tie -> lowest index (Metal/CPU rule)", worst_tie, 0.5);
     check("argmax_top2 margin == CPU top1-top2", worst_cpu, 0.5);
     check("argmax_top2 margin == margin() kernel", worst_kern, 0.5);
 }

@@ -34,12 +34,16 @@ inline uint32_t sample_logits_cpu(const std::vector<float>& logits,const Samplin
 
     std::vector<uint32_t> order(logits.size());
     for(uint32_t i=0;i<order.size();i++) order[i]=i;
+    // Ties break index-ascending (codex P2 on the boundary-tie fix): the
+    // candidates path already orders ties by index, and with boundary ties
+    // now inside the nucleus the two paths must map the same draw to the
+    // same token — unspecified sort order here would break that.
+    auto before=[&](uint32_t a,uint32_t b){return logits[a]!=logits[b]?logits[a]>logits[b]:a<b;};
     const size_t keep=p.top_k?std::min<size_t>(p.top_k,order.size()):order.size();
     if(keep<order.size()) {
-        std::partial_sort(order.begin(),order.begin()+keep,order.end(),
-                          [&](uint32_t a,uint32_t b){return logits[a]>logits[b];});
+        std::partial_sort(order.begin(),order.begin()+keep,order.end(),before);
         order.resize(keep);
-    } else std::sort(order.begin(),order.end(),[&](uint32_t a,uint32_t b){return logits[a]>logits[b];});
+    } else std::sort(order.begin(),order.end(),before);
 
     const double maximum=logits[order.front()]/(double)p.temperature;
     std::vector<double> weights; weights.reserve(order.size()); double total=0.0;
@@ -52,6 +56,12 @@ inline uint32_t sample_logits_cpu(const std::vector<float>& logits,const Samplin
     if(p.top_p<1.0f) {
         const double cutoff=total*p.top_p; double cumulative=0.0; size_t retained=0;
         do { cumulative+=weights[retained++]; } while(retained<weights.size() && cumulative<cutoff);
+        // Boundary ties stay in the nucleus (parity audit 2026-07-17): the
+        // CUDA sampler keeps every token at or above its threshold value, so
+        // exact ties at the truncation boundary must not be dropped by sort
+        // order here. Extends through logits exactly equal to the boundary.
+        while(retained<weights.size() && logits[order[retained]]==logits[order[retained-1]])
+            cumulative+=weights[retained++];
         order.resize(retained); weights.resize(retained); total=cumulative;
     }
     std::uniform_real_distribution<double> distribution(0.0,total);
@@ -100,6 +110,10 @@ inline uint32_t sample_candidates_cpu(const std::vector<float>& values,
     if(p.top_p<1.0f) {
         const double cutoff=total*p.top_p; double cumulative=0.0; size_t retained=0;
         do { cumulative+=weights[retained++]; } while(retained<weights.size() && cumulative<cutoff);
+        // Boundary ties stay in the nucleus — same rule as sample_logits_cpu
+        // (parity audit 2026-07-17), keyed on the exact candidate values.
+        while(retained<weights.size() && values[order[retained]]==values[order[retained-1]])
+            cumulative+=weights[retained++];
         order.resize(retained); weights.resize(retained); total=cumulative;
     }
     std::uniform_real_distribution<double> distribution(0.0,total);
