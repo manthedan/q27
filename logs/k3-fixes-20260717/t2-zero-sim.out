@@ -1,0 +1,18 @@
+class patterns: gdn=attn_qkv./ssm_*  attn=attn_*  ffn=ffn_*  other=rest
+
+class   tensors        elements    zero%   in-zgrp%all  in-zgrp%zero  net-save%
+attn        112      3187671040   30.68%         0.00%         0.00%     -0.37%
+ffn         192     17112760320   29.21%         0.00%         0.00%     -0.37%
+gdn         192      4050124800   30.75%         0.00%         0.00%     -0.37%
+other         2      2542796800   30.06%         0.00%         0.00%     -0.37%
+OVERALL     498     26893352960   29.70%         0.00%         0.00%     -0.37%
+
+per-group zero-code histogram (group = 128 cols; distance from contiguity):
+  0                   92    0.00%
+  1-31          12937322    6.16%
+  32-63        197163917   93.84%
+  64-95             2873    0.00%
+  96-127             116    0.00%
+  128                  0    0.00%
+
+net saving -0.37% — >= 8% funds a kernel look / < 8% KILL (pre-registered)
