@@ -3,3 +3,6 @@ models/
 __pycache__/
 build/
 scratchpad/
+
+# Claude Code local state — settings live user-level on each machine
+.claude/
