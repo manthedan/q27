@@ -9,14 +9,17 @@ was already healthy on :8213 and serving gates.
 ## Protocol for every agent on this box
 
 1. **NEVER launch `q27-metal-server` without BOTH checks first:**
-   `pgrep -f "q27-metal-server.*--port 8213"` and
+   the argv[0] pgrep in item 2 and
    `curl -s -m 2 http://127.0.0.1:8213/health`.
    If either shows a live server: DO NOT LAUNCH. Use the running one.
 2. **NEVER kill a server by the launch line's `$!`** — `caffeinate` forks,
    so `$!` is the wrapper and the 17 GB server survives as an orphan (this
-   caused crash #1). Kill the pid from
-   `pgrep -f "q27-metal-server.*--port 8213"`, then verify `pgrep` is EMPTY
-   (not just the wrapper gone) before any relaunch.
+   caused crash #1). Note `pgrep -f "q27-metal-server.*--port"` ALSO
+   matches the wrapper (its command line contains the pattern): match the
+   server by argv[0] —
+   `ps -Ao pid,args | awk '$2=="./build/q27-metal-server" && /--port 8213/ {print $1}'`
+   — kill that, then verify the list is EMPTY (not just the wrapper gone)
+   before any relaunch.
 3. **ONE 17 GB resident max.** No benches, no second server, no model loads
    while the T2 serving instance is up. The quiet-bench watcher
    (`tools/quiet_q4_bench.sh`) stops the server first and is the only

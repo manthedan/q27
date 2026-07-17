@@ -20,7 +20,10 @@ SERVER_LOG="$LOGDIR/t2-server-quiet-restart.log"
 
 idle_s() { ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/{printf "%d",$NF/1000000000; exit}'; }
 
-server_pid() { pgrep -f "q27-metal-server.*--port $PORT" | head -1; }
+# The server pid must match the SERVER process, not the caffeinate wrapper
+# (whose command line also contains the pattern): match argv[0] exactly.
+# Killing the wrapper orphans the 17 GB server — the 2026-07-17 OOM crashes.
+server_pid() { ps -Ao pid,args | awk -v p="./build/q27-metal-server" -v port="$PORT" '$2==p && $0 ~ ("--port " port) {print $1}' | head -1; }
 
 start_server() {
     env Q27_METAL_SNAPSHOT_DIR=/Users/macthedan/.q27/snapshots \

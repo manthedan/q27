@@ -1,0 +1,13 @@
+Review the uncommitted changes in src/metal/metal_server.cpp + tools/trace_gate.sh + tools/quiet_q4_bench.sh (git diff only). FIX-VERIFICATION round 2 on --trace (triage I2). Round 1 findings, all addressed:
+
+1. (P1) TraceLog::event not exception-contained → now `void event(json j) noexcept` with internal try/catch; comment records the accepted boundary (call-site scalar initializer lists can only throw on OOM).
+2. (P2) completions request event unguarded → now behind enabled() like the others.
+3. (P2) mid-request cancel misclassified → run() now emits {"kind":"cancel","phase":"generate","id":trace_id} where Finish::Cancelled is set; the redundant guarded "midrequest" events (no ids) are REMOVED.
+4. (P2) tms ordering → stamped inside the trace mutex (file order == tms order within a boot); the gate now resets monotonicity at each boot event (append-across-restarts resets tms per process).
+5. (P2) --trace "-" mixed with stderr logging → "-" support REMOVED, path only.
+6. (P3) ctx-limit error events now carry the request id on all four endpoints.
+7. (P3) prefix tier could mislabel disk when memory==disk len → disk_loaded flag tracks the actual load_state success.
+
+Also: tools/quiet_q4_bench.sh server_pid() now matches the server by argv[0] (ps+awk $2=="./build/q27-metal-server") instead of pgrep -f, which also matched the caffeinate wrapper (the orphan-and-double-load crash class; COORDINATION.md/lessons updated accordingly).
+
+Verify with file:line: every round-1 finding is genuinely closed; noexcept covers dump/fwrite/copy; no call site constructs non-scalar json values that could throw for non-OOM reasons; no trace call remains outside enabled() on the request path; quiet_q4_bench.sh's awk matches exactly the server. P1/P2/P3 verdicts.

@@ -252,9 +252,10 @@ class DiskSnapshotStore {
 
     // Budget enforcement: oldest-first until the directory fits. The
     // just-written file is deletable too — the budget is a hard cap, and
-    // the gate asserts the total never exceeds it.
-    void evict_past_budget() {
-        if(!enabled() || !max_bytes_) return;
+    // the gate asserts the total never exceeds it. Returns {files, bytes}
+    // removed so the --trace stream can record the eviction decision.
+    std::pair<size_t,uint64_t> evict_past_budget() {
+        if(!enabled() || !max_bytes_) return {0,0};
         std::lock_guard<std::mutex> lk(m_);
         struct F { std::string path; uint64_t size; std::filesystem::file_time_type mtime; };
         std::vector<F> files; uint64_t total=0;
@@ -266,16 +267,64 @@ class DiskSnapshotStore {
             total+=sz;
         }
         std::sort(files.begin(),files.end(),[](const F& a,const F& b){ return a.mtime<b.mtime; });
+        size_t n=0; uint64_t freed=0;
         for(const auto& f:files) {
             if(total<=max_bytes_) break;
-            if(std::filesystem::remove(f.path,ec)) total-=f.size;
+            if(std::filesystem::remove(f.path,ec)) { total-=f.size; n++; freed+=f.size; }
         }
+        return {n,freed};
     }
 
     std::atomic<uint64_t> hits{0}, saves{0};
   private:
     std::string dir_; uint64_t max_bytes_=0; std::string tag_; std::mutex m_;
 };
+
+// Whole-session trace stream (triage I2, docs/plans/2026-07-17-ds4-product-
+// triage.md): one JSONL stream of the events the parity rounds kept having
+// to reconstruct by hand from scattered logs — rendered prompts, snapshot /
+// prefix-cache decisions, tool-parser recoveries, cancellations, error
+// answers. Diagnostic switch only (ds4 flag rule): off by default, zero
+// semantic effect when on. Every line carries wall `ts` plus monotonic
+// `tms` (ms since open) so two-slot interleavings reconstruct exactly.
+struct TraceLog {
+    void open(const std::string& path) {
+        // Path only (codex P2): "-"/stderr is not offered — the server's
+        // fprintf logging shares stderr, so the JSONL stream would not be
+        // clean. /dev/stderr remains available for anyone who wants the mix.
+        f_=fopen(path.c_str(),"a");
+        if(!f_) throw std::runtime_error("cannot open --trace path: "+path);
+    }
+    bool enabled() const { return f_!=nullptr; }
+    // noexcept: a diagnostic stream must never throw through a handler or
+    // mask a cancellation (codex P1). json dump/copy/fwrite are contained
+    // here; call-site initializer lists are scalar-only, so their
+    // construction can only throw on OOM — accepted and recorded.
+    void event(json j) noexcept {
+        if(!f_) return;
+        try {
+            j["ts"]=(long)std::time(nullptr);
+            std::lock_guard<std::mutex> lk(m_);
+            // tms stamped inside the lock: file order == tms order (codex P2).
+            j["tms"]=(long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now()-t0_).count();
+            const std::string s=j.dump();
+            fwrite(s.data(),1,s.size(),f_);
+            fputc('\n',f_);
+            fflush(f_);
+        } catch(...) {}
+    }
+  private:
+    FILE* f_=nullptr; std::mutex m_;
+    const std::chrono::steady_clock::time_point t0_=std::chrono::steady_clock::now();
+};
+
+// Trace prompt payloads cap at 64 KB (ctx-limit test prompts run ~1 MB);
+// truncation is recorded, never silent.
+inline json trace_text(const std::string& s) {
+    if(s.size()<=65536) return json(s);
+    return json({{"truncated",true},{"bytes",(uint64_t)s.size()},{"head",s.substr(0,65536)}});
+}
 
 struct Runtime {
     q27::Tokenizer tokenizer;
@@ -390,6 +439,7 @@ struct Runtime {
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
     DiskSnapshotStore snapstore;
+    TraceLog trace;
     // Auto-snapshot threshold in prompt tokens (0 = hint-only); set with
     // the snapshot store, meaningful only when snapstore.enabled().
     size_t snap_auto_min=0;
@@ -582,7 +632,8 @@ struct Runtime {
                 const std::function<bool(const std::string&)>& emit,
                 const std::vector<std::string>& tool_names={},
                 bool snapshot_hint=false,
-                const std::function<bool()>& live={}) {
+                const std::function<bool()>& live={},
+                const std::string& trace_id="") {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         q27::validate_sampling(sampling);
         const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
@@ -636,6 +687,7 @@ struct Runtime {
                 if(live && !live()) {
                     queue_waiters--;
                     cancelled_queue++;
+                    trace.event({{"kind","cancel"},{"phase","queue"},{"id",trace_id}});
                     if(slot_serving_==ticket) {
                         // Front of the queue: the normal TurnPass increment
                         // is in order.
@@ -685,7 +737,7 @@ struct Runtime {
         // the resulting load_state goes under it. MTP requests stay on the
         // cold path: lane warming state is not part of the snapshot
         // contract in this phase.
-        std::string disk_path; uint32_t disk_len=0;
+        std::string disk_path; uint32_t disk_len=0; bool disk_loaded=false;
         const bool disk_ok=!mtp && snapstore.enabled() &&
                            snapstore.best_match(prompt,disk_path,disk_len);
         {
@@ -703,6 +755,7 @@ struct Runtime {
             if(disk_ok && disk_len>hit) {
                 try {
                     engine.load_state(disk_path);
+                    disk_loaded=true;
                     hit=disk_len;
                     if(hit==prompt.size()) { pending=engine.pending_from_logits(); restored=true; }
                     snapstore.hits++;
@@ -718,6 +771,9 @@ struct Runtime {
             if((uint64_t)engine.position()+(prompt.size()-hit)>context)
                 throw std::runtime_error("prompt exceeds context");
         }
+        trace.event({{"kind","prefix"},{"id",trace_id},
+                     {"tier",hit==0?"cold":(disk_loaded?"disk":"memory")},
+                     {"hit",(uint64_t)hit},{"prompt_tokens",(uint64_t)prompt.size()}});
         // Hinted save target: a stable boundary — trim a 32-token tail
         // (the question-specific suffix) and align down to a 96-token
         // prefill-chunk boundary. Reached exactly by capping one chunk's
@@ -771,11 +827,15 @@ struct Runtime {
                                                   prompt.data(),(uint32_t)(hit+i),false);
                             }
                             snapstore.saves++;
-                            snapstore.evict_past_budget();
+                            const auto ev=snapstore.evict_past_budget();
+                            trace.event({{"kind","snapshot_bank"},{"id",trace_id},
+                                         {"len",(uint64_t)(hit+i)},
+                                         {"evicted_files",ev.first},{"evicted_bytes",ev.second}});
                         } catch(const std::exception& e) {
                             fprintf(stderr,"[cancel-save] skipped: %s\n",e.what());
                         }
                         cancelled_prefill++;
+                        trace.event({{"kind","cancel"},{"phase","prefill"},{"id",trace_id}});
                         throw ClientGone{};
                     }
                     const uint32_t width=quantum_width(slot);
@@ -798,6 +858,9 @@ struct Runtime {
                         engine.save_state(snapstore.path_for(prompt.data(),(uint32_t)save_at),
                                           prompt.data(),(uint32_t)save_at,false);
                         snapstore.saves++;
+                        trace.event({{"kind","snapshot_save"},{"id",trace_id},
+                                     {"len",(uint64_t)save_at},
+                                     {"mode",snapshot_hint?"hint":"auto"}});
                         save_at=0; saved_snapshot=true;
                     }
                 }
@@ -811,7 +874,11 @@ struct Runtime {
             }
         }
         // LRU enforcement is pure file I/O — outside the lease.
-        if(saved_snapshot) snapstore.evict_past_budget();
+        if(saved_snapshot) {
+            const auto ev=snapstore.evict_past_budget();
+            if(ev.first) trace.event({{"kind","snapshot_evict"},{"id",trace_id},
+                                      {"files",ev.first},{"bytes",ev.second}});
+        }
         // Fail oversize generations before emitting anything, exactly like
         // the whole-generation streaming calls used to.
         if((uint64_t)engine.position()+(count?count-1:0)>context)
@@ -1029,7 +1096,10 @@ struct Runtime {
         out.queue_wait_ms=queue_wait_ms;
         out.gate_wait_ms=std::max(gate_wait_ms,0.0);
         out.arrival=arrival;
-        if(client_gone) out.finish=Finish::Cancelled;
+        if(client_gone) {
+            out.finish=Finish::Cancelled;
+            trace.event({{"kind","cancel"},{"phase","generate"},{"id",trace_id}});
+        }
         else if(stop_hit) {
             out.finish=Finish::StopSequence;
             if(stopbuf.matched>=0 && stopbuf.matched<(int)stops.size())
@@ -1096,11 +1166,12 @@ void json_response(httplib::Response& response,const json& value,int status=200)
 
 int main(int argc,char** argv) {
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N]\n",argv[0]);
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n",argv[0]);
         return 1;
     }
     try {
         std::string model=argv[1],tok=argv[2],host="127.0.0.1";
+        std::string trace_path;
         uint32_t port=8080,context=8192,width=0,suffix_width=0,prefix_entries=1,slot_count=2;
         bool turbo3=false; bool constrain_tools=false;
         for(int i=3;i<argc;i++) {
@@ -1114,6 +1185,7 @@ int main(int argc,char** argv) {
             else if(arg=="--slots" && i+1<argc) slot_count=parse_u32(argv[++i],"--slots");
             else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
             else if(arg=="--constrain-tools") constrain_tools=true;
+            else if(arg=="--trace" && i+1<argc) trace_path=argv[++i];
             else throw std::runtime_error("unknown/incomplete argument: "+arg);
         }
         if(port>65535) throw std::runtime_error("port out of range");
@@ -1133,6 +1205,11 @@ int main(int argc,char** argv) {
         // width/stats model extended first (codex P2 on d243f92).
         if(slot_count<1 || slot_count>2) throw std::runtime_error("--slots must be 1..2 in multislot Phase 1");
         Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count);
+        if(!trace_path.empty()) {
+            runtime.trace.open(trace_path);
+            runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
+                                 {"mtp",width},{"suffix",suffix_width},{"slots",slot_count}});
+        }
         httplib::Server server;
         // Bound the accept-side queue (codex P1 on d243f92): the default
         // task queue holds accepted connections without limit, so the
@@ -1186,9 +1263,9 @@ int main(int argc,char** argv) {
                 // negative the client gets a parseable error instead of an
                 // empty 200 (codex P2 on this round).
                 catch(const Runtime::ClientGone&) { response.status=499; }
-                catch(const Runtime::ServerOverloaded& e) { json_response(response,{{"error",{{"message",e.what()},{"type","overloaded_error"}}}},503); }
-                catch(const Runtime::EngineError& e) { json_response(response,{{"error",{{"message",e.what()},{"type","api_error"}}}},500); }
-                catch(const std::exception& e) { json_response(response,{{"error",{{"message",e.what()},{"type","invalid_request_error"}}}},400); }
+                catch(const Runtime::ServerOverloaded& e) { runtime.trace.event({{"kind","error"},{"status",503},{"type","overloaded_error"},{"message",e.what()}}); json_response(response,{{"error",{{"message",e.what()},{"type","overloaded_error"}}}},503); }
+                catch(const Runtime::EngineError& e) { runtime.trace.event({{"kind","error"},{"status",500},{"type","api_error"},{"message",e.what()}}); json_response(response,{{"error",{{"message",e.what()},{"type","api_error"}}}},500); }
+                catch(const std::exception& e) { runtime.trace.event({{"kind","error"},{"status",400},{"type","invalid_request_error"},{"message",e.what()}}); json_response(response,{{"error",{{"message",e.what()},{"type","invalid_request_error"}}}},400); }
             };
         };
         // Liveness probe for phases with no response writes yet (queue wait,
@@ -1224,14 +1301,17 @@ int main(int argc,char** argv) {
                 // 499 as in `guarded` (codex P2): never an empty 200.
                 catch(const Runtime::ClientGone&) { response.status=499; }
                 catch(const Runtime::EngineError& e) {
+                    runtime.trace.event({{"kind","error"},{"status",500},{"type","api_error"},{"message",e.what()}});
                     response.status=500;
                     response.set_content(q27::anthropic_error_json("api_error",e.what()),"application/json");
                 }
                 catch(const Runtime::ServerOverloaded& e) {
+                    runtime.trace.event({{"kind","error"},{"status",503},{"type","overloaded_error"},{"message",e.what()}});
                     response.status=503;
                     response.set_content(q27::anthropic_error_json("overloaded_error",e.what()),"application/json");
                 }
                 catch(const std::exception& e) {
+                    runtime.trace.event({{"kind","error"},{"status",400},{"type","invalid_request_error"},{"message",e.what()}});
                     response.status=400;
                     response.set_content(q27::anthropic_error_json("invalid_request_error",e.what()),"application/json");
                 }
@@ -1259,17 +1339,30 @@ int main(int argc,char** argv) {
             if(ids.empty()) throw std::runtime_error("prompt is empty");
             uint32_t maxp=0;
             if(prompt_overflow(ids.size(),n,maxp)) {
+                runtime.trace.event({{"kind","error"},{"status",400},{"type","context_length_exceeded"},
+                    {"id",id},{"prompt_tokens",(uint64_t)ids.size()},{"max",maxp}});
                 json_response(r,{{"error",{{"message",q27::ctx_limit_error_message((int)ids.size(),(int)maxp)},
                     {"type","invalid_request_error"},{"code","context_length_exceeded"}}}},400);
                 return;
             }
+            if(runtime.trace.enabled())
+                // body.value("prompt","") repeats the encode line's identical
+                // accessor verbatim — a non-string prompt throws THERE first
+                // (guarded 400), so this event adds no new throw path (codex
+                // P2 on the trace round, rejected with this evidence).
+                runtime.trace.event({{"kind","request"},{"api","completions"},{"id",id},
+                    {"stream",wants_stream(body)},{"prompt_tokens",(uint64_t)ids.size()},
+                    {"max_tokens",n},{"rendered",trace_text(body.value("prompt",""))}});
             if(!wants_stream(body)) {
                 std::string text; size_t probe=0;
                 auto outcome=engine_guard([&]{
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ text+=piece;
                             return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                        tool_names_from(body),body.value("snapshot",false),socket_live(sock)); });
+                        tool_names_from(body),body.value("snapshot",false),socket_live(sock),id); });
+                runtime.trace.event({{"kind","outcome"},{"api","completions"},{"id",id},
+                    {"finish",openai_finish(outcome.finish)},{"prompt_tokens",outcome.prompt_tokens},
+                    {"output_tokens",outcome.output_tokens},{"prefix_hit",outcome.prefix_hit}});
                 json_response(r,{{"id",id},{"object","text_completion"},{"created",created},{"model","q27-metal"},
                     {"choices",json::array({{{"index",0},{"text",text},{"finish_reason",openai_finish(outcome.finish)}}})},
                     {"usage",{{"prompt_tokens",outcome.prompt_tokens},{"completion_tokens",outcome.output_tokens},
@@ -1289,13 +1382,16 @@ int main(int argc,char** argv) {
                             return sink.write(s.data(),s.size());
                         };
                         auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
-                            [sock]{ return httplib::detail::is_socket_alive(sock); });
+                            [sock]{ return httplib::detail::is_socket_alive(sock); },id);
                         // Terminal chunk with a real finish_reason before [DONE]
                         // (parity with server.cu security-review fix #7).
                         std::string fin=q27::sse_data(q27::openai_stream_final_chunk(
                             false,id,"text_completion",created,"q27-metal",openai_finish(outcome.finish)));
                         sink.write(fin.data(),fin.size());
                         std::string done=q27::sse_done(); sink.write(done.data(),done.size());
+                        runtime.trace.event({{"kind","outcome"},{"api","completions"},{"id",id},
+                            {"finish",openai_finish(outcome.finish)},{"prompt_tokens",outcome.prompt_tokens},
+                            {"output_tokens",outcome.output_tokens},{"prefix_hit",outcome.prefix_hit}});
                     } catch(const Runtime::ClientGone&) {
                         return false;
                     } catch(const std::exception& e) {
@@ -1321,7 +1417,8 @@ int main(int argc,char** argv) {
                 think=body["chat_template_kwargs"].value("enable_thinking",think);
             const json tools=body.contains("tools") && body["tools"].is_array()
                                  ?body["tools"]:json::array();
-            auto ids=to_u32(runtime.tokenizer.encode(q27::chatml_prompt(openai_msgs(body),tools,think)));
+            const std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think);
+            auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,256);
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop");
@@ -1331,6 +1428,8 @@ int main(int argc,char** argv) {
             if(ids.empty()) throw std::runtime_error("prompt is empty");
             uint32_t maxp=0;
             if(prompt_overflow(ids.size(),n,maxp)) {
+                runtime.trace.event({{"kind","error"},{"status",400},{"type","context_length_exceeded"},
+                    {"id",id},{"prompt_tokens",(uint64_t)ids.size()},{"max",maxp}});
                 json_response(r,{{"error",{{"message",q27::ctx_limit_error_message((int)ids.size(),(int)maxp)},
                     {"type","invalid_request_error"},{"code","context_length_exceeded"}}}},400);
                 return;
@@ -1338,6 +1437,11 @@ int main(int argc,char** argv) {
             const bool has_tools=!tools.empty();
             const std::vector<std::string> tnames=tool_names_from(body);
             const bool snap_hint=body.value("snapshot",false);
+            if(runtime.trace.enabled())
+                runtime.trace.event({{"kind","request"},{"api","chat"},{"id",id},
+                    {"stream",wants_stream(body)},{"prompt_tokens",(uint64_t)ids.size()},
+                    {"max_tokens",n},{"tools",(uint64_t)tools.size()},
+                    {"rendered",trace_text(rendered)}});
             if(!wants_stream(body)) {
                 q27::StreamSplitter sp;
                 std::string think_buf,text,tool_buf;
@@ -1355,7 +1459,7 @@ int main(int argc,char** argv) {
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
                             return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                        tnames,snap_hint,socket_live(sock)); });
+                        tnames,snap_hint,socket_live(sock),id); });
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
                 std::string th=q27::strip_ws2(think_buf),tx=q27::strip_ws2(text);
@@ -1371,6 +1475,7 @@ int main(int argc,char** argv) {
                     auto bcs=q27::parse_bare_tool_calls(tx,&pre,&tools);
                     if(!bcs.empty()) {
                         fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",bcs.size());
+                        runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"stream",false},{"count",bcs.size()}});
                         tx=pre;
                         for(auto& bc:bcs) good.push_back(std::move(bc));
                     }
@@ -1385,6 +1490,10 @@ int main(int argc,char** argv) {
                               {"content",(!tcs.empty() && tx.empty())?json(nullptr):json(tx)}};
                 if(!th.empty()) message["reasoning_content"]=th;
                 if(!tcs.empty()) message["tool_calls"]=tcs;
+                runtime.trace.event({{"kind","outcome"},{"api","chat"},{"id",id},
+                    {"finish",!tcs.empty()?"tool_calls":openai_finish(outcome.finish)},
+                    {"prompt_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
+                    {"prefix_hit",outcome.prefix_hit}});
                 json_response(r,{{"id",id},{"object","chat.completion"},{"created",created},{"model","q27-metal"},
                     {"choices",json::array({{{"index",0},{"message",message},
                         {"finish_reason",!tcs.empty()?"tool_calls":openai_finish(outcome.finish)}}})},
@@ -1439,7 +1548,7 @@ int main(int argc,char** argv) {
                                 for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
-                            [sock]{ return httplib::detail::is_socket_alive(sock); });
+                            [sock]{ return httplib::detail::is_socket_alive(sock); },id);
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
@@ -1448,8 +1557,10 @@ int main(int argc,char** argv) {
                             // chunks still fire so the client can execute.
                             std::string pre;
                             auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,&tools);
-                            if(!bcs.empty())
+                            if(!bcs.empty()) {
                                 fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat stream)\n",bcs.size());
+                                runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"stream",true},{"count",bcs.size()}});
+                            }
                             for(auto& bc:bcs) {
                                 any_call=true;
                                 chunk({{"tool_calls",json::array({{{"index",tool_counter},
@@ -1461,6 +1572,10 @@ int main(int argc,char** argv) {
                         }
                         chunk(json::object(),any_call?"tool_calls":openai_finish(outcome.finish));
                         std::string done=q27::sse_done(); sink.write(done.data(),done.size());
+                        runtime.trace.event({{"kind","outcome"},{"api","chat"},{"id",id},
+                            {"finish",any_call?"tool_calls":openai_finish(outcome.finish)},
+                            {"prompt_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
+                            {"prefix_hit",outcome.prefix_hit}});
                     } catch(const Runtime::ClientGone&) {
                         return false;
                     } catch(const std::exception& e) {
@@ -1493,13 +1608,17 @@ int main(int argc,char** argv) {
             }
             const std::string rendered=q27::chatml_prompt(
                 q27::anthropic_msgs(body),q27::anthropic_tools_json(body),true);
-            json_response(r,{{"input_tokens",(long)runtime.tokenizer.encode(rendered).size()}});
+            const long input_tokens=(long)runtime.tokenizer.encode(rendered).size();
+            if(runtime.trace.enabled())
+                runtime.trace.event({{"kind","request"},{"api","count_tokens"},{"id",""},
+                    {"prompt_tokens",(uint64_t)input_tokens},{"rendered",trace_text(rendered)}});
+            json_response(r,{{"input_tokens",input_tokens}});
         }));
 
         server.Post("/v1/messages",anthropic_guarded([&](const json& body,httplib::Response& r,socket_t sock){
             const json tools=q27::anthropic_tools_json(body);
-            auto ids=to_u32(runtime.tokenizer.encode(
-                q27::chatml_prompt(q27::anthropic_msgs(body),tools,true)));
+            const std::string rendered=q27::chatml_prompt(q27::anthropic_msgs(body),tools,true);
+            auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,1024);
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop_sequences");
@@ -1509,6 +1628,8 @@ int main(int argc,char** argv) {
             uint32_t maxp=0;
             if(prompt_overflow(ids.size(),n,maxp)) {
                 fprintf(stderr,"[ctx-limit] prompt=%zu max=%u -> 400\n",ids.size(),maxp);
+                runtime.trace.event({{"kind","error"},{"status",400},{"type","context_length_exceeded"},
+                    {"id",mid},{"prompt_tokens",(uint64_t)ids.size()},{"max",maxp}});
                 r.status=400;
                 r.set_content(q27::anthropic_error_json("invalid_request_error",
                     q27::ctx_limit_error_message((int)ids.size(),(int)maxp)),"application/json");
@@ -1517,6 +1638,11 @@ int main(int argc,char** argv) {
             const bool has_tools=tools.is_array() && !tools.empty();
             const std::vector<std::string> tnames=tool_names_from(body);
             const bool snap_hint=body.value("snapshot",false);
+            if(runtime.trace.enabled())
+                runtime.trace.event({{"kind","request"},{"api","messages"},{"id",mid},
+                    {"stream",wants_stream(body)},{"prompt_tokens",(uint64_t)ids.size()},
+                    {"max_tokens",n},{"tools",(uint64_t)(has_tools?tools.size():0)},
+                    {"rendered",trace_text(rendered)}});
             if(!wants_stream(body)) {
                 q27::StreamSplitter sp;
                 std::string think,text,tool_buf;
@@ -1534,7 +1660,7 @@ int main(int argc,char** argv) {
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
                             return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                        tnames,snap_hint,socket_live(sock)); });
+                        tnames,snap_hint,socket_live(sock),mid); });
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
                 json content=json::array();
@@ -1552,6 +1678,7 @@ int main(int argc,char** argv) {
                     auto bcs=q27::parse_bare_tool_calls(tx,&pre,&tools);
                     if(!bcs.empty()) {
                         fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (nonstream)\n",bcs.size());
+                        runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"stream",false},{"count",bcs.size()}});
                         tx=pre;
                         for(auto& bc:bcs) calls.push_back(bc);
                         any_call=true;
@@ -1571,6 +1698,10 @@ int main(int argc,char** argv) {
                     {"stop_sequence",outcome.finish==Runtime::Finish::StopSequence?json(outcome.stop_sequence):json(nullptr)},
                     {"usage",{{"input_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens}}},
                     {"q27_prefix_hit",outcome.prefix_hit}};
+                runtime.trace.event({{"kind","outcome"},{"api","messages"},{"id",mid},
+                    {"finish",any_call?"tool_use":anthropic_stop(outcome.finish)},
+                    {"prompt_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
+                    {"prefix_hit",outcome.prefix_hit}});
                 json_response(r,out);
                 return;
             }
@@ -1666,7 +1797,7 @@ int main(int argc,char** argv) {
                                 for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
-                            [sock]{ return httplib::detail::is_socket_alive(sock); });
+                            [sock]{ return httplib::detail::is_socket_alive(sock); },mid);
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
@@ -1676,6 +1807,7 @@ int main(int argc,char** argv) {
                             auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,&tools);
                             if(!bcs.empty()) {
                                 fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (stream)\n",bcs.size());
+                                runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"stream",true},{"count",bcs.size()}});
                                 any=true;
                                 for(auto& bc:bcs) emit_tool_block(bc.name,bc.arguments);
                             }
@@ -1692,6 +1824,10 @@ int main(int argc,char** argv) {
                                       {"stop_sequence",outcome.finish==Runtime::Finish::StopSequence?json(outcome.stop_sequence):json(nullptr)}}},
                             {"usage",{{"output_tokens",outcome.output_tokens}}}});
                         ev("message_stop",{{"type","message_stop"}});
+                        runtime.trace.event({{"kind","outcome"},{"api","messages"},{"id",mid},
+                            {"finish",any_call?"tool_use":anthropic_stop(outcome.finish)},
+                            {"prompt_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
+                            {"prefix_hit",outcome.prefix_hit}});
                     } catch(const Runtime::ClientGone&) {
                         return false;
                     } catch(const std::exception& e) {
@@ -1792,7 +1928,8 @@ int main(int argc,char** argv) {
                 if(!merged.empty() && merged.back().role==m.role) merged.back().content+="\n"+m.content;
                 else merged.push_back(m);
             }
-            auto ids=to_u32(runtime.tokenizer.encode(q27::chatml_prompt(merged,tools,true)));
+            const std::string rendered=q27::chatml_prompt(merged,tools,true);
+            auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,4096);
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop");
@@ -1800,11 +1937,18 @@ int main(int argc,char** argv) {
             uint32_t maxp=0;
             if(prompt_overflow(ids.size(),n,maxp)) {
                 // context_length_exceeded is fatal-class for codex, correctly
+                runtime.trace.event({{"kind","error"},{"status",400},{"type","context_length_exceeded"},
+                    {"id",resp_id},{"prompt_tokens",(uint64_t)ids.size()},{"max",maxp}});
                 json_response(r,{{"error",{{"code","context_length_exceeded"}}}},400);
                 return;
             }
             const std::vector<std::string> tnames=tool_names_from(body);
             const bool snap_hint=body.value("snapshot",false);
+            if(runtime.trace.enabled())
+                runtime.trace.event({{"kind","request"},{"api","responses"},{"id",resp_id},
+                    {"stream",wants_stream(body)},{"prompt_tokens",(uint64_t)ids.size()},
+                    {"max_tokens",n},{"tools",(uint64_t)tools.size()},
+                    {"rendered",trace_text(rendered)}});
             if(!wants_stream(body)) {
                 json items=json::array();
                 int tool_counter=0;
@@ -1853,6 +1997,7 @@ int main(int argc,char** argv) {
                                                         final_turn);
                     if(!bcs.empty()) {
                         fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",bcs.size());
+                        runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"stream",false},{"count",bcs.size()}});
                         tx=pre;
                     }
                     if(!tx.empty())
@@ -1898,7 +2043,7 @@ int main(int argc,char** argv) {
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
                             return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                        tnames,snap_hint,socket_live(sock)); });
+                        tnames,snap_hint,socket_live(sock),resp_id); });
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
                 if(!tool_buf.empty()) flush_tool(true);
                 flush_think();
@@ -1908,6 +2053,9 @@ int main(int argc,char** argv) {
                     if(it.value("type","")=="message" && it.contains("content"))
                         for(const auto& c:it["content"])
                             if(c.value("type","")=="output_text") all_text+=c.value("text","");
+                runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},
+                    {"finish","completed"},{"prompt_tokens",outcome.prompt_tokens},
+                    {"output_tokens",outcome.output_tokens},{"prefix_hit",outcome.prefix_hit}});
                 json_response(r,{{"id",resp_id},{"object","response"},{"model","q27-metal"},{"status","completed"},
                     {"output_text",all_text}, // Metal convenience field, pre-port consumers
                     {"output",items},
@@ -1997,6 +2145,7 @@ int main(int argc,char** argv) {
                                                                         tools.empty()?nullptr:&tools,true);
                                     if(!bcs.empty()) {
                                         fprintf(stderr,"[tool-fallback] %zu truncated wrapped call(s) recovered (resp stream)\n",bcs.size());
+                                        runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"stream",true},{"truncated_wrapper",true},{"count",bcs.size()}});
                                         if(!pre.empty())
                                             item_done({{"type","message"},{"role","assistant"},{"status","completed"},
                                                 {"content",json::array({{{"type","output_text"},{"text",pre},
@@ -2043,7 +2192,7 @@ int main(int argc,char** argv) {
                                 for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
-                            [sock]{ return httplib::detail::is_socket_alive(sock); });
+                            [sock]{ return httplib::detail::is_socket_alive(sock); },resp_id);
                         for(auto& [ch,t]:sp.flush()) route(ch,t);
                         if(!tool_buf.empty()) flush_tool(true);
                         flush_think();
@@ -2052,10 +2201,15 @@ int main(int argc,char** argv) {
                             std::string pre;
                             auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,
                                                                 tools.empty()?nullptr:&tools);
-                            if(!bcs.empty())
+                            if(!bcs.empty()) {
                                 fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",bcs.size());
+                                runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"stream",true},{"count",bcs.size()}});
+                            }
                             for(auto& bc:bcs) push_call(bc.name,bc.arguments);
                         }
+                        runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},
+                            {"finish","completed"},{"prompt_tokens",outcome.prompt_tokens},
+                            {"output_tokens",outcome.output_tokens},{"prefix_hit",outcome.prefix_hit}});
                         ev({{"type","response.completed"},
                             {"response",{{"id",resp_id},{"object","response"},{"status","completed"},
                                 {"output",items},
