@@ -63,7 +63,7 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 7";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 8";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -2051,11 +2051,11 @@ void MetalBackend::gated_norm_gdn(const BackendBuffer& x, const BackendTensor& w
     const MetalBuffer& xb=metal_buffer(x); const MetalBuffer& w=tensor_data(weight,DType::F32,"GDN norm"); const MetalBuffer& gb=metal_buffer(gate); MetalBuffer& o=metal_buffer(out);
     const uint64_t bytes=(uint64_t)heads*head_dim*4;
     check_range(xb.size(),0,bytes,"GDN norm input"); check_range(gb.size(),0,bytes,"GDN norm gate"); check_range(o.size(),0,bytes,"GDN norm output"); check_range(tensor_limit(w.size(), weight.data_offset, weight.data_size), weight.data_offset,(uint64_t)head_dim*4,"GDN norm weight");
-    HeadArgs args{heads,head_dim,head_dim,8,eps};
+    HeadArgs args{heads,head_dim,head_dim,kReduceThreads/32,eps};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_gated_norm_gdn"); [enc setComputePipelineState:impl_->gated_norm];
         [enc setBuffer:xb.handle() offset:0 atIndex:0]; [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1]; [enc setBuffer:gb.handle() offset:0 atIndex:2]; [enc setBuffer:o.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; if(own) impl_->finish_command("GDN gated norm");
+        [enc dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)]; if(own) impl_->finish_command("GDN gated norm");
     }
 }
 
