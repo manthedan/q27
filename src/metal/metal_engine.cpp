@@ -437,7 +437,7 @@ void MetalEngine::set_kv_attrib(uint32_t mode) {
 }
 
 void MetalEngine::set_kv_attrib_rt(bool scale32, const float* feature_scales) {
-    if (!kv_attrib_ || (kv_attrib_flags_ & 4u))
+    if (!kv_attrib_ || (kv_attrib_flags_ & 4u) || kv_attrib_ == 3)
         throw std::runtime_error("q27 Metal: KV round-trip modifiers need a side arm (set_kv_attrib first)");
     if (position_)
         throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
@@ -485,6 +485,24 @@ void MetalEngine::set_kv_attrib_cell(uint32_t mode, uint32_t layer, uint32_t hea
     kv_attrib_head_ = head;
     kv_attrib_flags_ = 0;
     kv_attrib_aux_.reset();
+}
+
+void MetalEngine::set_kv_attrib_except(const uint32_t* cells, size_t n) {
+    if (turbo3_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (position_)
+        throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
+    kv_attrib_ = 3;
+    kv_attrib_layer_ = UINT32_MAX;
+    kv_attrib_head_ = UINT32_MAX;
+    kv_attrib_flags_ = 0;
+    kv_attrib_aux_.reset();
+    std::memset(kv_attrib_masks_, 0, sizeof kv_attrib_masks_);
+    for (size_t i = 0; i < n; i++) {
+        if (cells[i] >= 128)
+            throw std::runtime_error("q27 Metal: KV exception cell must be 0..127");
+        kv_attrib_masks_[cells[i] >> 3] |= uint8_t(1u << (cells[i] & 7u));
+    }
 }
 
 void MetalEngine::reset() {
@@ -938,7 +956,9 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
     } else {
         if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))
             backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache,
-                                              pos, N_KV, 1, kv_attrib_, kv_attrib_head_,
+                                              pos, N_KV, 1, kv_attrib_,
+                                              kv_attrib_ == 3 ? kv_attrib_masks_[layer / 4]
+                                                              : kv_attrib_head_,
                                               kv_attrib_flags_, (layer / 4) * 1024,
                                               kv_attrib_aux_.get());
         else
@@ -1067,7 +1087,9 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
     } else {
         if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))
             backend_.kv_store_f16_attrib_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
-                                              position_, N_KV, count, kv_attrib_, kv_attrib_head_,
+                                              position_, N_KV, count, kv_attrib_,
+                                              kv_attrib_ == 3 ? kv_attrib_masks_[layer / 4]
+                                                              : kv_attrib_head_,
                                               kv_attrib_flags_, (layer / 4) * 1024,
                                               kv_attrib_aux_.get());
         else
@@ -1195,8 +1217,12 @@ void MetalEngine::mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t
     else if (kv_attrib_ && kv_attrib_layer_ == UINT32_MAX)
         // Plain round-trip only: step-2 flags index per-attn-layer slots
         // that do not exist for the MTP layer (instrument never runs MTP).
+        // Mode 3: MTP KV is not a census cell, so it is never excepted
+        // (mask 0 = both sides quantized), keeping the empty-mask control
+        // arm comparable to the modes-1/2 full-side treatment.
         backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_,
-                                          position, N_KV, 1, kv_attrib_, kv_attrib_head_,
+                                          position, N_KV, 1, kv_attrib_,
+                                          kv_attrib_ == 3 ? 0u : kv_attrib_head_,
                                           0, 0, nullptr);
     else
         backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
@@ -1297,7 +1323,8 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
     } else {
         if (kv_attrib_ && kv_attrib_layer_ == UINT32_MAX)
             backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_,
-                                              position, N_KV, 1, kv_attrib_, kv_attrib_head_,
+                                              position, N_KV, 1, kv_attrib_,
+                                              kv_attrib_ == 3 ? 0u : kv_attrib_head_,
                                               0, 0, nullptr);
         else
             backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);

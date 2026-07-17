@@ -282,6 +282,13 @@ class MetalEngine {
     // both sides. read_kv_attrib_stats returns the 2*16*4*256 accumulator.
     void set_kv_attrib_stats();
     void read_kv_attrib_stats(std::vector<float>& out);
+    // Step-4 exception probe (docs/plans/2026-07-17-kv-codec-step4-probe.md):
+    // round-trip BOTH sides of every attention layer through the turbo3
+    // quantizer EXCEPT the listed census cells (attn_idx*8 + head*2 + side),
+    // which stay clean fp16. n == 0 is the control arm (everything
+    // quantized). fp16-KV engines only; set before any tokens are encoded;
+    // not combinable with the step-2 rt flags.
+    void set_kv_attrib_except(const uint32_t* cells, size_t n);
 
   private:
     static constexpr uint32_t N_LAYER = 64;
@@ -320,6 +327,9 @@ class MetalEngine {
     uint32_t kv_attrib_layer_ = UINT32_MAX;
     uint32_t kv_attrib_head_ = UINT32_MAX;
     uint32_t kv_attrib_flags_ = 0;
+    // Mode-3 per-attn-layer exception masks (bit = head*2 + side); rides
+    // the kernel's head argument at the attrib store call sites.
+    uint8_t kv_attrib_masks_[16] = {};
     std::shared_ptr<BackendBuffer> kv_attrib_aux_;
     uint64_t engine_cache_bytes_ = 0;
     // Blocked-GQA softmax partials, engine-owned (audit E2): allocated once

@@ -2437,9 +2437,16 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
                                             uint32_t scale_off, BackendBuffer* aux) {
     if (!kv_heads || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid KV attribution store");
-    if (mode != 1 && mode != 2)
-        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K) or 2 (V)");
-    if (head != UINT32_MAX && head >= kv_heads)
+    if (mode != 1 && mode != 2 && mode != 3)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K), 2 (V), or 3 (except-mask)");
+    if (mode == 3) {
+        // Exception mode: head carries the per-layer (head, side) bitmask
+        // (bit = head*2 + side); flags modifiers are side-arm-only.
+        if (head > 0xffu)
+            throw std::runtime_error("q27 Metal: KV exception mask out of range");
+        if (flags)
+            throw std::runtime_error("q27 Metal: KV exception mode takes no round-trip flags");
+    } else if (head != UINT32_MAX && head >= kv_heads)
         throw std::runtime_error("q27 Metal: KV attribution head out of range");
     if (flags & ~7u)
         throw std::runtime_error("q27 Metal: unknown KV attribution flags");

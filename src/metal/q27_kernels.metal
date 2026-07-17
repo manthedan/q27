@@ -3827,7 +3827,10 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
 // a KL delta against the fp16 baseline is attributable to that one side's
 // quantization alone.
 // head selects a single KV head for cell-granular attribution (census);
-// ~0u round-trips every head of the selected side. flags: step-2 scaling
+// ~0u round-trips every head of the selected side. Mode 3 (step-4
+// exception probe) round-trips BOTH sides and reuses head as a per-layer
+// 8-bit exception mask (bit = head*2 + side): set bits stay clean fp16.
+// flags: step-2 scaling
 // arms (docs/plans/2026-07-16-kv-codec-step2.md) — SCALE32 keeps the
 // group scale in f32 through the round-trip, FEATURE descales each
 // dimension by aux[scale_off + side/head/dim] before the quantizer and
@@ -3863,10 +3866,15 @@ kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
         dst[j] = half(src[j]);
         return;
     }
-    // group.y and h are uniform across the threadgroup, so this early exit
-    // and the barriers below never diverge within a threadgroup.
-    if (args.mode != (group.y ? 2u : 1u) ||
-        (args.head != ~0u && h != args.head)) { dst[j] = half(src[j]); return; }
+    // group.y and h are uniform across the threadgroup, so these early
+    // exits and the barriers below never diverge within a threadgroup.
+    // Mode 3 (step-4 exception probe): quantize BOTH sides unless this
+    // (head, side) bit is set in the per-layer exception mask riding
+    // args.head — bit = head*2 + side, matching census cell numbering.
+    if (args.mode == 3u) {
+        if (args.head & (1u << (h * 2u + group.y))) { dst[j] = half(src[j]); return; }
+    } else if (args.mode != (group.y ? 2u : 1u) ||
+               (args.head != ~0u && h != args.head)) { dst[j] = half(src[j]); return; }
     const float sj = (args.flags & Q27_ATTRIB_FEATURE) ? aux[aux_at] : 1.0f;
     threadgroup float xs[128], red[128];
     const float x0 = src[j] / sj;

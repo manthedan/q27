@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width | --suffix-serial width | --oracle width] [--kv fp16|turbo3] "
-                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N | --kl-kv-stats FILE] [--kv-rt-scale32] [--kv-rt-feature FILE] [--chunk-parity N] "
+                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N | --kl-kv-except LIST | --kl-kv-stats FILE] [--kv-rt-scale32] [--kv-rt-feature FILE] [--chunk-parity N] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--save-state file | --load-state file] [--dump-logits file]\n",
                 argv[0]);
@@ -157,6 +157,8 @@ int main(int argc, char** argv) {
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         bool kl_kv = false, kl_self = false;
         uint32_t kv_attrib = 0, kv_cell = UINT32_MAX;
+        std::vector<uint32_t> kv_except;
+        bool kv_except_set = false;
         bool kv_rt_scale32 = false;
         std::string kv_rt_feature, kv_stats_out;
         uint32_t chunk_parity = 0;
@@ -178,6 +180,25 @@ int main(int argc, char** argv) {
                 if (kv_cell >= 128)
                     throw std::runtime_error("--kl-kv-cell must be 0..127 (attn_idx*8 + head*2 + side, side 0=K 1=V)");
                 kl_kv = true;
+            }
+            else if (arg == "--kl-kv-except" && i + 1 < argc) {
+                // Step-4 probe: quantize both sides everywhere EXCEPT the
+                // listed census cells. "-" = empty list (control arm).
+                const std::string list = argv[++i];
+                if (list != "-") {
+                    size_t at = 0;
+                    while (at < list.size()) {
+                        size_t comma = list.find(',', at);
+                        if (comma == std::string::npos) comma = list.size();
+                        const uint32_t cell =
+                            parse_u32(list.substr(at, comma - at).c_str(), "--kl-kv-except");
+                        if (cell >= 128)
+                            throw std::runtime_error("--kl-kv-except cells must be 0..127");
+                        kv_except.push_back(cell);
+                        at = comma + 1;
+                    }
+                }
+                kl_kv = true; kv_except_set = true;
             }
             else if (arg == "--kl-kv-k" || arg == "--kl-kv-v") {
                 const uint32_t side = (arg == "--kl-kv-k") ? 1 : 2;
@@ -286,6 +307,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--kl-kv-stats is its own pass; drop other kl-kv arms/modifiers");
         if ((kv_rt_scale32 || !kv_rt_feature.empty()) && !kv_attrib)
             throw std::runtime_error("--kv-rt-scale32/--kv-rt-feature modify a side arm; add --kl-kv-k or --kl-kv-v");
+        if (kv_except_set && (kv_attrib || kl_self || kv_cell != UINT32_MAX ||
+                              !kv_stats_out.empty() || kv_rt_scale32 || !kv_rt_feature.empty()))
+            throw std::runtime_error("--kl-kv-except is its own arm; drop other kl-kv arms/modifiers");
         if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty() &&
             load_state_path.empty())
             throw std::runtime_error("--tokens, --prompt, --nll, --load-state, or --validate-only is required");
@@ -656,7 +680,7 @@ int main(int argc, char** argv) {
             // the turbo3 quantizer, so the KL is that side's error alone.
             q27::MetalEngine subject(shared, context,
                                      !kl_self && !kv_attrib && kv_cell == UINT32_MAX &&
-                                     kv_stats_out.empty());
+                                     kv_stats_out.empty() && !kv_except_set);
             char cell_name[48] = {0};
             std::vector<float> feature_scales;
             if (!kv_stats_out.empty()) subject.set_kv_attrib_stats();
@@ -695,6 +719,8 @@ int main(int argc, char** argv) {
                 subject.set_kv_attrib_cell(side, attn_idx * 4 + 3, head);
                 snprintf(cell_name, sizeof cell_name, "turbo3 cell L%u:h%u:%s round-trip",
                          attn_idx * 4 + 3, head, side == 1 ? "K" : "V");
+            } else if (kv_except_set) {
+                subject.set_kv_attrib_except(kv_except.data(), kv_except.size());
             } else if (kv_attrib) {
                 // Side arm first, modifiers second — set_kv_attrib clears
                 // the round-trip flags (codex P1 on b1bed0e).
@@ -711,6 +737,8 @@ int main(int argc, char** argv) {
             std::string arm_name = kl_self ? "fp16 self-check"
                                   : !kv_stats_out.empty() ? "fp16 stats pass (KL must be 0)"
                                   : kv_cell != UINT32_MAX ? cell_name
+                                  : kv_except_set ? ("turbo3 both-sides round-trip except " +
+                                                     std::to_string(kv_except.size()) + " cells")
                                   : kv_attrib == 1 ? "turbo3 K-only round-trip"
                                   : kv_attrib == 2 ? "turbo3 V-only round-trip"
                                   : "turbo3";
