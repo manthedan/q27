@@ -4,6 +4,7 @@
 #include "../sampling.h"
 #include "../loader.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
