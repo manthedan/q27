@@ -486,7 +486,16 @@ void build_q_synth(q27::MetalBackend& backend, const Shape& s, uint32_t seed,
     }
 }
 
-int run_official_probe(q27::MetalBackend& backend, int reps) {
+// With q4_candidate set (--q4-candidate N, the Q4 rewrite-round arms,
+// docs/plans/2026-07-17-q4-rewrite-round.md), the Q4_G64 shapes (candidates
+// 2-3), the Q8 shapes (candidate 4), or all shapes (candidate 1 = production
+// through the probe path, A/B parity) run matvec_q4_probe instead of the
+// production dispatch; the ffn sibling pair runs as two probe singles (the
+// round has no pair variant). The candidate arm must pass the same CPU
+// int8-activation model gate (1e-3, all shapes) plus byte-identity against
+// the production single kernel (the round's kernel contract) BEFORE timing;
+// the per-shape GB/s + ratio table stays directly comparable to E6 RESULTS.
+int run_official_probe(q27::MetalBackend& backend, int reps, int q4_candidate) {
     // The official-tier per-token production projection mix (metal_engine.cpp
     // weight shapes; counts: 48 GDN layers, 16 attention layers, 64 FFN, 1
     // head) under the real v1.3 dtype policy (tools/repack.py policy()):
@@ -512,6 +521,12 @@ int run_official_probe(q27::MetalBackend& backend, int reps) {
            "draft-head copy — both stream\nonly on draft rounds, this leg measures the serial "
            "production token; gdn alpha/beta [48x5120] x96 (~0.15%% of\nper-token weight "
            "bytes, dispatch-overhead-dominated)\n");
+    if (q4_candidate)
+        printf("q4-round candidate %d arm (%s): affected shapes run matvec_q4_probe; "
+               "the ffn sibling pair runs as two probe singles\n", q4_candidate,
+               q4_candidate == 1 ? "production kernels through the probe path" :
+               q4_candidate == 2 ? "q4 2 rows/simdgroup" :
+               q4_candidate == 3 ? "q4 4 rows/simdgroup" : "q8 4 rows/simdgroup");
     double total_q_bytes = 0.0;
     for (const ProbeShape& p : probes)
         total_q_bytes += (double)weight_bytes(p.shape) * p.per_token_count;
@@ -524,6 +539,12 @@ int run_official_probe(q27::MetalBackend& backend, int reps) {
     size_t n = 0;
     for (const ProbeShape& p : probes) {
         const Shape& s = p.shape;
+        // Candidate routing: 1 = every shape through the probe path,
+        // 2-3 = the Q4_G64 shapes, 4 = the Q8_G128 shapes; the rest keep
+        // the production dispatch (a promoted candidate replaces only its
+        // own kernel, so the mix R matches the promotion re-run semantics).
+        const bool use_probe = q4_candidate == 1 ||
+            (q4_candidate && (q4_candidate == 4) == (s.dtype == DType::Q8_G128));
         // Activations + the exact CPU int8 model of q27_quantize_x: per
         // 32-block amax/127 float scale, reciprocal-multiply + rint
         // (nearest-even, matching Metal's CUDA-parity form — k3 audit D1),
@@ -610,15 +631,61 @@ int run_official_probe(q27::MetalBackend& backend, int reps) {
             fprintf(stderr, "FAIL: %s — anti-vacuity (zero or row-identical output)\n", s.name);
             return 1;
         }
+        // Candidate gates before any timing: the probe arm against the same
+        // CPU int8-activation model, plus byte-identity against the
+        // production single kernel (the round's kernel contract: same dot,
+        // same scale multiply order). A failing candidate never times.
+        if (use_probe) {
+            auto ycand = backend.allocate((uint64_t)s.rows * sizeof(float));
+            std::vector<float> yc(s.rows), yprod(s.rows);
+            const QSynth* tensors[2] = {&wa, &wb};
+            const float* prod[2] = {ya.data(), yprod.data()};
+            const size_t n_arms = p.pair_arm ? 2 : 1;
+            for (size_t k = 0; k < n_arms; k++) {
+                backend.begin_commands();
+                backend.matvec_q4_probe(q4_candidate, tensors[k]->weight, xq, *ycand);
+                // The pair shape's byte gate needs a production SINGLE on the
+                // sibling tensor (the pair kernel is not the identity target).
+                if (k == 1) backend.matvec_quantized(wb.weight, xq, *y);
+                backend.end_commands();
+                backend.read(*ycand, 0, yc.data(), s.rows * sizeof(float));
+                if (k == 1) backend.read(*y, 0, yprod.data(), s.rows * sizeof(float));
+                double ec = 0.0;
+                for (uint32_t r = 0; r < s.rows; r++)
+                    ec = std::fmax(ec, std::fabs(yc[r] - tensors[k]->ref_i[r]) /
+                                           std::fmax(std::fabs(tensors[k]->ref_i[r]), denom_floor));
+                if (ec > 1e-3) {
+                    fprintf(stderr, "FAIL: %s — candidate %d vs CPU int8-activation model "
+                            "%.2e (bound 1e-3)\n", s.name, q4_candidate, ec);
+                    return 1;
+                }
+                if (memcmp(yc.data(), prod[k], s.rows * sizeof(float)) != 0) {
+                    fprintf(stderr, "FAIL: %s — candidate %d output is not byte-identical "
+                            "to the production kernel\n", s.name, q4_candidate);
+                    return 1;
+                }
+            }
+        }
 
         auto time_arm = [&](int arm) {
             auto body = [&](int count) {
                 backend.begin_commands();
                 for (int i = 0; i < count; i++) {
-                    if (arm == 0) backend.matvec_quantized(wa.weight, xq, *y);
-                    else if (arm == 1)
-                        backend.matvec_quantized_pair(wa.weight, *ypa, wb.weight, *ypb, xq);
-                    else backend.matvec(t2w, *xb, *yt2);
+                    if (arm == 0) {
+                        if (use_probe) backend.matvec_q4_probe(q4_candidate, wa.weight, xq, *y);
+                        else backend.matvec_quantized(wa.weight, xq, *y);
+                    } else if (arm == 1) {
+                        // Candidate pair arm = two probe singles; the 2x
+                        // weight-bytes GB/s accounting below still holds.
+                        if (use_probe) {
+                            backend.matvec_q4_probe(q4_candidate, wa.weight, xq, *ypa);
+                            backend.matvec_q4_probe(q4_candidate, wb.weight, xq, *ypb);
+                        } else {
+                            backend.matvec_quantized_pair(wa.weight, *ypa, wb.weight, *ypb, xq);
+                        }
+                    } else {
+                        backend.matvec(t2w, *xb, *yt2);
+                    }
                 }
                 backend.end_commands();
             };
@@ -667,6 +734,14 @@ int run_official_probe(q27::MetalBackend& backend, int reps) {
            q_wall_ms, 1e3 / q_wall_ms, parity_ms, 1e3 / parity_ms);
     printf("R = %.3f (official mix %.2f GB/s byte-weighted / same-run T2 reference "
            "%.2f GB/s)\n", ratio, q_gbs, ref_gbs);
+    if (q4_candidate) {
+        // The E6 funding verdict below pre-registered a different decision;
+        // the round's own lines are R >= 0.90 on the promotion re-run and
+        // >= 10% over production on both worst shapes (attn q, ssm/attn out).
+        printf("candidate %d mix: R = %.3f, %.2f GB/s byte-weighted (E6 baseline R = 0.716, "
+               "52.44 GB/s; round ship line R >= 0.90)\n", q4_candidate, ratio, q_gbs);
+        return 0;
+    }
     if (ratio >= 0.90) {
         printf("verdict: KILL the rewrite (R >= 0.90) — even perfect parity buys <= 11%% "
                "wall, below the cost of a kernel round plus regate\n");
@@ -693,6 +768,7 @@ int run_official_probe(q27::MetalBackend& backend, int reps) {
 
 int main(int argc, char** argv) {
     int reps = 20;
+    int q4_candidate = 0;
     bool t2 = false, t3 = false, slot2 = false, b1 = false, official = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -707,13 +783,23 @@ int main(int argc, char** argv) {
             b1 = true;
         } else if (arg == "--official") {
             official = true;
+        } else if (arg == "--q4-candidate" && i + 1 < argc) {
+            q4_candidate = atoi(argv[++i]);
+            if (q4_candidate < 1 || q4_candidate > 4) {
+                fprintf(stderr, "invalid --q4-candidate (1=production 2=r2 3=r4 4=q8_r4)\n");
+                return 1;
+            }
         } else if (!arg.empty() && arg[0] != '-') {
             reps = atoi(arg.c_str());
         } else {
             fprintf(stderr, "usage: %s [reps] [--dtype q4q8|t2|t3] [--slot2] [--b1] "
-                    "[--official]\n", argv[0]);
+                    "[--official] [--q4-candidate N]\n", argv[0]);
             return 1;
         }
+    }
+    if (q4_candidate && !official) {
+        fprintf(stderr, "--q4-candidate requires --official\n");
+        return 1;
     }
     if (reps < 1) reps = 1;
     q27::MetalBackend backend;
@@ -769,7 +855,7 @@ int main(int argc, char** argv) {
 
     if (slot2) return run_slot2_probe(backend, reps);
     if (b1) return run_b1_probe(backend, reps);
-    if (official) return run_official_probe(backend, reps);
+    if (official) return run_official_probe(backend, reps, q4_candidate);
 
     double total_seconds = 0.0, total_bytes = 0.0;
     for (size_t si = 0; si < n_shapes; si++) {

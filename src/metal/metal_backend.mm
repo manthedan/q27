@@ -266,6 +266,11 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> b1_signxor_p;
     id<MTLComputePipelineState> b1_popcount_p;
     id<MTLComputePipelineState> b1_x_prep_p;
+    // Q4-round candidate PSOs (bench-only): built on first matvec_q4_probe
+    // use (the roofline-k pattern), so production startup never creates them.
+    id<MTLComputePipelineState> q4_r2_p;
+    id<MTLComputePipelineState> q4_r4_p;
+    id<MTLComputePipelineState> q8_r4_p;
     // Arm K (function-constant probe): one specialized PSO per baked cols.
     std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
     id<MTLComputePipelineState> mm_dr_p;
@@ -1447,6 +1452,93 @@ void MetalBackend::matvec_b1_probe(int candidate, uint32_t rows, uint32_t cols,
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         if (own) impl_->finish_command(sel ? "b1 select probe" : "b1 signxor probe");
+    }
+}
+
+// Q4 rewrite-round candidate arms (bench-only, docs/plans/2026-07-17-q4-
+// rewrite-round.md): the production quantized-matvec validation, then
+// candidate routing. Candidate 1 re-dispatches the production PSO so the
+// bench's A/B runs one code path; 2/3 are the Q4 multi-row arms, 4 the Q8
+// twin. Candidate PSOs build lazily on first use (the roofline-k pattern) —
+// production startup never creates them. Never engine-routed.
+void MetalBackend::matvec_q4_probe(int candidate, const BackendTensor& weight,
+                                   const BackendQuantized& x, BackendBuffer& y) {
+    if (candidate < 1 || candidate > 4)
+        throw std::runtime_error("q27 Metal: invalid q4 probe candidate");
+    if ((weight.dtype != DType::Q4_G64 && weight.dtype != DType::Q8_G128) ||
+        !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: q4 probe requires Q4/Q8 weight");
+    if ((candidate == 2 || candidate == 3) && weight.dtype != DType::Q4_G64)
+        throw std::runtime_error("q27 Metal: q4 probe candidates 2-3 require Q4_G64");
+    if (candidate == 4 && weight.dtype != DType::Q8_G128)
+        throw std::runtime_error("q27 Metal: q4 probe candidate 4 requires Q8_G128");
+    const uint64_t group = weight.dtype == DType::Q4_G64 ? 64 : 128;
+    if (!weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX ||
+        weight.cols % group)
+        throw std::runtime_error("q27 Metal: invalid q4 probe dimensions");
+    if (x.count != weight.cols || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: q4 probe activation mismatch");
+    check_range(y.size(), 0, weight.rows * 4, "q4 probe output");
+    const MetalBuffer& data = metal_buffer(*weight.data);
+    const MetalBuffer& ws = metal_buffer(*weight.scales);
+    const MetalBuffer& xv = metal_buffer(*x.values);
+    const MetalBuffer& xs = metal_buffer(*x.scales);
+    MetalBuffer& out = metal_buffer(y);
+    const uint64_t data_bytes = weight.rows * weight.cols /
+                                (weight.dtype == DType::Q4_G64 ? 2 : 1);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size),
+                weight.data_offset, data_bytes, "q4 probe weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size),
+                weight.scales_offset, weight.rows * (weight.cols / group) * 2,
+                "q4 probe weight scales");
+    check_range(xv.size(), 0, x.count, "q4 probe values");
+    check_range(xs.size(), 0, (uint64_t)(x.count / 32) * 4, "q4 probe activation scales");
+    const bool q8 = weight.dtype == DType::Q8_G128;
+    id<MTLComputePipelineState> pso = nil;
+    const char* label = nullptr;
+    switch (candidate) {
+        case 1:
+            pso = q8 ? impl_->q8_quantized : impl_->q4_quantized;
+            label = q8 ? "q27_matvec_q8_quantized" : "q27_matvec_q4_quantized";
+            break;
+        case 2:
+            if (!impl_->q4_r2_p)
+                impl_->q4_r2_p = make_pipeline(impl_->device, impl_->library,
+                                               @"q27_matvec_q4_quantized_r2");
+            pso = impl_->q4_r2_p;
+            label = "q27_matvec_q4_quantized_r2";
+            break;
+        case 3:
+            if (!impl_->q4_r4_p)
+                impl_->q4_r4_p = make_pipeline(impl_->device, impl_->library,
+                                               @"q27_matvec_q4_quantized_r4");
+            pso = impl_->q4_r4_p;
+            label = "q27_matvec_q4_quantized_r4";
+            break;
+        default:
+            if (!impl_->q8_r4_p)
+                impl_->q8_r4_p = make_pipeline(impl_->device, impl_->library,
+                                               @"q27_matvec_q8_quantized_r4");
+            pso = impl_->q8_r4_p;
+            label = "q27_matvec_q8_quantized_r4";
+            break;
+    }
+    // Rows per 256-thread group: production 8 simdgroups x 1 row; r2 x2; r4 x4.
+    const uint32_t rows_per_group = candidate == 1 ? 8 : candidate == 2 ? 16 : 32;
+    MatvecArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, label);
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2];
+        [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("q4 probe");
     }
 }
 
