@@ -23,7 +23,7 @@ test-metal: build/test_metal build/test_metal_ops build/test_metal_stream
 	./build/test_metal_ops
 	./build/test_metal_stream
 
-build/test_metal_stream: src/metal/test_metal_stream.cpp src/metal/stream_format.h third_party/json.hpp | build
+build/test_metal_stream: src/metal/test_metal_stream.cpp src/metal/stream_format.h src/api_common.h src/stream_split.h src/tool_preamble.h third_party/json.hpp | build
 	$(CXX) $(CXXFLAGS) -I src/metal src/metal/test_metal_stream.cpp -o $@
 
 build/test_metal: src/metal/test_metal.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
@@ -45,7 +45,7 @@ build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/me
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
 
-build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/metal/stream_format.h src/suffixdraft.h src/sampling.h src/tool_preamble.h \
+build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/metal/stream_format.h src/api_common.h src/stream_split.h src/tool_preamble.h src/suffixdraft.h src/sampling.h \
                         src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                         src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h \
                         third_party/httplib.h third_party/json.hpp | build
