@@ -288,9 +288,45 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     const bool chunk_capable = backend_.supports_quantized_matmul();
     const uint64_t partial_bytes =
         gqa_partial_peak(max_context_, backend_.gqa_block_size(), chunk_capable);
+    // Production KV fp16 exception cells
+    // (docs/plans/2026-07-17-kv-except-production.md): parse the env once
+    // here so the side-cache bytes join the same reservation. Cells use
+    // census numbering (attn_idx*8 + head*2 + side); v1 requires a head's K
+    // and V cells together (step 4b: K alone retains nothing, V alone
+    // amplifies — only the pair is meaningful). fp16-KV engines ignore the
+    // env (their cells are already fp16), so the kl-kv baseline coexists.
+    uint8_t kv_fp16_head_masks[16] = {};
+    uint64_t kv_side_bytes = 0;
+    if (const char* cells_env = getenv("Q27_METAL_KV_FP16_CELLS")) {
+        if (turbo3_kv_) {
+            uint8_t side_masks[16][4] = {};
+            const std::string list(cells_env);
+            size_t at = 0;
+            while (at < list.size()) {
+                size_t comma = list.find(',', at);
+                if (comma == std::string::npos) comma = list.size();
+                const unsigned long cell = std::stoul(list.substr(at, comma - at));
+                if (cell >= 128)
+                    throw std::runtime_error("q27 Metal: Q27_METAL_KV_FP16_CELLS cells must be 0..127");
+                side_masks[cell >> 3][(cell >> 1) & 3] |= uint8_t(1u << (cell & 1u));
+                at = comma + 1;
+            }
+            for (uint32_t li = 0; li < 16; li++)
+                for (uint32_t h = 0; h < 4; h++) {
+                    if (side_masks[li][h] == 0) continue;
+                    if (side_masks[li][h] != 3)
+                        throw std::runtime_error("q27 Metal: Q27_METAL_KV_FP16_CELLS v1 needs a head's K and V cells together (step 4b: only the pair is protective)");
+                    kv_fp16_head_masks[li] |= uint8_t(1u << h);
+                    kv_side_bytes += 2ull * max_context_ * HEAD_DIM * 2;   // K + V, fp16
+                    kv_fp16_except_ = true;
+                }
+        } else {
+            fprintf(stderr, "q27 Metal: Q27_METAL_KV_FP16_CELLS ignored on an fp16-KV engine (cells already fp16)\n");
+        }
+    }
     const uint64_t total_cache_bytes =
         (16ull + (has_mtp_ ? 1 : 0)) * 2 * max_context_ * cache_row_bytes
-        + partial_bytes;
+        + partial_bytes + kv_side_bytes;
     // Budget the combined caches of every engine on this mapping, not just
     // this one — two engines can each pass a per-engine check while jointly
     // overcommitting the device.
@@ -357,6 +393,15 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     q10240_=backend_.allocate_quantized(GDN_CH); q17408_=backend_.allocate_quantized(N_FFN);
 
     gqa_partials_ = backend_.allocate_private(partial_bytes);
+
+    if (kv_fp16_except_)
+        for (uint32_t li = 0; li < 16; li++)
+            for (uint32_t h = 0; h < 4; h++)
+                if (kv_fp16_head_masks[li] & (1u << h))
+                    kv_fp16_side_[li].push_back(KvFp16Side{
+                        h,
+                        backend_.allocate_private((uint64_t)max_context_ * HEAD_DIM * 2),
+                        backend_.allocate_private((uint64_t)max_context_ * HEAD_DIM * 2)});
 
     // Layer-major chunked prefill routes projections through the simdgroup
     // GEMM, so it requires the same device family. The per-chunk activation
@@ -676,6 +721,8 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
                              uint32_t token_count, bool logits_resident) {
     if (token_count && !tokens)
         throw std::runtime_error("q27 Metal: snapshot token metadata is null");
+    if (kv_fp16_except_)
+        throw std::runtime_error("q27 Metal: snapshots do not yet serialize the KV fp16 exception side caches (Q27_METAL_KV_FP16_CELLS); recorded v1 exclusion");
     backend_.synchronize();
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
@@ -767,6 +814,8 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
 }
 
 uint32_t MetalEngine::load_state(const std::string& path) {
+    if (kv_fp16_except_)
+        throw std::runtime_error("q27 Metal: snapshots do not yet serialize the KV fp16 exception side caches (Q27_METAL_KV_FP16_CELLS); recorded v1 exclusion");
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("q27 Metal: cannot open snapshot: " + path);
     try {
@@ -948,10 +997,29 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
     if (turbo3_kv_) {
         backend_.turbo_wht(*qg_, N_HEAD, 2 * HEAD_DIM, false);
         backend_.kv_store_turbo3(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, pos, N_KV);
+        // fp16 exception cells: side-store the masked heads' rows in the
+        // turbo3 WHT domain (kbuf/vbuf are dead after the store, so the
+        // in-place transform is safe) — the window re-attention below then
+        // sees exactly what the turbo3 kernel's dequant approximates, and
+        // the shared inverse WHT on attn_out_ fixes its rows with the rest.
+        const auto& side = kv_fp16_side_[layer / 4];
+        if (!side.empty()) {
+            backend_.turbo_wht(*kbuf_, N_KV, HEAD_DIM, false);
+            backend_.turbo_wht(*vbuf_, N_KV, HEAD_DIM, false);
+            for (const KvFp16Side& s : side)
+                backend_.kv_store_f16_head_rows_side(*kbuf_, *vbuf_, s.head * HEAD_DIM,
+                                                     N_KV * HEAD_DIM, *s.k, *s.v,
+                                                     pos, HEAD_DIM, 1);
+        }
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
                                   *attn_out_, pos + 1, N_HEAD, N_KV,
                                   HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
                                   gqa_partials_.get());
+        for (const KvFp16Side& s : side)
+            backend_.attention_f16_window(*qg_, 2 * HEAD_DIM, s.head * (N_HEAD / N_KV),
+                                          *s.k, *s.v, *attn_out_, pos + 1,
+                                          N_HEAD / N_KV, HEAD_DIM,
+                                          1.0f / std::sqrt((float)HEAD_DIM));
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
         if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))
@@ -1079,10 +1147,28 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
         backend_.turbo_wht(*cqg_, count * N_HEAD, 2 * HEAD_DIM, false);
         backend_.kv_store_turbo3_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
                                       position_, N_KV, count);
+        // fp16 exception cells: WHT-domain side store + window re-attention
+        // (see the serial branch for the domain argument). ckbuf/cvbuf are
+        // dead after the turbo3 store.
+        const auto& side = kv_fp16_side_[layer / 4];
+        if (!side.empty()) {
+            backend_.turbo_wht(*ckbuf_, count * N_KV, HEAD_DIM, false);
+            backend_.turbo_wht(*cvbuf_, count * N_KV, HEAD_DIM, false);
+            for (const KvFp16Side& s : side)
+                backend_.kv_store_f16_head_rows_side(*ckbuf_, *cvbuf_, s.head * HEAD_DIM,
+                                                     N_KV * HEAD_DIM, *s.k, *s.v,
+                                                     position_, HEAD_DIM, count);
+        }
         backend_.attention_turbo3_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                          *state.k_cache, *state.v_cache,
                                          *cattn_out_, position_ + 1, N_HEAD, N_KV,
                                          HEAD_DIM, count, scale, gqa_partials_.get());
+        for (const KvFp16Side& s : side)
+            backend_.attention_f16_causal_window(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
+                                                 s.head * (N_HEAD / N_KV), *s.k, *s.v,
+                                                 *cattn_out_, N_HEAD * HEAD_DIM,
+                                                 position_ + 1, N_HEAD / N_KV,
+                                                 HEAD_DIM, count, scale);
         backend_.turbo_wht(*cattn_out_, count * N_HEAD, HEAD_DIM, true);
     } else {
         if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))

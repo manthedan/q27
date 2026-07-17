@@ -167,6 +167,8 @@ struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode, head, flags,
 struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
 struct ArgmaxRowsArgs { uint32_t n, rows; };
 struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
+struct AttentionCausalWinArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, out_row_stride; float scale; };
+struct KvStoreHeadRowsArgs { uint32_t position, src_stride, row_length, tokens; };
 
 } // namespace
 
@@ -242,6 +244,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> kv_store_attrib_rows;
     id<MTLBuffer> attrib_dummy;
     id<MTLComputePipelineState> attention_causal;
+    id<MTLComputePipelineState> attention_causal_win;
+    id<MTLComputePipelineState> kv_store_head_rows;
     id<MTLComputePipelineState> attention_turbo3_causal_p;
     id<MTLComputePipelineState> sigmoid_gate_rows;
     id<MTLComputePipelineState> argmax_rows_p;
@@ -651,6 +655,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->kv_store_turbo3_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3_rows");
         impl_->kv_store_attrib_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_attrib_rows");
         impl_->attention_causal = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal");
+        impl_->attention_causal_win = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_win");
+        impl_->kv_store_head_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_head_rows");
         impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
         impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
         impl_->argmax_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_argmax_rows");
@@ -2402,6 +2408,94 @@ void MetalBackend::kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer
         [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreads:MTLSizeMake(row_length,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("chunked KV store");
+    }
+}
+
+// --- KV fp16 exception cells (docs/plans/2026-07-17-kv-except-production.md).
+// The excepted head's K/V rows are copied out of the packed staging buffers
+// into a kv_heads=1 fp16 side cache, and the existing f16 attention math
+// re-runs over a WINDOW of query heads against that side cache, overwriting
+// the production dispatch's output rows. Head offsets ride buffer bindings;
+// the production kernels and the shader ABI are untouched.
+
+void MetalBackend::kv_store_f16_head_rows_side(const BackendBuffer& k, const BackendBuffer& v,
+                                               uint32_t head_offset_elems, uint32_t src_stride,
+                                               BackendBuffer& k_side, BackendBuffer& v_side,
+                                               uint32_t position, uint32_t row_length, uint32_t tokens) {
+    if (!tokens || tokens > 96 || !row_length || row_length > src_stride)
+        throw std::runtime_error("q27 Metal: invalid KV side store");
+    const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
+    MetalBuffer& kc = metal_buffer(k_side); MetalBuffer& vc = metal_buffer(v_side);
+    const uint64_t src_off = (uint64_t)head_offset_elems * 4;
+    const uint64_t src_need = ((uint64_t)(tokens - 1) * src_stride + row_length) * 4;
+    check_range(kb.size(), src_off, src_need, "KV side store K rows");
+    check_range(vb.size(), src_off, src_need, "KV side store V rows");
+    check_range(kc.size(), (uint64_t)position * row_length * 2, (uint64_t)row_length * tokens * 2, "K side cache");
+    check_range(vc.size(), (uint64_t)position * row_length * 2, (uint64_t)row_length * tokens * 2, "V side cache");
+    KvStoreHeadRowsArgs args{position, src_stride, row_length, tokens};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_f16_head_rows");
+        [enc setComputePipelineState:impl_->kv_store_head_rows];
+        [enc setBuffer:kb.handle() offset:(NSUInteger)src_off atIndex:0];
+        [enc setBuffer:vb.handle() offset:(NSUInteger)src_off atIndex:1];
+        [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(row_length,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("KV side store");
+    }
+}
+
+void MetalBackend::attention_f16_window(const BackendBuffer& q, uint32_t q_stride, uint32_t qh_start,
+                                        const BackendBuffer& k_side, const BackendBuffer& v_side,
+                                        BackendBuffer& out, uint32_t seq_len,
+                                        uint32_t win_heads, uint32_t head_dim, float scale) {
+    if (!seq_len || !win_heads || !head_dim || head_dim > 256)
+        throw std::runtime_error("q27 Metal: invalid window attention dimensions");
+    const MetalBuffer& qb=metal_buffer(q); const MetalBuffer& kc=metal_buffer(k_side); const MetalBuffer& vc=metal_buffer(v_side);
+    MetalBuffer& output=metal_buffer(out);
+    const uint64_t q_off = (uint64_t)qh_start * q_stride * 4;
+    const uint64_t out_off = (uint64_t)qh_start * head_dim * 4;
+    check_range(qb.size(), q_off, ((uint64_t)(win_heads-1)*q_stride+head_dim)*4, "window attention Q");
+    const uint64_t cache_bytes=(uint64_t)seq_len*head_dim*2;
+    check_range(kc.size(),0,cache_bytes,"window K side"); check_range(vc.size(),0,cache_bytes,"window V side");
+    check_range(output.size(),out_off,(uint64_t)win_heads*head_dim*4,"window attention output");
+    AttentionArgs args{q_stride,seq_len,win_heads,1,head_dim,scale};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_f16_window"); [enc setComputePipelineState:impl_->attention];
+        [enc setBuffer:qb.handle() offset:(NSUInteger)q_off atIndex:0];
+        [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:output.handle() offset:(NSUInteger)out_off atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(win_heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        if(own) impl_->finish_command("window FP16 attention");
+    }
+}
+
+void MetalBackend::attention_f16_causal_window(const BackendBuffer& q, uint32_t q_stride, uint32_t q_row_stride,
+                                               uint32_t qh_start, const BackendBuffer& k_side,
+                                               const BackendBuffer& v_side, BackendBuffer& out,
+                                               uint32_t out_row_stride, uint32_t base_len_plus_1,
+                                               uint32_t win_heads, uint32_t head_dim,
+                                               uint32_t tokens, float scale) {
+    if (!tokens || tokens > 96 || !win_heads || !head_dim || head_dim > 256 || !base_len_plus_1)
+        throw std::runtime_error("q27 Metal: invalid window causal attention dimensions");
+    const MetalBuffer& qb=metal_buffer(q); const MetalBuffer& kc=metal_buffer(k_side); const MetalBuffer& vc=metal_buffer(v_side);
+    MetalBuffer& output=metal_buffer(out);
+    const uint64_t q_off = (uint64_t)qh_start * q_stride * 4;
+    const uint64_t out_off = (uint64_t)qh_start * head_dim * 4;
+    check_range(qb.size(), q_off, ((uint64_t)(tokens-1)*q_row_stride+(uint64_t)(win_heads-1)*q_stride+head_dim)*4, "window causal Q");
+    const uint64_t cache_bytes=(uint64_t)(base_len_plus_1+tokens-1)*head_dim*2;
+    check_range(kc.size(),0,cache_bytes,"window causal K side"); check_range(vc.size(),0,cache_bytes,"window causal V side");
+    check_range(output.size(),out_off,((uint64_t)(tokens-1)*out_row_stride+(uint64_t)win_heads*head_dim)*4,"window causal output");
+    AttentionCausalWinArgs args{q_stride,q_row_stride,base_len_plus_1,win_heads,1,head_dim,tokens,out_row_stride,scale};
+    @autoreleasepool {
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_f16_causal_win"); [enc setComputePipelineState:impl_->attention_causal_win];
+        [enc setBuffer:qb.handle() offset:(NSUInteger)q_off atIndex:0];
+        [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
+        [enc setBuffer:output.handle() offset:(NSUInteger)out_off atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(win_heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        if(own) impl_->finish_command("window causal FP16 attention");
     }
 }
 

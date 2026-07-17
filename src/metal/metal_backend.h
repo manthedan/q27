@@ -182,6 +182,26 @@ class MetalBackend final : public ComputeBackend {
     void kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer& v,
                            BackendBuffer& k_cache, BackendBuffer& v_cache,
                            uint32_t position, uint32_t row_length, uint32_t tokens) override;
+    // KV fp16 exception cells (docs/plans/2026-07-17-kv-except-production.md),
+    // Metal-only concrete entries (not on the ComputeBackend interface): copy
+    // one head's K/V rows into a kv_heads=1 fp16 side cache, and re-run f16
+    // attention over that head's query-head window against the side cache,
+    // overwriting the production dispatch's output rows. Head offsets ride
+    // the buffer bindings; production kernels and shader ABI untouched.
+    void kv_store_f16_head_rows_side(const BackendBuffer& k, const BackendBuffer& v,
+                                     uint32_t head_offset_elems, uint32_t src_stride,
+                                     BackendBuffer& k_side, BackendBuffer& v_side,
+                                     uint32_t position, uint32_t row_length, uint32_t tokens);
+    void attention_f16_window(const BackendBuffer& q, uint32_t q_stride, uint32_t qh_start,
+                              const BackendBuffer& k_side, const BackendBuffer& v_side,
+                              BackendBuffer& out, uint32_t seq_len,
+                              uint32_t win_heads, uint32_t head_dim, float scale);
+    void attention_f16_causal_window(const BackendBuffer& q, uint32_t q_stride, uint32_t q_row_stride,
+                                     uint32_t qh_start, const BackendBuffer& k_side,
+                                     const BackendBuffer& v_side, BackendBuffer& out,
+                                     uint32_t out_row_stride, uint32_t base_len_plus_1,
+                                     uint32_t win_heads, uint32_t head_dim,
+                                     uint32_t tokens, float scale);
     void kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
                               BackendBuffer& k_cache, BackendBuffer& v_cache,
                               uint32_t position, uint32_t kv_heads, uint32_t tokens) override;

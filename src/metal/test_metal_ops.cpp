@@ -617,6 +617,166 @@ int test_attention_gqa_path() {
     return failures;
 }
 
+// KV fp16 exception window entries (docs/plans/2026-07-17-kv-except-production.md,
+// pre-registered gate 2). Three independent checks: (a) the head-rows side
+// store copies exactly one head's slice out of the packed staging layout
+// (exact — it is a float->half cast copy); (b) the decode window dispatch
+// overwrites exactly the masked head's query rows with attention over the
+// side cache (side poisoned with values distinct from the main cache so a
+// silent no-op cannot pass) while every other row keeps the production
+// kernel's output byte-for-byte; (c) the causal window variant ditto with
+// the explicit out_row_stride.
+int test_attention_fp16_window(q27::MetalBackend& backend) {
+    constexpr uint32_t qh = 24, kvh = 4, dim = 256, stride = 2 * dim;
+    constexpr uint32_t mask_head = 1, win = qh / kvh, qh0 = mask_head * win;
+    const float scale = 1.0f / std::sqrt((float)dim);
+    uint32_t lcg = 4242;
+    auto uniform = [&]() { lcg = lcg * 1664525u + 1013904223u; return (float)(lcg >> 8) / 8388608.0f - 1.0f; };
+    auto as_half = [](float v) { return (float)(_Float16)v; };
+    auto as_half_bits = [](float v) { _Float16 h = (_Float16)v; uint16_t b; memcpy(&b, &h, 2); return b; };
+    int failures = 0;
+
+    // (a) head-rows side store: 5 packed rows, copy head 2, compare exactly.
+    {
+        constexpr uint32_t tokens = 5, copy_head = 2;
+        std::vector<float> kv((uint64_t)tokens * kvh * dim), vv(kv.size());
+        for (auto& x : kv) x = uniform();
+        for (auto& x : vv) x = uniform();
+        auto kb = upload_buffer(backend, kv), vb = upload_buffer(backend, vv);
+        auto ks = backend.allocate((uint64_t)tokens * dim * 2), vs = backend.allocate((uint64_t)tokens * dim * 2);
+        backend.kv_store_f16_head_rows_side(*kb, *vb, copy_head * dim, kvh * dim, *ks, *vs, 0, dim, tokens);
+        backend.synchronize();
+        std::vector<uint16_t> gk(tokens * dim), gv(tokens * dim);
+        backend.read(*ks, 0, gk.data(), gk.size() * 2);
+        backend.read(*vs, 0, gv.data(), gv.size() * 2);
+        for (uint32_t t = 0; t < tokens; t++)
+            for (uint32_t d = 0; d < dim; d++) {
+                const float wk = as_half(kv[(uint64_t)t * kvh * dim + copy_head * dim + d]);
+                const float wv = as_half(vv[(uint64_t)t * kvh * dim + copy_head * dim + d]);
+                if (as_half_bits(wk) != gk[t * dim + d] || as_half_bits(wv) != gv[t * dim + d]) {
+                    fprintf(stderr, "side store mismatch t=%u d=%u\n", t, d);
+                    if (++failures > 4) return failures;
+                }
+            }
+    }
+
+    // Shared main cache + q for (b) and (c).
+    constexpr uint32_t max_seq = 149, tokens_c = 12, base_c = 133;
+    std::vector<std::vector<float>> keys(max_seq), vals(max_seq);
+    auto kc = backend.allocate((uint64_t)max_seq * kvh * dim * 2), vc = backend.allocate((uint64_t)max_seq * kvh * dim * 2);
+    for (uint32_t p = 0; p < max_seq; p++) {
+        keys[p].resize(kvh * dim); vals[p].resize(kvh * dim);
+        for (auto& x : keys[p]) x = uniform();
+        for (auto& x : vals[p]) x = uniform();
+        auto kb = upload_buffer(backend, keys[p]), vb = upload_buffer(backend, vals[p]);
+        backend.kv_store_f16(*kb, *vb, *kc, *vc, p, kvh * dim);
+    }
+    // Poisoned side cache: values the main cache does NOT hold.
+    std::vector<float> skeys((uint64_t)max_seq * dim), svals(skeys.size());
+    for (auto& x : skeys) x = uniform() * 2.0f;
+    for (auto& x : svals) x = uniform() * 2.0f;
+    auto ks = backend.allocate((uint64_t)max_seq * dim * 2), vs = backend.allocate((uint64_t)max_seq * dim * 2);
+    {
+        std::vector<uint16_t> hk(skeys.size()), hv(svals.size());
+        for (size_t i = 0; i < skeys.size(); i++) { hk[i] = as_half_bits(as_half(skeys[i])); hv[i] = as_half_bits(as_half(svals[i])); }
+        backend.write(*ks, 0, hk.data(), hk.size() * 2);
+        backend.write(*vs, 0, hv.data(), hv.size() * 2);
+    }
+    auto fp16_ref = [&](const float* qrow, uint32_t seq, bool side, uint32_t kh, float* want) {
+        std::vector<float> s(seq);
+        float mx = -1e30f;
+        for (uint32_t p = 0; p < seq; p++) {
+            s[p] = 0;
+            for (uint32_t d = 0; d < dim; d++)
+                s[p] += qrow[d] * as_half(side ? skeys[(uint64_t)p * dim + d] : keys[p][kh * dim + d]);
+            s[p] *= scale;
+            mx = std::max(mx, s[p]);
+        }
+        float den = 0; for (float& v : s) { v = std::exp(v - mx); den += v; }
+        for (float& v : s) v /= den;
+        for (uint32_t d = 0; d < dim; d++) {
+            want[d] = 0;
+            for (uint32_t p = 0; p < seq; p++)
+                want[d] += s[p] * as_half(side ? svals[(uint64_t)p * dim + d] : vals[p][kh * dim + d]);
+        }
+    };
+
+    // (b) decode window.
+    {
+        const uint32_t seq = max_seq;
+        std::vector<float> q((uint64_t)qh * stride);
+        for (auto& x : q) x = uniform();
+        auto qb = upload_buffer(backend, q);
+        auto out = backend.allocate((uint64_t)qh * dim * 4);
+        auto partials = backend.allocate_private((uint64_t)qh * (1 + ((uint64_t)seq - 1) / 128) * 258 * 4);
+        backend.attention_f16(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale, partials.get());
+        auto base_out = read_f32(backend, *out, (uint64_t)qh * dim);
+        backend.attention_f16_window(*qb, stride, qh0, *ks, *vs, *out, seq, win, dim, scale);
+        auto got = read_f32(backend, *out, (uint64_t)qh * dim);
+        std::vector<float> want(dim);
+        for (uint32_t h = 0; h < qh; h++) {
+            const bool inwin = h >= qh0 && h < qh0 + win;
+            if (!inwin) {
+                for (uint32_t d = 0; d < dim; d++)
+                    if (got[(uint64_t)h * dim + d] != base_out[(uint64_t)h * dim + d]) {
+                        fprintf(stderr, "decode window leaked into head %u\n", h);
+                        if (++failures > 8) return failures;
+                        break;
+                    }
+                continue;
+            }
+            fp16_ref(&q[(uint64_t)h * stride], seq, true, 0, want.data());
+            for (uint32_t d = 0; d < dim; d++)
+                if (!near(got[(uint64_t)h * dim + d], want[d], 8e-4f)) {
+                    fprintf(stderr, "decode window [%u,%u] got %.8g want %.8g\n",
+                            h, d, got[(uint64_t)h * dim + d], want[d]);
+                    if (++failures > 8) return failures;
+                }
+        }
+    }
+
+    // (c) causal window.
+    {
+        const uint32_t q_row_stride = 2 * qh * dim;
+        std::vector<float> q((uint64_t)tokens_c * q_row_stride);
+        for (auto& x : q) x = uniform();
+        auto qb = upload_buffer(backend, q);
+        auto out = backend.allocate((uint64_t)tokens_c * qh * dim * 4);
+        auto partials = backend.allocate_private(
+            (uint64_t)tokens_c * qh * (1 + ((uint64_t)max_seq - 1) / 128) * 258 * 4);
+        backend.attention_f16_causal(*qb, stride, q_row_stride, *kc, *vc, *out,
+                                     base_c, qh, kvh, dim, tokens_c, scale, partials.get());
+        auto base_out = read_f32(backend, *out, (uint64_t)tokens_c * qh * dim);
+        backend.attention_f16_causal_window(*qb, stride, q_row_stride, qh0, *ks, *vs, *out,
+                                            qh * dim, base_c, win, dim, tokens_c, scale);
+        auto got = read_f32(backend, *out, (uint64_t)tokens_c * qh * dim);
+        std::vector<float> want(dim);
+        for (uint32_t t = 0; t < tokens_c; t++)
+            for (uint32_t h = 0; h < qh; h++) {
+                const uint64_t row = ((uint64_t)t * qh + h) * dim;
+                const bool inwin = h >= qh0 && h < qh0 + win;
+                if (!inwin) {
+                    for (uint32_t d = 0; d < dim; d++)
+                        if (got[row + d] != base_out[row + d]) {
+                            fprintf(stderr, "causal window leaked into t=%u head %u\n", t, h);
+                            if (++failures > 12) return failures;
+                            break;
+                        }
+                    continue;
+                }
+                fp16_ref(&q[(uint64_t)t * q_row_stride + h * stride], base_c + t, true, 0, want.data());
+                for (uint32_t d = 0; d < dim; d++)
+                    if (!near(got[row + d], want[d], 8e-4f)) {
+                        fprintf(stderr, "causal window [t=%u,%u,%u] got %.8g want %.8g\n",
+                                t, h, d, got[row + d], want[d]);
+                        if (++failures > 12) return failures;
+                    }
+            }
+    }
+    if (!failures) printf("fp16 exception window: side store exact, decode+causal windows overwrite correctly\n");
+    return failures;
+}
+
 // Threshold-straddle contract gate (codex review finding 1): with the
 // DEFAULT threshold, a chunk whose rows span the switch point must produce
 // bit-identical output to serial decode at each row's sequence length —
@@ -1508,6 +1668,7 @@ int main() {
                        test_attention_production_shape(backend) +
                        test_turbo3(backend) + test_turbo3_production_shape(backend) +
                        test_attention_gqa_path() + test_attention_gqa_straddle() +
+                       test_attention_fp16_window(backend) +
                        test_attention_gqa_tiled_parity() +
                        test_topk(backend) + test_argmax_stress(backend) +
                        test_tensor_extent(backend) + test_mask_logits(backend) +

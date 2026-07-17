@@ -1,0 +1,18 @@
+production layer sweep, 1536 positions, ctx 2048 (event @pos 1000)
+sweep_L11      overall mean KL 0.0132035 nats, max 2.78685
+sweep_L15      overall mean KL 0.0121539 nats, max 2.76698
+sweep_L19      overall mean KL 0.010162 nats, max 1.44541
+sweep_L23      overall mean KL 0.0120439 nats, max 2.35233
+sweep_L27      overall mean KL 0.011806 nats, max 2.74085
+sweep_L3       overall mean KL 0.0103022 nats, max 0.879132
+sweep_L31      overall mean KL 0.011884 nats, max 2.95579
+sweep_L35      overall mean KL 0.0100893 nats, max 1.43989
+sweep_L39      overall mean KL 0.0121021 nats, max 2.74178
+sweep_L43      overall mean KL 0.0124076 nats, max 2.73467
+sweep_L47      overall mean KL 0.0118334 nats, max 2.77279
+sweep_L51      overall mean KL 0.0113095 nats, max 2.74364
+sweep_L55      overall mean KL 0.0115702 nats, max 2.7093
+sweep_L59      overall mean KL 0.0115861 nats, max 2.88893
+sweep_L63      overall mean KL 0.00999662 nats, max 2.66
+sweep_L7       overall mean KL 0.00998405 nats, max 0.6717
+sweep_control  overall mean KL 0.0122163 nats, max 2.7719

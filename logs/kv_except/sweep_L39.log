@@ -1,0 +1,10 @@
+q27 Metal: Q27_METAL_KV_FP16_CELLS ignored on an fp16-KV engine (cells already fp16)
+Metal model ready on Apple M4 in 6.15 s (two engines, one mapping: fp16 baseline vs turbo3)
+kl-kv: 1535 positions, single pass, no resets
+  kl pos 384/1535  kl pos 768/1535  kl pos 1152/1535  kl pos 1535/1535
+kl-kv tail: p50 0.003999  p90 0.02043  p99 0.09355  p99.5 0.1494  max 2.742 @pos 1000
+kl-kv runs >0.1: 14 positions, 13 runs, longest 2 @pos 1000
+kl-kv runs >0.5: 2 positions, 2 runs, longest 1 @pos 641
+kl-kv wall: 103.13 s (14.88 pos/s through both engines), overall mean KL 0.0121021 nats, max 2.74178
+KV forward-KL vs fp16 baseline by target position (1536 tokens, no resets):
+  0-2k    : mean KL 0.0121021 nats  max 2.74178  (n=1535)

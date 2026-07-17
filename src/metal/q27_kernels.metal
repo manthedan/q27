@@ -3455,6 +3455,24 @@ kernel void q27_kv_store_f16_rows(device const float *k [[buffer(0)]],
     kc[dst] = half(k[src]); vc[dst] = half(v[src]);
 }
 
+// KV fp16 exception cells (docs/plans/2026-07-17-kv-except-production.md):
+// copies ONE head's K/V rows out of the packed multi-head staging buffers
+// (src rows are src_stride apart; the head offset rides the buffer binding)
+// into a kv_heads=1 fp16 side cache (dst rows are row_length apart). tokens
+// = 1 covers the serial store.
+struct KvStoreHeadRowsArgs { uint position; uint src_stride; uint row_length; uint tokens; };
+kernel void q27_kv_store_f16_head_rows(device const float *k [[buffer(0)]],
+                                        device const float *v [[buffer(1)]],
+                                        device half *kc       [[buffer(2)]],
+                                        device half *vc       [[buffer(3)]],
+                                        constant KvStoreHeadRowsArgs &args [[buffer(4)]],
+                                        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.row_length || gid.y >= args.tokens) return;
+    const ulong src = (ulong)gid.y * args.src_stride + gid.x;
+    const ulong dst = (ulong)(args.position + gid.y) * args.row_length + gid.x;
+    kc[dst] = half(k[src]); vc[dst] = half(v[src]);
+}
+
 struct GateRowsArgs { uint heads; uint head_dim; uint tokens; };
 kernel void q27_sigmoid_gate_mul_rows(device float *out [[buffer(0)]],
                                        device const float *qg [[buffer(1)]],
@@ -3609,6 +3627,80 @@ kernel void q27_attention_f16_causal(device const float *q [[buffer(0)]],
         const float inv = l > 0.0f ? 1.0f / l : 0.0f;
         for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
             out[((ulong)token * args.q_heads + qh) * args.head_dim + d] = acc[i] * inv;
+    }
+}
+
+// KV fp16-exception window variant of q27_attention_f16_causal
+// (docs/plans/2026-07-17-kv-except-production.md): identical math over a
+// kv_heads=1 fp16 side cache for a WINDOW of query heads (the base head
+// offset rides the q/out buffer bindings), overwriting the production
+// dispatch's rows for those heads. The one structural difference is
+// out_row_stride: the full output rows are q_heads_total*head_dim apart,
+// while this dispatch only covers window heads — so the stride is explicit
+// instead of derived from args.q_heads. Additive kernel, own args struct:
+// the production causal kernel and the shader ABI are untouched.
+struct AttentionCausalWinArgs {
+    uint q_stride; uint q_row_stride; uint base_len;
+    uint q_heads; uint kv_heads; uint head_dim; uint tokens;
+    uint out_row_stride; float scale;
+};
+kernel void q27_attention_f16_causal_win(device const float *q [[buffer(0)]],
+                                         device const half *kc [[buffer(1)]],
+                                         device const half *vc [[buffer(2)]],
+                                         device float *out      [[buffer(3)]],
+                                         constant AttentionCausalWinArgs &args [[buffer(4)]],
+                                         uint2 group [[threadgroup_position_in_grid]],
+                                         ushort lane [[thread_index_in_simdgroup]],
+                                         ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint qh = group.x, token = group.y;
+    if (qh >= args.q_heads || token >= args.tokens) return;
+    const uint seq_len = args.base_len + token;
+    const uint gqa = args.q_heads / args.kv_heads;
+    const uint kvh = qh / gqa;
+    device const float *qh_ptr = q + (ulong)token * args.q_row_stride + (ulong)qh * args.q_stride;
+
+    float acc[8];                       // head_dim <= 256 -> at most 8 dims per lane
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint p = sg; p < seq_len; p += 8) {
+        device const half *kh = kc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
+        float partial = 0.0f;
+        for (uint d = lane; d < args.head_dim; d += 32) partial += qh_ptr[d] * float(kh[d]);
+        const float score = simd_sum(partial) * args.scale;
+        const float m_new = max(m, score);
+        const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
+        const float weight = exp(score - m_new);
+        l = l * correction + weight;
+        device const half *vh = vc + ((ulong)p * args.kv_heads + kvh) * args.head_dim;
+        for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+            acc[i] = acc[i] * correction + weight * float(vh[d]);
+        m = m_new;
+    }
+
+    threadgroup float tg_m[4], tg_l[4], tg_acc[4][256];
+    for (uint offset = 4; offset >= 1; offset /= 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg >= offset && sg < 2 * offset) {
+            if (lane == 0) { tg_m[sg - offset] = m; tg_l[sg - offset] = l; }
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                tg_acc[sg - offset][d] = acc[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < offset) {
+            const float m_other = tg_m[sg], l_other = tg_l[sg];
+            const float m_new = max(m, m_other);
+            if (m_new == -INFINITY) continue;       // both stripes empty
+            const float c_mine = exp(m - m_new), c_other = exp(m_other - m_new);
+            l = l * c_mine + l_other * c_other;
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                acc[i] = acc[i] * c_mine + tg_acc[sg][d] * c_other;
+            m = m_new;
+        }
+    }
+    if (sg == 0) {
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+            out[(ulong)token * args.out_row_stride + (ulong)qh * args.head_dim + d] = acc[i] * inv;
     }
 }
 

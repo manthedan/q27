@@ -331,6 +331,18 @@ class MetalEngine {
     // the kernel's head argument at the attrib store call sites.
     uint8_t kv_attrib_masks_[16] = {};
     std::shared_ptr<BackendBuffer> kv_attrib_aux_;
+    // Production KV fp16 exception cells
+    // (docs/plans/2026-07-17-kv-except-production.md): per masked head, a
+    // kv_heads=1 fp16 side cache in the turbo3 WHT domain; the head's
+    // query-head window is re-attended f16 against it, overwriting the
+    // production dispatch's output rows. Parsed from
+    // Q27_METAL_KV_FP16_CELLS (census cell numbers, per-head K+V pairs
+    // required) in the constructor; turbo3 engines only (ignored with a
+    // note on fp16 engines — those cells are already fp16). Indexed by
+    // attn_idx = layer/4. Bytes ride engine_cache_bytes_.
+    struct KvFp16Side { uint32_t head; std::shared_ptr<BackendBuffer> k, v; };
+    std::array<std::vector<KvFp16Side>, 16> kv_fp16_side_;
+    bool kv_fp16_except_ = false;
     uint64_t engine_cache_bytes_ = 0;
     // Blocked-GQA softmax partials, engine-owned (audit E2): allocated once
     // in the constructor at gqa_partial_peak, GPU-private, freed with the
