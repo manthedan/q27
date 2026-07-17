@@ -4,6 +4,13 @@
 // TEXT / TOOL channels, holding back any tail that could be a partial marker.
 // Markers do not nest; tool_calls can appear only outside think blocks in
 // well-formed output, but we tolerate them inside by scanning TEXT only.
+// Adjacent calls (</tool_call><tool_call>, the multi-call batch shape) emit
+// an empty {TEXT,""} boundary segment between them: consumers buffer one
+// TOOL segment at a time and flush on any non-TOOL segment, so without the
+// boundary two calls fold into one buffer, the combined parse fails, and a
+// well-formed call followed by a malformed one silently loses the malformed
+// raw (codex P2, 2026-07-17). Empty TEXT segments are no-ops for consumers
+// that do not buffer tools.
 #pragma once
 #include <algorithm>
 #include <cstring>
@@ -17,6 +24,10 @@ struct StreamSplitter {
     enum Chan { TEXT, THINK, TOOL };
     Chan chan = TEXT;
     std::string hold;
+    // Set when a TOOL closer returned us to TEXT and nothing has been emitted
+    // since; a <tool_call> opener at position 0 then means ADJACENT calls and
+    // gets an empty {TEXT,""} boundary segment (file-header comment).
+    bool tool_boundary = false;
 
     static constexpr const char* T_OPEN = "<think>";
     static constexpr const char* T_CLOSE = "</think>";
@@ -32,11 +43,14 @@ struct StreamSplitter {
                 size_t pt = hold.find(T_OPEN), pc = hold.find(C_OPEN);
                 if (pt != std::string::npos && (pc == std::string::npos || pt < pc)) {
                     if (pt > 0) out.push_back({TEXT, hold.substr(0, pt)});
+                    tool_boundary = false; // think content flushes a pending tool
                     hold.erase(0, pt + strlen(T_OPEN));
                     chan = THINK;
                     continue;
                 }
                 if (pc != std::string::npos) {
+                    if (pc == 0 && tool_boundary) out.push_back({TEXT, ""}); // adjacent-call boundary
+                    tool_boundary = false;
                     if (pc > 0) out.push_back({TEXT, hold.substr(0, pc)});
                     hold.erase(0, pc + strlen(C_OPEN));
                     chan = TOOL;
@@ -45,7 +59,7 @@ struct StreamSplitter {
                 // hold back the longest suffix that prefixes either opener
                 size_t keep = tail_keep(T_OPEN);
                 keep = std::max(keep, tail_keep(C_OPEN));
-                emit_head(out, keep);
+                if (emit_head(out, keep)) tool_boundary = false;
                 break;
             }
             const char* closer = chan == THINK ? T_CLOSE : C_CLOSE;
@@ -53,6 +67,7 @@ struct StreamSplitter {
             if (p != std::string::npos) {
                 if (p > 0) out.push_back({chan, hold.substr(0, p)});
                 hold.erase(0, p + strlen(closer));
+                tool_boundary = (chan == TOOL);
                 chan = TEXT;
                 continue;
             }
@@ -76,11 +91,13 @@ struct StreamSplitter {
             if (hold.compare(hold.size() - k, k, marker, k) == 0) return k;
         return 0;
     }
-    void emit_head(std::vector<std::pair<Chan, std::string>>& out, size_t keep) {
+    bool emit_head(std::vector<std::pair<Chan, std::string>>& out, size_t keep) {
         if (hold.size() > keep) {
             out.push_back({chan, hold.substr(0, hold.size() - keep)});
             hold.erase(0, hold.size() - keep);
+            return true;
         }
+        return false;
     }
 };
 

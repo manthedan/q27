@@ -357,6 +357,13 @@ struct Runtime {
     // stream providers catch it by name and return without writing.
     struct ClientGone {};
     std::atomic<uint64_t> cancelled_queue{0}, cancelled_prefill{0};
+    // Engine failures during generation are server bugs, not request bugs:
+    // Anthropic defines api_error (500) for them, and 400 is fatal-class to
+    // codex while 500 retries (residue round 2026-07-17-responses-parity-
+    // residue.md). Handlers wrap ONLY the run() call — parse/validation/
+    // overflow all throw before it. Known coarseness, recorded: the rare
+    // post-restore "prompt exceeds context" inside run() rides this class.
+    struct EngineError : std::runtime_error { using std::runtime_error::runtime_error; };
     // Mid-queue cancelled tickets awaiting their in-order skip (route_).
     std::set<uint64_t> cancelled_tickets_;
     // Innermost lock: guards the shared host-side ToolMaskCache (mask
@@ -1180,6 +1187,7 @@ int main(int argc,char** argv) {
                 // empty 200 (codex P2 on this round).
                 catch(const Runtime::ClientGone&) { response.status=499; }
                 catch(const Runtime::ServerOverloaded& e) { json_response(response,{{"error",{{"message",e.what()},{"type","overloaded_error"}}}},503); }
+                catch(const Runtime::EngineError& e) { json_response(response,{{"error",{{"message",e.what()},{"type","api_error"}}}},500); }
                 catch(const std::exception& e) { json_response(response,{{"error",{{"message",e.what()},{"type","invalid_request_error"}}}},400); }
             };
         };
@@ -1188,6 +1196,16 @@ int main(int argc,char** argv) {
         // the q27 httplib patch (Request::sock).
         auto socket_live=[](socket_t sock){
             return [sock]{ return httplib::detail::is_socket_alive(sock); };
+        };
+        // Wraps ONLY a handler's run() call: engine failures reclassify as
+        // EngineError (api_error 500); the cancellation and overload types
+        // pass through untouched.
+        auto engine_guard=[](auto&& fn)->decltype(fn()) {
+            try { return fn(); }
+            catch(const Runtime::ClientGone&) { throw; }
+            catch(const Runtime::ServerOverloaded&) { throw; }
+            catch(const Runtime::EngineError&) { throw; }
+            catch(const std::exception& e) { throw Runtime::EngineError(e.what()); }
         };
         // Anthropic endpoints answer in Anthropic's error envelope
         // ({"type":"error","error":{...}} — the SDK inside Claude Code reads
@@ -1205,6 +1223,10 @@ int main(int argc,char** argv) {
                 try { handler(body,response,request.sock); }
                 // 499 as in `guarded` (codex P2): never an empty 200.
                 catch(const Runtime::ClientGone&) { response.status=499; }
+                catch(const Runtime::EngineError& e) {
+                    response.status=500;
+                    response.set_content(q27::anthropic_error_json("api_error",e.what()),"application/json");
+                }
                 catch(const Runtime::ServerOverloaded& e) {
                     response.status=503;
                     response.set_content(q27::anthropic_error_json("overloaded_error",e.what()),"application/json");
@@ -1243,10 +1265,11 @@ int main(int argc,char** argv) {
             }
             if(!wants_stream(body)) {
                 std::string text; size_t probe=0;
-                auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ text+=piece;
-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                    tool_names_from(body),body.value("snapshot",false),socket_live(sock));
+                auto outcome=engine_guard([&]{
+                    return runtime.run(ids,n,sampling,stops,
+                        [&](const std::string& piece){ text+=piece;
+                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                        tool_names_from(body),body.value("snapshot",false),socket_live(sock)); });
                 json_response(r,{{"id",id},{"object","text_completion"},{"created",created},{"model","q27-metal"},
                     {"choices",json::array({{{"index",0},{"text",text},{"finish_reason",openai_finish(outcome.finish)}}})},
                     {"usage",{{"prompt_tokens",outcome.prompt_tokens},{"completion_tokens",outcome.output_tokens},
@@ -1328,10 +1351,11 @@ int main(int argc,char** argv) {
                     (ch==q27::StreamSplitter::THINK?think_buf:text)+=t;
                 };
                 size_t probe=0;
-                auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                    tnames,snap_hint,socket_live(sock));
+                auto outcome=engine_guard([&]{
+                    return runtime.run(ids,n,sampling,stops,
+                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                        tnames,snap_hint,socket_live(sock)); });
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
                 std::string th=q27::strip_ws2(think_buf),tx=q27::strip_ws2(text);
@@ -1506,10 +1530,11 @@ int main(int argc,char** argv) {
                     (ch==q27::StreamSplitter::THINK?think:text)+=t;
                 };
                 size_t probe=0;
-                auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                    tnames,snap_hint,socket_live(sock));
+                auto outcome=engine_guard([&]{
+                    return runtime.run(ids,n,sampling,stops,
+                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                        tnames,snap_hint,socket_live(sock)); });
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
                 json content=json::array();
@@ -1682,46 +1707,95 @@ int main(int argc,char** argv) {
         }));
 
         // ---- OpenAI Responses API (/v1/responses, Codex CLI) ----
-        // Non-streaming: output_text plus a message/output_text item. Streaming
-        // follows src/server.cu: response.created, output_item.added(message),
-        // content_part.added, response.output_text.delta per piece,
-        // output_text.done, content_part.done, output_item.done,
-        // response.completed. Codex keys off the JSON `type` field.
+        // Full CUDA port (src/server.cu:1441-1882, residue round
+        // 2026-07-17-responses-parity-residue.md): instructions/input-item
+        // mapping through the chat template (replacing the raw-text
+        // preamble hack), custom freeform tools bridged to one-string-param
+        // functions, hosted tool types skipped never rejected, and
+        // structured function_call / custom_tool_call output items with the
+        // codex 0.143 item lifecycle on the stream (an output_text.delta
+        // without an open item aborts the codex turn). Wire facts from
+        // codex-rs: the client keys off the JSON `type` field; the agent
+        // loop consumes only response.output_item.done items;
+        // response.completed{response:{id}} is the required terminator;
+        // function_call.arguments is a JSON-encoded STRING. 400 is fatal
+        // to codex, 500 retries — tolerate quirks, 500 on bugs.
         server.Post("/v1/responses",guarded([&](const json& body,httplib::Response& r,socket_t sock){
-            std::string input=body.contains("input")?text_content(body["input"]):"";
-            // Validate BEFORE the preamble (codex P1): an item-array input
-            // that text_content cannot flatten must fail loud here — a
-            // nonempty preamble would otherwise slip past the empty-ids
-            // check and generate from the tool declarations alone.
-            if(input.empty()) throw std::runtime_error("input is empty");
-            // Tools preamble parity (codex P1 on the parity-audit merge):
-            // this endpoint feeds raw flattened text to the model (no chat
-            // template), so without the schemas prepended the constrainer
-            // could mask decoding toward tools the model has never seen.
-            // Flat Responses function entries are normalized to the nested
-            // shape tools_preamble renders on the chat/CUDA paths (codex
-            // P2); hosted tool types are skipped, never rejected. Full
-            // CUDA-style Responses normalization (instructions,
-            // function_call bridging, custom tools) is a recorded follow-up.
-            if(body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
-                json norm=json::array();
+            const long rn=req_counter++;
+            const std::string resp_id="resp_metal_"+std::to_string(rn);
+            const std::string msg_id="msg_metal_"+std::to_string(rn);
+            // Tools: flat function entries normalized to the nested shape
+            // chatml_prompt renders; `custom` freeform tools (apply_patch)
+            // bridged; hosted types (web_search etc.) skipped.
+            json tools=json::array();
+            std::set<std::string> custom_names;
+            if(body.contains("tools") && body["tools"].is_array())
                 for(const auto& t:body["tools"]) {
                     if(!t.is_object()) continue;
-                    if(t.contains("function") && t["function"].is_object()) norm.push_back(t);
-                    else if(t.value("type","")=="function" && t.contains("name"))
-                        norm.push_back({{"type","function"},
+                    const std::string ty=t.value("type","");
+                    if(t.contains("function") && t["function"].is_object()) tools.push_back(t);
+                    else if(ty=="function" && t.contains("name"))
+                        tools.push_back({{"type","function"},
                             {"function",{{"name",t.value("name","")},
                                          {"description",t.value("description","")},
                                          {"parameters",t.contains("parameters")?t["parameters"]
-                                                                                :json::object()}}}});
+                                                                               :json::object()}}}});
+                    else if(ty=="custom") {
+                        const std::string cn=t.value("name","");
+                        custom_names.insert(cn);
+                        tools.push_back({{"type","function"},
+                            {"function",{{"name",cn},
+                                         {"description",t.value("description","")},
+                                         {"parameters",{{"type","object"},
+                                             {"properties",{{"input",{{"type","string"},
+                                                 {"description","The complete raw input text for this tool."}}}}},
+                                             {"required",json::array({"input"})}}}}}});
+                    }
                 }
-                if(!norm.empty()) input=q27::tools_preamble(norm)+"\n\n"+input;
+            // input -> messages; instructions is the system prompt.
+            std::vector<q27::Msg> msgs;
+            if(body.contains("instructions") && body["instructions"].is_string())
+                msgs.push_back({"system",body["instructions"]});
+            if(body.contains("input")) {
+                if(body["input"].is_string()) msgs.push_back({"user",body["input"]});
+                else if(body["input"].is_array())
+                    for(const auto& it:body["input"]) {
+                        if(!it.is_object()) continue;
+                        const std::string ty=it.value("type","message");
+                        if(ty=="message") {
+                            std::string role=it.value("role","user");
+                            if(role=="developer") role="system";
+                            msgs.push_back({role,it.contains("content")?text_content(it["content"]):""});
+                        } else if(ty=="function_call" || ty=="custom_tool_call") {
+                            json args;
+                            if(ty=="function_call") {
+                                try { args=json::parse(it.value("arguments","{}")); }
+                                catch(...) { args=it.value("arguments",""); }
+                            } else args={{"input",it.value("input","")}};
+                            msgs.push_back({"assistant",q27::tool_call_text(it.value("name",""),args)});
+                        } else if(ty=="function_call_output" || ty=="custom_tool_call_output") {
+                            std::string out;
+                            if(it.contains("output"))
+                                out=it["output"].is_string()?it["output"].get<std::string>()
+                                                            :text_content(it["output"]);
+                            msgs.push_back({"user",q27::tool_response_text(out)});
+                        }
+                        // reasoning items in history are dropped (template behavior)
+                    }
             }
-            auto ids=to_u32(runtime.tokenizer.encode(input));
+            // Fail-loud before the template renders (codex P1 on the old
+            // endpoint, preserved): tool declarations alone must not
+            // generate.
+            if(msgs.empty()) throw std::runtime_error("input is empty");
+            std::vector<q27::Msg> merged;
+            for(auto& m:msgs) {
+                if(!merged.empty() && merged.back().role==m.role) merged.back().content+="\n"+m.content;
+                else merged.push_back(m);
+            }
+            auto ids=to_u32(runtime.tokenizer.encode(q27::chatml_prompt(merged,tools,true)));
             uint32_t n=max_tokens(body,4096);
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop");
-            const std::string rid="resp_metal", mid="msg_metal";
             if(ids.empty()) throw std::runtime_error("input is empty");
             uint32_t maxp=0;
             if(prompt_overflow(ids.size(),n,maxp)) {
@@ -1729,62 +1803,286 @@ int main(int argc,char** argv) {
                 json_response(r,{{"error",{{"code","context_length_exceeded"}}}},400);
                 return;
             }
+            const std::vector<std::string> tnames=tool_names_from(body);
+            const bool snap_hint=body.value("snapshot",false);
             if(!wants_stream(body)) {
-                std::string text; size_t probe=0;
-                auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ text+=piece;
-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                    tool_names_from(body),body.value("snapshot",false),socket_live(sock));
-                json_response(r,{{"id",rid},{"object","response"},{"model","q27-metal"},{"status","completed"},
-                    {"output_text",text},
-                    {"output",json::array({{{"type","message"},{"id",mid},{"role","assistant"},{"status","completed"},
-                        {"content",json::array({{{"type","output_text"},{"text",text},{"annotations",json::array()}}})}}})},
+                json items=json::array();
+                int tool_counter=0;
+                std::string think,text,tool_buf,text_accum;
+                auto flush_think=[&]{
+                    std::string th=q27::strip_ws2(think); think.clear();
+                    if(th.empty()) return;
+                    items.push_back({{"type","reasoning"},{"id","rs_metal_"+std::to_string(rn)},
+                        {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
+                        {"encrypted_content",nullptr}});
+                };
+                auto push_call=[&](const std::string& name,const json& args){
+                    const std::string cid="call_metal_"+std::to_string(rn)+"_"+std::to_string(tool_counter++);
+                    if(custom_names.count(name)) {
+                        std::string input=args.is_object() && args.contains("input") && args["input"].is_string()
+                                              ?args["input"].get<std::string>():args.dump();
+                        items.push_back({{"type","custom_tool_call"},{"call_id",cid},{"name",name},{"input",input}});
+                    } else
+                        items.push_back({{"type","function_call"},{"call_id",cid},{"name",name},
+                                         {"arguments",args.dump()}});
+                };
+                auto flush_text=[&](bool final_turn){
+                    std::string tx=q27::strip_ws2(text); text.clear();
+                    if(tx.empty()) return;
+                    // Wrapper-less recovery rides EVERY text commit (codex P2
+                    // round 2): a bare call completes within one segment
+                    // before any think/tool transition, so per-segment
+                    // recovery keeps coverage exact. Runs even with empty
+                    // tools: codex registers its shell tool as a hosted type
+                    // this handler skips, yet the model still emits bare
+                    // calls for it. tx=pre convention (chat/Anthropic
+                    // handlers): the pre-call prose message precedes the
+                    // recovered calls, in model output order. Truncation
+                    // repair is gated to the final end-of-turn flush (codex
+                    // P2 round 3): a mid-turn segment boundary is not a
+                    // truncation, so an incomplete call-shaped fragment
+                    // before <think>/<tool_call> stays surfaced as text
+                    // instead of being repaired into an invented call.
+                    // Recorded coarseness (house convention, identical in
+                    // the chat/Anthropic handlers): prose AFTER a recovered
+                    // call within the same natural segment is trimmed by
+                    // tx=pre — parse_bare_tool_calls reports no suffix.
+                    std::string pre;
+                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,
+                                                        tools.empty()?nullptr:&tools,
+                                                        final_turn);
+                    if(!bcs.empty()) {
+                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",bcs.size());
+                        tx=pre;
+                    }
+                    if(!tx.empty())
+                        items.push_back({{"type","message"},{"id",msg_id},{"role","assistant"},
+                            {"status","completed"},
+                            {"content",json::array({{{"type","output_text"},{"text",tx},
+                                                     {"annotations",json::array()}}})}});
+                    for(auto& bc:bcs) push_call(bc.name,bc.arguments);
+                };
+                auto flush_tool=[&](bool final_turn){
+                    auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
+                    if(!c.ok) { // malformed: commit the raw as its OWN text
+                        // segment right now (chat/Anthropic recovery
+                        // convention): recovery runs over it, so a
+                        // recoverable nested call is not lost as raw text
+                        // (codex P2 round 3) — and committing it alone means
+                        // the tx=pre trim can never drop prose that followed
+                        // the wrapper in the model's output (codex P2 round 4).
+                        text+=(text.empty()?"":"\n")+c.raw;
+                        flush_text(final_turn); return;
+                    }
+                    push_call(c.name,c.arguments);
+                };
+                q27::StreamSplitter sp;
+                auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+                    if(ch==q27::StreamSplitter::TOOL) {
+                        if(!think.empty()) flush_think();
+                        if(!text.empty()) flush_text(false);
+                        tool_buf+=t; return;
+                    }
+                    if(!tool_buf.empty()) flush_tool(false);
+                    // codex P2: close pending text BEFORE think accumulates —
+                    // same transition rule as TOOL, else a text→think→text
+                    // turn interleaves items (reasoning pushed ahead of the
+                    // message it followed) and the stream twin corrupts
+                    // output_index.
+                    if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(false); think+=t; return; }
+                    if(!think.empty()) flush_think();
+                    text+=t; text_accum+=t;
+                };
+                size_t probe=0;
+                auto outcome=engine_guard([&]{
+                    return runtime.run(ids,n,sampling,stops,
+                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                        tnames,snap_hint,socket_live(sock)); });
+                for(auto& [ch,t]:sp.flush()) route(ch,t);
+                if(!tool_buf.empty()) flush_tool(true);
+                flush_think();
+                flush_text(true);
+                std::string all_text;
+                for(const auto& it:items)
+                    if(it.value("type","")=="message" && it.contains("content"))
+                        for(const auto& c:it["content"])
+                            if(c.value("type","")=="output_text") all_text+=c.value("text","");
+                json_response(r,{{"id",resp_id},{"object","response"},{"model","q27-metal"},{"status","completed"},
+                    {"output_text",all_text}, // Metal convenience field, pre-port consumers
+                    {"output",items},
                     {"usage",{{"input_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
                               {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}},
                     {"q27_prefix_hit",outcome.prefix_hit}});
                 return;
             }
             r.set_header("Content-Type","text/event-stream");
-            const std::vector<std::string> tnames=tool_names_from(body);
-            const bool snap_hint=body.value("snapshot",false);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,rid,mid,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
-                    auto ev=[&](const json& j){ std::string s=q27::sse_event(j.value("type",std::string("x")),j); return sink.write(s.data(),s.size()); };
-                    try {
-                        // Gate the run on the opening writes and probe the
-                        // socket on empty pieces, so a disconnected client
-                        // cannot hold the engine through the token cap.
-                        if(!ev({{"type","response.created"},{"response",{{"id",rid},{"object","response"},{"status","in_progress"}}}}) ||
-                           !ev({{"type","response.output_item.added"},{"output_index",0},
-                               {"item",{{"type","message"},{"id",mid},{"role","assistant"},{"status","in_progress"},{"content",json::array()}}}}) ||
-                           !ev({{"type","response.content_part.added"},{"item_id",mid},{"output_index",0},{"content_index",0},
-                               {"part",{{"type","output_text"},{"text",""},{"annotations",json::array()}}}})) {
-                            sink.done();
-                            return true;
-                        }
-                        std::string text;
-                        auto emit=[&](const std::string& piece)->bool {
-                            text+=piece;
-                            if(piece.empty()) return sink.is_writable();
-                            return ev({{"type","response.output_text.delta"},{"item_id",mid},
-                                {"output_index",0},{"content_index",0},{"delta",piece}});
+                [&runtime,ids,n,sampling,stops,rn,resp_id,msg_id,tools,custom_names,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
+                    bool alive=true;
+                    auto ev=[&](const json& j){
+                        std::string s=q27::sse_event(j.value("type",std::string("x")),j);
+                        if(!sink.write(s.data(),s.size())) alive=false;
+                        return alive;
+                    };
+                    // codex P3: item-lifecycle state + machinery hoisted
+                    // above the try so the engine-failure path below can
+                    // still close an open item and terminate the turn.
+                    json items=json::array();
+                    int tool_counter=0,out_index=0,msg_index=-1;
+                    std::string think,text,tool_buf,text_accum;
+                        auto item_done=[&](const json& it){
+                            ev({{"type","response.output_item.done"},{"output_index",out_index++},{"item",it}});
+                            items.push_back(it);
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
+                        auto flush_think=[&]{
+                            std::string th=q27::strip_ws2(think); think.clear();
+                            if(th.empty()) return;
+                            item_done({{"type","reasoning"},{"id","rs_metal_"+std::to_string(rn)},
+                                {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
+                                {"encrypted_content",nullptr}});
+                        };
+                        // codex 0.143 item lifecycle: a delta needs an OPEN item
+                        // (added + content_part.added), else the turn aborts.
+                        auto open_text=[&]{
+                            if(msg_index>=0) return;
+                            msg_index=out_index;
+                            ev({{"type","response.output_item.added"},{"output_index",msg_index},
+                                {"item",{{"type","message"},{"id",msg_id},{"role","assistant"},
+                                         {"status","in_progress"},{"content",json::array()}}}});
+                            ev({{"type","response.content_part.added"},{"item_id",msg_id},
+                                {"output_index",msg_index},{"content_index",0},
+                                {"part",{{"type","output_text"},{"text",""},{"annotations",json::array()}}}});
+                        };
+                        auto flush_text=[&]{
+                            if(msg_index<0) { text.clear(); return; }
+                            std::string tx=q27::strip_ws2(text); text.clear();
+                            ev({{"type","response.output_text.done"},{"item_id",msg_id},
+                                {"output_index",msg_index},{"content_index",0},{"text",tx}});
+                            ev({{"type","response.content_part.done"},{"item_id",msg_id},
+                                {"output_index",msg_index},{"content_index",0},
+                                {"part",{{"type","output_text"},{"text",tx},{"annotations",json::array()}}}});
+                            json it={{"type","message"},{"id",msg_id},{"role","assistant"},{"status","completed"},
+                                {"content",json::array({{{"type","output_text"},{"text",tx},
+                                                         {"annotations",json::array()}}})}};
+                            ev({{"type","response.output_item.done"},{"output_index",msg_index},{"item",it}});
+                            items.push_back(it);
+                            out_index=msg_index+1; msg_index=-1;
+                        };
+                        auto push_call=[&](const std::string& name,const json& args){
+                            const std::string cid="call_metal_"+std::to_string(rn)+"_"+std::to_string(tool_counter++);
+                            if(custom_names.count(name)) {
+                                std::string input=args.is_object() && args.contains("input") && args["input"].is_string()
+                                                      ?args["input"].get<std::string>():args.dump();
+                                item_done({{"type","custom_tool_call"},{"call_id",cid},{"name",name},{"input",input}});
+                            } else
+                                item_done({{"type","function_call"},{"call_id",cid},{"name",name},
+                                           {"arguments",args.dump()}});
+                        };
+                        auto flush_tool=[&](bool final_turn){
+                            auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
+                            if(!c.ok) {
+                                // A max_tokens-truncated FINAL wrapper never
+                                // reached text_accum (TOOL content is not
+                                // text), so the end-of-turn recovery below
+                                // cannot see it — rescue it here with the
+                                // truncation-repair path (codex P2 round 5).
+                                // Goes beyond the CUDA reference, which
+                                // commits the fragment as a message; matches
+                                // the non-stream handler's rescue. Non-final
+                                // malformed raw keeps the reference behavior.
+                                if(final_turn) {
+                                    std::string pre;
+                                    auto bcs=q27::parse_bare_tool_calls(c.raw,&pre,
+                                                                        tools.empty()?nullptr:&tools,true);
+                                    if(!bcs.empty()) {
+                                        fprintf(stderr,"[tool-fallback] %zu truncated wrapped call(s) recovered (resp stream)\n",bcs.size());
+                                        if(!pre.empty())
+                                            item_done({{"type","message"},{"role","assistant"},{"status","completed"},
+                                                {"content",json::array({{{"type","output_text"},{"text",pre},
+                                                                         {"annotations",json::array()}}})}});
+                                        for(auto& bc:bcs) push_call(bc.name,bc.arguments);
+                                        return;
+                                    }
+                                }
+                                item_done({{"type","message"},{"role","assistant"},{"status","completed"},
+                                    {"content",json::array({{{"type","output_text"},{"text",c.raw},
+                                                             {"annotations",json::array()}}})}});
+                                return;
+                            }
+                            push_call(c.name,c.arguments);
+                        };
+                        auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+                            if(ch==q27::StreamSplitter::TOOL) {
+                                if(!think.empty()) flush_think();
+                                if(!text.empty()) flush_text();
+                                tool_buf+=t; return;
+                            }
+                            if(!tool_buf.empty()) flush_tool(false);
+                            // codex P2: a THINK transition must close an open
+                            // text item first (same rule as TOOL) — else
+                            // flush_think's item_done consumes the still-open
+                            // message's output_index and the done events
+                            // duplicate/reorder indices.
+                            if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(); think+=t; return; }
+                            if(!think.empty()) flush_think();
+                            if(msg_index<0 && text.empty() && q27::strip_ws2(t).empty()) return;
+                            open_text();
+                            text+=t; text_accum+=t;
+                            ev({{"type","response.output_text.delta"},{"item_id",msg_id},
+                                {"output_index",msg_index},{"content_index",0},{"delta",t}});
+                        };
+                        try {
+                        if(!ev({{"type","response.created"},
+                                {"response",{{"id",resp_id},{"object","response"},{"status","in_progress"}}}})) {
+                            sink.done(); return true;
+                        }
+                        q27::StreamSplitter sp;
+                        auto outcome=runtime.run(ids,n,sampling,stops,
+                            [&](const std::string& piece)->bool {
+                                for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+                                return alive && sink.is_writable();
+                            },tnames,snap_hint,
                             [sock]{ return httplib::detail::is_socket_alive(sock); });
-                        ev({{"type","response.output_text.done"},{"item_id",mid},{"output_index",0},{"content_index",0},{"text",text}});
-                        ev({{"type","response.content_part.done"},{"item_id",mid},{"output_index",0},{"content_index",0},
-                            {"part",{{"type","output_text"},{"text",text},{"annotations",json::array()}}}});
-                        json item={{"type","message"},{"id",mid},{"role","assistant"},{"status","completed"},
-                            {"content",json::array({{{"type","output_text"},{"text",text},{"annotations",json::array()}}})}};
-                        ev({{"type","response.output_item.done"},{"output_index",0},{"item",item}});
-                        ev({{"type","response.completed"},{"response",{{"id",rid},{"object","response"},{"status","completed"},
-                            {"output",json::array({item})},
-                            {"usage",{{"input_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
-                                      {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}}}}});
+                        for(auto& [ch,t]:sp.flush()) route(ch,t);
+                        if(!tool_buf.empty()) flush_tool(true);
+                        flush_think();
+                        flush_text();
+                        { // bare-call recovery even with empty tools (CUDA comment)
+                            std::string pre;
+                            auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,
+                                                                tools.empty()?nullptr:&tools);
+                            if(!bcs.empty())
+                                fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",bcs.size());
+                            for(auto& bc:bcs) push_call(bc.name,bc.arguments);
+                        }
+                        ev({{"type","response.completed"},
+                            {"response",{{"id",resp_id},{"object","response"},{"status","completed"},
+                                {"output",items},
+                                {"usage",{{"input_tokens",outcome.prompt_tokens},
+                                          {"input_tokens_details",{{"cached_tokens",0}}},
+                                          {"output_tokens",outcome.output_tokens},
+                                          {"output_tokens_details",{{"reasoning_tokens",0}}},
+                                          {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}}}}});
                     } catch(const Runtime::ClientGone&) {
                         return false;
                     } catch(const std::exception& e) {
-                        ev({{"type","error"},{"error",{{"type","invalid_request_error"},{"message",e.what()}}}});
+                        // codex P3: an engine failure mid-stream must not
+                        // leave codex holding an unterminated item lifecycle
+                        // over a 200 stream. Close any open item (the
+                        // flushers emit the done triplet; no-ops when
+                        // nothing is open — a pending tool buffer is dropped
+                        // as unreliable), keep the first-class api_error
+                        // event (Anthropic-stream precedent), then end the
+                        // turn with the Responses-spec failure terminator
+                        // carrying the partial output. Weak gate, recorded in
+                        // the plan: no forced-failure failpoint on this path.
+                        try { if(!think.empty()) flush_think(); flush_text(); } catch(...) {}
+                        ev({{"type","error"},{"error",{{"type","api_error"},{"message",e.what()}}}});
+                        ev({{"type","response.failed"},
+                            {"response",{{"id",resp_id},{"object","response"},{"status","failed"},
+                                {"last_error",{{"code","server_error"},{"message",e.what()}}},
+                                {"output",items}}}});
                     }
                     sink.done();
                     return true;

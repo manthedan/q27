@@ -1,0 +1,2201 @@
+OpenAI Codex v0.144.0
+--------
+workdir: /Users/macthedan/projects/q27
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019f718b-1fb9-7cd2-bb50-d18da3136be1
+--------
+user
+Review the uncommitted changes in src/metal/metal_server.cpp AND src/api_common.h (git diff; ignore q27_kernels.metal/metal_backend.mm/README). FIX-VERIFICATION round 5 on the /v1/responses port. Round 4 accepted the repair-gating but found one P2: flush_tool folding malformed raw into the shared text buffer meant a later recovery's tx=pre could drop prose that followed the wrapper.
+
+The round-5 fix: flush_tool(bool final_turn) now commits malformed raw as its OWN segment immediately (text+=c.raw; flush_text(final_turn)) — recovery still runs over it (round-3 hole stays closed), but later prose accumulates in separate segments where tx=pre cannot reach it. route calls flush_tool(false) at transitions; the end-of-turn call passes true so a max_tokens-truncated wrapper still gets the repair path. The remaining tx=pre boundary (prose after a recovered call within one NATURAL segment) is documented as the house convention, identical in the chat/Anthropic handlers.
+
+Verify with file:line: (1) no path from model output to committed items can now drop text that followed a malformed wrapper; (2) item order is model-order for: wrapped-call → text, wrapped-call → think, malformed → malformed, malformed(at max_tokens truncation, end-of-turn) → repair rescue; (3) the fold cannot double-flush (end-of-turn sequence flush_tool(true) then flush_text(true)); (4) definition order (flush_tool references flush_text — both defined before route); (5) the natural-segment tx=pre coarseness is genuinely identical to the chat/Anthropic convention (check lines ~1371 and ~1552). P1/P2/P3 verdicts.
+
+codex
+I’ll review the relevant diffs only, then trace the response assembly paths around `flush_tool`, `flush_text`, and the chat/Anthropic comparisons. Since this is a review request, I’ll stay in findings mode and only report issues with file/line evidence.
+exec
+/bin/zsh -lc 'rg -n "flush_tool|flush_text|tx=pre|pre" src/metal/metal_server.cpp src/api_common.h' in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+src/api_common.h:3://   system preamble lists tools as JSON inside <tools>...</tools>
+src/api_common.h:17:#include "tool_preamble.h"
+src/api_common.h:28:// prefix, holding back an incomplete trailing sequence until its
+src/api_common.h:134:// Tools preamble, verbatim structure from the chat template. `tools` entries
+src/api_common.h:136:// Claude Code (<= 2.1.1xx era) prefixes its system prompt with
+src/api_common.h:139:// first bytes of the prompt mutate per turn -- which voids the P8 stable-prefix
+src/api_common.h:141:// under Claude Code: 126K-token full re-prefill, ~72s, on every turn). Pin the
+src/api_common.h:156:// strip_ctrl + tools_preamble moved to tool_preamble.h (shared with the
+src/api_common.h:159:// Build the full ChatML prompt string. If tools are present they are merged
+src/api_common.h:165:// everything after (assistant open + think prefill) is per-turn volatile.
+src/api_common.h:182:        p += "<|im_start|>system\n" + tools_preamble(tools);
+src/api_common.h:224:// Anthropic tools -> qwen tools json for the system preamble (the
+src/api_common.h:304:// no double-encode unwrap); the wrapper-less bare-scan recovery is suppressed
+src/api_common.h:305:// entirely. Suppressed rescues are logged ([q27-strict]) so a campaign can
+src/api_common.h:319:        // arguments value. Anything else stays text (rescue suppressed).
+src/api_common.h:361:// success: prefix = text before the JSON, suffix = text after it (typically
+src/api_common.h:428:    // all present in ARGS could never validate as a call -- eliminate those;
+src/api_common.h:483:// typically batched, behind a dangling {"name": prefix line, with a stray
+src/api_common.h:605:// (codex P2, 2026-07-17). prefix = text before the first recovered call.
+src/api_common.h:608:                                                   std::string* prefix,
+src/api_common.h:615:        // campaign can count suppressed rescues against the tolerant leg.
+src/api_common.h:616:        if (prefix) *prefix = "";
+src/api_common.h:713:            // model prepends a bare {"name": before a batch of VALID calls ("read all files
+src/api_common.h:776:    if (prefix) {
+src/api_common.h:781:        // drop a dangling {"name": opener fragment (mode-6/8 hybrid prefix line)
+src/api_common.h:784:        *prefix = p;
+src/api_common.h:804:        // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
+src/api_common.h:813:inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* prefix,
+src/api_common.h:815:    auto v = parse_bare_tool_calls(text_in, prefix, tools);
+src/metal/metal_server.cpp:4:#include "../tool_preamble.h"
+src/metal/metal_server.cpp:61:// preamble into the system message, replacing the manual merge that lived
+src/metal/metal_server.cpp:91:                // an object too (some clients send it pre-parsed).
+src/metal/metal_server.cpp:121:// Context preflight ceiling: the run()-level throws stay as backstops, but
+src/metal/metal_server.cpp:175:    bool prepare_insert(const std::vector<uint32_t>& tokens,bool mtp) {
+src/metal/metal_server.cpp:195:// Disk snapshot store (prefix snapshots Phase 2, docs/plans/2026-07-16-
+src/metal/metal_server.cpp:196:// prefix-snapshots.md): token-prefix keyed — the server tokenizes every
+src/metal/metal_server.cpp:197:// prompt itself, so "the snapshot's stored token ids are a prefix of this
+src/metal/metal_server.cpp:201:// bytes, so an identical prefix overwrites rather than duplicates. LRU by
+src/metal/metal_server.cpp:206:    // tag = artifact/KV identity prefix baked into every filename, so one
+src/metal/metal_server.cpp:215:    // Longest stored token prefix of `prompt`. Full-length matches whose
+src/metal/metal_server.cpp:216:    // logits are stale (mid-prefill saves) are skipped: state would be
+src/metal/metal_server.cpp:229:            // Saves record exactly the encoded prefix; anything else is not
+src/metal/metal_server.cpp:284:    // prefix cache, scheduling phase, and constraint device-pool map (each
+src/metal/metal_server.cpp:344:    // the ticket spread doubles as the queue bound.
+src/metal/metal_server.cpp:354:    // or prefill (2026-07-17-abandoned-request-cancellation.md) —
+src/metal/metal_server.cpp:359:    std::atomic<uint64_t> cancelled_queue{0}, cancelled_prefill{0};
+src/metal/metal_server.cpp:374:    // arrival (idle/prefill/decode/verify), guarded by route_. Two distinct
+src/metal/metal_server.cpp:411:            fprintf(stderr,"q27 Metal server: KV fp16 exception cells active (Q27_METAL_KV_FP16_CELLS); side caches ride prefix/disk snapshots (v2)\n");
+src/metal/metal_server.cpp:434:                               +q27::MetalEngine::fixed_state_bytes(e0.chunked_prefill())
+src/metal/metal_server.cpp:473:            // Full 160-bit identity in the tag: a truncated prefix could
+src/metal/metal_server.cpp:479:            // request); env-unset tags are unchanged so pre-v2 snapshot
+src/metal/metal_server.cpp:496:            if(!slots[0]->engine.chunked_prefill())
+src/metal/metal_server.cpp:497:                fprintf(stderr,"prefix-snapshots: WARNING — no chunked prefill on this device; "
+src/metal/metal_server.cpp:499:            // Auto-snapshot threshold (2026-07-17 T2 prefill finding,
+src/metal/metal_server.cpp:500:            // docs/plans/2026-07-17-t2-prefill-throughput.md): chunked
+src/metal/metal_server.cpp:501:            // prefill is compute-mature at ~28-40 tok/s on the M4, so a
+src/metal/metal_server.cpp:506:            // covered-prefix skip and LRU budget bound the write traffic.
+src/metal/metal_server.cpp:516:            fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB, auto>=%zu tokens, tag %s\n",
+src/metal/metal_server.cpp:529:            case Slot::Phase::Prefill: return "prefill";
+src/metal/metal_server.cpp:538:    // competing traffic is itself prefilling, 12 when a latency-sensitive
+src/metal/metal_server.cpp:560:        size_t prefix_hit=0;
+src/metal/metal_server.cpp:572:    // Multislot Phase 1: a request claims an idle slot (engine + prefix
+src/metal/metal_server.cpp:574:    // prefill chunk at the policy width, one decode step, or one MTP
+src/metal/metal_server.cpp:600:            // every wait predicate), or stale cancels would falsely 503 new
+src/metal/metal_server.cpp:698:            // The deeper prefix wins across tiers: a short in-memory entry
+src/metal/metal_server.cpp:723:        // prefill-chunk boundary. Reached exactly by capping one chunk's
+src/metal/metal_server.cpp:724:        // width; skipped when the restored prefix already covers it.
+src/metal/metal_server.cpp:731:        // ~1.3 GB write (+~15 s under the lease) per unique prefix — the
+src/metal/metal_server.cpp:733:        // repeated agent prefixes, where the trade wins; churn-sensitive
+src/metal/metal_server.cpp:738:        if(snap_wanted && !mtp && snapstore.enabled() && engine.chunked_prefill() &&
+src/metal/metal_server.cpp:745:            if(mtp || !engine.chunked_prefill()) {
+src/metal/metal_server.cpp:761:                    // disk instead of re-paying the whole prefill cold
+src/metal/metal_server.cpp:778:                        cancelled_prefill++;
+src/metal/metal_server.cpp:784:                        // prefill_chunk takes 2..96 tokens: a one-token gap
+src/metal/metal_server.cpp:792:                    engine.prefill_chunk(suffix.data()+i,take);
+src/metal/metal_server.cpp:795:                        // Mid-prefill state is exact but the logits row is
+src/metal/metal_server.cpp:806:                // mirrors MetalEngine::prefill()'s tail exactly.
+src/metal/metal_server.cpp:823:        // prepare_insert can release an evicted snapshot's GPU buffers, so it
+src/metal/metal_server.cpp:827:            if(slot->cache.prepare_insert(prompt,mtp))
+src/metal/metal_server.cpp:901:        } else if(mtp && engine.chunked_prefill()) {
+src/metal/metal_server.cpp:924:        } else if(sfx && engine.chunked_prefill()) {
+src/metal/metal_server.cpp:927:            // prompt — including any restored prefix, which never reached
+src/metal/metal_server.cpp:953:                    // forced the constrained path's pre-lease prewarm.
+src/metal/metal_server.cpp:1000:                    // cache against a concurrent slot's prewarm above.
+src/metal/metal_server.cpp:1008:                    // under the previous state's legal set.
+src/metal/metal_server.cpp:1015:        // and any text held back as a possible stop-sequence prefix is real
+src/metal/metal_server.cpp:1028:        out.prefix_hit=hit;
+src/metal/metal_server.cpp:1073:// client values always win; the context preflight still clamps to the
+src/metal/metal_server.cpp:1099:        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N]\n",argv[0]);
+src/metal/metal_server.cpp:1104:        uint32_t port=8080,context=8192,width=0,suffix_width=0,prefix_entries=1,slot_count=2;
+src/metal/metal_server.cpp:1113:            else if(arg=="--prefix-entries" && i+1<argc) prefix_entries=parse_u32(argv[++i],"--prefix-entries");
+src/metal/metal_server.cpp:1127:        if(prefix_entries>4096) throw std::runtime_error("--prefix-entries must be 0..4096");
+src/metal/metal_server.cpp:1135:        Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count);
+src/metal/metal_server.cpp:1177:                                               {"prefill",(uint64_t)runtime.cancelled_prefill}}}});
+src/metal/metal_server.cpp:1195:        // prefill) and for non-streaming generation. The socket fd rides
+src/metal/metal_server.cpp:1241:        // Shared context preflight: each endpoint refuses an oversized prompt
+src/metal/metal_server.cpp:1277:                    {"q27_prefix_hit",outcome.prefix_hit}});
+src/metal/metal_server.cpp:1370:                    std::string pre;
+src/metal/metal_server.cpp:1371:                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,&tools);
+src/metal/metal_server.cpp:1374:                        tx=pre;
+src/metal/metal_server.cpp:1393:                    {"q27_prefix_hit",outcome.prefix_hit}});
+src/metal/metal_server.cpp:1449:                            std::string pre;
+src/metal/metal_server.cpp:1450:                            auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,&tools);
+src/metal/metal_server.cpp:1485:        // estimates blind. Count = exactly what /v1/messages prefills for the
+src/metal/metal_server.cpp:1551:                    std::string pre;
+src/metal/metal_server.cpp:1552:                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,&tools);
+src/metal/metal_server.cpp:1555:                        tx=pre;
+src/metal/metal_server.cpp:1573:                    {"q27_prefix_hit",outcome.prefix_hit}};
+src/metal/metal_server.cpp:1645:                        // suppress pure-whitespace text before/between blocks
+src/metal/metal_server.cpp:1675:                            std::string pre;
+src/metal/metal_server.cpp:1676:                            auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,&tools);
+src/metal/metal_server.cpp:1713:        // preamble hack), custom freeform tools bridged to one-string-param
+src/metal/metal_server.cpp:1787:            // endpoint, preserved): tool declarations alone must not
+src/metal/metal_server.cpp:1829:                auto flush_text=[&](bool final_turn){
+src/metal/metal_server.cpp:1838:                    // calls for it. tx=pre convention (chat/Anthropic
+src/metal/metal_server.cpp:1839:                    // handlers): the pre-call prose message precedes the
+src/metal/metal_server.cpp:1849:                    // tx=pre — parse_bare_tool_calls reports no suffix.
+src/metal/metal_server.cpp:1850:                    std::string pre;
+src/metal/metal_server.cpp:1851:                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,
+src/metal/metal_server.cpp:1856:                        tx=pre;
+src/metal/metal_server.cpp:1865:                auto flush_tool=[&](bool final_turn){
+src/metal/metal_server.cpp:1872:                        // the tx=pre trim can never drop prose that followed
+src/metal/metal_server.cpp:1875:                        flush_text(final_turn); return;
+src/metal/metal_server.cpp:1883:                        if(!text.empty()) flush_text(false);
+src/metal/metal_server.cpp:1886:                    if(!tool_buf.empty()) flush_tool(false);
+src/metal/metal_server.cpp:1892:                    if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(false); think+=t; return; }
+src/metal/metal_server.cpp:1903:                if(!tool_buf.empty()) flush_tool(true);
+src/metal/metal_server.cpp:1905:                flush_text(true);
+src/metal/metal_server.cpp:1912:                    {"output_text",all_text}, // Metal convenience field, pre-port consumers
+src/metal/metal_server.cpp:1916:                    {"q27_prefix_hit",outcome.prefix_hit}});
+src/metal/metal_server.cpp:1957:                        auto flush_text=[&]{
+src/metal/metal_server.cpp:1982:                        auto flush_tool=[&]{
+src/metal/metal_server.cpp:1995:                                if(!text.empty()) flush_text();
+src/metal/metal_server.cpp:1998:                            if(!tool_buf.empty()) flush_tool();
+src/metal/metal_server.cpp:2004:                            if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(); think+=t; return; }
+src/metal/metal_server.cpp:2025:                        if(!tool_buf.empty()) flush_tool();
+src/metal/metal_server.cpp:2027:                        flush_text();
+src/metal/metal_server.cpp:2029:                            std::string pre;
+src/metal/metal_server.cpp:2030:                            auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,
+src/metal/metal_server.cpp:2053:                        // event (Anthropic-stream precedent), then end the
+src/metal/metal_server.cpp:2057:                        try { if(!think.empty()) flush_think(); flush_text(); } catch(...) {}
+
+exec
+/bin/zsh -lc 'git status --short -- src/metal/metal_server.cpp src/api_common.h src/metal/q27_kernels.metal src/metal/metal_backend.mm README*' in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-lD1fV6wd' (errno=Operation not permitted)
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-WDExsz51' (errno=Operation not permitted)
+ M README.md
+ M src/api_common.h
+ M src/metal/metal_backend.mm
+ M src/metal/metal_server.cpp
+ M src/metal/q27_kernels.metal
+
+exec
+/bin/zsh -lc 'git diff -- src/metal/metal_server.cpp src/api_common.h' in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-SpmFfNOW' (errno=Operation not permitted)
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-iWwws1eH' (errno=Operation not permitted)
+diff --git a/src/api_common.h b/src/api_common.h
+index b30dac4..c12e395 100644
+--- a/src/api_common.h
++++ b/src/api_common.h
+@@ -598,11 +598,16 @@ inline void scan_namedropped(const std::string& text, const json* tools,
+ // objects anywhere in the text are collected (skipping unbalanced wrappers
+ // like the literal {"tool_call": opener, which nets +1 depth per blob and
+ // never closes); a trailing truncated {"name" candidate gets framing repair
+-// (close open string, strip junk tags, close braces). prefix = text before
+-// the first recovered call. `tools` (optional) enables mode-6 name inference.
++// ONLY when allow_trunc_repair (the default) — repair is semantically an
++// end-of-turn rescue, so callers scanning mid-turn segments (responses
++// per-segment recovery) pass false: a segment boundary is not a truncation
++// and inventing framing there false-positives prose fragments into calls
++// (codex P2, 2026-07-17). prefix = text before the first recovered call.
++// `tools` (optional) enables mode-6 name inference.
+ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
+                                                    std::string* prefix,
+-                                                   const json* tools = nullptr) {
++                                                   const json* tools = nullptr,
++                                                   bool allow_trunc_repair = true) {
+     std::vector<ToolCall> out;
+     if (tool_strict()) {
+         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
+@@ -660,9 +665,10 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
+         }
+         if (end == std::string::npos) {
+             // unbalanced to EOF: repair only a {"name" candidate (truncated
+-            // final call); otherwise keep scanning inner objects. `san` holds
++            // final call), and only when the caller guarantees the buffer is
++            // end-of-turn; otherwise keep scanning inner objects. `san` holds
+             // the sanitized remainder (scan ran to EOF).
+-            if (san.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
++            if (!allow_trunc_repair || san.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
+             std::string r = san;
+             while (true) {
+                 size_t e2 = r.find_last_not_of(" \t\r\n");
+diff --git a/src/metal/metal_server.cpp b/src/metal/metal_server.cpp
+index 72a83cd..1b1ecf1 100644
+--- a/src/metal/metal_server.cpp
++++ b/src/metal/metal_server.cpp
+@@ -357,6 +357,13 @@ struct Runtime {
+     // stream providers catch it by name and return without writing.
+     struct ClientGone {};
+     std::atomic<uint64_t> cancelled_queue{0}, cancelled_prefill{0};
++    // Engine failures during generation are server bugs, not request bugs:
++    // Anthropic defines api_error (500) for them, and 400 is fatal-class to
++    // codex while 500 retries (residue round 2026-07-17-responses-parity-
++    // residue.md). Handlers wrap ONLY the run() call — parse/validation/
++    // overflow all throw before it. Known coarseness, recorded: the rare
++    // post-restore "prompt exceeds context" inside run() rides this class.
++    struct EngineError : std::runtime_error { using std::runtime_error::runtime_error; };
+     // Mid-queue cancelled tickets awaiting their in-order skip (route_).
+     std::set<uint64_t> cancelled_tickets_;
+     // Innermost lock: guards the shared host-side ToolMaskCache (mask
+@@ -1180,6 +1187,7 @@ int main(int argc,char** argv) {
+                 // empty 200 (codex P2 on this round).
+                 catch(const Runtime::ClientGone&) { response.status=499; }
+                 catch(const Runtime::ServerOverloaded& e) { json_response(response,{{"error",{{"message",e.what()},{"type","overloaded_error"}}}},503); }
++                catch(const Runtime::EngineError& e) { json_response(response,{{"error",{{"message",e.what()},{"type","api_error"}}}},500); }
+                 catch(const std::exception& e) { json_response(response,{{"error",{{"message",e.what()},{"type","invalid_request_error"}}}},400); }
+             };
+         };
+@@ -1189,6 +1197,16 @@ int main(int argc,char** argv) {
+         auto socket_live=[](socket_t sock){
+             return [sock]{ return httplib::detail::is_socket_alive(sock); };
+         };
++        // Wraps ONLY a handler's run() call: engine failures reclassify as
++        // EngineError (api_error 500); the cancellation and overload types
++        // pass through untouched.
++        auto engine_guard=[](auto&& fn)->decltype(fn()) {
++            try { return fn(); }
++            catch(const Runtime::ClientGone&) { throw; }
++            catch(const Runtime::ServerOverloaded&) { throw; }
++            catch(const Runtime::EngineError&) { throw; }
++            catch(const std::exception& e) { throw Runtime::EngineError(e.what()); }
++        };
+         // Anthropic endpoints answer in Anthropic's error envelope
+         // ({"type":"error","error":{...}} — the SDK inside Claude Code reads
+         // error.message from it), not the OpenAI shape (codex P2 on this
+@@ -1205,6 +1223,10 @@ int main(int argc,char** argv) {
+                 try { handler(body,response,request.sock); }
+                 // 499 as in `guarded` (codex P2): never an empty 200.
+                 catch(const Runtime::ClientGone&) { response.status=499; }
++                catch(const Runtime::EngineError& e) {
++                    response.status=500;
++                    response.set_content(q27::anthropic_error_json("api_error",e.what()),"application/json");
++                }
+                 catch(const Runtime::ServerOverloaded& e) {
+                     response.status=503;
+                     response.set_content(q27::anthropic_error_json("overloaded_error",e.what()),"application/json");
+@@ -1243,10 +1265,11 @@ int main(int argc,char** argv) {
+             }
+             if(!wants_stream(body)) {
+                 std::string text; size_t probe=0;
+-                auto outcome=runtime.run(ids,n,sampling,stops,
+-                    [&](const std::string& piece){ text+=piece;
+-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+-                    tool_names_from(body),body.value("snapshot",false),socket_live(sock));
++                auto outcome=engine_guard([&]{
++                    return runtime.run(ids,n,sampling,stops,
++                        [&](const std::string& piece){ text+=piece;
++                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
++                        tool_names_from(body),body.value("snapshot",false),socket_live(sock)); });
+                 json_response(r,{{"id",id},{"object","text_completion"},{"created",created},{"model","q27-metal"},
+                     {"choices",json::array({{{"index",0},{"text",text},{"finish_reason",openai_finish(outcome.finish)}}})},
+                     {"usage",{{"prompt_tokens",outcome.prompt_tokens},{"completion_tokens",outcome.output_tokens},
+@@ -1328,10 +1351,11 @@ int main(int argc,char** argv) {
+                     (ch==q27::StreamSplitter::THINK?think_buf:text)+=t;
+                 };
+                 size_t probe=0;
+-                auto outcome=runtime.run(ids,n,sampling,stops,
+-                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+-                    tnames,snap_hint,socket_live(sock));
++                auto outcome=engine_guard([&]{
++                    return runtime.run(ids,n,sampling,stops,
++                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
++                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
++                        tnames,snap_hint,socket_live(sock)); });
+                 for(auto& [ch,t]:sp.flush()) route(ch,t);
+                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                 std::string th=q27::strip_ws2(think_buf),tx=q27::strip_ws2(text);
+@@ -1506,10 +1530,11 @@ int main(int argc,char** argv) {
+                     (ch==q27::StreamSplitter::THINK?think:text)+=t;
+                 };
+                 size_t probe=0;
+-                auto outcome=runtime.run(ids,n,sampling,stops,
+-                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+-                    tnames,snap_hint,socket_live(sock));
++                auto outcome=engine_guard([&]{
++                    return runtime.run(ids,n,sampling,stops,
++                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
++                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
++                        tnames,snap_hint,socket_live(sock)); });
+                 for(auto& [ch,t]:sp.flush()) route(ch,t);
+                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                 json content=json::array();
+@@ -1682,46 +1707,95 @@ int main(int argc,char** argv) {
+         }));
+ 
+         // ---- OpenAI Responses API (/v1/responses, Codex CLI) ----
+-        // Non-streaming: output_text plus a message/output_text item. Streaming
+-        // follows src/server.cu: response.created, output_item.added(message),
+-        // content_part.added, response.output_text.delta per piece,
+-        // output_text.done, content_part.done, output_item.done,
+-        // response.completed. Codex keys off the JSON `type` field.
++        // Full CUDA port (src/server.cu:1441-1882, residue round
++        // 2026-07-17-responses-parity-residue.md): instructions/input-item
++        // mapping through the chat template (replacing the raw-text
++        // preamble hack), custom freeform tools bridged to one-string-param
++        // functions, hosted tool types skipped never rejected, and
++        // structured function_call / custom_tool_call output items with the
++        // codex 0.143 item lifecycle on the stream (an output_text.delta
++        // without an open item aborts the codex turn). Wire facts from
++        // codex-rs: the client keys off the JSON `type` field; the agent
++        // loop consumes only response.output_item.done items;
++        // response.completed{response:{id}} is the required terminator;
++        // function_call.arguments is a JSON-encoded STRING. 400 is fatal
++        // to codex, 500 retries — tolerate quirks, 500 on bugs.
+         server.Post("/v1/responses",guarded([&](const json& body,httplib::Response& r,socket_t sock){
+-            std::string input=body.contains("input")?text_content(body["input"]):"";
+-            // Validate BEFORE the preamble (codex P1): an item-array input
+-            // that text_content cannot flatten must fail loud here — a
+-            // nonempty preamble would otherwise slip past the empty-ids
+-            // check and generate from the tool declarations alone.
+-            if(input.empty()) throw std::runtime_error("input is empty");
+-            // Tools preamble parity (codex P1 on the parity-audit merge):
+-            // this endpoint feeds raw flattened text to the model (no chat
+-            // template), so without the schemas prepended the constrainer
+-            // could mask decoding toward tools the model has never seen.
+-            // Flat Responses function entries are normalized to the nested
+-            // shape tools_preamble renders on the chat/CUDA paths (codex
+-            // P2); hosted tool types are skipped, never rejected. Full
+-            // CUDA-style Responses normalization (instructions,
+-            // function_call bridging, custom tools) is a recorded follow-up.
+-            if(body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
+-                json norm=json::array();
++            const long rn=req_counter++;
++            const std::string resp_id="resp_metal_"+std::to_string(rn);
++            const std::string msg_id="msg_metal_"+std::to_string(rn);
++            // Tools: flat function entries normalized to the nested shape
++            // chatml_prompt renders; `custom` freeform tools (apply_patch)
++            // bridged; hosted types (web_search etc.) skipped.
++            json tools=json::array();
++            std::set<std::string> custom_names;
++            if(body.contains("tools") && body["tools"].is_array())
+                 for(const auto& t:body["tools"]) {
+                     if(!t.is_object()) continue;
+-                    if(t.contains("function") && t["function"].is_object()) norm.push_back(t);
+-                    else if(t.value("type","")=="function" && t.contains("name"))
+-                        norm.push_back({{"type","function"},
++                    const std::string ty=t.value("type","");
++                    if(t.contains("function") && t["function"].is_object()) tools.push_back(t);
++                    else if(ty=="function" && t.contains("name"))
++                        tools.push_back({{"type","function"},
+                             {"function",{{"name",t.value("name","")},
+                                          {"description",t.value("description","")},
+                                          {"parameters",t.contains("parameters")?t["parameters"]
+-                                                                                :json::object()}}}});
++                                                                               :json::object()}}}});
++                    else if(ty=="custom") {
++                        const std::string cn=t.value("name","");
++                        custom_names.insert(cn);
++                        tools.push_back({{"type","function"},
++                            {"function",{{"name",cn},
++                                         {"description",t.value("description","")},
++                                         {"parameters",{{"type","object"},
++                                             {"properties",{{"input",{{"type","string"},
++                                                 {"description","The complete raw input text for this tool."}}}}},
++                                             {"required",json::array({"input"})}}}}}});
++                    }
+                 }
+-                if(!norm.empty()) input=q27::tools_preamble(norm)+"\n\n"+input;
++            // input -> messages; instructions is the system prompt.
++            std::vector<q27::Msg> msgs;
++            if(body.contains("instructions") && body["instructions"].is_string())
++                msgs.push_back({"system",body["instructions"]});
++            if(body.contains("input")) {
++                if(body["input"].is_string()) msgs.push_back({"user",body["input"]});
++                else if(body["input"].is_array())
++                    for(const auto& it:body["input"]) {
++                        if(!it.is_object()) continue;
++                        const std::string ty=it.value("type","message");
++                        if(ty=="message") {
++                            std::string role=it.value("role","user");
++                            if(role=="developer") role="system";
++                            msgs.push_back({role,it.contains("content")?text_content(it["content"]):""});
++                        } else if(ty=="function_call" || ty=="custom_tool_call") {
++                            json args;
++                            if(ty=="function_call") {
++                                try { args=json::parse(it.value("arguments","{}")); }
++                                catch(...) { args=it.value("arguments",""); }
++                            } else args={{"input",it.value("input","")}};
++                            msgs.push_back({"assistant",q27::tool_call_text(it.value("name",""),args)});
++                        } else if(ty=="function_call_output" || ty=="custom_tool_call_output") {
++                            std::string out;
++                            if(it.contains("output"))
++                                out=it["output"].is_string()?it["output"].get<std::string>()
++                                                            :text_content(it["output"]);
++                            msgs.push_back({"user",q27::tool_response_text(out)});
++                        }
++                        // reasoning items in history are dropped (template behavior)
++                    }
++            }
++            // Fail-loud before the template renders (codex P1 on the old
++            // endpoint, preserved): tool declarations alone must not
++            // generate.
++            if(msgs.empty()) throw std::runtime_error("input is empty");
++            std::vector<q27::Msg> merged;
++            for(auto& m:msgs) {
++                if(!merged.empty() && merged.back().role==m.role) merged.back().content+="\n"+m.content;
++                else merged.push_back(m);
+             }
+-            auto ids=to_u32(runtime.tokenizer.encode(input));
++            auto ids=to_u32(runtime.tokenizer.encode(q27::chatml_prompt(merged,tools,true)));
+             uint32_t n=max_tokens(body,4096);
+             const q27::SamplingParams sampling=sampling_params(body);
+             const std::vector<std::string> stops=parse_stops(body,"stop");
+-            const std::string rid="resp_metal", mid="msg_metal";
+             if(ids.empty()) throw std::runtime_error("input is empty");
+             uint32_t maxp=0;
+             if(prompt_overflow(ids.size(),n,maxp)) {
+@@ -1729,62 +1803,263 @@ int main(int argc,char** argv) {
+                 json_response(r,{{"error",{{"code","context_length_exceeded"}}}},400);
+                 return;
+             }
++            const std::vector<std::string> tnames=tool_names_from(body);
++            const bool snap_hint=body.value("snapshot",false);
+             if(!wants_stream(body)) {
+-                std::string text; size_t probe=0;
+-                auto outcome=runtime.run(ids,n,sampling,stops,
+-                    [&](const std::string& piece){ text+=piece;
+-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+-                    tool_names_from(body),body.value("snapshot",false),socket_live(sock));
+-                json_response(r,{{"id",rid},{"object","response"},{"model","q27-metal"},{"status","completed"},
+-                    {"output_text",text},
+-                    {"output",json::array({{{"type","message"},{"id",mid},{"role","assistant"},{"status","completed"},
+-                        {"content",json::array({{{"type","output_text"},{"text",text},{"annotations",json::array()}}})}}})},
++                json items=json::array();
++                int tool_counter=0;
++                std::string think,text,tool_buf,text_accum;
++                auto flush_think=[&]{
++                    std::string th=q27::strip_ws2(think); think.clear();
++                    if(th.empty()) return;
++                    items.push_back({{"type","reasoning"},{"id","rs_metal_"+std::to_string(rn)},
++                        {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
++                        {"encrypted_content",nullptr}});
++                };
++                auto push_call=[&](const std::string& name,const json& args){
++                    const std::string cid="call_metal_"+std::to_string(rn)+"_"+std::to_string(tool_counter++);
++                    if(custom_names.count(name)) {
++                        std::string input=args.is_object() && args.contains("input") && args["input"].is_string()
++                                              ?args["input"].get<std::string>():args.dump();
++                        items.push_back({{"type","custom_tool_call"},{"call_id",cid},{"name",name},{"input",input}});
++                    } else
++                        items.push_back({{"type","function_call"},{"call_id",cid},{"name",name},
++                                         {"arguments",args.dump()}});
++                };
++                auto flush_text=[&](bool final_turn){
++                    std::string tx=q27::strip_ws2(text); text.clear();
++                    if(tx.empty()) return;
++                    // Wrapper-less recovery rides EVERY text commit (codex P2
++                    // round 2): a bare call completes within one segment
++                    // before any think/tool transition, so per-segment
++                    // recovery keeps coverage exact. Runs even with empty
++                    // tools: codex registers its shell tool as a hosted type
++                    // this handler skips, yet the model still emits bare
++                    // calls for it. tx=pre convention (chat/Anthropic
++                    // handlers): the pre-call prose message precedes the
++                    // recovered calls, in model output order. Truncation
++                    // repair is gated to the final end-of-turn flush (codex
++                    // P2 round 3): a mid-turn segment boundary is not a
++                    // truncation, so an incomplete call-shaped fragment
++                    // before <think>/<tool_call> stays surfaced as text
++                    // instead of being repaired into an invented call.
++                    // Recorded coarseness (house convention, identical in
++                    // the chat/Anthropic handlers): prose AFTER a recovered
++                    // call within the same natural segment is trimmed by
++                    // tx=pre — parse_bare_tool_calls reports no suffix.
++                    std::string pre;
++                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,
++                                                        tools.empty()?nullptr:&tools,
++                                                        final_turn);
++                    if(!bcs.empty()) {
++                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",bcs.size());
++                        tx=pre;
++                    }
++                    if(!tx.empty())
++                        items.push_back({{"type","message"},{"id",msg_id},{"role","assistant"},
++                            {"status","completed"},
++                            {"content",json::array({{{"type","output_text"},{"text",tx},
++                                                     {"annotations",json::array()}}})}});
++                    for(auto& bc:bcs) push_call(bc.name,bc.arguments);
++                };
++                auto flush_tool=[&](bool final_turn){
++                    auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
++                    if(!c.ok) { // malformed: commit the raw as its OWN text
++                        // segment right now (chat/Anthropic recovery
++                        // convention): recovery runs over it, so a
++                        // recoverable nested call is not lost as raw text
++                        // (codex P2 round 3) — and committing it alone means
++                        // the tx=pre trim can never drop prose that followed
++                        // the wrapper in the model's output (codex P2 round 4).
++                        text+=(text.empty()?"":"\n")+c.raw;
++                        flush_text(final_turn); return;
++                    }
++                    push_call(c.name,c.arguments);
++                };
++                q27::StreamSplitter sp;
++                auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
++                    if(ch==q27::StreamSplitter::TOOL) {
++                        if(!think.empty()) flush_think();
++                        if(!text.empty()) flush_text(false);
++                        tool_buf+=t; return;
++                    }
++                    if(!tool_buf.empty()) flush_tool(false);
++                    // codex P2: close pending text BEFORE think accumulates —
++                    // same transition rule as TOOL, else a text→think→text
++                    // turn interleaves items (reasoning pushed ahead of the
++                    // message it followed) and the stream twin corrupts
++                    // output_index.
++                    if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(false); think+=t; return; }
++                    if(!think.empty()) flush_think();
++                    text+=t; text_accum+=t;
++                };
++                size_t probe=0;
++                auto outcome=engine_guard([&]{
++                    return runtime.run(ids,n,sampling,stops,
++                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
++                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
++                        tnames,snap_hint,socket_live(sock)); });
++                for(auto& [ch,t]:sp.flush()) route(ch,t);
++                if(!tool_buf.empty()) flush_tool(true);
++                flush_think();
++                flush_text(true);
++                std::string all_text;
++                for(const auto& it:items)
++                    if(it.value("type","")=="message" && it.contains("content"))
++                        for(const auto& c:it["content"])
++                            if(c.value("type","")=="output_text") all_text+=c.value("text","");
++                json_response(r,{{"id",resp_id},{"object","response"},{"model","q27-metal"},{"status","completed"},
++                    {"output_text",all_text}, // Metal convenience field, pre-port consumers
++                    {"output",items},
+                     {"usage",{{"input_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
+                               {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}},
+                     {"q27_prefix_hit",outcome.prefix_hit}});
+                 return;
+             }
+             r.set_header("Content-Type","text/event-stream");
+-            const std::vector<std::string> tnames=tool_names_from(body);
+-            const bool snap_hint=body.value("snapshot",false);
+             r.set_chunked_content_provider("text/event-stream",
+-                [&runtime,ids,n,sampling,stops,rid,mid,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
+-                    auto ev=[&](const json& j){ std::string s=q27::sse_event(j.value("type",std::string("x")),j); return sink.write(s.data(),s.size()); };
+-                    try {
+-                        // Gate the run on the opening writes and probe the
+-                        // socket on empty pieces, so a disconnected client
+-                        // cannot hold the engine through the token cap.
+-                        if(!ev({{"type","response.created"},{"response",{{"id",rid},{"object","response"},{"status","in_progress"}}}}) ||
+-                           !ev({{"type","response.output_item.added"},{"output_index",0},
+-                               {"item",{{"type","message"},{"id",mid},{"role","assistant"},{"status","in_progress"},{"content",json::array()}}}}) ||
+-                           !ev({{"type","response.content_part.added"},{"item_id",mid},{"output_index",0},{"content_index",0},
+-                               {"part",{{"type","output_text"},{"text",""},{"annotations",json::array()}}}})) {
+-                            sink.done();
+-                            return true;
+-                        }
+-                        std::string text;
+-                        auto emit=[&](const std::string& piece)->bool {
+-                            text+=piece;
+-                            if(piece.empty()) return sink.is_writable();
+-                            return ev({{"type","response.output_text.delta"},{"item_id",mid},
+-                                {"output_index",0},{"content_index",0},{"delta",piece}});
++                [&runtime,ids,n,sampling,stops,rn,resp_id,msg_id,tools,custom_names,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
++                    bool alive=true;
++                    auto ev=[&](const json& j){
++                        std::string s=q27::sse_event(j.value("type",std::string("x")),j);
++                        if(!sink.write(s.data(),s.size())) alive=false;
++                        return alive;
++                    };
++                    // codex P3: item-lifecycle state + machinery hoisted
++                    // above the try so the engine-failure path below can
++                    // still close an open item and terminate the turn.
++                    json items=json::array();
++                    int tool_counter=0,out_index=0,msg_index=-1;
++                    std::string think,text,tool_buf,text_accum;
++                        auto item_done=[&](const json& it){
++                            ev({{"type","response.output_item.done"},{"output_index",out_index++},{"item",it}});
++                            items.push_back(it);
+                         };
+-                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
++                        auto flush_think=[&]{
++                            std::string th=q27::strip_ws2(think); think.clear();
++                            if(th.empty()) return;
++                            item_done({{"type","reasoning"},{"id","rs_metal_"+std::to_string(rn)},
++                                {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
++                                {"encrypted_content",nullptr}});
++                        };
++                        // codex 0.143 item lifecycle: a delta needs an OPEN item
++                        // (added + content_part.added), else the turn aborts.
++                        auto open_text=[&]{
++                            if(msg_index>=0) return;
++                            msg_index=out_index;
++                            ev({{"type","response.output_item.added"},{"output_index",msg_index},
++                                {"item",{{"type","message"},{"id",msg_id},{"role","assistant"},
++                                         {"status","in_progress"},{"content",json::array()}}}});
++                            ev({{"type","response.content_part.added"},{"item_id",msg_id},
++                                {"output_index",msg_index},{"content_index",0},
++                                {"part",{{"type","output_text"},{"text",""},{"annotations",json::array()}}}});
++                        };
++                        auto flush_text=[&]{
++                            if(msg_index<0) { text.clear(); return; }
++                            std::string tx=q27::strip_ws2(text); text.clear();
++                            ev({{"type","response.output_text.done"},{"item_id",msg_id},
++                                {"output_index",msg_index},{"content_index",0},{"text",tx}});
++                            ev({{"type","response.content_part.done"},{"item_id",msg_id},
++                                {"output_index",msg_index},{"content_index",0},
++                                {"part",{{"type","output_text"},{"text",tx},{"annotations",json::array()}}}});
++                            json it={{"type","message"},{"id",msg_id},{"role","assistant"},{"status","completed"},
++                                {"content",json::array({{{"type","output_text"},{"text",tx},
++                                                         {"annotations",json::array()}}})}};
++                            ev({{"type","response.output_item.done"},{"output_index",msg_index},{"item",it}});
++                            items.push_back(it);
++                            out_index=msg_index+1; msg_index=-1;
++                        };
++                        auto push_call=[&](const std::string& name,const json& args){
++                            const std::string cid="call_metal_"+std::to_string(rn)+"_"+std::to_string(tool_counter++);
++                            if(custom_names.count(name)) {
++                                std::string input=args.is_object() && args.contains("input") && args["input"].is_string()
++                                                      ?args["input"].get<std::string>():args.dump();
++                                item_done({{"type","custom_tool_call"},{"call_id",cid},{"name",name},{"input",input}});
++                            } else
++                                item_done({{"type","function_call"},{"call_id",cid},{"name",name},
++                                           {"arguments",args.dump()}});
++                        };
++                        auto flush_tool=[&]{
++                            auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
++                            if(!c.ok) {
++                                item_done({{"type","message"},{"role","assistant"},{"status","completed"},
++                                    {"content",json::array({{{"type","output_text"},{"text",c.raw},
++                                                             {"annotations",json::array()}}})}});
++                                return;
++                            }
++                            push_call(c.name,c.arguments);
++                        };
++                        auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
++                            if(ch==q27::StreamSplitter::TOOL) {
++                                if(!think.empty()) flush_think();
++                                if(!text.empty()) flush_text();
++                                tool_buf+=t; return;
++                            }
++                            if(!tool_buf.empty()) flush_tool();
++                            // codex P2: a THINK transition must close an open
++                            // text item first (same rule as TOOL) — else
++                            // flush_think's item_done consumes the still-open
++                            // message's output_index and the done events
++                            // duplicate/reorder indices.
++                            if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(); think+=t; return; }
++                            if(!think.empty()) flush_think();
++                            if(msg_index<0 && text.empty() && q27::strip_ws2(t).empty()) return;
++                            open_text();
++                            text+=t; text_accum+=t;
++                            ev({{"type","response.output_text.delta"},{"item_id",msg_id},
++                                {"output_index",msg_index},{"content_index",0},{"delta",t}});
++                        };
++                        try {
++                        if(!ev({{"type","response.created"},
++                                {"response",{{"id",resp_id},{"object","response"},{"status","in_progress"}}}})) {
++                            sink.done(); return true;
++                        }
++                        q27::StreamSplitter sp;
++                        auto outcome=runtime.run(ids,n,sampling,stops,
++                            [&](const std::string& piece)->bool {
++                                for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
++                                return alive && sink.is_writable();
++                            },tnames,snap_hint,
+                             [sock]{ return httplib::detail::is_socket_alive(sock); });
+-                        ev({{"type","response.output_text.done"},{"item_id",mid},{"output_index",0},{"content_index",0},{"text",text}});
+-                        ev({{"type","response.content_part.done"},{"item_id",mid},{"output_index",0},{"content_index",0},
+-                            {"part",{{"type","output_text"},{"text",text},{"annotations",json::array()}}}});
+-                        json item={{"type","message"},{"id",mid},{"role","assistant"},{"status","completed"},
+-                            {"content",json::array({{{"type","output_text"},{"text",text},{"annotations",json::array()}}})}};
+-                        ev({{"type","response.output_item.done"},{"output_index",0},{"item",item}});
+-                        ev({{"type","response.completed"},{"response",{{"id",rid},{"object","response"},{"status","completed"},
+-                            {"output",json::array({item})},
+-                            {"usage",{{"input_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
+-                                      {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}}}}});
++                        for(auto& [ch,t]:sp.flush()) route(ch,t);
++                        if(!tool_buf.empty()) flush_tool();
++                        flush_think();
++                        flush_text();
++                        { // bare-call recovery even with empty tools (CUDA comment)
++                            std::string pre;
++                            auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,
++                                                                tools.empty()?nullptr:&tools);
++                            if(!bcs.empty())
++                                fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",bcs.size());
++                            for(auto& bc:bcs) push_call(bc.name,bc.arguments);
++                        }
++                        ev({{"type","response.completed"},
++                            {"response",{{"id",resp_id},{"object","response"},{"status","completed"},
++                                {"output",items},
++                                {"usage",{{"input_tokens",outcome.prompt_tokens},
++                                          {"input_tokens_details",{{"cached_tokens",0}}},
++                                          {"output_tokens",outcome.output_tokens},
++                                          {"output_tokens_details",{{"reasoning_tokens",0}}},
++                                          {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}}}}});
+                     } catch(const Runtime::ClientGone&) {
+                         return false;
+                     } catch(const std::exception& e) {
+-                        ev({{"type","error"},{"error",{{"type","invalid_request_error"},{"message",e.what()}}}});
++                        // codex P3: an engine failure mid-stream must not
++                        // leave codex holding an unterminated item lifecycle
++                        // over a 200 stream. Close any open item (the
++                        // flushers emit the done triplet; no-ops when
++                        // nothing is open — a pending tool buffer is dropped
++                        // as unreliable), keep the first-class api_error
++                        // event (Anthropic-stream precedent), then end the
++                        // turn with the Responses-spec failure terminator
++                        // carrying the partial output. Weak gate, recorded in
++                        // the plan: no forced-failure failpoint on this path.
++                        try { if(!think.empty()) flush_think(); flush_text(); } catch(...) {}
++                        ev({{"type","error"},{"error",{{"type","api_error"},{"message",e.what()}}}});
++                        ev({{"type","response.failed"},
++                            {"response",{{"id",resp_id},{"object","response"},{"status","failed"},
++                                {"last_error",{{"code","server_error"},{"message",e.what()}}},
++                                {"output",items}}}});
+                     }
+                     sink.done();
+                     return true;
+
+codex
+The diff is large and includes other response-port work, but the round-5 area is localized. I’m pulling exact line-numbered slices now so the verdict can cite the committed-item paths rather than restating the patch intent.
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1348,1390p'" in /Users/macthedan/projects/q27
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1528,1570p'" in /Users/macthedan/projects/q27
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1818,1910p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  1348	                        calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+  1349	                        tool_buf.clear();
+  1350	                    }
+  1351	                    (ch==q27::StreamSplitter::THINK?think_buf:text)+=t;
+  1352	                };
+  1353	                size_t probe=0;
+  1354	                auto outcome=engine_guard([&]{
+  1355	                    return runtime.run(ids,n,sampling,stops,
+  1356	                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+  1357	                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+  1358	                        tnames,snap_hint,socket_live(sock)); });
+  1359	                for(auto& [ch,t]:sp.flush()) route(ch,t);
+  1360	                if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+  1361	                std::string th=q27::strip_ws2(think_buf),tx=q27::strip_ws2(text);
+  1362	                // Malformed wrapped calls surface as text so nothing is lost;
+  1363	                // then the wrapper-less recovery chain runs over the text.
+  1364	                std::vector<q27::ToolCall> good;
+  1365	                for(auto& c:calls) {
+  1366	                    if(c.ok) good.push_back(std::move(c));
+  1367	                    else tx+=(tx.empty()?"":"\n")+c.raw;
+  1368	                }
+  1369	                if(has_tools) {
+  1370	                    std::string pre;
+  1371	                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,&tools);
+  1372	                    if(!bcs.empty()) {
+  1373	                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",bcs.size());
+  1374	                        tx=pre;
+  1375	                        for(auto& bc:bcs) good.push_back(std::move(bc));
+  1376	                    }
+  1377	                }
+  1378	                json tcs=json::array();
+  1379	                int ci=0;
+  1380	                for(auto& c:good)
+  1381	                    tcs.push_back({{"id","call_metal_"+std::to_string(rid)+"_"+std::to_string(ci++)},
+  1382	                                   {"type","function"},
+  1383	                                   {"function",{{"name",c.name},{"arguments",c.arguments.dump()}}}});
+  1384	                json message={{"role","assistant"},
+  1385	                              {"content",(!tcs.empty() && tx.empty())?json(nullptr):json(tx)}};
+  1386	                if(!th.empty()) message["reasoning_content"]=th;
+  1387	                if(!tcs.empty()) message["tool_calls"]=tcs;
+  1388	                json_response(r,{{"id",id},{"object","chat.completion"},{"created",created},{"model","q27-metal"},
+  1389	                    {"choices",json::array({{{"index",0},{"message",message},
+  1390	                        {"finish_reason",!tcs.empty()?"tool_calls":openai_finish(outcome.finish)}}})},
+
+ succeeded in 0ms:
+  1818	                };
+  1819	                auto push_call=[&](const std::string& name,const json& args){
+  1820	                    const std::string cid="call_metal_"+std::to_string(rn)+"_"+std::to_string(tool_counter++);
+  1821	                    if(custom_names.count(name)) {
+  1822	                        std::string input=args.is_object() && args.contains("input") && args["input"].is_string()
+  1823	                                              ?args["input"].get<std::string>():args.dump();
+  1824	                        items.push_back({{"type","custom_tool_call"},{"call_id",cid},{"name",name},{"input",input}});
+  1825	                    } else
+  1826	                        items.push_back({{"type","function_call"},{"call_id",cid},{"name",name},
+  1827	                                         {"arguments",args.dump()}});
+  1828	                };
+  1829	                auto flush_text=[&](bool final_turn){
+  1830	                    std::string tx=q27::strip_ws2(text); text.clear();
+  1831	                    if(tx.empty()) return;
+  1832	                    // Wrapper-less recovery rides EVERY text commit (codex P2
+  1833	                    // round 2): a bare call completes within one segment
+  1834	                    // before any think/tool transition, so per-segment
+  1835	                    // recovery keeps coverage exact. Runs even with empty
+  1836	                    // tools: codex registers its shell tool as a hosted type
+  1837	                    // this handler skips, yet the model still emits bare
+  1838	                    // calls for it. tx=pre convention (chat/Anthropic
+  1839	                    // handlers): the pre-call prose message precedes the
+  1840	                    // recovered calls, in model output order. Truncation
+  1841	                    // repair is gated to the final end-of-turn flush (codex
+  1842	                    // P2 round 3): a mid-turn segment boundary is not a
+  1843	                    // truncation, so an incomplete call-shaped fragment
+  1844	                    // before <think>/<tool_call> stays surfaced as text
+  1845	                    // instead of being repaired into an invented call.
+  1846	                    // Recorded coarseness (house convention, identical in
+  1847	                    // the chat/Anthropic handlers): prose AFTER a recovered
+  1848	                    // call within the same natural segment is trimmed by
+  1849	                    // tx=pre — parse_bare_tool_calls reports no suffix.
+  1850	                    std::string pre;
+  1851	                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,
+  1852	                                                        tools.empty()?nullptr:&tools,
+  1853	                                                        final_turn);
+  1854	                    if(!bcs.empty()) {
+  1855	                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",bcs.size());
+  1856	                        tx=pre;
+  1857	                    }
+  1858	                    if(!tx.empty())
+  1859	                        items.push_back({{"type","message"},{"id",msg_id},{"role","assistant"},
+  1860	                            {"status","completed"},
+  1861	                            {"content",json::array({{{"type","output_text"},{"text",tx},
+  1862	                                                     {"annotations",json::array()}}})}});
+  1863	                    for(auto& bc:bcs) push_call(bc.name,bc.arguments);
+  1864	                };
+  1865	                auto flush_tool=[&](bool final_turn){
+  1866	                    auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
+  1867	                    if(!c.ok) { // malformed: commit the raw as its OWN text
+  1868	                        // segment right now (chat/Anthropic recovery
+  1869	                        // convention): recovery runs over it, so a
+  1870	                        // recoverable nested call is not lost as raw text
+  1871	                        // (codex P2 round 3) — and committing it alone means
+  1872	                        // the tx=pre trim can never drop prose that followed
+  1873	                        // the wrapper in the model's output (codex P2 round 4).
+  1874	                        text+=(text.empty()?"":"\n")+c.raw;
+  1875	                        flush_text(final_turn); return;
+  1876	                    }
+  1877	                    push_call(c.name,c.arguments);
+  1878	                };
+  1879	                q27::StreamSplitter sp;
+  1880	                auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+  1881	                    if(ch==q27::StreamSplitter::TOOL) {
+  1882	                        if(!think.empty()) flush_think();
+  1883	                        if(!text.empty()) flush_text(false);
+  1884	                        tool_buf+=t; return;
+  1885	                    }
+  1886	                    if(!tool_buf.empty()) flush_tool(false);
+  1887	                    // codex P2: close pending text BEFORE think accumulates —
+  1888	                    // same transition rule as TOOL, else a text→think→text
+  1889	                    // turn interleaves items (reasoning pushed ahead of the
+  1890	                    // message it followed) and the stream twin corrupts
+  1891	                    // output_index.
+  1892	                    if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(false); think+=t; return; }
+  1893	                    if(!think.empty()) flush_think();
+  1894	                    text+=t; text_accum+=t;
+  1895	                };
+  1896	                size_t probe=0;
+  1897	                auto outcome=engine_guard([&]{
+  1898	                    return runtime.run(ids,n,sampling,stops,
+  1899	                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+  1900	                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+  1901	                        tnames,snap_hint,socket_live(sock)); });
+  1902	                for(auto& [ch,t]:sp.flush()) route(ch,t);
+  1903	                if(!tool_buf.empty()) flush_tool(true);
+  1904	                flush_think();
+  1905	                flush_text(true);
+  1906	                std::string all_text;
+  1907	                for(const auto& it:items)
+  1908	                    if(it.value("type","")=="message" && it.contains("content"))
+  1909	                        for(const auto& c:it["content"])
+  1910	                            if(c.value("type","")=="output_text") all_text+=c.value("text","");
+
+ succeeded in 0ms:
+  1528	                        tool_buf.clear();
+  1529	                    }
+  1530	                    (ch==q27::StreamSplitter::THINK?think:text)+=t;
+  1531	                };
+  1532	                size_t probe=0;
+  1533	                auto outcome=engine_guard([&]{
+  1534	                    return runtime.run(ids,n,sampling,stops,
+  1535	                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+  1536	                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+  1537	                        tnames,snap_hint,socket_live(sock)); });
+  1538	                for(auto& [ch,t]:sp.flush()) route(ch,t);
+  1539	                if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+  1540	                json content=json::array();
+  1541	                std::string th=q27::strip_ws2(think),tx=q27::strip_ws2(text);
+  1542	                if(!th.empty())
+  1543	                    content.push_back({{"type","thinking"},{"thinking",th},{"signature","q27-local"}});
+  1544	                bool any_call=false;
+  1545	                for(auto& c:calls) {
+  1546	                    if(!c.ok) tx+=(tx.empty()?"":"\n")+c.raw; // malformed: keep as text
+  1547	                    else any_call=true;
+  1548	                }
+  1549	                if(has_tools) {
+  1550	                    // wrapper-less call recovery (see parse_bare_tool_calls)
+  1551	                    std::string pre;
+  1552	                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,&tools);
+  1553	                    if(!bcs.empty()) {
+  1554	                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (nonstream)\n",bcs.size());
+  1555	                        tx=pre;
+  1556	                        for(auto& bc:bcs) calls.push_back(bc);
+  1557	                        any_call=true;
+  1558	                    }
+  1559	                }
+  1560	                if(!tx.empty() || (!any_call && th.empty()))
+  1561	                    content.push_back({{"type","text"},{"text",tx}});
+  1562	                int ci=0;
+  1563	                for(auto& c:calls)
+  1564	                    if(c.ok)
+  1565	                        content.push_back({{"type","tool_use"},
+  1566	                            {"id","toolu_metal_"+std::to_string(rid)+"_"+std::to_string(ci++)},
+  1567	                            {"name",c.name},{"input",c.arguments}});
+  1568	                json out={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
+  1569	                    {"content",content},
+  1570	                    {"stop_reason",any_call?"tool_use":anthropic_stop(outcome.finish)},
+
+exec
+/bin/zsh -lc "nl -ba src/api_common.h | sed -n '598,690p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+   598	// objects anywhere in the text are collected (skipping unbalanced wrappers
+   599	// like the literal {"tool_call": opener, which nets +1 depth per blob and
+   600	// never closes); a trailing truncated {"name" candidate gets framing repair
+   601	// ONLY when allow_trunc_repair (the default) — repair is semantically an
+   602	// end-of-turn rescue, so callers scanning mid-turn segments (responses
+   603	// per-segment recovery) pass false: a segment boundary is not a truncation
+   604	// and inventing framing there false-positives prose fragments into calls
+   605	// (codex P2, 2026-07-17). prefix = text before the first recovered call.
+   606	// `tools` (optional) enables mode-6 name inference.
+   607	inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
+   608	                                                   std::string* prefix,
+   609	                                                   const json* tools = nullptr,
+   610	                                                   bool allow_trunc_repair = true) {
+   611	    std::vector<ToolCall> out;
+   612	    if (tool_strict()) {
+   613	        // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
+   614	        // is OFF. Log when the text plausibly contained an intended call so the
+   615	        // campaign can count suppressed rescues against the tolerant leg.
+   616	        if (prefix) *prefix = "";
+   617	        if (text_in.find("{\"name\"") != std::string::npos ||
+   618	            text_in.find("{\"tool_call\"") != std::string::npos ||
+   619	            text_in.find("</content>") != std::string::npos)
+   620	            fprintf(stderr, "[q27-strict] SUPPRESSED bare-call rescue: %.200s\n",
+   621	                    text_in.c_str());
+   622	        return out;
+   623	    }
+   624	    bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
+   625	    // drift mode 9 (2026-07-11, codex-harnessed traffic): the model drops the
+   626	    // OPENING quote of the "arguments" key ({"name":"X",\narguments":{...}}).
+   627	    // "arguments" is the tool-call schema key, so quoting a bare `arguments":`
+   628	    // is unambiguous inside these segments. Applied before segmentation so
+   629	    // both the whole-object and truncated-tail parse paths see valid JSON.
+   630	    auto fix_arg_quote = [](std::string s) {
+   631	        size_t p = 0;
+   632	        while ((p = s.find("arguments\"", p)) != std::string::npos) {
+   633	            if (p == 0 || s[p - 1] != '"') { s.insert(p, "\""); p += 11; }
+   634	            else p += 10;
+   635	        }
+   636	        return s;
+   637	    };
+   638	    const std::string text = fix_arg_quote(escape_content_tags(text_in));
+   639	    const bool m3 = (text != text_in);              // mode 3: <content>-tagged value rewritten
+   640	    const bool m4 = text.find("{\"tool_call\":") != std::string::npos; // mode 4: JSON-keyed opener
+   641	    size_t first = std::string::npos;
+   642	    size_t i = text.find('{');
+   643	    while (i != std::string::npos) {
+   644	        int depth = 0;
+   645	        bool in_str = false, esc = false;
+   646	        size_t end = std::string::npos;
+   647	        std::string san;  // segment with raw in-string control chars escaped
+   648	        for (size_t j = i; j < text.size(); j++) {
+   649	            char ch = text[j];
+   650	            if (esc) { esc = false; san += ch; continue; }
+   651	            if (in_str) {
+   652	                if (ch == '\\') { esc = true; san += ch; continue; }
+   653	                if (ch == '"') { in_str = false; san += ch; continue; }
+   654	                // fifth drift mode: literal newlines/tabs inside the string
+   655	                if (ch == '\n') { san += "\\n"; m5 = true; continue; }
+   656	                if (ch == '\r') { san += "\\r"; m5 = true; continue; }
+   657	                if (ch == '\t') { san += "\\t"; m5 = true; continue; }
+   658	                san += ch;
+   659	                continue;
+   660	            }
+   661	            san += ch;
+   662	            if (ch == '"') in_str = true;
+   663	            else if (ch == '{') depth++;
+   664	            else if (ch == '}' && --depth == 0) { end = j; break; }
+   665	        }
+   666	        if (end == std::string::npos) {
+   667	            // unbalanced to EOF: repair only a {"name" candidate (truncated
+   668	            // final call), and only when the caller guarantees the buffer is
+   669	            // end-of-turn; otherwise keep scanning inner objects. `san` holds
+   670	            // the sanitized remainder (scan ran to EOF).
+   671	            if (!allow_trunc_repair || san.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
+   672	            std::string r = san;
+   673	            while (true) {
+   674	                size_t e2 = r.find_last_not_of(" \t\r\n");
+   675	                if (e2 == std::string::npos) break;
+   676	                r.resize(e2 + 1);
+   677	                if (r.size() >= 7 && r.compare(r.size() - 7, 7, "</file>") == 0)
+   678	                    r.resize(r.size() - 7);
+   679	                else break;
+   680	            }
+   681	            int d2 = 0;
+   682	            bool s2 = false, e2f = false;
+   683	            for (char ch : r) {
+   684	                if (e2f) { e2f = false; continue; }
+   685	                if (s2) {
+   686	                    if (ch == '\\') e2f = true;
+   687	                    else if (ch == '"') s2 = false;
+   688	                    continue;
+   689	                }
+   690	                if (ch == '"') s2 = true;
+
+exec
+/bin/zsh -lc "nl -ba src/api_common.h | sed -n '1,90p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+     1	// Shared prompt construction + tool-call parsing for the q27 API endpoints.
+     2	// Qwopus (qwen35) tool protocol, from the GGUF chat template:
+     3	//   system preamble lists tools as JSON inside <tools>...</tools>
+     4	//   model emits  <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>
+     5	//   results go back as user content wrapped in <tool_response>...</tool_response>
+     6	#pragma once
+     7	#include <atomic>
+     8	#include <condition_variable>
+     9	#include <cstdint>
+    10	#include <cstdio>
+    11	#include <mutex>
+    12	#include <set>
+    13	#include <string>
+    14	#include <vector>
+    15	
+    16	#include "../third_party/json.hpp"
+    17	#include "tool_preamble.h"
+    18	#include "stream_split.h"
+    19	
+    20	namespace q27 {
+    21	using json = nlohmann::json;
+    22	
+    23	// Incremental UTF-8 boundary gate for streaming token pieces. BPE token
+    24	// boundaries can split a multi-byte character (em dash E2 80 94 is a Qwopus
+    25	// favorite), the raw piece is then invalid UTF-8, and nlohmann json::dump
+    26	// throws type_error.316 on it -- which took q27-server down mid-generation
+    27	// under Claude Code (R0, 2026-07-04). feed() returns the longest valid
+    28	// prefix, holding back an incomplete trailing sequence until its
+    29	// continuation bytes arrive; flush() ends the stream, turning a dangling
+    30	// partial into U+FFFD. Invalid leads/continuations pass through -- the
+    31	// dump-time replace error handler is the backstop for those.
+    32	struct Utf8Gate {
+    33	    std::string pend;
+    34	    static int seq_len(unsigned char b) {
+    35	        if (b < 0x80) return 1;
+    36	        if ((b & 0xE0) == 0xC0) return 2;
+    37	        if ((b & 0xF0) == 0xE0) return 3;
+    38	        if ((b & 0xF8) == 0xF0) return 4;
+    39	        return -1; // continuation or invalid lead byte
+    40	    }
+    41	    std::string feed(const std::string& piece) {
+    42	        pend += piece;
+    43	        size_t n = pend.size(), i = n;
+    44	        int back = 0;
+    45	        while (i > 0 && back < 4) {
+    46	            unsigned char b = (unsigned char)pend[i - 1];
+    47	            if ((b & 0xC0) != 0x80) { i--; break; }
+    48	            i--;
+    49	            back++;
+    50	        }
+    51	        size_t cut = n;
+    52	        if (i < n) {
+    53	            int L = seq_len((unsigned char)pend[i]);
+    54	            if (L > 0 && i + (size_t)L > n) cut = i; // incomplete tail: hold back
+    55	        }
+    56	        std::string out = pend.substr(0, cut);
+    57	        pend.erase(0, cut);
+    58	        return out;
+    59	    }
+    60	    std::string flush() {
+    61	        std::string out = pend.empty() ? std::string() : std::string("\xEF\xBF\xBD");
+    62	        pend.clear();
+    63	        return out;
+    64	    }
+    65	};
+    66	
+    67	// R1b: FIFO ticket lock time-slicing the GPU across concurrent generations.
+    68	// Replaces the server's whole-generation mutex. The holder calls
+    69	// maybe_yield() at round/chunk boundaries: if anyone is queued it releases
+    70	// and re-acquires -- the fresh ticket lands at the TAIL, so contended
+    71	// requests round-robin at round granularity instead of head-of-line
+    72	// blocking for a whole generation. Solo path: one relaxed atomic load per
+    73	// call, no syscalls. contended() can miss a waiter arriving in the same
+    74	// instant (nwait is read unlocked); it is caught one round (~27ms) later.
+    75	struct GpuGate {
+    76	    void acquire() {
+    77	        std::unique_lock<std::mutex> lk(m);
+    78	        uint64_t t = next++;
+    79	        if (t != serving) {
+    80	            nwait.fetch_add(1, std::memory_order_relaxed);
+    81	            cv.wait(lk, [&] { return serving == t; });
+    82	            nwait.fetch_sub(1, std::memory_order_relaxed);
+    83	        }
+    84	    }
+    85	    void release() {
+    86	        { std::lock_guard<std::mutex> lk(m); serving++; }
+    87	        cv.notify_all();
+    88	    }
+    89	    int contended() const { return nwait.load(std::memory_order_relaxed); }
+    90	    // RAII whole-hold (the R1-equivalent region): exception-safe release,
+
+exec
+/bin/zsh -lc "rg -n \"struct StreamSplitter|class StreamSplitter|enum.*Chan|TOOL|NATURAL|THINK\" src/api_common.h src -g'*.h' -g'*.cpp'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+src/api_common.h:302:// Q27_TOOL_STRICT=1: disable EVERY tolerant-parser rescue (the strict-parser
+src/api_common.h:310:    if (v < 0) { const char* e = getenv("Q27_TOOL_STRICT"); v = e ? atoi(e) : 0; }
+src/api_common.h:302:// Q27_TOOL_STRICT=1: disable EVERY tolerant-parser rescue (the strict-parser
+src/api_common.h:310:    if (v < 0) { const char* e = getenv("Q27_TOOL_STRICT"); v = e ? atoi(e) : 0; }
+src/stream_split.h:3:// tokens. Feeds token-by-token decoded text and routes segments into THINK /
+src/stream_split.h:4:// TEXT / TOOL channels, holding back any tail that could be a partial marker.
+src/stream_split.h:16:struct StreamSplitter {
+src/stream_split.h:17:    enum Chan { TEXT, THINK, TOOL };
+src/stream_split.h:36:                    chan = THINK;
+src/stream_split.h:42:                    chan = TOOL;
+src/stream_split.h:51:            const char* closer = chan == THINK ? T_CLOSE : C_CLOSE;
+src/metal/metal_server.cpp:1346:                    if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
+src/metal/metal_server.cpp:1351:                    (ch==q27::StreamSplitter::THINK?think_buf:text)+=t;
+src/metal/metal_server.cpp:1431:                            if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
+src/metal/metal_server.cpp:1434:                            if(ch==q27::StreamSplitter::THINK) chunk({{"reasoning_content",t}},nullptr);
+src/metal/metal_server.cpp:1525:                    if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
+src/metal/metal_server.cpp:1530:                    (ch==q27::StreamSplitter::THINK?think:text)+=t;
+src/metal/metal_server.cpp:1641:                        if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
+src/metal/metal_server.cpp:1644:                        const int chan=ch==q27::StreamSplitter::THINK?1:0;
+src/metal/metal_server.cpp:1881:                    if(ch==q27::StreamSplitter::TOOL) {
+src/metal/metal_server.cpp:1888:                    // same transition rule as TOOL, else a text→think→text
+src/metal/metal_server.cpp:1892:                    if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(false); think+=t; return; }
+src/metal/metal_server.cpp:1993:                            if(ch==q27::StreamSplitter::TOOL) {
+src/metal/metal_server.cpp:1999:                            // codex P2: a THINK transition must close an open
+src/metal/metal_server.cpp:2000:                            // text item first (same rule as TOOL) — else
+src/metal/metal_server.cpp:2004:                            if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(); think+=t; return; }
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1928,2040p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  1928	                    // codex P3: item-lifecycle state + machinery hoisted
+  1929	                    // above the try so the engine-failure path below can
+  1930	                    // still close an open item and terminate the turn.
+  1931	                    json items=json::array();
+  1932	                    int tool_counter=0,out_index=0,msg_index=-1;
+  1933	                    std::string think,text,tool_buf,text_accum;
+  1934	                        auto item_done=[&](const json& it){
+  1935	                            ev({{"type","response.output_item.done"},{"output_index",out_index++},{"item",it}});
+  1936	                            items.push_back(it);
+  1937	                        };
+  1938	                        auto flush_think=[&]{
+  1939	                            std::string th=q27::strip_ws2(think); think.clear();
+  1940	                            if(th.empty()) return;
+  1941	                            item_done({{"type","reasoning"},{"id","rs_metal_"+std::to_string(rn)},
+  1942	                                {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
+  1943	                                {"encrypted_content",nullptr}});
+  1944	                        };
+  1945	                        // codex 0.143 item lifecycle: a delta needs an OPEN item
+  1946	                        // (added + content_part.added), else the turn aborts.
+  1947	                        auto open_text=[&]{
+  1948	                            if(msg_index>=0) return;
+  1949	                            msg_index=out_index;
+  1950	                            ev({{"type","response.output_item.added"},{"output_index",msg_index},
+  1951	                                {"item",{{"type","message"},{"id",msg_id},{"role","assistant"},
+  1952	                                         {"status","in_progress"},{"content",json::array()}}}});
+  1953	                            ev({{"type","response.content_part.added"},{"item_id",msg_id},
+  1954	                                {"output_index",msg_index},{"content_index",0},
+  1955	                                {"part",{{"type","output_text"},{"text",""},{"annotations",json::array()}}}});
+  1956	                        };
+  1957	                        auto flush_text=[&]{
+  1958	                            if(msg_index<0) { text.clear(); return; }
+  1959	                            std::string tx=q27::strip_ws2(text); text.clear();
+  1960	                            ev({{"type","response.output_text.done"},{"item_id",msg_id},
+  1961	                                {"output_index",msg_index},{"content_index",0},{"text",tx}});
+  1962	                            ev({{"type","response.content_part.done"},{"item_id",msg_id},
+  1963	                                {"output_index",msg_index},{"content_index",0},
+  1964	                                {"part",{{"type","output_text"},{"text",tx},{"annotations",json::array()}}}});
+  1965	                            json it={{"type","message"},{"id",msg_id},{"role","assistant"},{"status","completed"},
+  1966	                                {"content",json::array({{{"type","output_text"},{"text",tx},
+  1967	                                                         {"annotations",json::array()}}})}};
+  1968	                            ev({{"type","response.output_item.done"},{"output_index",msg_index},{"item",it}});
+  1969	                            items.push_back(it);
+  1970	                            out_index=msg_index+1; msg_index=-1;
+  1971	                        };
+  1972	                        auto push_call=[&](const std::string& name,const json& args){
+  1973	                            const std::string cid="call_metal_"+std::to_string(rn)+"_"+std::to_string(tool_counter++);
+  1974	                            if(custom_names.count(name)) {
+  1975	                                std::string input=args.is_object() && args.contains("input") && args["input"].is_string()
+  1976	                                                      ?args["input"].get<std::string>():args.dump();
+  1977	                                item_done({{"type","custom_tool_call"},{"call_id",cid},{"name",name},{"input",input}});
+  1978	                            } else
+  1979	                                item_done({{"type","function_call"},{"call_id",cid},{"name",name},
+  1980	                                           {"arguments",args.dump()}});
+  1981	                        };
+  1982	                        auto flush_tool=[&]{
+  1983	                            auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
+  1984	                            if(!c.ok) {
+  1985	                                item_done({{"type","message"},{"role","assistant"},{"status","completed"},
+  1986	                                    {"content",json::array({{{"type","output_text"},{"text",c.raw},
+  1987	                                                             {"annotations",json::array()}}})}});
+  1988	                                return;
+  1989	                            }
+  1990	                            push_call(c.name,c.arguments);
+  1991	                        };
+  1992	                        auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+  1993	                            if(ch==q27::StreamSplitter::TOOL) {
+  1994	                                if(!think.empty()) flush_think();
+  1995	                                if(!text.empty()) flush_text();
+  1996	                                tool_buf+=t; return;
+  1997	                            }
+  1998	                            if(!tool_buf.empty()) flush_tool();
+  1999	                            // codex P2: a THINK transition must close an open
+  2000	                            // text item first (same rule as TOOL) — else
+  2001	                            // flush_think's item_done consumes the still-open
+  2002	                            // message's output_index and the done events
+  2003	                            // duplicate/reorder indices.
+  2004	                            if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(); think+=t; return; }
+  2005	                            if(!think.empty()) flush_think();
+  2006	                            if(msg_index<0 && text.empty() && q27::strip_ws2(t).empty()) return;
+  2007	                            open_text();
+  2008	                            text+=t; text_accum+=t;
+  2009	                            ev({{"type","response.output_text.delta"},{"item_id",msg_id},
+  2010	                                {"output_index",msg_index},{"content_index",0},{"delta",t}});
+  2011	                        };
+  2012	                        try {
+  2013	                        if(!ev({{"type","response.created"},
+  2014	                                {"response",{{"id",resp_id},{"object","response"},{"status","in_progress"}}}})) {
+  2015	                            sink.done(); return true;
+  2016	                        }
+  2017	                        q27::StreamSplitter sp;
+  2018	                        auto outcome=runtime.run(ids,n,sampling,stops,
+  2019	                            [&](const std::string& piece)->bool {
+  2020	                                for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+  2021	                                return alive && sink.is_writable();
+  2022	                            },tnames,snap_hint,
+  2023	                            [sock]{ return httplib::detail::is_socket_alive(sock); });
+  2024	                        for(auto& [ch,t]:sp.flush()) route(ch,t);
+  2025	                        if(!tool_buf.empty()) flush_tool();
+  2026	                        flush_think();
+  2027	                        flush_text();
+  2028	                        { // bare-call recovery even with empty tools (CUDA comment)
+  2029	                            std::string pre;
+  2030	                            auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,
+  2031	                                                                tools.empty()?nullptr:&tools);
+  2032	                            if(!bcs.empty())
+  2033	                                fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",bcs.size());
+  2034	                            for(auto& bc:bcs) push_call(bc.name,bc.arguments);
+  2035	                        }
+  2036	                        ev({{"type","response.completed"},
+  2037	                            {"response",{{"id",resp_id},{"object","response"},{"status","completed"},
+  2038	                                {"output",items},
+  2039	                                {"usage",{{"input_tokens",outcome.prompt_tokens},
+  2040	                                          {"input_tokens_details",{{"cached_tokens",0}}},
+
+codex
+So far the non-streaming `flush_tool(bool)` path does isolate malformed raw before later prose is appended. I’m checking the splitter behavior and the streaming twin just enough to avoid missing a model-order edge case outside the named helper.
+exec
+/bin/zsh -lc "nl -ba src/api_common.h | sed -n '690,825p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+   690	                if (ch == '"') s2 = true;
+   691	                else if (ch == '{') d2++;
+   692	                else if (ch == '}') d2--;
+   693	            }
+   694	            if (s2) r += '"';
+   695	            for (; d2 > 0; d2--) r += '}';
+   696	            bool shaped = false;
+   697	            try {
+   698	                json j = json::parse(r);
+   699	                shaped = j.is_object() && j.contains("name") && j.contains("arguments");
+   700	            } catch (...) {}
+   701	            bool recovered_here = false;
+   702	            if (shaped) {
+   703	                ToolCall tc = parse_tool_call(r);
+   704	                if (tc.ok) {
+   705	                    if (first == std::string::npos) first = i;
+   706	                    out.push_back(tc);
+   707	                    m2 = true;   // mode 2: truncated/unterminated JSON repaired
+   708	                    recovered_here = true;
+   709	                }
+   710	            }
+   711	            if (recovered_here) break;   // genuine truncated FINAL call consumed the rest
+   712	            // else: a dangling/failed {"name": opener -- e.g. the mode-6 HYBRID where the
+   713	            // model prepends a bare {"name": before a batch of VALID calls ("read all files
+   714	            // in parallel"). Don't discard the rest: advance past the opener and keep scanning
+   715	            // so the real calls after it recover normally.
+   716	            i = text.find('{', i + 1);
+   717	            continue;
+   718	        }
+   719	        const std::string& seg = san;
+   720	        bool shaped = false, m6cand = false, m8cand = false;
+   721	        json j6, j8;
+   722	        try {
+   723	            json j = json::parse(seg);
+   724	            shaped = j.is_object() && j.contains("name") && j.contains("arguments");
+   725	            if (!shaped && j.is_object() && j.contains("name") &&
+   726	                j["name"].is_object() && !j.contains("arguments")) {
+   727	                m6cand = true; j6 = std::move(j);
+   728	            } else if (!shaped && j.is_object()) {
+   729	                m8cand = true; j8 = std::move(j);
+   730	            }
+   731	        } catch (...) {}
+   732	        if (shaped) {
+   733	            ToolCall tc = parse_tool_call(seg);
+   734	            if (tc.ok) {
+   735	                if (first == std::string::npos) first = i;
+   736	                out.push_back(tc);
+   737	                i = text.find('{', end + 1);
+   738	                continue;
+   739	            }
+   740	        } else if (m6cand && tools) {
+   741	            // mode 6: {"name": {ARGS}} -- name string + "arguments" key both dropped.
+   742	            // Infer the tool from the orphaned args' key signature (mode 7:
+   743	            // unwrap a lone shell key first when the raw keys match nothing).
+   744	            json m6args = j6["name"];
+   745	            std::string nm = infer_tool_name_unwrapped(*tools, m6args);
+   746	            if (!nm.empty()) {
+   747	                ToolCall tc; tc.ok = true; tc.name = nm; tc.arguments = std::move(m6args);
+   748	                if (first == std::string::npos) first = i;
+   749	                out.push_back(std::move(tc));
+   750	                m6 = true;
+   751	                i = text.find('{', end + 1);
+   752	                continue;
+   753	            }
+   754	        } else if (m8cand && tools) {
+   755	            // mode 8: alias-named call object ({"function": "Read", ...});
+   756	            // registered-name validation inside keeps prose JSON out
+   757	            std::string an;
+   758	            json aa;
+   759	            if (resolve_aliased_call(*tools, j8, an, aa)) {
+   760	                ToolCall tc; tc.ok = true; tc.name = std::move(an); tc.arguments = std::move(aa);
+   761	                if (first == std::string::npos) first = i;
+   762	                out.push_back(std::move(tc));
+   763	                m8 = true;
+   764	                i = text.find('{', end + 1);
+   765	                continue;
+   766	            }
+   767	        }
+   768	        i = text.find('{', i + 1);
+   769	    }
+   770	    // Fallback: name-dropped mode-6 BATCH (the main scan can't segment it). Only when the
+   771	    // standard scan found nothing, so normal calls are never double-counted.
+   772	    if (out.empty() && tools && text.find("{\"name\":") != std::string::npos) {
+   773	        scan_namedropped(text, tools, out, &first);
+   774	        if (!out.empty()) m6 = true;
+   775	    }
+   776	    if (prefix) {
+   777	        std::string p = first == std::string::npos ? "" : strip_ws2(text.substr(0, first));
+   778	        // drop a dangling {"tool_call": opener fragment (mode-4 wrapper junk)
+   779	        if (p.size() >= 13 && p.compare(p.size() - 13, 13, "{\"tool_call\":") == 0)
+   780	            p = strip_ws2(p.substr(0, p.size() - 13));
+   781	        // drop a dangling {"name": opener fragment (mode-6/8 hybrid prefix line)
+   782	        if (p.size() >= 8 && p.compare(p.size() - 8, 8, "{\"name\":") == 0)
+   783	            p = strip_ws2(p.substr(0, p.size() - 8));
+   784	        *prefix = p;
+   785	    }
+   786	    // Drift catalog (exit gate, docs/sampling-exit-gate.md): tag which tool-format
+   787	    // drift mode(s) the fallback chain rescued, or flag an intended call it could
+   788	    // NOT recover. Log-only; the parse result is unchanged.
+   789	    if (!out.empty()) {
+   790	        char modes[8]; int mi = 0;
+   791	        modes[mi++] = '1';               // baseline: dropped-<tool_call>-wrapper recovery
+   792	        if (m2) modes[mi++] = '2';
+   793	        if (m3) modes[mi++] = '3';
+   794	        if (m4) modes[mi++] = '4';
+   795	        if (m5) modes[mi++] = '5';
+   796	        if (m6) modes[mi++] = '6';
+   797	        if (m8) modes[mi++] = '8';
+   798	        modes[mi] = 0;
+   799	        fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
+   800	    } else if (text_in.find("{\"name\"") != std::string::npos ||
+   801	               text_in.find("{\"tool_call\"") != std::string::npos) {
+   802	        // ntools distinguishes plumbing (-1/0) from a schema/inference miss (>0 =
+   803	        // mode-6 args didn't confidently match any tool). Longer window so the call
+   804	        // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
+   805	        fprintf(stderr, "[drift] UN-RESCUED (ntools=%d) intended tool call: %.400s\n",
+   806	                tools ? (int)tools->size() : -1, text_in.c_str());
+   807	    }
+   808	    return out;
+   809	}
+   810	
+   811	// Single-call convenience wrapper (first recovered call). suffix retained for
+   812	// callers that trim trailing junk; multi-call callers use the vector form.
+   813	inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* prefix,
+   814	                                     std::string* suffix, const json* tools = nullptr) {
+   815	    auto v = parse_bare_tool_calls(text_in, prefix, tools);
+   816	    if (v.empty()) return ToolCall{};
+   817	    if (suffix) *suffix = "";
+   818	    return v.front();
+   819	}
+   820	
+   821	
+   822	} // namespace q27
+
+exec
+/bin/zsh -lc "nl -ba src/stream_split.h | sed -n '1,120p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+     1	// Streaming splitter for Qwopus output markers: <think>...</think> reasoning
+     2	// and <tool_call>...</tool_call> function calls, both emitted as plain-text
+     3	// tokens. Feeds token-by-token decoded text and routes segments into THINK /
+     4	// TEXT / TOOL channels, holding back any tail that could be a partial marker.
+     5	// Markers do not nest; tool_calls can appear only outside think blocks in
+     6	// well-formed output, but we tolerate them inside by scanning TEXT only.
+     7	#pragma once
+     8	#include <algorithm>
+     9	#include <cstring>
+    10	#include <string>
+    11	#include <utility>
+    12	#include <vector>
+    13	
+    14	namespace q27 {
+    15	
+    16	struct StreamSplitter {
+    17	    enum Chan { TEXT, THINK, TOOL };
+    18	    Chan chan = TEXT;
+    19	    std::string hold;
+    20	
+    21	    static constexpr const char* T_OPEN = "<think>";
+    22	    static constexpr const char* T_CLOSE = "</think>";
+    23	    static constexpr const char* C_OPEN = "<tool_call>";
+    24	    static constexpr const char* C_CLOSE = "</tool_call>";
+    25	
+    26	    std::vector<std::pair<Chan, std::string>> feed(const std::string& piece) {
+    27	        hold += piece;
+    28	        std::vector<std::pair<Chan, std::string>> out;
+    29	        for (;;) {
+    30	            if (chan == TEXT) {
+    31	                // whichever of <think> / <tool_call> comes first
+    32	                size_t pt = hold.find(T_OPEN), pc = hold.find(C_OPEN);
+    33	                if (pt != std::string::npos && (pc == std::string::npos || pt < pc)) {
+    34	                    if (pt > 0) out.push_back({TEXT, hold.substr(0, pt)});
+    35	                    hold.erase(0, pt + strlen(T_OPEN));
+    36	                    chan = THINK;
+    37	                    continue;
+    38	                }
+    39	                if (pc != std::string::npos) {
+    40	                    if (pc > 0) out.push_back({TEXT, hold.substr(0, pc)});
+    41	                    hold.erase(0, pc + strlen(C_OPEN));
+    42	                    chan = TOOL;
+    43	                    continue;
+    44	                }
+    45	                // hold back the longest suffix that prefixes either opener
+    46	                size_t keep = tail_keep(T_OPEN);
+    47	                keep = std::max(keep, tail_keep(C_OPEN));
+    48	                emit_head(out, keep);
+    49	                break;
+    50	            }
+    51	            const char* closer = chan == THINK ? T_CLOSE : C_CLOSE;
+    52	            size_t p = hold.find(closer);
+    53	            if (p != std::string::npos) {
+    54	                if (p > 0) out.push_back({chan, hold.substr(0, p)});
+    55	                hold.erase(0, p + strlen(closer));
+    56	                chan = TEXT;
+    57	                continue;
+    58	            }
+    59	            emit_head(out, tail_keep(closer));
+    60	            break;
+    61	        }
+    62	        return out;
+    63	    }
+    64	
+    65	    std::vector<std::pair<Chan, std::string>> flush() {
+    66	        std::vector<std::pair<Chan, std::string>> out;
+    67	        if (!hold.empty()) { out.push_back({chan, hold}); hold.clear(); }
+    68	        return out;
+    69	    }
+    70	
+    71	  private:
+    72	    size_t tail_keep(const char* marker) const {
+    73	        size_t mlen = strlen(marker);
+    74	        size_t maxk = std::min(hold.size(), mlen - 1);
+    75	        for (size_t k = maxk; k > 0; k--)
+    76	            if (hold.compare(hold.size() - k, k, marker, k) == 0) return k;
+    77	        return 0;
+    78	    }
+    79	    void emit_head(std::vector<std::pair<Chan, std::string>>& out, size_t keep) {
+    80	        if (hold.size() > keep) {
+    81	            out.push_back({chan, hold.substr(0, hold.size() - keep)});
+    82	            hold.erase(0, hold.size() - keep);
+    83	        }
+    84	    }
+    85	};
+    86	
+    87	} // namespace q27
+
+exec
+/bin/zsh -lc "git diff --unified=80 -- src/metal/metal_server.cpp | sed -n '250,520p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-eGbDcYEE' (errno=Operation not permitted)
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-qjCAyLj5' (errno=Operation not permitted)
+                 // negative the client gets a parseable error instead of an
+                 // empty 200 (codex P2 on this round).
+                 catch(const Runtime::ClientGone&) { response.status=499; }
+                 catch(const Runtime::ServerOverloaded& e) { json_response(response,{{"error",{{"message",e.what()},{"type","overloaded_error"}}}},503); }
++                catch(const Runtime::EngineError& e) { json_response(response,{{"error",{{"message",e.what()},{"type","api_error"}}}},500); }
+                 catch(const std::exception& e) { json_response(response,{{"error",{{"message",e.what()},{"type","invalid_request_error"}}}},400); }
+             };
+         };
+         // Liveness probe for phases with no response writes yet (queue wait,
+         // prefill) and for non-streaming generation. The socket fd rides
+         // the q27 httplib patch (Request::sock).
+         auto socket_live=[](socket_t sock){
+             return [sock]{ return httplib::detail::is_socket_alive(sock); };
+         };
++        // Wraps ONLY a handler's run() call: engine failures reclassify as
++        // EngineError (api_error 500); the cancellation and overload types
++        // pass through untouched.
++        auto engine_guard=[](auto&& fn)->decltype(fn()) {
++            try { return fn(); }
++            catch(const Runtime::ClientGone&) { throw; }
++            catch(const Runtime::ServerOverloaded&) { throw; }
++            catch(const Runtime::EngineError&) { throw; }
++            catch(const std::exception& e) { throw Runtime::EngineError(e.what()); }
++        };
+         // Anthropic endpoints answer in Anthropic's error envelope
+         // ({"type":"error","error":{...}} — the SDK inside Claude Code reads
+         // error.message from it), not the OpenAI shape (codex P2 on this
+         // round). Streaming errors after SSE commit use the error event.
+         auto anthropic_guarded=[&](auto handler) {
+             return [&,handler](const httplib::Request& request,httplib::Response& response) {
+                 json body;
+                 try { body=json::parse(request.body); }
+                 catch(...) {
+                     response.status=400;
+                     response.set_content(q27::anthropic_error_json("invalid_request_error","invalid JSON body"),"application/json");
+                     return;
+                 }
+                 try { handler(body,response,request.sock); }
+                 // 499 as in `guarded` (codex P2): never an empty 200.
+                 catch(const Runtime::ClientGone&) { response.status=499; }
++                catch(const Runtime::EngineError& e) {
++                    response.status=500;
++                    response.set_content(q27::anthropic_error_json("api_error",e.what()),"application/json");
++                }
+                 catch(const Runtime::ServerOverloaded& e) {
+                     response.status=503;
+                     response.set_content(q27::anthropic_error_json("overloaded_error",e.what()),"application/json");
+                 }
+                 catch(const std::exception& e) {
+                     response.status=400;
+                     response.set_content(q27::anthropic_error_json("invalid_request_error",e.what()),"application/json");
+                 }
+             };
+         };
+ 
+         // Shared context preflight: each endpoint refuses an oversized prompt
+         // in its API's native 400 shape before slot claim / SSE commit.
+         auto prompt_overflow=[&](size_t prompt_tokens,uint32_t& n,uint32_t& maxp)->bool {
+             maxp=max_prompt_tokens(runtime.context,runtime.mtp_width,runtime.suffix_width);
+             if(prompt_tokens>maxp) return true;
+             if(prompt_tokens+n>runtime.context) n=runtime.context-(uint32_t)prompt_tokens;
+             return false;
+         };
+ 
+         // ---- OpenAI /v1/completions (raw continuation; no template, no
+         // tool protocol) ----
+         server.Post("/v1/completions",guarded([&](const json& body,httplib::Response& r,socket_t sock){
+             auto ids=to_u32(runtime.tokenizer.encode(body.value("prompt","")));
+             uint32_t n=max_tokens(body,256);
+             const q27::SamplingParams sampling=sampling_params(body);
+             const std::vector<std::string> stops=parse_stops(body,"stop");
+             const std::string id="cmpl-metal-"+std::to_string((long)req_counter++);
+             const long created=unix_now();
+             if(ids.empty()) throw std::runtime_error("prompt is empty");
+             uint32_t maxp=0;
+             if(prompt_overflow(ids.size(),n,maxp)) {
+                 json_response(r,{{"error",{{"message",q27::ctx_limit_error_message((int)ids.size(),(int)maxp)},
+                     {"type","invalid_request_error"},{"code","context_length_exceeded"}}}},400);
+                 return;
+             }
+             if(!wants_stream(body)) {
+                 std::string text; size_t probe=0;
+-                auto outcome=runtime.run(ids,n,sampling,stops,
+-                    [&](const std::string& piece){ text+=piece;
+-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+-                    tool_names_from(body),body.value("snapshot",false),socket_live(sock));
++                auto outcome=engine_guard([&]{
++                    return runtime.run(ids,n,sampling,stops,
++                        [&](const std::string& piece){ text+=piece;
++                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
++                        tool_names_from(body),body.value("snapshot",false),socket_live(sock)); });
+                 json_response(r,{{"id",id},{"object","text_completion"},{"created",created},{"model","q27-metal"},
+                     {"choices",json::array({{{"index",0},{"text",text},{"finish_reason",openai_finish(outcome.finish)}}})},
+                     {"usage",{{"prompt_tokens",outcome.prompt_tokens},{"completion_tokens",outcome.output_tokens},
+                               {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}},
+                     {"q27_prefix_hit",outcome.prefix_hit}});
+                 return;
+             }
+             r.set_header("Content-Type","text/event-stream");
+             const std::vector<std::string> tnames=tool_names_from(body);
+             const bool snap_hint=body.value("snapshot",false);
+             r.set_chunked_content_provider("text/event-stream",
+                 [&runtime,ids,n,sampling,stops,id,created,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
+                     try {
+                         auto emit=[&](const std::string& piece)->bool {
+                             std::string s=q27::sse_data(
+                                 q27::openai_stream_chunk(false,id,"text_completion",created,"q27-metal",piece));
+                             return sink.write(s.data(),s.size());
+                         };
+                         auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
+                             [sock]{ return httplib::detail::is_socket_alive(sock); });
+                         // Terminal chunk with a real finish_reason before [DONE]
+                         // (parity with server.cu security-review fix #7).
+                         std::string fin=q27::sse_data(q27::openai_stream_final_chunk(
+                             false,id,"text_completion",created,"q27-metal",openai_finish(outcome.finish)));
+                         sink.write(fin.data(),fin.size());
+                         std::string done=q27::sse_done(); sink.write(done.data(),done.size());
+                     } catch(const Runtime::ClientGone&) {
+                         return false;
+                     } catch(const std::exception& e) {
+                         std::string s=q27::sse_data({{"error",{{"message",e.what()},{"type","invalid_request_error"}}}});
+                         sink.write(s.data(),s.size());
+                     }
+                     sink.done();
+                     return true;
+                 });
+         }));
+ 
+         // ---- OpenAI /v1/chat/completions ----
+         // Structured tool traffic both directions (agentic-parity round,
+         // docs/plans/2026-07-17-metal-agentic-parity.md): incoming
+         // assistant.tool_calls / role:"tool" via openai_msgs above; outgoing
+         // <tool_call> segments become message.tool_calls (non-streaming) or
+         // one delta.tool_calls chunk per call (streaming) with finish_reason
+         // "tool_calls"; <think> segments go to reasoning_content (llama.cpp
+         // convention) instead of leaking raw into content.
+         server.Post("/v1/chat/completions",guarded([&](const json& body,httplib::Response& r,socket_t sock){
+             bool think=body.value("enable_thinking",true);
+             if(body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+                 think=body["chat_template_kwargs"].value("enable_thinking",think);
+             const json tools=body.contains("tools") && body["tools"].is_array()
+                                  ?body["tools"]:json::array();
+             auto ids=to_u32(runtime.tokenizer.encode(q27::chatml_prompt(openai_msgs(body),tools,think)));
+             uint32_t n=max_tokens(body,256);
+             const q27::SamplingParams sampling=sampling_params(body);
+             const std::vector<std::string> stops=parse_stops(body,"stop");
+             const long rid=req_counter++;
+             const std::string id="chatcmpl-metal-"+std::to_string(rid);
+             const long created=unix_now();
+             if(ids.empty()) throw std::runtime_error("prompt is empty");
+             uint32_t maxp=0;
+             if(prompt_overflow(ids.size(),n,maxp)) {
+                 json_response(r,{{"error",{{"message",q27::ctx_limit_error_message((int)ids.size(),(int)maxp)},
+                     {"type","invalid_request_error"},{"code","context_length_exceeded"}}}},400);
+                 return;
+             }
+             const bool has_tools=!tools.empty();
+             const std::vector<std::string> tnames=tool_names_from(body);
+             const bool snap_hint=body.value("snapshot",false);
+             if(!wants_stream(body)) {
+                 q27::StreamSplitter sp;
+                 std::string think_buf,text,tool_buf;
+                 std::vector<q27::ToolCall> calls;
+                 auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+                     if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
+                     if(!tool_buf.empty()) {
+                         calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                         tool_buf.clear();
+                     }
+                     (ch==q27::StreamSplitter::THINK?think_buf:text)+=t;
+                 };
+                 size_t probe=0;
+-                auto outcome=runtime.run(ids,n,sampling,stops,
+-                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+-                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+-                    tnames,snap_hint,socket_live(sock));
++                auto outcome=engine_guard([&]{
++                    return runtime.run(ids,n,sampling,stops,
++                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
++                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
++                        tnames,snap_hint,socket_live(sock)); });
+                 for(auto& [ch,t]:sp.flush()) route(ch,t);
+                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                 std::string th=q27::strip_ws2(think_buf),tx=q27::strip_ws2(text);
+                 // Malformed wrapped calls surface as text so nothing is lost;
+                 // then the wrapper-less recovery chain runs over the text.
+                 std::vector<q27::ToolCall> good;
+                 for(auto& c:calls) {
+                     if(c.ok) good.push_back(std::move(c));
+                     else tx+=(tx.empty()?"":"\n")+c.raw;
+                 }
+                 if(has_tools) {
+                     std::string pre;
+                     auto bcs=q27::parse_bare_tool_calls(tx,&pre,&tools);
+                     if(!bcs.empty()) {
+                         fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",bcs.size());
+                         tx=pre;
+                         for(auto& bc:bcs) good.push_back(std::move(bc));
+                     }
+                 }
+                 json tcs=json::array();
+                 int ci=0;
+                 for(auto& c:good)
+                     tcs.push_back({{"id","call_metal_"+std::to_string(rid)+"_"+std::to_string(ci++)},
+                                    {"type","function"},
+                                    {"function",{{"name",c.name},{"arguments",c.arguments.dump()}}}});
+                 json message={{"role","assistant"},
+                               {"content",(!tcs.empty() && tx.empty())?json(nullptr):json(tx)}};
+                 if(!th.empty()) message["reasoning_content"]=th;
+                 if(!tcs.empty()) message["tool_calls"]=tcs;
+                 json_response(r,{{"id",id},{"object","chat.completion"},{"created",created},{"model","q27-metal"},
+                     {"choices",json::array({{{"index",0},{"message",message},
+                         {"finish_reason",!tcs.empty()?"tool_calls":openai_finish(outcome.finish)}}})},
+                     {"usage",{{"prompt_tokens",outcome.prompt_tokens},{"completion_tokens",outcome.output_tokens},
+                               {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}},
+                     {"q27_prefix_hit",outcome.prefix_hit}});
+                 return;
+             }
+             r.set_header("Content-Type","text/event-stream");
+             r.set_chunked_content_provider("text/event-stream",
+                 [&runtime,ids,n,sampling,stops,id,rid,created,tools,has_tools,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
+                     bool alive=true;
+                     auto chunk=[&](const json& delta,const json& finish){
+                         std::string s=q27::sse_data({{"id",id},{"object","chat.completion.chunk"},
+                             {"created",created},{"model","q27-metal"},
+                             {"choices",json::array({{{"index",0},{"delta",delta},{"finish_reason",finish}}})}});
+                         if(!sink.write(s.data(),s.size())) alive=false;
+                         return alive;
+                     };
+                     try {
+                         // Opening role delta (OpenAI streaming convention);
+                         // also the client-gone probe before generation starts.
+                         if(!chunk({{"role","assistant"},{"content",""}},nullptr)) { sink.done(); return true; }
+                         q27::StreamSplitter sp;
+                         std::string tool_buf,text_accum;
+                         int tool_counter=0;
+                         bool any_call=false;
+                         auto emit_tool=[&](){
+                             auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                             tool_buf.clear();
+                             if(!c.ok) { // malformed: surface as text so nothing is lost
+                                 text_accum+=c.raw;
+                                 chunk({{"content",c.raw}},nullptr);
+                                 return;
+                             }
+                             any_call=true;
+                             chunk({{"tool_calls",json::array({{{"index",tool_counter},
+                                 {"id","call_metal_"+std::to_string(rid)+"_"+std::to_string(tool_counter)},
+                                 {"type","function"},
+                                 {"function",{{"name",c.name},{"arguments",c.arguments.dump()}}}}})}},nullptr);
+                             tool_counter++;
+                         };
+                         auto emit_seg=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+                             if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
+                             if(!tool_buf.empty()) emit_tool();
+                             if(t.empty()) return;
+                             if(ch==q27::StreamSplitter::THINK) chunk({{"reasoning_content",t}},nullptr);
+                             else { text_accum+=t; chunk({{"content",t}},nullptr); }
+                         };
+                         auto outcome=runtime.run(ids,n,sampling,stops,
+                             [&](const std::string& piece)->bool {
+@@ -1429,164 +1453,165 @@ int main(int argc,char** argv) {
+                             for(auto& bc:bcs) {
+                                 any_call=true;
+                                 chunk({{"tool_calls",json::array({{{"index",tool_counter},
+                                     {"id","call_metal_"+std::to_string(rid)+"_"+std::to_string(tool_counter)},
+                                     {"type","function"},
+                                     {"function",{{"name",bc.name},{"arguments",bc.arguments.dump()}}}}})}},nullptr);
+                                 tool_counter++;
+                             }
+                         }
+
+exec
+/bin/zsh -lc "nl -ba src/api_common.h | sed -n '340,430p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+   340	        json j = json::parse(escape_content_tags(seg));
+   341	        tc.name = j.value("name", std::string());
+   342	        tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
+   343	        if (tc.arguments.is_string()) // some models double-encode
+   344	            tc.arguments = json::parse(tc.arguments.get<std::string>());
+   345	        tc.ok = !tc.name.empty();
+   346	    } catch (...) { tc.ok = false; }
+   347	    return tc;
+   348	}
+   349	
+   350	inline std::string strip_ws2(const std::string& s) {
+   351	    size_t a = s.find_first_not_of(" \t\r\n");
+   352	    if (a == std::string::npos) return "";
+   353	    size_t b = s.find_last_not_of(" \t\r\n");
+   354	    return s.substr(a, b - a + 1);
+   355	}
+   356	
+   357	// Fallback for models that drop the <tool_call> wrapper and emit the call
+   358	// JSON as plain text (observed on long write calls under no-think greedy;
+   359	// llama.cpp's chat parser has the same class of tolerance). Scans for the
+   360	// first balanced {...} that parses as {"name":..., "arguments":...}. On
+   361	// success: prefix = text before the JSON, suffix = text after it (typically
+   362	// junk like "</file>" -- caller decides to drop it).
+   363	// Third observed drift mode: JSON framing with a raw-code value inside
+   364	// <content>...</content> tags (the fine-tune's SFT file format leaking into
+   365	// arguments). Rewrite `: <content>RAW</content>` spans into proper JSON
+   366	// strings so the call parses. Returns the input unchanged if no tag pair.
+   367	inline std::string escape_json_interior(const std::string& s) {
+   368	    std::string esc;
+   369	    for (char c : s) {
+   370	        switch (c) {
+   371	            case '"': esc += "\\\""; break;
+   372	            case '\\': esc += "\\\\"; break;
+   373	            case '\n': esc += "\\n"; break;
+   374	            case '\r': esc += "\\r"; break;
+   375	            case '\t': esc += "\\t"; break;
+   376	            default: esc += c;
+   377	        }
+   378	    }
+   379	    return esc;
+   380	}
+   381	
+   382	// Rewrite a raw code/text value the fine-tune delimited with <content> tags into a
+   383	// proper JSON string so the call parses. Two observed shapes:
+   384	//   (1) "key": <content>RAW</content>   -- both angle tags in value position.
+   385	//   (2) "content": "RAW</content>       -- JSON-quote OPEN, tag CLOSE. The file-write
+   386	//       drift: RAW is a multi-line file body with unescaped quotes/newlines/braces
+   387	//       that break the JSON string; the model terminates it with a stray </content>
+   388	//       (SFT format leak) instead of a closing quote, then continues ", "file_path":...".
+   389	//       Verified 6/6 on the failing writes in the 2026-07-06 CRUSH A/B batch.
+   390	inline std::string escape_content_tags(const std::string& text) {
+   391	    size_t a = text.find("<content>");
+   392	    if (a != std::string::npos) {                    // shape 1
+   393	        size_t v = a + 9;
+   394	        size_t b = text.rfind("</content>");
+   395	        if (b == std::string::npos || b < v) return text;
+   396	        size_t k = text.find_last_not_of(" \t\r\n", a - 1);
+   397	        if (k == std::string::npos || text[k] != ':') return text;
+   398	        return text.substr(0, a) + "\"" + escape_json_interior(text.substr(v, b - v)) +
+   399	               "\"" + text.substr(b + 10);
+   400	    }
+   401	    // shape 2: "content": "RAW</content>  (no opening <content> tag)
+   402	    size_t close = text.find("</content>");
+   403	    if (close == std::string::npos) return text;
+   404	    size_t key = text.rfind("\"content\":", close); // nearest content key before the tag
+   405	    if (key == std::string::npos) return text;
+   406	    size_t q = text.find('"', key + 10);            // value-open quote after "content":
+   407	    if (q == std::string::npos || q > close) return text;
+   408	    return text.substr(0, q) + "\"" +
+   409	           escape_json_interior(text.substr(q + 1, close - q - 1)) + "\"" +
+   410	           text.substr(close + 10);
+   411	}
+   412	
+   413	// Infer a tool name from an orphaned arguments object (drift mode 6: the model emits
+   414	// {"name": {ARGS}} with the name STRING value and the "arguments" key both absent from
+   415	// the bytes -- observed on the Claude Code tool schema). Match ARGS's keys against each
+   416	// tool's schema: an exact required-set match wins outright; else the highest
+   417	// (2*overlap - foreign) score, refusing on a tie (a wrong tool is worse than leaving it
+   418	// un-rescued). Needs the request's anthropic_tools_json; nullptr/no-match -> "".
+   419	inline std::string infer_tool_name(const json& tools, const json& args) {
+   420	    if (!tools.is_array() || !args.is_object()) return "";
+   421	    std::set<std::string> ak;
+   422	    for (auto it = args.begin(); it != args.end(); ++it) ak.insert(it.key());
+   423	    if (ak.empty()) return "";
+   424	    // Tie-break (2026-07-11, thunderdome T8 one-shot-quit root cause): the
+   425	    // modern CC registry has property-set near-twins (Bash and Monitor both
+   426	    // carry {command, description}), so orphaned Bash args scored a 4-4 tie
+   427	    // and the rescue refused. A tied candidate whose REQUIRED params are not
+   428	    // all present in ARGS could never validate as a call -- eliminate those;
+   429	    // a UNIQUE survivor wins. Both-satisfied ties still refuse (a wrong tool
+   430	    // remains worse than un-rescued).
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '2020,2065p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  2020	                                for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+  2021	                                return alive && sink.is_writable();
+  2022	                            },tnames,snap_hint,
+  2023	                            [sock]{ return httplib::detail::is_socket_alive(sock); });
+  2024	                        for(auto& [ch,t]:sp.flush()) route(ch,t);
+  2025	                        if(!tool_buf.empty()) flush_tool();
+  2026	                        flush_think();
+  2027	                        flush_text();
+  2028	                        { // bare-call recovery even with empty tools (CUDA comment)
+  2029	                            std::string pre;
+  2030	                            auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,
+  2031	                                                                tools.empty()?nullptr:&tools);
+  2032	                            if(!bcs.empty())
+  2033	                                fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",bcs.size());
+  2034	                            for(auto& bc:bcs) push_call(bc.name,bc.arguments);
+  2035	                        }
+  2036	                        ev({{"type","response.completed"},
+  2037	                            {"response",{{"id",resp_id},{"object","response"},{"status","completed"},
+  2038	                                {"output",items},
+  2039	                                {"usage",{{"input_tokens",outcome.prompt_tokens},
+  2040	                                          {"input_tokens_details",{{"cached_tokens",0}}},
+  2041	                                          {"output_tokens",outcome.output_tokens},
+  2042	                                          {"output_tokens_details",{{"reasoning_tokens",0}}},
+  2043	                                          {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}}}}});
+  2044	                    } catch(const Runtime::ClientGone&) {
+  2045	                        return false;
+  2046	                    } catch(const std::exception& e) {
+  2047	                        // codex P3: an engine failure mid-stream must not
+  2048	                        // leave codex holding an unterminated item lifecycle
+  2049	                        // over a 200 stream. Close any open item (the
+  2050	                        // flushers emit the done triplet; no-ops when
+  2051	                        // nothing is open — a pending tool buffer is dropped
+  2052	                        // as unreliable), keep the first-class api_error
+  2053	                        // event (Anthropic-stream precedent), then end the
+  2054	                        // turn with the Responses-spec failure terminator
+  2055	                        // carrying the partial output. Weak gate, recorded in
+  2056	                        // the plan: no forced-failure failpoint on this path.
+  2057	                        try { if(!think.empty()) flush_think(); flush_text(); } catch(...) {}
+  2058	                        ev({{"type","error"},{"error",{{"type","api_error"},{"message",e.what()}}}});
+  2059	                        ev({{"type","response.failed"},
+  2060	                            {"response",{{"id",resp_id},{"object","response"},{"status","failed"},
+  2061	                                {"last_error",{{"code","server_error"},{"message",e.what()}}},
+  2062	                                {"output",items}}}});
+  2063	                    }
+  2064	                    sink.done();
+  2065	                    return true;
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1630,1685p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  1630	                        tool_buf.clear();
+  1631	                        if(!c.ok) { // malformed: surface as text so nothing is lost
+  1632	                            open_block(0);
+  1633	                            text_accum+=c.raw;
+  1634	                            ev("content_block_delta",{{"type","content_block_delta"},{"index",idx},
+  1635	                                {"delta",{{"type","text_delta"},{"text",c.raw}}}});
+  1636	                            return;
+  1637	                        }
+  1638	                        emit_tool_block(c.name,c.arguments);
+  1639	                    };
+  1640	                    auto emit_seg=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+  1641	                        if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
+  1642	                        if(!tool_buf.empty()) emit_tool();
+  1643	                        if(t.empty()) return;
+  1644	                        const int chan=ch==q27::StreamSplitter::THINK?1:0;
+  1645	                        // suppress pure-whitespace text before/between blocks
+  1646	                        if(chan==0 && idx<0 && q27::strip_ws2(t).empty()) return;
+  1647	                        open_block(chan);
+  1648	                        if(chan==0) text_accum+=t;
+  1649	                        ev("content_block_delta",{{"type","content_block_delta"},{"index",idx},
+  1650	                            {"delta",chan==1?json{{"type","thinking_delta"},{"thinking",t}}
+  1651	                                            :json{{"type","text_delta"},{"text",t}}}});
+  1652	                    };
+  1653	                    try {
+  1654	                        json msg={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
+  1655	                            {"content",json::array()},{"stop_reason",nullptr},{"stop_sequence",nullptr},
+  1656	                            {"usage",{{"input_tokens",(int)ids.size()},{"output_tokens",0}}}};
+  1657	                        // A client gone before generation starts must not hold
+  1658	                        // the engine through the token cap: gate the run on the
+  1659	                        // opening write, and probe the socket on quiet pieces.
+  1660	                        if(!ev("message_start",{{"type","message_start"},{"message",msg}})) {
+  1661	                            sink.done();
+  1662	                            return true;
+  1663	                        }
+  1664	                        auto outcome=runtime.run(ids,n,sampling,stops,
+  1665	                            [&](const std::string& piece)->bool {
+  1666	                                for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
+  1667	                                return alive && sink.is_writable();
+  1668	                            },tnames,snap_hint,
+  1669	                            [sock]{ return httplib::detail::is_socket_alive(sock); });
+  1670	                        for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
+  1671	                        if(!tool_buf.empty()) emit_tool();
+  1672	                        if(has_tools) {
+  1673	                            // wrapper-less recovery: text already streamed as
+  1674	                            // text_delta (cosmetic); tool_use blocks still fire
+  1675	                            std::string pre;
+  1676	                            auto bcs=q27::parse_bare_tool_calls(text_accum,&pre,&tools);
+  1677	                            if(!bcs.empty()) {
+  1678	                                fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (stream)\n",bcs.size());
+  1679	                                any=true;
+  1680	                                for(auto& bc:bcs) emit_tool_block(bc.name,bc.arguments);
+  1681	                            }
+  1682	                        }
+  1683	                        if(idx<0 && !any) { // nothing at all: empty text block for validity
+  1684	                            idx=block_counter++;
+  1685	                            chan_open=0;
+
+codex
+One important scope point: the non-streaming Responses path and the streaming Responses path are not using the same recovery machinery. The named round-5 `flush_tool(bool final_turn)` checks out, but I’m validating whether the broader `/v1/responses` wording makes the streaming end-of-turn truncation a remaining finding.
+exec
+/bin/zsh -lc "nl -ba src/api_common.h | sed -n '300,348p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+   300	inline std::string escape_content_tags(const std::string& text);
+   301	
+   302	// Q27_TOOL_STRICT=1: disable EVERY tolerant-parser rescue (the strict-parser
+   303	// A/B knob). Wrapped calls must be plain valid JSON (no <content>-tag rewrite,
+   304	// no double-encode unwrap); the wrapper-less bare-scan recovery is suppressed
+   305	// entirely. Suppressed rescues are logged ([q27-strict]) so a campaign can
+   306	// count what the tolerant chain WOULD have carried. Read once (server-lifetime
+   307	// knob, one leg per server run).
+   308	inline bool tool_strict() {
+   309	    static int v = -1;
+   310	    if (v < 0) { const char* e = getenv("Q27_TOOL_STRICT"); v = e ? atoi(e) : 0; }
+   311	    return v == 1;
+   312	}
+   313	
+   314	inline ToolCall parse_tool_call(const std::string& seg) {
+   315	    ToolCall tc;
+   316	    tc.raw = seg;
+   317	    if (tool_strict()) {
+   318	        // strict: the wrapped segment must parse as-is, with a JSON-object
+   319	        // arguments value. Anything else stays text (rescue suppressed).
+   320	        try {
+   321	            json j = json::parse(seg);
+   322	            tc.name = j.value("name", std::string());
+   323	            tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
+   324	            if (tc.arguments.is_string()) {
+   325	                fprintf(stderr, "[q27-strict] rejected double-encoded arguments (tool=%s)\n",
+   326	                        tc.name.c_str());
+   327	                tc.ok = false;
+   328	                return tc;
+   329	            }
+   330	            tc.ok = !tc.name.empty();
+   331	        } catch (...) {
+   332	            tc.ok = false;
+   333	            if (seg.find("<content>") != std::string::npos ||
+   334	                seg.find("</content>") != std::string::npos)
+   335	                fprintf(stderr, "[q27-strict] rejected <content>-tagged call (mode 3)\n");
+   336	        }
+   337	        return tc;
+   338	    }
+   339	    try {
+   340	        json j = json::parse(escape_content_tags(seg));
+   341	        tc.name = j.value("name", std::string());
+   342	        tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
+   343	        if (tc.arguments.is_string()) // some models double-encode
+   344	            tc.arguments = json::parse(tc.arguments.get<std::string>());
+   345	        tc.ok = !tc.name.empty();
+   346	    } catch (...) { tc.ok = false; }
+   347	    return tc;
+   348	}
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1860,1908p'" in /Users/macthedan/projects/q27
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1806,1832p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  1860	                            {"status","completed"},
+  1861	                            {"content",json::array({{{"type","output_text"},{"text",tx},
+  1862	                                                     {"annotations",json::array()}}})}});
+  1863	                    for(auto& bc:bcs) push_call(bc.name,bc.arguments);
+  1864	                };
+  1865	                auto flush_tool=[&](bool final_turn){
+  1866	                    auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
+  1867	                    if(!c.ok) { // malformed: commit the raw as its OWN text
+  1868	                        // segment right now (chat/Anthropic recovery
+  1869	                        // convention): recovery runs over it, so a
+  1870	                        // recoverable nested call is not lost as raw text
+  1871	                        // (codex P2 round 3) — and committing it alone means
+  1872	                        // the tx=pre trim can never drop prose that followed
+  1873	                        // the wrapper in the model's output (codex P2 round 4).
+  1874	                        text+=(text.empty()?"":"\n")+c.raw;
+  1875	                        flush_text(final_turn); return;
+  1876	                    }
+  1877	                    push_call(c.name,c.arguments);
+  1878	                };
+  1879	                q27::StreamSplitter sp;
+  1880	                auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+  1881	                    if(ch==q27::StreamSplitter::TOOL) {
+  1882	                        if(!think.empty()) flush_think();
+  1883	                        if(!text.empty()) flush_text(false);
+  1884	                        tool_buf+=t; return;
+  1885	                    }
+  1886	                    if(!tool_buf.empty()) flush_tool(false);
+  1887	                    // codex P2: close pending text BEFORE think accumulates —
+  1888	                    // same transition rule as TOOL, else a text→think→text
+  1889	                    // turn interleaves items (reasoning pushed ahead of the
+  1890	                    // message it followed) and the stream twin corrupts
+  1891	                    // output_index.
+  1892	                    if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(false); think+=t; return; }
+  1893	                    if(!think.empty()) flush_think();
+  1894	                    text+=t; text_accum+=t;
+  1895	                };
+  1896	                size_t probe=0;
+  1897	                auto outcome=engine_guard([&]{
+  1898	                    return runtime.run(ids,n,sampling,stops,
+  1899	                        [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+  1900	                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+  1901	                        tnames,snap_hint,socket_live(sock)); });
+  1902	                for(auto& [ch,t]:sp.flush()) route(ch,t);
+  1903	                if(!tool_buf.empty()) flush_tool(true);
+  1904	                flush_think();
+  1905	                flush_text(true);
+  1906	                std::string all_text;
+  1907	                for(const auto& it:items)
+  1908	                    if(it.value("type","")=="message" && it.contains("content"))
+
+ succeeded in 0ms:
+  1806	            const std::vector<std::string> tnames=tool_names_from(body);
+  1807	            const bool snap_hint=body.value("snapshot",false);
+  1808	            if(!wants_stream(body)) {
+  1809	                json items=json::array();
+  1810	                int tool_counter=0;
+  1811	                std::string think,text,tool_buf,text_accum;
+  1812	                auto flush_think=[&]{
+  1813	                    std::string th=q27::strip_ws2(think); think.clear();
+  1814	                    if(th.empty()) return;
+  1815	                    items.push_back({{"type","reasoning"},{"id","rs_metal_"+std::to_string(rn)},
+  1816	                        {"summary",json::array({{{"type","summary_text"},{"text",th}}})},
+  1817	                        {"encrypted_content",nullptr}});
+  1818	                };
+  1819	                auto push_call=[&](const std::string& name,const json& args){
+  1820	                    const std::string cid="call_metal_"+std::to_string(rn)+"_"+std::to_string(tool_counter++);
+  1821	                    if(custom_names.count(name)) {
+  1822	                        std::string input=args.is_object() && args.contains("input") && args["input"].is_string()
+  1823	                                              ?args["input"].get<std::string>():args.dump();
+  1824	                        items.push_back({{"type","custom_tool_call"},{"call_id",cid},{"name",name},{"input",input}});
+  1825	                    } else
+  1826	                        items.push_back({{"type","function_call"},{"call_id",cid},{"name",name},
+  1827	                                         {"arguments",args.dump()}});
+  1828	                };
+  1829	                auto flush_text=[&](bool final_turn){
+  1830	                    std::string tx=q27::strip_ws2(text); text.clear();
+  1831	                    if(tx.empty()) return;
+  1832	                    // Wrapper-less recovery rides EVERY text commit (codex P2
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1980,2008p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  1980	                                           {"arguments",args.dump()}});
+  1981	                        };
+  1982	                        auto flush_tool=[&]{
+  1983	                            auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
+  1984	                            if(!c.ok) {
+  1985	                                item_done({{"type","message"},{"role","assistant"},{"status","completed"},
+  1986	                                    {"content",json::array({{{"type","output_text"},{"text",c.raw},
+  1987	                                                             {"annotations",json::array()}}})}});
+  1988	                                return;
+  1989	                            }
+  1990	                            push_call(c.name,c.arguments);
+  1991	                        };
+  1992	                        auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
+  1993	                            if(ch==q27::StreamSplitter::TOOL) {
+  1994	                                if(!think.empty()) flush_think();
+  1995	                                if(!text.empty()) flush_text();
+  1996	                                tool_buf+=t; return;
+  1997	                            }
+  1998	                            if(!tool_buf.empty()) flush_tool();
+  1999	                            // codex P2: a THINK transition must close an open
+  2000	                            // text item first (same rule as TOOL) — else
+  2001	                            // flush_think's item_done consumes the still-open
+  2002	                            // message's output_index and the done events
+  2003	                            // duplicate/reorder indices.
+  2004	                            if(ch==q27::StreamSplitter::THINK) { if(!text.empty()) flush_text(); think+=t; return; }
+  2005	                            if(!think.empty()) flush_think();
+  2006	                            if(msg_index<0 && text.empty() && q27::strip_ws2(t).empty()) return;
+  2007	                            open_text();
+  2008	                            text+=t; text_accum+=t;
+
+codex
+**Findings**
+- **P2** [src/metal/metal_server.cpp:1881](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1881): adjacent `<tool_call>` wrappers can still be folded into one `tool_buf`. The `TOOL` branch only appends and returns; it only flushes a pending tool on a later non-`TOOL` channel at [1886](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1886). That means `malformed -> malformed` is not guaranteed to become two committed segments. If recovery finds a call in the combined raw, [1851-1857](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1851) applies `tx=pre` to the combined segment, so later malformed raw can still be trimmed.
+
+- **P2** [src/metal/metal_server.cpp:2024](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:2024): streaming `/v1/responses` does not get the end-of-turn truncation repair. A max-token-truncated tool wrapper is flushed as `TOOL`, then [2025](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:2025) calls streaming `flush_tool()` with no `final_turn`; [1982-1988](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1982) parses once and commits malformed raw. The later recovery scans only `text_accum` at [2028-2034](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:2028), and `text_accum` is populated only on the text path at [2007-2008](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:2007), so the truncated tool raw never reaches repair.
+
+**Verified**
+- Non-streaming `wrapped-call -> text` and `wrapped-call -> think` preserve model order via `flush_tool(false)` before text/think accumulation at [1886-1893](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1886).
+- Non-streaming end-of-turn `flush_tool(true)` then `flush_text(true)` does not double-flush because malformed `flush_tool` clears `tool_buf` and `flush_text` clears `text` at [1865-1875](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1865), then [1903-1905](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1903) sees empty state.
+- Definition order is correct: `flush_text` is defined at [1829](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1829), `flush_tool` at [1865](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1865), `route` at [1880](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1880).
+- The natural-segment `tx=pre` coarseness is indeed the same convention as chat/Anthropic: [1371-1375](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1371) and [1552-1556](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1552).
+
+**Verdict:** P1 none. P2 two. P3 none.
+tokens used
+45,793
+**Findings**
+- **P2** [src/metal/metal_server.cpp:1881](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1881): adjacent `<tool_call>` wrappers can still be folded into one `tool_buf`. The `TOOL` branch only appends and returns; it only flushes a pending tool on a later non-`TOOL` channel at [1886](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1886). That means `malformed -> malformed` is not guaranteed to become two committed segments. If recovery finds a call in the combined raw, [1851-1857](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1851) applies `tx=pre` to the combined segment, so later malformed raw can still be trimmed.
+
+- **P2** [src/metal/metal_server.cpp:2024](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:2024): streaming `/v1/responses` does not get the end-of-turn truncation repair. A max-token-truncated tool wrapper is flushed as `TOOL`, then [2025](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:2025) calls streaming `flush_tool()` with no `final_turn`; [1982-1988](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1982) parses once and commits malformed raw. The later recovery scans only `text_accum` at [2028-2034](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:2028), and `text_accum` is populated only on the text path at [2007-2008](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:2007), so the truncated tool raw never reaches repair.
+
+**Verified**
+- Non-streaming `wrapped-call -> text` and `wrapped-call -> think` preserve model order via `flush_tool(false)` before text/think accumulation at [1886-1893](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1886).
+- Non-streaming end-of-turn `flush_tool(true)` then `flush_text(true)` does not double-flush because malformed `flush_tool` clears `tool_buf` and `flush_text` clears `text` at [1865-1875](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1865), then [1903-1905](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1903) sees empty state.
+- Definition order is correct: `flush_text` is defined at [1829](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1829), `flush_tool` at [1865](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1865), `route` at [1880](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1880).
+- The natural-segment `tx=pre` coarseness is indeed the same convention as chat/Anthropic: [1371-1375](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1371) and [1552-1556](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1552).
+
+**Verdict:** P1 none. P2 two. P3 none.

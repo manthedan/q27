@@ -598,11 +598,16 @@ inline void scan_namedropped(const std::string& text, const json* tools,
 // objects anywhere in the text are collected (skipping unbalanced wrappers
 // like the literal {"tool_call": opener, which nets +1 depth per blob and
 // never closes); a trailing truncated {"name" candidate gets framing repair
-// (close open string, strip junk tags, close braces). prefix = text before
-// the first recovered call. `tools` (optional) enables mode-6 name inference.
+// ONLY when allow_trunc_repair (the default) — repair is semantically an
+// end-of-turn rescue, so callers scanning mid-turn segments (responses
+// per-segment recovery) pass false: a segment boundary is not a truncation
+// and inventing framing there false-positives prose fragments into calls
+// (codex P2, 2026-07-17). prefix = text before the first recovered call.
+// `tools` (optional) enables mode-6 name inference.
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
-                                                   const json* tools = nullptr) {
+                                                   const json* tools = nullptr,
+                                                   bool allow_trunc_repair = true) {
     std::vector<ToolCall> out;
     if (tool_strict()) {
         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
@@ -660,9 +665,10 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         }
         if (end == std::string::npos) {
             // unbalanced to EOF: repair only a {"name" candidate (truncated
-            // final call); otherwise keep scanning inner objects. `san` holds
+            // final call), and only when the caller guarantees the buffer is
+            // end-of-turn; otherwise keep scanning inner objects. `san` holds
             // the sanitized remainder (scan ran to EOF).
-            if (san.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
+            if (!allow_trunc_repair || san.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
             std::string r = san;
             while (true) {
                 size_t e2 = r.find_last_not_of(" \t\r\n");
