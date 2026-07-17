@@ -525,8 +525,9 @@ int run_official_probe(q27::MetalBackend& backend, int reps, int q4_candidate) {
         printf("q4-round candidate %d arm (%s): affected shapes run matvec_q4_probe; "
                "the ffn sibling pair runs as two probe singles\n", q4_candidate,
                q4_candidate == 1 ? "production kernels through the probe path" :
-               q4_candidate == 2 ? "q4 2 rows/simdgroup" :
-               q4_candidate == 3 ? "q4 4 rows/simdgroup" : "q8 4 rows/simdgroup");
+               q4_candidate == 2 ? "q4 2 rows/simdgroup (retained comparison arm)" :
+               q4_candidate == 3 ? "q4 4 rows/simdgroup (promoted production, alias)" :
+                                   "q8 r4 twin (KILLED 2026-07-17 — backend throws)");
     double total_q_bytes = 0.0;
     for (const ProbeShape& p : probes)
         total_q_bytes += (double)weight_bytes(p.shape) * p.per_token_count;
@@ -787,7 +788,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--q4-candidate" && i + 1 < argc) {
             q4_candidate = atoi(argv[++i]);
             if (q4_candidate < 1 || q4_candidate > 4) {
-                fprintf(stderr, "invalid --q4-candidate (1=production 2=r2 3=r4 4=q8_r4)\n");
+                fprintf(stderr, "invalid --q4-candidate (1=production 2=r2 3=production-alias; 4 was killed 2026-07-17)\n");
                 return 1;
             }
         } else if (!arg.empty() && arg[0] != '-') {

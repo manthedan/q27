@@ -73,8 +73,9 @@ class MetalBackend final : public ComputeBackend {
     // Q4 rewrite-round candidate arms (bench-only, docs/plans/2026-07-17-
     // q4-rewrite-round.md): candidate 1 = the production kernel through the
     // probe path (A/B parity in one code path; Q4 or Q8 weight), 2 = Q4
-    // 2-rows-per-simdgroup, 3 = Q4 4-rows, 4 = Q8 4-rows (the A' twin;
-    // 2-3 require Q4_G64, 4 requires Q8_G128). Same validation as
+    // 2-rows-per-simdgroup (retained comparison arm), 3 = alias of the
+    // production kernel (r4 was promoted, 2026-07-17), 4 = THROWS (the A'
+    // Q8 twin was killed by measurement — round doc RESULTS). Validation as
     // matvec_quantized; candidate PSOs build lazily on first call, so
     // production startup never creates them. Never engine-routed.
     void matvec_q4_probe(int candidate, const BackendTensor& weight,

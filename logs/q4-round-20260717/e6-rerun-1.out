@@ -1,0 +1,12 @@
+ffn down      [5120x17408]     q4     0.959        -    49.40 |    0.258    91.64 |  0.539  22.0%
+gdn qkv       [10240x5120]     q4     0.338        -    82.38 |    0.226    61.72 |  1.335   9.7%
+gdn gate      [6144x5120]      q4     0.211        -    79.11 |    0.137    60.93 |  1.298   5.8%
+ssm/attn out  [5120x6144]      q4     0.240        -    69.49 |    0.168    49.63 |  1.400   7.8%
+attn q        [12288x5120]     q4     0.490        -    68.16 |    0.327    51.11 |  1.334   3.9%
+attn k/v      [1024x5120]      q8     0.097        -    54.74 |    0.036    38.98 |  1.404   1.2%
+output head   [151936x5120]    q8     9.268        -    85.24 |    3.406    99.14 |  0.860   5.7%
+identity: single and pair kernels match their CPU int8-activation models on all shapes, <= 1e-3 max rel;
+distance to the float dequantize-dot reference max rel 2.836e+00 (activation-quantization cost, reported not gated)
+per-token GEMV wall over the mix: 186.45 ms (5.4 tok/s GEMV-bound); at T2-reference parity: 190.93 ms (5.2 tok/s)
+R = 1.024 (official mix 73.99 GB/s byte-weighted / same-run T2 reference 72.25 GB/s)
+verdict: KILL the rewrite (R >= 0.90) — even perfect parity buys <= 11% wall, below the cost of a kernel round plus regate
