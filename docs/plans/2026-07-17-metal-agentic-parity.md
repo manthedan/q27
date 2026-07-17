@@ -1,11 +1,11 @@
 # Metal server agentic parity — pre-registration (2026-07-17)
 
-Daniel's go 2026-07-17 ("Go for the parity pass") on the external review's
+the operator's go 2026-07-17 ("Go for the parity pass") on the external review's
 seven agentic blockers, all source-confirmed, plus the eighth found in
 verification: the OpenAI chat endpoint (pi's API) also returns no structured
 tool_calls — the model's <tool_call> XML arrives as plain content text, so
 pi's tool loop cannot execute reads/edits at all. README wording is out of
-scope per Daniel ("you can ignore the readme changes").
+scope per the operator ("you can ignore the readme changes").
 
 ## Scope
 
@@ -75,11 +75,11 @@ Live gates (tools/agentic_parity_gate.sh against the T2 server, ctx 131072,
   prefix-cache hit proves the stamp was canonicalized; run as a
   consecutive pair, cache capacity is 1).
 - **G8 pi smoke**: non-interactive pi run against provider q27-metal
-  executes a real read-tool loop end-to-end (the retry Daniel planned,
+  executes a real read-tool loop end-to-end (the retry the operator planned,
   scripted).
 
 No timing claims this round; all legs contention-tolerant. Server restart
-(same launch line, new binary) is part of the pass per Daniel's go.
+(same launch line, new binary) is part of the pass per the operator's go.
 
 ## RESULTS (2026-07-17, 24 GB M4, T2 @ 131072/--suffix 32 on :8213 — logs/agentic-parity-20260717/)
 

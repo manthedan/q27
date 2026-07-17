@@ -1,7 +1,7 @@
 # Upstream PR queue — approved in principle, HELD until the fork is further along
 
 Status: RECORDED 2026-07-16 night. The maintainer has approved the idea
-(merge-back / contributions conversation, Daniel-relayed); Daniel's
+(merge-back / contributions conversation, operator-relayed); the operator's
 explicit call: **do not open PRs yet** — wait until our project is
 further along. This doc is the queue so nothing is lost in the meantime.
 
@@ -33,7 +33,7 @@ further along. This doc is the queue so nothing is lost in the meantime.
 - Format dtypes 6 (`B1_G128`) / 7 (`Q4_1_G32`) registry coordination —
   only matters once merge-back is real.
 
-## Unhold criteria (Daniel decides; suggestions)
+## Unhold criteria (the operator decides; suggestions)
 
 The fork reads "further along" when: suffix-burst economics measured
 (gate 6), official-tier multislot gates run, Homebrew v0.1.0 tagged and

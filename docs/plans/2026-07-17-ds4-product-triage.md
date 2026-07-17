@@ -1,11 +1,11 @@
 # ds4 product/quant/process triage — the layers the kernel survey never read
 
-**Status: TRIAGED (2026-07-17, Daniel's analysis + review).** The
+**Status: TRIAGED (2026-07-17, the operator's analysis + review).** The
 2026-07-15 ds4 survey covered kernels and infra only (352 lines, nothing
 on the agent product, quant tooling, or process files). This doc records
 verdicts on the rest of ds4 so each import/skip is traceable. The one
 big item — the native in-process agent direction — gets its own design
-doc: `2026-07-17-native-agent-direction.md` (**Daniel's decision: worth
+doc: `2026-07-17-native-agent-direction.md` (**the operator's decision: worth
 trying, DEFERRED until the engine is stable**).
 
 ## ADOPT NOW (small, no product-direction decision required)

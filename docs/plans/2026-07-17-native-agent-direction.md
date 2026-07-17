@@ -1,6 +1,6 @@
 # Native agent direction — in-process coding agent with KV-as-session
 
-**Status: DESIGN, DEFERRED (2026-07-17, Daniel: "worth trying the native
+**Status: DESIGN, DEFERRED (2026-07-17, operator: "worth trying the native
 direction later, once everything is stable"). No code. Do not start
 before the stability gate below.** Reference: ds4-agent (ds4_agent.c,
 ~10.2K lines) — triaged in `2026-07-17-ds4-product-triage.md` (N1).

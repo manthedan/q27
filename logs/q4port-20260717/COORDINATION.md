@@ -32,7 +32,7 @@ was already healthy on :8213 and serving gates.
 
 ## State of play (2026-07-17 12:05, pi session)
 
-- Serving instance is DOWN (it is Daniel's pi backend; bring it back per
+- Serving instance is DOWN (it is the operator's pi backend; bring it back per
   the protocol above once the box is calm — exact env in
   `tools/quiet_q4_bench.sh:start_server`).
 - The residue-round binary (build 11:48, round-3 codex fix in

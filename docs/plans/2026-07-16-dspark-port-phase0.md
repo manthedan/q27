@@ -1,6 +1,6 @@
 # DSpark port — Phase 0: contract, repack, and gate design (no engine code)
 
-**RESOLVED (2026-07-16 evening, Daniel-authorized Phase-2 legs): the
+**RESOLVED (2026-07-16 evening, operator-authorized Phase-2 legs): the
 pre-registered Phase-3 gate fires PARK — decisively.** Leg B
 (`logs/dspark-phase2-20260716/`, fork harness `test-dspark-real-eval`, T2
 target + drafter, 24 prompts / 712 rounds / 2,285 tokens): **τ = 3.209

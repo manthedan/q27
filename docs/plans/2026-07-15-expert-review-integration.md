@@ -8,7 +8,7 @@ Apple Silicon characterization — NOT our Metal ledgers/plans. Where they
 independently reconstructed our own conclusions from first principles,
 that's meaningful confirmation; where they guessed at gaps we've already
 closed, corrections are listed at the bottom. This doc distills the review
-into deltas against existing plan docs. Full response text is with Daniel.
+into deltas against existing plan docs. Full response text is with the operator.
 
 ## Independent confirmations (no action; confidence++)
 

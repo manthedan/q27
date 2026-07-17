@@ -1,6 +1,6 @@
 # Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, QUEUED not started)
 
-k3 roadmap item #2, adopted 2026-07-17 (Daniel: "sounds good, do it" —
+k3 roadmap item #2, adopted 2026-07-17 (operator: "sounds good, do it" —
 queued behind the funded kernel rounds and the fp8-KV control arm). The
 last artifact-level lever needing no kernel work: B1 (3.79 GB) carries
 ~1.05–1.16× PPL vs T2 (7.15 GB); if a small tensor set drives the gap, a
@@ -31,7 +31,7 @@ Zoom to per-tensor only inside the classes the first pass indicts.
   ≥ 15% of the B1→T2 NLL gap at ≤ 10% of the byte cost of full T2.
 - Mixed-pack ship bands (carried from the tier ladder discipline):
   NLL mixed/T2 ≤ 1.06 at ≤ 5.0 GB → ship as a tier; 1.06–1.12 →
-  conditional (report, Daniel decides); > 1.12 → the gap is diffuse,
+  conditional (report, the operator decides); > 1.12 → the gap is diffuse,
   record and close (that is itself the answer: B1's 16% is not
   concentrated, and the two-tier ladder stands).
 - Every shipped pack passes the suffix byte-identity battery and the

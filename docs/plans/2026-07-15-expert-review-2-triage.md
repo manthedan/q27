@@ -5,7 +5,7 @@
 finding against source at `38c744a` and records what was **overtaken by the
 mini's same-day landings** (the review snapshot predates c514714..38c744a:
 Phase B kill, R1 park, R1b graduation, R2 probe). Full review text is with
-Daniel. Statuses: CONFIRMED (verified in source), ADOPT (design/process
+the operator. Statuses: CONFIRMED (verified in source), ADOPT (design/process
 change accepted), OVERTAKEN (resolved by measurement before the review
 arrived), PARKED-AGREED.
 

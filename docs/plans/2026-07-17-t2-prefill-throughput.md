@@ -1,8 +1,8 @@
-# T2 chunked-prefill throughput — measurement pre-registration (2026-07-17 night; Daniel's go: "yes, please try to fix")
+# T2 chunked-prefill throughput — measurement pre-registration (2026-07-17 night; the operator's go: "yes, please try to fix")
 
 ## The finding (live serving, 24 GB M4)
 
-Daniel's first real pi.dev request ("yo" + pi's ~14 KB system prompt + 6
+the operator's first real pi.dev request ("yo" + pi's ~14 KB system prompt + 6
 tools = **8,355 prompt tokens**) appeared hung. Captured the exact body and
 timed it against the T2 server: **prefill 8,355 tokens in 4:44 at
 --ctx 131072 and 5:23 at --ctx 16384** — ≈ **28 tok/s, ctx-independent**,
@@ -92,4 +92,53 @@ ships nothing and records the honest table. Note the summation-order
 contract must be checked against the chunk-parity gate's expectations
 before promotion (byte-identity vs the old MM kernel is NOT expected).
 Beneficiary is the official tier (T2 serving is unaffected); queued behind
-Daniel's go alongside B1 select round 2.
+the operator's go alongside B1 select round 2.
+
+## Port round RESULTS (2026-07-17 morning, the operator's go: "run official q4 port")
+
+Contract check first: no standing gate expects byte-identity of GEMM output
+vs the old kernel — the shape suite is tolerance-gated vs the serial GEMV,
+`--chunk-parity` compares widths of the SAME engine build (both on the new
+kernel), and the bit-exact contracts (GDN replay) don't touch projections.
+Clear to proceed.
+
+**Q4 half kernel (`q27_matmul_q4_mm_h`) — all correctness gates PASS:**
+
+- Written as the mechanical G′ transplant of `q27_matmul_t2_mm_h` (half
+  tiles, raw ints, float mixed-MMA accumulators, 64-K staged tiles, two
+  accumulator pairs, one flush barrier region) with the Q4 deltas: weight
+  stride cols/2, uint2 loads, 256-entry half2 nibble-pair LUT (low nibble
+  first, generated not hand-typed), scale group 64 cols = exactly one K-tile
+  (index c0/64). Numerics are STRONGER than the float-staged kernel it
+  replaces: products bounded by 8×128 = 1024 < 2048 are exact in half
+  wherever the MMA rounds, and the old per-value activation staging round
+  disappears.
+- `test_matmul_shape` suite: PASS both `Q27_METAL_GEMM_HALF` settings
+  (true exit codes checked, per the masked-failure lesson).
+- `--chunk-parity 384` on the official artifact: widths 17/48/96
+  bit-identical to width 12 — every metric exactly zero, exit 0.
+- 8K NLL A/B (wikitext-2, `--nll-long 8192 --ctx 8192`): float
+  1.5742/1.9217 (0-2k/2k-8k) vs half 1.5742/1.9218 — ΔNLL +0.005%,
+  two orders inside the ±0.5% gate.
+- Codex autoreview: clean, no P1/P2/P3 (static; suite runs done locally).
+
+**Q8 half kernel — FAILED and PARKED (the empirical answer to the open
+product-precision question):** `q27_matmul_q8_mm_h` missed the shape-suite
+bound at the high-cancellation 33×5120 repro (5.5e-4 vs 3e-4). Q8 products
+(up to 127×127) exceed half's 2048 exact-integer range, and the failure
+shows the mixed-precision MMA rounds products at HALF precision, not at
+the float accumulator's — Q4/T2/B1 are immune (products ≤ 1024). Q8
+stays float-staged (~8% of wall; a split-nibble staging would restore
+exactness at 2× the MMA work — not worth it). Kernel kept in the .metal,
+never routed, verdict in its comment.
+
+**Ship-line bench: PENDING QUIET MACHINE — commit HELD.** the operator was
+actively using the box (WindowServer ~30%, Brave ~25%) and the timing legs
+were uninterpretable: the float baseline itself swung 23.44 → 18.26 tok/s
+between runs; half read 21.39/18.69/20.76 across three runs (a 960-token
+profiled pair suggested ~1.35×, hot 8352 back-to-back ~1.0×). Per the
+pre-registered band ("8352/96, quiet"), no promotion on contaminated
+numbers: a watcher (verdict file logs/q4port-20260717/quiet_bench.verdict)
+waits for ≥10 min input idle, stops the T2 server, runs float/half at 8352
+(×2) and 960, restarts the server. ≥1.7× ships default-ON; <1.7× ships
+nothing but the parked kernels + this honest table, per the kill line.

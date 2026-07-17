@@ -2,7 +2,7 @@
 
 Status: PRE-REGISTERED before measurement (results appended below the
 line). Machine: 24 GB M4 (T2 for correctness gates; official tier + timing
-on a quiet machine, Daniel-authorized). Follow-on from the day's two
+on a quiet machine, operator-authorized). Follow-on from the day's two
 closures: DSpark PARKED (2026-07-16-dspark-port-phase0.md — every drafter
 shape now measured dead on M4) and lever 2 LANDED (S(48) = 3.94×,
 w ∈ {16,32,48} full-tile sweet spots). Suffix bursts are the named w=48
@@ -101,7 +101,7 @@ bursts); P2 tool-constraint rejection at driver entry AND in suffix_round
 (burst argmax is unmasked; same contract as GPU-resident greedy). Codex
 found no state/position/KV divergence vs the serial walk. Correctness
 gates 2–4 staged in `tools/suffix_burst_gates_2026-07-16.sh` — **runs on
-Daniel's go** (T2, ~7.15 GB, correctness class, desktop-contention
+the operator's go** (T2, ~7.15 GB, correctness class, desktop-contention
 tolerant); gate 6 timing needs the quiet machine.
 
 ## Kill lines
@@ -121,7 +121,7 @@ revival (parked with prejudice this morning).
 
 ---
 
-## RESULTS (2026-07-16 night, quiet 24 GB M4, Daniel-provided quiet window) — SHIP LINE MET
+## RESULTS (2026-07-16 night, quiet 24 GB M4, operator-provided quiet window) — SHIP LINE MET
 
 Gates 2–4 + 6 all PASS (`logs/suffix-gates-20260716/verdicts.txt`):
 byte identity across --suffix-serial 12 / --suffix 16/32/48 and both

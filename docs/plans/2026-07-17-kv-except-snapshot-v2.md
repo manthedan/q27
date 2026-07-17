@@ -1,7 +1,7 @@
 # KV exception snapshot v2: side caches join all three snapshot surfaces
 
 Status: PRE-REGISTERED before implementation (2026-07-17, mini).
-Daniel funded L7-full as the production config ("fund full l7") and then
+the operator funded L7-full as the production config ("fund full l7") and then
 "do v2" — remove the v1 exclusion that refuses snapshots under
 `Q27_METAL_KV_FP16_CELLS`, so the funded quality config regains the
 prefix cache (TTFT) and the disk snapshot tier. Parent:

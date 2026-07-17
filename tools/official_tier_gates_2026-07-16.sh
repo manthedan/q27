@@ -1,6 +1,6 @@
 #!/bin/sh
 # Official-tier gate backlog — 24 GB M4 ONLY (17 GiB artifact pages; nothing
-# else may touch the GPU). STAGED 2026-07-16; run only on Daniel's explicit go:
+# else may touch the GPU). STAGED 2026-07-16; run only on the operator's explicit go:
 #   caffeinate -dims sh tools/official_tier_gates_2026-07-16.sh
 #
 # Backlog items covered (chronicle refs in parentheses):

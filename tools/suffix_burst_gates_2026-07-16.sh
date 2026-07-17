@@ -1,7 +1,7 @@
 #!/bin/bash
 # Suffix-burst batched-verify correctness gates (2026-07-16-suffix-burst-verify.md
 # gates 2-4). T2 artifact, ~7.15 GB, one model load per leg, legs strictly
-# serial. STAGED — run only on Daniel's go. Timing legs are NOT here (quiet
+# serial. STAGED — run only on the operator's go. Timing legs are NOT here (quiet
 # machine; gate 6 has its own leg once these pass).
 set -u  # no -e: each gate checks its own exit and the verdict file decides
 cd "$(dirname "$0")/.."

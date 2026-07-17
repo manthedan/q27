@@ -1,6 +1,6 @@
 # Verify round cost: cut the flat ~430 ms that prices all speculation
 
-**Status: P0 DONE (2026-07-16, 24 GB M4, Daniel-authorized "go quick") — hypothesis
+**Status: P0 DONE (2026-07-16, 24 GB M4, operator-authorized "go quick") — hypothesis
 CONFIRMED at 97.5%; levers 1–2 stand, lever 3 formally dead. Kernel work not
 started.** Machine: mac-mini (T2 artifact suffices; every gate here runs on it). Follow-on from Gate 0
 (`2026-07-15-sibling-drafter-probe.md` §Gate 0 result): oracle rounds cost
