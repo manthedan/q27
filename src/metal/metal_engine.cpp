@@ -345,8 +345,11 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
         if (codec == "e4m3") {
             if (kv_fp16_except_)
                 kv_fp16_side_codec_ = 1;
-            else if (!getenv("Q27_METAL_KV_FP16_CELLS"))
-                throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC=e4m3 needs Q27_METAL_KV_FP16_CELLS (nothing to encode)");
+            else if (turbo3_kv_ || !getenv("Q27_METAL_KV_FP16_CELLS"))
+                // Covers the EMPTY cells list on turbo3 too: an explicitly
+                // requested e4m3 arm must never silently degrade to plain
+                // turbo3 (vacuous-instrument class; codex P2 on d9ee75a).
+                throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC=e4m3 needs a non-empty Q27_METAL_KV_FP16_CELLS (nothing to encode)");
             // else: fp16-KV engine — the cells env was ignored above (with
             // its note), so the codec rides along ignored too; the kl-kv
             // baseline engine shares the subject's process environment.
@@ -860,6 +863,17 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
                     put_side_blob(*side.k, side_active);
                     put_side_blob(*side.v, side_active);
                 }
+            // Codec trailer, e4m3 sides only (codex P2 on d9ee75a): a
+            // reserved bit alone cannot stop a PRE-codec binary from
+            // silently continuing an e4m3 history with fp16 stores — this
+            // extra blob trips that binary's own trailing-bytes check
+            // loudly. fp16-side files carry no trailer, so they stay
+            // loadable across the version boundary.
+            if (kv_fp16_side_codec_) {
+                const uint64_t codec_bytes = sizeof kv_fp16_side_codec_;
+                snap_write(f, &codec_bytes, sizeof codec_bytes, tmp);
+                snap_write(f, &kv_fp16_side_codec_, codec_bytes, tmp);
+            }
         }
         // Test-only failpoints for the snapshot crash gate
         // (tools/snapshot_gate.sh); read fresh each save.
@@ -959,7 +973,7 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         // streams into a shared buffer; Mask is host data whose CONTENT is
         // validated in pass 1 (equal-length cell lists differ only there);
         // Side bounces through staging into a private buffer.
-        struct BlobRef { BackendBuffer* buf; uint64_t bytes; enum Kind { Std, Mask, Side } kind; };
+        struct BlobRef { BackendBuffer* buf; uint64_t bytes; enum Kind { Std, Mask, Side, Codec } kind; };
         std::vector<BlobRef> blobs;
         for (uint32_t i = 0; i < N_LAYER; i++) {
             LayerState& d = layers_[i];
@@ -980,12 +994,23 @@ uint32_t MetalEngine::load_state(const std::string& path) {
                     blobs.push_back({side.k.get(), side_active, BlobRef::Side});
                     blobs.push_back({side.v.get(), side_active, BlobRef::Side});
                 }
+            // e4m3 sides carry a codec trailer (see save_state); its
+            // absence/presence is already pinned by reserved bit 2, its
+            // CONTENT is checked like the mask blob's.
+            if (kv_fp16_side_codec_)
+                blobs.push_back({nullptr, sizeof kv_fp16_side_codec_, BlobRef::Codec});
         }
         auto check_mask = [&]() {
             uint8_t stored_masks[sizeof kv_fp16_head_masks_];
             snap_read(f, stored_masks, sizeof stored_masks, path);
             if (memcmp(stored_masks, kv_fp16_head_masks_, sizeof stored_masks) != 0)
                 throw std::runtime_error("q27 Metal: snapshot KV fp16 exception cells do not match this engine (Q27_METAL_KV_FP16_CELLS): " + path);
+        };
+        auto check_codec = [&]() {
+            uint32_t stored_codec = 0;
+            snap_read(f, &stored_codec, sizeof stored_codec, path);
+            if (stored_codec != kv_fp16_side_codec_)
+                throw std::runtime_error("q27 Metal: snapshot side-cache codec does not match this engine (Q27_METAL_KV_CELLS_CODEC): " + path);
         };
         const off_t blob_start = ftello(f);
         // Real file size up front: fseeko past EOF succeeds silently, so the
@@ -1005,9 +1030,10 @@ uint32_t MetalEngine::load_state(const std::string& path) {
             expected_end += sizeof stored + stored;
             if (expected_end > (uint64_t)file_size)
                 throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
-            // Mask content is part of pass-1 validation: a mismatched cell
-            // list must reject BEFORE pass 2 writes any standard blob.
+            // Mask/codec content is part of pass-1 validation: a mismatch
+            // must reject BEFORE pass 2 writes any standard blob.
             if (blob.kind == BlobRef::Mask) check_mask();
+            else if (blob.kind == BlobRef::Codec) check_codec();
             else if (fseeko(f, (off_t)stored, SEEK_CUR) != 0)
                 throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
         }
@@ -1028,6 +1054,7 @@ uint32_t MetalEngine::load_state(const std::string& path) {
             if (stored != blob.bytes)
                 throw std::runtime_error("q27 Metal: snapshot changed during load: " + path);
             if (blob.kind == BlobRef::Mask) { check_mask(); continue; }
+            if (blob.kind == BlobRef::Codec) { check_codec(); continue; }
             for (uint64_t off = 0; off < blob.bytes; off += stage.size()) {
                 const uint64_t n = std::min<uint64_t>(stage.size(), blob.bytes - off);
                 snap_read(f, stage.data(), n, path);
