@@ -1,0 +1,3 @@
+Post-rebase re-verification (mini lane merged: E2 per-engine GQA partials, ABI 10, Responses preamble hardening):
+make test-metal green; full agentic_parity_gate.sh ALL PASS; pi read-tool smoke PASS.
+See session gate output archived below (identical PASS set to gates-final.out).

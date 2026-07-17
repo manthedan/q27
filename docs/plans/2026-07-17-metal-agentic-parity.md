@@ -111,6 +111,13 @@ P3 per-endpoint max_tokens defaults now mirror CUDA (messages 1024,
 completions/chat 256, responses 4096 — was a uniform 128); P3 the streaming
 OpenAI gate now validates the full tool_calls chunk wire shape.
 
+Post-rebase note: the mini's lane landed mid-round (E2 per-engine GQA
+partials, SHADER_ABI 10, its own /v1/responses tools-preamble hardening);
+after rebasing onto it the two /v1/responses changes compose (mini's
+preamble prepend feeds my context preflight), test-metal, the full gate
+battery, and the pi smoke were re-run green on the merged binary
+(gates-postmerge-note.out).
+
 Registered residue: /v1/responses structured function_call items (CUDA
 reference exists; no codex traffic on this box); error-class split on
 /v1/messages (engine failures still map to invalid_request_error 400 rather
