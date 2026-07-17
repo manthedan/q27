@@ -373,6 +373,9 @@ struct Runtime {
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
     DiskSnapshotStore snapstore;
+    // Auto-snapshot threshold in prompt tokens (0 = hint-only); set with
+    // the snapshot store, meaningful only when snapstore.enabled().
+    size_t snap_auto_min=0;
 
     Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
             uint32_t width,uint32_t sfx_width,size_t cache_entries,bool constrain,
@@ -457,8 +460,25 @@ struct Runtime {
             if(!slots[0]->engine.chunked_prefill())
                 fprintf(stderr,"prefix-snapshots: WARNING — no chunked prefill on this device; "
                         "\"snapshot\" hints are ignored (loads still served)\n");
-            fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB, tag %s\n",
-                    sdir,(unsigned long long)snap_mb,tag);
+            // Auto-snapshot threshold (2026-07-17 T2 prefill finding,
+            // docs/plans/2026-07-17-t2-prefill-throughput.md): chunked
+            // prefill is compute-mature at ~28-40 tok/s on the M4, so a
+            // large agentic prompt (pi ~8.4K tokens, CC larger) costs
+            // minutes of TTFT — and real agent clients never send the
+            // "snapshot" hint. With the snapshot dir already opted in,
+            // prompts at/above the threshold behave as hinted; the existing
+            // covered-prefix skip and LRU budget bound the write traffic.
+            // Q27_METAL_SNAPSHOT_AUTO overrides (tokens; 0 disables auto).
+            snap_auto_min=4096;
+            if(const char* sauto=getenv("Q27_METAL_SNAPSHOT_AUTO"); sauto && *sauto) {
+                char* end=nullptr; errno=0;
+                const unsigned long long v=strtoull(sauto,&end,10);
+                if(errno || end==sauto || *end || v>(1ull<<24))
+                    throw std::runtime_error("Q27_METAL_SNAPSHOT_AUTO must be an integer 0..16777216");
+                snap_auto_min=(size_t)v;
+            }
+            fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB, auto>=%zu tokens, tag %s\n",
+                    sdir,(unsigned long long)snap_mb,snap_auto_min,tag);
         }
         if(constrain_tools) {
             vocab_bytes_v=tokenizer.vocab_bytes();
@@ -629,8 +649,20 @@ struct Runtime {
         // (the question-specific suffix) and align down to a 96-token
         // prefill-chunk boundary. Reached exactly by capping one chunk's
         // width; skipped when the restored prefix already covers it.
+        //
+        // Auto-save (snap_auto_min) rides the same machinery. Two codex P2s
+        // on this, recorded: (a) same-path save collisions are lease-
+        // serialized — save_state only ever runs under a Lease::Guard, so
+        // the worst case is a redundant rewrite of an identical file, not a
+        // torn .tmp; (b) a non-repeating large-prompt workload pays one
+        // ~1.3 GB write (+~15 s under the lease) per unique prefix — the
+        // LRU budget bounds retention, not write churn. This box serves
+        // repeated agent prefixes, where the trade wins; churn-sensitive
+        // deployments set Q27_METAL_SNAPSHOT_AUTO=0 (hint-only).
         size_t save_at=0;
-        if(snapshot_hint && !mtp && snapstore.enabled() && engine.chunked_prefill() &&
+        const bool snap_wanted=snapshot_hint ||
+                               (snap_auto_min && prompt.size()>=snap_auto_min);
+        if(snap_wanted && !mtp && snapstore.enabled() && engine.chunked_prefill() &&
            prompt.size()>32+96) {
             const size_t target=(prompt.size()-32)/96*96;
             if(target>hit) save_at=target;
