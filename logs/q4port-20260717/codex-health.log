@@ -1,0 +1,921 @@
+OpenAI Codex v0.144.0
+--------
+workdir: /Users/macthedan/projects/q27
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019f7224-4d5e-7620-80e7-4c5a5679ce04
+--------
+user
+Review the uncommitted changes in src/metal/metal_server.cpp (git diff — small). Change: homebrew plan Q2 server identity — Runtime stores model_name (basename of the model artifact path, std::filesystem::path(model).filename()), /health now returns {"status":"ok","model":<name>} (was {"status":"ok"}), and the --trace boot event carries the model name. Verify: /health clients that parse the old shape are unaffected (additive field); the handler's new &runtime capture is safe (runtime outlives the server); no other /health consumer in-repo breaks (check tools/*.sh and QA doc expectations); the change cannot throw (std::filesystem::path::filename on an arbitrary string). P1/P2/P3 verdicts.
+
+codex
+I’ll review this as a diff/code-review pass, focusing on the exact safety and compatibility claims you listed. I’ll inspect the changed file plus in-repo health consumers and docs before giving P1/P2/P3 findings.
+exec
+/bin/zsh -lc 'git diff -- src/metal/metal_server.cpp' in /Users/macthedan/projects/q27
+exec
+/bin/zsh -lc 'git status --short' in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-gnLW5oL1' (errno=Operation not permitted)
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-hfLCSMq6' (errno=Operation not permitted)
+diff --git a/src/metal/metal_server.cpp b/src/metal/metal_server.cpp
+index 346082c..c926318 100644
+--- a/src/metal/metal_server.cpp
++++ b/src/metal/metal_server.cpp
+@@ -440,6 +440,7 @@ struct Runtime {
+     q27::ToolMaskCache mask_cache;
+     DiskSnapshotStore snapstore;
+     TraceLog trace;
++    std::string model_name;
+     // Auto-snapshot threshold in prompt tokens (0 = hint-only); set with
+     // the snapshot store, meaningful only when snapstore.enabled().
+     size_t snap_auto_min=0;
+@@ -449,6 +450,9 @@ struct Runtime {
+             uint32_t slot_count)
+         :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
+          constrain_tools(constrain) {
++        // Server identity (homebrew plan Q2): /health and the boot trace name
++        // the resident artifact so wrapper/clients can tell what's loaded.
++        model_name=std::filesystem::path(model).filename().string();
+         if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
+             throw std::runtime_error("tokenizer/model vocabulary mismatch");
+         shared=q27::MetalEngine::open_shared(model);
+@@ -1208,7 +1212,8 @@ int main(int argc,char** argv) {
+         if(!trace_path.empty()) {
+             runtime.trace.open(trace_path);
+             runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
+-                                 {"mtp",width},{"suffix",suffix_width},{"slots",slot_count}});
++                                 {"mtp",width},{"suffix",suffix_width},{"slots",slot_count},
++                                 {"model",runtime.model_name}});
+         }
+         httplib::Server server;
+         // Bound the accept-side queue (codex P1 on d243f92): the default
+@@ -1220,7 +1225,7 @@ int main(int argc,char** argv) {
+         // wait while one generated (G6 found this). The 32-connection accept
+         // queue stays the outer bound.
+         server.new_task_queue=[]{ return new httplib::ThreadPool(16,32); };
+-        server.Get("/health",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"}});});
++        server.Get("/health",[&runtime](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"},{"model",runtime.model_name}});});
+         // Wait honesty (Phase 1 contract): per-arrival-phase stats. Gate
+         // wait (admission -> first lease) carries the one-quantum bound;
+         // queue wait (arrival -> admission) is bounded only by QUEUE_MAX
+
+ succeeded in 0ms:
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-yGqIga4A' (errno=Operation not permitted)
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-ILneZqKS' (errno=Operation not permitted)
+ M src/metal/metal_backend.mm
+ M src/metal/metal_server.cpp
+ M src/metal/q27_kernels.metal
+?? bonsai-27b-whitepaper.pdf
+?? data/
+?? logs/dspark-phase2-20260716/fixtures/round-0000-seq0.bin
+?? logs/dspark-phase2-20260716/fixtures/round-0001-seq0.bin
+?? logs/dspark-phase2-20260716/fixtures/round-0002-seq0.bin
+?? logs/dspark-phase2-20260716/fixtures/round-0003-seq0.bin
+?? logs/dspark-phase2-20260716/fixtures/round-0004-seq0.bin
+?? logs/dspark-phase2-20260716/fixtures/round-0005-seq0.bin
+?? logs/dspark-phase2-20260716/fixtures/round-0006-seq0.bin
+?? logs/q4port-20260717/agentic-gates-cancel.log
+?? logs/q4port-20260717/agentic-gates-health.log
+?? logs/q4port-20260717/agentic-gates-p2fix.log
+?? logs/q4port-20260717/agentic-gates-p2fix3.log
+?? logs/q4port-20260717/agentic-gates-p2fix4.log
+?? logs/q4port-20260717/agentic-gates-p2fix5.log
+?? logs/q4port-20260717/agentic-gates-trace.log
+?? logs/q4port-20260717/agentic-gates-trace2.log
+?? logs/q4port-20260717/agentic-gates-trace3.log
+?? logs/q4port-20260717/chunk_parity_half.log
+?? logs/q4port-20260717/codex-cancel.log
+?? logs/q4port-20260717/codex-health-prompt.txt
+?? logs/q4port-20260717/codex-health.log
+?? logs/q4port-20260717/codex-q4port.log
+?? logs/q4port-20260717/nll8k_float.log
+?? logs/q4port-20260717/nll8k_half.log
+?? logs/q4port-20260717/quiet-watcher.log
+?? logs/q4port-20260717/responses-gates-health.log
+?? logs/q4port-20260717/responses-gates-p2fix.log
+?? logs/q4port-20260717/responses-gates-p2fix2.log
+?? logs/q4port-20260717/responses-gates-p2fix3.log
+?? logs/q4port-20260717/responses-gates-p2fix4.log
+?? logs/q4port-20260717/responses-gates-p2fix5.log
+?? logs/q4port-20260717/responses-gates-postoutage.log
+?? logs/q4port-20260717/responses-gates-trace.log
+?? logs/q4port-20260717/responses-gates-trace2.log
+?? logs/q4port-20260717/responses-gates-trace3.log
+?? logs/q4port-20260717/t2-server-cancel.log
+?? logs/q4port-20260717/t2-server-cancel2.log
+?? logs/q4port-20260717/t2-server-p2fix.log
+?? logs/q4port-20260717/t2-server-p2fix2.log
+?? logs/q4port-20260717/t2-server-p2fix3.log
+?? logs/q4port-20260717/t2-server-p2fix4.log
+?? logs/q4port-20260717/t2-server-p2fix5.log
+?? logs/q4port-20260717/t2-server-restart-postoutage.log
+?? logs/q4port-20260717/t2-server-restart.log
+?? logs/q4port-20260717/t2-server-trace.log
+?? logs/q4port-20260717/t2-server-trace2.log
+?? logs/q4port-20260717/t2-server-trace3.log
+?? logs/q4port-20260717/t2-server-trace5.log
+?? logs/q4port-20260717/trace-gate.log
+?? logs/q4port-20260717/trace-gate2.log
+?? logs/q4port-20260717/trace-gate3.log
+?? logs/q4port-20260717/verdicts.txt
+
+codex
+The broad search hit logs/data noise, so I’m narrowing it to tracked scripts and docs that can encode expectations. The diff itself is only the three intended changes in `metal_server.cpp`; I’m checking lifetime and exception behavior against surrounding code now.
+exec
+/bin/zsh -lc "sed -n '1,80p' src/metal/metal_server.cpp" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+#include "metal_engine.h"
+#include "stream_format.h"
+#include "../suffixdraft.h"
+#include "../tool_preamble.h"
+#include "../tokenizer.h"
+#include "../toolconstrain.h"
+#include <cerrno>
+#include "../../third_party/httplib.h"
+#include "../../third_party/json.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <functional>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <set>
+#include <stdexcept>
+
+#include <CommonCrypto/CommonDigest.h>
+#include <string>
+#include <vector>
+
+using json = nlohmann::json;
+
+namespace {
+
+uint32_t parse_u32(const std::string& text, const char* option) {
+    if (text.empty() || text[0]=='-') throw std::runtime_error(std::string("invalid ")+option);
+    size_t used=0; unsigned long long value=std::stoull(text,&used,10);
+    if(used!=text.size() || value>UINT32_MAX) throw std::runtime_error(std::string("invalid ")+option);
+    return (uint32_t)value;
+}
+
+std::vector<uint32_t> to_u32(const std::vector<int>& ids) {
+    std::vector<uint32_t> result; result.reserve(ids.size());
+    for(int id:ids) { if(id<0) throw std::runtime_error("tokenizer returned a negative id"); result.push_back((uint32_t)id); }
+    return result;
+}
+
+std::string text_content(const json& content) {
+    if(content.is_string()) return content.get<std::string>();
+    std::string out;
+    if(content.is_array()) for(const auto& part:content) {
+        if(!part.is_object()) continue;
+        const std::string type=part.value("type","");
+        if(type=="text" || type=="input_text" || type=="output_text") out+=part.value("text","");
+    }
+    return out;
+}
+
+// OpenAI chat messages -> Msg list for chatml_prompt (which merges the tools
+// preamble into the system message, replacing the manual merge that lived
+// here). Beyond-CUDA: src/server.cu's chat endpoint is text-only by design
+// (its structured tool paths are /v1/messages and /v1/responses), but pi.dev
+// speaks openai-completions, so this endpoint must round-trip tool traffic —
+// assistant.tool_calls arrays and role:"tool" results are reconstructed to
+// the model's <tool_call>/<tool_response> markers (agentic-parity round,
+// docs/plans/2026-07-17-metal-agentic-parity.md).
+std::vector<q27::Msg> openai_msgs(const json& body) {
+    std::vector<q27::Msg> msgs;
+    if(body.contains("system")) {
+        std::string system=text_content(body["system"]);
+        if(!system.empty()) msgs.push_back({"system",system});
+    }
+    if(!body.contains("messages") || !body["messages"].is_array())
+        throw std::runtime_error("messages must be an array");
+    for(const auto& message:body["messages"]) {
+        if(!message.is_object()) continue;
+        std::string role=message.value("role","");
+        if(role=="developer") role="system";
+        std::string content=message.contains("content")?text_content(message["content"]):"";
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '420,470p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+   420	    // route_ | lease_ -> mask_mutex_; never the reverse.
+   421	    std::mutex mask_mutex_;
+   422	    // Wait accounting bucketed by what the competing traffic was doing at
+   423	    // arrival (idle/prefill/decode/verify), guarded by route_. Two distinct
+   424	    // quantities: queue wait (arrival -> slot admission; bounded only by
+   425	    // QUEUE_MAX generations) and gate wait (admission -> first GPU lease;
+   426	    // the Phase 1 one-active-quantum guarantee applies to THIS one).
+   427	    struct WaitStats { uint64_t n=0; double sum_ms=0, max_ms=0; };
+   428	    std::map<std::string,WaitStats> queue_wait_stats, gate_wait_stats;
+   429	    // Speculation ground truth for the multislot MTP gates: a quantum round
+   430	    // committing >1 token proves accepted drafts, so committed > rounds is
+   431	    // the nonzero-speculation assert's unfakeable signal (vacuous-gate rule).
+   432	    std::atomic<uint64_t> spec_rounds_total{0}, spec_committed_total{0};
+   433	    // Suffix-path round attribution: bursts actually dispatched vs serial
+   434	    // fallbacks, so /stats shows whether traffic rides the batched path at
+   435	    // all (a suffix server whose every round falls back is misconfigured
+   436	    // or serving burst-hostile traffic — either way it should be visible).
+   437	    std::atomic<uint64_t> suffix_burst_rounds_total{0}, suffix_fallback_rounds_total{0};
+   438	    bool constrain_tools=false;
+   439	    std::vector<std::string> vocab_bytes_v;
+   440	    q27::ToolMaskCache mask_cache;
+   441	    DiskSnapshotStore snapstore;
+   442	    TraceLog trace;
+   443	    std::string model_name;
+   444	    // Auto-snapshot threshold in prompt tokens (0 = hint-only); set with
+   445	    // the snapshot store, meaningful only when snapstore.enabled().
+   446	    size_t snap_auto_min=0;
+   447	
+   448	    Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
+   449	            uint32_t width,uint32_t sfx_width,size_t cache_entries,bool constrain,
+   450	            uint32_t slot_count)
+   451	        :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
+   452	         constrain_tools(constrain) {
+   453	        // Server identity (homebrew plan Q2): /health and the boot trace name
+   454	        // the resident artifact so wrapper/clients can tell what's loaded.
+   455	        model_name=std::filesystem::path(model).filename().string();
+   456	        if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
+   457	            throw std::runtime_error("tokenizer/model vocabulary mismatch");
+   458	        shared=q27::MetalEngine::open_shared(model);
+   459	        slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
+   460	        // Snapshot v2 (2026-07-17-kv-except-snapshot-v2.md): exception
+   461	        // engines snapshot like any other — side rows ride every surface
+   462	        // and snapshot_bytes() prices them, so no capacity override exists
+   463	        // anymore. Informational note only.
+   464	        if(slots.front()->engine.kv_fp16_except())
+   465	            fprintf(stderr,"q27 Metal server: KV fp16 exception cells active (Q27_METAL_KV_FP16_CELLS); side caches ride prefix/disk snapshots (v2)\n");
+   466	        // G6 admission (docs/plans/2026-07-16-g6-admission.md): additional
+   467	        // slots must fit the FULL per-slot footprint — KV + this slot's own
+   468	        // GQA partials (per-engine since audit E2, charged inside
+   469	        // kv_reserved_bytes) + fixed engine state + snapshot capacity x
+   470	        // snapshot bytes — against the device budget (Q27_METAL_BUDGET_MB
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1180,1245p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  1180	        bool turbo3=false; bool constrain_tools=false;
+  1181	        for(int i=3;i<argc;i++) {
+  1182	            std::string arg=argv[i];
+  1183	            if(arg=="--host" && i+1<argc) host=argv[++i];
+  1184	            else if(arg=="--port" && i+1<argc) port=parse_u32(argv[++i],"--port");
+  1185	            else if(arg=="--ctx" && i+1<argc) context=parse_u32(argv[++i],"--ctx");
+  1186	            else if(arg=="--mtp" && i+1<argc) width=parse_u32(argv[++i],"--mtp");
+  1187	            else if(arg=="--suffix" && i+1<argc) suffix_width=parse_u32(argv[++i],"--suffix");
+  1188	            else if(arg=="--prefix-entries" && i+1<argc) prefix_entries=parse_u32(argv[++i],"--prefix-entries");
+  1189	            else if(arg=="--slots" && i+1<argc) slot_count=parse_u32(argv[++i],"--slots");
+  1190	            else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
+  1191	            else if(arg=="--constrain-tools") constrain_tools=true;
+  1192	            else if(arg=="--trace" && i+1<argc) trace_path=argv[++i];
+  1193	            else throw std::runtime_error("unknown/incomplete argument: "+arg);
+  1194	        }
+  1195	        if(port>65535) throw std::runtime_error("port out of range");
+  1196	        if(width && (width<2 || width>12)) throw std::runtime_error("MTP width must be 2..12");
+  1197	        if(suffix_width && (suffix_width<2 || suffix_width>q27::MetalEngine::VERIFY_CHUNK_MAX))
+  1198	            throw std::runtime_error("suffix width must be 2..48");
+  1199	        // Bounded so entries x snapshot_bytes() can never wrap uint64 in the
+  1200	        // G6 per-slot charge — side-inclusive snapshots (~4.6 GB at max ctx
+  1201	        // under L7-full) put the wrap within uint32 entry range (codex P2 on
+  1202	        // 4415c53); 4096 entries is already far beyond any real deployment.
+  1203	        if(prefix_entries>4096) throw std::runtime_error("--prefix-entries must be 0..4096");
+  1204	        if(width && suffix_width) throw std::runtime_error("--mtp and --suffix are mutually exclusive (one speculation lever per server)");
+  1205	        if(constrain_tools && width) throw std::runtime_error("--constrain-tools requires serial decode; drop --mtp (verify-lane masks are not wired on Metal)");
+  1206	        if(constrain_tools && suffix_width) throw std::runtime_error("--constrain-tools requires serial decode; drop --suffix (burst rounds argmax unmasked logits)");
+  1207	        // Phase 1's latency guarantee (wait <= one active quantum) only
+  1208	        // holds with one competing slot; >2 needs the scheduler and the
+  1209	        // width/stats model extended first (codex P2 on d243f92).
+  1210	        if(slot_count<1 || slot_count>2) throw std::runtime_error("--slots must be 1..2 in multislot Phase 1");
+  1211	        Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count);
+  1212	        if(!trace_path.empty()) {
+  1213	            runtime.trace.open(trace_path);
+  1214	            runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
+  1215	                                 {"mtp",width},{"suffix",suffix_width},{"slots",slot_count},
+  1216	                                 {"model",runtime.model_name}});
+  1217	        }
+  1218	        httplib::Server server;
+  1219	        // Bound the accept-side queue (codex P1 on d243f92): the default
+  1220	        // task queue holds accepted connections without limit, so the
+  1221	        // in-run admission bound alone could never engage — excess requests
+  1222	        // would pile up behind the workers instead of being rejected.
+  1223	        // 16 workers > QUEUE_MAX + slots: with only 8 workers the ticket-queue
+  1224	        // overflow (503) was UNREACHABLE dead code — at most 7 requests could
+  1225	        // wait while one generated (G6 found this). The 32-connection accept
+  1226	        // queue stays the outer bound.
+  1227	        server.new_task_queue=[]{ return new httplib::ThreadPool(16,32); };
+  1228	        server.Get("/health",[&runtime](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"},{"model",runtime.model_name}});});
+  1229	        // Wait honesty (Phase 1 contract): per-arrival-phase stats. Gate
+  1230	        // wait (admission -> first lease) carries the one-quantum bound;
+  1231	        // queue wait (arrival -> admission) is bounded only by QUEUE_MAX
+  1232	        // generations and is reported so nobody mistakes one for the other.
+  1233	        server.Get("/stats",[&runtime](const httplib::Request&,httplib::Response& r){
+  1234	            auto bucket=[](const std::map<std::string,Runtime::WaitStats>& stats){
+  1235	                json out=json::object();
+  1236	                for(const auto& [phase,ws]:stats)
+  1237	                    out[phase]={{"requests",ws.n},
+  1238	                                {"mean_ms",ws.n?ws.sum_ms/ws.n:0.0},
+  1239	                                {"max_ms",ws.max_ms}};
+  1240	                return out;
+  1241	            };
+  1242	            json gate,queue;
+  1243	            {
+  1244	                std::lock_guard<std::mutex> lk(runtime.route_);
+  1245	                gate=bucket(runtime.gate_wait_stats);
+
+codex
+So far, in-repo `/health` call sites either discard the body or check only `status == "ok"` through JSON parsing. I’m checking trace consumers separately because the boot event shape also changed.
+exec
+/bin/zsh -lc "nl -ba tools/reqlog_gate.sh | sed -n '24,42p;88,104p;194,206p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+    24	SRV=""
+    25	
+    26	start_server() { # args: logfile, extra flags...
+    27	    local log=$1; shift
+    28	    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
+    29	      "$BIN" "$MODEL" "$TOK" --port "$PORT" --ctx 8192 --no-think "$@" >"$log" 2>&1 &
+    30	    SRV=$!
+    31	    for i in $(seq 1 120); do
+    32	        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
+    33	        kill -0 $SRV 2>/dev/null || { echo "[gate] FAIL: server died at startup"; tail -5 "$log"; return 1; }
+    34	        sleep 2
+    35	    done
+    36	    echo "[gate] FAIL: no health after 240s"; return 1
+    37	}
+    38	stop_server() {
+    39	    [ -n "$SRV" ] && kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; SRV=""
+    40	}
+    41	trap 'stop_server' EXIT
+    42	
+    88	# T6 oversize prompt: since 2f47508 the server returns an anthropic-shaped
+    89	# HTTP 400 (ctx-limit) instead of a 200 -- expect it, then require health.
+    90	try:
+    91	    post("/v1/messages", {"model": "q27", "max_tokens": 16,
+    92	        "messages": [{"role": "user", "content": "alpha bravo charlie delta " * 4000}]})
+    93	    sys.exit("T6: oversize prompt unexpectedly succeeded (want HTTP 400)")
+    94	except urllib.error.HTTPError as e:
+    95	    assert e.code == 400, f"T6: expected 400, got {e.code}"
+    96	with urllib.request.urlopen(base + "/health", timeout=10) as r:
+    97	    assert json.loads(r.read())["status"] == "ok", "server unhealthy after T6"
+    98	
+    99	pat = re.compile(
+   100	    r"\[req\] rid=(\d+) api=(\w+) conv=([0-9a-f]{8,16}) qw_ms=([\d.]+) "
+   101	    r"tok_ms=([\d.]+) prompt=(\d+) hit=(\d+) ckpt=(-?\d+) pf=(\d+) "
+   102	    r"pf_ms=([\d.]+) dec=(\d+) dec_ms=([\d.]+) cb_ms=([\d.]+) rounds=(\d+) "
+   103	    r"tps=([\d.]+) end=([\w-]+)")
+   104	lines = [l for l in open(log) if "[req]" in l]
+   194	# then the server must stay healthy.
+   195	try:
+   196	    post("/v1/messages", {"model": "q27", "max_tokens": 16,
+   197	        "messages": [{"role": "user", "content": "alpha bravo charlie delta " * 4000}]})
+   198	    sys.exit("C15: oversize prompt unexpectedly succeeded (want HTTP 400)")
+   199	except urllib.error.HTTPError as e:
+   200	    assert e.code == 400, f"C15: expected 400, got {e.code}"
+   201	with urllib.request.urlopen(base + "/health", timeout=10) as r:
+   202	    assert json.loads(r.read())["status"] == "ok", "server unhealthy after oversize"
+   203	
+   204	hitp = re.compile(r"\[req\] rid=(\d+) .*? hit=(\d+) .*? end=([\w-]+)")
+   205	slotp = re.compile(r" slot=(\d+)")
+   206	recs = []
+
+exec
+/bin/zsh -lc "nl -ba tools/interleave_gate.sh | sed -n '20,40p;126,138p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+    20	MODEL=${MODEL:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}
+    21	TOK=${TOK:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.tok}
+    22	SRV=""
+    23	
+    24	start_server() { # args: logfile, extra flags...
+    25	    local log=$1; shift
+    26	    # a stale listener would make the whole phase test the wrong binary
+    27	    if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    28	        echo "[gate] FAIL: port $PORT already serving -- stop it first"; return 1
+    29	    fi
+    30	    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
+    31	      "$BIN" "$MODEL" "$TOK" --port "$PORT" --ctx 8192 --no-think "$@" >"$log" 2>&1 &
+    32	    SRV=$!
+    33	    for i in $(seq 1 120); do
+    34	        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
+    35	        kill -0 $SRV 2>/dev/null || { echo "[gate] FAIL: server died at startup"; tail -5 "$log"; return 1; }
+    36	        sleep 2
+    37	    done
+    38	    echo "[gate] FAIL: no health after 240s"; return 1
+    39	}
+    40	stop_server() {
+   126	t0 = time.monotonic()
+   127	ta = threading.Thread(target=stream_a, args=(a_run,))
+   128	tb = threading.Thread(target=run_b)
+   129	tc = threading.Thread(target=run_c)
+   130	ta.start(); tb.start(); tc.start()
+   131	ta.join(); tb.join(); tc.join()
+   132	
+   133	with urllib.request.urlopen(base + "/health", timeout=10) as r:
+   134	    assert json.loads(r.read())["status"] == "ok", "server unhealthy after phase 1"
+   135	
+   136	# [req] lines: full R0 schema + R1b fields (gw=, yields= after end=)
+   137	pat = re.compile(
+   138	    r"\[req\] rid=(\d+) api=(\w+) conv=([0-9a-f]{8,16}) qw_ms=([\d.]+) "
+
+exec
+/bin/zsh -lc "nl -ba tools/thunderdome_pin_ab.sh | sed -n '24,36p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+    24	
+    25	systemctl --user stop q27-eval 2>/dev/null
+    26	sleep 3
+    27	systemd-run --user --unit=q27-eval "$BIN" "$MODEL" "$TOK" \
+    28	  --port 8081 --host 0.0.0.0 >/dev/null 2>&1
+    29	for _ in $(seq 180); do
+    30	  curl -s -m 1 http://127.0.0.1:8081/health >/dev/null 2>&1 && break
+    31	  sleep 2
+    32	done
+    33	curl -s -m 3 http://127.0.0.1:8081/health | grep -q ok || { echo "$LEG: server never came up" >&2; exit 1; }
+    34	START="$(date '+%Y-%m-%d %H:%M:%S')"
+    35	echo "[$LEG] serving $(basename "$BIN") on :8081 since $START"
+    36	
+
+exec
+/bin/zsh -lc "rg -n \"kind.*boot|boot.*kind|trace.*boot|\\[.*boot|jq.*boot|model_name|/health\" tools docs src --glob '"'!logs/**'"' --glob '"'!data/**'"'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+tools/reqlog_gate.sh:32:        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
+tools/reqlog_gate.sh:96:with urllib.request.urlopen(base + "/health", timeout=10) as r:
+tools/reqlog_gate.sh:201:with urllib.request.urlopen(base + "/health", timeout=10) as r:
+docs/SECURITY-MODEL.md:70:**#5 -- Disconnected clients keep consuming GPU; public `/health?verify` stalls
+tools/official_tier_gates_2026-07-16.sh:59:i=0; until curl -s -o /dev/null http://127.0.0.1:8121/health; do
+docs/METAL_PROGRESS.md:141:`MetalEngine::capture_state` and `restore_state` copy GDN state, active KV rows, MTP KV, position, last normalized hidden state, and resident logits on-device. `build/q27-metal` supports token IDs or text prompts, deterministic temperature/top-k/top-p sampling, logit dumps, MTP, and suffix drafting. `build/q27-metal-server` adds a mutex-serialized Metal service with longest-prefix snapshot LRU and baseline `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` endpoints. The health endpoint is browser-smoke-tested. Streaming event formats, constrained tools, multi-slot scheduling, GPU-side sampling, and the full CUDA server compatibility suite remain.
+docs/METAL_PROGRESS.md:331:**--trace whole-session logging SHIPPED (triage I2) + the release checklist (I3) + the I1 strip tier sent back with a mechanism question (2026-07-17 afternoon, 24 GB M4).** the operator's ds4 product triage landed mid-day; three of its four adopt-now items resolved in one session. **I2:** `q27-metal-server --trace <path>` writes one JSONL stream of exactly what the parity rounds reconstructed by hand — per-endpoint request events with the RENDERED chatml prompt (64 KB cap, truncation recorded), outcomes with finish/tokens/prefix_hit, prefix-tier decisions (cold/memory/disk via a disk_loaded flag, not length equality), snapshot save/bank/evict with eviction stats, queue/prefill/generate-phase cancels (generate = where Finish::Cancelled is set, not a guessed wrapper catch), error answers including the four ctx-limit preflight sites the guards alone missed, and tool_recovery events beside every [tool-fallback] line. TraceLog is noexcept-contained, mutex-serialized with tms stamped inside the lock (file order == tms order within a boot), path-only (no "-": stderr is shared with server logging). Gates: new `tools/trace_gate.sh` (5 api families, boot, outcomes, 400s, monotonic per-boot tms) ALL PASS alongside both parity suites on the live server; the serving line now carries `--trace ~/.q27/trace.jsonl` (append; truncate to rotate, never rm a live trace). Codex two rounds: P1 (throw-through) fixed; rejected-with-evidence: completions' body.value repeats the encode line's identical accessor (throws there first); scalar-only unguarded events are the recorded OOM-only boundary. **I3:** `docs/QA_BEFORE_RELEASES.md` — the single pre-tag checklist (preconditions through homebrew formula smoke), first concrete Homebrew Phase-2 task. **I1 strip tier:** design check RECORDED against building it (`docs/plans/2026-07-17-i1-strip-design-check.md`) — ds4's strip exists because the session owns the transcript; ours is a request/response cache where the client always sends the full prompt, so a tokens-only stub never saves one token of prefill (restore ≡ cold by construction). The valuable form is proactive re-materialization (speculative idle-slot warming) — needs trace-measured prefix recurrence economics first; recommendation recorded, verdict is the operator's. **I4** folds into the bench binaries at the Q4 verdict (their next touch), not before — the ship-line harness stays pristine. Also caught and fixed in `tools/quiet_q4_bench.sh` + COORDINATION.md/lessons: `pgrep -f "q27-metal-server.*--port"` matches the caffeinate WRAPPER too — server pids must match argv[0] (ps+awk), or the verify-empty check lies (the orphan-double-load crash class).
+docs/METAL_PROGRESS.md:333:**Codex CLI drives the Metal server END-TO-END: the /v1/responses port validated on real agent traffic, and the cancel-bank + disk-restore machinery fired in production for the first time (2026-07-17 afternoon, 24 GB M4).** A stock `codex exec` (0.144, read-only sandbox, one-shot `-c model_providers.q27` override — no user config touched) ran a read-and-answer task through the server: turn 1 (11,243 tokens) hit codex's stream timeout mid-COLD-prefill and disconnected; the per-chunk liveness probe caught it and **banked the completed chunks to disk**; codex's retry restored the banked prefix (`prefix tier=disk` in the trace), finished prefill in seconds, auto-saved at the aligned boundary, and the model's tool call executed (file read); turn 2 answered exactly right (the plan's gate ids G8a–G8d + G9, battery G2–G7). The whole rescue is one trace story: cancel(prefill) → disk restore → snapshot_save(11136) → outcome. Non-findings recorded: codex's models-manager fails to decode our OpenAI-standard `/v1/models` (wants its own ModelInfo shape; falls back to default metadata and proceeds — codex-side nicety, NOT a wire bug, noted in the homebrew plan's Q2). Also this session, all no-bench lanes: LICENSE Q3 verified RESOLVED (upstream declares MIT per GitHub API; our LICENSE matches with attribution); `tools/prefix_recurrence.py` lands (the I1 recurrence-economics instrument — first read on gate traffic: 59% of requests hit an already-seen family; real pi/codex traffic accumulates for the verdict); Q2 (/health model identity) next up. G2–G7/G8–G9 suites + trace gate green throughout.
+tools/accept_ab.sh:37:      curl -s -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 2
+docs/NOTEBOOK.md:469:tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
+docs/NOTEBOOK.md:660:for short supervised benches; `--verify-weights` / `/health?verify=1` is
+docs/QA_BEFORE_RELEASES.md:55:Per COORDINATION.md: pgrep + `curl :8213/health` before launch; one
+tools/accept_kv_ab.sh:45:      curl -s -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 2
+src/server.cu:5://   GET  /health, /v1/models
+src/server.cu:836:    srv.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
+src/server.cu:837:        // /health?verify=1 recomputes the resident-weight checksums (~20 ms;
+docs/BUILDLOG.md:111:(CLI) and /health?verify=1 (server), 867 tensors in ~20 ms. Review minors
+docs/BUILDLOG.md:642:unchanged); /health?verify comment corrected (default-stream xsum BARRIERS
+tools/thunderdome_pin_ab.sh:30:  curl -s -m 1 http://127.0.0.1:8081/health >/dev/null 2>&1 && break
+tools/thunderdome_pin_ab.sh:33:curl -s -m 3 http://127.0.0.1:8081/health | grep -q ok || { echo "$LEG: server never came up" >&2; exit 1; }
+tools/multislot_gates.py:119:            c.request("GET", "/health")
+src/metal/metal_server.cpp:443:    std::string model_name;
+src/metal/metal_server.cpp:453:        // Server identity (homebrew plan Q2): /health and the boot trace name
+src/metal/metal_server.cpp:455:        model_name=std::filesystem::path(model).filename().string();
+src/metal/metal_server.cpp:1214:            runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
+src/metal/metal_server.cpp:1216:                                 {"model",runtime.model_name}});
+src/metal/metal_server.cpp:1228:        server.Get("/health",[&runtime](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"},{"model",runtime.model_name}});});
+tools/interleave_gate.sh:27:    if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+tools/interleave_gate.sh:34:        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
+tools/interleave_gate.sh:133:with urllib.request.urlopen(base + "/health", timeout=10) as r:
+tools/phase_split_run.sh:26:    curl -s -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 2
+tools/quiet_q4_bench.sh:36:        [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:$PORT/health 2>/dev/null)" = "200" ] && return 0
+tools/gate8_caphist.sh:21:  for _ in $(seq 180); do curl -s -m 1 http://127.0.0.1:8081/health >/dev/null 2>&1 && break; sleep 2; done
+tools/trace_gate.sh:27:apis=set(); outcomes=set(); errors=[]; prefixes=0; boots=0
+tools/trace_gate.sh:60:print("PASS: trace stream complete (boot, 5 api families, outcomes, 400s, prefix decisions, monotonic tms)")
+tools/width_curve.sh:31:    curl -s -m 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+docs/plans/2026-07-16-homebrew-distribution.md:198:  model name into `/health` so clients can tell what's resident. Engine
+tools/phase_width_run.sh:22:    curl -s -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 2
+tools/suffix_gate.sh:26:    curl -s -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 2
+tools/batch_ab.sh:77:    curl -s -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && return 0
+docs/plans/2026-07-06-p14-perf-levers.md:242:- NEW first-token bootstrap gate: gated (`Q27_PMIN=1.0`) vs ungated sampled runs at the SAME seed must emit an IDENTICAL FIRST token -- token 0 comes from the retained prefill logits via `sample_g` kind 0 on both paths, before any spec round. A differing first token means the gated branch broke the `samp_first` bootstrap (the known silent-bug class here).
+
+codex
+Trace-gate currently counts boot events but does not assert the exact boot object keys, so the added `model` key should not disturb it. I’m opening that gate and the Python health check to verify there isn’t a stricter parser hidden there.
+exec
+/bin/zsh -lc "nl -ba tools/trace_gate.sh | sed -n '1,75p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+     1	#!/bin/bash
+     2	# Gate for --trace whole-session logging (triage I2, ds4-product-triage).
+     3	# Run AFTER tools/agentic_parity_gate.sh + tools/responses_parity_gate.sh
+     4	# against a server started with --trace <path>: this script adds one
+     5	# /v1/completions smoke (the suites don't cover it) and then asserts the
+     6	# JSONL stream recorded the session.
+     7	#   usage: tools/trace_gate.sh <trace-path> [base-url]
+     8	set -u
+     9	TRACE="${1:?usage: tools/trace_gate.sh <trace-path> [base-url]}"
+    10	BASE="${2:-http://127.0.0.1:8213}"
+    11	FAIL=0
+    12	note() { printf '%s\n' "$*"; }
+    13	pass() { note "PASS: $*"; }
+    14	fail() { note "FAIL: $*"; FAIL=1; }
+    15	
+    16	# completions smoke so every endpoint family has request+outcome events
+    17	curl -s -H "Content-Type: application/json" --max-time 120 "$BASE/v1/completions" \
+    18	    -d '{"model":"q27-metal","max_tokens":16,"prompt":"The capital of France is"}' >/dev/null
+    19	sleep 1   # trace flushes per event, but stay gracious on a loaded box
+    20	
+    21	[ -s "$TRACE" ] || { fail "trace file missing/empty: $TRACE"; exit 1; }
+    22	
+    23	python3 - "$TRACE" <<'EOF'
+    24	import json,sys
+    25	path=sys.argv[1]
+    26	kinds=[]
+    27	apis=set(); outcomes=set(); errors=[]; prefixes=0; boots=0
+    28	bad=0; prev_tms=-1; monotonic=True
+    29	with open(path) as f:
+    30	    for ln,line in enumerate(f,1):
+    31	        line=line.strip()
+    32	        if not line: continue
+    33	        try: d=json.loads(line)
+    34	        except Exception: bad+=1; continue
+    35	        k=d.get("kind"); kinds.append(k)
+    36	        if k=="boot": boots+=1
+    37	        if k=="request": apis.add(d.get("api"))
+    38	        if k=="outcome": outcomes.add(d.get("api"))
+    39	        if k=="error": errors.append((d.get("status"),d.get("type")))
+    40	        if k=="prefix": prefixes+=1
+    41	        t=d.get("tms",-1)
+    42	        if k=="boot": prev_tms=-1   # append-across-restarts: tms resets per process
+    43	        if t<prev_tms: monotonic=False
+    44	        prev_tms=t
+    45	def report(ok,msg): print(("PASS" if ok else "FAIL")+": "+msg); sys.exit(0 if False else 0) or (not ok and sys.stdout.write("")) or ok
+    46	fails=[]
+    47	if bad: fails.append(f"{bad} unparseable JSONL line(s)")
+    48	if boots<1: fails.append("no boot event")
+    49	need={"completions","chat","messages","count_tokens","responses"}
+    50	if not need<=apis: fails.append(f"request events missing apis: {sorted(need-apis)}")
+    51	if not {"completions","chat","messages","responses"}<=outcomes: fails.append(f"outcome events missing apis: {sorted({'completions','chat','messages','responses'}-outcomes)}")
+    52	if not any(s==400 for s,_ in errors): fails.append("no 400-class error event (G9 controls should have produced them)")
+    53	if prefixes<1: fails.append("no prefix decision events")
+    54	if not monotonic: fails.append("tms not monotonic")
+    55	print(f"trace-kinds: {sorted(set(k for k in kinds if k))}")
+    56	print(f"trace-apis: requests={sorted(apis)} outcomes={sorted(outcomes)} errors={len(errors)}")
+    57	if fails:
+    58	    for m in fails: print("FAIL: "+m)
+    59	    sys.exit(1)
+    60	print("PASS: trace stream complete (boot, 5 api families, outcomes, 400s, prefix decisions, monotonic tms)")
+    61	EOF
+    62	RC=$?
+    63	[ $RC -eq 0 ] && pass "trace gate: ALL PASS" || fail "trace gate: failures above"
+    64	exit $FAIL
+
+exec
+/bin/zsh -lc "nl -ba tools/multislot_gates.py | sed -n '100,128p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+   100	        got += 1
+   101	    c.sock.close()  # hard disconnect mid-stream
+   102	
+   103	
+   104	def stats():
+   105	    c = http.client.HTTPConnection(HOST, PORT, timeout=30)
+   106	    c.request("GET", "/stats")
+   107	    data = json.loads(c.getresponse().read())
+   108	    c.close()
+   109	    return data
+   110	
+   111	
+   112	def wait_ready(proc, deadline=180, port=PORT):
+   113	    start = time.time()
+   114	    while time.time() - start < deadline:
+   115	        if proc.poll() is not None:
+   116	            raise RuntimeError("server exited early")
+   117	        try:
+   118	            c = http.client.HTTPConnection(HOST, port, timeout=2)
+   119	            c.request("GET", "/health")
+   120	            if c.getresponse().status == 200:
+   121	                c.close()
+   122	                return
+   123	        except OSError:
+   124	            time.sleep(1)
+   125	    raise RuntimeError("server did not become ready")
+   126	
+   127	
+   128	def main():
+
+exec
+/bin/zsh -lc "rg -n \"json\\.loads\\(.*health|/health.*json|status.*ok|grep -q ok|http_code.*health|kind.*boot|boots\" tools docs src --glob '"'!logs/**'"' --glob '"'!data/**'"'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+src/engine.cuh:2293:    // why: the conductor bootstraps a sampled member's first token once
+src/engine.cuh:2295:    void draft_sample_bootstrap() {
+src/engine.cuh:2340:    // first-token bootstrap from the retained prefill logits (samp_first) and
+src/engine.cuh:2348:        if (sampled) draft_sample_bootstrap();
+src/engine.cuh:2473:    // no forward) -- symmetric with the greedy bootstrap (step_with's argmax);
+tools/reqlog_gate.sh:97:    assert json.loads(r.read())["status"] == "ok", "server unhealthy after T6"
+tools/reqlog_gate.sh:202:    assert json.loads(r.read())["status"] == "ok", "server unhealthy after oversize"
+docs/METAL_PROGRESS.md:293:**Upstream v0.2.0 merged (LICENSE/defaults/benchmarks) + 3090 fits-leg under the new default-ON batching graphs: PASS (2026-07-16 night, yukon; log `/tmp/legC-w8-v020-ctx16384.log` on yukon).** Merge `abbbcda`: LICENSE conflict kept ours (superset — upstream notice verbatim + fork line), README ours, server.cu auto-merged (their `Q27_BATCH=1 Q27_BATCH_GRAPH=1 CAP=64` defaults + our CUDA-12.0 compat fix coexist). Fits-leg, w8 build, ctx 16384: **boots at 23,232 MiB** (prebuilt envelope +8 MiB), static graph zoo identical to the pre-defaults leg (1,721.8 MB — `build_spec_graphs` is untouched by the flip), 8 concurrent completions all 200, **16-token canonical gate byte-exact** through the batching-ON server. Honesty note: the fused-verify exec cache (the new memory variable, cap 64 × ~7.2 MB) stayed **structurally cold** — single-slot serving never fuses rounds (`bat=1.0`, zero cache inserts), so this leg proves the yukon production config (single-slot ctx-16384) safe but does NOT bound 2-slot cache growth on 24 GB; that question is open and belongs with any future multi-slot-on-3090 ambition. Oracle restored exactly (health, live completion, 23,224 MiB). Same session: upstream PR queue recorded and HELD per the operator (`docs/plans/2026-07-16-upstream-prs.md`); B1 Phase 0B implementation delegated and in flight.
+docs/METAL_PROGRESS.md:295:**KV fp16 exception cells in production — machinery ships default-off; the attrib tail selection did NOT transfer, production re-selection says the event is ALL of layer 7 (2026-07-17 02:30–04:00, 16 GB mini; plan+gates: 2026-07-17-kv-except-production.md, logs/kv_except/).** operator-approved design step. Implementation (zero production-kernel changes, no ABI bump): per masked head, a kv_heads=1 fp16 side cache in the turbo3 WHT domain, an additive head-rows side-store kernel + causal window kernel (explicit out_row_stride), and window re-dispatches of the existing f16 attention over the masked head's 6-query window that overwrite the production output rows before the shared inverse WHT; `Q27_METAL_KV_FP16_CELLS` env (census cells, K+V pairs enforced), bytes in the engine reservation, snapshots refuse (v1), fp16 engines ignore the env. Gates: default-off byte-identical + suite green; new unit test (side store bit-exact, both windows overwrite exactly, zero leakage); ALL-cells probe collapses KL to the envelope floor (2.2e-4 mean — machinery correct end-to-end). **The scientific result: gate 3 with the instrument-selected cells 10,11 FAILED its kill line (max 2.265 @1000 vs band ≤1.30; mean in band) — instrument→production transfer holds for means, fails at the knife-edge tail.** Production re-selection (17 layer arms + L7 decomposition, 1,536-position arms ~2 min each): only FULL layer 7 kills the event (2.77→0.67; singles 2.2–2.7; **h0+h1 amplifies vs its own singles, 2.35** — the 4b anti-additive class again); L3 nearly (0.879), L19/L35 halve, 12 layers inert. **Formal 8K gate with L7-full (8 cells, +25.8% KV bytes): PASS — max 2.94→0.755 (3.9×, pos-1000 gone), mean −11%, wall +0.7%.** Disposition handed to operator: fund L7-full at +25.8%, design a mid-rate code (~+12.9%, unmeasured, amplification risk), or the uniform null. Attrib instrument demoted to means-only; production 1,536-pos arms are the tail standard now. **DECIDED (2026-07-17, operator: "fund full l7"): option 1 funded — `Q27_METAL_KV_FP16_CELLS=8,9,10,11,12,13,14,15` is the blessed turbo3 long-context production setting** (landing smoke: engine ctor accepts the list; server boots under it with the loud prefix-cache-DISABLED note and serves greedy). Funded residue: v1's snapshot refusal / prefix-cache disable is now a live production cost — side-cache snapshot serialization (v2) is the registered follow-up.
+src/engine.cu:1124:        // accepts drafts. Same bootstrap as Engine::generate -- e.logits holds
+docs/NOTEBOOK.md:661:the detector; offset is volatile across reboots.
+docs/BUILDLOG.md:1401:The `samp_first` bootstrap stays ABOVE the gate/ungated branch, so token 0 (retained prefill
+docs/BUILDLOG.md:4225:  approved): 32K boots at 22.7GB; 131072 boots at 23.9/24.6GB. turbo3 KV
+docs/BUILDLOG.md:4331:655360). Verified: bare boots auto-size 262144 and reach slot-ready on
+docs/BUILDLOG.md:4725:tools/ckpt_gate.sh (self-contained: generates prompts, boots the
+src/conductor.h:16:// the P2a step-granular draft pieces (draft_sample_bootstrap/draft_md_used/
+src/conductor.h:1218:            // bootstrap once before step 0, then the drafting ceiling
+src/conductor.h:1220:            if (mm.sampled) mm.e->draft_sample_bootstrap();
+src/conductor.h:1226:        // GPU work lives on its OWN stm (the sampled bootstrap enqueued just
+src/conductor.h:1244:        // (suffix prep/H2D staging, sampled bootstrap, floor top-ups, the
+src/server.cu:844:            res.set_content(std::string("{\"status\":\"") + (bad ? "corrupted" : "ok") +
+src/server.cu:849:        res.set_content("{\"status\":\"ok\"}", "application/json");
+docs/plans/2026-07-16-3090-graph-oom.md:59:  boots at ctx 16384 on the 3090 with headroom logged.
+docs/plans/2026-07-16-3090-graph-oom.md:81:boots to healthy at **23,230 MiB** (prebuilt envelope: 23,214–23,224),
+docs/plans/2026-07-16-batch-p2c-draft-fusion.md:70:- Sampled members: draft_sample_bootstrap runs per-engine before step 0
+docs/plans/2026-07-16-batch-p2c-draft-fusion.md:124:prep/H2D, sampled bootstrap) while the fused steps need no event at all:
+docs/plans/2026-07-16-homebrew-distribution.md:179:  `q27 serve` boots; `curl localhost:8080/v1/messages` returns tokens;
+src/metal/metal_server.cpp:1214:            runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
+src/metal/metal_server.cpp:1228:        server.Get("/health",[&runtime](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"},{"model",runtime.model_name}});});
+tools/quiet_q4_bench.sh:36:        [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:$PORT/health 2>/dev/null)" = "200" ] && return 0
+tools/trace_gate.sh:27:apis=set(); outcomes=set(); errors=[]; prefixes=0; boots=0
+tools/trace_gate.sh:36:        if k=="boot": boots+=1
+tools/trace_gate.sh:48:if boots<1: fails.append("no boot event")
+docs/plans/2026-07-17-kv-except-production.md:174:enforced); `q27-metal-server` boots under the env with the loud
+docs/plans/2026-07-15-batch-p2-overlap.md:111:   - sampled bootstrap (:1907-1910) stays in a `draft_sample_bootstrap()`
+docs/plans/2026-07-06-p14-perf-levers.md:230:    if (samp_first) { ... existing bootstrap ... }
+docs/plans/2026-07-06-p14-perf-levers.md:234:Keep the `samp_first` bootstrap correct on the gated branch too (first token samples from retained prefill logits BEFORE any spec round -- study lines 1098-1101 and replicate). P13 EMA: do NOT update sat/yield EMAs from sampled rounds this phase (sampled ceiling is 4; document as limitation in the BUILDLOG entry).
+docs/plans/2026-07-06-p14-perf-levers.md:242:- NEW first-token bootstrap gate: gated (`Q27_PMIN=1.0`) vs ungated sampled runs at the SAME seed must emit an IDENTICAL FIRST token -- token 0 comes from the retained prefill logits via `sample_g` kind 0 on both paths, before any spec round. A differing first token means the gated branch broke the `samp_first` bootstrap (the known silent-bug class here).
+docs/plans/2026-07-15-expert-review-3-answers.md:214:bootstrap CIs. Fail if deep-bucket K-only softmax KL > ~2× shallow with CI
+docs/plans/2026-07-15-expert-review-3-answers.md:247:  separate hard alarm, bootstrap over contiguous *windows* (positions are
+tools/thunderdome_pin_ab.sh:33:curl -s -m 3 http://127.0.0.1:8081/health | grep -q ok || { echo "$LEG: server never came up" >&2; exit 1; }
+tools/interleave_gate.sh:134:    assert json.loads(r.read())["status"] == "ok", "server unhealthy after phase 1"
+docs/posts/2026-07-methodology.md:307:native window for the compact formats, and the eval server boots there
+tools/gguf_to_hf.py:480:        status = "ok " if ok else "FAIL"
+
+exec
+/bin/zsh -lc "rg -n \"int main|server\\.listen|listen\\(|Runtime runtime|stop\\(\" src/metal/metal_server.cpp" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+1123:const char* anthropic_stop(Runtime::Finish f) {
+1171:int main(int argc,char** argv) {
+1211:        Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count);
+1702:                    {"stop_reason",any_call?"tool_use":anthropic_stop(outcome.finish)},
+1707:                    {"finish",any_call?"tool_use":anthropic_stop(outcome.finish)},
+1828:                            {"delta",{{"stop_reason",any_call?"tool_use":anthropic_stop(outcome.finish)},
+1833:                            {"finish",any_call?"tool_use":anthropic_stop(outcome.finish)},
+2253:        if(!server.listen(host.c_str(),(int)port)) throw std::runtime_error("server listen failed");
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '2238,2264p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  2238	                        // the plan: no forced-failure failpoint on this path.
+  2239	                        try { if(!think.empty()) flush_think(); flush_text(); } catch(...) {}
+  2240	                        ev({{"type","error"},{"error",{{"type","api_error"},{"message",e.what()}}}});
+  2241	                        ev({{"type","response.failed"},
+  2242	                            {"response",{{"id",resp_id},{"object","response"},{"status","failed"},
+  2243	                                {"last_error",{{"code","server_error"},{"message",e.what()}}},
+  2244	                                {"output",items}}}});
+  2245	                    }
+  2246	                    sink.done();
+  2247	                    return true;
+  2248	                });
+  2249	        }));
+  2250	
+  2251	        fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u, slots=%zu)\n",
+  2252	                host.c_str(),port,context,turbo3?"turbo3":"fp16",width,runtime.slots.size());
+  2253	        if(!server.listen(host.c_str(),(int)port)) throw std::runtime_error("server listen failed");
+  2254	        return 0;
+  2255	    } catch(const std::exception& e) { fprintf(stderr,"%s\n",e.what()); return 1; }
+  2256	}
+
+exec
+/bin/zsh -lc "rg -n \"using path|std::filesystem::path|filename\\(\" /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1/filesystem 2>/dev/null" in /Users/macthedan/projects/q27
+ exited 2 in 0ms:
+exec
+/bin/zsh -lc 'rg -n "json_response" src/metal/metal_server.cpp' in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+1164:void json_response(httplib::Response& response,const json& value,int status=200) {
+1228:        server.Get("/health",[&runtime](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"},{"model",runtime.model_name}});});
+1248:            json_response(r,{{"slots",runtime.slots.size()},
+1261:        server.Get("/v1/models",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"object","list"},{"data",json::array({{{"id","q27-metal"},{"object","model"}}})}});});
+1271:                catch(const Runtime::ServerOverloaded& e) { runtime.trace.event({{"kind","error"},{"status",503},{"type","overloaded_error"},{"message",e.what()}}); json_response(response,{{"error",{{"message",e.what()},{"type","overloaded_error"}}}},503); }
+1272:                catch(const Runtime::EngineError& e) { runtime.trace.event({{"kind","error"},{"status",500},{"type","api_error"},{"message",e.what()}}); json_response(response,{{"error",{{"message",e.what()},{"type","api_error"}}}},500); }
+1273:                catch(const std::exception& e) { runtime.trace.event({{"kind","error"},{"status",400},{"type","invalid_request_error"},{"message",e.what()}}); json_response(response,{{"error",{{"message",e.what()},{"type","invalid_request_error"}}}},400); }
+1349:                json_response(r,{{"error",{{"message",q27::ctx_limit_error_message((int)ids.size(),(int)maxp)},
+1371:                json_response(r,{{"id",id},{"object","text_completion"},{"created",created},{"model","q27-metal"},
+1438:                json_response(r,{{"error",{{"message",q27::ctx_limit_error_message((int)ids.size(),(int)maxp)},
+1502:                json_response(r,{{"id",id},{"object","chat.completion"},{"created",created},{"model","q27-metal"},
+1620:            json_response(r,{{"input_tokens",input_tokens}});
+1710:                json_response(r,out);
+1947:                json_response(r,{{"error",{{"code","context_length_exceeded"}}}},400);
+2064:                json_response(r,{{"id",resp_id},{"object","response"},{"model","q27-metal"},{"status","completed"},
+
+exec
+/bin/zsh -lc "nl -ba src/metal/metal_server.cpp | sed -n '1156,1168p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  1156	    if(value<0 || value>UINT32_MAX) throw std::runtime_error("invalid max_tokens");
+  1157	    return (uint32_t)value;
+  1158	}
+  1159	
+  1160	bool wants_stream(const json& body) { return body.value("stream",false); }
+  1161	
+  1162	long unix_now() { return (long)std::time(nullptr); }
+  1163	
+  1164	void json_response(httplib::Response& response,const json& value,int status=200) {
+  1165	    response.status=status;
+  1166	    response.set_content(value.dump(-1,' ',false,json::error_handler_t::replace),"application/json");
+  1167	}
+  1168	
+
+codex
+One nuance: the “cannot throw” claim is only true in the ordinary “bad path syntax will not throw” sense. This expression still constructs/copies strings, so it is not `noexcept`; I’m deciding whether that is review-worthy given the surrounding constructor already throws on startup failures.
+exec
+/bin/zsh -lc "rg -n \"filename\\(\" /Library/Developer/CommandLineTools/usr/include/c++/v1 /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1 2>/dev/null | head -40" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:852:    if (has_filename())
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:873:    else if (has_filename())
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:886:    else if (has_filename())
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:957:  path& remove_filename() {
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:958:    auto __fname = __filename();
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:964:  path& replace_filename(const path& __replacement) {
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:965:    remove_filename();
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:1032:  __string_view __filename() const;
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:1067:  _LIBCPP_INLINE_VISIBILITY path filename() const {
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:1068:    return string_type(__filename());
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:1096:  _LIBCPP_INLINE_VISIBILITY bool has_filename() const {
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:1097:    return !__filename().empty();
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:1989:  void replace_filename(_Path const& __p) {
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:1990:    __p_.replace_filename(__p);
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem:1996:  void replace_filename(_Path const& __p, error_code& __ec) {
+
+exec
+/bin/zsh -lc "find /Applications/Xcode.app -path '*c++/v1/filesystem*' -maxdepth 12 2>/dev/null | head -20" in /Users/macthedan/projects/q27
+exec
+/bin/zsh -lc "find /Library/Developer/CommandLineTools -path '*c++/v1/filesystem*' -maxdepth 12 2>/dev/null | head -20" in /Users/macthedan/projects/q27
+ succeeded in 1476ms:
+/Applications/Xcode.app/Contents/Developer/Platforms/AppleTVOS.platform/Developer/SDKs/AppleTVOS.sdk/usr/include/c++/v1/filesystem
+/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/usr/include/c++/v1/filesystem
+/Applications/Xcode.app/Contents/Developer/Platforms/WatchOS.platform/Developer/SDKs/WatchOS.sdk/usr/include/c++/v1/filesystem
+/Applications/Xcode.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS.sdk/usr/include/c++/v1/filesystem
+/Applications/Xcode.app/Contents/Developer/Platforms/XRSimulator.platform/Developer/SDKs/XRSimulator.sdk/usr/include/c++/v1/filesystem
+/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/c++/v1/filesystem
+/Applications/Xcode.app/Contents/Developer/Platforms/WatchSimulator.platform/Developer/SDKs/WatchSimulator.sdk/usr/include/c++/v1/filesystem
+/Applications/Xcode.app/Contents/Developer/Platforms/AppleTVSimulator.platform/Developer/SDKs/AppleTVSimulator.sdk/usr/include/c++/v1/filesystem
+/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk/usr/include/c++/v1/filesystem
+
+ succeeded in 2722ms:
+/Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem
+/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk/usr/include/c++/v1/filesystem
+/Library/Developer/CommandLineTools/SDKs/MacOSX26.4.sdk/usr/include/c++/v1/filesystem
+
+exec
+/bin/zsh -lc "nl -ba /Library/Developer/CommandLineTools/usr/include/c++/v1/filesystem | sed -n '1048,1072p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+  1048	    return __compare(__s);
+  1049	  }
+  1050	
+  1051	  // decomposition
+  1052	  _LIBCPP_INLINE_VISIBILITY path root_name() const {
+  1053	    return string_type(__root_name());
+  1054	  }
+  1055	  _LIBCPP_INLINE_VISIBILITY path root_directory() const {
+  1056	    return string_type(__root_directory());
+  1057	  }
+  1058	  _LIBCPP_INLINE_VISIBILITY path root_path() const {
+  1059	    return root_name().append(string_type(__root_directory()));
+  1060	  }
+  1061	  _LIBCPP_INLINE_VISIBILITY path relative_path() const {
+  1062	    return string_type(__relative_path());
+  1063	  }
+  1064	  _LIBCPP_INLINE_VISIBILITY path parent_path() const {
+  1065	    return string_type(__parent_path());
+  1066	  }
+  1067	  _LIBCPP_INLINE_VISIBILITY path filename() const {
+  1068	    return string_type(__filename());
+  1069	  }
+  1070	  _LIBCPP_INLINE_VISIBILITY path stem() const { return string_type(__stem()); }
+  1071	  _LIBCPP_INLINE_VISIBILITY path extension() const {
+  1072	    return string_type(__extension());
+
+exec
+/bin/zsh -lc "nl -ba docs/QA_BEFORE_RELEASES.md | sed -n '14,60p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+    14	## 0. Preconditions
+    15	
+    16	- [ ] Working tree clean: every round committed or explicitly HELD with
+    17	      its plan doc saying why (`git status --short` has no surprises;
+    18	      stage explicitly — never `git add -A`, tasks/lessons.md).
+    19	- [ ] Quiet machine for every timed leg: one model resident at a time,
+    20	      input-idle, `caffeinate` wraps each leg
+    21	      (logs/q4port-20260717/COORDINATION.md — two OOM crashes proved why:
+    22	      never two 17 GB residents; pgrep+curl health-check before any
+    23	      server launch).
+    24	- [ ] `docs/METAL_PROGRESS.md` chronicle current through HEAD (grep-count
+    25	      each new entry's headline == 1 after any merge).
+    26	
+    27	## 1. Build + unit (M4, ~5 min)
+    28	
+    29	- [ ] `make clean && make -j` (or `make all`) — zero warnings tolerated
+    30	      in the server/engine TU.
+    31	- [ ] `make test-cpu` — ALL PASS (toolconstrain, suffixdraft, sampling,
+    32	      kl, artifacts, depthctl).
+    33	- [ ] `make test-metal` — matvec, ops (incl. turbo3 attention, fp16
+    34	      exception window, e4m3 store goldens), stream format + splitter.
+    35	
+    36	## 2. Canonical correctness (box-marked)
+    37	
+    38	- [ ] **yukon:** CUDA 16-token byte gate — canonical CLI run matches the
+    39	      recorded SHA (the merge-time reminder: mandatory when loader.cpp,
+    40	      tokenizer, or shared headers — api_common.h, stream_split.h,
+    41	      tool_preamble.h — were touched; the byte-exact contract lives on
+    42	      the CUDA side).
+    43	- [ ] **M4:** `./build/q27-metal --chunk-parity 384` on the official
+    44	      artifact — widths 17/48/96 bit-identical to width 12.
+    45	- [ ] **M4:** `tools/snapshot_gate.sh` — Phase-1 byte identity both KV
+    46	      dtypes + reject matrix + crash legs + the l7full exception arm.
+    47	- [ ] **M4:** `tools/failpoint_gate.sh <model.q27>` — post-throw engine
+    48	      state (position held; reset+regenerate byte-identical).
+    49	- [ ] **M4:** `tools/ckpt_gate.sh` — divergence-replay cache aliasing.
+    50	- [ ] **M4:** `tools/constrain_gate.sh` — grammar engage/disengage,
+    51	      split-brain rebind, pool-full sticky off.
+    52	
+    53	## 3. Live-server API gates (M4, one server, serialized)
+    54	
+    55	Per COORDINATION.md: pgrep + `curl :8213/health` before launch; one
+    56	17 GB resident; gates against the running server only.
+    57	
+    58	- [ ] `tools/agentic_parity_gate.sh` — Anthropic + OpenAI chat tool
+    59	      loops, count_tokens, ctx-limit 400, prefix hit (G2–G7).
+    60	- [ ] `tools/responses_parity_gate.sh` — /v1/responses function_call
+
+exec
+/bin/zsh -lc "nl -ba docs/METAL_PROGRESS.md | sed -n '136,144p;328,334p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+   136	
+   137	Gates: widths 4, 8 and 12 produce the canonical greedy output, and a 32-token `--mtp 8` run matched greedy byte-exactly at 48.6% draft acceptance, `0.71` versus `0.73 tok/s` — parity with greedy where serial verification ran `0.01–0.55 tok/s`. `Q27_MTP_TRACE=1` prints per-round draft/verify/commit timing: currently ~1.0 s verify plus ~0.9 s commit re-encode per partial round. The re-encode is the main structural overhead; removing it (per-token GDN state capture or GPU-side acceptance fused into the chunk) and GPU-resident drafting are the remaining levers.
+   138	
+   139	### 7 — Prefix/server
+   140	
+   141	`MetalEngine::capture_state` and `restore_state` copy GDN state, active KV rows, MTP KV, position, last normalized hidden state, and resident logits on-device. `build/q27-metal` supports token IDs or text prompts, deterministic temperature/top-k/top-p sampling, logit dumps, MTP, and suffix drafting. `build/q27-metal-server` adds a mutex-serialized Metal service with longest-prefix snapshot LRU and baseline `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` endpoints. The health endpoint is browser-smoke-tested. Streaming event formats, constrained tools, multi-slot scheduling, GPU-side sampling, and the full CUDA server compatibility suite remain.
+   142	
+   143	### 8 — turbo3/long context
+   144	
+   328	
+   329	**Responses-API full parity + Anthropic error-class split SHIPPED: Codex CLI can drive the Metal server end-to-end; SIX codex rounds to clean (2026-07-17 midday, 24 GB M4; while the Q4-port ship bench waits for its quiet window).** The two registered agentic-parity residues closed (`docs/plans/2026-07-17-responses-parity-residue.md`): **/v1/responses** is now a wholesale port of the CUDA handler onto Runtime::run (the raw-text + tools_preamble hack is dead) — instructions/input-item mapping (message/function_call/custom_tool_call/function_call_output, reasoning items dropped, same-role merge), custom freeform tools bridged to one-string-param functions, hosted types skipped never rejected, chatml_prompt rendering, StreamSplitter routing into reasoning/message/function_call/custom_tool_call items with the codex 0.143 lifecycle on the stream (added+content_part.added before the first delta, done triplet on flush, response.completed terminator), bare-call recovery even with empty tools; **EngineError split** — engine failures during generation answer Anthropic api_error 500 / OpenAI api_error 500 while request-class errors stay 400 (400 is fatal to codex, 500 retries). Gates (live T2 server): the new `tools/responses_parity_gate.sh` G8a–G8d+G9 ALL PASS (function_call items with arguments-as-string, stream lifecycle ordering, tool-result round-trip, custom_tool_call bare-string input, 400 class not widened), agentic battery G2–G7 ALL PASS, test-cpu/test-metal green. Codex earned its keep across SIX rounds: text→think transitions corrupting output_index; bare-call recovery double-emission then coverage then per-segment placement; truncation repair gated to true end-of-turn (`parse_bare_tool_calls` gains a defaulted `allow_trunc_repair` — every prior caller unchanged); malformed-wrapper raw folded through recovery then committed as its own segment; **StreamSplitter adjacent-call boundary segment** (`</tool_call><tool_call>`, the multi-call batch shape — shared component: every handler on BOTH backends gains call separation, canonical non-tool path segment-identical, test_splitter pins it); streaming end-of-turn truncation rescue (beyond the CUDA reference, which commits the fragment); streaming engine-failure terminator `response.failed` with last_error + partial output. Honesty notes: the 500 leg and failure path have no failpoint (review-only, pre-registered); natural-segment tx=pre is the house convention. **Operational:** two same-box OOM crashes from double 17 GB servers (wrapper-pid kill orphaning the server; a concurrent agent launching without a health check) — coordination protocol committed (`logs/q4port-20260717/COORDINATION.md`, `tasks/lessons.md`); the Q4-port quiet ship bench is re-armed via `tools/quiet_q4_bench.sh` + hold file `/tmp/q27-quiet-bench.hold` (the operator calls the window).
+   330	
+   331	**--trace whole-session logging SHIPPED (triage I2) + the release checklist (I3) + the I1 strip tier sent back with a mechanism question (2026-07-17 afternoon, 24 GB M4).** the operator's ds4 product triage landed mid-day; three of its four adopt-now items resolved in one session. **I2:** `q27-metal-server --trace <path>` writes one JSONL stream of exactly what the parity rounds reconstructed by hand — per-endpoint request events with the RENDERED chatml prompt (64 KB cap, truncation recorded), outcomes with finish/tokens/prefix_hit, prefix-tier decisions (cold/memory/disk via a disk_loaded flag, not length equality), snapshot save/bank/evict with eviction stats, queue/prefill/generate-phase cancels (generate = where Finish::Cancelled is set, not a guessed wrapper catch), error answers including the four ctx-limit preflight sites the guards alone missed, and tool_recovery events beside every [tool-fallback] line. TraceLog is noexcept-contained, mutex-serialized with tms stamped inside the lock (file order == tms order within a boot), path-only (no "-": stderr is shared with server logging). Gates: new `tools/trace_gate.sh` (5 api families, boot, outcomes, 400s, monotonic per-boot tms) ALL PASS alongside both parity suites on the live server; the serving line now carries `--trace ~/.q27/trace.jsonl` (append; truncate to rotate, never rm a live trace). Codex two rounds: P1 (throw-through) fixed; rejected-with-evidence: completions' body.value repeats the encode line's identical accessor (throws there first); scalar-only unguarded events are the recorded OOM-only boundary. **I3:** `docs/QA_BEFORE_RELEASES.md` — the single pre-tag checklist (preconditions through homebrew formula smoke), first concrete Homebrew Phase-2 task. **I1 strip tier:** design check RECORDED against building it (`docs/plans/2026-07-17-i1-strip-design-check.md`) — ds4's strip exists because the session owns the transcript; ours is a request/response cache where the client always sends the full prompt, so a tokens-only stub never saves one token of prefill (restore ≡ cold by construction). The valuable form is proactive re-materialization (speculative idle-slot warming) — needs trace-measured prefix recurrence economics first; recommendation recorded, verdict is the operator's. **I4** folds into the bench binaries at the Q4 verdict (their next touch), not before — the ship-line harness stays pristine. Also caught and fixed in `tools/quiet_q4_bench.sh` + COORDINATION.md/lessons: `pgrep -f "q27-metal-server.*--port"` matches the caffeinate WRAPPER too — server pids must match argv[0] (ps+awk), or the verify-empty check lies (the orphan-double-load crash class).
+   332	
+   333	**Codex CLI drives the Metal server END-TO-END: the /v1/responses port validated on real agent traffic, and the cancel-bank + disk-restore machinery fired in production for the first time (2026-07-17 afternoon, 24 GB M4).** A stock `codex exec` (0.144, read-only sandbox, one-shot `-c model_providers.q27` override — no user config touched) ran a read-and-answer task through the server: turn 1 (11,243 tokens) hit codex's stream timeout mid-COLD-prefill and disconnected; the per-chunk liveness probe caught it and **banked the completed chunks to disk**; codex's retry restored the banked prefix (`prefix tier=disk` in the trace), finished prefill in seconds, auto-saved at the aligned boundary, and the model's tool call executed (file read); turn 2 answered exactly right (the plan's gate ids G8a–G8d + G9, battery G2–G7). The whole rescue is one trace story: cancel(prefill) → disk restore → snapshot_save(11136) → outcome. Non-findings recorded: codex's models-manager fails to decode our OpenAI-standard `/v1/models` (wants its own ModelInfo shape; falls back to default metadata and proceeds — codex-side nicety, NOT a wire bug, noted in the homebrew plan's Q2). Also this session, all no-bench lanes: LICENSE Q3 verified RESOLVED (upstream declares MIT per GitHub API; our LICENSE matches with attribution); `tools/prefix_recurrence.py` lands (the I1 recurrence-economics instrument — first read on gate traffic: 59% of requests hit an already-seen family; real pi/codex traffic accumulates for the verdict); Q2 (/health model identity) next up. G2–G7/G8–G9 suites + trace gate green throughout.
+   334	
+
+exec
+/bin/zsh -lc "nl -ba docs/plans/2026-07-16-homebrew-distribution.md | sed -n '188,204p'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+   188	  plist for always-on serving; auto-ctx (B2); download progress UI
+   189	  (this is the "graduate the wrapper to Go" trigger, if it ever fires).
+   190	
+   191	## Open questions
+   192	
+   193	- **Q1:** Does the 1.8 GB dspark drafter pack ship as a user-facing
+   194	  artifact or stay a dev fixture? (Ride the DSpark port decision —
+   195	  2026-07-16-dspark-port-phase0.md; the manifest format doesn't care.)
+   196	- **Q2:** Server identity: today the single-model server accepts any
+   197	  model name in requests. The wrapper should at minimum write the loaded
+   198	  model name into `/health` so clients can tell what's resident. Engine
+   199	  or wrapper responsibility? (Lean engine: one string, one endpoint.)
+   200	  Adjacent finding (2026-07-17 e2e smoke): codex 0.144's models-manager
+   201	  probes `/v1/models` and fails to decode our (OpenAI-standard,
+   202	  CUDA-identical) `{"object":"list","data":[...]}` — it wants its own
+   203	  ModelInfo shape (`missing field models`). Non-fatal: falls back to
+   204	  default metadata and proceeds. Codex-side nicety, not a wire bug;
+
+exec
+/bin/zsh -lc 'rg -n "''^'"\\s*server\\.Get\\(\\\"/health|/health\\?verify|\\{\\\"status\\\":\\\"ok\\\"\\}|status.*corrupted\" src/server.cu src/metal/metal_server.cpp docs tools --glob '"'!logs/**'"' --glob '"'!data/**'"'" in /Users/macthedan/projects/q27
+ succeeded in 0ms:
+src/server.cu:837:        // /health?verify=1 recomputes the resident-weight checksums (~20 ms;
+src/server.cu:844:            res.set_content(std::string("{\"status\":\"") + (bad ? "corrupted" : "ok") +
+src/metal/metal_server.cpp:1228:        server.Get("/health",[&runtime](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"},{"model",runtime.model_name}});});
+docs/SECURITY-MODEL.md:70:**#5 -- Disconnected clients keep consuming GPU; public `/health?verify` stalls
+docs/NOTEBOOK.md:469:tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
+docs/NOTEBOOK.md:660:for short supervised benches; `--verify-weights` / `/health?verify=1` is
+docs/BUILDLOG.md:111:(CLI) and /health?verify=1 (server), 867 tensors in ~20 ms. Review minors
+docs/BUILDLOG.md:642:unchanged); /health?verify comment corrected (default-stream xsum BARRIERS
+
+codex
+**Findings:** None.
+
+**Verdicts**
+- **P1:** none.
+- **P2:** none.
+- **P3:** none.
+
+Checked the changed surface in [src/metal/metal_server.cpp](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:455), [health handler](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1228), and [trace boot event](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1214). The `/health` change is additive, and in-repo consumers either ignore the body/status-only check or parse only `status == "ok"`: examples are [tools/reqlog_gate.sh](/Users/macthedan/projects/q27/tools/reqlog_gate.sh:97), [tools/interleave_gate.sh](/Users/macthedan/projects/q27/tools/interleave_gate.sh:134), and [tools/thunderdome_pin_ab.sh](/Users/macthedan/projects/q27/tools/thunderdome_pin_ab.sh:33).
+
+The `&runtime` capture is safe: `runtime` is constructed before `server`, `server.listen(...)` blocks, and reverse destruction order destroys `server` before `runtime` after listen returns. `model_name` is initialized before serving and is only read afterward.
+
+Nuance on “cannot throw”: `std::filesystem::path(model).filename()` will not throw because the input string is an arbitrary/nonexistent path; it does not stat or validate an artifact. The expression is not formally `noexcept` because string/path construction can still allocate. Given this runs during startup inside a constructor that already throws on normal startup failures, I would not file that as a defect. No build/server run performed; this was a static review/search pass.
+tokens used
+57,704
+**Findings:** None.
+
+**Verdicts**
+- **P1:** none.
+- **P2:** none.
+- **P3:** none.
+
+Checked the changed surface in [src/metal/metal_server.cpp](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:455), [health handler](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1228), and [trace boot event](/Users/macthedan/projects/q27/src/metal/metal_server.cpp:1214). The `/health` change is additive, and in-repo consumers either ignore the body/status-only check or parse only `status == "ok"`: examples are [tools/reqlog_gate.sh](/Users/macthedan/projects/q27/tools/reqlog_gate.sh:97), [tools/interleave_gate.sh](/Users/macthedan/projects/q27/tools/interleave_gate.sh:134), and [tools/thunderdome_pin_ab.sh](/Users/macthedan/projects/q27/tools/thunderdome_pin_ab.sh:33).
+
+The `&runtime` capture is safe: `runtime` is constructed before `server`, `server.listen(...)` blocks, and reverse destruction order destroys `server` before `runtime` after listen returns. `model_name` is initialized before serving and is only read afterward.
+
+Nuance on “cannot throw”: `std::filesystem::path(model).filename()` will not throw because the input string is an arbitrary/nonexistent path; it does not stat or validate an artifact. The expression is not formally `noexcept` because string/path construction can still allocate. Given this runs during startup inside a constructor that already throws on normal startup failures, I would not file that as a defect. No build/server run performed; this was a static review/search pass.

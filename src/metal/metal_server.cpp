@@ -440,6 +440,7 @@ struct Runtime {
     q27::ToolMaskCache mask_cache;
     DiskSnapshotStore snapstore;
     TraceLog trace;
+    std::string model_name;
     // Auto-snapshot threshold in prompt tokens (0 = hint-only); set with
     // the snapshot store, meaningful only when snapstore.enabled().
     size_t snap_auto_min=0;
@@ -449,6 +450,9 @@ struct Runtime {
             uint32_t slot_count)
         :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
          constrain_tools(constrain) {
+        // Server identity (homebrew plan Q2): /health and the boot trace name
+        // the resident artifact so wrapper/clients can tell what's loaded.
+        model_name=std::filesystem::path(model).filename().string();
         if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
@@ -1208,7 +1212,8 @@ int main(int argc,char** argv) {
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
             runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
-                                 {"mtp",width},{"suffix",suffix_width},{"slots",slot_count}});
+                                 {"mtp",width},{"suffix",suffix_width},{"slots",slot_count},
+                                 {"model",runtime.model_name}});
         }
         httplib::Server server;
         // Bound the accept-side queue (codex P1 on d243f92): the default
@@ -1220,7 +1225,7 @@ int main(int argc,char** argv) {
         // wait while one generated (G6 found this). The 32-connection accept
         // queue stays the outer bound.
         server.new_task_queue=[]{ return new httplib::ThreadPool(16,32); };
-        server.Get("/health",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"}});});
+        server.Get("/health",[&runtime](const httplib::Request&,httplib::Response& r){json_response(r,{{"status","ok"},{"model",runtime.model_name}});});
         // Wait honesty (Phase 1 contract): per-arrival-phase stats. Gate
         // wait (admission -> first lease) carries the one-quantum bound;
         // queue wait (arrival -> admission) is bounded only by QUEUE_MAX

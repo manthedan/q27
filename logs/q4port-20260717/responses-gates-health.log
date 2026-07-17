@@ -1,0 +1,16 @@
+PASS: G8a function_call item name=get_weather
+PASS: G8a arguments is a JSON-encoded string
+PASS: G8a arguments.city='Paris'
+PASS: G8b(i) added+content_part.added precede first output_text.delta
+PASS: G8b(i) response.completed terminator
+PASS: G8b(ii) output_item.done carries the function_call
+PASS: G8b(ii) response.completed carries output items + usage
+PASS: G8c round-trip text references the tool result: The weather in Paris right now is 14 degrees C, sunny, with light wind.
+PASS: G8c no spurious new function_call
+PASS: G8d custom_tool_call item name=apply_patch
+PASS: G8d custom_tool_call input is a bare string
+PASS: G9 invalid JSON -> 400
+PASS: G9 missing input -> 400
+PASS: G9 oversize prompt -> 400 context_length_exceeded
+----
+responses parity gates: ALL PASS
