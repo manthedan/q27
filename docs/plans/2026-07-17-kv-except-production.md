@@ -160,3 +160,21 @@ Program note: the attrib instrument remains valid for MEANS (it
 transferred within band twice) but NOT for knife-edge tail selection;
 production arms at 1,536 positions (~2 min) are the standard tail
 instrument from here.
+
+## Decision: Daniel funded option 1 — L7-full (2026-07-17)
+
+Daniel: "fund full l7". The production exception list is
+`Q27_METAL_KV_FP16_CELLS=8,9,10,11,12,13,14,15` (L7 h0–h3, K+V,
++25.8% turbo3 KV bytes) — the blessed setting for turbo3 long-context
+serving on this artifact. Options 2 (mid-rate code, ~+12.9%) and 3
+(uniform null) stay parked unless the +25.8% price ever hurts.
+
+Landing verification (same day, mini): funded env accepted by the
+engine ctor (`--validate-only --ctx 8 --kv turbo3` OK, 8 cells, pairs
+enforced); `q27-metal-server` boots under the env with the loud
+prefix-cache-DISABLED note and serves a greedy completion
+(" Paris."). Funded residue, now a real production cost rather than a
+footnote: **v1 refuses snapshots and disables the prefix cache under
+the env** — side-cache serialization (snapshot v2) is the follow-up
+that reunites the funded quality config with the TTFT prefix-snapshot
+story.
