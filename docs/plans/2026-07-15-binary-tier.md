@@ -376,3 +376,36 @@ the fork binary — mini), official-tier canonical smoke + CUDA byte gate
 at merge, `metal_decode_bench` resident-vs-artifact at matched thermal
 state and the 8K→32K NLL ladder (quiet machine), Phase 0A quality gates
 re-run through OUR engine (the vendor-stack numbers stand in until then).
+
+## Phase 0A-q27 — quality battery through OUR engine (pre-registered 2026-07-16 night, before running)
+
+The vendor-stack Phase 0A numbers stand in until the same qualities are
+shown through our own engine on our own pack. Legs, gates written before
+any run:
+
+1. **NLL ratio leg**: `--nll data/wikitext2-test.tokens.bin --nll-long
+   8192 --ctx 8192` (single pass, no resets), identical invocation on B1,
+   T2, and the official tier, one load at a time. GATES: B1/T2 PPL ratio
+   in **[1.05, 1.30]** (vendor-stack protocol measured 1.16×; a ratio
+   outside the band means the repack or kernels changed quality, not the
+   model — investigate before any serving claim). B1/official ≤ **3.5×**
+   (the Phase 0 serving-tier band, carried verbatim).
+2. **Behavioral probes**: the four RECORDED Phase 0A prompts
+   (`logs/overnight-20260715/run.sh` probe set: json / constraints /
+   codeedit / native toolcall) through OUR server on the B1 pack, greedy,
+   max_tokens 6144 (the vendor run's thinking-budget lesson), toolcall
+   via `--constrain-tools` serial. Machine-checked: JSON parses with
+   exact keys/types/arity and no fences; constraints list obeys all seven;
+   code edit contains the boundary fix; tool call names get_weather with
+   city Taipei. GATE: **4/4**; any malformed tool call or JSON is a FAIL
+   (agentic collapse criterion carried from Phase 0).
+3. **Decode economics** (`metal_decode_bench` on the B1 artifact,
+   back-to-back with resident ceiling, matched thermal state): BANDS —
+   artifact decode ≥ **18 tok/s strong** (Phase 0B parity projection
+   20–23), **15–18 conditional** (issue-bound residue, fund one kernel
+   look), < **15 investigate before serving claims** (T2 serves at ~11;
+   a B1 below 15 fails to clear the tier's reason to exist by margin).
+
+Machine: quiet 24 GB M4 (Daniel's go this window covers the runs).
+Correctness legs tolerate contention; leg 3 is timing and runs last,
+alone. RESULTS below when run.
