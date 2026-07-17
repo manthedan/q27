@@ -1,0 +1,4 @@
+pi 0.80.10 -p --provider q27-metal --tools read, shipped binary (post codex fixes):
+prompt: Read the file pi-smoke.txt ... first line?
+answer: The first line of pi-smoke.txt says: "The launch code is PINEAPPLE-42."
+result: PASS (structured tool_calls -> pi executed read -> tool result consumed)

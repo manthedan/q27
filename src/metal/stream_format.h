@@ -7,6 +7,10 @@
 #pragma once
 
 #include "../../third_party/json.hpp"
+// Utf8Gate now comes from the shared header directly (it was a verbatim
+// copy here until the 2026-07-17 agentic-parity round, which made the
+// Metal server consume api_common.h wholesale — one gate, both servers).
+#include "../api_common.h"
 
 #include <algorithm>
 #include <string>
@@ -14,49 +18,6 @@
 #include <vector>
 
 namespace q27 {
-
-// Incremental UTF-8 boundary gate for streaming token pieces. Copied verbatim
-// from src/api_common.h (the CUDA server's Utf8Gate) so both servers split
-// multi-byte characters identically. BPE token boundaries can split a
-// multi-byte character; the raw piece is then invalid UTF-8 and nlohmann
-// json::dump throws type_error.316 on it. feed() returns the longest valid
-// prefix, holding an incomplete trailing sequence until its continuation
-// bytes arrive; flush() ends the stream, turning a dangling partial into
-// U+FFFD.
-struct Utf8Gate {
-    std::string pend;
-    static int seq_len(unsigned char b) {
-        if (b < 0x80) return 1;
-        if ((b & 0xE0) == 0xC0) return 2;
-        if ((b & 0xF0) == 0xE0) return 3;
-        if ((b & 0xF8) == 0xF0) return 4;
-        return -1; // continuation or invalid lead byte
-    }
-    std::string feed(const std::string& piece) {
-        pend += piece;
-        size_t n = pend.size(), i = n;
-        int back = 0;
-        while (i > 0 && back < 4) {
-            unsigned char b = (unsigned char)pend[i - 1];
-            if ((b & 0xC0) != 0x80) { i--; break; }
-            i--;
-            back++;
-        }
-        size_t cut = n;
-        if (i < n) {
-            int L = seq_len((unsigned char)pend[i]);
-            if (L > 0 && i + (size_t)L > n) cut = i; // incomplete tail: hold back
-        }
-        std::string out = pend.substr(0, cut);
-        pend.erase(0, cut);
-        return out;
-    }
-    std::string flush() {
-        std::string out = pend.empty() ? std::string() : std::string("\xEF\xBF\xBD");
-        pend.clear();
-        return out;
-    }
-};
 
 // Stop-sequence holdback for streaming text. Implements the OpenAI `stop` /
 // Anthropic `stop_sequences` contract for an incremental byte stream: text up
