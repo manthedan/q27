@@ -38,3 +38,14 @@ every cell in `caffeinate -i`. System sleep reaps background children.
   the gap between inner caffeinated children is enough to sleep in.
 - Never edit a shell script while zsh is executing it (incremental
   read) — fix drivers between runs, not during.
+
+## Stage files explicitly, never by directory or -A (2026-07-17)
+Twice in one night a broad `git add` swept in unintended files: `git add
+-A` grabbed stray root logs plus the 1.2 MB corpus binary (caught only
+because the commit stat looked wrong — amended), and `git add
+logs/kv_step4b/` grabbed a stale ABORTED marker next to the real
+results (caught by codex, contradicted the summary for any tooling
+reading the marker convention). Measurement directories accumulate
+driver droppings (ABORTED, .tmp, .attempt1); name every file in the
+`git add`, and glance at `git status --short` of what got staged
+before committing.
