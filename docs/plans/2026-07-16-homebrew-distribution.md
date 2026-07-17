@@ -197,8 +197,14 @@ release, and `q27 pull` never needs a network call to know what exists.
   model name in requests. The wrapper should at minimum write the loaded
   model name into `/health` so clients can tell what's resident. Engine
   or wrapper responsibility? (Lean engine: one string, one endpoint.)
-- **Q3:** LICENSE — **the repo has no LICENSE file at all** (checked
-  2026-07-16). The formula must state a license, and distributing
-  binaries without one is legally murky regardless of brew. Resolve with
-  upstream (match whatever signalnine/q27 declares) before Phase 2; this
-  is a hard Phase-2 prerequisite, not a nice-to-have.
+  Adjacent finding (2026-07-17 e2e smoke): codex 0.144's models-manager
+  probes `/v1/models` and fails to decode our (OpenAI-standard,
+  CUDA-identical) `{"object":"list","data":[...]}` — it wants its own
+  ModelInfo shape (`missing field models`). Non-fatal: falls back to
+  default metadata and proceeds. Codex-side nicety, not a wire bug;
+  candidates for its config docs, not our endpoint.
+- **Q3:** LICENSE — **RESOLVED (verified 2026-07-17).** The repo now has
+  an MIT LICENSE with the upstream attribution line; GitHub's API
+  confirms upstream `signalnine/q27` declares MIT (`license.spdx_id`,
+  LICENSE on `master`), so the formula's `license "MIT"` is correct
+  as sketched.
