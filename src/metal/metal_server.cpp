@@ -391,6 +391,11 @@ struct Runtime {
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
         slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
+        // Exception engines cannot snapshot (v1): the effective capacity
+        // feeds the G6 admission charge and the disk snapshot tier below
+        // (codex P1+P2 rounds on 41705bb/88373f7 — all three snapshot
+        // surfaces must agree with the Slot-internal capacity-0 override).
+        const size_t effective_entries=slots.front()->engine.kv_fp16_except()?0:cache_entries;
         if(slots.front()->engine.kv_fp16_except() && cache_entries)
             fprintf(stderr,"q27 Metal server: KV fp16 exception cells active (Q27_METAL_KV_FP16_CELLS) — prefix cache DISABLED (snapshots are a v1 exclusion)\n");
         // G6 admission (docs/plans/2026-07-16-g6-admission.md): additional
@@ -416,7 +421,7 @@ struct Runtime {
         const q27::MetalEngine& e0=slots[0]->engine;
         const uint64_t per_slot=e0.kv_reserved_bytes()
                                +q27::MetalEngine::fixed_state_bytes(e0.chunked_prefill())
-                               +(uint64_t)cache_entries*e0.snapshot_bytes();
+                               +(uint64_t)effective_entries*e0.snapshot_bytes();
         for(uint32_t s=1;s<slot_count;s++) {
             const uint64_t need=(uint64_t)(slots.size()+1)*per_slot;
             if(need>budget) {
@@ -440,7 +445,10 @@ struct Runtime {
         // class as Q27_METAL_BUDGET_MB; default 8192 MB). The artifact
         // identity hash (~3 s over the 7 GB mapping) is primed HERE, at
         // startup, so the first hinted request never stalls the lease on it.
-        if(const char* sdir=getenv("Q27_METAL_SNAPSHOT_DIR"); sdir && *sdir) {
+        if(slots.front()->engine.kv_fp16_except() && getenv("Q27_METAL_SNAPSHOT_DIR"))
+            fprintf(stderr,"q27 Metal server: Q27_METAL_SNAPSHOT_DIR ignored — exception engines cannot snapshot (v1)\n");
+        if(const char* sdir=getenv("Q27_METAL_SNAPSHOT_DIR");
+           sdir && *sdir && !slots.front()->engine.kv_fp16_except()) {
             uint64_t snap_mb=8192;
             if(const char* smax=getenv("Q27_METAL_SNAPSHOT_MAX_MB"); smax && *smax) {
                 char* end=nullptr; errno=0;
