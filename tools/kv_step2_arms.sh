@@ -8,6 +8,11 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# Self-caffeinate the whole run, not just the inner arms — the gaps
+# between caffeinated children are enough for the machine to sleep in
+# (2026-07-16 lesson: sleep reaps background jobs).
+[ -z "${STEP2_CAFF:-}" ] && exec env STEP2_CAFF=1 caffeinate -i "$0" "$@"
+
 BIN=build/q27-metal
 MODEL=models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27
 TOK=models/qwen36-27b-mtp/qwen36-27b-mtp.tok
