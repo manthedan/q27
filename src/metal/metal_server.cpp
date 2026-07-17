@@ -290,12 +290,7 @@ struct Runtime {
         bool busy=false;
         enum class Phase { Idle, Prefill, Decode, Verify } phase=Phase::Idle;
         Slot(std::shared_ptr<q27::MetalEngine::Shared> s,uint32_t ctx,bool turbo3,size_t entries)
-            :engine(std::move(s),ctx,turbo3),
-             // KV fp16 exception engines cannot snapshot yet (v1 exclusion) —
-             // a capacity-0 cache never calls capture_state, so the server
-             // stays usable instead of failing every request post-prefill
-             // (codex P1 on 41705bb). Loud note at startup below.
-             cache(engine.kv_fp16_except()?0:entries) {}
+            :engine(std::move(s),ctx,turbo3),cache(entries) {}
     };
     std::vector<std::unique_ptr<Slot>> slots;
     uint32_t mtp_width;
@@ -391,13 +386,12 @@ struct Runtime {
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
         slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
-        // Exception engines cannot snapshot (v1): the effective capacity
-        // feeds the G6 admission charge and the disk snapshot tier below
-        // (codex P1+P2 rounds on 41705bb/88373f7 — all three snapshot
-        // surfaces must agree with the Slot-internal capacity-0 override).
-        const size_t effective_entries=slots.front()->engine.kv_fp16_except()?0:cache_entries;
-        if(slots.front()->engine.kv_fp16_except() && cache_entries)
-            fprintf(stderr,"q27 Metal server: KV fp16 exception cells active (Q27_METAL_KV_FP16_CELLS) — prefix cache DISABLED (snapshots are a v1 exclusion)\n");
+        // Snapshot v2 (2026-07-17-kv-except-snapshot-v2.md): exception
+        // engines snapshot like any other — side rows ride every surface
+        // and snapshot_bytes() prices them, so no capacity override exists
+        // anymore. Informational note only.
+        if(slots.front()->engine.kv_fp16_except())
+            fprintf(stderr,"q27 Metal server: KV fp16 exception cells active (Q27_METAL_KV_FP16_CELLS); side caches ride prefix/disk snapshots (v2)\n");
         // G6 admission (docs/plans/2026-07-16-g6-admission.md): additional
         // slots must fit the FULL per-slot footprint — KV + this slot's own
         // GQA partials (per-engine since audit E2, charged inside
@@ -421,7 +415,7 @@ struct Runtime {
         const q27::MetalEngine& e0=slots[0]->engine;
         const uint64_t per_slot=e0.kv_reserved_bytes()
                                +q27::MetalEngine::fixed_state_bytes(e0.chunked_prefill())
-                               +(uint64_t)effective_entries*e0.snapshot_bytes();
+                               +(uint64_t)cache_entries*e0.snapshot_bytes();
         for(uint32_t s=1;s<slot_count;s++) {
             const uint64_t need=(uint64_t)(slots.size()+1)*per_slot;
             if(need>budget) {
@@ -445,10 +439,7 @@ struct Runtime {
         // class as Q27_METAL_BUDGET_MB; default 8192 MB). The artifact
         // identity hash (~3 s over the 7 GB mapping) is primed HERE, at
         // startup, so the first hinted request never stalls the lease on it.
-        if(slots.front()->engine.kv_fp16_except() && getenv("Q27_METAL_SNAPSHOT_DIR"))
-            fprintf(stderr,"q27 Metal server: Q27_METAL_SNAPSHOT_DIR ignored — exception engines cannot snapshot (v1)\n");
-        if(const char* sdir=getenv("Q27_METAL_SNAPSHOT_DIR");
-           sdir && *sdir && !slots.front()->engine.kv_fp16_except()) {
+        if(const char* sdir=getenv("Q27_METAL_SNAPSHOT_DIR"); sdir && *sdir) {
             uint64_t snap_mb=8192;
             if(const char* smax=getenv("Q27_METAL_SNAPSHOT_MAX_MB"); smax && *smax) {
                 char* end=nullptr; errno=0;
@@ -465,10 +456,23 @@ struct Runtime {
             // Full 160-bit identity in the tag: a truncated prefix could
             // collide across artifacts sharing a directory and let one
             // server overwrite another's snapshots (codex P2 on f05ef2d).
-            char tag[48];
-            for(int i=0;i<20;i++) snprintf(tag+2*i,3,"%02x",sha[i]);
-            snprintf(tag+40,sizeof tag-40,"%c-",turbo3?'t':'f');
-            snapstore.init(sdir,snap_mb*1024ull*1024ull,tag);
+            // Exception engines append their cell config (v2): different
+            // cell lists sharing a directory must MISS each other's files
+            // (load_state would loudly reject them, costing a fallback per
+            // request); env-unset tags are unchanged so pre-v2 snapshot
+            // files stay live.
+            std::string tag;
+            tag.reserve(64);
+            char hex[3];
+            for(int i=0;i<20;i++) { snprintf(hex,3,"%02x",sha[i]); tag+=hex; }
+            tag+=turbo3?'t':'f';
+            if(slots[0]->engine.kv_fp16_except()) {
+                tag+='x';
+                const uint8_t* masks=slots[0]->engine.kv_fp16_head_masks();
+                for(int i=0;i<16;i++) tag+="0123456789abcdef"[masks[i]&15];
+            }
+            tag+='-';
+            snapstore.init(sdir,snap_mb*1024ull*1024ull,tag.c_str());
             // A restart over an oversized directory must come back under
             // budget without waiting for the next save (codex P2 on 607160e).
             snapstore.evict_past_budget();
@@ -493,7 +497,7 @@ struct Runtime {
                 snap_auto_min=(size_t)v;
             }
             fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB, auto>=%zu tokens, tag %s\n",
-                    sdir,(unsigned long long)snap_mb,snap_auto_min,tag);
+                    sdir,(unsigned long long)snap_mb,snap_auto_min,tag.c_str());
         }
         if(constrain_tools) {
             vocab_bytes_v=tokenizer.vocab_bytes();

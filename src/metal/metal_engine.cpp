@@ -56,6 +56,12 @@ struct MetalEngine::Snapshot {
     uint32_t position = 0;
     std::vector<StoredLayer> layers;
     std::shared_ptr<BackendBuffer> mtp_k_cache, mtp_v_cache, hidden, logits;
+    // KV fp16 exception side rows (snapshot v2): flat, in kv_fp16_side_
+    // traversal order (attn_idx asc, head asc), K then V per masked head.
+    // Empty when the engine has no exception cells or position was 0. The
+    // owner check pins the config: a Snapshot never crosses engines, so
+    // the side layout always matches.
+    std::vector<std::shared_ptr<BackendBuffer>> kv_side;
 };
 
 std::shared_ptr<BackendBuffer> MetalEngine::alloc_f32(uint64_t count) {
@@ -295,7 +301,6 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     // and V cells together (step 4b: K alone retains nothing, V alone
     // amplifies — only the pair is meaningful). fp16-KV engines ignore the
     // env (their cells are already fp16), so the kl-kv baseline coexists.
-    uint8_t kv_fp16_head_masks[16] = {};
     uint64_t kv_side_bytes = 0;
     if (const char* cells_env = getenv("Q27_METAL_KV_FP16_CELLS")) {
         if (turbo3_kv_) {
@@ -320,7 +325,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
                     if (side_masks[li][h] == 0) continue;
                     if (side_masks[li][h] != 3)
                         throw std::runtime_error("q27 Metal: Q27_METAL_KV_FP16_CELLS v1 needs a head's K and V cells together (step 4b: only the pair is protective)");
-                    kv_fp16_head_masks[li] |= uint8_t(1u << h);
+                    kv_fp16_head_masks_[li] |= uint8_t(1u << h);
                     kv_side_bytes += 2ull * max_context_ * HEAD_DIM * 2;   // K + V, fp16
                     kv_fp16_except_ = true;
                 }
@@ -401,7 +406,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     if (kv_fp16_except_)
         for (uint32_t li = 0; li < 16; li++)
             for (uint32_t h = 0; h < 4; h++)
-                if (kv_fp16_head_masks[li] & (1u << h))
+                if (kv_fp16_head_masks_[li] & (1u << h))
                     kv_fp16_side_[li].push_back(KvFp16Side{
                         h,
                         backend_.allocate_private((uint64_t)max_context_ * HEAD_DIM * 2),
@@ -580,6 +585,10 @@ uint64_t MetalEngine::snapshot_bytes() const {
     bytes += attn_layers * 2 * active;
     if (has_mtp_) bytes += 2 * active;
     bytes += (uint64_t)N_EMBD * 4 + (uint64_t)VOCAB * 4;   // hidden + logits
+    // Exception side rows (snapshot v2): K + V fp16 per masked head.
+    uint64_t side_entries = 0;
+    for (const auto& sides : kv_fp16_side_) side_entries += sides.size();
+    bytes += side_entries * 2ull * max_context_ * HEAD_DIM * 2;
     return bytes;
 }
 
@@ -627,8 +636,6 @@ uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block, bool ch
 }
 
 std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
-    if (kv_fp16_except_)
-        throw std::runtime_error("q27 Metal: snapshots do not yet serialize the KV fp16 exception side caches (Q27_METAL_KV_FP16_CELLS); recorded v1 exclusion");
     backend_.synchronize();
     auto snapshot = std::make_shared<Snapshot>();
     snapshot->owner = this; snapshot->position = position_; snapshot->layers.resize(N_LAYER);
@@ -649,15 +656,35 @@ std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
     }
     snapshot->hidden=backend_.allocate(x1_->size()); backend_.copy(*x1_,0,*snapshot->hidden,0,x1_->size());
     snapshot->logits=backend_.allocate(logits_->size()); backend_.copy(*logits_,0,*snapshot->logits,0,logits_->size());
+    // Exception side rows ride the snapshot (v2): copy() is a GPU kernel,
+    // so the private side caches are reachable; destinations are ordinary
+    // shared buffers like every other snapshot blob.
+    const uint64_t side_active=(uint64_t)position_*HEAD_DIM*2;
+    if(kv_fp16_except_ && side_active)
+        for(uint32_t li=0;li<16;li++)
+            for(const KvFp16Side& side : kv_fp16_side_[li]) {
+                auto k=backend_.allocate(side_active), v=backend_.allocate(side_active);
+                backend_.copy(*side.k,0,*k,0,side_active);
+                backend_.copy(*side.v,0,*v,0,side_active);
+                snapshot->kv_side.push_back(std::move(k));
+                snapshot->kv_side.push_back(std::move(v));
+            }
     batch.finish();
     return snapshot;
 }
 
 void MetalEngine::restore_state(const Snapshot& snapshot) {
-    if (kv_fp16_except_)
-        throw std::runtime_error("q27 Metal: snapshots do not yet serialize the KV fp16 exception side caches (Q27_METAL_KV_FP16_CELLS); recorded v1 exclusion");
     if(snapshot.owner!=this || snapshot.layers.size()!=N_LAYER || snapshot.position>max_context_)
         throw std::runtime_error("q27 Metal: incompatible state snapshot");
+    // Side-row bookkeeping must agree with the engine's exception config
+    // before any GPU write: a snapshot without side rows cannot serve an
+    // exception engine at position > 0 (the masked heads' fp16 history
+    // would be stale — the exact 41705bb P2 recombination hazard).
+    uint64_t side_entries=0;
+    for(const auto& sides : kv_fp16_side_) side_entries+=sides.size();
+    const uint64_t side_expected=snapshot.position?2*side_entries:0;
+    if(snapshot.kv_side.size()!=side_expected)
+        throw std::runtime_error("q27 Metal: incompatible state snapshot (KV fp16 exception side rows)");
     backend_.synchronize();
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
@@ -672,6 +699,15 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
     if(snapshot.mtp_k_cache) { backend_.copy(*snapshot.mtp_k_cache,0,*mtp_k_cache_,0,active_cache); backend_.copy(*snapshot.mtp_v_cache,0,*mtp_v_cache_,0,active_cache); }
     backend_.copy(*snapshot.hidden,0,*x1_,0,x1_->size());
     if(snapshot.logits) backend_.copy(*snapshot.logits,0,*logits_,0,logits_->size());
+    if(!snapshot.kv_side.empty()) {
+        const uint64_t side_active=(uint64_t)snapshot.position*HEAD_DIM*2;
+        size_t si=0;
+        for(uint32_t li=0;li<16;li++)
+            for(KvFp16Side& side : kv_fp16_side_[li]) {
+                backend_.copy(*snapshot.kv_side[si++],0,*side.k,0,side_active);
+                backend_.copy(*snapshot.kv_side[si++],0,*side.v,0,side_active);
+            }
+    }
     batch.finish();
     position_=snapshot.position;
 }
@@ -680,6 +716,16 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
 // Format Q27SNAP1 (LE): magic, artifact identity (file size + SHA1 of the
 // first 64 KB), kv dtype, position, token metadata, then length-prefixed
 // blobs in capture_state() order. Plain read/write, never mmap.
+//
+// KV fp16 exception extension (snapshot v2, docs/plans/2026-07-17-kv-
+// except-snapshot-v2.md): header reserved bit 1 marks its presence
+// (bit 0 remains !logits_resident). After the standard blobs: one
+// length-prefixed 16-byte head-mask blob (the snapshot-config identity —
+// side blob LENGTHS alone cannot distinguish cell lists of equal size),
+// then per masked head the K and V side blobs in capture_state() side
+// order. Presence and mask content must both match the loading engine
+// exactly; either mismatch is a loud pass-1 reject. Pre-v2 binaries
+// reject extended files via the trailing-bytes check.
 
 namespace {
 
@@ -729,8 +775,6 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
                              uint32_t token_count, bool logits_resident) {
     if (token_count && !tokens)
         throw std::runtime_error("q27 Metal: snapshot token metadata is null");
-    if (kv_fp16_except_)
-        throw std::runtime_error("q27 Metal: snapshots do not yet serialize the KV fp16 exception side caches (Q27_METAL_KV_FP16_CELLS); recorded v1 exclusion");
     backend_.synchronize();
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
@@ -747,7 +791,7 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         h.kv_dtype = turbo3_kv_ ? 1 : 0;
         h.position = position_;
         h.token_count = token_count;
-        h.reserved = logits_resident ? 0 : 1;
+        h.reserved = (logits_resident ? 0u : 1u) | (kv_fp16_except_ ? 2u : 0u);
         snap_write(f, &h, sizeof h, tmp);
         if (token_count) snap_write(f, tokens, (size_t)token_count * 4, tmp);
         auto put_blob = [&](const BackendBuffer* src, uint64_t bytes) {
@@ -769,6 +813,30 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         put_blob(mtp_v_cache_.get(), mtp_v_cache_ ? active_cache : 0);
         put_blob(x1_.get(), x1_->size());
         put_blob(logits_.get(), logits_->size());
+        if (kv_fp16_except_) {
+            // Head-mask blob, then the private side caches bounced through
+            // one shared staging buffer (copy() is the only host path that
+            // can source a StorageModePrivate buffer).
+            const uint64_t mask_bytes = sizeof kv_fp16_head_masks_;
+            snap_write(f, &mask_bytes, sizeof mask_bytes, tmp);
+            snap_write(f, kv_fp16_head_masks_, mask_bytes, tmp);
+            auto staging = backend_.allocate(stage.size());
+            auto put_side_blob = [&](const BackendBuffer& src, uint64_t bytes) {
+                snap_write(f, &bytes, sizeof bytes, tmp);
+                for (uint64_t off = 0; off < bytes; off += stage.size()) {
+                    const uint64_t n = std::min<uint64_t>(stage.size(), bytes - off);
+                    backend_.copy(src, off, *staging, 0, n);
+                    backend_.read(*staging, 0, stage.data(), n);
+                    snap_write(f, stage.data(), n, tmp);
+                }
+            };
+            const uint64_t side_active = (uint64_t)position_ * HEAD_DIM * 2;
+            for (uint32_t li = 0; li < 16; li++)
+                for (const KvFp16Side& side : kv_fp16_side_[li]) {
+                    put_side_blob(*side.k, side_active);
+                    put_side_blob(*side.v, side_active);
+                }
+        }
         // Test-only failpoints for the snapshot crash gate
         // (tools/snapshot_gate.sh); read fresh each save.
         const char* snap_crash = getenv("Q27_METAL_SNAP_CRASH");
@@ -822,8 +890,6 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
 }
 
 uint32_t MetalEngine::load_state(const std::string& path) {
-    if (kv_fp16_except_)
-        throw std::runtime_error("q27 Metal: snapshots do not yet serialize the KV fp16 exception side caches (Q27_METAL_KV_FP16_CELLS); recorded v1 exclusion");
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("q27 Metal: cannot open snapshot: " + path);
     try {
@@ -838,6 +904,14 @@ uint32_t MetalEngine::load_state(const std::string& path) {
             throw std::runtime_error("q27 Metal: snapshot KV dtype does not match this engine: " + path);
         if (h.position > max_context_)
             throw std::runtime_error("q27 Metal: snapshot position exceeds this engine's context: " + path);
+        // KV fp16 exception extension presence must match this engine's
+        // config exactly (v2): an env-unset snapshot has no fp16 history
+        // for the masked heads, and an exception snapshot's continuation
+        // assumed fp16 where a plain engine would have quantized.
+        if (bool(h.reserved & 2) != kv_fp16_except_)
+            throw std::runtime_error(kv_fp16_except_
+                ? "q27 Metal: snapshot carries no KV fp16 exception side rows but this engine needs them (Q27_METAL_KV_FP16_CELLS): " + path
+                : "q27 Metal: snapshot carries KV fp16 exception side rows but this engine has none: " + path);
         if (fseeko(f, (off_t)h.token_count * 4, SEEK_CUR) != 0)
             throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
         const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
@@ -845,19 +919,38 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         const uint64_t active_cache = (uint64_t)h.position * cache_row;
         // The expected blob sequence, mirrored from save_state. Validating
         // every length (pass 1) before the first GPU write (pass 2) means a
-        // rejected file never leaves partially-restored state.
-        std::vector<std::pair<BackendBuffer*, uint64_t>> blobs;
+        // rejected file never leaves partially-restored state. Kinds: Std
+        // streams into a shared buffer; Mask is host data whose CONTENT is
+        // validated in pass 1 (equal-length cell lists differ only there);
+        // Side bounces through staging into a private buffer.
+        struct BlobRef { BackendBuffer* buf; uint64_t bytes; enum Kind { Std, Mask, Side } kind; };
+        std::vector<BlobRef> blobs;
         for (uint32_t i = 0; i < N_LAYER; i++) {
             LayerState& d = layers_[i];
-            blobs.push_back({d.recurrent.get(), d.recurrent ? d.recurrent->size() : 0});
-            blobs.push_back({d.ring.get(), d.ring ? d.ring->size() : 0});
-            blobs.push_back({d.k_cache.get(), d.k_cache ? active_cache : 0});
-            blobs.push_back({d.v_cache.get(), d.v_cache ? active_cache : 0});
+            blobs.push_back({d.recurrent.get(), d.recurrent ? d.recurrent->size() : 0, BlobRef::Std});
+            blobs.push_back({d.ring.get(), d.ring ? d.ring->size() : 0, BlobRef::Std});
+            blobs.push_back({d.k_cache.get(), d.k_cache ? active_cache : 0, BlobRef::Std});
+            blobs.push_back({d.v_cache.get(), d.v_cache ? active_cache : 0, BlobRef::Std});
         }
-        blobs.push_back({mtp_k_cache_.get(), mtp_k_cache_ ? active_cache : 0});
-        blobs.push_back({mtp_v_cache_.get(), mtp_v_cache_ ? active_cache : 0});
-        blobs.push_back({x1_.get(), x1_->size()});
-        blobs.push_back({logits_.get(), logits_->size()});
+        blobs.push_back({mtp_k_cache_.get(), mtp_k_cache_ ? active_cache : 0, BlobRef::Std});
+        blobs.push_back({mtp_v_cache_.get(), mtp_v_cache_ ? active_cache : 0, BlobRef::Std});
+        blobs.push_back({x1_.get(), x1_->size(), BlobRef::Std});
+        blobs.push_back({logits_.get(), logits_->size(), BlobRef::Std});
+        if (kv_fp16_except_) {
+            blobs.push_back({nullptr, sizeof kv_fp16_head_masks_, BlobRef::Mask});
+            const uint64_t side_active = (uint64_t)h.position * HEAD_DIM * 2;
+            for (uint32_t li = 0; li < 16; li++)
+                for (KvFp16Side& side : kv_fp16_side_[li]) {
+                    blobs.push_back({side.k.get(), side_active, BlobRef::Side});
+                    blobs.push_back({side.v.get(), side_active, BlobRef::Side});
+                }
+        }
+        auto check_mask = [&]() {
+            uint8_t stored_masks[sizeof kv_fp16_head_masks_];
+            snap_read(f, stored_masks, sizeof stored_masks, path);
+            if (memcmp(stored_masks, kv_fp16_head_masks_, sizeof stored_masks) != 0)
+                throw std::runtime_error("q27 Metal: snapshot KV fp16 exception cells do not match this engine (Q27_METAL_KV_FP16_CELLS): " + path);
+        };
         const off_t blob_start = ftello(f);
         // Real file size up front: fseeko past EOF succeeds silently, so the
         // walk below could otherwise bless a file truncated inside its FINAL
@@ -868,15 +961,18 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         if (fseeko(f, blob_start, SEEK_SET) != 0)
             throw std::runtime_error("q27 Metal: cannot rewind snapshot: " + path);
         uint64_t expected_end = (uint64_t)blob_start;
-        for (const auto& [buf, bytes] : blobs) {
+        for (const auto& blob : blobs) {
             uint64_t stored = 0;
             snap_read(f, &stored, sizeof stored, path);
-            if (stored != bytes)
+            if (stored != blob.bytes)
                 throw std::runtime_error("q27 Metal: snapshot blob layout does not match this engine: " + path);
             expected_end += sizeof stored + stored;
             if (expected_end > (uint64_t)file_size)
                 throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
-            if (fseeko(f, (off_t)stored, SEEK_CUR) != 0)
+            // Mask content is part of pass-1 validation: a mismatched cell
+            // list must reject BEFORE pass 2 writes any standard blob.
+            if (blob.kind == BlobRef::Mask) check_mask();
+            else if (fseeko(f, (off_t)stored, SEEK_CUR) != 0)
                 throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
         }
         if (expected_end != (uint64_t)file_size)
@@ -886,17 +982,27 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         if (fseeko(f, blob_start, SEEK_SET) != 0)
             throw std::runtime_error("q27 Metal: cannot rewind snapshot: " + path);
         std::vector<unsigned char> stage(16u << 20);
-        for (const auto& [buf, bytes] : blobs) {
+        std::shared_ptr<BackendBuffer> staging;
+        if (kv_fp16_except_) staging = backend_.allocate(stage.size());
+        for (const auto& blob : blobs) {
             uint64_t stored = 0;
             snap_read(f, &stored, sizeof stored, path);
             // TOCTOU: pass 1 validated a file that could have been swapped
             // since (k3 audit B3).
-            if (stored != bytes)
+            if (stored != blob.bytes)
                 throw std::runtime_error("q27 Metal: snapshot changed during load: " + path);
-            for (uint64_t off = 0; off < bytes; off += stage.size()) {
-                const uint64_t n = std::min<uint64_t>(stage.size(), bytes - off);
+            if (blob.kind == BlobRef::Mask) { check_mask(); continue; }
+            for (uint64_t off = 0; off < blob.bytes; off += stage.size()) {
+                const uint64_t n = std::min<uint64_t>(stage.size(), blob.bytes - off);
                 snap_read(f, stage.data(), n, path);
-                backend_.write(*buf, off, stage.data(), n);
+                if (blob.kind == BlobRef::Side) {
+                    // Private destination: write() cannot reach it — bounce
+                    // through the shared staging buffer with copy().
+                    backend_.write(*staging, 0, stage.data(), n);
+                    backend_.copy(*staging, 0, *blob.buf, off, n);
+                } else {
+                    backend_.write(*blob.buf, off, stage.data(), n);
+                }
             }
         }
         fclose(f);
@@ -918,7 +1024,8 @@ MetalEngine::SnapshotInfo MetalEngine::peek_snapshot(const std::string& path) {
             throw std::runtime_error("q27 Metal: not a q27 snapshot: " + path);
         SnapshotInfo info;
         info.position = h.position;
-        info.logits_resident = h.reserved == 0;
+        // Bit test, not equality: bit 1 is the v2 exception extension.
+        info.logits_resident = (h.reserved & 1) == 0;
         // Bound the metadata before allocating: a corrupt header must not
         // drive a multi-GB resize on the scan path (codex P2 on 607160e).
         if (h.token_count > 262144)

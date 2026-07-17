@@ -290,9 +290,13 @@ class MetalEngine {
     // not combinable with the step-2 rt flags.
     void set_kv_attrib_except(const uint32_t* cells, size_t n);
     // True when Q27_METAL_KV_FP16_CELLS armed production fp16 exception
-    // side caches on this engine (snapshots are refused in v1; the server
-    // disables its prefix cache off this bit).
+    // side caches on this engine. Snapshots carry the side rows (v2,
+    // docs/plans/2026-07-17-kv-except-snapshot-v2.md); the head masks are
+    // the snapshot-config identity — a snapshot only restores into an
+    // engine with the exact same cell list, and the server keys its disk
+    // store off them so mismatched configs miss instead of rejecting.
     bool kv_fp16_except() const { return kv_fp16_except_; }
+    const uint8_t* kv_fp16_head_masks() const { return kv_fp16_head_masks_; }
 
   private:
     static constexpr uint32_t N_LAYER = 64;
@@ -347,6 +351,7 @@ class MetalEngine {
     struct KvFp16Side { uint32_t head; std::shared_ptr<BackendBuffer> k, v; };
     std::array<std::vector<KvFp16Side>, 16> kv_fp16_side_;
     bool kv_fp16_except_ = false;
+    uint8_t kv_fp16_head_masks_[16] = {};   // snapshot-config identity (bit = head)
     uint64_t engine_cache_bytes_ = 0;
     // Blocked-GQA softmax partials, engine-owned (audit E2): allocated once
     // in the constructor at gqa_partial_peak, GPU-private, freed with the
