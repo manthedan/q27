@@ -68,11 +68,13 @@ awk -v m="$cmean" 'BEGIN{exit !(m >= 0.0102 && m <= 0.0138)}' ||
 run_arm l7h1   10,11
 run_arm l7h1k  10
 run_arm l63v   125,127
+# Amendment arm (registered 01:26 pre-measurement): V of L7 h1 alone.
+run_arm l7h1v  11
 
 {
     echo "4a anchors: control 0.011871 / p99 0.1006 / max 2.478 @1000; probe4 0.009329 / 0.0924 / 1.117 @7719"
     echo "reads: cheapest arm retaining max >=2x vs control becomes the design candidate"
-    for a in control l7h1 l7h1k l63v; do
+    for a in control l7h1 l7h1k l63v l7h1v; do
         printf "%-8s %s\n" "$a" "$(grep 'kl-kv tail:' "$OUT/$a.log")"
         printf "%-8s %s\n" "$a" "$(grep 'overall mean KL' "$OUT/$a.log")"
     done

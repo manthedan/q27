@@ -8,3 +8,5 @@ l7h1k    kl-kv tail: p50 0.005369  p90 0.02271  p99 0.09912  p99.5 0.174  max 2.
 l7h1k    kl-kv wall: 644.96 s (12.70 pos/s through both engines), overall mean KL 0.0117283 nats, max 2.61598
 l63v     kl-kv tail: p50 0.003612  p90 0.01914  p99 0.09901  p99.5 0.1641  max 2.438 @pos 1000
 l63v     kl-kv wall: 653.47 s (12.53 pos/s through both engines), overall mean KL 0.0100551 nats, max 2.43757
+l7h1v    kl-kv tail: p50 0.005264  p90 0.02268  p99 0.08942  p99.5 0.161  max 3.344 @pos 1000
+l7h1v    kl-kv wall: 638.22 s (12.83 pos/s through both engines), overall mean KL 0.0117926 nats, max 3.34393
