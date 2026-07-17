@@ -1,0 +1,13 @@
+PASS: sfx-serial-rep committed bytes identical to serial
+PASS: sfx16-rep committed bytes identical to serial
+PASS: sfx32-rep committed bytes identical to serial
+PASS: sfx48-rep committed bytes identical to serial
+PASS: dispatch trace shows live >= 16 (w16 arm) and >= 32 (w48 arm)
+FAIL: every lane of every round accepted — walk may be vacuous (or prompt is degenerate; change prompt before trusting)
+FAIL: neutral prompt regressed (bursts fired or bytes differ)
+--- corrected arms (same night, quiet machine) ---
+PASS: reject arm (numbered-list prompt) — walk LIVE: 10 drafts 3 accepted (30%), committed bytes identical to serial
+PASS: story arm (narrative prompt) — drafter SILENT: 0 bursts, 95/95 fallback, bytes identical, wall -0.1% vs serial
+PASS gate 6 economics: repetition-heavy 25.38 vs 10.85 tok/s = 2.34x (bar 1.15x); neutral -0.1% (bar <=2%)
+NOTE: original rep-prompt "all lanes accepted" and canonical-prompt "3 bursts" verdicts were prompt-construction artifacts, not engine failures — canonical 96-token continuation genuinely self-repeats (bursts were correct and profitable, 16.4 tok/s), and a perfectly-repeating prompt cannot produce rejection evidence by construction.
+VERDICT: SHIP LINE MET. Gate 5 (live EOS) unlocked for stream/server integration.

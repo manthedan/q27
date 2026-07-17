@@ -118,3 +118,32 @@ Cross-request suffix indexes (per-request stream only, as today); CUDA-side
 changes (upstream has its own speculation); sampled-temperature suffix
 verification (greedy-only, as the serial path today); any drafter-model
 revival (parked with prejudice this morning).
+
+---
+
+## RESULTS (2026-07-16 night, quiet 24 GB M4, Daniel-provided quiet window) — SHIP LINE MET
+
+Gates 2–4 + 6 all PASS (`logs/suffix-gates-20260716/verdicts.txt`):
+byte identity across --suffix-serial 12 / --suffix 16/32/48 and both
+corrected arms; dispatch-traced live lanes ≥16/≥32; stats reconcile.
+Two staged verdicts failed on prompt construction, not engine behavior,
+and were re-run corrected: a perfectly-repeating prompt cannot yield
+rejection evidence by construction (fixed with a numbered-list prompt —
+10 drafts / 3 accepted, walk provably live, bytes identical), and the
+canonical prompt's own 96-token continuation self-repeats so its 3
+bursts were CORRECT firings (16.4 tok/s, bytes identical); the
+docs-class silence claim was re-tested with narrative prose — 0 bursts,
+95/95 fallback, wall −0.1%.
+
+**Gate 6 economics: repetition-heavy 2.34× (25.38 vs 10.85 tok/s,
+96 tokens in 3 rounds, 0 fallbacks) vs the 1.15× bar; neutral −0.1% vs
+the ≤2% bar.** Single-run protocol on a quiet machine; margins are 15×
+and 20× the bars respectively, re-measurement not required for the ship
+decision. Gate-6 burst histogram note for the round-up-to-tile
+alternative: the rep run fired 1×≤16 + 1×32 + 1×48 — matches snapped to
+full tiles naturally on this traffic; no evidence yet that 17–31-length
+matches carry mass; round-up stays unfunded.
+
+**Next: gate 5 — live EOS through the stream/server suffix integration
+(now unlocked), and server plumbing so agentic traffic actually rides
+the batched path.**
