@@ -12,6 +12,9 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <CommonCrypto/CommonDigest.h>
 
 namespace q27 {
@@ -233,7 +236,13 @@ std::shared_ptr<MetalEngine::Shared> MetalEngine::open_shared(const std::string&
 // assert guards double-return/underflow (round-2 expert P0 #2 companion).
 MetalEngine::~MetalEngine() {
     assert(shared_->cache_bytes >= engine_cache_bytes_ && "KV reservation underflow");
-    shared_->cache_bytes -= engine_cache_bytes_;
+    // Can't throw from a dtor; clamp+log beats silent wrap (k3 audit B8).
+    if (shared_->cache_bytes < engine_cache_bytes_) {
+        fprintf(stderr, "q27 Metal: KV reservation underflow — double return?\n");
+        shared_->cache_bytes = 0;
+    } else {
+        shared_->cache_bytes -= engine_cache_bytes_;
+    }
 }
 
 int MetalEngine::mask_pool_add(const void* bits) {
@@ -479,8 +488,10 @@ void MetalEngine::reset() {
 // G6 admission accounting. snapshot_bytes mirrors capture_state()'s
 // allocations at worst case (position_ == max_context_); fixed_state_bytes
 // mirrors the constructor's non-KV buffers (the >= 1 MB class; scalar-sized
-// allocations omitted); gqa_partial_peak mirrors the backend's causal-GQA
-// partial sizing at the widest chunk. Keep paired with those sites.
+// allocations omitted), and lazy worst-case buffers (mask pool, wide head
+// stage, top-k staging) are charged as if populated — conservative
+// admission (k3 audit B6/E7); gqa_partial_peak mirrors the backend's
+// causal-GQA partial sizing at the widest chunk. Keep paired with those sites.
 uint64_t MetalEngine::snapshot_bytes() const {
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
@@ -506,6 +517,10 @@ uint64_t MetalEngine::fixed_state_bytes(bool chunked) {
     // serial-path logits + hidden/scratch rows: allocated on every device.
     uint64_t bytes = gdn_layers * ((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3ull * GDN_CH) * 4;
     bytes += (uint64_t)VOCAB * 4 + (uint64_t)N_EMBD * 4 * 4;
+    // Constraint-mask pool at capacity (lazy in mask_pool_add; ~2.0 MB full)
+    // + top-k sampling staging: allocated regardless of chunked (k3 audit B6/E7).
+    bytes += (((uint64_t)VOCAB + 31) / 32) * 4 * MASK_POOL_CAP;
+    bytes += (uint64_t)TOPK_CAPACITY * (4 + 4) + 4;
     if (!chunked) return bytes;   // pre-Apple7: no chunk/verify/replay buffers
     bytes += (uint64_t)PREFILL_CHUNK_MAX * chunk_row * 4;
     // Quantized activation copies (int8 values + f32 scales per 32).
@@ -516,6 +531,8 @@ uint64_t MetalEngine::fixed_state_bytes(bool chunked) {
     bytes += gdn_layers * (uint64_t)VERIFY_CHUNK_MAX * (GDN_CH + 2ull * GDN_HEADS) * 4;
     // Verify-chunk discard state slots (one shared pair per engine).
     bytes += ((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3ull * GDN_CH) * 4;
+    // Wide-head staging (lazy in teacher_force_logits_wide; k3 audit B6/E7).
+    bytes += (uint64_t)CHUNK_MAX * N_EMBD * 4;
     return bytes;
 }
 
@@ -671,13 +688,39 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         put_blob(mtp_v_cache_.get(), mtp_v_cache_ ? active_cache : 0);
         put_blob(x1_.get(), x1_->size());
         put_blob(logits_.get(), logits_->size());
-        if (fflush(f) != 0 || fclose(f) != 0) {
+        // Test-only failpoints for the snapshot crash gate
+        // (tools/snapshot_gate.sh); read fresh each save.
+        const char* snap_crash = getenv("Q27_METAL_SNAP_CRASH");
+        if (snap_crash && strcmp(snap_crash, "before-fsync") == 0) _exit(42);
+        // rename gives atomicity, fsync gives content durability: a crash
+        // without it can leave a structurally-valid file whose data pages
+        // read back as zeroes — every blob length still matches, so pass-1
+        // validation cannot catch it (k3 audit B1).
+        if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0) {
             f = nullptr;
             throw std::runtime_error("q27 Metal: cannot finish snapshot: " + tmp);
         }
         f = nullptr;
         if (rename(tmp.c_str(), path.c_str()) != 0)
             throw std::runtime_error("q27 Metal: cannot move snapshot into place: " + path);
+        // The rename lives in the directory entry: without a directory fsync
+        // a crash can drop it after this call reported success. The snapshot
+        // is a correctness-bearing artifact, so failure here is fatal, never
+        // advisory (k3 audit B1).
+        {
+            const std::string::size_type slash = path.find_last_of('/');
+            const std::string dir = slash == std::string::npos ? "."
+                                  : slash == 0 ? "/" : path.substr(0, slash);
+            const int dfd = open(dir.c_str(), O_RDONLY);
+            if (dfd < 0)
+                throw std::runtime_error("q27 Metal: cannot open snapshot directory: " + dir);
+            if (fsync(dfd) != 0) {
+                close(dfd);
+                throw std::runtime_error("q27 Metal: cannot sync snapshot directory: " + dir);
+            }
+            close(dfd);
+        }
+        if (snap_crash && strcmp(snap_crash, "after-rename") == 0) _exit(42);
     } catch (...) {
         if (f) fclose(f);
         remove(tmp.c_str());
@@ -751,6 +794,10 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         for (const auto& [buf, bytes] : blobs) {
             uint64_t stored = 0;
             snap_read(f, &stored, sizeof stored, path);
+            // TOCTOU: pass 1 validated a file that could have been swapped
+            // since (k3 audit B3).
+            if (stored != bytes)
+                throw std::runtime_error("q27 Metal: snapshot changed during load: " + path);
             for (uint64_t off = 0; off < bytes; off += stage.size()) {
                 const uint64_t n = std::min<uint64_t>(stage.size(), bytes - off);
                 snap_read(f, stage.data(), n, path);
@@ -849,7 +896,7 @@ void MetalEngine::gdn_block(uint32_t layer) {
     project(ssm_out_w, *gated_out_, q6144_, *y_);
 }
 
-void MetalEngine::attention_block(uint32_t layer) {
+void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
     project(layer_weight(layer, "attn_q.weight"), *x1_, q5120_, *qg_);
     backend_.rmsnorm_heads(*qg_, layer_weight(layer, "attn_q_norm.weight"),
                            N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS);
@@ -857,26 +904,26 @@ void MetalEngine::attention_block(uint32_t layer) {
                  layer_weight(layer,"attn_v.weight"),*vbuf_,*x1_,q5120_);
     backend_.rmsnorm_heads(*kbuf_, layer_weight(layer, "attn_k_norm.weight"),
                            N_KV, HEAD_DIM, HEAD_DIM, EPS);
-    backend_.rope_neox(*qg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, position_, FREQ_BASE);
-    backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position_, FREQ_BASE);
+    backend_.rope_neox(*qg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, pos, FREQ_BASE);
+    backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, pos, FREQ_BASE);
     LayerState& state = layers_[layer];
     if (turbo3_kv_) {
         backend_.turbo_wht(*qg_, N_HEAD, 2 * HEAD_DIM, false);
-        backend_.kv_store_turbo3(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, position_, N_KV);
+        backend_.kv_store_turbo3(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, pos, N_KV);
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
-                                  *attn_out_, position_ + 1, N_HEAD, N_KV,
+                                  *attn_out_, pos + 1, N_HEAD, N_KV,
                                   HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
         if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))
             backend_.kv_store_f16_attrib_rows(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache,
-                                              position_, N_KV, 1, kv_attrib_, kv_attrib_head_,
+                                              pos, N_KV, 1, kv_attrib_, kv_attrib_head_,
                                               kv_attrib_flags_, (layer / 4) * 1024,
                                               kv_attrib_aux_.get());
         else
-            backend_.kv_store_f16(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, position_, N_KV * HEAD_DIM);
+            backend_.kv_store_f16(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, pos, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
-                               *attn_out_, position_ + 1, N_HEAD, N_KV,
+                               *attn_out_, pos + 1, N_HEAD, N_KV,
                                HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
     }
     backend_.sigmoid_gate_mul(*attn_out_, *qg_, N_HEAD, HEAD_DIM);
@@ -894,16 +941,23 @@ void MetalEngine::ffn(uint32_t layer) {
     project(ffn_down_w, *ffn_gate_, q17408_, *y_);
 }
 
-void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_from_device) {
+// position_ advances at the CALL SITE after successful finish — a backend
+// throw must leave the engine's host state describing only work that
+// completed (k3 audit B2/E4); mtp_round/suffix_round already follow this.
+// pos_offset places the row for multi-token command batches (prefill,
+// resident decode): the token encodes at position_ + pos_offset.
+void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_from_device,
+                               uint32_t pos_offset) {
     if (!token_from_device && token >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
-    if (position_ >= max_context_) throw std::runtime_error("q27 Metal: context exhausted");
+    const uint32_t pos = position_ + pos_offset;
+    if (pos >= max_context_) throw std::runtime_error("q27 Metal: context exhausted");
     if (token_from_device)
         backend_.embedding_from_device(weight("token_embd.weight"), *token_out_, *h_);
     else
         backend_.embedding_q8(weight("token_embd.weight"), token, *h_);
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         backend_.rmsnorm_quantized(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
-        if (attention_layer(layer)) attention_block(layer); else gdn_block(layer);
+        if (attention_layer(layer)) attention_block(layer, pos); else gdn_block(layer);
         backend_.add_inplace(*h_, *y_, N_EMBD);
         backend_.rmsnorm_quantized(*h_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
         ffn(layer);
@@ -920,7 +974,6 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_f
                                  (uint64_t)active_mask_ * (((uint64_t)VOCAB + 31) / 32) * 4, VOCAB);
         backend_.argmax(*logits_, VOCAB, *token_out_);
     }
-    position_++;
 }
 
 void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count, bool verify) {
@@ -1043,11 +1096,6 @@ void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count, bool ver
     }
 }
 
-void MetalEngine::encode_chunk(const uint32_t* tokens, uint32_t count) {
-    chunk_forward(tokens, count);
-    position_ += count;
-}
-
 // Commits GDN state (recurrent + convolution ring) for the first `count`
 // verified lanes by replaying only the conv/DeltaNet recurrence from the
 // inputs parked during the verify chunk. Both chunk kernels are sequential
@@ -1081,11 +1129,12 @@ uint32_t MetalEngine::decode_resident(uint32_t pending, uint32_t* out, uint32_t 
     {
         CommandBatch batch(backend_);
         for (uint32_t i = 0; i < k; i++) {
-            encode_token(0, true, true);
+            encode_token(0, true, true, i);
             backend_.copy(*token_out_, 0, *token_ring_, (uint64_t)i * sizeof(uint32_t),
                           sizeof(uint32_t));
         }
         batch.finish();
+        position_ += k;
     }
     backend_.read(*token_ring_, 0, out, (uint64_t)k * sizeof(uint32_t));
     return out[k - 1];
@@ -1097,6 +1146,7 @@ uint32_t MetalEngine::step(uint32_t token) {
     CommandBatch batch(backend_);
     encode_token(token, true);
     batch.finish();
+    position_++;
     uint32_t next = 0;
     backend_.read(*token_out_, 0, &next, sizeof(next));
     return next;
@@ -1144,8 +1194,9 @@ void MetalEngine::prefill_chunk(const uint32_t* tokens, uint32_t count) {
     for (uint32_t i = 0; i < count; i++)
         if (tokens[i] >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
     CommandBatch batch(backend_);
-    encode_chunk(tokens, count);
+    chunk_forward(tokens, count);
     batch.finish();
+    position_ += count;
 }
 
 uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp) {
@@ -1177,10 +1228,11 @@ uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp
         if(begin==serial_begin && warm_mtp && position_>0) mtp_warm(*x1_,prompt.front(),position_);
         size_t end=std::min(prompt.size(),begin+COMMAND_CHUNK);
         for(size_t i=begin;i<end;i++) {
-            encode_token(prompt[i],i+1==prompt.size());
-            if(warm_mtp && i+1<prompt.size()) mtp_warm(*x1_,prompt[i+1],position_);
+            encode_token(prompt[i],i+1==prompt.size(),false,(uint32_t)(i-begin));
+            if(warm_mtp && i+1<prompt.size()) mtp_warm(*x1_,prompt[i+1],position_+(uint32_t)(i-begin)+1);
         }
         batch.finish();
+        position_ += (uint32_t)(end - begin);
     }
     uint32_t next = 0;
     backend_.read(*token_out_, 0, &next, sizeof(next));
@@ -1490,6 +1542,12 @@ std::vector<float> MetalEngine::read_logits() {
     return result;
 }
 
+void MetalEngine::read_hidden(std::vector<float>& out) {
+    out.resize(N_EMBD);
+    backend_.synchronize();
+    backend_.read(*x1_,0,out.data(),out.size()*sizeof(float));
+}
+
 std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& tokens) {
     if (tokens.size() < 2) throw std::runtime_error("q27 Metal: NLL needs at least two tokens");
     if (tokens.size() - 1 > max_context_)
@@ -1555,8 +1613,27 @@ std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& t
             encode_token(tokens[done], true);
             batch.finish();
         }
-        std::vector<float> logits = read_logits();
-        result.push_back(nll_cpu(logits.data(), tokens[done + 1], VOCAB));
+        position_++;
+        if (chunked_prefill_) {
+            // The leftover row rides the same float GPU reduction as the
+            // chunked rows — a CPU double tail would be a third regime
+            // inside one pass, and CUDA runs every row float on the GPU
+            // (k3 audit D4/E5). logits_ is one VOCAB row, valid at rows=1.
+            backend_.write(*ctargets_, 0, &tokens[done + 1], sizeof(uint32_t));
+            {
+                CommandBatch batch(backend_);
+                backend_.nll_rows(*logits_, *ctargets_, *cnll_, VOCAB, 1);
+                batch.finish();
+            }
+            float row_nll = 0.0f;
+            backend_.read(*cnll_, 0, &row_nll, sizeof row_nll);
+            result.push_back(row_nll);
+        } else {
+            // Pre-Apple7 all-serial fallback: no ctargets_/cnll_ exist and
+            // the whole pass is one (CPU) regime already.
+            std::vector<float> logits = read_logits();
+            result.push_back(nll_cpu(logits.data(), tokens[done + 1], VOCAB));
+        }
         done++;
     }
     if (n_encode >= CHUNK_MAX) fprintf(stderr, "\n");
@@ -1588,6 +1665,11 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
         // (mirrors prefill; codex sweep finding, 2026-07-15).
         backend_.copy(*clogits_, (uint64_t)(count - 1) * VOCAB * sizeof(float),
                       *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+        // x1_ likewise: snapshots persist the hidden row, which must describe
+        // the last encoded token, not the pre-pass one (mirrors mtp_round;
+        // k3 audit A1).
+        backend_.copy(*cfinal_, (uint64_t)(count - 1) * N_EMBD * sizeof(float),
+                      *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
         backend_.read(*clogits_, 0, out.data(), out.size() * sizeof(float));
         return;
     }
@@ -1597,6 +1679,7 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
             encode_token(tokens[i], true);
             batch.finish();
         }
+        position_++;
         backend_.read(*logits_, 0, out.data() + (size_t)i * VOCAB,
                       (uint64_t)VOCAB * sizeof(float));
     }
@@ -1646,6 +1729,10 @@ void MetalEngine::teacher_force_logits_wide(const uint32_t* tokens, uint32_t cou
     const uint32_t last_row = (count - 1) % CHUNK_MAX;
     backend_.copy(*clogits_, (uint64_t)last_row * VOCAB * sizeof(float),
                   *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+    // x1_ likewise, from cfinal_'s final head slice (mirrors mtp_round;
+    // k3 audit A1).
+    backend_.copy(*cfinal_, (uint64_t)last_row * N_EMBD * sizeof(float),
+                  *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
 }
 
 // GPU-assisted sampling: when top-k is active and within the radix-select

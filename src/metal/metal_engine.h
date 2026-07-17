@@ -123,6 +123,9 @@ class MetalEngine {
     std::vector<uint32_t> generate_from_pending(uint32_t pending, uint32_t count,
                                                 uint32_t mtp_width = 0);
     std::vector<float> read_logits();
+    // x1_ readback — the hidden row capture_state/save_state persist — for
+    // the --chunk-parity hidden-row leg (k3 audit A1/E3).
+    void read_hidden(std::vector<float>& out);
     // Teacher-forced NLL for tokens[0..N): returns N-1 values where
     // result[i] = -log P(tokens[i+1] | tokens[0..i]). Uses layer-major
     // chunked encode + batched output head when available.
@@ -373,14 +376,14 @@ class MetalEngine {
                       const BackendTensor& b, BackendBuffer& b_out,
                       const BackendBuffer& x_float, const BackendQuantized& xq);
     void gdn_block(uint32_t layer);
-    void attention_block(uint32_t layer);
+    void attention_block(uint32_t layer, uint32_t pos);
     void ffn(uint32_t layer);
-    void encode_token(uint32_t token, bool produce_logits, bool token_from_device = false);
+    void encode_token(uint32_t token, bool produce_logits, bool token_from_device = false,
+                      uint32_t pos_offset = 0);
     void gdn_chunk(uint32_t layer, uint32_t count, bool verify);
     void attention_chunk(uint32_t layer, uint32_t count);
     void ffn_chunk(uint32_t layer, uint32_t count);
     void chunk_forward(const uint32_t* tokens, uint32_t count, bool verify = false);
-    void encode_chunk(const uint32_t* tokens, uint32_t count);
     static uint32_t gdn_slot(uint32_t layer) { return layer - (layer + 1) / 4; }
     void gdn_replay(uint32_t count);
     std::vector<uint32_t> generate_mtp_batched(uint32_t pending, uint32_t count,

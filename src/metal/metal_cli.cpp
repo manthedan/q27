@@ -360,6 +360,12 @@ int main(int argc, char** argv) {
                     done += take;
                 }
             }
+            // Hidden-row leg (k3 audit A1/E3): both teacher-force paths must
+            // leave x1_ — the row snapshots persist — describing the LAST
+            // encoded token. Compared like the logits rows: bytewise against
+            // the baseline pass, expectation inverted by the serial control.
+            std::vector<float> ref_hidden;
+            baseline.read_hidden(ref_hidden);
             auto nll_of = [&](const float* logits, uint32_t target) -> double {
                 double mx = -1e300;
                 for (uint32_t v = 0; v < vocab; v++) mx = std::max(mx, (double)logits[v]);
@@ -444,28 +450,42 @@ int main(int argc, char** argv) {
                     }
                     done += take;
                 }
+                std::vector<float> hidden;
+                subject.read_hidden(hidden);
+                const bool hidden_differs =
+                    std::memcmp(ref_hidden.data(), hidden.data(),
+                                hidden.size() * sizeof(float)) != 0;
+                // An all-zero readback is a never-written buffer, not a
+                // passing comparison (vacuous-gate lesson).
+                bool hidden_live = false;
+                for (float v : hidden) if (v != 0.0f) { hidden_live = true; break; }
                 printf("width %2u vs 12: rows differing %llu/%u, max|dlogit| %.6g (mean %.6g), "
                        "KL mean %.3g max %.3g nats, "
                        "top-1 flips %llu/%u (ref margin min %.4g max %.4g), top-20 overlap %.2f%%, "
-                       "NLL %.6f vs %.6f (max |dNLL| %.4g)\n",
+                       "NLL %.6f vs %.6f (max |dNLL| %.4g), hidden row %s\n",
                        width, (unsigned long long)rows_differ, n, max_abs, sum_abs / n,
                        sum_kl / n, max_kl,
                        (unsigned long long)flips, n,
                        flips ? min_flip_margin : 0.0, flips ? max_flip_margin : 0.0,
                        100.0 * overlap / ((double)n * 20.0),
-                       subj_nll / n, ref_nll / n, max_nll_delta);
+                       subj_nll / n, ref_nll / n, max_nll_delta,
+                       !hidden_live ? "ALL-ZERO" : hidden_differs ? "DIFFERS" : "identical");
                 const bool differs = rows_differ != 0;
-                if (serial_prefill ? !differs : differs) gate_fail = true;
+                // Serial control gates on logits only: the whole-stream
+                // rounding class must appear somewhere, but single-row
+                // hidden bit-inequality is not a guaranteed member of it.
+                if (serial_prefill ? !differs : (differs || hidden_differs || !hidden_live))
+                    gate_fail = true;
             }
             if (gate_fail) {
                 fprintf(stderr, serial_prefill
                         ? "chunk-parity: FAIL — negative control did not fire at every width\n"
-                        : "chunk-parity: FAIL — wide path diverged from the width-12 baseline\n");
+                        : "chunk-parity: FAIL — wide path (logits or hidden row) diverged from the width-12 baseline\n");
                 return 1;
             }
             fprintf(stderr, serial_prefill
                     ? "chunk-parity: negative control fired at every width (instrument healthy)\n"
-                    : "chunk-parity: PASS — widths {17,48,96} bit-identical to the width-12 baseline\n");
+                    : "chunk-parity: PASS — widths {17,48,96} bit-identical to the width-12 baseline (logits + hidden row)\n");
             return 0;
         }
 
