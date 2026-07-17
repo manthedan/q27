@@ -212,6 +212,35 @@ struct Engine {
     std::vector<int> snap_toks;
     bool have_snap = false;
     int perm = 0;
+    // ---- P3 T2 (capture plan 2026-07-16): device-resolved GDN role tables.
+    // d_gdn_tab = ONE flat init-time upload of [2][N_LAYER][W_MAX] float*:
+    // ring half first, S half second; entry [il][ph] = the physical buffer
+    // RBuf/SBuf return when (role+perm)%W_MAX == ph (attn layers stay
+    // nullptr, never indexed). The conv_step_t/delta_step_t twins index
+    // (table + il*W_MAX) with *d_perm_scalar, so a captured fused round no
+    // longer bakes host-resolved role pointers -- the T3 enabler for
+    // cross-round graph exec reuse. Tables are read ONLY when a caller asks
+    // gdn_mix for use_tables: the fused path does from T2 on (mix_all in
+    // conductor.h, eager first per the plan gate; T3 captures the same
+    // launches); the solo path never passes the flag, so its kernels/
+    // pointers are byte-for-byte untouched. h_perm_pin is the PINNED
+    // per-engine staging int the caller cudaMemcpyAsyncs to d_perm_scalar
+    // on cstm before each fused round / graph launch (pinned: no new
+    // pageable-blocking semantics; at most one DISTINCT VALUE in flight per
+    // round -- the guard-trip fallback may enqueue a second byte-identical
+    // copy (perm is constant within a round); the round sync fences the
+    // next rewrite).
+    float** d_gdn_tab = nullptr;   // base == ring half
+    float** d_gdn_S_tab = nullptr; // = d_gdn_tab + N_LAYER*W_MAX
+    int* d_perm_scalar = nullptr;
+    int* h_perm_pin = nullptr;
+    // Stage the CURRENT host perm to the device scalar on st (T3 calls this
+    // per capture-mode round, before the graph launch on the same stream).
+    void stage_perm_async(cudaStream_t st) {
+        *h_perm_pin = perm;
+        CUDA_CHECK(cudaMemcpyAsync(d_perm_scalar, h_perm_pin, sizeof(int),
+                                   cudaMemcpyHostToDevice, st));
+    }
     // ---- GRAPH ZOO (read before any width/depth change: miss one and a decode
     // path silently runs a stale graph). perm is mod-W_MAX=12 (12 GDN state
     // buffers), so every spec/gated set below is [..][perm=0..11]. Two NON-spec
@@ -726,6 +755,29 @@ struct Engine {
                     (size_t)(W_MAX + 1) * ((size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH) * 4;
                 attn_cache_idx.push_back(-1);
             }
+        }
+        // P3 T2: upload the device role-pointer tables (ring half + S half,
+        // one flat alloc) and the perm scalar, ONCE, now that every role
+        // buffer above has its final address. Inert unless the conv/delta
+        // table twins run (gdn_mix use_tables; see the member block).
+        {
+            const size_t half = (size_t)N_LAYER * W_MAX;
+            std::vector<float*> tab(2 * half, nullptr);
+            for (int il = 0; il < N_LAYER; il++) {
+                if (attn_layer[il]) continue;
+                for (int ph = 0; ph < W_MAX; ph++) {
+                    tab[(size_t)il * W_MAX + ph] = ph == 0 ? conv_ring[il] : ring_sp[ph - 1][il];
+                    tab[half + (size_t)il * W_MAX + ph] = ph == 0 ? S[il] : S_sp[ph - 1][il];
+                }
+            }
+            CUDA_CHECK(cudaMalloc((void**)&d_gdn_tab, 2 * half * sizeof(float*)));
+            CUDA_CHECK(cudaMemcpy(d_gdn_tab, tab.data(), 2 * half * sizeof(float*),
+                                  cudaMemcpyHostToDevice));
+            d_gdn_S_tab = d_gdn_tab + half;
+            CUDA_CHECK(cudaMalloc((void**)&d_perm_scalar, sizeof(int)));
+            CUDA_CHECK(cudaMemset(d_perm_scalar, 0, sizeof(int)));
+            CUDA_CHECK(cudaMallocHost((void**)&h_perm_pin, sizeof(int)));
+            *h_perm_pin = 0;
         }
         if (own_weights) {
             fprintf(stderr, "uploading weights...\n");
@@ -1345,13 +1397,35 @@ struct Engine {
     // value, same launch sequence). Width stays MEMBER vw: each engine's mix
     // walks its OWN granted lanes 0..vw-1, never the union width (the
     // conductor sets vw per round via set_round_width before the fused round).
-    void gdn_mix(int il, cudaStream_t st) {
+    // P3 T2: use_tables=false (every existing call site) keeps the shipped
+    // conv_step/delta_step launches with host-resolved RBuf/SBuf pointers --
+    // the solo path is untouched by construction. use_tables=true swaps in
+    // the TABLE TWINS (identical math, device-resolved role pointers via
+    // d_gdn_tab + *d_perm_scalar); the FUSED path passes it (mix_all,
+    // conductor.h -- eager from T2 on, captured in T3), after the caller's
+    // stage_perm_async has landed the round's perm in the scalar.
+    void gdn_mix(int il, cudaStream_t st, bool use_tables = false) {
         const float eps = EPS;
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         // P12: per-lane recurrent chain -- role k reads role k-1 (written fresh
         // earlier this round) and writes role k. Only lanes < vw are live; a
         // width-vw graph skips the rest, leaving their (never-read) role buffers
         // untouched. Lane a (role 0, the pending token) always runs.
+        if (use_tables) {
+            float* const* rt = d_gdn_tab + (size_t)il * W_MAX;
+            float* const* stab = d_gdn_S_tab + (size_t)il * W_MAX;
+            q27k::conv_step_t(rt, d_perm_scalar, 0, 0, W_MAX, qkv, cw, convout, GDN_CH, st);
+            for (int L = 1; L < vw; L++)
+                q27k::conv_step_t(rt, d_perm_scalar, L - 1, L, W_MAX, qkv_L[L], cw,
+                                  convout_L[L], GDN_CH, st);
+            q27k::l2norm3(LANESW(convout), 32,
+                          GDN_DIM, eps, st, vw);
+            q27k::delta_step_t(stab, d_perm_scalar, 0, 0, W_MAX, convout, g, beta, o, st);
+            for (int L = 1; L < vw; L++)
+                q27k::delta_step_t(stab, d_perm_scalar, L - 1, L, W_MAX, convout_L[L], g_L[L],
+                                   beta_L[L], o_L[L], st);
+            return;
+        }
         q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, st); // lane 0
         for (int L = 1; L < vw; L++)
             q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, st);
@@ -2136,6 +2210,26 @@ struct Engine {
         gs.verify_ms += verify_ms;
         gs.draft_steps += steps;
     }
+    // ---- P3 T3 exec-cache accessors (A4; plan 2026-07-16-batch-p3-capture) --
+    // why: the conductor's graph-cache shape key includes each member's
+    // KV-cache kind -- attn_mix's kv_store/attn_decode kernel family
+    // branches on it at capture time. Init-fixed per engine, keyed anyway:
+    // a recycled Engine* address must never hit a differently-configured
+    // engine's cached exec.
+    int kv_cache_kind() const { return kv_kind; }
+    // why: the T3 ALWAYS-ON hit guard re-derives the device state a cached
+    // exec's table twins consume -- the GDN role-table base, the perm
+    // scalar the twins dereference, and the pinned staging int
+    // stage_perm_async copies from -- and compares each against the
+    // capture-stored snapshot (B8 discipline) before any replay.
+    float* const* gdn_role_tab() const { return d_gdn_tab; }
+    const int* perm_scalar_dev() const { return d_perm_scalar; }
+    const int* perm_pin_host() const { return h_perm_pin; }
+    // why: the guard's staging-expectation check -- stage_perm_async(cstm)
+    // must already have run this round, so the pinned int must carry the
+    // CURRENT perm; a stale value means the copy the twins depend on was
+    // never staged and a replay would consume last round's rotation.
+    int cur_perm() const { return perm; }
     //
     // Set the granted verify width for the NEXT (eager, fused) round. vw is
     // capture-time state for the graph zoo, so this must only be called on
