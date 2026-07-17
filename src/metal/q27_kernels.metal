@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 11
+// Q27_SHADER_ABI 12
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -3442,6 +3442,32 @@ kernel void q27_rope_neox_rows(device float *x [[buffer(0)]],
     xh[d + args.n_rot / 2] = x0 * sn + x1 * cs;
 }
 
+// OCP e4m3 round-trip (fp8-KV control arm, docs/plans/2026-07-17-fp8-kv-
+// control.md; hot-cells arm, 2026-07-17-kv-e4m3-hot-cells.md): RNE onto
+// the e4m3 grid — 3 mantissa bits, exponent [-6..8], subnormal step
+// 2^-9, saturate to +-448 (no inf; 480 is the NaN encoding). Because the
+// codec is transform-free, round-tripped values are bit-identical to
+// what a real e4m3 cache would feed attention, so store-time rounding is
+// production-exact for this codec (unlike turbo3, whose production
+// attention sums in the WHT domain). frexp is exact and division by a
+// power of two is exact, so rint gives true round-nearest-even on the
+// grid. Finite inputs only (KV rows).
+inline float q27_e4m3_roundtrip(float x) {
+    const float a = fabs(x);
+    if (a == 0.0f) return x;                      // signed zero unchanged
+    float q;
+    if (a > 448.0f) {
+        q = 448.0f;                               // saturate, no infinity
+    } else if (a < 0.015625f) {                   // below min normal 2^-6
+        q = rint(a * 512.0f) * 0.001953125f;      // subnormal grid 2^-9
+    } else {
+        int e; frexp(a, e);                       // a in [2^(e-1), 2^e)
+        const float step = exp2(float(e - 4));    // 2^(exp-3), exp = e-1
+        q = min(rint(a / step) * step, 448.0f);
+    }
+    return x < 0.0f ? -q : q;
+}
+
 struct KvStoreRowsArgs { uint position; uint row_length; uint tokens; };
 kernel void q27_kv_store_f16_rows(device const float *k [[buffer(0)]],
                                    device const float *v [[buffer(1)]],
@@ -3459,8 +3485,12 @@ kernel void q27_kv_store_f16_rows(device const float *k [[buffer(0)]],
 // copies ONE head's K/V rows out of the packed multi-head staging buffers
 // (src rows are src_stride apart; the head offset rides the buffer binding)
 // into a kv_heads=1 fp16 side cache (dst rows are row_length apart). tokens
-// = 1 covers the serial store.
-struct KvStoreHeadRowsArgs { uint position; uint src_stride; uint row_length; uint tokens; };
+// = 1 covers the serial store. codec 1 (hot-cells arm, 2026-07-17-kv-
+// e4m3-hot-cells.md) rounds each value onto the e4m3 grid before the
+// half store — values-exact for a real 1-byte e4m3 side cache, every
+// downstream kernel unchanged.
+struct KvStoreHeadRowsArgs { uint position; uint src_stride; uint row_length; uint tokens;
+                             uint codec; };
 kernel void q27_kv_store_f16_head_rows(device const float *k [[buffer(0)]],
                                         device const float *v [[buffer(1)]],
                                         device half *kc       [[buffer(2)]],
@@ -3470,7 +3500,12 @@ kernel void q27_kv_store_f16_head_rows(device const float *k [[buffer(0)]],
     if (gid.x >= args.row_length || gid.y >= args.tokens) return;
     const ulong src = (ulong)gid.y * args.src_stride + gid.x;
     const ulong dst = (ulong)(args.position + gid.y) * args.row_length + gid.x;
-    kc[dst] = half(k[src]); vc[dst] = half(v[src]);
+    if (args.codec) {
+        kc[dst] = half(q27_e4m3_roundtrip(k[src]));
+        vc[dst] = half(q27_e4m3_roundtrip(v[src]));
+    } else {
+        kc[dst] = half(k[src]); vc[dst] = half(v[src]);
+    }
 }
 
 struct GateRowsArgs { uint heads; uint head_dim; uint tokens; };
@@ -3752,31 +3787,6 @@ kernel void q27_turbo_wht(device float *x [[buffer(0)]],
     xs[j] = xh[j] * float(args.inverse ? turbo_s2[j] : turbo_s1[j]);
     turbo_butterfly(xs, j);
     xh[j] = xs[j] * turbo_inv_sqrt_128 * float(args.inverse ? turbo_s1[j] : turbo_s2[j]);
-}
-
-// OCP e4m3 round-trip (fp8-KV control arm, docs/plans/2026-07-17-fp8-kv-
-// control.md): RNE onto the e4m3 grid — 3 mantissa bits, exponent
-// [-6..8], subnormal step 2^-9, saturate to +-448 (no inf; 480 is the
-// NaN encoding). Because the codec is transform-free, round-tripped
-// values are bit-identical to what a real e4m3 cache would feed
-// attention, so the attrib-store arm is production-exact for this codec
-// (unlike turbo3, whose production attention sums in the WHT domain).
-// frexp is exact and division by a power of two is exact, so rint gives
-// true round-nearest-even on the grid. Finite inputs only (KV rows).
-inline float q27_e4m3_roundtrip(float x) {
-    const float a = fabs(x);
-    if (a == 0.0f) return x;                      // signed zero unchanged
-    float q;
-    if (a > 448.0f) {
-        q = 448.0f;                               // saturate, no infinity
-    } else if (a < 0.015625f) {                   // below min normal 2^-6
-        q = rint(a * 512.0f) * 0.001953125f;      // subnormal grid 2^-9
-    } else {
-        int e; frexp(a, e);                       // a in [2^(e-1), 2^e)
-        const float step = exp2(float(e - 4));    // 2^(exp-3), exp = e-1
-        q = min(rint(a / step) * step, 448.0f);
-    }
-    return x < 0.0f ? -q : q;
 }
 
 struct TurboStoreArgs { uint position; uint kv_heads; };

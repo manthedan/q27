@@ -90,12 +90,16 @@ void MetalEngine::validate_architecture() const {
     if (meta.value("general.architecture", std::string()) != "qwen35")
         throw std::runtime_error("q27 Metal: expected qwen35 architecture");
     // Bonsai artifacts (T2 ternary / B1 binary repacks): 64 blocks, no MTP
-    // layer, bonsai-dtype embeddings/head/alpha/beta. Everything else
-    // matches the official tier; the two bonsai packs differ only in dtype.
+    // layer, bonsai-dtype embeddings/head/alpha/beta. The sibling packs
+    // share this architecture even though their trained tensor bytes differ.
     const std::string policy = meta.value("quant_policy", std::string());
     const bool ternary = policy == "bonsai-t2-v1";
     const bool binary = policy == "bonsai-b1-v1";
-    const bool bonsai = ternary || binary;
+    // Mixed-tier census packs (docs/plans/2026-07-17-mixed-tier-census.md,
+    // tools/q27_mix.py): per-tensor T2/B1 routing over the same bonsai
+    // shape. Both tiers' layout declarations are demanded below.
+    const bool mixed = policy == "bonsai-mixed-v1";
+    const bool bonsai = ternary || binary || mixed;
     exact("qwen35.block_count", bonsai ? 64 : 65); exact("qwen35.embedding_length", N_EMBD);
     exact("qwen35.feed_forward_length", N_FFN); exact("qwen35.attention.head_count", N_HEAD);
     exact("qwen35.attention.head_count_kv", N_KV); exact("qwen35.attention.key_length", HEAD_DIM);
@@ -113,12 +117,12 @@ void MetalEngine::validate_architecture() const {
     // The kernels hardcode the pack encodings; the meta strings are the
     // repack's declaration of what it wrote (codex P3 on the B1 wiring —
     // the T2 twin closes the same pre-existing gap).
-    if (ternary) {
+    if (ternary || mixed) {
         exact("group_t2", 128);
         exact_str("t2_codes", "0=-1,1=0,2=+1;3 forbidden");
         exact_str("t2_slot_order", "seq-lsb-first");
     }
-    if (binary) {
+    if (binary || mixed) {
         exact("group_b1", 128);
         exact_str("b1_codes", "1=+d,0=-d");
         exact_str("b1_bit_order", "seq-lsb-first");
@@ -160,6 +164,7 @@ void MetalEngine::validate_architecture() const {
     auto matrix_dtype_ok = [&](DType dtype) {
         if (ternary) return dtype == DType::T2_G128;
         if (binary) return dtype == DType::B1_G128;
+        if (mixed) return dtype == DType::T2_G128 || dtype == DType::B1_G128;
         return dtype == DType::Q4_G64 || dtype == DType::Q8_G128;
     };
     auto matrix = [&](const std::string& name, uint64_t rows, uint64_t cols) {
@@ -168,10 +173,21 @@ void MetalEngine::validate_architecture() const {
             throw std::runtime_error("q27 Metal: required matrix mismatch: " + name);
     };
 
+    // Tensors whose tier follows the pack policy: mixed admits either
+    // bonsai dtype (per-tensor routing decides at dispatch), the pure
+    // packs stay pinned exactly.
+    auto require_tier = [&](const std::string& name, DType pure,
+                            std::initializer_list<uint64_t> shape) {
+        if (!mixed) { require(name, pure, shape); return; }
+        const Tensor* tensor = model_.find(name);
+        if (!tensor || (tensor->dtype != DType::T2_G128 && tensor->dtype != DType::B1_G128) ||
+            tensor->shape != std::vector<uint64_t>(shape))
+            throw std::runtime_error("q27 Metal: required tensor mismatch: " + name);
+    };
     const DType vocab_dtype = ternary ? DType::T2_G128
-                            : binary ? DType::B1_G128 : DType::Q8_G128;
-    require("token_embd.weight", vocab_dtype, {VOCAB, N_EMBD});
-    require("output.weight", vocab_dtype, {VOCAB, N_EMBD});
+                            : binary ? DType::B1_G128 : DType::Q8_G128;   // unused under mixed
+    require_tier("token_embd.weight", vocab_dtype, {VOCAB, N_EMBD});
+    require_tier("output.weight", vocab_dtype, {VOCAB, N_EMBD});
     require("output_norm.weight", DType::F32, {N_EMBD});
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         const std::string p = "blk." + std::to_string(layer) + ".";
@@ -190,12 +206,15 @@ void MetalEngine::validate_architecture() const {
         } else {
             matrix(p + "attn_qkv.weight", GDN_CH, N_EMBD);
             matrix(p + "attn_gate.weight", GDN_V, N_EMBD);
-            require(p + "ssm_alpha.weight", ternary ? DType::T2_G128
-                                            : binary ? DType::B1_G128 : DType::F16,
-                    {GDN_HEADS, N_EMBD});
-            require(p + "ssm_beta.weight", ternary ? DType::T2_G128
-                                           : binary ? DType::B1_G128 : DType::F16,
-                    {GDN_HEADS, N_EMBD});
+            if (bonsai) {
+                require_tier(p + "ssm_alpha.weight", ternary ? DType::T2_G128 : DType::B1_G128,
+                             {GDN_HEADS, N_EMBD});
+                require_tier(p + "ssm_beta.weight", ternary ? DType::T2_G128 : DType::B1_G128,
+                             {GDN_HEADS, N_EMBD});
+            } else {
+                require(p + "ssm_alpha.weight", DType::F16, {GDN_HEADS, N_EMBD});
+                require(p + "ssm_beta.weight", DType::F16, {GDN_HEADS, N_EMBD});
+            }
             require(p + "ssm_a", DType::F32, {GDN_HEADS});
             require(p + "ssm_dt.bias", DType::F32, {GDN_HEADS});
             require(p + "ssm_conv1d.weight", DType::F32, {GDN_CH, 4});
@@ -331,6 +350,28 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
                 }
         } else {
             fprintf(stderr, "q27 Metal: Q27_METAL_KV_FP16_CELLS ignored on an fp16-KV engine (cells already fp16)\n");
+        }
+    }
+    // Side-cache codec (hot-cells arm): e4m3 rounds the excepted cells'
+    // rows onto the fp8 grid at store time — partial fidelity instead of
+    // full fp16, at the real e4m3 side format's byte price. Meaningless
+    // without an exception list, so that combination is rejected loudly
+    // rather than silently ignored.
+    if (const char* codec_env = getenv("Q27_METAL_KV_CELLS_CODEC")) {
+        const std::string codec(codec_env);
+        if (codec != "fp16" && codec != "e4m3")
+            throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC must be fp16 or e4m3");
+        if (codec == "e4m3") {
+            if (kv_fp16_except_)
+                kv_fp16_side_codec_ = 1;
+            else if (turbo3_kv_ || !getenv("Q27_METAL_KV_FP16_CELLS"))
+                // Covers the EMPTY cells list on turbo3 too: an explicitly
+                // requested e4m3 arm must never silently degrade to plain
+                // turbo3 (vacuous-instrument class; codex P2 on d9ee75a).
+                throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC=e4m3 needs a non-empty Q27_METAL_KV_FP16_CELLS (nothing to encode)");
+            // else: fp16-KV engine — the cells env was ignored above (with
+            // its note), so the codec rides along ignored too; the kl-kv
+            // baseline engine shares the subject's process environment.
         }
     }
     const uint64_t total_cache_bytes =
@@ -795,7 +836,8 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         h.kv_dtype = turbo3_kv_ ? 1 : 0;
         h.position = position_;
         h.token_count = token_count;
-        h.reserved = (logits_resident ? 0u : 1u) | (kv_fp16_except_ ? 2u : 0u);
+        h.reserved = (logits_resident ? 0u : 1u) | (kv_fp16_except_ ? 2u : 0u)
+                   | (kv_fp16_side_codec_ ? 4u : 0u);
         snap_write(f, &h, sizeof h, tmp);
         if (token_count) snap_write(f, tokens, (size_t)token_count * 4, tmp);
         auto put_blob = [&](const BackendBuffer* src, uint64_t bytes) {
@@ -840,6 +882,17 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
                     put_side_blob(*side.k, side_active);
                     put_side_blob(*side.v, side_active);
                 }
+            // Codec trailer, e4m3 sides only (codex P2 on d9ee75a): a
+            // reserved bit alone cannot stop a PRE-codec binary from
+            // silently continuing an e4m3 history with fp16 stores — this
+            // extra blob trips that binary's own trailing-bytes check
+            // loudly. fp16-side files carry no trailer, so they stay
+            // loadable across the version boundary.
+            if (kv_fp16_side_codec_) {
+                const uint64_t codec_bytes = sizeof kv_fp16_side_codec_;
+                snap_write(f, &codec_bytes, sizeof codec_bytes, tmp);
+                snap_write(f, &kv_fp16_side_codec_, codec_bytes, tmp);
+            }
         }
         // Test-only failpoints for the snapshot crash gate
         // (tools/snapshot_gate.sh); read fresh each save.
@@ -916,6 +969,12 @@ uint32_t MetalEngine::load_state(const std::string& path) {
             throw std::runtime_error(kv_fp16_except_
                 ? "q27 Metal: snapshot carries no KV fp16 exception side rows but this engine needs them (Q27_METAL_KV_FP16_CELLS): " + path
                 : "q27 Metal: snapshot carries KV fp16 exception side rows but this engine has none: " + path);
+        // Side codec is config identity too (bit 2): an fp16-side snapshot
+        // continued under e4m3 stores (or vice versa) would mix codec
+        // histories silently. Binaries older than the hot-cells arm ignore
+        // this bit — recorded cross-version caveat.
+        if (bool(h.reserved & 4) != (kv_fp16_side_codec_ != 0))
+            throw std::runtime_error("q27 Metal: snapshot side-cache codec does not match this engine (Q27_METAL_KV_CELLS_CODEC): " + path);
         if (fseeko(f, (off_t)h.token_count * 4, SEEK_CUR) != 0)
             throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
         const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
@@ -933,7 +992,7 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         // streams into a shared buffer; Mask is host data whose CONTENT is
         // validated in pass 1 (equal-length cell lists differ only there);
         // Side bounces through staging into a private buffer.
-        struct BlobRef { BackendBuffer* buf; uint64_t bytes; enum Kind { Std, Mask, Side } kind; };
+        struct BlobRef { BackendBuffer* buf; uint64_t bytes; enum Kind { Std, Mask, Side, Codec } kind; };
         std::vector<BlobRef> blobs;
         for (uint32_t i = 0; i < N_LAYER; i++) {
             LayerState& d = layers_[i];
@@ -954,12 +1013,23 @@ uint32_t MetalEngine::load_state(const std::string& path) {
                     blobs.push_back({side.k.get(), side_active, BlobRef::Side});
                     blobs.push_back({side.v.get(), side_active, BlobRef::Side});
                 }
+            // e4m3 sides carry a codec trailer (see save_state); its
+            // absence/presence is already pinned by reserved bit 2, its
+            // CONTENT is checked like the mask blob's.
+            if (kv_fp16_side_codec_)
+                blobs.push_back({nullptr, sizeof kv_fp16_side_codec_, BlobRef::Codec});
         }
         auto check_mask = [&]() {
             uint8_t stored_masks[sizeof kv_fp16_head_masks_];
             snap_read(f, stored_masks, sizeof stored_masks, path);
             if (memcmp(stored_masks, kv_fp16_head_masks_, sizeof stored_masks) != 0)
                 throw std::runtime_error("q27 Metal: snapshot KV fp16 exception cells do not match this engine (Q27_METAL_KV_FP16_CELLS): " + path);
+        };
+        auto check_codec = [&]() {
+            uint32_t stored_codec = 0;
+            snap_read(f, &stored_codec, sizeof stored_codec, path);
+            if (stored_codec != kv_fp16_side_codec_)
+                throw std::runtime_error("q27 Metal: snapshot side-cache codec does not match this engine (Q27_METAL_KV_CELLS_CODEC): " + path);
         };
         const off_t blob_start = ftello(f);
         // Real file size up front: fseeko past EOF succeeds silently, so the
@@ -979,9 +1049,10 @@ uint32_t MetalEngine::load_state(const std::string& path) {
             expected_end += sizeof stored + stored;
             if (expected_end > (uint64_t)file_size)
                 throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
-            // Mask content is part of pass-1 validation: a mismatched cell
-            // list must reject BEFORE pass 2 writes any standard blob.
+            // Mask/codec content is part of pass-1 validation: a mismatch
+            // must reject BEFORE pass 2 writes any standard blob.
             if (blob.kind == BlobRef::Mask) check_mask();
+            else if (blob.kind == BlobRef::Codec) check_codec();
             else if (fseeko(f, (off_t)stored, SEEK_CUR) != 0)
                 throw std::runtime_error("q27 Metal: truncated snapshot: " + path);
         }
@@ -1002,6 +1073,7 @@ uint32_t MetalEngine::load_state(const std::string& path) {
             if (stored != blob.bytes)
                 throw std::runtime_error("q27 Metal: snapshot changed during load: " + path);
             if (blob.kind == BlobRef::Mask) { check_mask(); continue; }
+            if (blob.kind == BlobRef::Codec) { check_codec(); continue; }
             for (uint64_t off = 0; off < blob.bytes; off += stage.size()) {
                 const uint64_t n = std::min<uint64_t>(stage.size(), blob.bytes - off);
                 snap_read(f, stage.data(), n, path);
@@ -1134,7 +1206,7 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
             for (const KvFp16Side& s : side)
                 backend_.kv_store_f16_head_rows_side(*kbuf_, *vbuf_, s.head * HEAD_DIM,
                                                      N_KV * HEAD_DIM, *s.k, *s.v,
-                                                     pos, HEAD_DIM, 1);
+                                                     pos, HEAD_DIM, 1, kv_fp16_side_codec_);
         }
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
                                   *attn_out_, pos + 1, N_HEAD, N_KV,
@@ -1282,7 +1354,7 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
             for (const KvFp16Side& s : side)
                 backend_.kv_store_f16_head_rows_side(*ckbuf_, *cvbuf_, s.head * HEAD_DIM,
                                                      N_KV * HEAD_DIM, *s.k, *s.v,
-                                                     position_, HEAD_DIM, count);
+                                                     position_, HEAD_DIM, count, kv_fp16_side_codec_);
         }
         backend_.attention_turbo3_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                          *state.k_cache, *state.v_cache,

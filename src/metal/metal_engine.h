@@ -298,6 +298,10 @@ class MetalEngine {
     // store off them so mismatched configs miss instead of rejecting.
     bool kv_fp16_except() const { return kv_fp16_except_; }
     const uint8_t* kv_fp16_head_masks() const { return kv_fp16_head_masks_; }
+    // Side-cache codec (Q27_METAL_KV_CELLS_CODEC): 0 = fp16, 1 = e4m3
+    // (hot-cells arm, 2026-07-17-kv-e4m3-hot-cells.md). Part of the
+    // snapshot-config identity and the server's disk-store tag.
+    uint32_t kv_side_codec() const { return kv_fp16_side_codec_; }
 
   private:
     static constexpr uint32_t N_LAYER = 64;
@@ -353,6 +357,7 @@ class MetalEngine {
     std::array<std::vector<KvFp16Side>, 16> kv_fp16_side_;
     bool kv_fp16_except_ = false;
     uint8_t kv_fp16_head_masks_[16] = {};   // snapshot-config identity (bit = head)
+    uint32_t kv_fp16_side_codec_ = 0;       // 0 fp16, 1 e4m3 side stores
     uint64_t engine_cache_bytes_ = 0;
     // Blocked-GQA softmax partials, engine-owned (audit E2): allocated once
     // in the constructor at gqa_partial_peak, GPU-private, freed with the

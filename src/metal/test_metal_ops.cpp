@@ -1013,7 +1013,35 @@ int test_kv_e4m3_store(q27::MetalBackend& backend) {
                     d, kh[d], vh[d]);
             failures++;
         }
-    printf("e4m3 fp8 KV store: golden ties/saturation/subnormals/signed zero + full-binade sweep exact on both sides\n");
+    // Cross-kernel consistency (hot-cells arm, 2026-07-17-kv-e4m3-hot-
+    // cells.md): the side store's codec 1 must land byte-identical e4m3
+    // halves to attrib mode 4 over the same inputs, and codec 0 must stay
+    // plain fp16 — the funded config's stores are bit-unchanged.
+    auto ks = backend.allocate((uint64_t)dim * 2), vs = backend.allocate((uint64_t)dim * 2);
+    backend.kv_store_f16_head_rows_side(*kb, *vb, 0, dim, *ks, *vs, 0, dim, 1, 1);
+    std::vector<uint16_t> ksh(dim), vsh(dim);
+    backend.read(*ks, 0, ksh.data(), dim * 2);
+    backend.read(*vs, 0, vsh.data(), dim * 2);
+    for (uint32_t d = 0; d < dim; d++)
+        if (ksh[d] != kh[d] || vsh[d] != vh[d]) {
+            fprintf(stderr, "e4m3 side-store[%u]: k %04x vs attrib %04x, v %04x vs %04x\n",
+                    d, ksh[d], kh[d], vsh[d], vh[d]);
+            failures++;
+            break;
+        }
+    backend.kv_store_f16_head_rows_side(*kb, *vb, 0, dim, *ks, *vs, 0, dim, 1, 0);
+    backend.read(*ks, 0, ksh.data(), dim * 2);
+    for (uint32_t d = 0; d < dim; d++) {
+        const __fp16 e = (__fp16)k[d];
+        uint16_t eb; std::memcpy(&eb, &e, 2);
+        if (ksh[d] != eb) {
+            fprintf(stderr, "fp16 side-store[%u]: %04x want %04x (codec 0 must be plain fp16)\n",
+                    d, ksh[d], eb);
+            failures++;
+            break;
+        }
+    }
+    printf("e4m3 fp8 KV store: golden ties/saturation/subnormals/signed zero + full-binade sweep exact on both sides; side-store codec 1 matches attrib mode 4, codec 0 plain\n");
     return failures;
 }
 
