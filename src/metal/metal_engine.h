@@ -289,6 +289,10 @@ class MetalEngine {
     // quantized). fp16-KV engines only; set before any tokens are encoded;
     // not combinable with the step-2 rt flags.
     void set_kv_attrib_except(const uint32_t* cells, size_t n);
+    // True when Q27_METAL_KV_FP16_CELLS armed production fp16 exception
+    // side caches on this engine (snapshots are refused in v1; the server
+    // disables its prefix cache off this bit).
+    bool kv_fp16_except() const { return kv_fp16_except_; }
 
   private:
     static constexpr uint32_t N_LAYER = 64;

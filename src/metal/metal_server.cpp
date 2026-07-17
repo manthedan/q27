@@ -290,7 +290,12 @@ struct Runtime {
         bool busy=false;
         enum class Phase { Idle, Prefill, Decode, Verify } phase=Phase::Idle;
         Slot(std::shared_ptr<q27::MetalEngine::Shared> s,uint32_t ctx,bool turbo3,size_t entries)
-            :engine(std::move(s),ctx,turbo3),cache(entries) {}
+            :engine(std::move(s),ctx,turbo3),
+             // KV fp16 exception engines cannot snapshot yet (v1 exclusion) —
+             // a capacity-0 cache never calls capture_state, so the server
+             // stays usable instead of failing every request post-prefill
+             // (codex P1 on 41705bb). Loud note at startup below.
+             cache(engine.kv_fp16_except()?0:entries) {}
     };
     std::vector<std::unique_ptr<Slot>> slots;
     uint32_t mtp_width;
@@ -386,6 +391,8 @@ struct Runtime {
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
         slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
+        if(slots.front()->engine.kv_fp16_except() && cache_entries)
+            fprintf(stderr,"q27 Metal server: KV fp16 exception cells active (Q27_METAL_KV_FP16_CELLS) — prefix cache DISABLED (snapshots are a v1 exclusion)\n");
         // G6 admission (docs/plans/2026-07-16-g6-admission.md): additional
         // slots must fit the FULL per-slot footprint — KV + this slot's own
         // GQA partials (per-engine since audit E2, charged inside
