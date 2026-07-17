@@ -667,9 +667,6 @@ int main(int argc, char** argv) {
                             std::max((float)std::sqrt(sumsq[base + i] / (double)sn), floor_s);
                 }
             }
-            if (kv_attrib && (kv_rt_scale32 || !kv_rt_feature.empty()))
-                subject.set_kv_attrib_rt(kv_rt_scale32,
-                                         feature_scales.empty() ? nullptr : feature_scales.data());
             if (kv_cell != UINT32_MAX) {
                 // cell id = attn_idx*8 + head*2 + side (side 0=K, 1=V);
                 // attn_idx 0..15 maps to absolute layer attn_idx*4+3.
@@ -679,7 +676,13 @@ int main(int argc, char** argv) {
                 snprintf(cell_name, sizeof cell_name, "turbo3 cell L%u:h%u:%s round-trip",
                          attn_idx * 4 + 3, head, side == 1 ? "K" : "V");
             } else if (kv_attrib) {
+                // Side arm first, modifiers second — set_kv_attrib clears
+                // the round-trip flags (codex P1 on b1bed0e).
                 subject.set_kv_attrib(kv_attrib);
+                if (kv_rt_scale32 || !kv_rt_feature.empty())
+                    subject.set_kv_attrib_rt(kv_rt_scale32,
+                                             feature_scales.empty() ? nullptr
+                                                                    : feature_scales.data());
             }
             if (serial_prefill) {
                 baseline.set_chunked_prefill(false);
