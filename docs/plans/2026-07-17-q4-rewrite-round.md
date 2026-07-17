@@ -53,6 +53,42 @@ body, then: test-metal, the 16-token official-tier byte gate
 Timing legs on the quiet 24 GB M4 (nothing else loaded); correctness legs
 contention-tolerant.
 
-## RESULTS
+## RESULTS (2026-07-17, quiet 24 GB M4 — logs/q4-round-20260717/)
 
-(pending)
+**SHIPPED. Candidate A (r4) promoted; E6 leg re-run ×2 on the production
+path: R = 1.024 and R = 1.060** — the official Q4/Q8 mix now streams at or
+above the same-run T2 reference (73.99/88.29 GB/s byte-weighted vs 52.44 at
+funding). Per-token GEMV wall 236.95 → 156–186 ms, landing inside E6's
+predicted at-parity window (157–188 ms): the ~1.4× serial-decode prize
+materialized.
+
+Candidate table (same-run relative, correctness + byte-identity gates green
+pre-timing on every arm):
+- **r4: R = 0.957** — sub-line cleared on both named shapes (attn q
+  59.17 → 84.73 GB/s, +43%; ssm/attn out 60.47 → 76.42, +26%; ffn pair
+  69.81 → 93.87 as two singles, +34%). PROMOTED.
+- r2: R = 0.826 — beaten, retained as the bench comparison arm.
+- A′ (q8 r4 twin): mix R 0.604 vs same-run baseline 0.663 — regressed the
+  output head; **killed by its own sub-line**, Q8 kernels untouched, kernel
+  deleted (probe candidate 4 throws with this citation).
+- Candidate B (half-MMA) never ran: A cleared the ship line.
+
+Gates: full test-metal green post-promotion; 16-token official-tier byte
+gate IDENTICAL pre/post (--tokens identity, greedy). Run-to-run T2-reference
+variance was real (61–88 GB/s across the session) — the ship verdict rests
+on two consecutive re-runs both clearing 0.90 by ≥ 0.12, not on one number.
+
+**SHADER_ABI 8 → 9, and a lesson the byte gate itself taught:** the first
+gate run produced garbage — the promoted binary, run with cwd in the main
+checkout, runtime-compiled the PRE-promotion kernel source (load_kernel_source
+resolves relative to cwd) and drove it with the /32 grid, leaving 3/4 of
+output rows stale. Dispatch-topology changes are ABI-tag-relevant even when
+argument structs are unchanged: new-binary/old-source is garbage in one
+direction and 4× redundant compute in the other. The tag's contract comment
+now covers rows-per-simdgroup changes by precedent.
+
+Registered residue: none from this round — the E6 question is closed
+(funding-verdict print in the bench reworded to say so). The prebuilt-oracle
+note is unaffected (no CUDA changes). Next queued per the composite order:
+B1 select round 2 (ship ≥ 18 tok/s artifact decode), then the fp8-KV
+control arm.

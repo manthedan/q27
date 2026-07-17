@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 8
+// Q27_SHADER_ABI 9
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -1201,6 +1201,16 @@ kernel void q27_matvec_q8_quantized(device const char *weights [[buffer(0)]],
     if (lane == 0) out[row] = acc;
 }
 
+// PROMOTED 2026-07-17 (docs/plans/2026-07-17-q4-rewrite-round.md candidate A,
+// r4 arm: bench R = 0.957 vs the 0.90 ship line; the prior 1-row-per-simdgroup
+// structure re-issued the full x load per row). 4 rows per simdgroup, each
+// lane's 32-column int8 x-slice and activation scale held in registers, so
+// x-loads, x-scale reads and the reduction chain amortize across rows and the
+// weight stream runs 4 independent load chains. The decode ALU (q27_dot8_q4)
+// is unchanged: per-row dot, scale multiply order and accumulation order match
+// the pre-promotion kernel exactly — byte-identical outputs (gated). Rows past
+// the grid edge clamp to the last row and compute without storing (the T2
+// wide-kernel convention). Dispatch: 32 rows per 256-thread group.
 kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
                                      device const half *weight_scales [[buffer(1)]],
                                      device const char *x [[buffer(2)]],
@@ -1210,38 +1220,126 @@ kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
                                      uint group [[threadgroup_position_in_grid]],
                                      ushort lane [[thread_index_in_simdgroup]],
                                      ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    const uint row = group * 8 + simdgroup;
-    if (row >= args.rows) return;
-    device const uint4 *w4x8 = (device const uint4 *)(weights + (ulong)row * (args.cols / 2));
+    const uint row0 = (group * 8 + (uint)simdgroup) * 4;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
     device const int4 *x16 = (device const int4 *)x;
-    const ulong scale_base = (ulong)row * (args.cols / 64);
-    float acc = 0.0f;
+    const uint sgroups = args.cols / 64;
+    device const uint4 *w[4];
+    ulong sbase[4];
+    for (uint r = 0; r < 4; r++) {
+        const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+        w[r] = (device const uint4 *)(weights + (ulong)row * (args.cols / 2));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    // float4 packs the accumulators; simd_sum per component is still 4
+    // cross-lane reductions — the win is issuing them once per row, not
+    // once per (row, x-load).
+    float4 acc = 0.0f;
     const uint chunks = args.cols / 1024;
     for (uint chunk = 0; chunk < chunks; chunk++) {
         const uint idx = chunk * 32 + lane;
-        const uint4 wp = w4x8[idx];
+        // The lane's 32-column x-slice and activation scale load ONCE per
+        // chunk and serve all 4 rows — the amortization the round bought.
         const int4 xp0 = x16[idx * 2];
         const int4 xp1 = x16[idx * 2 + 1];
-        const int dot0 = q27_dot8_q4(wp.x, as_type<char4>(xp0.x), as_type<char4>(xp0.y)) +
-                         q27_dot8_q4(wp.y, as_type<char4>(xp0.z), as_type<char4>(xp0.w));
-        const int dot1 = q27_dot8_q4(wp.z, as_type<char4>(xp1.x), as_type<char4>(xp1.y)) +
-                         q27_dot8_q4(wp.w, as_type<char4>(xp1.z), as_type<char4>(xp1.w));
-        // Same 32-aligned lane layout as the Q8 kernel: one activation-scale
-        // block and one weight-scale group cover the lane's 32 columns.
         const uint c = chunk * 1024 + lane * 32;
-        acc += float(dot0 + dot1) *
-               float(weight_scales[scale_base + c / 64]) * x_scales[c / 32];
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 4; r++) {
+            const uint4 wp = w[r][idx];
+            const int dot0 = q27_dot8_q4(wp.x, as_type<char4>(xp0.x), as_type<char4>(xp0.y)) +
+                             q27_dot8_q4(wp.y, as_type<char4>(xp0.z), as_type<char4>(xp0.w));
+            const int dot1 = q27_dot8_q4(wp.z, as_type<char4>(xp1.x), as_type<char4>(xp1.y)) +
+                             q27_dot8_q4(wp.w, as_type<char4>(xp1.z), as_type<char4>(xp1.w));
+            // Same 32-aligned lane layout as the Q8 kernel: one activation-
+            // scale block and one weight-scale group cover the lane's 32
+            // columns, and the per-lane integer dot stays exact in float:
+            // nibble-8 is in [-8,7], so |dot0 + dot1| <= 32*8*127 = 32512,
+            // well inside float's 2^24 exact-integer range.
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 64]) * xs;
+        }
+    }
+    // Tail (cols % 1024): the 128-column tail, per row.
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const char4 xp = *(device const char4 *)(x + c);
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 4; r++) {
+            const uchar2 wp = *(device const uchar2 *)((device const uchar *)w[r] + c / 2);
+            const int dot = (int(wp.x & 15u) - 8) * xp.x + (int(wp.x >> 4) - 8) * xp.y +
+                            (int(wp.y & 15u) - 8) * xp.z + (int(wp.y >> 4) - 8) * xp.w;
+            acc[r] += float(dot) * float(weight_scales[sbase[r] + c / 64]) * xs;
+        }
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// Round residue (docs/plans/2026-07-17-q4-rewrite-round.md): the r4 arm above
+// was PROMOTED into q27_matvec_q4_quantized (bench R = 0.957); r2 below stays
+// as the retained comparison arm (bench R = 0.826). Bench-only, dispatched by
+// matvec_q4_probe, never engine-routed.
+// The 2-row variant of the promoted structure (half the register pressure —
+// the bench decides between them). Same contracts: byte-identical per-row
+// math vs q27_matvec_q4_quantized, clamped edge rows compute and drop.
+kernel void q27_matvec_q4_quantized_r2(device const uchar *weights [[buffer(0)]],
+                                        device const half *weight_scales [[buffer(1)]],
+                                        device const char *x [[buffer(2)]],
+                                        device const float *x_scales [[buffer(3)]],
+                                        device float *out [[buffer(4)]],
+                                        constant MatvecArgs &args [[buffer(5)]],
+                                        uint group [[threadgroup_position_in_grid]],
+                                        ushort lane [[thread_index_in_simdgroup]],
+                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = (group * 8 + (uint)simdgroup) * 2;   // 16 rows per threadgroup
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    device const int4 *x16 = (device const int4 *)x;
+    const uint sgroups = args.cols / 64;
+    device const uint4 *w[2];
+    ulong sbase[2];
+    for (uint r = 0; r < 2; r++) {
+        const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+        w[r] = (device const uint4 *)(weights + (ulong)row * (args.cols / 2));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float2 acc = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
+        const uint c = chunk * 1024 + lane * 32;
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 2; r++) {
+            const uint4 wp = w[r][idx];
+            const int dot0 = q27_dot8_q4(wp.x, as_type<char4>(xp0.x), as_type<char4>(xp0.y)) +
+                             q27_dot8_q4(wp.y, as_type<char4>(xp0.z), as_type<char4>(xp0.w));
+            const int dot1 = q27_dot8_q4(wp.z, as_type<char4>(xp1.x), as_type<char4>(xp1.y)) +
+                             q27_dot8_q4(wp.w, as_type<char4>(xp1.z), as_type<char4>(xp1.w));
+            // |dot0 + dot1| <= 32*8*127 = 32512 — exact in float (see r4).
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 64]) * xs;
+        }
     }
     for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
-        const uchar2 wp = *(device const uchar2 *)(weights + (ulong)row * (args.cols / 2) + c / 2);
         const char4 xp = *(device const char4 *)(x + c);
-        const int dot = (int(wp.x & 15u) - 8) * xp.x + (int(wp.x >> 4) - 8) * xp.y +
-                        (int(wp.y & 15u) - 8) * xp.z + (int(wp.y >> 4) - 8) * xp.w;
-        acc += float(dot) * float(weight_scales[scale_base + c / 64]) * x_scales[c / 32];
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 2; r++) {
+            const uchar2 wp = *(device const uchar2 *)((device const uchar *)w[r] + c / 2);
+            const int dot = (int(wp.x & 15u) - 8) * xp.x + (int(wp.x >> 4) - 8) * xp.y +
+                            (int(wp.y & 15u) - 8) * xp.z + (int(wp.y >> 4) - 8) * xp.w;
+            acc[r] += float(dot) * float(weight_scales[sbase[r] + c / 64]) * xs;
+        }
     }
-    acc = simd_sum(acc);
-    if (lane == 0) out[row] = acc;
+    for (uint r = 0; r < 2; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
 }
+
 
 // 16 sequential LSB-first 2-bit codes per uint; code c contributes (c-1)*x.
 // The integer dot is exact: |dot| <= 16*1*127 = 2032 per uint, 4064 per
