@@ -1856,6 +1856,61 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
     return predictions[commit_n - 1];
 }
 
+uint32_t MetalEngine::suffix_step(SuffixDraft& drafter, uint32_t pending, uint32_t remaining,
+                                  uint32_t eos, uint32_t width, uint32_t minimum_match,
+                                  std::vector<uint32_t>& committed, bool* burst) {
+    if (remaining < 2)
+        throw std::runtime_error("q27 Metal: suffix step needs remaining >= 2 (emit the last token directly)");
+    if (width < 2 || width > VERIFY_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: suffix width must be 2..VERIFY_CHUNK_MAX");
+    committed.clear();
+    if (burst) *burst = false;
+    // A pending eos commits without encoding, mirroring suffix_round's lane
+    // clamp — the serial fallback below must never step() the eos token.
+    // Unreachable from generate_suffix (its sentinel never matches).
+    if (pending == eos) { committed.push_back(eos); return eos; }
+    // Propose up to width-1 continuation tokens; the verify chunk also
+    // needs one KV row per lane inside the reserved context.
+    uint32_t max_lanes = std::min<uint32_t>(width, remaining);
+    if ((uint64_t)position_ + max_lanes > max_context_)
+        max_lanes = (uint32_t)(max_context_ - position_);
+    int proposals[VERIFY_CHUNK_MAX];
+    int match = 0;
+    if (max_lanes >= 2)
+        match = drafter.propose_with((int)pending, (int)(max_lanes - 1), proposals);
+    // Match-capped width (plan contract, codex P2): forward lanes are
+    // bounded by the matched suffix length — proposals past the match
+    // evidence are lag-copy extrapolation, and dispatching them would
+    // make the drafted stats and burst economics measure speculation
+    // beyond what the match justifies.
+    uint32_t live = match >= (int)minimum_match
+                        ? std::min<uint32_t>(max_lanes, (uint32_t)match + 1) : 0;
+    // Full-tile snap-down (lever 2: round cost steps one full weight
+    // stream per 16-token tile): a partial second/third tile pays a
+    // whole stream for < 16 possible tokens — never worth it. 17..31
+    // lanes snap to 16, 33..47 snap to 32.
+    if (live > 16 && live < 32) live = 16;
+    else if (live > 32 && live < 48) live = 32;
+    if (live >= 2) {
+        last_suffix_stats_.burst_rounds++;
+        if (live <= 16) last_suffix_stats_.lanes_le16++;
+        else if (live == 32) last_suffix_stats_.lanes_32++;
+        else last_suffix_stats_.lanes_48++;
+        if (burst) *burst = true;
+        uint32_t lanes[VERIFY_CHUNK_MAX];
+        lanes[0] = pending;
+        for (uint32_t i = 1; i < live; i++) lanes[i] = (uint32_t)proposals[i - 1];
+        pending = suffix_round(remaining, eos, lanes, live, committed);
+        for (uint32_t tok : committed) drafter.append((int)tok);
+        return pending;
+    }
+    last_suffix_stats_.fallback_rounds++;
+    last_spec_stats_.rounds++;
+    committed.push_back(pending);
+    drafter.append((int)pending);
+    return step(pending);
+}
+
 std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& prompt,
                                                    uint32_t count, uint32_t width,
                                                    uint32_t minimum_match) {
@@ -1879,53 +1934,15 @@ std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& 
     drafter.reset(history);
     std::vector<uint32_t> output;
     output.reserve(count);
-    std::vector<int> proposals(VERIFY_CHUNK_MAX);
-    std::vector<uint32_t> lanes(VERIFY_CHUNK_MAX);
     std::vector<uint32_t> committed;
     // EOS sentinel: the CLI drives this path with a never-matching token
     // when it wants a fixed count; a real eos clamps commits mid-burst.
     const uint32_t eos = VOCAB; // never matches: lanes are validated < VOCAB
     while (output.size() < count) {
         if (output.size() + 1 == count) { output.push_back(pending); break; }
-        const uint32_t remaining = (uint32_t)(count - output.size());
-        // Propose up to width-1 continuation tokens; the verify chunk also
-        // needs one KV row per lane inside the reserved context.
-        uint32_t max_lanes = std::min<uint32_t>(width, remaining);
-        if ((uint64_t)position_ + max_lanes > max_context_)
-            max_lanes = (uint32_t)(max_context_ - position_);
-        int match = 0;
-        if (max_lanes >= 2)
-            match = drafter.propose_with((int)pending, (int)(max_lanes - 1), proposals.data());
-        // Match-capped width (plan contract, codex P2): forward lanes are
-        // bounded by the matched suffix length — proposals past the match
-        // evidence are lag-copy extrapolation, and dispatching them would
-        // make the drafted stats and burst economics measure speculation
-        // beyond what the match justifies.
-        uint32_t live = match >= (int)minimum_match
-                            ? std::min<uint32_t>(max_lanes, (uint32_t)match + 1) : 0;
-        // Full-tile snap-down (lever 2: round cost steps one full weight
-        // stream per 16-token tile): a partial second/third tile pays a
-        // whole stream for < 16 possible tokens — never worth it. 17..31
-        // lanes snap to 16, 33..47 snap to 32.
-        if (live > 16 && live < 32) live = 16;
-        else if (live > 32 && live < 48) live = 32;
-        if (live >= 2) {
-            last_suffix_stats_.burst_rounds++;
-            if (live <= 16) last_suffix_stats_.lanes_le16++;
-            else if (live == 32) last_suffix_stats_.lanes_32++;
-            else last_suffix_stats_.lanes_48++;
-            lanes[0] = pending;
-            for (uint32_t i = 1; i < live; i++) lanes[i] = (uint32_t)proposals[i - 1];
-            committed.clear();
-            pending = suffix_round(remaining, eos, lanes.data(), live, committed);
-            for (uint32_t tok : committed) { output.push_back(tok); drafter.append((int)tok); }
-        } else {
-            last_suffix_stats_.fallback_rounds++;
-            last_spec_stats_.rounds++;
-            output.push_back(pending);
-            drafter.append((int)pending);
-            pending = step(pending);
-        }
+        pending = suffix_step(drafter, pending, (uint32_t)(count - output.size()),
+                              eos, width, minimum_match, committed);
+        output.insert(output.end(), committed.begin(), committed.end());
     }
     return output;
 }

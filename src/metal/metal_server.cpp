@@ -1,5 +1,6 @@
 #include "metal_engine.h"
 #include "stream_format.h"
+#include "../suffixdraft.h"
 #include "../tokenizer.h"
 #include "../toolconstrain.h"
 #include <cerrno>
@@ -239,6 +240,10 @@ struct Runtime {
     };
     std::vector<std::unique_ptr<Slot>> slots;
     uint32_t mtp_width;
+    // Suffix-burst decode width (--suffix, 2..VERIFY_CHUNK_MAX; 0 = off).
+    // Mutually exclusive with --mtp: the burst path is the no-MTP tiers'
+    // speculation lever (2026-07-16-suffix-burst-verify.md, server phase).
+    uint32_t suffix_width;
     uint32_t context;
     // Lock order (multislot Phase 1 contract, docs/plans/2026-07-15-
     // multislot-phase1.md): route_ before lease_ — and in fact the two are
@@ -305,14 +310,21 @@ struct Runtime {
     // committing >1 token proves accepted drafts, so committed > rounds is
     // the nonzero-speculation assert's unfakeable signal (vacuous-gate rule).
     std::atomic<uint64_t> spec_rounds_total{0}, spec_committed_total{0};
+    // Suffix-path round attribution: bursts actually dispatched vs serial
+    // fallbacks, so /stats shows whether traffic rides the batched path at
+    // all (a suffix server whose every round falls back is misconfigured
+    // or serving burst-hostile traffic — either way it should be visible).
+    std::atomic<uint64_t> suffix_burst_rounds_total{0}, suffix_fallback_rounds_total{0};
     bool constrain_tools=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
     DiskSnapshotStore snapstore;
 
     Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
-            uint32_t width,size_t cache_entries,bool constrain,uint32_t slot_count)
-        :tokenizer(tok),mtp_width(width),context(ctx),constrain_tools(constrain) {
+            uint32_t width,uint32_t sfx_width,size_t cache_entries,bool constrain,
+            uint32_t slot_count)
+        :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
+         constrain_tools(constrain) {
         if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
@@ -466,6 +478,7 @@ struct Runtime {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         q27::validate_sampling(sampling);
         const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
+        const bool sfx=suffix_width!=0 && sampling.temperature==0.0f;
         const auto arrive=std::chrono::steady_clock::now();
 
         // ---- slot acquisition (route_ only; never held across GPU work) ----
@@ -667,7 +680,7 @@ struct Runtime {
         // constraint set here masks the NEXT token's logits inside step()).
         q27::BasicToolConstrainer<q27::MetalEngine,q27::Tokenizer> tc;
         tc.eng=&engine; tc.tok=&tokenizer; tc.cache=&mask_cache; tc.host2dev=&slot->host2dev;
-        tc.enabled=constrain_tools && !tool_names.empty() && sampling.temperature==0.0f && !mtp_width;
+        tc.enabled=constrain_tools && !tool_names.empty() && sampling.temperature==0.0f && !mtp_width && !suffix_width;
         {
             auto gpu=lease_now();
             tc.begin(tool_names);
@@ -722,6 +735,52 @@ struct Runtime {
                 }
                 spec_rounds_total.fetch_add(1,std::memory_order_relaxed);
                 spec_committed_total.fetch_add(committed.size(),std::memory_order_relaxed);
+                for(uint32_t token:committed) {
+                    if(token==eos_id) { cause=q27::MetalEngine::StopCause::Eos; stopped=true; break; }
+                    if(!deliver(token)) { stopped=true; break; }
+                }
+            }
+        } else if(sfx && engine.chunked_prefill()) {
+            // Suffix-burst decode (2026-07-16-suffix-burst-verify.md, server
+            // integration): drafter state is CPU-side, seeded from the FULL
+            // prompt — including any restored prefix, which never reached
+            // this engine's step loop — then fed every committed token by
+            // suffix_step. One suffix_step per lease keeps the MTP branch's
+            // quantum discipline; the real eos id rides into the round's
+            // lane clamp, so an eos inside a burst commits and stops without
+            // encoding past it (gate 5, live EOS).
+            q27::SuffixDraft drafter;
+            {
+                std::vector<int> history(prompt.begin(),prompt.end());
+                drafter.reset(history);
+            }
+            std::vector<uint32_t> committed;
+            bool stopped=false;
+            while(!stopped && produced<count) {
+                if(produced+1==count) {
+                    if(pending!=eos_id) deliver(pending);
+                    else cause=q27::MetalEngine::StopCause::Eos;
+                    break;
+                }
+                bool burst=false;
+                {
+                    // The drafter's propose/append inside suffix_step is
+                    // host work under the lease — accepted deliberately
+                    // (codex P2 on this change): it is bounded integer
+                    // compares, microseconds against a multi-ms GPU round,
+                    // nothing like the whole-vocab mask simulation that
+                    // forced the constrained path's pre-lease prewarm.
+                    // Splitting the round across the lease boundary would
+                    // move burst policy back out of the engine.
+                    auto gpu=lease_now();
+                    pending=engine.suffix_step(drafter,pending,count-produced,eos_id,
+                                               suffix_width,q27::MetalEngine::SUFFIX_MIN_MATCH,
+                                               committed,&burst);
+                }
+                spec_rounds_total.fetch_add(1,std::memory_order_relaxed);
+                spec_committed_total.fetch_add(committed.size(),std::memory_order_relaxed);
+                (burst?suffix_burst_rounds_total:suffix_fallback_rounds_total)
+                    .fetch_add(1,std::memory_order_relaxed);
                 for(uint32_t token:committed) {
                     if(token==eos_id) { cause=q27::MetalEngine::StopCause::Eos; stopped=true; break; }
                     if(!deliver(token)) { stopped=true; break; }
@@ -843,12 +902,12 @@ void json_response(httplib::Response& response,const json& value,int status=200)
 
 int main(int argc,char** argv) {
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N]\n",argv[0]);
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N]\n",argv[0]);
         return 1;
     }
     try {
         std::string model=argv[1],tok=argv[2],host="127.0.0.1";
-        uint32_t port=8080,context=8192,width=0,prefix_entries=1,slot_count=2;
+        uint32_t port=8080,context=8192,width=0,suffix_width=0,prefix_entries=1,slot_count=2;
         bool turbo3=false; bool constrain_tools=false;
         for(int i=3;i<argc;i++) {
             std::string arg=argv[i];
@@ -856,6 +915,7 @@ int main(int argc,char** argv) {
             else if(arg=="--port" && i+1<argc) port=parse_u32(argv[++i],"--port");
             else if(arg=="--ctx" && i+1<argc) context=parse_u32(argv[++i],"--ctx");
             else if(arg=="--mtp" && i+1<argc) width=parse_u32(argv[++i],"--mtp");
+            else if(arg=="--suffix" && i+1<argc) suffix_width=parse_u32(argv[++i],"--suffix");
             else if(arg=="--prefix-entries" && i+1<argc) prefix_entries=parse_u32(argv[++i],"--prefix-entries");
             else if(arg=="--slots" && i+1<argc) slot_count=parse_u32(argv[++i],"--slots");
             else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
@@ -864,12 +924,16 @@ int main(int argc,char** argv) {
         }
         if(port>65535) throw std::runtime_error("port out of range");
         if(width && (width<2 || width>12)) throw std::runtime_error("MTP width must be 2..12");
+        if(suffix_width && (suffix_width<2 || suffix_width>q27::MetalEngine::VERIFY_CHUNK_MAX))
+            throw std::runtime_error("suffix width must be 2..48");
+        if(width && suffix_width) throw std::runtime_error("--mtp and --suffix are mutually exclusive (one speculation lever per server)");
         if(constrain_tools && width) throw std::runtime_error("--constrain-tools requires serial decode; drop --mtp (verify-lane masks are not wired on Metal)");
+        if(constrain_tools && suffix_width) throw std::runtime_error("--constrain-tools requires serial decode; drop --suffix (burst rounds argmax unmasked logits)");
         // Phase 1's latency guarantee (wait <= one active quantum) only
         // holds with one competing slot; >2 needs the scheduler and the
         // width/stats model extended first (codex P2 on d243f92).
         if(slot_count<1 || slot_count>2) throw std::runtime_error("--slots must be 1..2 in multislot Phase 1");
-        Runtime runtime(model,tok,context,turbo3,width,prefix_entries,constrain_tools,slot_count);
+        Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count);
         httplib::Server server;
         // Bound the accept-side queue (codex P1 on d243f92): the default
         // task queue holds accepted connections without limit, so the
@@ -904,7 +968,9 @@ int main(int argc,char** argv) {
                              {"gate_wait_by_arrival",gate},
                              {"queue_wait_by_arrival",queue},
                              {"speculation",{{"rounds",(uint64_t)runtime.spec_rounds_total},
-                                             {"committed",(uint64_t)runtime.spec_committed_total}}},
+                                             {"committed",(uint64_t)runtime.spec_committed_total},
+                                             {"suffix_bursts",(uint64_t)runtime.suffix_burst_rounds_total},
+                                             {"suffix_fallbacks",(uint64_t)runtime.suffix_fallback_rounds_total}}},
                              {"snapshots",{{"enabled",runtime.snapstore.enabled()},
                                            {"disk_hits",(uint64_t)runtime.snapstore.hits},
                                            {"disk_saves",(uint64_t)runtime.snapstore.saves}}}});

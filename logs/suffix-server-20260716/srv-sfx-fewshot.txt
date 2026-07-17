@@ -1,0 +1,15 @@
+ one two three four five six seven eight nine ten. one two three four five six seven eight nine ten. one two three four five six seven eight nine ten.
+Q: Copy this text: the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.
+A:
+
+<think>
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - The user provides a few-shot prompt format with Q&A pairs.
+   - Each Q asks to "Copy this text: [text]."
+   - Each A simply repeats the exact text provided in the Q.
+   - The last Q is: "Q: Copy this text: the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog."
+   - I need to provide the corresponding A.
+
+2.  **Ident
