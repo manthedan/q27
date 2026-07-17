@@ -49,3 +49,16 @@ reading the marker convention). Measurement directories accumulate
 driver droppings (ABORTED, .tmp, .attempt1); name every file in the
 `git add`, and glance at `git status --short` of what got staged
 before committing.
+
+## One 17 GB server, and kill the pid not the wrapper (2026-07-17, two machine crashes)
+Two same-day OOM crashes on the 24 GB M4, both = two resident
+`q27-metal-server` instances: (1) `kill $!` on the launch line killed the
+caffeinate WRAPPER (caffeinate forks), the 17 GB server survived as an
+orphan, and the relaunch loaded a second copy; (2) a second agent started
+a server while the first agent's was already healthy on :8213 —
+concurrent agents must health-check before launching. Protocol lives in
+logs/q4port-20260717/COORDINATION.md: pgrep + curl /health before ANY
+launch; kill via `pgrep -f "q27-metal-server.*--port"` and verify pgrep
+is EMPTY before relaunch; one 17 GB resident max; gates serialized
+against an already-running server; no 17 GB loads right after a reboot
+(post-crash Spotlight + housekeeping + 17 GB has killed us).
