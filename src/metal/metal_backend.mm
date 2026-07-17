@@ -706,6 +706,11 @@ void MetalBackend::zero(BackendBuffer& dst) {
     std::memset(buffer.handle().contents, 0, (size_t)buffer.size());
 }
 
+// copy() is the ONE host-mutation path that stays legal during a command
+// batch: it dispatches a GPU kernel on the batch's own encoder (ordered with
+// the surrounding work) instead of touching shared-memory contents the way
+// write()/zero() do. Do not add the write/zero `if (batching) throw` guard
+// here — batched callers (KV moves, snapshot restores) depend on this.
 void MetalBackend::copy(const BackendBuffer& src, uint64_t src_offset,
                         BackendBuffer& dst, uint64_t dst_offset, uint64_t bytes) {
     const MetalBuffer& sb=metal_buffer(src); MetalBuffer& db=metal_buffer(dst);
@@ -863,6 +868,10 @@ void MetalBackend::end_commands() {
     @autoreleasepool { impl_->finish_command("command batch"); }
 }
 
+// CONTRACT: only legal between begin_commands and end_commands — the held
+// command buffer is never committed, so dropping the reference discards it.
+// (MTLCommandBuffer has no cancel API; an already-committed buffer could not
+// be stopped here, which is why commit stays confined to end_commands.)
 void MetalBackend::abort_commands() noexcept {
     @autoreleasepool {
         if (impl_->encoder) [impl_->encoder endEncoding];
@@ -1030,8 +1039,9 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
 
 // N=2 slot-batched select-form T2 GEMV (multislot Phase 2 probe): the
 // float-activation production serial-decode path with two independent
-// activation/output buffer pairs. Metal-only surface until the probe
-// passes its pre-registered decision line.
+// activation/output buffer pairs. PARKED by measurement (2026-07-16):
+// aggregate s_k 1.093 vs the 1.31 decision line — bench-only reference
+// surface, never engine-routed.
 void MetalBackend::matvec_x2(const BackendTensor& weight,
                              const BackendBuffer& x_a, const BackendBuffer& x_b,
                              BackendBuffer& y_a, BackendBuffer& y_b) {
@@ -1066,9 +1076,10 @@ void MetalBackend::matvec_x2(const BackendTensor& weight,
 // N=2 slot-batched T2 GEMV (multislot Phase 2 probe): x carries two
 // activation rows ([2, cols] values, [2, cols/32] scales), out is token-
 // major [2, rows] — the matmul_quantized layouts at x_rows=2. Metal-only
-// surface (not on the Backend interface) until the probe passes its
-// pre-registered decision line (docs/plans/2026-07-16-multislot-phase2-
-// probe.md).
+// surface (not on the Backend interface). PARKED by measurement
+// (2026-07-16, docs/plans/2026-07-16-multislot-phase2-probe.md): aggregate
+// s_k 1.093 vs the 1.31 decision line — bench-only reference surface,
+// never engine-routed.
 void MetalBackend::matvec_quantized_x2(const BackendTensor& weight,
                                        const BackendQuantized& x, BackendBuffer& y) {
     if (weight.dtype!=DType::T2_G128 || !weight.data || !weight.scales)

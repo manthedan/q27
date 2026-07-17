@@ -226,6 +226,9 @@ kernel void q27_matvec_t2_g128(
 // activations and outputs stay in separate buffers (no layout coupling).
 // Per-row op order matches the single kernel exactly, so each output is
 // bit-identical to two single dispatches.
+// PARKED by measurement (2026-07-16, multislot Phase-2 probe): aggregate
+// s_k 1.093 vs the 1.31 decision line — kept as the probe's reference
+// surface, never engine-routed.
 kernel void q27_matvec_t2_g128_x2(
         device const uchar *weights [[buffer(0)]],
         device const half  *scales  [[buffer(1)]],
@@ -343,6 +346,9 @@ kernel void q27_matvec_t3_g128(
     // byte keeps its own group scale (a word can span a group boundary);
     // byte b with b%26 == 25 is the 3-column group tail (slots 3-4 are
     // canonical code-1 padding).
+    // Odd nb (cols % 256 != 0) disables the word walk entirely; every byte
+    // then takes the scalar tail below. That path is slower, not wrong —
+    // test_t3_wide gates cols=1152 (nb=9) against the CPU reference.
     const uint words_per_row = (row_bytes & 3) ? 0 : row_bytes / 4;
     for (uint wi = lane; wi < words_per_row; wi += 32) {
         uint wv[4];
@@ -526,13 +532,16 @@ kernel void q27_b1_x_prep(
         ushort lane                  [[thread_index_in_simdgroup]],
         ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
     const float xv = x[group * 128 + tid];
-    // Two threadgroup arrays: sum partials are written while other threads
-    // may still be reading the max partials (no barrier between the phases).
+    // The max/sum phases overlap safely ONLY because pmax and psum are
+    // distinct arrays (a thread may write psum while another still reads
+    // pmax). The barrier below the pmax reads is insurance: it keeps this
+    // correct if the two arrays are ever consolidated into one.
     threadgroup float pmax[4], psum[4];
     float amax = simd_max(fabs(xv));
     if (lane == 0) pmax[simdgroup] = amax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     amax = max(max(pmax[0], pmax[1]), max(pmax[2], pmax[3]));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const float s = amax / 127.0f;
     const uint u = s > 0.0f ? uint(clamp(round(xv / s) + 128.0f, 0.0f, 255.0f)) : 128u;
     for (uint p = 0; p < 8; p++) {
@@ -1256,6 +1265,9 @@ inline void q27_dot16_t2_dual(uint packed, int4 xpa, int4 xpb,
 // output is bit-identical to the single-row kernel. (The fused-pair
 // precedent — two weights, one x — lost on register pressure; here the
 // shared work is the unpack, the actual issue-bound resource.)
+// PARKED by measurement (2026-07-16, multislot Phase-2 probe): aggregate
+// s_k 1.093 vs the 1.31 decision line — kept as the probe's reference
+// surface, never engine-routed.
 kernel void q27_matvec_t2_quantized_x2(device const uchar *weights [[buffer(0)]],
                                         device const half *weight_scales [[buffer(1)]],
                                         device const char *x [[buffer(2)]],

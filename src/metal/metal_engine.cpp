@@ -1625,7 +1625,11 @@ uint32_t MetalEngine::sample_next(const SamplingParams& params, std::mt19937_64&
         backend_.topk(*logits_, VOCAB, params.top_k, *topk_values_, *topk_indices_, *topk_count_);
         uint32_t count = 0;
         backend_.read(*topk_count_, 0, &count, sizeof(count));
-        if (count <= TOPK_CAPACITY) {
+        // count >= k is provable from the kernel's two-pass construction
+        // (2026-07-17 triage doc); the lower bound here guards future
+        // kernel edits — an under-set must fall back, never silently
+        // sample from a truncated candidate list.
+        if (count >= (uint32_t)params.top_k && count <= TOPK_CAPACITY) {
             std::vector<float> values(count);
             std::vector<uint32_t> indices(count);
             backend_.read(*topk_values_, 0, values.data(), count * sizeof(float));

@@ -812,6 +812,97 @@ int test_topk(q27::MetalBackend& backend) {
     uint32_t count = 0;
     backend.read(*count_buffer, 0, &count, 4);
     if (count <= capacity) { fprintf(stderr, "topk flat: count %u did not signal fallback\n", count); failures++; }
+    // All-(-inf) (fully grammar-masked logits): every key lands in one
+    // 16-bit bucket, the over-set is the whole vocabulary, and the count
+    // must signal fallback exactly like the flat tie storm.
+    std::vector<float> ninf(n, -INFINITY);
+    auto nb = upload_buffer(backend, ninf);
+    backend.topk(*nb, n, 40, *values_buffer, *indices_buffer, *count_buffer);
+    backend.read(*count_buffer, 0, &count, 4);
+    if (count <= capacity) { fprintf(stderr, "topk -inf: count %u did not signal fallback\n", count); failures++; }
+    // n not a multiple of the 1024-thread dispatch (strided tail coverage).
+    std::vector<float> odd(logits.begin(), logits.begin() + (n - 77));
+    check(odd, 40, "odd-n");
+    // Boundary-exact shape (audit A2's count==k-1 hazard): exactly k
+    // separated high values, everything else far below — the boundary bin
+    // must supply exactly the remaining candidates and count stays >= k
+    // (asserted inside check).
+    std::vector<float> boundary(n, -50.0f);
+    for (uint32_t i = 0; i < 40; i++) boundary[(i * 3797u + 11u) % n] = 100.0f + (float)i;
+    check(boundary, 40, "boundary-exact");
+    return failures;
+}
+
+// Deterministic argmax over degenerate inputs: all-(-inf) (fully masked),
+// all-tie, and a non-multiple-of-256 n — first-past-the-post must stay the
+// lowest index, and strided tails must not drop the winner.
+int test_argmax_stress(q27::MetalBackend& backend) {
+    int failures = 0;
+    auto expect = [&](const std::vector<float>& logits, uint32_t want, const char* label) {
+        auto lb = upload_buffer(backend, logits);
+        auto ib = backend.allocate(4);
+        backend.argmax(*lb, (uint32_t)logits.size(), *ib);
+        uint32_t got = 0xffffffffu;
+        backend.read(*ib, 0, &got, 4);
+        if (got != want) { fprintf(stderr, "argmax %s: got %u want %u\n", label, got, want); failures++; }
+    };
+    expect(std::vector<float>(1000, -INFINITY), 0, "all -inf");
+    expect(std::vector<float>(1001, 1.5f), 0, "all tie");
+    std::vector<float> tail(777);
+    for (uint32_t i = 0; i < tail.size(); i++) tail[i] = (float)(i % 7);
+    tail[776] = 100.0f;
+    expect(tail, 776, "odd-n max at tail");
+    return failures;
+}
+
+// E1 (metal-review 2026-07-17): bind-time checks bound a tensor by its
+// LOGICAL extent, not its buffer — on a whole-mapping shared buffer the
+// buffer size alone would let a corrupt header read the neighbor tensor.
+// The negative arms prove the check can fail; the controls prove it is
+// inert for well-formed extents.
+int test_tensor_extent(q27::MetalBackend& backend) {
+    int failures = 0;
+    constexpr uint32_t n = 256;
+    // "Mapping" twice the tensor's size: the neighbor's bytes live behind it.
+    auto shared = backend.allocate((uint64_t)n * 4 * 2);
+    std::vector<float> w(n, 1.0f);
+    backend.write(*shared, 0, w.data(), n * 4);
+    auto x = upload_buffer(backend, w);
+    auto y = backend.allocate((uint64_t)n * 4);
+    q27::BackendTensor weight;
+    weight.dtype = q27::DType::F32;
+    weight.rows = 1; weight.cols = n;
+    weight.data = shared;
+    weight.data_size = (uint64_t)n * 4;
+    try { backend.rmsnorm(*x, weight, *y, n, 1e-6f); }
+    catch (const std::exception& e) { fprintf(stderr, "extent control: %s\n", e.what()); failures++; }
+    weight.data_size = (uint64_t)n * 4 - 4;   // declared extent one float short
+    bool threw = false;
+    try { backend.rmsnorm(*x, weight, *y, n, 1e-6f); }
+    catch (const std::exception&) { threw = true; }
+    if (!threw) { fprintf(stderr, "extent: short data_size did not throw\n"); failures++; }
+    // Scales side, via the embedding path (Q8 scales one entry short).
+    constexpr uint32_t rows = 4, cols = 128;
+    std::vector<uint8_t> qdata((size_t)rows * cols, 1);
+    auto qbuf = backend.allocate(qdata.size());
+    backend.write(*qbuf, 0, qdata.data(), qdata.size());
+    auto sbuf = backend.allocate(64);   // roomy buffer; logical extent is what must bind
+    std::vector<uint16_t> qscales(rows, 0x3c00);
+    backend.write(*sbuf, 0, qscales.data(), rows * 2);
+    auto out = backend.allocate((uint64_t)cols * 4);
+    q27::BackendTensor emb;
+    emb.dtype = q27::DType::Q8_G128;
+    emb.rows = rows; emb.cols = cols;
+    emb.data = qbuf; emb.scales = sbuf;
+    emb.data_size = qdata.size();
+    emb.scales_size = (uint64_t)rows * 2;
+    try { backend.embedding_q8(emb, 0, *out); }
+    catch (const std::exception& e) { fprintf(stderr, "extent scales control: %s\n", e.what()); failures++; }
+    emb.scales_size = (uint64_t)rows * 2 - 2;   // one fp16 scale short
+    threw = false;
+    try { backend.embedding_q8(emb, 0, *out); }
+    catch (const std::exception&) { threw = true; }
+    if (!threw) { fprintf(stderr, "extent: short scales_size did not throw\n"); failures++; }
     return failures;
 }
 
@@ -1393,7 +1484,8 @@ int main() {
                        test_turbo3(backend) + test_turbo3_production_shape(backend) +
                        test_attention_gqa_path() + test_attention_gqa_straddle() +
                        test_attention_gqa_tiled_parity() +
-                       test_topk(backend) + test_mask_logits(backend) +
+                       test_topk(backend) + test_argmax_stress(backend) +
+                       test_tensor_extent(backend) + test_mask_logits(backend) +
                        test_gdn(backend) + test_chunked(backend);
         if (failures) { fprintf(stderr, "Metal ops: %d failure(s)\n", failures); return 1; }
         puts("Metal decode primitives, FP16/turbo3 attention (incl. GQA KV-reuse path), GDN, and chunked prefill ops: OK");
