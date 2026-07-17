@@ -146,6 +146,8 @@ one (attn layer, KV head, K|V) to turbo3 against a full-fp16 baseline.
 head + one mean layer-side); the pooled-concentration bar failing means
 Block-GTQ-shape *uniform-extra-bits-per-block* buys little — the win, if
 any, is a tiny exception list (protect ~4 cells at higher precision,
-~3% of KV bytes at 2K). Sub-additivity (read 4) says simulate jointly
++12.9% of turbo3 KV bytes at any ctx — corrected 2026-07-17, codex P2
+on the step-2 commit: the original ~3% counted cells, not bytes; fp16
+is 512 B/token vs turbo3's 100 per cell). Sub-additivity (read 4) says simulate jointly
 before believing any projected win. Step 2's K-scaling arms are
 unaffected (full-side treatment, same instrument as step 1) and run next.

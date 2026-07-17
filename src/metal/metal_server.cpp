@@ -1133,6 +1133,14 @@ int main(int argc,char** argv) {
         // response.completed. Codex keys off the JSON `type` field.
         server.Post("/v1/responses",guarded([&](const json& body,httplib::Response& r){
             std::string input=body.contains("input")?text_content(body["input"]):"";
+            // Tools preamble parity (codex P1 on the parity-audit merge):
+            // this endpoint feeds raw flattened text to the model (no chat
+            // template), so without the schemas prepended the constrainer
+            // could mask decoding toward tools the model has never seen.
+            // Full CUDA-style Responses normalization (instructions,
+            // function_call bridging, custom tools) is a recorded follow-up.
+            if(body.contains("tools") && body["tools"].is_array() && !body["tools"].empty())
+                input=q27::tools_preamble(body["tools"])+"\n\n"+input;
             auto ids=to_u32(runtime.tokenizer.encode(input));
             const uint32_t n=max_tokens(body);
             const q27::SamplingParams sampling=sampling_params(body);

@@ -1,0 +1,6 @@
+step-1 both-sides baseline (turbo3 engine): mean 0.01165  p99 0.089  max 2.94 @pos 1000
+graduation bar: probe4 cuts control max >=2x OR p99 >=1.5x (mean read reported, no bar)
+control  kl-kv tail: p50 0.005265  p90 0.02295  p99 0.1006  p99.5 0.1689  max 2.478 @pos 1000
+control  kl-kv wall: 637.89 s (12.84 pos/s through both engines), overall mean KL 0.0118712 nats, max 2.47793
+probe4   kl-kv tail: p50 0.00364  p90 0.01849  p99 0.09242  p99.5 0.1512  max 1.117 @pos 7719
+probe4   kl-kv wall: 645.25 s (12.69 pos/s through both engines), overall mean KL 0.00932864 nats, max 1.11732

@@ -56,6 +56,15 @@ run_arm() {
 }
 
 run_arm control -
+# Control-arm class assert (codex P1 on the mode-3 commit): a stale
+# pre-mode-3 shader stores everything clean and reads KL 0 — and the
+# vacuity gate above EXPECTS 0, so it cannot catch that skew. The
+# control arm can: its mean must land in the pre-registered class band
+# (~0.0120 +-15%, the step-1 additivity sum).
+cmean=$(grep -o 'overall mean KL [0-9.e-]*' "$OUT/control.log" | awk '{print $4}')
+awk -v m="$cmean" 'BEGIN{exit !(m >= 0.0102 && m <= 0.0138)}' ||
+    { echo "step4: CONTROL OUT OF CLASS (mean $cmean vs [0.0102,0.0138]) — mode-3 plumbing suspect" |
+      tee "$OUT/ABORTED"; exit 1; }
 run_arm probe4 10,11,125,127
 
 {

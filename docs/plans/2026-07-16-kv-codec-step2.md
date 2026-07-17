@@ -89,7 +89,8 @@ the max bar by 1.4× and the p99 bar by 3×+ — no calibration-free
 online estimate can do better. K-side scaling levers are PARKED. What
 remains live for the codec effort is step 4's structured allocation
 shaped by the census: a ~4-cell exception list (L7 h1 K+V, L63 h2/h3 V,
-~3% of KV bytes), validated jointly (census read 4: per-cell
++12.9% of turbo3 KV bytes — corrected 2026-07-17 pre-result, codex
+P2: the original ~3% counted cells, not bytes), validated jointly (census read 4: per-cell
 sensitivities overstate joint damage 2.3×). Given the small footprint
 of the exception list and the parked scaling levers, step 4 should be
 sized as a cheap targeted probe (keep the listed cells fp16, measure

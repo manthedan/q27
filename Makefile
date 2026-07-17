@@ -45,7 +45,7 @@ build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/me
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
 
-build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/metal/stream_format.h src/suffixdraft.h src/sampling.h \
+build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/metal/stream_format.h src/suffixdraft.h src/sampling.h src/tool_preamble.h \
                         src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                         src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h \
                         third_party/httplib.h third_party/json.hpp | build
@@ -107,7 +107,7 @@ build/t2_zero_sim: tools/t2_zero_sim.cpp src/loader.cpp src/loader.h | build
 build/tokenize_to_bin: tools/tokenize_to_bin.cpp src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/tokenize_to_bin.cpp src/tokenizer.cpp -o $@
 
-build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/toolgram.h | build
+build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/tool_preamble.h src/stream_split.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) src/test_tokenizer.cpp src/tokenizer.cpp -o $@
 
 build/test_artifacts: src/test_artifacts.cpp src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
@@ -140,7 +140,7 @@ build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks
 
 
 build/q27-server: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
+                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/tool_preamble.h src/stream_split.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -180,7 +180,7 @@ build/turbo3_test: tools/turbo3_test.cu src/turbo3.cuh | build
 # graph zoo so the fixed stack fits beside the weights (the default W12
 # build OOMs at graph instantiation on 24GB). Same sources, own binary.
 build/q27-server-w8: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
+                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/tool_preamble.h src/stream_split.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -205,7 +205,7 @@ build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/conductor.h src/block
 
 # w16 serving build (batch mode's natural target; was hand-built since part 10)
 build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
+                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/tool_preamble.h src/stream_split.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \

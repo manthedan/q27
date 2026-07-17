@@ -14,8 +14,13 @@ the both-sides instrument?** Census read 4 (sub-additivity 2.32×) says
 per-cell numbers overstate joint effects, so this must be measured
 jointly, not summed.
 
-Cost of the hold-out at ctx 2048+: 4/128 cells ≈ 3.1% of KV bytes
-(fp16 vs ~3.2 bpv turbo3 for those rows ≈ +2.7% total KV bytes).
+Cost of the hold-out (CORRECTED pre-result, 2026-07-17 00:25, codex P2
+on the step-2 commit — the original "~3% of KV bytes" counted cells,
+not bytes): a turbo3 cell stores 100 B/token (two 50-byte blocks), an
+fp16 cell 512 B/token, so 4 held cells cost 4×(512−100)/(128×100) =
+**+12.9% of turbo3 KV storage**. This amendment was written while the
+8K arms were still running (control mid-pass, probe not started) —
+no result was visible when the bar below was re-priced.
 
 ## Instrument extension (mode 3: exception mask)
 
@@ -57,13 +62,59 @@ via `--kl-kv-except -` is the control arm).
 2. **Mean:** B vs A mean delta, against the naive per-cell prediction
    (Σ of the 4 held cells' census means = 0.00311 at 2K scale —
    sub-additivity says expect LESS). Report the realized fraction.
-3. **Decision:** the probe GRADUATES into a codec design step only if
-   B cuts A's max ≥ 2× or p99 ≥ 1.5× at ≤ 3.5% KV-byte cost. Below
-   that, targeted-precision joins scaling in the parked list and the
-   KV-codec program STOPS at "turbo3 as shipped, damage priced in"
-   (0.0115 mean / 2.83 max class, recorded 2026-07-15) — the honest
-   outcome of steps 1–4 would then be: the tail is multi-cell,
-   position-local, and not addressable by any per-cell lever measured.
+3. **Decision (re-priced with the corrected 12.9% cost, pre-result):**
+   the cut bars stand — B graduates only on max ≥ 2× or p99 ≥ 1.5× vs
+   A. But at +12.9% KV bytes a graduating result funds a DESIGN step,
+   not a shippable config: find a cheaper encoding of the same
+   protection (fp16 for K of L7 h1 alone = +3.2%; or a mid-rate code
+   for the listed cells), and any design must beat the null alternative
+   of simply spending +12.9% uniformly (e.g. a richer global block
+   code). Below the cut bars, targeted-precision joins scaling in the
+   parked list and the KV-codec program STOPS at "turbo3 as shipped,
+   damage priced in" (0.0115 mean / 2.83 max class, recorded
+   2026-07-15) — the honest outcome of steps 1–4 would then be: the
+   tail is multi-cell, position-local, and not addressable by any
+   per-cell lever measured.
 
 Layer-only marginals, V-only holds, or bigger masks are follow-ups
 only if B graduates.
+
+## Results (2026-07-17 00:42, 16 GB mini — GRADUATES on the max bar)
+
+8,191 positions/arm, ctx 8192, pinned route, fingerprinted
+(logs/kv_step4/); vacuity gate exactly 0 at launch.
+
+| arm | mean KL | p90 | p99 | p99.5 | max |
+|---|---|---|---|---|---|
+| A control (all quantized) | 0.011871 | 0.0230 | 0.1006 | 0.169 | 2.478 @1000 |
+| B probe (4 cells fp16) | 0.009329 | 0.0185 | 0.0924 | 0.151 | 1.117 @7719 |
+
+Reads, in pre-registered order:
+
+1. **Tail: B cuts A's max 2.22× (2.478 → 1.117) — the ≥2× bar CLEARS —
+   and the argmax moves off position 1000 entirely (→ 7719).** Nuance
+   against census read 3: no single cell owns pos-1000 (every cell
+   < 0.3 there), yet jointly holding these 4 cells kills the event —
+   the multi-cell sum is substantially composed of/coupled through the
+   held cells. The p99 body barely moves (1.09×, fails its 1.5× bar):
+   step 2's "broad near-tie population" verdict stands for the body.
+2. **Mean: −21.4% (0.011871 → 0.009329), realized Δ 0.00254 = 71% of
+   the naive per-cell sum (0.00359)** — sub-additive again, milder at
+   4 cells than the census's 128-cell 2.32×.
+3. **Decision (re-priced bar): GRADUATES on max — funds the DESIGN
+   step, not a shippable config.** At +12.9% KV bytes the protection
+   is real but expensive; the design step must find a cheaper encoding
+   (candidates from the data: L7h1-only hold — both its cells — since
+   the max cut is the graduating read and L63 V mostly buys mean;
+   fp16-K-of-L7h1 alone at +3.2%; or a mid-rate 2× code for the listed
+   cells at ~+6%) and must beat the null of spending +12.9% uniformly
+   on a richer global block code. Control-arm validity: mean 0.011871
+   sits dead-center in the pre-registered class band (~0.0120 ±15%)
+   and reproduces the both-sides tail signature (max @pos 1000, 2.478
+   vs the turbo3 engine's 2.94 — same event, attrib-instrument class).
+
+Instrument note (codex P1, fixed same night): SHADER_ABI 9 → 10 for
+mode 3 — a stale shader would store everything clean and read KL 0,
+which the vacuity gate cannot catch (it expects 0); the driver now
+also asserts the control arm's class band, the canary that CAN fire
+under that skew.
