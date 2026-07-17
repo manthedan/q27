@@ -1,0 +1,3 @@
+per-token GEMV wall over the mix: 156.25 ms (6.4 tok/s GEMV-bound); at T2-reference parity: 165.56 ms (6.0 tok/s)
+R = 1.060 (official mix 88.29 GB/s byte-weighted / same-run T2 reference 83.32 GB/s)
+verdict: KILL the rewrite (R >= 0.90) — even perfect parity buys <= 11% wall, below the cost of a kernel round plus regate

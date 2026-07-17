@@ -73,6 +73,16 @@ class MetalBackend final : public ComputeBackend {
                          const BackendBuffer& bits, const BackendBuffer& scales,
                          const BackendBuffer& x, BackendBuffer* scratch,
                          BackendBuffer& y);
+    // Q4 rewrite-round candidate arms (bench-only, docs/plans/2026-07-17-
+    // q4-rewrite-round.md): candidate 1 = the production kernel through the
+    // probe path (A/B parity in one code path; Q4 or Q8 weight), 2 = Q4
+    // 2-rows-per-simdgroup (retained comparison arm), 3 = alias of the
+    // production kernel (r4 was promoted, 2026-07-17), 4 = THROWS (the A'
+    // Q8 twin was killed by measurement — round doc RESULTS). Validation as
+    // matvec_quantized; candidate PSOs build lazily on first call, so
+    // production startup never creates them. Never engine-routed.
+    void matvec_q4_probe(int candidate, const BackendTensor& weight,
+                         const BackendQuantized& x, BackendBuffer& y);
     void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
                           uint32_t x_rows,BackendBuffer& y) override;
     void embedding_q8(const BackendTensor& weight, uint32_t token,

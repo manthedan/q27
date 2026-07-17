@@ -99,6 +99,11 @@ build:
 build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) src/inspect.cpp src/loader.cpp -o $@
 
+# Phase-0 probe for k3 item #3 (group-skip over T2 zeros; d5a5674). CPU only,
+# read-only mmap scan — pre-registered kill line lives in the tool's output.
+build/t2_zero_sim: tools/t2_zero_sim.cpp src/loader.cpp src/loader.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/t2_zero_sim.cpp src/loader.cpp -o $@
+
 build/tokenize_to_bin: tools/tokenize_to_bin.cpp src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/tokenize_to_bin.cpp src/tokenizer.cpp -o $@
 
