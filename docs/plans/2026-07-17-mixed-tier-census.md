@@ -89,8 +89,10 @@ reopened by each child, that complete fingerprint is recomputed before and
 after every measurement; a mid-run change aborts instead of splitting the
 experiment. An atomic lifetime lock excludes a second driver and each run
 uses a PID-unique transient pack. NLL output is written to a temporary log
-and atomically published only after post-run global and exact-pack hash checks,
-so a crash cannot bless an unverified completion. Results have not started.
+and atomically published only after a zero exit, exactly one finite NLL, and
+post-run global + exact-pack hash checks, so a crash cannot bless an unverified
+completion. The 25-arm summary is validated and atomically published before
+`COMPLETE` is printed. Results have not started.
 
 ## Execution registration (2026-07-17 midday, mini — recorded before the batch ran)
 

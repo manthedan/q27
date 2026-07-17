@@ -118,19 +118,41 @@ check_fingerprint() {
         { echo "census: input changed while batch was running — aborting" | tee "$OUT/ABORTED"; exit 1; }
 }
 
+file_md5() {
+    md5 -q "$1" || { echo "census: cannot hash $1" >&2; return 1; }
+}
+
+valid_nll_log() {
+    python3 - "$1" <<'PY'
+import math, re, sys
+text = open(sys.argv[1], errors="replace").read()
+values = re.findall(r"overall mean NLL\s+(\S+)", text)
+if len(values) != 1:
+    raise SystemExit(1)
+try:
+    value = float(values[0])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) else 1)
+PY
+}
+
 nll_run() {
     local model=$1 log=$2 expected_md5=$3
-    local tmp="$log.tmp"
+    local tmp="$log.tmp" actual_md5 rc
     # Only the atomic final pathname means complete: it is published after
-    # both the global identity and this exact model file pass post-run checks.
-    [ -s "$log" ] && grep -q "overall mean NLL" "$log" && return 0
+    # a zero exit, one finite NLL, and global + exact-model post-run hashes.
+    [ -s "$log" ] && valid_nll_log "$log" && return 0
     rm -f "$tmp"
     for attempt in 1 2; do
         check_fingerprint
         q27 "$model" "$TOK" --nll "$C" --nll-long 8192 --ctx 8192 > "$tmp" 2>&1
-        if grep -q "overall mean NLL" "$tmp"; then
+        rc=$?
+        if [ "$rc" = 0 ] && valid_nll_log "$tmp"; then
             check_fingerprint
-            [ "$(md5 -q "$model")" = "$expected_md5" ] ||
+            actual_md5=$(file_md5 "$model") ||
+                { echo "census: post-run model hash failed" | tee "$OUT/ABORTED"; exit 1; }
+            [ "$actual_md5" = "$expected_md5" ] ||
                 { echo "census: model changed during $(basename "$log")" | tee "$OUT/ABORTED"; exit 1; }
             mv "$tmp" "$log" ||
                 { echo "census: cannot publish $(basename "$log")" | tee "$OUT/ABORTED"; exit 1; }
@@ -139,22 +161,24 @@ nll_run() {
         if [ "$attempt" = 1 ]; then
             mv "$tmp" "$log.attempt1" ||
                 { echo "census: cannot preserve failed $(basename "$log")" | tee "$OUT/ABORTED"; exit 1; }
-            echo "census: $(basename "$log") attempt 1 failed; retrying once"
+            echo "census: $(basename "$log") attempt 1 failed (exit $rc or invalid NLL); retrying once"
         fi
     done
-    mv "$tmp" "$log" 2>/dev/null || true
-    echo "census: NLL run FAILED twice (see $log)" | tee "$OUT/ABORTED"; exit 1
+    mv "$tmp" "$log.failed" 2>/dev/null || true
+    echo "census: NLL run FAILED twice (see $log.failed)" | tee "$OUT/ABORTED"; exit 1
 }
 
 # Baselines anchor the gap on THIS box and binary (the recorded 1.055
 # B1/T2 ratio is a 24 GB M4 number; ratios must be same-machine).
-nll_run "$B1" "$OUT/base_b1.log" "$(md5 -q "$B1")"
-nll_run "$T2" "$OUT/base_t2.log" "$(md5 -q "$T2")"
+B1_MD5=$(file_md5 "$B1") || { echo "census: B1 hash failed" | tee "$OUT/ABORTED"; exit 1; }
+T2_MD5=$(file_md5 "$T2") || { echo "census: T2 hash failed" | tee "$OUT/ABORTED"; exit 1; }
+nll_run "$B1" "$OUT/base_b1.log" "$B1_MD5"
+nll_run "$T2" "$OUT/base_t2.log" "$T2_MD5"
 
 arm() {
     local name=$1 take=$2
     local log="$OUT/arm_$name.log"
-    [ -s "$log" ] && grep -q "overall mean NLL" "$log" && return 0
+    [ -s "$log" ] && valid_nll_log "$log" && return 0
     check_fingerprint
     python3 tools/q27_mix.py "$B1" "$T2" "$ARM_PACK" --take "$take" \
         > "$OUT/mix_$name.log" 2>&1 ||
@@ -214,30 +238,43 @@ arm shared_f32 '(^output_norm\.weight$|\.(attn_norm|post_attention_norm|attn_q_n
 
 # Summary table: arm, overall NLL, delta vs B1 base, gap recovered.
 check_fingerprint
-python3 - "$OUT" <<'PY' | tee "$OUT/census_summary.txt"
-import glob, os, re, sys
+SUMMARY_TMP="$OUT/census_summary.txt.tmp"
+python3 - "$OUT" <<'PY' | tee "$SUMMARY_TMP"
+import glob, math, os, re, sys
 out = sys.argv[1]
 def nll(path):
-    for line in open(path):
-        m = re.search(r"overall mean NLL ([0-9.]+)", line)
-        if m: return float(m.group(1))
-    return None
+    values = re.findall(r"overall mean NLL\s+(\S+)", open(path, errors="replace").read())
+    if len(values) != 1:
+        raise RuntimeError(f"{path}: expected exactly one overall NLL")
+    value = float(values[0])
+    if not math.isfinite(value):
+        raise RuntimeError(f"{path}: non-finite overall NLL")
+    return value
 b1, t2 = nll(f"{out}/base_b1.log"), nll(f"{out}/base_t2.log")
 gap = b1 - t2
+if gap <= 0:
+    raise RuntimeError(f"expected positive B1-T2 gap, got {gap}")
 print(f"base B1 {b1:.4f}  base T2 {t2:.4f}  gap {gap:.4f} nats")
+files = sorted(glob.glob(f"{out}/arm_*.log"))
+if len(files) != 25:
+    raise RuntimeError(f"expected 25 arm logs, found {len(files)}")
 rows = []
-for f in sorted(glob.glob(f"{out}/arm_*.log")):
+for f in files:
     name = os.path.basename(f)[4:-4]
     v = nll(f)
-    if v is None: continue
-    take_mb = None
     mix = f"{out}/mix_{name}.log"
-    if os.path.exists(mix):
-        m = re.search(r"byte delta \+?([0-9.]+) MB", open(mix).read())
-        if m: take_mb = float(m.group(1))
-    rows.append((name, v, (b1 - v) / gap if gap else 0.0, take_mb))
+    matches = re.findall(r"byte delta ([+-]?[0-9.]+) MB", open(mix).read())
+    if len(matches) != 1:
+        raise RuntimeError(f"{mix}: expected exactly one byte delta")
+    take_mb = float(matches[0])
+    rows.append((name, v, (b1 - v) / gap, take_mb))
 rows.sort(key=lambda r: -r[2])
 for name, v, rec, mb in rows:
-    print(f"{name:16s} NLL {v:.4f}  gap recovered {100*rec:5.1f}%  bytes +{mb or 0:7.1f} MB")
+    print(f"{name:16s} NLL {v:.4f}  gap recovered {100*rec:5.1f}%  bytes {mb:+8.1f} MB")
 PY
+summary_rc=$?
+[ "$summary_rc" = 0 ] ||
+    { echo "census: summary generation FAILED" | tee "$OUT/ABORTED"; exit 1; }
+mv "$SUMMARY_TMP" "$OUT/census_summary.txt" ||
+    { echo "census: cannot publish summary" | tee "$OUT/ABORTED"; exit 1; }
 echo "census batch: COMPLETE"
