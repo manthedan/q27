@@ -118,3 +118,32 @@ mode 3 — a stale shader would store everything clean and read KL 0,
 which the vacuity gate cannot catch (it expects 0); the driver now
 also asserts the control arm's class band, the canary that CAN fire
 under that skew.
+
+## Design-step decomposition arms (pre-registered 2026-07-17 ~01:00,
+## before any 4b measurement)
+
+The graduating 4-cell result decomposes into candidate encodings that
+differ 4× in price. Batch 4b (`tools/kv_step4b_arms.sh`, new out dir —
+the ABI-10 rebuild changed the binary identity, so 4b re-anchors with
+its own control rather than borrowing step-4's):
+
+- **control** — re-run (same-identity anchor; must land in the ±15%
+  class band AND within a few percent of 4a's 0.011871/2.478).
+- **l7h1** (cells 10,11; +6.4% KV bytes) — does the tail head alone
+  carry the max cut?
+- **l7h1k** (cell 10; +3.2%) — the cheapest candidate: does K alone
+  retain it? (Census: the V cell 1.204 > K 1.100 at 2K single-cell,
+  so plausibly NO — that asymmetry is the read.)
+- **l63v** (cells 125,127; +6.4%) — the mean lever in isolation; also
+  a negative control for the max read (census says these cells are
+  mean-heavy, tail-light).
+
+Reads: (1) fraction of the 2.22× max cut retained by l7h1 and by
+l7h1k — retaining ≥2× at +6.4%/+3.2% halves/quarters the graduated
+price; (2) mean split — does control−probe4's 0.00254 mean cut
+decompose as l7h1 + l63v predict; (3) any arm whose max argmax
+RETURNS to pos 1000 identifies the cells actually coupled to that
+event. Decision: the cheapest arm retaining max ≥2× becomes the
+design-step encoding candidate; if none retains it, the 4-cell set is
+jointly necessary and the design step must price all four (mid-rate
+code ~+6% or accept +12.9%).
