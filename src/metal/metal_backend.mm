@@ -147,7 +147,7 @@ struct L2RowsArgs { uint32_t heads, head_dim, row_stride, tokens; float eps; };
 struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, position, tokens; float freq_base; };
 struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
 struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
-struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode, head; };
+struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode, head, flags, scale_off; };
 struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
 struct ArgmaxRowsArgs { uint32_t n, rows; };
 struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
@@ -215,6 +215,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> kv_store_rows;
     id<MTLComputePipelineState> kv_store_turbo3_rows;
     id<MTLComputePipelineState> kv_store_attrib_rows;
+    id<MTLBuffer> attrib_dummy;
     id<MTLComputePipelineState> attention_causal;
     id<MTLComputePipelineState> attention_turbo3_causal_p;
     id<MTLComputePipelineState> sigmoid_gate_rows;
@@ -2168,13 +2169,19 @@ void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuf
 void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
                                             BackendBuffer& k_cache, BackendBuffer& v_cache,
                                             uint32_t position, uint32_t kv_heads, uint32_t tokens,
-                                            uint32_t mode, uint32_t head) {
+                                            uint32_t mode, uint32_t head, uint32_t flags,
+                                            uint32_t scale_off, BackendBuffer* aux) {
     if (!kv_heads || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid KV attribution store");
     if (mode != 1 && mode != 2)
         throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K) or 2 (V)");
     if (head != UINT32_MAX && head >= kv_heads)
         throw std::runtime_error("q27 Metal: KV attribution head out of range");
+    if (flags & ~7u)
+        throw std::runtime_error("q27 Metal: unknown KV attribution flags");
+    const bool needs_aux = (flags & 6u) != 0;   // FEATURE or STATS
+    if (needs_aux && !aux)
+        throw std::runtime_error("q27 Metal: KV attribution flags need an aux buffer");
     const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
     MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
     const uint64_t row_floats = (uint64_t)kv_heads * 256;
@@ -2182,13 +2189,25 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
     check_range(vb.size(), 0, row_floats * tokens * 4, "attrib V rows");
     check_range(kc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib K cache");
     check_range(vc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib V cache");
-    TurboAttribArgs args{position, kv_heads, tokens, mode, head};
+    if (needs_aux) {
+        const uint64_t need = ((uint64_t)scale_off + 2ull * 16384) * 4;
+        check_range(metal_buffer(*aux).size(), 0, need, "attrib aux");
+    }
+    TurboAttribArgs args{position, kv_heads, tokens, mode, head, flags, scale_off};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_f16_attrib_rows");
         [enc setComputePipelineState:impl_->kv_store_attrib_rows];
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
+        // buffer(5) must always be bound; a 4-byte dummy covers flag-free calls.
+        if (aux) [enc setBuffer:metal_buffer(*aux).handle() offset:0 atIndex:5];
+        else {
+            if (!impl_->attrib_dummy)
+                impl_->attrib_dummy = [impl_->device newBufferWithLength:4
+                                                                 options:MTLResourceStorageModePrivate];
+            [enc setBuffer:impl_->attrib_dummy offset:0 atIndex:5];
+        }
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
                 threadsPerThreadgroup:MTLSizeMake(128,1,1)];
         if (own) impl_->finish_command("KV attribution store");

@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width | --suffix-serial width | --oracle width] [--kv fp16|turbo3] "
-                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N] [--chunk-parity N] "
+                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N | --kl-kv-stats FILE] [--kv-rt-scale32] [--kv-rt-feature FILE] [--chunk-parity N] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--save-state file | --load-state file] [--dump-logits file]\n",
                 argv[0]);
@@ -157,6 +157,8 @@ int main(int argc, char** argv) {
         bool turbo3_kv = false, validate_only = false, serial_prefill = false;
         bool kl_kv = false, kl_self = false;
         uint32_t kv_attrib = 0, kv_cell = UINT32_MAX;
+        bool kv_rt_scale32 = false;
+        std::string kv_rt_feature, kv_stats_out;
         uint32_t chunk_parity = 0;
         std::string envelope_mode;
         for (int i = 3; i < argc; i++) {
@@ -168,6 +170,9 @@ int main(int argc, char** argv) {
             else if (arg == "--validate-only") validate_only = true;
             else if (arg == "--kl-kv") kl_kv = true;
             else if (arg == "--kl-kv-self") { kl_kv = true; kl_self = true; }
+            else if (arg == "--kl-kv-stats" && i + 1 < argc) { kl_kv = true; kv_stats_out = argv[++i]; }
+            else if (arg == "--kv-rt-scale32") kv_rt_scale32 = true;
+            else if (arg == "--kv-rt-feature" && i + 1 < argc) kv_rt_feature = argv[++i];
             else if (arg == "--kl-kv-cell" && i + 1 < argc) {
                 kv_cell = parse_u32(argv[++i], "--kl-kv-cell");
                 if (kv_cell >= 128)
@@ -276,6 +281,11 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--kl-kv-k/--kl-kv-v and --kl-kv-self are mutually exclusive arms");
         if (kv_cell != UINT32_MAX && (kv_attrib || kl_self))
             throw std::runtime_error("--kl-kv-cell is its own arm; drop --kl-kv-k/--kl-kv-v/--kl-kv-self");
+        if (!kv_stats_out.empty() && (kv_attrib || kl_self || kv_cell != UINT32_MAX ||
+                                      kv_rt_scale32 || !kv_rt_feature.empty()))
+            throw std::runtime_error("--kl-kv-stats is its own pass; drop other kl-kv arms/modifiers");
+        if ((kv_rt_scale32 || !kv_rt_feature.empty()) && !kv_attrib)
+            throw std::runtime_error("--kv-rt-scale32/--kv-rt-feature modify a side arm; add --kl-kv-k or --kl-kv-v");
         if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty() &&
             load_state_path.empty())
             throw std::runtime_error("--tokens, --prompt, --nll, --load-state, or --validate-only is required");
@@ -625,8 +635,41 @@ int main(int argc, char** argv) {
             // attention kernels; only the store round-trips one side through
             // the turbo3 quantizer, so the KL is that side's error alone.
             q27::MetalEngine subject(shared, context,
-                                     !kl_self && !kv_attrib && kv_cell == UINT32_MAX);
+                                     !kl_self && !kv_attrib && kv_cell == UINT32_MAX &&
+                                     kv_stats_out.empty());
             char cell_name[48] = {0};
+            std::vector<float> feature_scales;
+            if (!kv_stats_out.empty()) subject.set_kv_attrib_stats();
+            if (!kv_rt_feature.empty()) {
+                // Stats file -> clamped per-feature RMS scales (step 2,
+                // docs/plans/2026-07-16-kv-codec-step2.md): s >= 1e-3 x the
+                // side's mean RMS so dead features cannot explode the arm.
+                FILE* sf = fopen(kv_rt_feature.c_str(), "rb");
+                if (!sf) throw std::runtime_error("cannot open stats file: " + kv_rt_feature);
+                char magic[8] = {0}; uint64_t sn = 0;
+                std::vector<float> sumsq(2ull * 16 * 4 * 256);
+                const bool ok = fread(magic, 1, 8, sf) == 8 &&
+                                memcmp(magic, "Q27KVS1\0", 8) == 0 &&
+                                fread(&sn, 8, 1, sf) == 1 && sn > 0 &&
+                                fread(sumsq.data(), 4, sumsq.size(), sf) == sumsq.size();
+                fclose(sf);
+                if (!ok) throw std::runtime_error("invalid stats file: " + kv_rt_feature);
+                feature_scales.resize(sumsq.size());
+                for (int side = 0; side < 2; side++) {
+                    double mean_rms = 0.0;
+                    const size_t base = (size_t)side * 16384;
+                    for (size_t i = 0; i < 16384; i++)
+                        mean_rms += std::sqrt(sumsq[base + i] / (double)sn);
+                    mean_rms /= 16384.0;
+                    const float floor_s = (float)(1e-3 * mean_rms);
+                    for (size_t i = 0; i < 16384; i++)
+                        feature_scales[base + i] =
+                            std::max((float)std::sqrt(sumsq[base + i] / (double)sn), floor_s);
+                }
+            }
+            if (kv_attrib && (kv_rt_scale32 || !kv_rt_feature.empty()))
+                subject.set_kv_attrib_rt(kv_rt_scale32,
+                                         feature_scales.empty() ? nullptr : feature_scales.data());
             if (kv_cell != UINT32_MAX) {
                 // cell id = attn_idx*8 + head*2 + side (side 0=K, 1=V);
                 // attn_idx 0..15 maps to absolute layer attn_idx*4+3.
@@ -642,11 +685,15 @@ int main(int argc, char** argv) {
                 baseline.set_chunked_prefill(false);
                 subject.set_chunked_prefill(false);
             }
-            const char* subject_name = kl_self ? "fp16 self-check"
-                                     : kv_cell != UINT32_MAX ? cell_name
-                                     : kv_attrib == 1 ? "turbo3 K-only round-trip"
-                                     : kv_attrib == 2 ? "turbo3 V-only round-trip"
-                                     : "turbo3";
+            std::string arm_name = kl_self ? "fp16 self-check"
+                                  : !kv_stats_out.empty() ? "fp16 stats pass (KL must be 0)"
+                                  : kv_cell != UINT32_MAX ? cell_name
+                                  : kv_attrib == 1 ? "turbo3 K-only round-trip"
+                                  : kv_attrib == 2 ? "turbo3 V-only round-trip"
+                                  : "turbo3";
+            if (kv_rt_scale32) arm_name += " +scale32";
+            if (!kv_rt_feature.empty()) arm_name += " +feature";
+            const char* subject_name = arm_name.c_str();
             auto ready = std::chrono::steady_clock::now();
             fprintf(stderr, "Metal model ready on %s in %.2f s (two engines, one mapping: fp16 baseline vs %s)\n",
                     baseline.backend().name().c_str(),
@@ -711,6 +758,24 @@ int main(int argc, char** argv) {
                     std::chrono::duration<double>(kl_done - kl_start).count(),
                     n / std::chrono::duration<double>(kl_done - kl_start).count(),
                     mean, peak);
+            if (!kv_stats_out.empty()) {
+                // The stats subject stores clean fp16, so any nonzero KL
+                // means the instrument itself is broken — hard stop.
+                if (mean != 0.0 || peak != 0.0)
+                    throw std::runtime_error("kl-kv stats pass: KL canary NONZERO — instrument broken");
+                std::vector<float> sumsq;
+                subject.read_kv_attrib_stats(sumsq);
+                FILE* sf = fopen(kv_stats_out.c_str(), "wb");
+                if (!sf) throw std::runtime_error("cannot write stats file: " + kv_stats_out);
+                const uint64_t sn = n;
+                bool ok = fwrite("Q27KVS1\0", 1, 8, sf) == 8 &&
+                          fwrite(&sn, 8, 1, sf) == 1 &&
+                          fwrite(sumsq.data(), 4, sumsq.size(), sf) == sumsq.size();
+                if (fclose(sf) != 0) ok = false;
+                if (!ok) throw std::runtime_error("cannot write stats file: " + kv_stats_out);
+                fprintf(stderr, "kl-kv stats: wrote %s (%u positions, 2x16x4x256 features)\n",
+                        kv_stats_out.c_str(), n);
+            }
             return 0;
         }
 
