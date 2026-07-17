@@ -1030,6 +1030,11 @@ int main(int argc,char** argv) {
         if(width && (width<2 || width>12)) throw std::runtime_error("MTP width must be 2..12");
         if(suffix_width && (suffix_width<2 || suffix_width>q27::MetalEngine::VERIFY_CHUNK_MAX))
             throw std::runtime_error("suffix width must be 2..48");
+        // Bounded so entries x snapshot_bytes() can never wrap uint64 in the
+        // G6 per-slot charge — side-inclusive snapshots (~4.6 GB at max ctx
+        // under L7-full) put the wrap within uint32 entry range (codex P2 on
+        // 4415c53); 4096 entries is already far beyond any real deployment.
+        if(prefix_entries>4096) throw std::runtime_error("--prefix-entries must be 0..4096");
         if(width && suffix_width) throw std::runtime_error("--mtp and --suffix are mutually exclusive (one speculation lever per server)");
         if(constrain_tools && width) throw std::runtime_error("--constrain-tools requires serial decode; drop --mtp (verify-lane masks are not wired on Metal)");
         if(constrain_tools && suffix_width) throw std::runtime_error("--constrain-tools requires serial decode; drop --suffix (burst rounds argmax unmasked logits)");

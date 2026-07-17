@@ -115,4 +115,22 @@ snapshot_bytes carrying it means multislot admission prices it.
    byte-identical continuation; in-memory tier warm hit
    (q27_prefix_hit 5) byte-identical to cold. Startup notes read
    "side caches ride prefix/disk snapshots (v2)".
-5. Codex cross-review: see commit trailer notes / ledger.
+5. Codex cross-review (gpt-5.6-sol, on 4415c53) — three findings, triaged:
+   - P1 (pass-2 failure atomicity of load_state): PRE-EXISTING contract,
+     not a v2 regression — the Phase-1 design already accepted that
+     mid-stream pass-2 failures leave indeterminate state and the server
+     resets/falls back (documented at its call site). Disposition:
+     contract now stated explicitly in the load_state comment; a fully
+     atomic restore needs a double-buffered staging pass and stays
+     unfunded.
+   - P2 (G6 admission overflow: uint32 --prefix-entries x side-inclusive
+     ~4.6 GB snapshot_bytes can wrap uint64 and falsely admit a slot):
+     REAL, newly reachable with v2 sizes — fixed, --prefix-entries
+     bounded to 4096.
+   - P3 (position-0 snapshots demand config match despite carrying no
+     history): accepted limitation — nothing saves at position 0 (the
+     server snapshots post-prefill, the CLI post-prompt), and relaxing
+     presence at 0 would special-case a state that never exists on disk.
+   Codex confirmed: staging-bounce synchronization, mask-before-write
+   ordering, cross-version format behavior, tag collision-freedom, and
+   the side-inclusive snapshot_bytes arithmetic are all correct.

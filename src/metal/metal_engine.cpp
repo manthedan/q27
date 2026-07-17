@@ -919,7 +919,13 @@ uint32_t MetalEngine::load_state(const std::string& path) {
         const uint64_t active_cache = (uint64_t)h.position * cache_row;
         // The expected blob sequence, mirrored from save_state. Validating
         // every length (pass 1) before the first GPU write (pass 2) means a
-        // rejected file never leaves partially-restored state. Kinds: Std
+        // rejected file never leaves partially-restored state. Contract
+        // (unchanged since Phase 1, restated at the codex round on 4415c53):
+        // pass-2 failures — mid-stream I/O errors or same-inode mutation
+        // caught by the TOCTOU re-checks — DO leave indeterminate buffer
+        // state behind the old position_; callers must reset() or restore a
+        // known state before reuse, as the server's disk-tier fallback does.
+        // Kinds: Std
         // streams into a shared buffer; Mask is host data whose CONTENT is
         // validated in pass 1 (equal-length cell lists differ only there);
         // Side bounces through staging into a private buffer.
