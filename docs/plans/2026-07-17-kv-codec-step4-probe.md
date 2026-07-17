@@ -147,3 +147,43 @@ event. Decision: the cheapest arm retaining max ≥2× becomes the
 design-step encoding candidate; if none retains it, the 4-cell set is
 jointly necessary and the design step must price all four (mid-rate
 code ~+6% or accept +12.9%).
+
+Amendment (01:26, registered mid-batch with l63v still running and NO
+v-only measurement in existence): l7h1k retained nothing (max 2.616
+@1000, at-control) while l7h1 retains the full cut (1.124 @7719) —
+so a fifth arm **l7h1v** (cell 11 alone, +3.2%) is added to split
+"V alone carries it" (price quarters) from "the K+V pair is jointly
+necessary" (interaction; design must buy both cells).
+
+## 4b Results (2026-07-17 01:45 — the L7 h1 pair is jointly necessary)
+
+| arm | cost | mean KL | p99 | max | vs control |
+|---|---|---|---|---|---|
+| control | — | 0.011871 | 0.1006 | 2.478 @1000 | 4a reproduced digit-identical |
+| l7h1 (K+V) | +6.4% | 0.011145 | 0.1000 | **1.124 @7719** | full 2.20× cut retained |
+| l7h1k (K) | +3.2% | 0.011728 | 0.0991 | 2.616 @1000 | nothing (envelope) |
+| l7h1v (V) | +3.2% | 0.011793 | 0.0894 | **3.344 @1000** | tail AMPLIFIED 1.35× |
+| l63v | +6.4% | 0.010055 | 0.0990 | 2.438 @1000 | mean lever only, tail-inert |
+
+Reads:
+
+1. **The tail protection is entirely L7 h1, and the pair is jointly
+   necessary with a sign-flipping interaction:** K alone retains
+   nothing; V alone makes the event WORSE than no protection at all
+   (3.344 vs 2.478 — clean V against quantized K misaligns harder than
+   both-quantized, i.e. this head's K/V quantization errors partially
+   cancel); K+V retains the full 4-cell cut (1.124 ≈ probe4's 1.117).
+   No sub-+6.4% fp16 decomposition exists.
+2. **The mean split is exactly additive:** l7h1 (−0.00073) + l63v
+   (−0.00182) = 0.00254 = the 4-cell arm's mean cut to the digit.
+3. Argmax behavior confirms the coupling: every arm that fails to
+   protect the pair keeps (or amplifies) the pos-1000 event; both arms
+   that protect the pair move the max to 7719 at ~1.12.
+
+**Design-step verdict:** the encoding candidate is **both cells of
+L7 h1 at +6.4% (fp16)**, or a mid-rate ~2× code for those two cells
+(~+3.2% total) if one is designed; l63v is a separable mean-only
+option (+6.4% for −15% mean, tail-inert) that the +12.9%-uniform null
+must also be weighed against. Any production format change (per-cell
+dtype in the KV layout) is a real codec-design task — handed to the
+program queue with these numbers, not started unilaterally tonight.

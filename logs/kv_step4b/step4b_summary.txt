@@ -1,0 +1,10 @@
+4a anchors: control 0.011871 / p99 0.1006 / max 2.478 @1000; probe4 0.009329 / 0.0924 / 1.117 @7719
+reads: cheapest arm retaining max >=2x vs control becomes the design candidate
+control  kl-kv tail: p50 0.005265  p90 0.02295  p99 0.1006  p99.5 0.1689  max 2.478 @pos 1000
+control  kl-kv wall: 662.44 s (12.36 pos/s through both engines), overall mean KL 0.0118712 nats, max 2.47793
+l7h1     kl-kv tail: p50 0.005309  p90 0.02195  p99 0.09999  p99.5 0.1503  max 1.124 @pos 7719
+l7h1     kl-kv wall: 653.54 s (12.53 pos/s through both engines), overall mean KL 0.0111454 nats, max 1.1237
+l7h1k    kl-kv tail: p50 0.005369  p90 0.02271  p99 0.09912  p99.5 0.174  max 2.616 @pos 1000
+l7h1k    kl-kv wall: 644.96 s (12.70 pos/s through both engines), overall mean KL 0.0117283 nats, max 2.61598
+l63v     kl-kv tail: p50 0.003612  p90 0.01914  p99 0.09901  p99.5 0.1641  max 2.438 @pos 1000
+l63v     kl-kv wall: 653.47 s (12.53 pos/s through both engines), overall mean KL 0.0100551 nats, max 2.43757
