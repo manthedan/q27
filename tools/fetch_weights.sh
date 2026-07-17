@@ -27,19 +27,30 @@ python3 -c "import numpy, gguf" 2>/dev/null ||
 
 mkdir -p "$DEST"
 
-if [ -f "$ARTIFACT" ] && [ "$(shasum -a 256 "$ARTIFACT" | cut -d' ' -f1)" = "$OUT_SHA" ]; then
+# The fast path needs BOTH files healthy — a verified artifact with a
+# missing/empty tokenizer (e.g. a prior run that died during export)
+# must fall through and repair (codex P2).
+if [ -f "$ARTIFACT" ] && [ -s "$TOK" ] &&
+   [ "$(shasum -a 256 "$ARTIFACT" | cut -d' ' -f1)" = "$OUT_SHA" ]; then
     echo "fetch: $ARTIFACT already present and verified ($OUT_SHA)"
     exit 0
 fi
 
 GGUF="$DEST/$FILE"
 if [ ! -f "$GGUF" ] || [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" != "$SRC_SHA" ]; then
-    echo "fetch: downloading $FILE (7.2 GB) from $REPO @ ${REV:0:12}"
-    curl -L --fail --continue-at - \
-        "https://huggingface.co/$REPO/resolve/$REV/$FILE" -o "$GGUF" ||
-        { echo "fetch: download failed"; exit 1; }
-    [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" = "$SRC_SHA" ] ||
-        { echo "fetch: source GGUF sha256 MISMATCH — refusing to repack"; exit 1; }
+    # Two attempts: resume first (cheap for interrupted downloads), then a
+    # clean restart — resuming onto corrupt bytes can never converge and
+    # previously wedged until a manual delete (codex P2).
+    for attempt in resume clean; do
+        [ "$attempt" = "clean" ] && { echo "fetch: retrying with a clean download"; rm -f "$GGUF"; }
+        echo "fetch: downloading $FILE (7.2 GB) from $REPO @ ${REV:0:12} ($attempt)"
+        curl -L --fail --continue-at - \
+            "https://huggingface.co/$REPO/resolve/$REV/$FILE" -o "$GGUF" || true
+        [ -f "$GGUF" ] &&
+            [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" = "$SRC_SHA" ] && break
+        [ "$attempt" = "clean" ] &&
+            { echo "fetch: source GGUF sha256 MISMATCH after clean download — aborting"; exit 1; }
+    done
 fi
 echo "fetch: source verified ($SRC_SHA)"
 
