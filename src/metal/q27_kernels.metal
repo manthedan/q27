@@ -2605,9 +2605,10 @@ kernel void q27_mask_logits(device float *logits [[buffer(0)]],
     if (!((mask[gid >> 5] >> (gid & 31)) & 1u)) logits[gid] = -INFINITY;
 }
 
-// ---- Chunked layer-major prefill (2..96 tokens per dispatch; decode
-// chunks cap at CHUNK_MAX=12, prompt ingestion at PREFILL_CHUNK_MAX=96,
-// verify at VERIFY_CHUNK_MAX=48 — wide-chunk phase A + lever 2) ----
+// ---- Chunked layer-major prefill (2..96 tokens per dispatch; per-path
+// caps: MTP rounds and NLL/KL teacher forcing at CHUNK_MAX=12, prompt
+// ingestion at PREFILL_CHUNK_MAX=96, suffix-burst/oracle verify chunks at
+// VERIFY_CHUNK_MAX=48 — wide-chunk phase A + lever 2) ----
 //
 // These kernels advance a whole token chunk through one operation so the
 // engine can execute prompts layer-major and route projections through the
