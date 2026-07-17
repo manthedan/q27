@@ -696,30 +696,42 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         // without it can leave a structurally-valid file whose data pages
         // read back as zeroes — every blob length still matches, so pass-1
         // validation cannot catch it (k3 audit B1).
-        if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0) {
+        // fflush/fsync failures must still reach fclose — a short-circuit
+        // chain leaks the descriptor on every failed save (codex P3).
+        if (fflush(f) != 0 || fsync(fileno(f)) != 0) {
+            fclose(f);
+            f = nullptr;
+            throw std::runtime_error("q27 Metal: cannot finish snapshot: " + tmp);
+        }
+        if (fclose(f) != 0) {
             f = nullptr;
             throw std::runtime_error("q27 Metal: cannot finish snapshot: " + tmp);
         }
         f = nullptr;
-        if (rename(tmp.c_str(), path.c_str()) != 0)
-            throw std::runtime_error("q27 Metal: cannot move snapshot into place: " + path);
         // The rename lives in the directory entry: without a directory fsync
         // a crash can drop it after this call reported success. The snapshot
         // is a correctness-bearing artifact, so failure here is fatal, never
-        // advisory (k3 audit B1).
-        {
-            const std::string::size_type slash = path.find_last_of('/');
-            const std::string dir = slash == std::string::npos ? "."
-                                  : slash == 0 ? "/" : path.substr(0, slash);
-            const int dfd = open(dir.c_str(), O_RDONLY);
-            if (dfd < 0)
-                throw std::runtime_error("q27 Metal: cannot open snapshot directory: " + dir);
-            if (fsync(dfd) != 0) {
-                close(dfd);
-                throw std::runtime_error("q27 Metal: cannot sync snapshot directory: " + dir);
-            }
+        // advisory (k3 audit B1). The directory opens BEFORE the rename so an
+        // open failure aborts while the previous snapshot is still in place
+        // (codex P3); a post-rename fsync failure leaves the new file in
+        // place — its content is already durable, only the rename's
+        // durability is uncertain, and either name resolves to a valid
+        // snapshot after a crash.
+        const std::string::size_type slash = path.find_last_of('/');
+        const std::string dir = slash == std::string::npos ? "."
+                              : slash == 0 ? "/" : path.substr(0, slash);
+        const int dfd = open(dir.c_str(), O_RDONLY);
+        if (dfd < 0)
+            throw std::runtime_error("q27 Metal: cannot open snapshot directory: " + dir);
+        if (rename(tmp.c_str(), path.c_str()) != 0) {
             close(dfd);
+            throw std::runtime_error("q27 Metal: cannot move snapshot into place: " + path);
         }
+        if (fsync(dfd) != 0) {
+            close(dfd);
+            throw std::runtime_error("q27 Metal: cannot sync snapshot directory: " + dir);
+        }
+        close(dfd);
         if (snap_crash && strcmp(snap_crash, "after-rename") == 0) _exit(42);
     } catch (...) {
         if (f) fclose(f);
@@ -1659,7 +1671,6 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
             backend_.matmul_quantized(weight("output.weight"), x5, count, *clogits_);
             batch.finish();
         }
-        position_ += count;
         // Keep the serial logits buffer coherent with the last encoded row so
         // sampling or snapshotting after a chunk sees post-chunk state
         // (mirrors prefill; codex sweep finding, 2026-07-15).
@@ -1670,6 +1681,10 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
         // k3 audit A1).
         backend_.copy(*cfinal_, (uint64_t)(count - 1) * N_EMBD * sizeof(float),
                       *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+        // Position advances only once logits_/x1_ are coherent — a throw in
+        // the copies above must not leave post-pass position with pre-pass
+        // state, the same torn-host-state class as B2 (codex P2).
+        position_ += count;
         backend_.read(*clogits_, 0, out.data(), out.size() * sizeof(float));
         return;
     }
@@ -1704,7 +1719,6 @@ void MetalEngine::teacher_force_logits_wide(const uint32_t* tokens, uint32_t cou
         chunk_forward(tokens, count);
         batch.finish();
     }
-    position_ += count;
     // Head in CHUNK_MAX-row slices: cfinal_/clogits_ are CHUNK_MAX-sized, so
     // each slice's hidden rows are staged to offset 0 first (backend ops take
     // whole buffers). The head math per row is identical to the narrow path;
@@ -1733,6 +1747,10 @@ void MetalEngine::teacher_force_logits_wide(const uint32_t* tokens, uint32_t cou
     // k3 audit A1).
     backend_.copy(*cfinal_, (uint64_t)last_row * N_EMBD * sizeof(float),
                   *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+    // Position advances only once every head slice and coherence copy has
+    // finished — KV rows written by chunk_forward stay invisible behind the
+    // old position_ if anything above throws (codex P2; same class as B2).
+    position_ += count;
 }
 
 // GPU-assisted sampling: when top-k is active and within the radix-select

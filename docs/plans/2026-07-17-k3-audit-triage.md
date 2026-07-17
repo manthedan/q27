@@ -62,9 +62,13 @@ Mini: E8 probe task, queued behind mini-e2-gqa-partials.
 1. **Suites**: test-cpu + test-metal green post-merge. No CUDA changes this
    batch (D1 moves Metal toward CUDA) — yukon untouched.
 2. **D1 sizing leg** (official tier, quiet M4): 8K wikitext NLL, same protocol
-   as the 0A-q27 battery, pre-change vs post-change binaries. Band: |ΔNLL|
-   ≤ 0.5% relative (noise class). Expectation: rare-event class, delta ~0.
-   Above band → stop and investigate before commit, per house rule.
+   as the 0A-q27 battery (`--nll data/wikitext2-test.tokens.bin --nll-long 8192
+   --ctx 8192`). Pre-change comparator is last night's battery run of the SAME
+   protocol on the divide-form code: mean NLL 1.8353 (PPL 6.267),
+   logs/b1-quality-20260716/nll-official.out — no re-run of the baseline
+   needed. Band: |ΔNLL| ≤ 0.5% relative → post-change ∈ [1.8261, 1.8445].
+   Expectation: rare-event class, delta ~0. Above band → stop and investigate
+   before commit, per house rule.
 3. **Snapshot crash gate** (B1 artifact, 3.79 GB): leg (a) crash before-fsync →
    target path absent or previous snapshot intact + loadable; leg (b) crash
    after-rename → snapshot loads and greedy-16 continuation is byte-identical
