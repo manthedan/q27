@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <stdexcept>
 
 #include <CommonCrypto/CommonDigest.h>
@@ -349,6 +350,15 @@ struct Runtime {
     // 400 path. Streaming requests that overflow after headers are sent
     // keep the SSE error-event path (status already committed).
     struct ServerOverloaded : std::runtime_error { using std::runtime_error::runtime_error; };
+    // Thrown when a liveness probe finds the client gone during queue wait
+    // or prefill (2026-07-17-abandoned-request-cancellation.md) —
+    // deliberately NOT a std::exception: the generic handler catches would
+    // otherwise try to write an error body to a dead socket. Handlers and
+    // stream providers catch it by name and return without writing.
+    struct ClientGone {};
+    std::atomic<uint64_t> cancelled_queue{0}, cancelled_prefill{0};
+    // Mid-queue cancelled tickets awaiting their in-order skip (route_).
+    std::set<uint64_t> cancelled_tickets_;
     // Innermost lock: guards the shared host-side ToolMaskCache (mask
     // construction simulates the whole vocabulary on a miss). Order:
     // route_ | lease_ -> mask_mutex_; never the reverse.
@@ -567,7 +577,8 @@ struct Runtime {
                 const std::vector<std::string>& stops,
                 const std::function<bool(const std::string&)>& emit,
                 const std::vector<std::string>& tool_names={},
-                bool snapshot_hint=false) {
+                bool snapshot_hint=false,
+                const std::function<bool()>& live={}) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         q27::validate_sampling(sampling);
         const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
@@ -580,21 +591,57 @@ struct Runtime {
         {
             std::unique_lock<std::mutex> lk(route_);
             for(const auto& s:slots) if(s->busy) arrival=phase_name(s->phase);
+            // A cancelled ticket may sit at the front with no waiter left to
+            // skip it: fast-forward before the capacity check (and again in
+            // every wait predicate), or stale cancels would falsely 503 new
+            // arrivals. Always called under route_.
+            auto drain_cancelled=[&]{
+                while(cancelled_tickets_.erase(slot_serving_)) slot_serving_++;
+            };
+            drain_cancelled();
             if(slot_next_-slot_serving_>=QUEUE_MAX)
                 throw ServerOverloaded("server overloaded: request queue is full");
             const uint64_t ticket=slot_next_++;
             // Pass the turn on every exit path, or a thrown acquisition
-            // would wedge every later ticket.
+            // would wedge every later ticket. A mid-queue cancel must NOT
+            // pass the turn out of order (codex P1 on this round: an
+            // unconditional increment from ticket k while ticket k-2 is
+            // still serving skips a live waiter and wedges the FIFO) — it
+            // registers in cancelled_tickets_ instead and disarms, and
+            // whoever holds route_ when serving reaches it skips past.
             struct TurnPass {
-                Runtime& rt;
-                ~TurnPass() { rt.slot_serving_++; rt.slot_free_.notify_all(); }
+                Runtime& rt; bool armed=true;
+                ~TurnPass() { if(armed) { rt.slot_serving_++; rt.slot_free_.notify_all(); } }
             } turn{*this};
             queue_waiters++;
-            slot_free_.wait(lk,[&]{
-                if(slot_serving_!=ticket) return false;
-                for(const auto& s:slots) if(!s->busy) return true;
-                return false;
-            });
+            // Timed wait so a dead client's ticket can self-evacuate: the
+            // 250 ms tick probes liveness (zero-timeout select + MSG_PEEK,
+            // negligible next to any quantum) — the pile-up class from the
+            // 2026-07-17 incident (dead requests holding queue positions
+            // for minutes, then running to completion for nobody) drains
+            // without ever touching the GPU.
+            for(;;) {
+                const bool admitted_now=slot_free_.wait_for(lk,
+                    std::chrono::milliseconds(250),[&]{
+                        drain_cancelled();
+                        if(slot_serving_!=ticket) return false;
+                        for(const auto& s:slots) if(!s->busy) return true;
+                        return false;
+                    });
+                if(admitted_now) break;
+                if(live && !live()) {
+                    queue_waiters--;
+                    cancelled_queue++;
+                    if(slot_serving_==ticket) {
+                        // Front of the queue: the normal TurnPass increment
+                        // is in order.
+                    } else {
+                        cancelled_tickets_.insert(ticket);
+                        turn.armed=false;
+                    }
+                    throw ClientGone{};
+                }
+            }
             queue_waiters--;
             for(const auto& s:slots) if(!s->busy) { slot=s.get(); break; }
             slot->busy=true;
@@ -702,6 +749,31 @@ struct Runtime {
                 size_t i=0;
                 const size_t chunkable=suffix.size()-1;
                 while(chunkable-i>=2) {
+                    // Per-chunk liveness probe: a chunk is seconds of GPU
+                    // work, the probe is a zero-timeout select. On death
+                    // with an armed snapshot target (the big-prompt cases),
+                    // bank the finished chunks at the current position
+                    // first — a client-timeout retry then restores from
+                    // disk instead of re-paying the whole prefill cold
+                    // (the timeout-retry livelock class).
+                    if(live && !live()) {
+                        // Best-effort: a failed save must not turn a dead-
+                        // client cancel into the generic error path
+                        // (codex P3 on this round).
+                        if(save_at && i>0) try {
+                            {
+                                auto gpu=lease_now();
+                                engine.save_state(snapstore.path_for(prompt.data(),(uint32_t)(hit+i)),
+                                                  prompt.data(),(uint32_t)(hit+i),false);
+                            }
+                            snapstore.saves++;
+                            snapstore.evict_past_budget();
+                        } catch(const std::exception& e) {
+                            fprintf(stderr,"[cancel-save] skipped: %s\n",e.what());
+                        }
+                        cancelled_prefill++;
+                        throw ClientGone{};
+                    }
                     const uint32_t width=quantum_width(slot);
                     uint32_t take=(uint32_t)std::min<size_t>(width,chunkable-i);
                     if(save_at && hit+i<save_at) {
@@ -990,7 +1062,18 @@ q27::SamplingParams sampling_params(const json& body) {
 
 // Per-endpoint defaults mirror the CUDA server (codex P3 on this round):
 // /v1/messages 1024, OpenAI completions/chat 256, responses 4096.
+// Q27_METAL_MAX_TOKENS_DEFAULT overrides all of them for requests that
+// omit max_tokens (or send null, which json::value also defaults): pi.dev
+// sends max_tokens:null, and the CUDA-parity 256 truncates real agent
+// turns mid-answer ("maximum output token limit", 2026-07-17). Explicit
+// client values always win; the context preflight still clamps to the
+// remaining window.
 uint32_t max_tokens(const json& body,long long dflt) {
+    static const long long env_dflt=[]{
+        const char* e=getenv("Q27_METAL_MAX_TOKENS_DEFAULT");
+        return e&&*e?atoll(e):0ll;
+    }();
+    if(env_dflt>0) dflt=env_dflt;
     long long value=body.value("max_tokens",body.value("max_output_tokens",dflt));
     if(value<0 || value>UINT32_MAX) throw std::runtime_error("invalid max_tokens");
     return (uint32_t)value;
@@ -1085,16 +1168,29 @@ int main(int argc,char** argv) {
                                              {"suffix_fallbacks",(uint64_t)runtime.suffix_fallback_rounds_total}}},
                              {"snapshots",{{"enabled",runtime.snapstore.enabled()},
                                            {"disk_hits",(uint64_t)runtime.snapstore.hits},
-                                           {"disk_saves",(uint64_t)runtime.snapstore.saves}}}});
+                                           {"disk_saves",(uint64_t)runtime.snapstore.saves}}},
+                             {"cancellations",{{"queued",(uint64_t)runtime.cancelled_queue},
+                                               {"prefill",(uint64_t)runtime.cancelled_prefill}}}});
         });
         server.Get("/v1/models",[](const httplib::Request&,httplib::Response& r){json_response(r,{{"object","list"},{"data",json::array({{{"id","q27-metal"},{"object","model"}}})}});});
 
         auto guarded=[&](auto handler) {
             return [&,handler](const httplib::Request& request,httplib::Response& response) {
-                try { handler(json::parse(request.body),response); }
+                try { handler(json::parse(request.body),response,request.sock); }
+                // 499 (client closed request): on a genuinely dead socket
+                // the write fails harmlessly; on an is_socket_alive false
+                // negative the client gets a parseable error instead of an
+                // empty 200 (codex P2 on this round).
+                catch(const Runtime::ClientGone&) { response.status=499; }
                 catch(const Runtime::ServerOverloaded& e) { json_response(response,{{"error",{{"message",e.what()},{"type","overloaded_error"}}}},503); }
                 catch(const std::exception& e) { json_response(response,{{"error",{{"message",e.what()},{"type","invalid_request_error"}}}},400); }
             };
+        };
+        // Liveness probe for phases with no response writes yet (queue wait,
+        // prefill) and for non-streaming generation. The socket fd rides
+        // the q27 httplib patch (Request::sock).
+        auto socket_live=[](socket_t sock){
+            return [sock]{ return httplib::detail::is_socket_alive(sock); };
         };
         // Anthropic endpoints answer in Anthropic's error envelope
         // ({"type":"error","error":{...}} — the SDK inside Claude Code reads
@@ -1109,7 +1205,9 @@ int main(int argc,char** argv) {
                     response.set_content(q27::anthropic_error_json("invalid_request_error","invalid JSON body"),"application/json");
                     return;
                 }
-                try { handler(body,response); }
+                try { handler(body,response,request.sock); }
+                // 499 as in `guarded` (codex P2): never an empty 200.
+                catch(const Runtime::ClientGone&) { response.status=499; }
                 catch(const Runtime::ServerOverloaded& e) {
                     response.status=503;
                     response.set_content(q27::anthropic_error_json("overloaded_error",e.what()),"application/json");
@@ -1132,7 +1230,7 @@ int main(int argc,char** argv) {
 
         // ---- OpenAI /v1/completions (raw continuation; no template, no
         // tool protocol) ----
-        server.Post("/v1/completions",guarded([&](const json& body,httplib::Response& r){
+        server.Post("/v1/completions",guarded([&](const json& body,httplib::Response& r,socket_t sock){
             auto ids=to_u32(runtime.tokenizer.encode(body.value("prompt","")));
             uint32_t n=max_tokens(body,256);
             const q27::SamplingParams sampling=sampling_params(body);
@@ -1147,10 +1245,11 @@ int main(int argc,char** argv) {
                 return;
             }
             if(!wants_stream(body)) {
-                std::string text;
+                std::string text; size_t probe=0;
                 auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ text+=piece; return true; },
-                    tool_names_from(body),body.value("snapshot",false));
+                    [&](const std::string& piece){ text+=piece;
+                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                    tool_names_from(body),body.value("snapshot",false),socket_live(sock));
                 json_response(r,{{"id",id},{"object","text_completion"},{"created",created},{"model","q27-metal"},
                     {"choices",json::array({{{"index",0},{"text",text},{"finish_reason",openai_finish(outcome.finish)}}})},
                     {"usage",{{"prompt_tokens",outcome.prompt_tokens},{"completion_tokens",outcome.output_tokens},
@@ -1162,20 +1261,23 @@ int main(int argc,char** argv) {
             const std::vector<std::string> tnames=tool_names_from(body);
             const bool snap_hint=body.value("snapshot",false);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,id,created,tnames,snap_hint](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,id,created,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
                     try {
                         auto emit=[&](const std::string& piece)->bool {
                             std::string s=q27::sse_data(
                                 q27::openai_stream_chunk(false,id,"text_completion",created,"q27-metal",piece));
                             return sink.write(s.data(),s.size());
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
+                            [sock]{ return httplib::detail::is_socket_alive(sock); });
                         // Terminal chunk with a real finish_reason before [DONE]
                         // (parity with server.cu security-review fix #7).
                         std::string fin=q27::sse_data(q27::openai_stream_final_chunk(
                             false,id,"text_completion",created,"q27-metal",openai_finish(outcome.finish)));
                         sink.write(fin.data(),fin.size());
                         std::string done=q27::sse_done(); sink.write(done.data(),done.size());
+                    } catch(const Runtime::ClientGone&) {
+                        return false;
                     } catch(const std::exception& e) {
                         std::string s=q27::sse_data({{"error",{{"message",e.what()},{"type","invalid_request_error"}}}});
                         sink.write(s.data(),s.size());
@@ -1193,7 +1295,7 @@ int main(int argc,char** argv) {
         // one delta.tool_calls chunk per call (streaming) with finish_reason
         // "tool_calls"; <think> segments go to reasoning_content (llama.cpp
         // convention) instead of leaking raw into content.
-        server.Post("/v1/chat/completions",guarded([&](const json& body,httplib::Response& r){
+        server.Post("/v1/chat/completions",guarded([&](const json& body,httplib::Response& r,socket_t sock){
             bool think=body.value("enable_thinking",true);
             if(body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
                 think=body["chat_template_kwargs"].value("enable_thinking",think);
@@ -1228,9 +1330,11 @@ int main(int argc,char** argv) {
                     }
                     (ch==q27::StreamSplitter::THINK?think_buf:text)+=t;
                 };
+                size_t probe=0;
                 auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t); return true; },
-                    tnames,snap_hint);
+                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                    tnames,snap_hint,socket_live(sock));
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
                 std::string th=q27::strip_ws2(think_buf),tx=q27::strip_ws2(text);
@@ -1270,7 +1374,7 @@ int main(int argc,char** argv) {
             }
             r.set_header("Content-Type","text/event-stream");
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,id,rid,created,tools,has_tools,tnames,snap_hint](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,id,rid,created,tools,has_tools,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
                     bool alive=true;
                     auto chunk=[&](const json& delta,const json& finish){
                         std::string s=q27::sse_data({{"id",id},{"object","chat.completion.chunk"},
@@ -1313,7 +1417,8 @@ int main(int argc,char** argv) {
                             [&](const std::string& piece)->bool {
                                 for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
                                 return alive && sink.is_writable();
-                            },tnames,snap_hint);
+                            },tnames,snap_hint,
+                            [sock]{ return httplib::detail::is_socket_alive(sock); });
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
@@ -1335,6 +1440,8 @@ int main(int argc,char** argv) {
                         }
                         chunk(json::object(),any_call?"tool_calls":openai_finish(outcome.finish));
                         std::string done=q27::sse_done(); sink.write(done.data(),done.size());
+                    } catch(const Runtime::ClientGone&) {
+                        return false;
                     } catch(const std::exception& e) {
                         std::string s=q27::sse_data({{"error",{{"message",e.what()},{"type","invalid_request_error"}}}});
                         sink.write(s.data(),s.size());
@@ -1356,7 +1463,7 @@ int main(int argc,char** argv) {
         // CC calls count_tokens before compaction decisions; a 404 means it
         // estimates blind. Count = exactly what /v1/messages prefills for the
         // same body. CPU-only: no slot, no GPU lease.
-        server.Post("/v1/messages/count_tokens",anthropic_guarded([&](const json& body,httplib::Response& r){
+        server.Post("/v1/messages/count_tokens",anthropic_guarded([&](const json& body,httplib::Response& r,socket_t){
             if(!body.contains("messages") || !body["messages"].is_array()) {
                 r.status=400;
                 r.set_content(q27::anthropic_error_json("invalid_request_error","messages: Field required"),
@@ -1368,7 +1475,7 @@ int main(int argc,char** argv) {
             json_response(r,{{"input_tokens",(long)runtime.tokenizer.encode(rendered).size()}});
         }));
 
-        server.Post("/v1/messages",anthropic_guarded([&](const json& body,httplib::Response& r){
+        server.Post("/v1/messages",anthropic_guarded([&](const json& body,httplib::Response& r,socket_t sock){
             const json tools=q27::anthropic_tools_json(body);
             auto ids=to_u32(runtime.tokenizer.encode(
                 q27::chatml_prompt(q27::anthropic_msgs(body),tools,true)));
@@ -1401,9 +1508,11 @@ int main(int argc,char** argv) {
                     }
                     (ch==q27::StreamSplitter::THINK?think:text)+=t;
                 };
+                size_t probe=0;
                 auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t); return true; },
-                    tnames,snap_hint);
+                    [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                    tnames,snap_hint,socket_live(sock));
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
                 if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
                 json content=json::array();
@@ -1445,7 +1554,7 @@ int main(int argc,char** argv) {
             }
             r.set_header("Content-Type","text/event-stream");
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,mid,rid,tools,has_tools,tnames,snap_hint](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,mid,rid,tools,has_tools,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
                     bool alive=true;
                     auto ev=[&](const char* name,const json& j){
                         std::string s=q27::sse_event(name,j);
@@ -1534,7 +1643,8 @@ int main(int argc,char** argv) {
                             [&](const std::string& piece)->bool {
                                 for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
                                 return alive && sink.is_writable();
-                            },tnames,snap_hint);
+                            },tnames,snap_hint,
+                            [sock]{ return httplib::detail::is_socket_alive(sock); });
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
@@ -1560,6 +1670,8 @@ int main(int argc,char** argv) {
                                       {"stop_sequence",outcome.finish==Runtime::Finish::StopSequence?json(outcome.stop_sequence):json(nullptr)}}},
                             {"usage",{{"output_tokens",outcome.output_tokens}}}});
                         ev("message_stop",{{"type","message_stop"}});
+                    } catch(const Runtime::ClientGone&) {
+                        return false;
                     } catch(const std::exception& e) {
                         // First-class error event; message_stop still follows so
                         // naive clients get a well-formed stream (server.cu's
@@ -1578,7 +1690,7 @@ int main(int argc,char** argv) {
         // content_part.added, response.output_text.delta per piece,
         // output_text.done, content_part.done, output_item.done,
         // response.completed. Codex keys off the JSON `type` field.
-        server.Post("/v1/responses",guarded([&](const json& body,httplib::Response& r){
+        server.Post("/v1/responses",guarded([&](const json& body,httplib::Response& r,socket_t sock){
             std::string input=body.contains("input")?text_content(body["input"]):"";
             // Validate BEFORE the preamble (codex P1): an item-array input
             // that text_content cannot flatten must fail loud here — a
@@ -1621,10 +1733,11 @@ int main(int argc,char** argv) {
                 return;
             }
             if(!wants_stream(body)) {
-                std::string text;
+                std::string text; size_t probe=0;
                 auto outcome=runtime.run(ids,n,sampling,stops,
-                    [&](const std::string& piece){ text+=piece; return true; },
-                    tool_names_from(body),body.value("snapshot",false));
+                    [&](const std::string& piece){ text+=piece;
+                        return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                    tool_names_from(body),body.value("snapshot",false),socket_live(sock));
                 json_response(r,{{"id",rid},{"object","response"},{"model","q27-metal"},{"status","completed"},
                     {"output_text",text},
                     {"output",json::array({{{"type","message"},{"id",mid},{"role","assistant"},{"status","completed"},
@@ -1638,7 +1751,7 @@ int main(int argc,char** argv) {
             const std::vector<std::string> tnames=tool_names_from(body);
             const bool snap_hint=body.value("snapshot",false);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,rid,mid,tnames,snap_hint](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,rid,mid,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
                     auto ev=[&](const json& j){ std::string s=q27::sse_event(j.value("type",std::string("x")),j); return sink.write(s.data(),s.size()); };
                     try {
                         // Gate the run on the opening writes and probe the
@@ -1659,7 +1772,8 @@ int main(int argc,char** argv) {
                             return ev({{"type","response.output_text.delta"},{"item_id",mid},
                                 {"output_index",0},{"content_index",0},{"delta",piece}});
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint);
+                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
+                            [sock]{ return httplib::detail::is_socket_alive(sock); });
                         ev({{"type","response.output_text.done"},{"item_id",mid},{"output_index",0},{"content_index",0},{"text",text}});
                         ev({{"type","response.content_part.done"},{"item_id",mid},{"output_index",0},{"content_index",0},
                             {"part",{{"type","output_text"},{"text",text},{"annotations",json::array()}}}});
@@ -1670,6 +1784,8 @@ int main(int argc,char** argv) {
                             {"output",json::array({item})},
                             {"usage",{{"input_tokens",outcome.prompt_tokens},{"output_tokens",outcome.output_tokens},
                                       {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}}}}});
+                    } catch(const Runtime::ClientGone&) {
+                        return false;
                     } catch(const std::exception& e) {
                         ev({{"type","error"},{"error",{{"type","invalid_request_error"},{"message",e.what()}}}});
                     }

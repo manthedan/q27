@@ -661,6 +661,12 @@ struct Request {
   ContentProvider content_provider_;
   bool is_chunked_content_provider_ = false;
   size_t authorization_count_ = 0;
+
+  // q27 patch (server-side only): the connection's socket fd, so handlers
+  // that run long GPU work before their first response write can probe
+  // client liveness via detail::is_socket_alive(req.sock). Set in
+  // Server::process_request; INVALID_SOCKET for client-side Request use.
+  socket_t sock = INVALID_SOCKET;
 };
 
 struct Response {
@@ -7050,6 +7056,7 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   if (!line_reader.getline()) { return false; }
 
   Request req;
+  req.sock = strm.socket(); // q27 patch: see Request::sock
 
   Response res;
   res.version = "HTTP/1.1";
