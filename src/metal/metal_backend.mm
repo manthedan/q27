@@ -166,8 +166,11 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> t3;
     id<MTLComputePipelineState> t2_quantized_matmul_h;
     id<MTLComputePipelineState> mask_logits_p;
-    // Half-staging T2 chunk GEMM: default ON (1.28x chunk rate at quality
-    // parity on this tier's gates); Q27_METAL_GEMM_HALF=0 opts out.
+    // Half-staging T2 chunk GEMM: default ON (landed at 1.22x chunk rate at
+    // quality parity — the GEMM envelope class, docs/plans/2026-07-15-
+    // margin-aware-gates.md); Q27_METAL_GEMM_HALF=0 opts out and exactly
+    // reproduces the float-staged route (used to attribute the kl-kv
+    // calibration shift to the digit, 2026-07-16-kv-codec-step1.md).
     bool gemm_half = true;
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> q8_quantized;
