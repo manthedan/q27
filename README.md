@@ -138,6 +138,7 @@ CUDA numbers are upstream's, re-validated on this fork byte-exactly.
 | RTX 3090 (24 GB) | default + turbo3 KV | **102.2 t/s** median | w8 server, 131K context |
 | M4 (24 GB) | default | ~12.5 t/s | batched MTP, 58.5% acceptance |
 | M4 (16 GB mini) | T2 | ~11.7 t/s greedy | 99% of the machine's own resident-weight ceiling |
+| M4 (24 GB) | B1 | **~18.7 t/s** greedy warm | memory wall: 3.36 GiB/token @ ~69 GB/s; select round 2 shipped (kernel 2.36×, wall noise — strictly dominates) |
 | M4 | T2 prefill | **47.2 t/s** | width-96 layer-major chunks, prefill closed as MATURE on this hardware |
 
 For calibration, the same model on the same 5090 runs at 117.1 t/s

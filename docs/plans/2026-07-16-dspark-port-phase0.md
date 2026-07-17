@@ -190,3 +190,34 @@ accept/reject through the batched verify is the correctness-equivalent
 baseline; scheduling is a Phase-4+ acceptance optimization measured
 separately); any drafter training; CUDA-side DSpark (upstream's fork already
 has the reference; our CUDA tier has native MTP).
+
+## Whitepaper read-through addendum (2026-07-17; reconciles the paper with the measured park above)
+
+Read of §6 + Table 9 against this plan's RESOLVED verdict:
+
+- **Paper vs measured acceptance:** Table 9 (H100, greedy, 24 diverse
+  chat prompts, k=4) reports ternary τ = 3.7. Our leg-B (fork harness,
+  real target+drafter, 24 prompts / 712 rounds on this box) measured
+  **τ = 3.209**, per-depth flat, category spread chat 2.40 / reasoning
+  3.63 / code 4.02. The measured run governs; the paper's number is not
+  contradicted so much as out-voted by 712 rounds on the exact stack in
+  question.
+- **§6.2 corroborated at home:** the vendor's Apple-Silicon batch-1 caveat
+  held in their own stack here — fork speedup 0.528 on the same run.
+- **Marginal drafter cost correction (recorded, moot):** the paper states
+  drafter-unique weights are ~0.5 GB at serving precision (embeddings and
+  output head shared with the resident target); the 1.95 GB pack — and our
+  1.97 GB repack — is the standalone form. This makes the park MORE
+  decisive, not less: the gate's chained upper bound already excluded
+  drafter forward cost entirely and still reached only S ≤ 1.07 < 1.3.
+- **What survives the park:** multi-row verification is cheap on this box
+  (~flat per 16-token tile; oracle S(48) = 3.94×) — which is exactly why
+  suffix-burst widening at w=48 inherits the speculation lever. The
+  binding constraint for LEARNED drafters here is acceptance against the
+  fixed per-tile verify cost (τ ≈ 3.2 vs BE 4.13), not verify cost
+  itself; suffix bursts dodge it because the drafter costs ~0 bytes and
+  its matches are exact by construction.
+- Honesty note: an earlier same-day draft of this addendum (written from
+  the chronicle's Phase-0/1 entry without reading this header) sketched
+  18–26 tok/s and recommended finishing the port. Superseded by the
+  RESOLVED gate above; corrected in place.
