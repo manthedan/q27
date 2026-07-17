@@ -305,7 +305,11 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
             while (at < list.size()) {
                 size_t comma = list.find(',', at);
                 if (comma == std::string::npos) comma = list.size();
-                const unsigned long cell = std::stoul(list.substr(at, comma - at));
+                const std::string field = list.substr(at, comma - at);
+                size_t used = 0;
+                const unsigned long cell = std::stoul(field, &used);
+                if (used != field.size())
+                    throw std::runtime_error("q27 Metal: malformed Q27_METAL_KV_FP16_CELLS entry: " + field);
                 if (cell >= 128)
                     throw std::runtime_error("q27 Metal: Q27_METAL_KV_FP16_CELLS cells must be 0..127");
                 side_masks[cell >> 3][(cell >> 1) & 3] |= uint8_t(1u << (cell & 1u));
@@ -623,6 +627,8 @@ uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block, bool ch
 }
 
 std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
+    if (kv_fp16_except_)
+        throw std::runtime_error("q27 Metal: snapshots do not yet serialize the KV fp16 exception side caches (Q27_METAL_KV_FP16_CELLS); recorded v1 exclusion");
     backend_.synchronize();
     auto snapshot = std::make_shared<Snapshot>();
     snapshot->owner = this; snapshot->position = position_; snapshot->layers.resize(N_LAYER);
@@ -648,6 +654,8 @@ std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
 }
 
 void MetalEngine::restore_state(const Snapshot& snapshot) {
+    if (kv_fp16_except_)
+        throw std::runtime_error("q27 Metal: snapshots do not yet serialize the KV fp16 exception side caches (Q27_METAL_KV_FP16_CELLS); recorded v1 exclusion");
     if(snapshot.owner!=this || snapshot.layers.size()!=N_LAYER || snapshot.position>max_context_)
         throw std::runtime_error("q27 Metal: incompatible state snapshot");
     backend_.synchronize();
