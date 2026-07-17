@@ -525,7 +525,8 @@ int run_official_probe(q27::MetalBackend& backend, int reps) {
     for (const ProbeShape& p : probes) {
         const Shape& s = p.shape;
         // Activations + the exact CPU int8 model of q27_quantize_x: per
-        // 32-block amax/127 float scale, rint (nearest-even, matching Metal),
+        // 32-block amax/127 float scale, reciprocal-multiply + rint
+        // (nearest-even, matching Metal's CUDA-parity form — k3 audit D1),
         // clamp to [-127,127].
         std::vector<float> x(s.cols);
         for (uint32_t i = 0; i < s.cols; i++) x[i] = (float)((int)(i % 23) - 11) / 11.0f;
@@ -536,8 +537,9 @@ int run_official_probe(q27::MetalBackend& backend, int reps) {
             for (uint32_t i = 0; i < 32; i++) amax = std::fmax(amax, std::fabs(x[b * 32 + i]));
             const float sc = amax / 127.0f;
             xs[b] = sc;
+            const float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
             for (uint32_t i = 0; i < 32; i++) {
-                const int q = sc > 0.0f ? (int)std::rint(x[b * 32 + i] / sc) : 0;
+                const int q = (int)std::rint(x[b * 32 + i] * inv);
                 xq8[b * 32 + i] = (int8_t)std::min(127, std::max(-127, q));
             }
         }

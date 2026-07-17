@@ -13,23 +13,15 @@ using namespace metal;
 struct MatvecArgs {
     uint rows;
     uint cols;
-    uint simdgroups;
 };
-struct MatvecPairArgs { uint rows_a; uint rows_b; uint cols; uint simdgroups; };
+struct MatvecPairArgs { uint rows_a; uint rows_b; uint cols; };
 struct MatmulArgs { uint rows; uint cols; uint x_rows; uint simdgroups; };
 
-inline void reduce_row(float sum, device float *out, uint row,
-                       threadgroup float *partial, ushort lane, ushort simdgroup,
-                       uint simdgroups) {
-    sum = simd_sum(sum);
-    if (lane == 0) partial[simdgroup] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (simdgroup == 0) {
-        float total = lane < simdgroups ? partial[lane] : 0.0f;
-        total = simd_sum(total);
-        if (lane == 0) out[row] = total;
-    }
+// Goldberg's exact-correction log1p — tracks CUDA log1pf to ~1 ulp; MSL has
+// no log1p (k3 audit D2).
+inline float log1p_f(float t) {
+    const float u = 1.0f + t;
+    return u == 1.0f ? t : log(u) * (t / (u - 1.0f));
 }
 
 kernel void q27_matvec_f32(
@@ -595,6 +587,8 @@ kernel void q27_b1_x_prep(
     amax = max(max(pmax[0], pmax[1]), max(pmax[2], pmax[3]));
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float s = amax / 127.0f;
+    // k3 audit D1 scope: B1 keeps round(xv/s) — Metal-native (no CUDA
+    // twin); matches its metal_gemv_bench CPU model and certified battery.
     const uint u = s > 0.0f ? uint(clamp(round(xv / s) + 128.0f, 0.0f, 255.0f)) : 128u;
     for (uint p = 0; p < 8; p++) {
         const uint m = uint(uint64_t(simd_ballot(bool((u >> p) & 1u))));
@@ -719,8 +713,9 @@ kernel void q27_embedding_b1(
 
 // GPU-resident greedy decode: identical embedding lookups, but the token id
 // comes from the device buffer the previous step's argmax wrote, so chained
-// steps need no CPU sync. A corrupt id past the vocabulary reads garbage,
-// never out of bounds (argmax only writes ids < n).
+// steps need no CPU sync. There is NO clamp on the id: a corrupt id WOULD
+// read out of bounds. Safety rests entirely on the argmax invariant —
+// argmax only writes ids < n, and mask+argmax degrades to id 0.
 kernel void q27_embedding_q8_dev(
         device const char *weights [[buffer(0)]],
         device const half *scales  [[buffer(1)]],
@@ -795,7 +790,10 @@ kernel void q27_rmsnorm_quantized(
     for(uint block=simdgroup;block<blocks;block+=8) {
         const uint i=block*32+lane; const float v=out[i];
         const float amax=simd_max(abs(v)); const float scale=amax/127.0f;
-        int q=scale>0.0f?int(rint(v/scale)):0; q=clamp(q,-127,127);
+        // k3 audit D1: reciprocal-multiply matches CUDA k_quantize_x — one
+        // rounding rule across backends (rint == __float2int_rn under RNE).
+        const float qinv=scale>0.0f?1.0f/scale:0.0f;
+        int q=int(rint(v*qinv)); q=clamp(q,-127,127);
         values[i]=char(q); if(lane==0) scales[block]=scale;
     }
 }
@@ -1008,7 +1006,7 @@ kernel void q27_gdn_gates(device const float *alpha [[buffer(0)]],
     if (gid >= heads) return;
     const float value = alpha[gid] + ssm_dt[gid];
     const float softplus = value > 20.0f ? value
-                         : (value < -16.0f ? exp(value) : log(1.0f + exp(value)));
+                         : (value < -16.0f ? exp(value) : log1p_f(exp(value)));
     g[gid] = ssm_a[gid] * softplus;
     beta[gid] = 1.0f / (1.0f + exp(-beta_raw[gid]));
 }
@@ -1122,7 +1120,10 @@ kernel void q27_quantize_x(device const float *x [[buffer(0)]],
     float v = i < count ? x[i] : 0.0f;
     float amax = simd_max(abs(v));
     float scale = amax / 127.0f;
-    int q = scale > 0.0f ? int(rint(v / scale)) : 0;
+    // k3 audit D1: reciprocal-multiply matches CUDA k_quantize_x — one
+    // rounding rule across backends (rint == __float2int_rn under RNE).
+    const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+    int q = int(rint(v * inv));
     q = clamp(q, -127, 127);
     if (i < count) values[i] = char(q);
     if (lane == 0) scales[group] = scale;
@@ -1754,15 +1755,17 @@ kernel void q27_matmul_t2_mm(
 
 // Half-staging variant of the T2 chunk GEMM (default path,
 // Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
-// variant B): tiles and accumulators are half, which doubles simdgroup-MMA
-// rate and halves threadgroup traffic, and BOTH operands stay integer-exact
-// in half — trits on the weight side, raw int8 on the activation side. The
-// activation scale folds at the flush instead of at staging, so flushes run
-// per 32-K sub-slab (the x-scale group) with the racc component scaled by
-// ws(row) * xs(token); flushes run per 16-K sub-slab, so partials are
-// integer sums bounded by 16*127 = 2032 — always exact in half. (Variant A
-// staged prescaled activations and failed the shape suite; variant B's
-// 32-K flush let sums round past 2048 and moved the 2K NLL +0.4%.)
+// variant G′): tiles are half — doubled simdgroup-MMA rate, halved
+// threadgroup traffic — and BOTH operands stay integer-exact in half: trits
+// on the weight side, raw int8 on the activation side. Accumulators are
+// FLOAT (mixed-precision MMA), keeping int8 x trit sums exact to 2^24.
+// Scales fold at the flush instead of at staging: each 64-K staged tile
+// accumulates its two 32-K sub-slabs (the x-scale groups) into separate
+// accumulator pairs, folded into racc in ONE barrier region per tile with
+// component (row, token) scaled by ws(row) * xs(token, sub-slab). (Variant
+// A staged prescaled activations and failed the shape suite; half
+// ACCUMULATION rounds past 2048 — variant B's 32-K half flush moved the
+// 2K NLL +0.4%.)
 // Trit code -> half bit pattern: (c-1) as f16 is one of three constants
 // (code 3 decodes to +2, preserving the arithmetic unpack's behavior for
 // a corrupt pack byte). The MMA roofline measured the unpack/convert
@@ -3151,7 +3154,10 @@ kernel void q27_rmsnorm_rows_quantized(
     for (uint block = simdgroup; block < blocks; block += 8) {
         const uint i = block * 32 + lane; const float v = or_[i];
         const float amax = simd_max(abs(v)); const float scale = amax / 127.0f;
-        int q = scale > 0.0f ? int(rint(v / scale)) : 0; q = clamp(q, -127, 127);
+        // k3 audit D1: reciprocal-multiply matches CUDA k_quantize_x — one
+        // rounding rule across backends (rint == __float2int_rn under RNE).
+        const float qinv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        int q = int(rint(v * qinv)); q = clamp(q, -127, 127);
         vr[i] = char(q); if (lane == 0) sr[block] = scale;
     }
 }
@@ -3218,7 +3224,7 @@ kernel void q27_gdn_gates_rows(device const float *alpha [[buffer(0)]],
     const uint head = gid % args.heads;
     const float value = alpha[gid] + ssm_dt[head];
     const float softplus = value > 20.0f ? value
-                         : (value < -16.0f ? exp(value) : log(1.0f + exp(value)));
+                         : (value < -16.0f ? exp(value) : log1p_f(exp(value)));
     g[gid] = ssm_a[head] * softplus;
     beta[gid] = 1.0f / (1.0f + exp(-beta_raw[gid]));
 }
@@ -3545,7 +3551,12 @@ kernel void q27_turbo_wht(device float *x [[buffer(0)]],
                            uint group [[threadgroup_position_in_grid]],
                            uint j [[thread_index_in_threadgroup]]) {
     const uint head = group >> 1, g = group & 1;
-    if (head >= args.heads || j >= 128) return;
+    // Guards here must be threadgroup-uniform (they derive from
+    // threadgroup_position only): a thread-index guard before the butterfly
+    // barriers is divergent and would under-populate them if a dispatch ever
+    // exceeded 128 threads. The host dispatches exactly 128; width guards
+    // land host-side (k3 audit A2/E6).
+    if (head >= args.heads) return;
     device float *xh = x + (ulong)head * args.stride + g * 128;
     threadgroup float xs[128];
     xs[j] = xh[j] * float(args.inverse ? turbo_s2[j] : turbo_s1[j]);
@@ -3562,7 +3573,7 @@ kernel void q27_kv_store_turbo3(device const float *k [[buffer(0)]],
                                  uint2 group [[threadgroup_position_in_grid]],
                                  uint j [[thread_index_in_threadgroup]]) {
     const uint h = group.x >> 1, g = group.x & 1;
-    if (h >= args.kv_heads || group.y >= 2 || j >= 128) return;
+    if (h >= args.kv_heads || group.y >= 2) return;
     device const float *src = (group.y ? v : k) + (ulong)h * 256 + g * 128;
     device uchar *cache = group.y ? vc : kc;
     device uchar *block = cache + ((ulong)args.position * args.kv_heads * 2 + h * 2 + g) * 50;
@@ -3676,7 +3687,7 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
                                       uint3 group [[threadgroup_position_in_grid]],
                                       uint j [[thread_index_in_threadgroup]]) {
     const uint h = group.x >> 1, g = group.x & 1, token = group.z;
-    if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens || j >= 128) return;
+    if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens) return;
     device const float *src = (group.y ? v : k) +
         (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
     device uchar *cache = group.y ? vc : kc;
@@ -3739,7 +3750,7 @@ kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
                                           uint3 group [[threadgroup_position_in_grid]],
                                           uint j [[thread_index_in_threadgroup]]) {
     const uint h = group.x >> 1, g = group.x & 1, token = group.z;
-    if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens || j >= 128) return;
+    if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens) return;
     device const float *src = (group.y ? v : k) +
         (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
     device half *dst = (group.y ? vc : kc) +
