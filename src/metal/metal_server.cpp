@@ -301,6 +301,10 @@ struct Runtime {
     // the Phase 1 one-active-quantum guarantee applies to THIS one).
     struct WaitStats { uint64_t n=0; double sum_ms=0, max_ms=0; };
     std::map<std::string,WaitStats> queue_wait_stats, gate_wait_stats;
+    // Speculation ground truth for the multislot MTP gates: a quantum round
+    // committing >1 token proves accepted drafts, so committed > rounds is
+    // the nonzero-speculation assert's unfakeable signal (vacuous-gate rule).
+    std::atomic<uint64_t> spec_rounds_total{0}, spec_committed_total{0};
     bool constrain_tools=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
@@ -716,6 +720,8 @@ struct Runtime {
                     pending=engine.mtp_round(pending,count-produced,eos_id,mtp_width,
                                              live_width,committed);
                 }
+                spec_rounds_total.fetch_add(1,std::memory_order_relaxed);
+                spec_committed_total.fetch_add(committed.size(),std::memory_order_relaxed);
                 for(uint32_t token:committed) {
                     if(token==eos_id) { cause=q27::MetalEngine::StopCause::Eos; stopped=true; break; }
                     if(!deliver(token)) { stopped=true; break; }
@@ -897,6 +903,8 @@ int main(int argc,char** argv) {
             json_response(r,{{"slots",runtime.slots.size()},
                              {"gate_wait_by_arrival",gate},
                              {"queue_wait_by_arrival",queue},
+                             {"speculation",{{"rounds",(uint64_t)runtime.spec_rounds_total},
+                                             {"committed",(uint64_t)runtime.spec_committed_total}}},
                              {"snapshots",{{"enabled",runtime.snapstore.enabled()},
                                            {"disk_hits",(uint64_t)runtime.snapstore.hits},
                                            {"disk_saves",(uint64_t)runtime.snapstore.saves}}}});
