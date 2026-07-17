@@ -333,3 +333,46 @@ the dspark work, 2026-07-16); the open work is engine integration
 (loader dtype 6 → backend tensors → c1 kernel as `matvec` for B1
 weights) and then the Phase 0A machine-checkable quality gates on the
 real artifact through our own engine.
+
+## Phases 1–3 results (2026-07-16 night, 24 GB M4)
+
+**Phase 1 — repack: DONE.** `tools/repack.py` detects the binary pack by
+tensor type (arch string is plain `qwen35`, same as ternary), emits
+`quant_policy: bonsai-b1-v1` + b1 meta keys, hard-fails any source type
+other than Q1_0/F32, and skips the MTP head alias. Census: 851 tensors =
+498 Q1_0 + 353 F32 — name set and every shape identical to the ternary
+pack; no blk.64. Full repack of `Bonsai-27B-Q1_0.gguf` →
+`bonsai-27b-b1.q27` (3.79 GB): all 498 lossless byte-copies, RMSE 0.0000,
+chunked round-trip gate green. Residue: the `-unpacked` masters
+cross-check (preferred source rule) — the masters live on the mini; the
+GGUF-sourced pack is bit-faithful to the GGUF by construction, and the
+cross-check gates only vendor packing errors. Registered for the mini's
+queue, not skipped silently.
+
+**Phase 2 — kernels: DONE.** Production surface mirrors T2 exactly:
+`q27_matvec_b1_g128` (select-form, promoted from the Phase 0B c1 winner),
+`q27_matvec_b1_quantized` (int8-x integer-exact), `q27_matmul_b1_mm`
+(half-staged LUT GEMM like T2's production route), `q27_embedding_b1`
+/`_dev`/`_rows`; per-dtype routing behind the existing backend entry
+points; `Q27_SHADER_ABI` unchanged (additive only). Tests mirror the T2
+battery in `test_metal.cpp` — narrow-exact, wide float/int with
+threadgroup-spanning rows and nonuniform scales, GEMM tile parity,
+embedding parity — all green in `make test-metal`.
+
+**Phase 3 — loader/dispatch: DONE.** `B1_G128 = 6` in the DType registry;
+`validate_architecture` generalizes `ternary` to a bonsai pair (policy
+string selects the tier dtype; both assert 64 blocks / no MTP / group
+128); `project`/`project_pair` and the quantize-skip sites key on a
+shared `is_bonsai_dtype` — B1 rides the float-activation select path
+end-to-end, chunked prefill included. `--validate-only` green on both
+bonsai packs.
+
+**First light + Phase 4 (partial):** "The capital of France is" → " Paris."
+— 13.5 tok/s on the very first cold, contended, untuned run (Phase 0B
+projection: ~23 tok/s at bandwidth parity). Suffix byte-identity battery
+(serial vs `--suffix-serial`/w16/w32/w48) passes on the B1 pack with
+bursts firing. Phase 4 residue, registered: vendor-fork byte gate (needs
+the fork binary — mini), official-tier canonical smoke + CUDA byte gate
+at merge, `metal_decode_bench` resident-vs-artifact at matched thermal
+state and the 8K→32K NLL ladder (quiet machine), Phase 0A quality gates
+re-run through OUR engine (the vendor-stack numbers stand in until then).

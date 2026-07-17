@@ -17,8 +17,11 @@
 namespace q27 {
 namespace {
 
-bool is_matrix_dtype(DType dtype) {
-    return dtype == DType::Q4_G64 || dtype == DType::Q8_G128 || dtype == DType::T2_G128;
+// Bonsai matrix tiers (T2 ternary / B1 binary): exact select-form math on
+// float activations, no activation quantization — one dispatch policy for
+// both (binary-tier plan, Phase 3). Q4/Q8 keep the packed-dot quantized path.
+bool is_bonsai_dtype(DType dtype) {
+    return dtype == DType::T2_G128 || dtype == DType::B1_G128;
 }
 
 class CommandBatch {
@@ -77,10 +80,14 @@ void MetalEngine::validate_architecture() const {
     };
     if (meta.value("general.architecture", std::string()) != "qwen35")
         throw std::runtime_error("q27 Metal: expected qwen35 architecture");
-    // Ternary artifacts (Bonsai repack): 64 blocks, no MTP layer, ternary
-    // embeddings/head/alpha/beta. Everything else matches the official tier.
-    const bool ternary = meta.value("quant_policy", std::string()) == "bonsai-t2-v1";
-    exact("qwen35.block_count", ternary ? 64 : 65); exact("qwen35.embedding_length", N_EMBD);
+    // Bonsai artifacts (T2 ternary / B1 binary repacks): 64 blocks, no MTP
+    // layer, bonsai-dtype embeddings/head/alpha/beta. Everything else
+    // matches the official tier; the two bonsai packs differ only in dtype.
+    const std::string policy = meta.value("quant_policy", std::string());
+    const bool ternary = policy == "bonsai-t2-v1";
+    const bool binary = policy == "bonsai-b1-v1";
+    const bool bonsai = ternary || binary;
+    exact("qwen35.block_count", bonsai ? 64 : 65); exact("qwen35.embedding_length", N_EMBD);
     exact("qwen35.feed_forward_length", N_FFN); exact("qwen35.attention.head_count", N_HEAD);
     exact("qwen35.attention.head_count_kv", N_KV); exact("qwen35.attention.key_length", HEAD_DIM);
     exact("qwen35.attention.value_length", HEAD_DIM); exact("qwen35.ssm.state_size", GDN_DIM);
@@ -88,9 +95,25 @@ void MetalEngine::validate_architecture() const {
     exact("qwen35.context_length", 262144); exact("qwen35.rope.dimension_count", N_ROT);
     exact("qwen35.ssm.conv_kernel", 4); exact("qwen35.ssm.time_step_rank", GDN_HEADS);
     exact("qwen35.full_attention_interval", 4);
-    if (!ternary) exact("qwen35.nextn_predict_layers", 1);
+    if (!bonsai) exact("qwen35.nextn_predict_layers", 1);
     exact("group_q4", 64); exact("group_q8", 128);
-    if (ternary) exact("group_t2", 128);
+    auto exact_str = [&](const char* key, const char* expected) {
+        if (meta.value(key, std::string()) != expected)
+            throw std::runtime_error(std::string("q27 Metal: architecture mismatch: ") + key);
+    };
+    // The kernels hardcode the pack encodings; the meta strings are the
+    // repack's declaration of what it wrote (codex P3 on the B1 wiring —
+    // the T2 twin closes the same pre-existing gap).
+    if (ternary) {
+        exact("group_t2", 128);
+        exact_str("t2_codes", "0=-1,1=0,2=+1;3 forbidden");
+        exact_str("t2_slot_order", "seq-lsb-first");
+    }
+    if (binary) {
+        exact("group_b1", 128);
+        exact_str("b1_codes", "1=+d,0=-d");
+        exact_str("b1_bit_order", "seq-lsb-first");
+    }
     if (meta.value("nibble_order", std::string()) != "even=low")
         throw std::runtime_error("q27 Metal: incompatible Q4 nibble order");
     auto exact_float = [&](const char* key, double expected, double tolerance) {
@@ -107,13 +130,13 @@ void MetalEngine::validate_architecture() const {
 
     std::vector<uint32_t> expected_attention;
     for (uint32_t i = 3; i < N_LAYER; i += 4) expected_attention.push_back(i);
-    const size_t expected_map = expected_attention.size() + (ternary ? 0 : 1);
+    const size_t expected_map = expected_attention.size() + (bonsai ? 0 : 1);
     if (!meta.contains("attn_layers") || meta["attn_layers"].size() != expected_map)
         throw std::runtime_error("q27 Metal: invalid attention layer map");
     for (size_t i = 0; i < expected_attention.size(); i++)
         if (meta["attn_layers"][i].get<uint32_t>() != expected_attention[i])
             throw std::runtime_error("q27 Metal: unexpected attention layer map");
-    if (!ternary && meta["attn_layers"].back().get<uint32_t>() != 64)
+    if (!bonsai && meta["attn_layers"].back().get<uint32_t>() != 64)
         throw std::runtime_error("q27 Metal: missing MTP attention layer");
 
     auto require = [&](const std::string& name, DType dtype, std::initializer_list<uint64_t> shape) {
@@ -121,13 +144,23 @@ void MetalEngine::validate_architecture() const {
         if (!tensor || tensor->dtype != dtype || tensor->shape != std::vector<uint64_t>(shape))
             throw std::runtime_error("q27 Metal: required tensor mismatch: " + name);
     };
+    // The allowed matrix dtype set follows the pack policy (codex P2 on
+    // the B1 wiring): per-tensor routing would happily run a mixed-tier
+    // artifact, so a stray wrong-tier matrix means a broken repack and
+    // must fail here, not compute silently.
+    auto matrix_dtype_ok = [&](DType dtype) {
+        if (ternary) return dtype == DType::T2_G128;
+        if (binary) return dtype == DType::B1_G128;
+        return dtype == DType::Q4_G64 || dtype == DType::Q8_G128;
+    };
     auto matrix = [&](const std::string& name, uint64_t rows, uint64_t cols) {
         const Tensor* tensor = model_.find(name);
-        if (!tensor || !is_matrix_dtype(tensor->dtype) || tensor->shape != std::vector<uint64_t>{rows, cols})
+        if (!tensor || !matrix_dtype_ok(tensor->dtype) || tensor->shape != std::vector<uint64_t>{rows, cols})
             throw std::runtime_error("q27 Metal: required matrix mismatch: " + name);
     };
 
-    const DType vocab_dtype = ternary ? DType::T2_G128 : DType::Q8_G128;
+    const DType vocab_dtype = ternary ? DType::T2_G128
+                            : binary ? DType::B1_G128 : DType::Q8_G128;
     require("token_embd.weight", vocab_dtype, {VOCAB, N_EMBD});
     require("output.weight", vocab_dtype, {VOCAB, N_EMBD});
     require("output_norm.weight", DType::F32, {N_EMBD});
@@ -148,9 +181,11 @@ void MetalEngine::validate_architecture() const {
         } else {
             matrix(p + "attn_qkv.weight", GDN_CH, N_EMBD);
             matrix(p + "attn_gate.weight", GDN_V, N_EMBD);
-            require(p + "ssm_alpha.weight", ternary ? DType::T2_G128 : DType::F16,
+            require(p + "ssm_alpha.weight", ternary ? DType::T2_G128
+                                            : binary ? DType::B1_G128 : DType::F16,
                     {GDN_HEADS, N_EMBD});
-            require(p + "ssm_beta.weight", ternary ? DType::T2_G128 : DType::F16,
+            require(p + "ssm_beta.weight", ternary ? DType::T2_G128
+                                           : binary ? DType::B1_G128 : DType::F16,
                     {GDN_HEADS, N_EMBD});
             require(p + "ssm_a", DType::F32, {GDN_HEADS});
             require(p + "ssm_dt.bias", DType::F32, {GDN_HEADS});
@@ -159,11 +194,11 @@ void MetalEngine::validate_architecture() const {
             matrix(p + "ssm_out.weight", N_EMBD, GDN_V);
         }
     }
-    if (ternary) {
-        // No MTP layer in ternary packs; a partial blk.64 would mean a broken
+    if (bonsai) {
+        // No MTP layer in bonsai packs; a partial blk.64 would mean a broken
         // repack, so its absence is asserted rather than tolerated silently.
         if (model_.find("blk.64.attn_norm.weight") || model_.find("output_q4.weight"))
-            throw std::runtime_error("q27 Metal: unexpected MTP tensors in a ternary artifact");
+            throw std::runtime_error("q27 Metal: unexpected MTP tensors in a bonsai artifact");
         return;
     }
     const std::string p = "blk.64.";
@@ -772,21 +807,21 @@ uint32_t MetalEngine::pending_from_logits() {
     return pending;
 }
 
-// Serial-decode projection dispatch: T2 weights route to the float-activation
-// select-form GEMV (exact ternary math, no activation quantization — see the
-// ternary-tier plan, Phase 2); Q4/Q8 keep the packed-dot quantized path. Both
+// Serial-decode projection dispatch: bonsai (T2/B1) weights route to the
+// float-activation select-form GEMV (exact math, no activation quantization
+// — ternary/binary-tier plans, Phase 2); Q4/Q8 keep the packed-dot quantized path. Both
 // operand sets are always live at the call sites: the fused rmsnorm/quantize
 // kernels produce the float output and the int8 copy together.
 void MetalEngine::project(const BackendTensor& w, const BackendBuffer& x_float,
                           const BackendQuantized& xq, BackendBuffer& out) {
-    if (w.dtype == DType::T2_G128) backend_.matvec(w, x_float, out);
+    if (is_bonsai_dtype(w.dtype)) backend_.matvec(w, x_float, out);
     else backend_.matvec_quantized(w, xq, out);
 }
 
 void MetalEngine::project_pair(const BackendTensor& a, BackendBuffer& a_out,
                                const BackendTensor& b, BackendBuffer& b_out,
                                const BackendBuffer& x_float, const BackendQuantized& xq) {
-    if (a.dtype == DType::T2_G128 || b.dtype == DType::T2_G128) {
+    if (is_bonsai_dtype(a.dtype) || is_bonsai_dtype(b.dtype)) {
         project(a, x_float, xq, a_out);
         project(b, x_float, xq, b_out);
     } else {
@@ -810,7 +845,7 @@ void MetalEngine::gdn_block(uint32_t layer) {
     backend_.gated_norm_gdn(*delta_out_, layer_weight(layer, "ssm_norm.weight"), *z_,
                             *gated_out_, GDN_HEADS, GDN_DIM, EPS);
     const BackendTensor& ssm_out_w = layer_weight(layer, "ssm_out.weight");
-    if (ssm_out_w.dtype != DType::T2_G128) backend_.quantize(*gated_out_, q6144_);
+    if (!is_bonsai_dtype(ssm_out_w.dtype)) backend_.quantize(*gated_out_, q6144_);
     project(ssm_out_w, *gated_out_, q6144_, *y_);
 }
 
@@ -846,7 +881,7 @@ void MetalEngine::attention_block(uint32_t layer) {
     }
     backend_.sigmoid_gate_mul(*attn_out_, *qg_, N_HEAD, HEAD_DIM);
     const BackendTensor& attn_out_w = layer_weight(layer, "attn_output.weight");
-    if (attn_out_w.dtype != DType::T2_G128) backend_.quantize(*attn_out_, q6144_);
+    if (!is_bonsai_dtype(attn_out_w.dtype)) backend_.quantize(*attn_out_, q6144_);
     project(attn_out_w, *attn_out_, q6144_, *y_);
 }
 
@@ -855,7 +890,7 @@ void MetalEngine::ffn(uint32_t layer) {
                  layer_weight(layer,"ffn_up.weight"),*ffn_up_,*x1_,q5120_);
     backend_.silu_mul(*ffn_gate_, *ffn_up_, *ffn_gate_, N_FFN);
     const BackendTensor& ffn_down_w = layer_weight(layer, "ffn_down.weight");
-    if (ffn_down_w.dtype != DType::T2_G128) backend_.quantize(*ffn_gate_, q17408_);
+    if (!is_bonsai_dtype(ffn_down_w.dtype)) backend_.quantize(*ffn_gate_, q17408_);
     project(ffn_down_w, *ffn_gate_, q17408_, *y_);
 }
 
@@ -892,11 +927,11 @@ void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count, bool verify) {
     BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
     backend_.matmul_quantized(layer_weight(layer, "attn_qkv.weight"), x5, count, *cqkv_);
     backend_.matmul_quantized(layer_weight(layer, "attn_gate.weight"), x5, count, *cz_);
-    // Official tier: fused F16 pair-rows kernel. Ternary tier: alpha/beta are
-    // T2 matrices; the T2 chunk GEMM writes the same [token][row] layout.
+    // Official tier: fused F16 pair-rows kernel. Bonsai tiers: alpha/beta
+    // are T2/B1 matrices; their chunk GEMMs write the same [token][row] layout.
     const BackendTensor& alpha_w = layer_weight(layer, "ssm_alpha.weight");
     const BackendTensor& beta_w = layer_weight(layer, "ssm_beta.weight");
-    if (alpha_w.dtype == DType::T2_G128) {
+    if (is_bonsai_dtype(alpha_w.dtype)) {
         backend_.matmul_quantized(alpha_w, x5, count, *calpha_);
         backend_.matmul_quantized(beta_w, x5, count, *cbeta_raw_);
     } else {
