@@ -402,11 +402,296 @@ int run_b1_probe(q27::MetalBackend& backend, int reps) {
     return 0;
 }
 
+// E6 — Q4/Q8 GEMV efficiency leg, official tier (docs/plans/2026-07-17-e6-
+// q4q8-gemv.md). Times the official-tier per-token production projection mix
+// on the current quantized kernels exactly as serial decode dispatches them
+// (matvec_quantized singles; matvec_quantized_pair on the ffn gate/up
+// sibling pair, two distinct synthetic tensors — the cache-honesty rule)
+// against the same-run production T2 select-form float matvec on the T2
+// projection mix (the machine's demonstrated stream ceiling, never the
+// spec-sheet peak). Decision metric R = byte-weighted per-token aggregate
+// effective GB/s over the mix / same-run T2 reference aggregate GB/s.
+// Pre-registered bands: R >= 0.90 KILL the rewrite; 0.80 <= R < 0.90
+// conditional (targeted fix only for a mix-dominant shape below 0.75 of the
+// reference); R < 0.80 fund exactly one rewrite round.
+
+struct QSynth {
+    std::vector<uint8_t> data;
+    std::vector<uint16_t> scales;
+    q27::BackendTensor weight;
+    std::vector<double> ref_f; // CPU double dequantize-dot against float x
+    std::vector<double> ref_i; // CPU double model of the int8-activation kernel
+};
+
+// Synthetic Q4_G64/Q8_G128 tensor with NONUNIFORM exactly-representable fp16
+// scales (0.5..2.0 step 0.25, the (r*31+g)%7 pattern from the b1 leg —
+// uniform 1.0 scales would leave a wrong/ignored scale index invisible to
+// the gate). Packing mirrors tools/repack.py quant_q4/quant_q8 exactly: Q4
+// stores q+8 nibbles with even columns in low nibbles (group 64), Q8 stores
+// int8 clipped to [-127,127] (group 128; repack never emits -128). The CPU
+// references decode the packed bytes back, so the gate covers the pack
+// layout itself; the int8 model mirrors q27_quantize_x plus the kernels'
+// per-32-column exact integer dot in double math (the c3-popcount pattern).
+void build_q_synth(q27::MetalBackend& backend, const Shape& s, uint32_t seed,
+                   const std::vector<float>& x, const std::vector<int8_t>& xq8,
+                   const std::vector<float>& xs, QSynth& t) {
+    static const uint16_t kScaleBits[7] = {0x3800, 0x3a00, 0x3c00, 0x3d00,
+                                           0x3e00, 0x3f00, 0x4000};
+    static const double kScaleVal[7] = {0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0};
+    const uint32_t group = s.dtype == DType::Q4_G64 ? 64 : 128;
+    const uint32_t ng = s.cols / group;
+    t.data.resize(data_bytes_for(s));
+    for (size_t i = 0; i < t.data.size(); i++) {
+        uint8_t b = (uint8_t)((i + (uint64_t)seed * 0x9e3779b9u) * 2654435761u >> 24);
+        if (s.dtype == DType::Q8_G128 && b == 0x80) b = 0x7f; // repack clips to [-127,127]
+        t.data[i] = b;
+    }
+    t.scales.resize((uint64_t)s.rows * ng);
+    for (uint32_t r = 0; r < s.rows; r++)
+        for (uint32_t g = 0; g < ng; g++)
+            t.scales[(uint64_t)r * ng + g] = kScaleBits[(r * 31u + g) % 7u];
+    q27::Tensor tensor;
+    tensor.name = s.name;
+    tensor.dtype = s.dtype;
+    tensor.shape = {s.rows, s.cols};
+    tensor.data = t.data.data();
+    tensor.data_size = t.data.size();
+    tensor.scales = reinterpret_cast<const uint8_t*>(t.scales.data());
+    tensor.scales_size = t.scales.size() * sizeof(uint16_t);
+    t.weight = backend.upload(tensor);
+
+    t.ref_f.resize(s.rows);
+    t.ref_i.resize(s.rows);
+    const uint64_t row_stride = (uint64_t)s.cols / (s.dtype == DType::Q4_G64 ? 2 : 1);
+    for (uint32_t r = 0; r < s.rows; r++) {
+        const uint64_t rb = (uint64_t)r * row_stride;
+        double accf = 0.0, acci = 0.0;
+        for (uint32_t b32 = 0; b32 < s.cols / 32; b32++) {
+            // A 32-column block never straddles a weight-scale group (64/128)
+            // or an activation-scale block — same alignment the kernels use.
+            const double ws = kScaleVal[(r * 31u + b32 * 32 / group) % 7u];
+            long idot = 0;
+            for (uint32_t i = 0; i < 32; i++) {
+                const uint32_t c = b32 * 32 + i;
+                const int w = s.dtype == DType::Q4_G64
+                    ? (int)(t.data[rb + c / 2] >> ((c & 1) * 4) & 15) - 8
+                    : (int)(int8_t)t.data[rb + c];
+                accf += ws * (double)w * (double)x[c];
+                idot += (long)w * xq8[c];
+            }
+            acci += ws * (double)idot * (double)xs[b32];
+        }
+        t.ref_f[r] = accf;
+        t.ref_i[r] = acci;
+    }
+}
+
+int run_official_probe(q27::MetalBackend& backend, int reps) {
+    // The official-tier per-token production projection mix (metal_engine.cpp
+    // weight shapes; counts: 48 GDN layers, 16 attention layers, 64 FFN, 1
+    // head) under the real v1.3 dtype policy (tools/repack.py policy()):
+    // every matrix weight Q4_G64 except attn_k/v (Q8, KV-persistence
+    // promotion) and the output head (Q8; official vocab 151936). The T2
+    // reference mix differs only at the head (T2 vocab 248320).
+    struct ProbeShape { Shape shape; uint32_t t2_rows; double per_token_count; bool pair_arm; };
+    const ProbeShape probes[] = {
+        {{"ffn gate/up   [17408x5120]", 17408, 5120, DType::Q4_G64, false}, 17408, 128, true},
+        {{"ffn down      [5120x17408]", 5120, 17408, DType::Q4_G64, false}, 5120, 64, false},
+        {{"gdn qkv       [10240x5120]", 10240, 5120, DType::Q4_G64, false}, 10240, 48, false},
+        {{"gdn gate      [6144x5120]",  6144, 5120, DType::Q4_G64, false}, 6144, 48, false},
+        {{"ssm/attn out  [5120x6144]",  5120, 6144, DType::Q4_G64, false}, 5120, 64, false},
+        {{"attn q        [12288x5120]", 12288, 5120, DType::Q4_G64, false}, 12288, 16, false},
+        {{"attn k/v      [1024x5120]",  1024, 5120, DType::Q8_G128, false}, 1024, 32, false},
+        {{"output head   [151936x5120]", 151936, 5120, DType::Q8_G128, false}, 248320, 1, false},
+    };
+    const size_t n_probes = sizeof(probes) / sizeof(probes[0]);
+    printf("E6 official-tier Q4/Q8 GEMV leg: production quantized kernels on the official "
+           "per-token projection mix;\nreference arm = same-run production T2 select-form "
+           "float matvec (backend.matvec) on the T2 mix\n");
+    printf("excluded from the mix: MTP draft layer (blk.64.*, Q8) and the output_q4.weight "
+           "draft-head copy — both stream\nonly on draft rounds, this leg measures the serial "
+           "production token; gdn alpha/beta [48x5120] x96 (~0.15%% of\nper-token weight "
+           "bytes, dispatch-overhead-dominated)\n");
+    double total_q_bytes = 0.0;
+    for (const ProbeShape& p : probes)
+        total_q_bytes += (double)weight_bytes(p.shape) * p.per_token_count;
+    printf("%-30s %-3s %8s %8s %8s | %8s %8s | %6s %6s\n",
+           "shape", "dt", "q1 ms", "pair ms", "q GB/s", "t2 ms", "t2 GB/s", "r", "byte%");
+    double q_wall_ms = 0.0, t2_wall_ms = 0.0, total_t2_bytes = 0.0;
+    double e_float_max = 0.0;
+    const char* names[n_probes];
+    double shares[n_probes], ratios[n_probes];
+    size_t n = 0;
+    for (const ProbeShape& p : probes) {
+        const Shape& s = p.shape;
+        // Activations + the exact CPU int8 model of q27_quantize_x: per
+        // 32-block amax/127 float scale, rint (nearest-even, matching Metal),
+        // clamp to [-127,127].
+        std::vector<float> x(s.cols);
+        for (uint32_t i = 0; i < s.cols; i++) x[i] = (float)((int)(i % 23) - 11) / 11.0f;
+        std::vector<int8_t> xq8(s.cols);
+        std::vector<float> xs(s.cols / 32);
+        for (uint32_t b = 0; b < s.cols / 32; b++) {
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 32; i++) amax = std::fmax(amax, std::fabs(x[b * 32 + i]));
+            const float sc = amax / 127.0f;
+            xs[b] = sc;
+            for (uint32_t i = 0; i < 32; i++) {
+                const int q = sc > 0.0f ? (int)std::rint(x[b * 32 + i] / sc) : 0;
+                xq8[b * 32 + i] = (int8_t)std::min(127, std::max(-127, q));
+            }
+        }
+        // Two distinct synthetic tensors for the sibling pair (cache honesty:
+        // reusing one would let the second dispatch hit warm cache lines).
+        QSynth wa, wb;
+        build_q_synth(backend, s, 1, x, xq8, xs, wa);
+        if (p.pair_arm) build_q_synth(backend, s, 2, x, xq8, xs, wb);
+        // Reference arm: synthetic T2 tensor through the production kernel.
+        Shape t2s = s;
+        t2s.rows = p.t2_rows;
+        t2s.dtype = DType::T2_G128;
+        std::vector<uint8_t> t2_data;
+        std::vector<uint16_t> t2_scales;
+        q27::BackendTensor t2w = upload_synthetic(backend, t2s, t2_data, t2_scales);
+
+        auto xb = backend.allocate(x.size() * sizeof(float));
+        backend.write(*xb, 0, x.data(), x.size() * sizeof(float));
+        q27::BackendQuantized xq = backend.allocate_quantized(s.cols);
+        backend.quantize(*xb, xq);
+        auto y = backend.allocate((uint64_t)s.rows * sizeof(float));
+        auto ypa = p.pair_arm ? backend.allocate((uint64_t)s.rows * sizeof(float)) : nullptr;
+        auto ypb = p.pair_arm ? backend.allocate((uint64_t)s.rows * sizeof(float)) : nullptr;
+        auto yt2 = backend.allocate((uint64_t)t2s.rows * sizeof(float));
+
+        // Correctness gates before any timing: each arm against the CPU
+        // double model of its own tensor, bound 1e-3 max rel with the sum|x|
+        // denominator floor (same rationale as the b1 leg: a near-zero row
+        // dot must not false-fail on float noise, a real bug still moves the
+        // dot by orders more than the floor).
+        backend.begin_commands();
+        backend.matvec_quantized(wa.weight, xq, *y);
+        if (p.pair_arm) backend.matvec_quantized_pair(wa.weight, *ypa, wb.weight, *ypb, xq);
+        backend.end_commands();
+        std::vector<float> ya(s.rows), yb_a(p.pair_arm ? s.rows : 0), yb_b(p.pair_arm ? s.rows : 0);
+        backend.read(*y, 0, ya.data(), s.rows * sizeof(float));
+        if (p.pair_arm) {
+            backend.read(*ypa, 0, yb_a.data(), s.rows * sizeof(float));
+            backend.read(*ypb, 0, yb_b.data(), s.rows * sizeof(float));
+        }
+        double sum_abs_x = 0.0;
+        for (uint32_t i = 0; i < s.cols; i++) sum_abs_x += std::fabs(x[i]);
+        const double denom_floor = 1e-3 * sum_abs_x;
+        struct GateCheck { const std::vector<float>* y; const QSynth* t; const char* arm; };
+        const GateCheck checks[3] = {
+            {&ya, &wa, "single"}, {&yb_a, &wa, "pair a"}, {&yb_b, &wb, "pair b"}};
+        const size_t n_checks = p.pair_arm ? 3 : 1;
+        for (size_t k = 0; k < n_checks; k++) {
+            double ei = 0.0, ef = 0.0;
+            for (uint32_t r = 0; r < s.rows; r++) {
+                const double yr = (*checks[k].y)[r];
+                ei = std::fmax(ei, std::fabs(yr - checks[k].t->ref_i[r]) /
+                                       std::fmax(std::fabs(checks[k].t->ref_i[r]), denom_floor));
+                ef = std::fmax(ef, std::fabs(yr - checks[k].t->ref_f[r]) /
+                                       std::fmax(std::fabs(checks[k].t->ref_f[r]), denom_floor));
+            }
+            if (ei > 1e-3) {
+                fprintf(stderr, "FAIL: %s — %s arm vs CPU int8-activation model %.2e "
+                        "(bound 1e-3)\n", s.name, checks[k].arm, ei);
+                return 1;
+            }
+            e_float_max = std::fmax(e_float_max, ef);
+        }
+        bool nonzero = false;
+        for (uint32_t r = 0; r < s.rows; r++)
+            if (ya[r] != 0.0f) { nonzero = true; break; }
+        if (!nonzero || (s.rows > 1 && ya[0] == ya[1])) {
+            fprintf(stderr, "FAIL: %s — anti-vacuity (zero or row-identical output)\n", s.name);
+            return 1;
+        }
+
+        auto time_arm = [&](int arm) {
+            auto body = [&](int count) {
+                backend.begin_commands();
+                for (int i = 0; i < count; i++) {
+                    if (arm == 0) backend.matvec_quantized(wa.weight, xq, *y);
+                    else if (arm == 1)
+                        backend.matvec_quantized_pair(wa.weight, *ypa, wb.weight, *ypb, xq);
+                    else backend.matvec(t2w, *xb, *yt2);
+                }
+                backend.end_commands();
+            };
+            body(2); // warmup / first touch
+            auto start = std::chrono::steady_clock::now();
+            body(reps);
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count() / reps;
+        };
+        const double q1_ms = time_arm(0) * 1e3;
+        const double qp_ms = p.pair_arm ? time_arm(1) * 1e3 : 0.0;
+        const double t2_ms = time_arm(2) * 1e3;
+        // Production dispatch for the mix: the pair kernel covers two of the
+        // per-token count per dispatch on the sibling shape, singles elsewhere.
+        const double wb_bytes = (double)weight_bytes(s);
+        const double prod_ms = p.pair_arm ? p.per_token_count / 2.0 * qp_ms
+                                          : p.per_token_count * q1_ms;
+        const double q_gbs = p.pair_arm ? 2.0 * wb_bytes / (qp_ms * 1e-3) / 1e9
+                                        : wb_bytes / (q1_ms * 1e-3) / 1e9;
+        const double t2_bytes = (double)weight_bytes(t2s);
+        const double t2_gbs = t2_bytes / (t2_ms * 1e-3) / 1e9;
+        char pair_col[16];
+        if (p.pair_arm) snprintf(pair_col, sizeof(pair_col), "%8.3f", qp_ms);
+        else snprintf(pair_col, sizeof(pair_col), "%8s", "-");
+        const double share = wb_bytes * p.per_token_count / total_q_bytes;
+        printf("%-30s %-3s %8.3f %s %8.2f | %8.3f %8.2f | %6.3f %5.1f%%\n",
+               s.name, s.dtype == DType::Q4_G64 ? "q4" : "q8", q1_ms, pair_col, q_gbs,
+               t2_ms, t2_gbs, q_gbs / t2_gbs, share * 100.0);
+        q_wall_ms += prod_ms;
+        t2_wall_ms += p.per_token_count * t2_ms;
+        total_t2_bytes += t2_bytes * p.per_token_count;
+        names[n] = s.name;
+        shares[n] = share;
+        ratios[n] = q_gbs / t2_gbs;
+        n++;
+    }
+    printf("identity: single and pair kernels match their CPU int8-activation models on all "
+           "shapes, <= 1e-3 max rel;\ndistance to the float dequantize-dot reference max rel "
+           "%.3e (activation-quantization cost, reported not gated)\n", e_float_max);
+    const double q_gbs = total_q_bytes / (q_wall_ms * 1e-3) / 1e9;
+    const double ref_gbs = total_t2_bytes / (t2_wall_ms * 1e-3) / 1e9;
+    const double ratio = q_gbs / ref_gbs;
+    const double parity_ms = total_q_bytes / (ref_gbs * 1e9) * 1e3;
+    printf("per-token GEMV wall over the mix: %.2f ms (%.1f tok/s GEMV-bound); "
+           "at T2-reference parity: %.2f ms (%.1f tok/s)\n",
+           q_wall_ms, 1e3 / q_wall_ms, parity_ms, 1e3 / parity_ms);
+    printf("R = %.3f (official mix %.2f GB/s byte-weighted / same-run T2 reference "
+           "%.2f GB/s)\n", ratio, q_gbs, ref_gbs);
+    if (ratio >= 0.90) {
+        printf("verdict: KILL the rewrite (R >= 0.90) — even perfect parity buys <= 11%% "
+               "wall, below the cost of a kernel round plus regate\n");
+    } else if (ratio >= 0.80) {
+        printf("verdict: CONDITIONAL (0.80 <= R < 0.90) — no full round; fund a targeted "
+               "fix only if a single mix-dominant shape\n(>= 20%% of per-token bytes) sits "
+               "below 0.75 of the reference — name it in RESULTS:\n");
+        int hits = 0;
+        for (size_t i = 0; i < n; i++)
+            if (shares[i] >= 0.20 && ratios[i] < 0.75) {
+                printf("  mix-dominant shape below 0.75: %s (byte share %.1f%%, "
+                       "ratio %.3f)\n", names[i], shares[i] * 100.0, ratios[i]);
+                hits++;
+            }
+        if (!hits) printf("  no mix-dominant shape below 0.75 — no targeted fix funded\n");
+    } else {
+        printf("verdict: FUND ONE ROUND (R < 0.80) — exactly one rewrite round, regated by "
+               "re-running this leg; the round's own ship line is R >= 0.90 after rewrite\n");
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     int reps = 20;
-    bool t2 = false, t3 = false, slot2 = false, b1 = false;
+    bool t2 = false, t3 = false, slot2 = false, b1 = false, official = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--dtype" && i + 1 < argc) {
@@ -418,10 +703,13 @@ int main(int argc, char** argv) {
             slot2 = true;
         } else if (arg == "--b1") {
             b1 = true;
+        } else if (arg == "--official") {
+            official = true;
         } else if (!arg.empty() && arg[0] != '-') {
             reps = atoi(arg.c_str());
         } else {
-            fprintf(stderr, "usage: %s [reps] [--dtype q4q8|t2|t3] [--slot2] [--b1]\n", argv[0]);
+            fprintf(stderr, "usage: %s [reps] [--dtype q4q8|t2|t3] [--slot2] [--b1] "
+                    "[--official]\n", argv[0]);
             return 1;
         }
     }
@@ -479,6 +767,7 @@ int main(int argc, char** argv) {
 
     if (slot2) return run_slot2_probe(backend, reps);
     if (b1) return run_b1_probe(backend, reps);
+    if (official) return run_official_probe(backend, reps);
 
     double total_seconds = 0.0, total_bytes = 0.0;
     for (size_t si = 0; si < n_shapes; si++) {
