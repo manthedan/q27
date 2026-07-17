@@ -1,0 +1,2785 @@
+Reading additional input from stdin...
+[2m2026-07-17T17:00:06.006959Z[0m [31mERROR[0m [2mcodex_models_manager::manager[0m[2m:[0m failed to refresh available models: timeout waiting for child process to exit
+OpenAI Codex v0.144.0
+--------
+[1mworkdir:[0m /Users/macthedan/projects/q27
+[1mmodel:[0m gpt-5.5
+[1mprovider:[0m openai
+[1mapproval:[0m never
+[1msandbox:[0m read-only
+[1mreasoning effort:[0m high
+[1mreasoning summaries:[0m none
+[1msession id:[0m 019f7105-6202-7b92-a4e2-57d6d256f53d
+--------
+[36muser[0m
+Review the uncommitted changes in src/metal/q27_kernels.metal and src/metal/metal_backend.mm (git diff): a Q4 chunk-GEMM half-staging port. q27_matmul_q4_mm_h copies the mature q27_matmul_t2_mm_h schedule (half tiles, raw ints exact in half, float mixed-precision MMA accumulators, 64-K staged tiles with two accumulator pairs and one flush barrier region) with Q4-specific deltas: weight stride cols/2, uint2 weight loads, a 256-entry half2 nibble-pair LUT (low nibble first), weight-scale group 64 cols (row stride cols/64, flush index c0/64). q27_matmul_q8_mm_h is PARKED never-routed (failed shape suite: half-precision MMA product rounding, comment records it). Backend routes Q4_G64 through the new kernel when gemm_half (Q27_METAL_GEMM_HALF, default on). Focus on: indexing/bounds errors vs the source kernels (esp. the cols/2 and cols/64 strides and the LUT nibble order vs the float kernel's LSB-first unpack), race/barrier correctness, out-of-bounds on row/token clamping, and whether the parked Q8 kernel or removed q8 routing left any dangling references. Report findings by priority P1/P2/P3.
+[35m[3mcodex[0m[0m
+I’ll review this as a diff-focused code review, comparing the changed Metal kernels against nearby mature kernels and backend routing. I’m going to inspect the relevant files and search for Q4/Q8 references before calling out findings.
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "rg -n \"q27_matmul_(q4|q8)_mm_h|Q4_G64|gemm_half|Q27_METAL_GEMM_HALF|q8_mm_h|q4_mm_h\" src/metal src -g '"'!*.o'"'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+src/metal/metal_backend.h:258:    void set_gemm_half(bool enabled);
+src/metal/test_metal.cpp:236:    tensor.dtype = q27::DType::Q4_G64;
+src/metal/test_metal.cpp:648:    std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:
+src/metal/test_metal.cpp:653:        if(dtype==q27::DType::Q4_G64) {
+src/metal/test_metal.cpp:664:    uint32_t groups=cols/(dtype==q27::DType::Q4_G64?64:128);
+src/metal/test_metal.cpp:769:    const uint32_t group = dtype == q27::DType::Q4_G64 ? 64 : 128;
+src/metal/test_metal.cpp:796:        } else if (dtype == q27::DType::Q4_G64) {
+src/metal/test_metal.cpp:879:    q27::Tensor a; a.name="mixed-q4"; a.dtype=q27::DType::Q4_G64; a.shape={1,cols};
+src/metal/test_metal.cpp:907:            test_quantized_wide(backend, q27::DType::Q4_G64) ||
+src/metal/test_metal.cpp:917:             (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128) ||
+src/loader.cpp:27:        case DType::Q4_G64:  return "Q4_G64";
+src/loader.cpp:120:        case DType::Q4_G64:
+src/kernels.cuh:22:    // group-64 requantization (prefill MMA GEMM only; matches the Q4_G64
+src/prefill.cu:230:// Q4IN: weights arrive nibble-packed (Q4_G64, scale per 64) and are unpacked
+src/loader.h:10:enum class DType : uint8_t { F32 = 0, F16 = 1, Q8_G128 = 2, Q4_G64 = 3, T2_G128 = 4, T3_G128 = 5, B1_G128 = 6 };
+src/metal/q27_kernels.metal:1855:// Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
+src/metal/q27_kernels.metal:2529:kernel void q27_matmul_q4_mm_h(
+src/metal/q27_kernels.metal:2646:kernel void q27_matmul_q8_mm_h(
+src/test_kernels.cu:32:    if (t.dtype == DType::Q4_G64) {
+src/test_kernels.cu:62:    if (t.dtype == DType::Q4_G64)
+src/test_kernels.cu:94:        case DType::Q4_G64:
+src/test_kernels.cu:212:    if (t.dtype == DType::Q4_G64) {
+src/test_kernels.cu:267:        if (t.dtype == DType::Q4_G64)
+src/test_kernels.cu:351:        if (t.dtype == DType::Q4_G64)
+src/metal/metal_cli.cpp:565:                if (mode_half) bk.set_gemm_half(true);
+src/metal/metal_cli.cpp:568:                if (mode_half) bk.set_gemm_half(false);
+src/vgemm.cu:253:        if (t.dtype != q27::DType::Q4_G64 && t.dtype != q27::DType::Q8_G128) continue;
+src/vgemm.cu:342:    if (w.dtype == q27::DType::Q4_G64) launch<true>(w, X, Y, ws, T, st);
+src/engine.cuh:808:            case DType::Q4_G64:
+src/engine.cuh:1044:            case DType::Q4_G64:
+src/engine.cuh:1069:            case DType::Q4_G64:
+src/engine.cuh:1353:        if (w.dtype == DType::Q4_G64)
+src/engine.cuh:2665:            case DType::Q4_G64:
+src/metal/metal_backend.mm:190:    // prefill-throughput.md); Q27_METAL_GEMM_HALF=0 opts out and exactly
+src/metal/metal_backend.mm:193:    bool gemm_half = true;
+src/metal/metal_backend.mm:604:            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm_h");
+src/metal/metal_backend.mm:614:            if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
+src/metal/metal_backend.mm:615:                impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
+src/metal/metal_backend.mm:963:                                 weight.dtype == DType::Q4_G64 ? 64 : 0;
+src/metal/metal_backend.mm:971:    if (weight.dtype == DType::Q4_G64) data_bytes /= 2;
+src/metal/metal_backend.mm:982:        case DType::Q4_G64: pipeline = impl_->q4; label = "q27_matvec_q4_g64"; break;
+src/metal/metal_backend.mm:1075:    if ((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
+src/metal/metal_backend.mm:1078:    const uint64_t group=weight.dtype==DType::Q4_G64?64:128;
+src/metal/metal_backend.mm:1087:    const uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:
+src/metal/metal_backend.mm:1108:        const NSUInteger rpg = weight.dtype==DType::Q4_G64 ? 32 : 8;
+src/metal/metal_backend.mm:1203:    if((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
+src/metal/metal_backend.mm:1206:    uint64_t group=weight.dtype==DType::Q4_G64?64:128;
+src/metal/metal_backend.mm:1215:    uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:
+src/metal/metal_backend.mm:1222:        // Q27_METAL_GEMM_HALF=1: half-staging chunk GEMMs (A/B lever, see
+src/metal/metal_backend.mm:1228:        // exact-integer range — the parked q27_matmul_q8_mm_h records the
+src/metal/metal_backend.mm:1230:        const bool h = impl_->gemm_half;
+src/metal/metal_backend.mm:1235:            (h?"q27_matmul_q4_mm_h":"q27_matmul_q4_mm"));
+src/metal/metal_backend.mm:1492:    if ((weight.dtype != DType::Q4_G64 && weight.dtype != DType::Q8_G128) ||
+src/metal/metal_backend.mm:1495:    if ((candidate == 2 || candidate == 3) && weight.dtype != DType::Q4_G64)
+src/metal/metal_backend.mm:1496:        throw std::runtime_error("q27 Metal: q4 probe candidates 2-3 require Q4_G64");
+src/metal/metal_backend.mm:1499:    const uint64_t group = weight.dtype == DType::Q4_G64 ? 64 : 128;
+src/metal/metal_backend.mm:1512:                                (weight.dtype == DType::Q4_G64 ? 2 : 1);
+src/metal/metal_backend.mm:2701:void MetalBackend::set_gemm_half(bool enabled) {
+src/metal/metal_backend.mm:2702:    impl_->gemm_half = enabled;
+src/inspect.cpp:35:            case q27::DType::Q4_G64:  want_data = r * c / 2; want_scales = r * (c / 64) * 2;  break;
+src/metal/test_metal.cpp:236:    tensor.dtype = q27::DType::Q4_G64;
+src/metal/test_metal.cpp:648:    std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:
+src/metal/test_metal.cpp:653:        if(dtype==q27::DType::Q4_G64) {
+src/metal/test_metal.cpp:664:    uint32_t groups=cols/(dtype==q27::DType::Q4_G64?64:128);
+src/metal/test_metal.cpp:769:    const uint32_t group = dtype == q27::DType::Q4_G64 ? 64 : 128;
+src/metal/test_metal.cpp:796:        } else if (dtype == q27::DType::Q4_G64) {
+src/metal/test_metal.cpp:879:    q27::Tensor a; a.name="mixed-q4"; a.dtype=q27::DType::Q4_G64; a.shape={1,cols};
+src/metal/test_metal.cpp:907:            test_quantized_wide(backend, q27::DType::Q4_G64) ||
+src/metal/test_metal.cpp:917:             (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128) ||
+src/metal/metal_backend.mm:190:    // prefill-throughput.md); Q27_METAL_GEMM_HALF=0 opts out and exactly
+src/metal/metal_backend.mm:193:    bool gemm_half = true;
+src/metal/metal_backend.mm:604:            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm_h");
+src/metal/metal_backend.mm:614:            if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
+src/metal/metal_backend.mm:615:                impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
+src/metal/metal_backend.mm:963:                                 weight.dtype == DType::Q4_G64 ? 64 : 0;
+src/metal/metal_backend.mm:971:    if (weight.dtype == DType::Q4_G64) data_bytes /= 2;
+src/metal/metal_backend.mm:982:        case DType::Q4_G64: pipeline = impl_->q4; label = "q27_matvec_q4_g64"; break;
+src/metal/metal_backend.mm:1075:    if ((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
+src/metal/metal_backend.mm:1078:    const uint64_t group=weight.dtype==DType::Q4_G64?64:128;
+src/metal/metal_backend.mm:1087:    const uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:
+src/metal/metal_backend.mm:1108:        const NSUInteger rpg = weight.dtype==DType::Q4_G64 ? 32 : 8;
+src/metal/metal_backend.mm:1203:    if((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
+src/metal/metal_backend.mm:1206:    uint64_t group=weight.dtype==DType::Q4_G64?64:128;
+src/metal/metal_backend.mm:1215:    uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:
+src/metal/metal_backend.mm:1222:        // Q27_METAL_GEMM_HALF=1: half-staging chunk GEMMs (A/B lever, see
+src/metal/metal_backend.mm:1228:        // exact-integer range — the parked q27_matmul_q8_mm_h records the
+src/metal/metal_backend.mm:1230:        const bool h = impl_->gemm_half;
+src/metal/metal_backend.mm:1235:            (h?"q27_matmul_q4_mm_h":"q27_matmul_q4_mm"));
+src/metal/metal_backend.mm:1492:    if ((weight.dtype != DType::Q4_G64 && weight.dtype != DType::Q8_G128) ||
+src/metal/metal_backend.mm:1495:    if ((candidate == 2 || candidate == 3) && weight.dtype != DType::Q4_G64)
+src/metal/metal_backend.mm:1496:        throw std::runtime_error("q27 Metal: q4 probe candidates 2-3 require Q4_G64");
+src/metal/metal_backend.mm:1499:    const uint64_t group = weight.dtype == DType::Q4_G64 ? 64 : 128;
+src/metal/metal_backend.mm:1512:                                (weight.dtype == DType::Q4_G64 ? 2 : 1);
+src/metal/metal_backend.mm:2701:void MetalBackend::set_gemm_half(bool enabled) {
+src/metal/metal_backend.mm:2702:    impl_->gemm_half = enabled;
+src/metal/metal_backend.h:258:    void set_gemm_half(bool enabled);
+src/metal/q27_kernels.metal:1855:// Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
+src/metal/q27_kernels.metal:2529:kernel void q27_matmul_q4_mm_h(
+src/metal/q27_kernels.metal:2646:kernel void q27_matmul_q8_mm_h(
+src/metal/metal_engine.cpp:157:        return dtype == DType::Q4_G64 || dtype == DType::Q8_G128;
+src/metal/metal_engine.cpp:224:        if (draft_head->dtype != DType::Q4_G64 || draft_head->shape != std::vector<uint64_t>{VOCAB, N_EMBD})
+src/metal/metal_engine.cpp:157:        return dtype == DType::Q4_G64 || dtype == DType::Q8_G128;
+src/metal/metal_engine.cpp:224:        if (draft_head->dtype != DType::Q4_G64 || draft_head->shape != std::vector<uint64_t>{VOCAB, N_EMBD})
+src/metal/metal_cli.cpp:565:                if (mode_half) bk.set_gemm_half(true);
+src/metal/metal_cli.cpp:568:                if (mode_half) bk.set_gemm_half(false);
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc 'git diff -- src/metal/q27_kernels.metal'[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-y753n7ZK' (errno=Operation not permitted)
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-vLnV4C30' (errno=Operation not permitted)
+diff --git a/src/metal/q27_kernels.metal b/src/metal/q27_kernels.metal
+index f52b1f7..39a9546 100644
+--- a/src/metal/q27_kernels.metal
++++ b/src/metal/q27_kernels.metal
+@@ -2251,6 +2251,495 @@ kernel void q27_matmul_t2_mm_h(
+ }
+ 
+ 
++// Byte -> 2 Q4 halves (low nibble first, code n -> n-8): one constant-
++// memory gather replaces two shift/mask/int-sub/convert chains. 1 KB,
++// values -8..+7 are all exact in half.
++constant half2 q27_q4_half2_lut[256] = {
++    half2(-8.0h, -8.0h),
++    half2(-7.0h, -8.0h),
++    half2(-6.0h, -8.0h),
++    half2(-5.0h, -8.0h),
++    half2(-4.0h, -8.0h),
++    half2(-3.0h, -8.0h),
++    half2(-2.0h, -8.0h),
++    half2(-1.0h, -8.0h),
++    half2(0.0h, -8.0h),
++    half2(1.0h, -8.0h),
++    half2(2.0h, -8.0h),
++    half2(3.0h, -8.0h),
++    half2(4.0h, -8.0h),
++    half2(5.0h, -8.0h),
++    half2(6.0h, -8.0h),
++    half2(7.0h, -8.0h),
++    half2(-8.0h, -7.0h),
++    half2(-7.0h, -7.0h),
++    half2(-6.0h, -7.0h),
++    half2(-5.0h, -7.0h),
++    half2(-4.0h, -7.0h),
++    half2(-3.0h, -7.0h),
++    half2(-2.0h, -7.0h),
++    half2(-1.0h, -7.0h),
++    half2(0.0h, -7.0h),
++    half2(1.0h, -7.0h),
++    half2(2.0h, -7.0h),
++    half2(3.0h, -7.0h),
++    half2(4.0h, -7.0h),
++    half2(5.0h, -7.0h),
++    half2(6.0h, -7.0h),
++    half2(7.0h, -7.0h),
++    half2(-8.0h, -6.0h),
++    half2(-7.0h, -6.0h),
++    half2(-6.0h, -6.0h),
++    half2(-5.0h, -6.0h),
++    half2(-4.0h, -6.0h),
++    half2(-3.0h, -6.0h),
++    half2(-2.0h, -6.0h),
++    half2(-1.0h, -6.0h),
++    half2(0.0h, -6.0h),
++    half2(1.0h, -6.0h),
++    half2(2.0h, -6.0h),
++    half2(3.0h, -6.0h),
++    half2(4.0h, -6.0h),
++    half2(5.0h, -6.0h),
++    half2(6.0h, -6.0h),
++    half2(7.0h, -6.0h),
++    half2(-8.0h, -5.0h),
++    half2(-7.0h, -5.0h),
++    half2(-6.0h, -5.0h),
++    half2(-5.0h, -5.0h),
++    half2(-4.0h, -5.0h),
++    half2(-3.0h, -5.0h),
++    half2(-2.0h, -5.0h),
++    half2(-1.0h, -5.0h),
++    half2(0.0h, -5.0h),
++    half2(1.0h, -5.0h),
++    half2(2.0h, -5.0h),
++    half2(3.0h, -5.0h),
++    half2(4.0h, -5.0h),
++    half2(5.0h, -5.0h),
++    half2(6.0h, -5.0h),
++    half2(7.0h, -5.0h),
++    half2(-8.0h, -4.0h),
++    half2(-7.0h, -4.0h),
++    half2(-6.0h, -4.0h),
++    half2(-5.0h, -4.0h),
++    half2(-4.0h, -4.0h),
++    half2(-3.0h, -4.0h),
++    half2(-2.0h, -4.0h),
++    half2(-1.0h, -4.0h),
++    half2(0.0h, -4.0h),
++    half2(1.0h, -4.0h),
++    half2(2.0h, -4.0h),
++    half2(3.0h, -4.0h),
++    half2(4.0h, -4.0h),
++    half2(5.0h, -4.0h),
++    half2(6.0h, -4.0h),
++    half2(7.0h, -4.0h),
++    half2(-8.0h, -3.0h),
++    half2(-7.0h, -3.0h),
++    half2(-6.0h, -3.0h),
++    half2(-5.0h, -3.0h),
++    half2(-4.0h, -3.0h),
++    half2(-3.0h, -3.0h),
++    half2(-2.0h, -3.0h),
++    half2(-1.0h, -3.0h),
++    half2(0.0h, -3.0h),
++    half2(1.0h, -3.0h),
++    half2(2.0h, -3.0h),
++    half2(3.0h, -3.0h),
++    half2(4.0h, -3.0h),
++    half2(5.0h, -3.0h),
++    half2(6.0h, -3.0h),
++    half2(7.0h, -3.0h),
++    half2(-8.0h, -2.0h),
++    half2(-7.0h, -2.0h),
++    half2(-6.0h, -2.0h),
++    half2(-5.0h, -2.0h),
++    half2(-4.0h, -2.0h),
++    half2(-3.0h, -2.0h),
++    half2(-2.0h, -2.0h),
++    half2(-1.0h, -2.0h),
++    half2(0.0h, -2.0h),
++    half2(1.0h, -2.0h),
++    half2(2.0h, -2.0h),
++    half2(3.0h, -2.0h),
++    half2(4.0h, -2.0h),
++    half2(5.0h, -2.0h),
++    half2(6.0h, -2.0h),
++    half2(7.0h, -2.0h),
++    half2(-8.0h, -1.0h),
++    half2(-7.0h, -1.0h),
++    half2(-6.0h, -1.0h),
++    half2(-5.0h, -1.0h),
++    half2(-4.0h, -1.0h),
++    half2(-3.0h, -1.0h),
++    half2(-2.0h, -1.0h),
++    half2(-1.0h, -1.0h),
++    half2(0.0h, -1.0h),
++    half2(1.0h, -1.0h),
++    half2(2.0h, -1.0h),
++    half2(3.0h, -1.0h),
++    half2(4.0h, -1.0h),
++    half2(5.0h, -1.0h),
++    half2(6.0h, -1.0h),
++    half2(7.0h, -1.0h),
++    half2(-8.0h, 0.0h),
++    half2(-7.0h, 0.0h),
++    half2(-6.0h, 0.0h),
++    half2(-5.0h, 0.0h),
++    half2(-4.0h, 0.0h),
++    half2(-3.0h, 0.0h),
++    half2(-2.0h, 0.0h),
++    half2(-1.0h, 0.0h),
++    half2(0.0h, 0.0h),
++    half2(1.0h, 0.0h),
++    half2(2.0h, 0.0h),
++    half2(3.0h, 0.0h),
++    half2(4.0h, 0.0h),
++    half2(5.0h, 0.0h),
++    half2(6.0h, 0.0h),
++    half2(7.0h, 0.0h),
++    half2(-8.0h, 1.0h),
++    half2(-7.0h, 1.0h),
++    half2(-6.0h, 1.0h),
++    half2(-5.0h, 1.0h),
++    half2(-4.0h, 1.0h),
++    half2(-3.0h, 1.0h),
++    half2(-2.0h, 1.0h),
++    half2(-1.0h, 1.0h),
++    half2(0.0h, 1.0h),
++    half2(1.0h, 1.0h),
++    half2(2.0h, 1.0h),
++    half2(3.0h, 1.0h),
++    half2(4.0h, 1.0h),
++    half2(5.0h, 1.0h),
++    half2(6.0h, 1.0h),
++    half2(7.0h, 1.0h),
++    half2(-8.0h, 2.0h),
++    half2(-7.0h, 2.0h),
++    half2(-6.0h, 2.0h),
++    half2(-5.0h, 2.0h),
++    half2(-4.0h, 2.0h),
++    half2(-3.0h, 2.0h),
++    half2(-2.0h, 2.0h),
++    half2(-1.0h, 2.0h),
++    half2(0.0h, 2.0h),
++    half2(1.0h, 2.0h),
++    half2(2.0h, 2.0h),
++    half2(3.0h, 2.0h),
++    half2(4.0h, 2.0h),
++    half2(5.0h, 2.0h),
++    half2(6.0h, 2.0h),
++    half2(7.0h, 2.0h),
++    half2(-8.0h, 3.0h),
++    half2(-7.0h, 3.0h),
++    half2(-6.0h, 3.0h),
++    half2(-5.0h, 3.0h),
++    half2(-4.0h, 3.0h),
++    half2(-3.0h, 3.0h),
++    half2(-2.0h, 3.0h),
++    half2(-1.0h, 3.0h),
++    half2(0.0h, 3.0h),
++    half2(1.0h, 3.0h),
++    half2(2.0h, 3.0h),
++    half2(3.0h, 3.0h),
++    half2(4.0h, 3.0h),
++    half2(5.0h, 3.0h),
++    half2(6.0h, 3.0h),
++    half2(7.0h, 3.0h),
++    half2(-8.0h, 4.0h),
++    half2(-7.0h, 4.0h),
++    half2(-6.0h, 4.0h),
++    half2(-5.0h, 4.0h),
++    half2(-4.0h, 4.0h),
++    half2(-3.0h, 4.0h),
++    half2(-2.0h, 4.0h),
++    half2(-1.0h, 4.0h),
++    half2(0.0h, 4.0h),
++    half2(1.0h, 4.0h),
++    half2(2.0h, 4.0h),
++    half2(3.0h, 4.0h),
++    half2(4.0h, 4.0h),
++    half2(5.0h, 4.0h),
++    half2(6.0h, 4.0h),
++    half2(7.0h, 4.0h),
++    half2(-8.0h, 5.0h),
++    half2(-7.0h, 5.0h),
++    half2(-6.0h, 5.0h),
++    half2(-5.0h, 5.0h),
++    half2(-4.0h, 5.0h),
++    half2(-3.0h, 5.0h),
++    half2(-2.0h, 5.0h),
++    half2(-1.0h, 5.0h),
++    half2(0.0h, 5.0h),
++    half2(1.0h, 5.0h),
++    half2(2.0h, 5.0h),
++    half2(3.0h, 5.0h),
++    half2(4.0h, 5.0h),
++    half2(5.0h, 5.0h),
++    half2(6.0h, 5.0h),
++    half2(7.0h, 5.0h),
++    half2(-8.0h, 6.0h),
++    half2(-7.0h, 6.0h),
++    half2(-6.0h, 6.0h),
++    half2(-5.0h, 6.0h),
++    half2(-4.0h, 6.0h),
++    half2(-3.0h, 6.0h),
++    half2(-2.0h, 6.0h),
++    half2(-1.0h, 6.0h),
++    half2(0.0h, 6.0h),
++    half2(1.0h, 6.0h),
++    half2(2.0h, 6.0h),
++    half2(3.0h, 6.0h),
++    half2(4.0h, 6.0h),
++    half2(5.0h, 6.0h),
++    half2(6.0h, 6.0h),
++    half2(7.0h, 6.0h),
++    half2(-8.0h, 7.0h),
++    half2(-7.0h, 7.0h),
++    half2(-6.0h, 7.0h),
++    half2(-5.0h, 7.0h),
++    half2(-4.0h, 7.0h),
++    half2(-3.0h, 7.0h),
++    half2(-2.0h, 7.0h),
++    half2(-1.0h, 7.0h),
++    half2(0.0h, 7.0h),
++    half2(1.0h, 7.0h),
++    half2(2.0h, 7.0h),
++    half2(3.0h, 7.0h),
++    half2(4.0h, 7.0h),
++    half2(5.0h, 7.0h),
++    half2(6.0h, 7.0h),
++    half2(7.0h, 7.0h),
++};
++
++
++// Q4 chunk GEMM on the half-staging pattern of q27_matmul_t2_mm_h (variant
++// G-prime, docs/plans/2026-07-15-gemm-half-staging.md follow-up; port pre-
++// registered in 2026-07-17-t2-prefill-throughput.md): half tiles, raw Q4
++// codes (-8..+7) and raw int8 activations both integer-exact in half, FLOAT
++// accumulators (mixed-precision MMA). Products are bounded by 8*128 = 1024 <
++// 2048, so every product is exact in half regardless of where the MMA
++// rounds, and float accumulation keeps sums exact to 2^24 — stronger than
++// the float-staged q27_matmul_q4_mm it replaces, whose activation side
++// rounded once per value at staging. The Q4 scale group is 64 columns, so
++// each staged 64-K tile coincides with exactly one weight-scale group
++// (index c0/64, row stride cols/64); activation scales fold per 32-K
++// sub-slab at the flush exactly as in the T2 kernel.
++kernel void q27_matmul_q4_mm_h(
++        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
++        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
++        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
++        uint2 group [[threadgroup_position_in_grid]],
++        uint tid [[thread_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]],
++        ushort sg [[simdgroup_index_in_threadgroup]]) {
++    threadgroup half Wt[32 * 64];
++    threadgroup half Xt[64 * 16];
++    threadgroup float Sc[4 * 256];
++    const uint row0 = group.x * 32;
++    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
++    if (row0 >= args.rows) return;
++    const uint rlast = args.rows - 1;
++    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
++    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 2);
++    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
++    const uint xtok = tok0 + xloc;                       // device rows are global
++    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
++    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
++    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 64);
++    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 64);
++    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    float4 racc = 0.0f;
++    threadgroup float *sc = Sc + sg * 256;
++    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
++    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
++        {
++            // 16 columns = 8 bytes per thread: one byte-LUT gather per
++            // nibble pair, low nibble first (matches the float kernel's
++            // LSB-first order). wcb is a multiple of 16 -> half2-aligned.
++            const uint2 wp = *(device const uint2 *)(wsrc + (c0 + wcb) / 2);
++            threadgroup half2 *dst = (threadgroup half2 *)(Wt + wrow * 64 + wcb);
++            dst[0] = q27_q4_half2_lut[wp.x         & 0xffu];
++            dst[1] = q27_q4_half2_lut[(wp.x >>  8) & 0xffu];
++            dst[2] = q27_q4_half2_lut[(wp.x >> 16) & 0xffu];
++            dst[3] = q27_q4_half2_lut[wp.x >> 24         ];
++            dst[4] = q27_q4_half2_lut[wp.y         & 0xffu];
++            dst[5] = q27_q4_half2_lut[(wp.y >>  8) & 0xffu];
++            dst[6] = q27_q4_half2_lut[(wp.y >> 16) & 0xffu];
++            dst[7] = q27_q4_half2_lut[wp.y >> 24         ];
++        }
++        {
++            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
++            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
++            threadgroup half *dst = Xt + xcb * 16 + xloc;
++            // Raw int8 values: exact in half. The per-token 32-group scale
++            // folds at the flush below; invalid token slots stage clamped
++            // real values whose outputs are never stored.
++            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
++            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
++            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
++            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        const float wsA = float(weight_scales[wsrowA + c0 / 64]);
++        const float wsB = float(weight_scales[wsrowB + c0 / 64]);
++        // The two 32-K sub-slabs (activation-scale groups) accumulate into
++        // separate tile pairs so both fold in ONE barrier region per staged 64.
++        for (uint k8 = 0; k8 < 32; k8 += 8) {
++            simdgroup_half8x8 a, b;
++            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
++            simdgroup_load(b, Xt + k8 * 16, 16);
++            simdgroup_multiply_accumulate(acc0, a, b, acc0);
++            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
++            simdgroup_multiply_accumulate(acc1, a, b, acc1);
++        }
++        for (uint k8 = 32; k8 < 64; k8 += 8) {
++            simdgroup_half8x8 a, b;
++            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
++            simdgroup_load(b, Xt + k8 * 16, 16);
++            simdgroup_multiply_accumulate(acc2, a, b, acc2);
++            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
++            simdgroup_multiply_accumulate(acc3, a, b, acc3);
++        }
++        simdgroup_store(acc0, sc, 8);
++        simdgroup_store(acc1, sc + 64, 8);
++        simdgroup_store(acc2, sc + 128, 8);
++        simdgroup_store(acc3, sc + 192, 8);
++        simdgroup_barrier(mem_flags::mem_threadgroup);
++        {
++            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
++            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
++            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
++            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
++            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
++                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
++            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
++                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
++        }
++        simdgroup_barrier(mem_flags::mem_threadgroup);
++        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
++    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
++    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
++    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
++}
++
++// PARKED (2026-07-17, never engine-routed): Q8 on the half-staging
++// pattern FAILED the shape suite — 5.5e-4 at the high-cancellation
++// 33x5120 repro vs the 3e-4 bound. Unlike Q4/T2, Q8 PRODUCTS (up to
++// 127*127) exceed half's 2048 exact-integer range, and the failure shows
++// the mixed-precision MMA rounds products at HALF precision, not at the
++// float accumulator's — the empirical answer to the open question the Q4
++// port's exactness argument sidesteps (its products are <= 1024, exact
++// regardless). A split-nibble Q8 staging would restore exactness at 2x
++// the MMA work for a ~8%-of-wall kernel: not worth it. Q8 chunk GEMM
++// stays float-staged; kernel kept as the record of the attempt.
++kernel void q27_matmul_q8_mm_h(
++        device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
++        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
++        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
++        uint2 group [[threadgroup_position_in_grid]],
++        uint tid [[thread_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]],
++        ushort sg [[simdgroup_index_in_threadgroup]]) {
++    threadgroup half Wt[32 * 64];
++    threadgroup half Xt[64 * 16];
++    threadgroup float Sc[4 * 256];
++    const uint row0 = group.x * 32;
++    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
++    if (row0 >= args.rows) return;
++    const uint rlast = args.rows - 1;
++    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
++    device const char *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
++    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
++    const uint xtok = tok0 + xloc;                       // device rows are global
++    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
++    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
++    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
++    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
++    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    float4 racc = 0.0f;
++    threadgroup float *sc = Sc + sg * 256;
++    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
++    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
++        {
++            const int4 wp = *(device const int4 *)(wsrc + c0 + wcb);
++            const char4 w0 = as_type<char4>(wp.x), w1 = as_type<char4>(wp.y);
++            const char4 w2 = as_type<char4>(wp.z), w3 = as_type<char4>(wp.w);
++            threadgroup half *dst = Wt + wrow * 64 + wcb;
++            dst[0]  = half(w0.x); dst[1]  = half(w0.y); dst[2]  = half(w0.z); dst[3]  = half(w0.w);
++            dst[4]  = half(w1.x); dst[5]  = half(w1.y); dst[6]  = half(w1.z); dst[7]  = half(w1.w);
++            dst[8]  = half(w2.x); dst[9]  = half(w2.y); dst[10] = half(w2.z); dst[11] = half(w2.w);
++            dst[12] = half(w3.x); dst[13] = half(w3.y); dst[14] = half(w3.z); dst[15] = half(w3.w);
++        }
++        {
++            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
++            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
++            threadgroup half *dst = Xt + xcb * 16 + xloc;
++            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
++            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
++            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
++            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
++        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
++        for (uint k8 = 0; k8 < 32; k8 += 8) {
++            simdgroup_half8x8 a, b;
++            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
++            simdgroup_load(b, Xt + k8 * 16, 16);
++            simdgroup_multiply_accumulate(acc0, a, b, acc0);
++            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
++            simdgroup_multiply_accumulate(acc1, a, b, acc1);
++        }
++        for (uint k8 = 32; k8 < 64; k8 += 8) {
++            simdgroup_half8x8 a, b;
++            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
++            simdgroup_load(b, Xt + k8 * 16, 16);
++            simdgroup_multiply_accumulate(acc2, a, b, acc2);
++            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
++            simdgroup_multiply_accumulate(acc3, a, b, acc3);
++        }
++        simdgroup_store(acc0, sc, 8);
++        simdgroup_store(acc1, sc + 64, 8);
++        simdgroup_store(acc2, sc + 128, 8);
++        simdgroup_store(acc3, sc + 192, 8);
++        simdgroup_barrier(mem_flags::mem_threadgroup);
++        {
++            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
++            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
++            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
++            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
++            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
++                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
++            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
++                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
++        }
++        simdgroup_barrier(mem_flags::mem_threadgroup);
++        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
++    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
++    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
++    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
++}
++
+ // Nibble -> 4 binary-code halves (bit j = element j, LSB-first): one
+ // constant-memory gather replaces four shift/mask/select chains. Bit b
+ // stages (2b-1) as f16 — exact, so the mm kernel's math mirrors mm_h's.
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc 'git diff -- src/metal/metal_backend.mm'[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-QHdXnCZS' (errno=Operation not permitted)
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-pHVLeq8f' (errno=Operation not permitted)
+diff --git a/src/metal/metal_backend.mm b/src/metal/metal_backend.mm
+index 7c5c29c..93329e7 100644
+--- a/src/metal/metal_backend.mm
++++ b/src/metal/metal_backend.mm
+@@ -182,11 +182,13 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
+     id<MTLComputePipelineState> t3;
+     id<MTLComputePipelineState> b1;
+     id<MTLComputePipelineState> t2_quantized_matmul_h;
++    id<MTLComputePipelineState> q4_quantized_matmul_h;
+     id<MTLComputePipelineState> mask_logits_p;
+-    // Half-staging T2 chunk GEMM: default ON (landed at 1.22x chunk rate at
++    // Half-staging chunk GEMMs: default ON (T2 landed at 1.22x chunk rate at
+     // quality parity — the GEMM envelope class, docs/plans/2026-07-15-
+-    // margin-aware-gates.md); Q27_METAL_GEMM_HALF=0 opts out and exactly
+-    // reproduces the float-staged route (used to attribute the kl-kv
++    // margin-aware-gates.md; Q4/Q8 ports pre-registered in 2026-07-17-t2-
++    // prefill-throughput.md); Q27_METAL_GEMM_HALF=0 opts out and exactly
++    // reproduces the float-staged routes (used to attribute the kl-kv
+     // calibration shift to the digit, 2026-07-16-kv-codec-step1.md).
+     bool gemm_half = true;
+     id<MTLComputePipelineState> quantize;
+@@ -599,6 +601,7 @@ void report_profile() {
+             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
+             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
+             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
++            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm_h");
+             impl_->b1_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_b1_mm");
+             impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
+             impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
+@@ -1216,16 +1219,24 @@ new MetalBuffer(buffer), [set](MetalBuffer* wrapper) {
+     check_range(xv.size(),0,x.count,"quantized matmul values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matmul scales");
+     MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
+     @autoreleasepool {
+-        // Q27_METAL_GEMM_HALF=1: half-staging T2 GEMM (A/B lever, see
+-        // docs/plans/2026-07-15-gemm-half-staging.md).
+-        const bool t2h = impl_->gemm_half && weight.dtype==DType::T2_G128;
++        // Q27_METAL_GEMM_HALF=1: half-staging chunk GEMMs (A/B lever, see
++        // docs/plans/2026-07-15-gemm-half-staging.md; Q4 port 2026-07-17-
++        // t2-prefill-throughput.md). Q8 stays on the float-staged kernel:
++        // its half variant failed the shape suite (5.5e-4 at the
++        // high-cancellation 33x5120 repro vs the 3e-4 bound) because
++        // half-operand MMA products up to 127*127 round past half's 2048
++        // exact-integer range — the parked q27_matmul_q8_mm_h records the
++        // attempt.
++        const bool h = impl_->gemm_half;
+         bool own; auto enc=impl_->encoder_for_operation(own,
+             weight.dtype==DType::Q8_G128?"q27_matmul_q8_mm":
+-            weight.dtype==DType::T2_G128?(t2h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):
+-            weight.dtype==DType::B1_G128?"q27_matmul_b1_mm":"q27_matmul_q4_mm");
++            weight.dtype==DType::T2_G128?(h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):
++            weight.dtype==DType::B1_G128?"q27_matmul_b1_mm":
++            (h?"q27_matmul_q4_mm_h":"q27_matmul_q4_mm"));
+         [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:
+-                                     weight.dtype==DType::T2_G128?(t2h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):
+-                                     weight.dtype==DType::B1_G128?impl_->b1_quantized_matmul:impl_->q4_quantized_matmul];
++                                     weight.dtype==DType::T2_G128?(h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):
++                                     weight.dtype==DType::B1_G128?impl_->b1_quantized_matmul:
++                                     (h?impl_->q4_quantized_matmul_h:impl_->q4_quantized_matmul)];
+         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
+         [enc setBytes:&args length:sizeof(args) atIndex:5];
+
+[35m[3mcodex[0m[0m
+The diff adds only a Q4 half pipeline and leaves Q8 un-routed in backend dispatch. Next I’m checking the source schedules and the existing float Q4 unpack path so the review is grounded in exact indexing, not just the new comments.
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/q27_kernels.metal | sed -n '2270,2735p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+  2270	    half2(4.0h, -8.0h),
+  2271	    half2(5.0h, -8.0h),
+  2272	    half2(6.0h, -8.0h),
+  2273	    half2(7.0h, -8.0h),
+  2274	    half2(-8.0h, -7.0h),
+  2275	    half2(-7.0h, -7.0h),
+  2276	    half2(-6.0h, -7.0h),
+  2277	    half2(-5.0h, -7.0h),
+  2278	    half2(-4.0h, -7.0h),
+  2279	    half2(-3.0h, -7.0h),
+  2280	    half2(-2.0h, -7.0h),
+  2281	    half2(-1.0h, -7.0h),
+  2282	    half2(0.0h, -7.0h),
+  2283	    half2(1.0h, -7.0h),
+  2284	    half2(2.0h, -7.0h),
+  2285	    half2(3.0h, -7.0h),
+  2286	    half2(4.0h, -7.0h),
+  2287	    half2(5.0h, -7.0h),
+  2288	    half2(6.0h, -7.0h),
+  2289	    half2(7.0h, -7.0h),
+  2290	    half2(-8.0h, -6.0h),
+  2291	    half2(-7.0h, -6.0h),
+  2292	    half2(-6.0h, -6.0h),
+  2293	    half2(-5.0h, -6.0h),
+  2294	    half2(-4.0h, -6.0h),
+  2295	    half2(-3.0h, -6.0h),
+  2296	    half2(-2.0h, -6.0h),
+  2297	    half2(-1.0h, -6.0h),
+  2298	    half2(0.0h, -6.0h),
+  2299	    half2(1.0h, -6.0h),
+  2300	    half2(2.0h, -6.0h),
+  2301	    half2(3.0h, -6.0h),
+  2302	    half2(4.0h, -6.0h),
+  2303	    half2(5.0h, -6.0h),
+  2304	    half2(6.0h, -6.0h),
+  2305	    half2(7.0h, -6.0h),
+  2306	    half2(-8.0h, -5.0h),
+  2307	    half2(-7.0h, -5.0h),
+  2308	    half2(-6.0h, -5.0h),
+  2309	    half2(-5.0h, -5.0h),
+  2310	    half2(-4.0h, -5.0h),
+  2311	    half2(-3.0h, -5.0h),
+  2312	    half2(-2.0h, -5.0h),
+  2313	    half2(-1.0h, -5.0h),
+  2314	    half2(0.0h, -5.0h),
+  2315	    half2(1.0h, -5.0h),
+  2316	    half2(2.0h, -5.0h),
+  2317	    half2(3.0h, -5.0h),
+  2318	    half2(4.0h, -5.0h),
+  2319	    half2(5.0h, -5.0h),
+  2320	    half2(6.0h, -5.0h),
+  2321	    half2(7.0h, -5.0h),
+  2322	    half2(-8.0h, -4.0h),
+  2323	    half2(-7.0h, -4.0h),
+  2324	    half2(-6.0h, -4.0h),
+  2325	    half2(-5.0h, -4.0h),
+  2326	    half2(-4.0h, -4.0h),
+  2327	    half2(-3.0h, -4.0h),
+  2328	    half2(-2.0h, -4.0h),
+  2329	    half2(-1.0h, -4.0h),
+  2330	    half2(0.0h, -4.0h),
+  2331	    half2(1.0h, -4.0h),
+  2332	    half2(2.0h, -4.0h),
+  2333	    half2(3.0h, -4.0h),
+  2334	    half2(4.0h, -4.0h),
+  2335	    half2(5.0h, -4.0h),
+  2336	    half2(6.0h, -4.0h),
+  2337	    half2(7.0h, -4.0h),
+  2338	    half2(-8.0h, -3.0h),
+  2339	    half2(-7.0h, -3.0h),
+  2340	    half2(-6.0h, -3.0h),
+  2341	    half2(-5.0h, -3.0h),
+  2342	    half2(-4.0h, -3.0h),
+  2343	    half2(-3.0h, -3.0h),
+  2344	    half2(-2.0h, -3.0h),
+  2345	    half2(-1.0h, -3.0h),
+  2346	    half2(0.0h, -3.0h),
+  2347	    half2(1.0h, -3.0h),
+  2348	    half2(2.0h, -3.0h),
+  2349	    half2(3.0h, -3.0h),
+  2350	    half2(4.0h, -3.0h),
+  2351	    half2(5.0h, -3.0h),
+  2352	    half2(6.0h, -3.0h),
+  2353	    half2(7.0h, -3.0h),
+  2354	    half2(-8.0h, -2.0h),
+  2355	    half2(-7.0h, -2.0h),
+  2356	    half2(-6.0h, -2.0h),
+  2357	    half2(-5.0h, -2.0h),
+  2358	    half2(-4.0h, -2.0h),
+  2359	    half2(-3.0h, -2.0h),
+  2360	    half2(-2.0h, -2.0h),
+  2361	    half2(-1.0h, -2.0h),
+  2362	    half2(0.0h, -2.0h),
+  2363	    half2(1.0h, -2.0h),
+  2364	    half2(2.0h, -2.0h),
+  2365	    half2(3.0h, -2.0h),
+  2366	    half2(4.0h, -2.0h),
+  2367	    half2(5.0h, -2.0h),
+  2368	    half2(6.0h, -2.0h),
+  2369	    half2(7.0h, -2.0h),
+  2370	    half2(-8.0h, -1.0h),
+  2371	    half2(-7.0h, -1.0h),
+  2372	    half2(-6.0h, -1.0h),
+  2373	    half2(-5.0h, -1.0h),
+  2374	    half2(-4.0h, -1.0h),
+  2375	    half2(-3.0h, -1.0h),
+  2376	    half2(-2.0h, -1.0h),
+  2377	    half2(-1.0h, -1.0h),
+  2378	    half2(0.0h, -1.0h),
+  2379	    half2(1.0h, -1.0h),
+  2380	    half2(2.0h, -1.0h),
+  2381	    half2(3.0h, -1.0h),
+  2382	    half2(4.0h, -1.0h),
+  2383	    half2(5.0h, -1.0h),
+  2384	    half2(6.0h, -1.0h),
+  2385	    half2(7.0h, -1.0h),
+  2386	    half2(-8.0h, 0.0h),
+  2387	    half2(-7.0h, 0.0h),
+  2388	    half2(-6.0h, 0.0h),
+  2389	    half2(-5.0h, 0.0h),
+  2390	    half2(-4.0h, 0.0h),
+  2391	    half2(-3.0h, 0.0h),
+  2392	    half2(-2.0h, 0.0h),
+  2393	    half2(-1.0h, 0.0h),
+  2394	    half2(0.0h, 0.0h),
+  2395	    half2(1.0h, 0.0h),
+  2396	    half2(2.0h, 0.0h),
+  2397	    half2(3.0h, 0.0h),
+  2398	    half2(4.0h, 0.0h),
+  2399	    half2(5.0h, 0.0h),
+  2400	    half2(6.0h, 0.0h),
+  2401	    half2(7.0h, 0.0h),
+  2402	    half2(-8.0h, 1.0h),
+  2403	    half2(-7.0h, 1.0h),
+  2404	    half2(-6.0h, 1.0h),
+  2405	    half2(-5.0h, 1.0h),
+  2406	    half2(-4.0h, 1.0h),
+  2407	    half2(-3.0h, 1.0h),
+  2408	    half2(-2.0h, 1.0h),
+  2409	    half2(-1.0h, 1.0h),
+  2410	    half2(0.0h, 1.0h),
+  2411	    half2(1.0h, 1.0h),
+  2412	    half2(2.0h, 1.0h),
+  2413	    half2(3.0h, 1.0h),
+  2414	    half2(4.0h, 1.0h),
+  2415	    half2(5.0h, 1.0h),
+  2416	    half2(6.0h, 1.0h),
+  2417	    half2(7.0h, 1.0h),
+  2418	    half2(-8.0h, 2.0h),
+  2419	    half2(-7.0h, 2.0h),
+  2420	    half2(-6.0h, 2.0h),
+  2421	    half2(-5.0h, 2.0h),
+  2422	    half2(-4.0h, 2.0h),
+  2423	    half2(-3.0h, 2.0h),
+  2424	    half2(-2.0h, 2.0h),
+  2425	    half2(-1.0h, 2.0h),
+  2426	    half2(0.0h, 2.0h),
+  2427	    half2(1.0h, 2.0h),
+  2428	    half2(2.0h, 2.0h),
+  2429	    half2(3.0h, 2.0h),
+  2430	    half2(4.0h, 2.0h),
+  2431	    half2(5.0h, 2.0h),
+  2432	    half2(6.0h, 2.0h),
+  2433	    half2(7.0h, 2.0h),
+  2434	    half2(-8.0h, 3.0h),
+  2435	    half2(-7.0h, 3.0h),
+  2436	    half2(-6.0h, 3.0h),
+  2437	    half2(-5.0h, 3.0h),
+  2438	    half2(-4.0h, 3.0h),
+  2439	    half2(-3.0h, 3.0h),
+  2440	    half2(-2.0h, 3.0h),
+  2441	    half2(-1.0h, 3.0h),
+  2442	    half2(0.0h, 3.0h),
+  2443	    half2(1.0h, 3.0h),
+  2444	    half2(2.0h, 3.0h),
+  2445	    half2(3.0h, 3.0h),
+  2446	    half2(4.0h, 3.0h),
+  2447	    half2(5.0h, 3.0h),
+  2448	    half2(6.0h, 3.0h),
+  2449	    half2(7.0h, 3.0h),
+  2450	    half2(-8.0h, 4.0h),
+  2451	    half2(-7.0h, 4.0h),
+  2452	    half2(-6.0h, 4.0h),
+  2453	    half2(-5.0h, 4.0h),
+  2454	    half2(-4.0h, 4.0h),
+  2455	    half2(-3.0h, 4.0h),
+  2456	    half2(-2.0h, 4.0h),
+  2457	    half2(-1.0h, 4.0h),
+  2458	    half2(0.0h, 4.0h),
+  2459	    half2(1.0h, 4.0h),
+  2460	    half2(2.0h, 4.0h),
+  2461	    half2(3.0h, 4.0h),
+  2462	    half2(4.0h, 4.0h),
+  2463	    half2(5.0h, 4.0h),
+  2464	    half2(6.0h, 4.0h),
+  2465	    half2(7.0h, 4.0h),
+  2466	    half2(-8.0h, 5.0h),
+  2467	    half2(-7.0h, 5.0h),
+  2468	    half2(-6.0h, 5.0h),
+  2469	    half2(-5.0h, 5.0h),
+  2470	    half2(-4.0h, 5.0h),
+  2471	    half2(-3.0h, 5.0h),
+  2472	    half2(-2.0h, 5.0h),
+  2473	    half2(-1.0h, 5.0h),
+  2474	    half2(0.0h, 5.0h),
+  2475	    half2(1.0h, 5.0h),
+  2476	    half2(2.0h, 5.0h),
+  2477	    half2(3.0h, 5.0h),
+  2478	    half2(4.0h, 5.0h),
+  2479	    half2(5.0h, 5.0h),
+  2480	    half2(6.0h, 5.0h),
+  2481	    half2(7.0h, 5.0h),
+  2482	    half2(-8.0h, 6.0h),
+  2483	    half2(-7.0h, 6.0h),
+  2484	    half2(-6.0h, 6.0h),
+  2485	    half2(-5.0h, 6.0h),
+  2486	    half2(-4.0h, 6.0h),
+  2487	    half2(-3.0h, 6.0h),
+  2488	    half2(-2.0h, 6.0h),
+  2489	    half2(-1.0h, 6.0h),
+  2490	    half2(0.0h, 6.0h),
+  2491	    half2(1.0h, 6.0h),
+  2492	    half2(2.0h, 6.0h),
+  2493	    half2(3.0h, 6.0h),
+  2494	    half2(4.0h, 6.0h),
+  2495	    half2(5.0h, 6.0h),
+  2496	    half2(6.0h, 6.0h),
+  2497	    half2(7.0h, 6.0h),
+  2498	    half2(-8.0h, 7.0h),
+  2499	    half2(-7.0h, 7.0h),
+  2500	    half2(-6.0h, 7.0h),
+  2501	    half2(-5.0h, 7.0h),
+  2502	    half2(-4.0h, 7.0h),
+  2503	    half2(-3.0h, 7.0h),
+  2504	    half2(-2.0h, 7.0h),
+  2505	    half2(-1.0h, 7.0h),
+  2506	    half2(0.0h, 7.0h),
+  2507	    half2(1.0h, 7.0h),
+  2508	    half2(2.0h, 7.0h),
+  2509	    half2(3.0h, 7.0h),
+  2510	    half2(4.0h, 7.0h),
+  2511	    half2(5.0h, 7.0h),
+  2512	    half2(6.0h, 7.0h),
+  2513	    half2(7.0h, 7.0h),
+  2514	};
+  2515	
+  2516	
+  2517	// Q4 chunk GEMM on the half-staging pattern of q27_matmul_t2_mm_h (variant
+  2518	// G-prime, docs/plans/2026-07-15-gemm-half-staging.md follow-up; port pre-
+  2519	// registered in 2026-07-17-t2-prefill-throughput.md): half tiles, raw Q4
+  2520	// codes (-8..+7) and raw int8 activations both integer-exact in half, FLOAT
+  2521	// accumulators (mixed-precision MMA). Products are bounded by 8*128 = 1024 <
+  2522	// 2048, so every product is exact in half regardless of where the MMA
+  2523	// rounds, and float accumulation keeps sums exact to 2^24 — stronger than
+  2524	// the float-staged q27_matmul_q4_mm it replaces, whose activation side
+  2525	// rounded once per value at staging. The Q4 scale group is 64 columns, so
+  2526	// each staged 64-K tile coincides with exactly one weight-scale group
+  2527	// (index c0/64, row stride cols/64); activation scales fold per 32-K
+  2528	// sub-slab at the flush exactly as in the T2 kernel.
+  2529	kernel void q27_matmul_q4_mm_h(
+  2530	        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+  2531	        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+  2532	        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+  2533	        uint2 group [[threadgroup_position_in_grid]],
+  2534	        uint tid [[thread_index_in_threadgroup]],
+  2535	        ushort lane [[thread_index_in_simdgroup]],
+  2536	        ushort sg [[simdgroup_index_in_threadgroup]]) {
+  2537	    threadgroup half Wt[32 * 64];
+  2538	    threadgroup half Xt[64 * 16];
+  2539	    threadgroup float Sc[4 * 256];
+  2540	    const uint row0 = group.x * 32;
+  2541	    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+  2542	    if (row0 >= args.rows) return;
+  2543	    const uint rlast = args.rows - 1;
+  2544	    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+  2545	    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 2);
+  2546	    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+  2547	    const uint xtok = tok0 + xloc;                       // device rows are global
+  2548	    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+  2549	    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+  2550	    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 64);
+  2551	    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 64);
+  2552	    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2553	    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2554	    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2555	    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2556	    float4 racc = 0.0f;
+  2557	    threadgroup float *sc = Sc + sg * 256;
+  2558	    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+  2559	    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+  2560	        {
+  2561	            // 16 columns = 8 bytes per thread: one byte-LUT gather per
+  2562	            // nibble pair, low nibble first (matches the float kernel's
+  2563	            // LSB-first order). wcb is a multiple of 16 -> half2-aligned.
+  2564	            const uint2 wp = *(device const uint2 *)(wsrc + (c0 + wcb) / 2);
+  2565	            threadgroup half2 *dst = (threadgroup half2 *)(Wt + wrow * 64 + wcb);
+  2566	            dst[0] = q27_q4_half2_lut[wp.x         & 0xffu];
+  2567	            dst[1] = q27_q4_half2_lut[(wp.x >>  8) & 0xffu];
+  2568	            dst[2] = q27_q4_half2_lut[(wp.x >> 16) & 0xffu];
+  2569	            dst[3] = q27_q4_half2_lut[wp.x >> 24         ];
+  2570	            dst[4] = q27_q4_half2_lut[wp.y         & 0xffu];
+  2571	            dst[5] = q27_q4_half2_lut[(wp.y >>  8) & 0xffu];
+  2572	            dst[6] = q27_q4_half2_lut[(wp.y >> 16) & 0xffu];
+  2573	            dst[7] = q27_q4_half2_lut[wp.y >> 24         ];
+  2574	        }
+  2575	        {
+  2576	            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+  2577	            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+  2578	            threadgroup half *dst = Xt + xcb * 16 + xloc;
+  2579	            // Raw int8 values: exact in half. The per-token 32-group scale
+  2580	            // folds at the flush below; invalid token slots stage clamped
+  2581	            // real values whose outputs are never stored.
+  2582	            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+  2583	            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+  2584	            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+  2585	            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+  2586	        }
+  2587	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  2588	        const float wsA = float(weight_scales[wsrowA + c0 / 64]);
+  2589	        const float wsB = float(weight_scales[wsrowB + c0 / 64]);
+  2590	        // The two 32-K sub-slabs (activation-scale groups) accumulate into
+  2591	        // separate tile pairs so both fold in ONE barrier region per staged 64.
+  2592	        for (uint k8 = 0; k8 < 32; k8 += 8) {
+  2593	            simdgroup_half8x8 a, b;
+  2594	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  2595	            simdgroup_load(b, Xt + k8 * 16, 16);
+  2596	            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+  2597	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  2598	            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+  2599	        }
+  2600	        for (uint k8 = 32; k8 < 64; k8 += 8) {
+  2601	            simdgroup_half8x8 a, b;
+  2602	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  2603	            simdgroup_load(b, Xt + k8 * 16, 16);
+  2604	            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+  2605	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  2606	            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+  2607	        }
+  2608	        simdgroup_store(acc0, sc, 8);
+  2609	        simdgroup_store(acc1, sc + 64, 8);
+  2610	        simdgroup_store(acc2, sc + 128, 8);
+  2611	        simdgroup_store(acc3, sc + 192, 8);
+  2612	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  2613	        {
+  2614	            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+  2615	            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+  2616	            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+  2617	            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+  2618	            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+  2619	                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+  2620	            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+  2621	                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+  2622	        }
+  2623	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  2624	        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2625	        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2626	        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2627	        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2628	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  2629	    }
+  2630	    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+  2631	    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+  2632	    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+  2633	    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+  2634	}
+  2635	
+  2636	// PARKED (2026-07-17, never engine-routed): Q8 on the half-staging
+  2637	// pattern FAILED the shape suite — 5.5e-4 at the high-cancellation
+  2638	// 33x5120 repro vs the 3e-4 bound. Unlike Q4/T2, Q8 PRODUCTS (up to
+  2639	// 127*127) exceed half's 2048 exact-integer range, and the failure shows
+  2640	// the mixed-precision MMA rounds products at HALF precision, not at the
+  2641	// float accumulator's — the empirical answer to the open question the Q4
+  2642	// port's exactness argument sidesteps (its products are <= 1024, exact
+  2643	// regardless). A split-nibble Q8 staging would restore exactness at 2x
+  2644	// the MMA work for a ~8%-of-wall kernel: not worth it. Q8 chunk GEMM
+  2645	// stays float-staged; kernel kept as the record of the attempt.
+  2646	kernel void q27_matmul_q8_mm_h(
+  2647	        device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+  2648	        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+  2649	        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+  2650	        uint2 group [[threadgroup_position_in_grid]],
+  2651	        uint tid [[thread_index_in_threadgroup]],
+  2652	        ushort lane [[thread_index_in_simdgroup]],
+  2653	        ushort sg [[simdgroup_index_in_threadgroup]]) {
+  2654	    threadgroup half Wt[32 * 64];
+  2655	    threadgroup half Xt[64 * 16];
+  2656	    threadgroup float Sc[4 * 256];
+  2657	    const uint row0 = group.x * 32;
+  2658	    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+  2659	    if (row0 >= args.rows) return;
+  2660	    const uint rlast = args.rows - 1;
+  2661	    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+  2662	    device const char *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
+  2663	    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+  2664	    const uint xtok = tok0 + xloc;                       // device rows are global
+  2665	    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+  2666	    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+  2667	    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+  2668	    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+  2669	    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2670	    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2671	    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2672	    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2673	    float4 racc = 0.0f;
+  2674	    threadgroup float *sc = Sc + sg * 256;
+  2675	    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+  2676	    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+  2677	        {
+  2678	            const int4 wp = *(device const int4 *)(wsrc + c0 + wcb);
+  2679	            const char4 w0 = as_type<char4>(wp.x), w1 = as_type<char4>(wp.y);
+  2680	            const char4 w2 = as_type<char4>(wp.z), w3 = as_type<char4>(wp.w);
+  2681	            threadgroup half *dst = Wt + wrow * 64 + wcb;
+  2682	            dst[0]  = half(w0.x); dst[1]  = half(w0.y); dst[2]  = half(w0.z); dst[3]  = half(w0.w);
+  2683	            dst[4]  = half(w1.x); dst[5]  = half(w1.y); dst[6]  = half(w1.z); dst[7]  = half(w1.w);
+  2684	            dst[8]  = half(w2.x); dst[9]  = half(w2.y); dst[10] = half(w2.z); dst[11] = half(w2.w);
+  2685	            dst[12] = half(w3.x); dst[13] = half(w3.y); dst[14] = half(w3.z); dst[15] = half(w3.w);
+  2686	        }
+  2687	        {
+  2688	            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+  2689	            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+  2690	            threadgroup half *dst = Xt + xcb * 16 + xloc;
+  2691	            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+  2692	            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+  2693	            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+  2694	            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+  2695	        }
+  2696	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  2697	        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+  2698	        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+  2699	        for (uint k8 = 0; k8 < 32; k8 += 8) {
+  2700	            simdgroup_half8x8 a, b;
+  2701	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  2702	            simdgroup_load(b, Xt + k8 * 16, 16);
+  2703	            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+  2704	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  2705	            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+  2706	        }
+  2707	        for (uint k8 = 32; k8 < 64; k8 += 8) {
+  2708	            simdgroup_half8x8 a, b;
+  2709	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  2710	            simdgroup_load(b, Xt + k8 * 16, 16);
+  2711	            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+  2712	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  2713	            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+  2714	        }
+  2715	        simdgroup_store(acc0, sc, 8);
+  2716	        simdgroup_store(acc1, sc + 64, 8);
+  2717	        simdgroup_store(acc2, sc + 128, 8);
+  2718	        simdgroup_store(acc3, sc + 192, 8);
+  2719	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  2720	        {
+  2721	            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+  2722	            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+  2723	            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+  2724	            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+  2725	            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+  2726	                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+  2727	            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+  2728	                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+  2729	        }
+  2730	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  2731	        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2732	        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2733	        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2734	        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2735	        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/q27_kernels.metal | sed -n '1720,2270p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+  1720	            dst[4]  = float(w1.x); dst[5]  = float(w1.y); dst[6]  = float(w1.z); dst[7]  = float(w1.w);
+  1721	            dst[8]  = float(w2.x); dst[9]  = float(w2.y); dst[10] = float(w2.z); dst[11] = float(w2.w);
+  1722	            dst[12] = float(w3.x); dst[13] = float(w3.y); dst[14] = float(w3.z); dst[15] = float(w3.w);
+  1723	        }
+  1724	        {
+  1725	            const float xs = xvalid ? x_scales[xsbase + (c0 + xcb) / 32] : 0.0f;
+  1726	            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+  1727	            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+  1728	            threadgroup float *dst = Xt + xcb * 16 + xloc;
+  1729	            dst[0 * 16] = float(xa.x) * xs; dst[1 * 16] = float(xa.y) * xs;
+  1730	            dst[2 * 16] = float(xa.z) * xs; dst[3 * 16] = float(xa.w) * xs;
+  1731	            dst[4 * 16] = float(xb.x) * xs; dst[5 * 16] = float(xb.y) * xs;
+  1732	            dst[6 * 16] = float(xb.z) * xs; dst[7 * 16] = float(xb.w) * xs;
+  1733	        }
+  1734	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  1735	        for (uint k8 = 0; k8 < 64; k8 += 8) {
+  1736	            simdgroup_float8x8 a, b;
+  1737	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  1738	            simdgroup_load(b, Xt + k8 * 16, 16);
+  1739	            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+  1740	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  1741	            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+  1742	        }
+  1743	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  1744	        simdgroup_store(acc0, sc, 8);
+  1745	        simdgroup_store(acc1, sc + 64, 8);
+  1746	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  1747	        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+  1748	        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+  1749	        racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+  1750	                float4(wsA, wsB, wsA, wsB);
+  1751	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  1752	        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1753	        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1754	    }
+  1755	    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+  1756	    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+  1757	    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+  1758	    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+  1759	    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+  1760	}
+  1761	
+  1762	// Ternary tiled chunk GEMM. Identical structure to q27_matmul_q8_mm — the
+  1763	// 64-column K-tile subdivides the 128-column T2 scale group, so the per-tile
+  1764	// flush scale stays constant within the tile — with the staging block
+  1765	// decoding 16 sequential LSB-first 2-bit codes per uint into exact integers.
+  1766	kernel void q27_matmul_t2_mm(
+  1767	        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+  1768	        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+  1769	        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+  1770	        uint2 group [[threadgroup_position_in_grid]],
+  1771	        uint tid [[thread_index_in_threadgroup]],
+  1772	        ushort lane [[thread_index_in_simdgroup]],
+  1773	        ushort sg [[simdgroup_index_in_threadgroup]]) {
+  1774	    threadgroup float Wt[32 * 64];
+  1775	    threadgroup float Xt[64 * 16];
+  1776	    threadgroup float Sc[4 * 128];
+  1777	    const uint row0 = group.x * 32;
+  1778	    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+  1779	    if (row0 >= args.rows) return;
+  1780	    const uint rlast = args.rows - 1;
+  1781	    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+  1782	    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+  1783	    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+  1784	    const uint xtok = tok0 + xloc;                       // device rows are global
+  1785	    const bool xvalid = xtok < args.x_rows;
+  1786	    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+  1787	    const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
+  1788	    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+  1789	    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+  1790	    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+  1791	    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1792	    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1793	    float4 racc = 0.0f;
+  1794	    threadgroup float *sc = Sc + sg * 128;
+  1795	    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+  1796	        {
+  1797	            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+  1798	            threadgroup float *dst = Wt + wrow * 64 + wcb;
+  1799	            dst[0]  = float(int(wp         & 3u) - 1);
+  1800	            dst[1]  = float(int((wp >>  2) & 3u) - 1);
+  1801	            dst[2]  = float(int((wp >>  4) & 3u) - 1);
+  1802	            dst[3]  = float(int((wp >>  6) & 3u) - 1);
+  1803	            dst[4]  = float(int((wp >>  8) & 3u) - 1);
+  1804	            dst[5]  = float(int((wp >> 10) & 3u) - 1);
+  1805	            dst[6]  = float(int((wp >> 12) & 3u) - 1);
+  1806	            dst[7]  = float(int((wp >> 14) & 3u) - 1);
+  1807	            dst[8]  = float(int((wp >> 16) & 3u) - 1);
+  1808	            dst[9]  = float(int((wp >> 18) & 3u) - 1);
+  1809	            dst[10] = float(int((wp >> 20) & 3u) - 1);
+  1810	            dst[11] = float(int((wp >> 22) & 3u) - 1);
+  1811	            dst[12] = float(int((wp >> 24) & 3u) - 1);
+  1812	            dst[13] = float(int((wp >> 26) & 3u) - 1);
+  1813	            dst[14] = float(int((wp >> 28) & 3u) - 1);
+  1814	            dst[15] = float(int((wp >> 30)      ) - 1);
+  1815	        }
+  1816	        {
+  1817	            const float xs = xvalid ? x_scales[xsbase + (c0 + xcb) / 32] : 0.0f;
+  1818	            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+  1819	            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+  1820	            threadgroup float *dst = Xt + xcb * 16 + xloc;
+  1821	            dst[0 * 16] = float(xa.x) * xs; dst[1 * 16] = float(xa.y) * xs;
+  1822	            dst[2 * 16] = float(xa.z) * xs; dst[3 * 16] = float(xa.w) * xs;
+  1823	            dst[4 * 16] = float(xb.x) * xs; dst[5 * 16] = float(xb.y) * xs;
+  1824	            dst[6 * 16] = float(xb.z) * xs; dst[7 * 16] = float(xb.w) * xs;
+  1825	        }
+  1826	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  1827	        for (uint k8 = 0; k8 < 64; k8 += 8) {
+  1828	            simdgroup_float8x8 a, b;
+  1829	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  1830	            simdgroup_load(b, Xt + k8 * 16, 16);
+  1831	            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+  1832	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  1833	            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+  1834	        }
+  1835	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  1836	        simdgroup_store(acc0, sc, 8);
+  1837	        simdgroup_store(acc1, sc + 64, 8);
+  1838	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  1839	        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+  1840	        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+  1841	        racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+  1842	                float4(wsA, wsB, wsA, wsB);
+  1843	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  1844	        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1845	        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1846	    }
+  1847	    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+  1848	    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+  1849	    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+  1850	    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+  1851	    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+  1852	}
+  1853	
+  1854	// Half-staging variant of the T2 chunk GEMM (default path,
+  1855	// Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
+  1856	// variant G′): tiles are half — doubled simdgroup-MMA rate, halved
+  1857	// threadgroup traffic — and BOTH operands stay integer-exact in half: trits
+  1858	// on the weight side, raw int8 on the activation side. Accumulators are
+  1859	// FLOAT (mixed-precision MMA), keeping int8 x trit sums exact to 2^24.
+  1860	// Scales fold at the flush instead of at staging: each 64-K staged tile
+  1861	// accumulates its two 32-K sub-slabs (the x-scale groups) into separate
+  1862	// accumulator pairs, folded into racc in ONE barrier region per tile with
+  1863	// component (row, token) scaled by ws(row) * xs(token, sub-slab). (Variant
+  1864	// A staged prescaled activations and failed the shape suite; half
+  1865	// ACCUMULATION rounds past 2048 — variant B's 32-K half flush moved the
+  1866	// 2K NLL +0.4%.)
+  1867	// Trit code -> half bit pattern: (c-1) as f16 is one of three constants
+  1868	// (code 3 decodes to +2, preserving the arithmetic unpack's behavior for
+  1869	// a corrupt pack byte). The MMA roofline measured the unpack/convert
+  1870	// chain at 13.5% of the production GEMM (C/Beq, docs/plans/2026-07-16-
+  1871	// mma-roofline.md); constructing the bit pattern directly deletes the
+  1872	// integer subtract and int->half convert per element — the roofline's
+  1873	// ONE authorized targeted round. The staged halves are identical values,
+  1874	// so kernel output is bit-identical to the arithmetic unpack (pre/post
+  1875	// artifact A/B gates the change).
+  1876	constant ushort q27_t2_half_lut[4] = {0xbc00, 0x0000, 0x3c00, 0x4000};
+  1877	
+  1878	// Byte -> 4 trit halves (little-endian codes): one constant-memory gather
+  1879	// replaces four shift/mask/select chains. 2 KB, generated from the 2-bit
+  1880	// code map (code 3 -> +2.0h, matching the arithmetic unpack).
+  1881	constant half4 q27_t2_half4_lut[256] = {
+  1882	    half4(-1.0h, -1.0h, -1.0h, -1.0h),
+  1883	    half4(0.0h, -1.0h, -1.0h, -1.0h),
+  1884	    half4(1.0h, -1.0h, -1.0h, -1.0h),
+  1885	    half4(2.0h, -1.0h, -1.0h, -1.0h),
+  1886	    half4(-1.0h, 0.0h, -1.0h, -1.0h),
+  1887	    half4(0.0h, 0.0h, -1.0h, -1.0h),
+  1888	    half4(1.0h, 0.0h, -1.0h, -1.0h),
+  1889	    half4(2.0h, 0.0h, -1.0h, -1.0h),
+  1890	    half4(-1.0h, 1.0h, -1.0h, -1.0h),
+  1891	    half4(0.0h, 1.0h, -1.0h, -1.0h),
+  1892	    half4(1.0h, 1.0h, -1.0h, -1.0h),
+  1893	    half4(2.0h, 1.0h, -1.0h, -1.0h),
+  1894	    half4(-1.0h, 2.0h, -1.0h, -1.0h),
+  1895	    half4(0.0h, 2.0h, -1.0h, -1.0h),
+  1896	    half4(1.0h, 2.0h, -1.0h, -1.0h),
+  1897	    half4(2.0h, 2.0h, -1.0h, -1.0h),
+  1898	    half4(-1.0h, -1.0h, 0.0h, -1.0h),
+  1899	    half4(0.0h, -1.0h, 0.0h, -1.0h),
+  1900	    half4(1.0h, -1.0h, 0.0h, -1.0h),
+  1901	    half4(2.0h, -1.0h, 0.0h, -1.0h),
+  1902	    half4(-1.0h, 0.0h, 0.0h, -1.0h),
+  1903	    half4(0.0h, 0.0h, 0.0h, -1.0h),
+  1904	    half4(1.0h, 0.0h, 0.0h, -1.0h),
+  1905	    half4(2.0h, 0.0h, 0.0h, -1.0h),
+  1906	    half4(-1.0h, 1.0h, 0.0h, -1.0h),
+  1907	    half4(0.0h, 1.0h, 0.0h, -1.0h),
+  1908	    half4(1.0h, 1.0h, 0.0h, -1.0h),
+  1909	    half4(2.0h, 1.0h, 0.0h, -1.0h),
+  1910	    half4(-1.0h, 2.0h, 0.0h, -1.0h),
+  1911	    half4(0.0h, 2.0h, 0.0h, -1.0h),
+  1912	    half4(1.0h, 2.0h, 0.0h, -1.0h),
+  1913	    half4(2.0h, 2.0h, 0.0h, -1.0h),
+  1914	    half4(-1.0h, -1.0h, 1.0h, -1.0h),
+  1915	    half4(0.0h, -1.0h, 1.0h, -1.0h),
+  1916	    half4(1.0h, -1.0h, 1.0h, -1.0h),
+  1917	    half4(2.0h, -1.0h, 1.0h, -1.0h),
+  1918	    half4(-1.0h, 0.0h, 1.0h, -1.0h),
+  1919	    half4(0.0h, 0.0h, 1.0h, -1.0h),
+  1920	    half4(1.0h, 0.0h, 1.0h, -1.0h),
+  1921	    half4(2.0h, 0.0h, 1.0h, -1.0h),
+  1922	    half4(-1.0h, 1.0h, 1.0h, -1.0h),
+  1923	    half4(0.0h, 1.0h, 1.0h, -1.0h),
+  1924	    half4(1.0h, 1.0h, 1.0h, -1.0h),
+  1925	    half4(2.0h, 1.0h, 1.0h, -1.0h),
+  1926	    half4(-1.0h, 2.0h, 1.0h, -1.0h),
+  1927	    half4(0.0h, 2.0h, 1.0h, -1.0h),
+  1928	    half4(1.0h, 2.0h, 1.0h, -1.0h),
+  1929	    half4(2.0h, 2.0h, 1.0h, -1.0h),
+  1930	    half4(-1.0h, -1.0h, 2.0h, -1.0h),
+  1931	    half4(0.0h, -1.0h, 2.0h, -1.0h),
+  1932	    half4(1.0h, -1.0h, 2.0h, -1.0h),
+  1933	    half4(2.0h, -1.0h, 2.0h, -1.0h),
+  1934	    half4(-1.0h, 0.0h, 2.0h, -1.0h),
+  1935	    half4(0.0h, 0.0h, 2.0h, -1.0h),
+  1936	    half4(1.0h, 0.0h, 2.0h, -1.0h),
+  1937	    half4(2.0h, 0.0h, 2.0h, -1.0h),
+  1938	    half4(-1.0h, 1.0h, 2.0h, -1.0h),
+  1939	    half4(0.0h, 1.0h, 2.0h, -1.0h),
+  1940	    half4(1.0h, 1.0h, 2.0h, -1.0h),
+  1941	    half4(2.0h, 1.0h, 2.0h, -1.0h),
+  1942	    half4(-1.0h, 2.0h, 2.0h, -1.0h),
+  1943	    half4(0.0h, 2.0h, 2.0h, -1.0h),
+  1944	    half4(1.0h, 2.0h, 2.0h, -1.0h),
+  1945	    half4(2.0h, 2.0h, 2.0h, -1.0h),
+  1946	    half4(-1.0h, -1.0h, -1.0h, 0.0h),
+  1947	    half4(0.0h, -1.0h, -1.0h, 0.0h),
+  1948	    half4(1.0h, -1.0h, -1.0h, 0.0h),
+  1949	    half4(2.0h, -1.0h, -1.0h, 0.0h),
+  1950	    half4(-1.0h, 0.0h, -1.0h, 0.0h),
+  1951	    half4(0.0h, 0.0h, -1.0h, 0.0h),
+  1952	    half4(1.0h, 0.0h, -1.0h, 0.0h),
+  1953	    half4(2.0h, 0.0h, -1.0h, 0.0h),
+  1954	    half4(-1.0h, 1.0h, -1.0h, 0.0h),
+  1955	    half4(0.0h, 1.0h, -1.0h, 0.0h),
+  1956	    half4(1.0h, 1.0h, -1.0h, 0.0h),
+  1957	    half4(2.0h, 1.0h, -1.0h, 0.0h),
+  1958	    half4(-1.0h, 2.0h, -1.0h, 0.0h),
+  1959	    half4(0.0h, 2.0h, -1.0h, 0.0h),
+  1960	    half4(1.0h, 2.0h, -1.0h, 0.0h),
+  1961	    half4(2.0h, 2.0h, -1.0h, 0.0h),
+  1962	    half4(-1.0h, -1.0h, 0.0h, 0.0h),
+  1963	    half4(0.0h, -1.0h, 0.0h, 0.0h),
+  1964	    half4(1.0h, -1.0h, 0.0h, 0.0h),
+  1965	    half4(2.0h, -1.0h, 0.0h, 0.0h),
+  1966	    half4(-1.0h, 0.0h, 0.0h, 0.0h),
+  1967	    half4(0.0h, 0.0h, 0.0h, 0.0h),
+  1968	    half4(1.0h, 0.0h, 0.0h, 0.0h),
+  1969	    half4(2.0h, 0.0h, 0.0h, 0.0h),
+  1970	    half4(-1.0h, 1.0h, 0.0h, 0.0h),
+  1971	    half4(0.0h, 1.0h, 0.0h, 0.0h),
+  1972	    half4(1.0h, 1.0h, 0.0h, 0.0h),
+  1973	    half4(2.0h, 1.0h, 0.0h, 0.0h),
+  1974	    half4(-1.0h, 2.0h, 0.0h, 0.0h),
+  1975	    half4(0.0h, 2.0h, 0.0h, 0.0h),
+  1976	    half4(1.0h, 2.0h, 0.0h, 0.0h),
+  1977	    half4(2.0h, 2.0h, 0.0h, 0.0h),
+  1978	    half4(-1.0h, -1.0h, 1.0h, 0.0h),
+  1979	    half4(0.0h, -1.0h, 1.0h, 0.0h),
+  1980	    half4(1.0h, -1.0h, 1.0h, 0.0h),
+  1981	    half4(2.0h, -1.0h, 1.0h, 0.0h),
+  1982	    half4(-1.0h, 0.0h, 1.0h, 0.0h),
+  1983	    half4(0.0h, 0.0h, 1.0h, 0.0h),
+  1984	    half4(1.0h, 0.0h, 1.0h, 0.0h),
+  1985	    half4(2.0h, 0.0h, 1.0h, 0.0h),
+  1986	    half4(-1.0h, 1.0h, 1.0h, 0.0h),
+  1987	    half4(0.0h, 1.0h, 1.0h, 0.0h),
+  1988	    half4(1.0h, 1.0h, 1.0h, 0.0h),
+  1989	    half4(2.0h, 1.0h, 1.0h, 0.0h),
+  1990	    half4(-1.0h, 2.0h, 1.0h, 0.0h),
+  1991	    half4(0.0h, 2.0h, 1.0h, 0.0h),
+  1992	    half4(1.0h, 2.0h, 1.0h, 0.0h),
+  1993	    half4(2.0h, 2.0h, 1.0h, 0.0h),
+  1994	    half4(-1.0h, -1.0h, 2.0h, 0.0h),
+  1995	    half4(0.0h, -1.0h, 2.0h, 0.0h),
+  1996	    half4(1.0h, -1.0h, 2.0h, 0.0h),
+  1997	    half4(2.0h, -1.0h, 2.0h, 0.0h),
+  1998	    half4(-1.0h, 0.0h, 2.0h, 0.0h),
+  1999	    half4(0.0h, 0.0h, 2.0h, 0.0h),
+  2000	    half4(1.0h, 0.0h, 2.0h, 0.0h),
+  2001	    half4(2.0h, 0.0h, 2.0h, 0.0h),
+  2002	    half4(-1.0h, 1.0h, 2.0h, 0.0h),
+  2003	    half4(0.0h, 1.0h, 2.0h, 0.0h),
+  2004	    half4(1.0h, 1.0h, 2.0h, 0.0h),
+  2005	    half4(2.0h, 1.0h, 2.0h, 0.0h),
+  2006	    half4(-1.0h, 2.0h, 2.0h, 0.0h),
+  2007	    half4(0.0h, 2.0h, 2.0h, 0.0h),
+  2008	    half4(1.0h, 2.0h, 2.0h, 0.0h),
+  2009	    half4(2.0h, 2.0h, 2.0h, 0.0h),
+  2010	    half4(-1.0h, -1.0h, -1.0h, 1.0h),
+  2011	    half4(0.0h, -1.0h, -1.0h, 1.0h),
+  2012	    half4(1.0h, -1.0h, -1.0h, 1.0h),
+  2013	    half4(2.0h, -1.0h, -1.0h, 1.0h),
+  2014	    half4(-1.0h, 0.0h, -1.0h, 1.0h),
+  2015	    half4(0.0h, 0.0h, -1.0h, 1.0h),
+  2016	    half4(1.0h, 0.0h, -1.0h, 1.0h),
+  2017	    half4(2.0h, 0.0h, -1.0h, 1.0h),
+  2018	    half4(-1.0h, 1.0h, -1.0h, 1.0h),
+  2019	    half4(0.0h, 1.0h, -1.0h, 1.0h),
+  2020	    half4(1.0h, 1.0h, -1.0h, 1.0h),
+  2021	    half4(2.0h, 1.0h, -1.0h, 1.0h),
+  2022	    half4(-1.0h, 2.0h, -1.0h, 1.0h),
+  2023	    half4(0.0h, 2.0h, -1.0h, 1.0h),
+  2024	    half4(1.0h, 2.0h, -1.0h, 1.0h),
+  2025	    half4(2.0h, 2.0h, -1.0h, 1.0h),
+  2026	    half4(-1.0h, -1.0h, 0.0h, 1.0h),
+  2027	    half4(0.0h, -1.0h, 0.0h, 1.0h),
+  2028	    half4(1.0h, -1.0h, 0.0h, 1.0h),
+  2029	    half4(2.0h, -1.0h, 0.0h, 1.0h),
+  2030	    half4(-1.0h, 0.0h, 0.0h, 1.0h),
+  2031	    half4(0.0h, 0.0h, 0.0h, 1.0h),
+  2032	    half4(1.0h, 0.0h, 0.0h, 1.0h),
+  2033	    half4(2.0h, 0.0h, 0.0h, 1.0h),
+  2034	    half4(-1.0h, 1.0h, 0.0h, 1.0h),
+  2035	    half4(0.0h, 1.0h, 0.0h, 1.0h),
+  2036	    half4(1.0h, 1.0h, 0.0h, 1.0h),
+  2037	    half4(2.0h, 1.0h, 0.0h, 1.0h),
+  2038	    half4(-1.0h, 2.0h, 0.0h, 1.0h),
+  2039	    half4(0.0h, 2.0h, 0.0h, 1.0h),
+  2040	    half4(1.0h, 2.0h, 0.0h, 1.0h),
+  2041	    half4(2.0h, 2.0h, 0.0h, 1.0h),
+  2042	    half4(-1.0h, -1.0h, 1.0h, 1.0h),
+  2043	    half4(0.0h, -1.0h, 1.0h, 1.0h),
+  2044	    half4(1.0h, -1.0h, 1.0h, 1.0h),
+  2045	    half4(2.0h, -1.0h, 1.0h, 1.0h),
+  2046	    half4(-1.0h, 0.0h, 1.0h, 1.0h),
+  2047	    half4(0.0h, 0.0h, 1.0h, 1.0h),
+  2048	    half4(1.0h, 0.0h, 1.0h, 1.0h),
+  2049	    half4(2.0h, 0.0h, 1.0h, 1.0h),
+  2050	    half4(-1.0h, 1.0h, 1.0h, 1.0h),
+  2051	    half4(0.0h, 1.0h, 1.0h, 1.0h),
+  2052	    half4(1.0h, 1.0h, 1.0h, 1.0h),
+  2053	    half4(2.0h, 1.0h, 1.0h, 1.0h),
+  2054	    half4(-1.0h, 2.0h, 1.0h, 1.0h),
+  2055	    half4(0.0h, 2.0h, 1.0h, 1.0h),
+  2056	    half4(1.0h, 2.0h, 1.0h, 1.0h),
+  2057	    half4(2.0h, 2.0h, 1.0h, 1.0h),
+  2058	    half4(-1.0h, -1.0h, 2.0h, 1.0h),
+  2059	    half4(0.0h, -1.0h, 2.0h, 1.0h),
+  2060	    half4(1.0h, -1.0h, 2.0h, 1.0h),
+  2061	    half4(2.0h, -1.0h, 2.0h, 1.0h),
+  2062	    half4(-1.0h, 0.0h, 2.0h, 1.0h),
+  2063	    half4(0.0h, 0.0h, 2.0h, 1.0h),
+  2064	    half4(1.0h, 0.0h, 2.0h, 1.0h),
+  2065	    half4(2.0h, 0.0h, 2.0h, 1.0h),
+  2066	    half4(-1.0h, 1.0h, 2.0h, 1.0h),
+  2067	    half4(0.0h, 1.0h, 2.0h, 1.0h),
+  2068	    half4(1.0h, 1.0h, 2.0h, 1.0h),
+  2069	    half4(2.0h, 1.0h, 2.0h, 1.0h),
+  2070	    half4(-1.0h, 2.0h, 2.0h, 1.0h),
+  2071	    half4(0.0h, 2.0h, 2.0h, 1.0h),
+  2072	    half4(1.0h, 2.0h, 2.0h, 1.0h),
+  2073	    half4(2.0h, 2.0h, 2.0h, 1.0h),
+  2074	    half4(-1.0h, -1.0h, -1.0h, 2.0h),
+  2075	    half4(0.0h, -1.0h, -1.0h, 2.0h),
+  2076	    half4(1.0h, -1.0h, -1.0h, 2.0h),
+  2077	    half4(2.0h, -1.0h, -1.0h, 2.0h),
+  2078	    half4(-1.0h, 0.0h, -1.0h, 2.0h),
+  2079	    half4(0.0h, 0.0h, -1.0h, 2.0h),
+  2080	    half4(1.0h, 0.0h, -1.0h, 2.0h),
+  2081	    half4(2.0h, 0.0h, -1.0h, 2.0h),
+  2082	    half4(-1.0h, 1.0h, -1.0h, 2.0h),
+  2083	    half4(0.0h, 1.0h, -1.0h, 2.0h),
+  2084	    half4(1.0h, 1.0h, -1.0h, 2.0h),
+  2085	    half4(2.0h, 1.0h, -1.0h, 2.0h),
+  2086	    half4(-1.0h, 2.0h, -1.0h, 2.0h),
+  2087	    half4(0.0h, 2.0h, -1.0h, 2.0h),
+  2088	    half4(1.0h, 2.0h, -1.0h, 2.0h),
+  2089	    half4(2.0h, 2.0h, -1.0h, 2.0h),
+  2090	    half4(-1.0h, -1.0h, 0.0h, 2.0h),
+  2091	    half4(0.0h, -1.0h, 0.0h, 2.0h),
+  2092	    half4(1.0h, -1.0h, 0.0h, 2.0h),
+  2093	    half4(2.0h, -1.0h, 0.0h, 2.0h),
+  2094	    half4(-1.0h, 0.0h, 0.0h, 2.0h),
+  2095	    half4(0.0h, 0.0h, 0.0h, 2.0h),
+  2096	    half4(1.0h, 0.0h, 0.0h, 2.0h),
+  2097	    half4(2.0h, 0.0h, 0.0h, 2.0h),
+  2098	    half4(-1.0h, 1.0h, 0.0h, 2.0h),
+  2099	    half4(0.0h, 1.0h, 0.0h, 2.0h),
+  2100	    half4(1.0h, 1.0h, 0.0h, 2.0h),
+  2101	    half4(2.0h, 1.0h, 0.0h, 2.0h),
+  2102	    half4(-1.0h, 2.0h, 0.0h, 2.0h),
+  2103	    half4(0.0h, 2.0h, 0.0h, 2.0h),
+  2104	    half4(1.0h, 2.0h, 0.0h, 2.0h),
+  2105	    half4(2.0h, 2.0h, 0.0h, 2.0h),
+  2106	    half4(-1.0h, -1.0h, 1.0h, 2.0h),
+  2107	    half4(0.0h, -1.0h, 1.0h, 2.0h),
+  2108	    half4(1.0h, -1.0h, 1.0h, 2.0h),
+  2109	    half4(2.0h, -1.0h, 1.0h, 2.0h),
+  2110	    half4(-1.0h, 0.0h, 1.0h, 2.0h),
+  2111	    half4(0.0h, 0.0h, 1.0h, 2.0h),
+  2112	    half4(1.0h, 0.0h, 1.0h, 2.0h),
+  2113	    half4(2.0h, 0.0h, 1.0h, 2.0h),
+  2114	    half4(-1.0h, 1.0h, 1.0h, 2.0h),
+  2115	    half4(0.0h, 1.0h, 1.0h, 2.0h),
+  2116	    half4(1.0h, 1.0h, 1.0h, 2.0h),
+  2117	    half4(2.0h, 1.0h, 1.0h, 2.0h),
+  2118	    half4(-1.0h, 2.0h, 1.0h, 2.0h),
+  2119	    half4(0.0h, 2.0h, 1.0h, 2.0h),
+  2120	    half4(1.0h, 2.0h, 1.0h, 2.0h),
+  2121	    half4(2.0h, 2.0h, 1.0h, 2.0h),
+  2122	    half4(-1.0h, -1.0h, 2.0h, 2.0h),
+  2123	    half4(0.0h, -1.0h, 2.0h, 2.0h),
+  2124	    half4(1.0h, -1.0h, 2.0h, 2.0h),
+  2125	    half4(2.0h, -1.0h, 2.0h, 2.0h),
+  2126	    half4(-1.0h, 0.0h, 2.0h, 2.0h),
+  2127	    half4(0.0h, 0.0h, 2.0h, 2.0h),
+  2128	    half4(1.0h, 0.0h, 2.0h, 2.0h),
+  2129	    half4(2.0h, 0.0h, 2.0h, 2.0h),
+  2130	    half4(-1.0h, 1.0h, 2.0h, 2.0h),
+  2131	    half4(0.0h, 1.0h, 2.0h, 2.0h),
+  2132	    half4(1.0h, 1.0h, 2.0h, 2.0h),
+  2133	    half4(2.0h, 1.0h, 2.0h, 2.0h),
+  2134	    half4(-1.0h, 2.0h, 2.0h, 2.0h),
+  2135	    half4(0.0h, 2.0h, 2.0h, 2.0h),
+  2136	    half4(1.0h, 2.0h, 2.0h, 2.0h),
+  2137	    half4(2.0h, 2.0h, 2.0h, 2.0h),
+  2138	};
+  2139	
+  2140	kernel void q27_matmul_t2_mm_h(
+  2141	        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+  2142	        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+  2143	        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+  2144	        uint2 group [[threadgroup_position_in_grid]],
+  2145	        uint tid [[thread_index_in_threadgroup]],
+  2146	        ushort lane [[thread_index_in_simdgroup]],
+  2147	        ushort sg [[simdgroup_index_in_threadgroup]]) {
+  2148	    threadgroup half Wt[32 * 64];
+  2149	    threadgroup half Xt[64 * 16];
+  2150	    threadgroup float Sc[4 * 256];
+  2151	    const uint row0 = group.x * 32;
+  2152	    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+  2153	    if (row0 >= args.rows) return;
+  2154	    const uint rlast = args.rows - 1;
+  2155	    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+  2156	    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+  2157	    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+  2158	    const uint xtok = tok0 + xloc;                       // device rows are global
+  2159	    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+  2160	    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+  2161	    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+  2162	    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+  2163	    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2164	    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2165	    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2166	    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2167	    float4 racc = 0.0f;
+  2168	    threadgroup float *sc = Sc + sg * 256;
+  2169	    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+  2170	    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+  2171	        {
+  2172	            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+  2173	            // Roofline round (docs/plans/2026-07-16-mma-roofline.md): one
+  2174	            // byte-LUT gather per 4 trits + 4 vector stores replaces the
+  2175	            // 16 shift/mask/int-sub/convert chains and 16 scalar stores —
+  2176	            // staged halves are identical values, so output is
+  2177	            // bit-identical to the arithmetic unpack. (K=128 staging was
+  2178	            // also tried in the round and REGRESSED — 16 KB threadgroup
+  2179	            // footprint cost more occupancy than the halved barrier
+  2180	            // cadence saved; K=64 stands, as K=32 already showed from the
+  2181	            // other side. wcb is a multiple of 16 -> half4-aligned.)
+  2182	            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+  2183	            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+  2184	            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+  2185	            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+  2186	            dst[3] = q27_t2_half4_lut[wp >> 24         ];
+  2187	        }
+  2188	        {
+  2189	            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+  2190	            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+  2191	            threadgroup half *dst = Xt + xcb * 16 + xloc;
+  2192	            // Raw int8 values: exact in half. The per-token 32-group scale
+  2193	            // folds at the flush below; invalid token slots stage clamped
+  2194	            // real values whose outputs are never stored. (Stores are
+  2195	            // 16-strided by tile layout — not vectorizable; a device-side
+  2196	            // int8->half pre-pass measured C/Cx = 1.006, not worth a
+  2197	            // kernel + ABI bump.)
+  2198	            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+  2199	            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+  2200	            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+  2201	            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+  2202	        }
+  2203	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  2204	        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+  2205	        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+  2206	        // Float accumulators keep int8 x trit sums exact to 2^24. The two
+  2207	        // 32-K sub-slabs (activation-scale groups) accumulate into separate
+  2208	        // tile pairs so both fold in ONE barrier region per staged 64.
+  2209	        for (uint k8 = 0; k8 < 32; k8 += 8) {
+  2210	            simdgroup_half8x8 a, b;
+  2211	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  2212	            simdgroup_load(b, Xt + k8 * 16, 16);
+  2213	            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+  2214	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  2215	            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+  2216	        }
+  2217	        for (uint k8 = 32; k8 < 64; k8 += 8) {
+  2218	            simdgroup_half8x8 a, b;
+  2219	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  2220	            simdgroup_load(b, Xt + k8 * 16, 16);
+  2221	            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+  2222	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  2223	            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+  2224	        }
+  2225	        simdgroup_store(acc0, sc, 8);
+  2226	        simdgroup_store(acc1, sc + 64, 8);
+  2227	        simdgroup_store(acc2, sc + 128, 8);
+  2228	        simdgroup_store(acc3, sc + 192, 8);
+  2229	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  2230	        {
+  2231	            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+  2232	            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+  2233	            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+  2234	            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+  2235	            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+  2236	                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+  2237	            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+  2238	                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+  2239	        }
+  2240	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  2241	        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2242	        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2243	        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2244	        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  2245	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  2246	    }
+  2247	    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+  2248	    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+  2249	    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+  2250	    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+  2251	}
+  2252	
+  2253	
+  2254	// Byte -> 2 Q4 halves (low nibble first, code n -> n-8): one constant-
+  2255	// memory gather replaces two shift/mask/int-sub/convert chains. 1 KB,
+  2256	// values -8..+7 are all exact in half.
+  2257	constant half2 q27_q4_half2_lut[256] = {
+  2258	    half2(-8.0h, -8.0h),
+  2259	    half2(-7.0h, -8.0h),
+  2260	    half2(-6.0h, -8.0h),
+  2261	    half2(-5.0h, -8.0h),
+  2262	    half2(-4.0h, -8.0h),
+  2263	    half2(-3.0h, -8.0h),
+  2264	    half2(-2.0h, -8.0h),
+  2265	    half2(-1.0h, -8.0h),
+  2266	    half2(0.0h, -8.0h),
+  2267	    half2(1.0h, -8.0h),
+  2268	    half2(2.0h, -8.0h),
+  2269	    half2(3.0h, -8.0h),
+  2270	    half2(4.0h, -8.0h),
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/metal_backend.mm | sed -n '1180,1255p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+  1180	        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  1181	        if(own) impl_->finish_command("x2 quantized matvec");
+  1182	    }
+  1183	}
+  1184	
+  1185	// Two independent packed-dot dispatches now beat a fused pair kernel: the
+  1186	// rewritten GEMV is weight-stream-bound, so sharing the (cached) activation
+  1187	// bytes buys nothing, while the fused kernel's doubled register pressure
+  1188	// measured 47-55 GB/s against 67-69 GB/s for back-to-back singles (Q4,
+  1189	// 17408x5120-class shapes, M4). The entry point survives as the engine's
+  1190	// sibling-projection idiom.
+  1191	void MetalBackend::matvec_quantized_pair(const BackendTensor& a, BackendBuffer& a_out,
+  1192	                                         const BackendTensor& b, BackendBuffer& b_out,
+  1193	                                         const BackendQuantized& x) {
+  1194	    matvec_quantized(a,x,a_out); matvec_quantized(b,x,b_out);
+  1195	}
+  1196	
+  1197	void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
+  1198	                                    uint32_t x_rows,BackendBuffer& y) {
+  1199	    if(!impl_->q4_quantized_matmul || !impl_->q8_quantized_matmul || !impl_->t2_quantized_matmul) {
+  1200	        if(x_rows==1) { matvec_quantized(weight,x,y); return; }
+  1201	        throw std::runtime_error("q27 Metal: quantized matmul requires Apple GPU family 7 or newer");
+  1202	    }
+  1203	    if((weight.dtype!=DType::Q4_G64 && weight.dtype!=DType::Q8_G128 &&
+  1204	        weight.dtype!=DType::T2_G128 && weight.dtype!=DType::B1_G128) || !weight.data || !weight.scales)
+  1205	        throw std::runtime_error("q27 Metal: quantized matmul requires Q4/Q8/T2/B1 weight");
+  1206	    uint64_t group=weight.dtype==DType::Q4_G64?64:128;
+  1207	    // Wide prefill chunks: the kernels tile tokens 16 per threadgroup on
+  1208	    // grid.y (docs/plans/2026-07-15-wide-chunks.md phase A). 96 = 8x12.
+  1209	    if(!x_rows || x_rows>96 || !weight.rows || !weight.cols || weight.rows>UINT32_MAX || weight.cols>UINT32_MAX ||
+  1210	       weight.cols%group || (uint64_t)weight.cols*x_rows>UINT32_MAX || x.count!=weight.cols*x_rows || !x.values || !x.scales)
+  1211	        throw std::runtime_error("q27 Metal: invalid quantized matmul dimensions");
+  1212	    check_range(y.size(),0,weight.rows*x_rows*4,"quantized matmul output");
+  1213	    const MetalBuffer& data=metal_buffer(*weight.data); const MetalBuffer& ws=metal_buffer(*weight.scales);
+  1214	    const MetalBuffer& xv=metal_buffer(*x.values); const MetalBuffer& xs=metal_buffer(*x.scales); MetalBuffer& out=metal_buffer(y);
+  1215	    uint64_t divisor=weight.dtype==DType::Q4_G64?2:weight.dtype==DType::T2_G128?4:
+  1216	                     weight.dtype==DType::B1_G128?8:1;
+  1217	    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,weight.rows*weight.cols/divisor,"quantized matmul weight");
+  1218	    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,weight.rows*(weight.cols/group)*2,"quantized matmul weight scales");
+  1219	    check_range(xv.size(),0,x.count,"quantized matmul values"); check_range(xs.size(),0,(uint64_t)(x.count/32)*4,"quantized matmul scales");
+  1220	    MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
+  1221	    @autoreleasepool {
+  1222	        // Q27_METAL_GEMM_HALF=1: half-staging chunk GEMMs (A/B lever, see
+  1223	        // docs/plans/2026-07-15-gemm-half-staging.md; Q4 port 2026-07-17-
+  1224	        // t2-prefill-throughput.md). Q8 stays on the float-staged kernel:
+  1225	        // its half variant failed the shape suite (5.5e-4 at the
+  1226	        // high-cancellation 33x5120 repro vs the 3e-4 bound) because
+  1227	        // half-operand MMA products up to 127*127 round past half's 2048
+  1228	        // exact-integer range — the parked q27_matmul_q8_mm_h records the
+  1229	        // attempt.
+  1230	        const bool h = impl_->gemm_half;
+  1231	        bool own; auto enc=impl_->encoder_for_operation(own,
+  1232	            weight.dtype==DType::Q8_G128?"q27_matmul_q8_mm":
+  1233	            weight.dtype==DType::T2_G128?(h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):
+  1234	            weight.dtype==DType::B1_G128?"q27_matmul_b1_mm":
+  1235	            (h?"q27_matmul_q4_mm_h":"q27_matmul_q4_mm"));
+  1236	        [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:
+  1237	                                     weight.dtype==DType::T2_G128?(h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):
+  1238	                                     weight.dtype==DType::B1_G128?impl_->b1_quantized_matmul:
+  1239	                                     (h?impl_->q4_quantized_matmul_h:impl_->q4_quantized_matmul)];
+  1240	        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+  1241	        [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
+  1242	        [enc setBytes:&args length:sizeof(args) atIndex:5];
+  1243	        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,(NSUInteger)(x_rows+15)/16,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+  1244	        if(own) impl_->finish_command("quantized simdgroup matmul");
+  1245	    }
+  1246	}
+  1247	
+  1248	// A/B/C MMA roofline probe entries (bench-only, docs/plans/2026-07-16-mma-
+  1249	// roofline.md): same dispatch grid and MatmulArgs as the production T2
+  1250	// GEMM. Arm 'b' takes half operands + half weight scales + float
+  1251	// activation scales; arm 'a' takes only the opaque tile seed. Never
+  1252	// engine-routed.
+  1253	void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t x_rows,
+  1254	                                const BackendBuffer& w_or_seed, const BackendBuffer* w_scales,
+  1255	                                const BackendBuffer* x, const BackendBuffer* x_scales,
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/metal_backend.mm | sed -n '560,625p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+   560	        MTLCompileOptions* options = [MTLCompileOptions new];
+   561	        // Correctness baseline; enable relaxed math only after CUDA comparison.
+   562	        if (@available(macOS 15.0, *)) {
+   563	            options.mathMode = MTLMathModeSafe;
+   564	        } else {
+   565	#pragma clang diagnostic push
+   566	#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+   567	            options.fastMathEnabled = NO;
+   568	#pragma clang diagnostic pop
+   569	        }
+   570	        NSError* error = nil;
+   571	        impl_->library = [impl_->device newLibraryWithSource:load_kernel_source()
+   572	                                                      options:options
+   573	                                                        error:&error];
+   574	        if (!impl_->library)
+   575	            throw std::runtime_error("q27 Metal: shader compilation failed: " +
+   576	                                     std::string(error.localizedDescription.UTF8String));
+   577	        impl_->f32 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f32");
+   578	        impl_->f16 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16");
+   579	        impl_->q8 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_g128");
+   580	        impl_->q4 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_g64");
+   581	        impl_->t2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128");
+   582	        impl_->t3 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t3_g128");
+   583	        impl_->b1 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_g128");
+   584	        impl_->mask_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_mask_logits");
+   585	        impl_->b1_select_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_select");
+   586	        impl_->b1_signxor_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_signxor");
+   587	        impl_->b1_popcount_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_popcount");
+   588	        impl_->b1_x_prep_p = make_pipeline(impl_->device, impl_->library, @"q27_b1_x_prep");
+   589	        impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
+   590	        impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
+   591	        impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
+   592	        impl_->t2_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized");
+   593	        impl_->b1_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_quantized");
+   594	        impl_->t2_quantized_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized_x2");
+   595	        impl_->t2_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128_x2");
+   596	        impl_->f16_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair");
+   597	        // SIMD-scoped matrix multiply is optional on older Intel-family Metal
+   598	        // devices. Decode GEMV remains available there; only small-N GEMM is gated.
+   599	        if ([impl_->device supportsFamily:MTLGPUFamilyApple7]) {
+   600	            impl_->q4_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm");
+   601	            impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
+   602	            impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
+   603	            impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
+   604	            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm_h");
+   605	            impl_->b1_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_b1_mm");
+   606	            impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
+   607	            impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
+   608	            impl_->mma_roofline_b_eq_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b_eq");
+   609	            impl_->mma_roofline_cx_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_cx");
+   610	            impl_->mma_roofline_f_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_f");
+   611	            impl_->mm_dr_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr");
+   612	            impl_->mm_dr2_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr2");
+   613	            impl_->x_to_half_t_p = make_pipeline(impl_->device, impl_->library, @"q27_x_int8_to_half_t");
+   614	            if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
+   615	                impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
+   616	        }
+   617	        impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
+   618	        impl_->embedding_t2 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2");
+   619	        impl_->embedding_b1 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1");
+   620	        impl_->embedding_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8_dev");
+   621	        impl_->embedding_t2_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_dev");
+   622	        impl_->embedding_b1_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1_dev");
+   623	        impl_->embedding_t2_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_rows");
+   624	        impl_->embedding_b1_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1_rows");
+   625	        impl_->rms = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm");
+
+[35m[3mcodex[0m[0m
+The half Q4 body is a near text clone of T2 half with the expected stride substitutions. I’m now checking whether those substitutions match the existing float Q4 kernel and the host-side shape/range checks, because that’s where a subtle `/2` or `/64` bug would show up.
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/q27_kernels.metal | sed -n '1460,1565p'"[0m in /Users/macthedan/projects/q27
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/q27_kernels.metal | sed -n '1560,1725p'"[0m in /Users/macthedan/projects/q27
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/test_metal.cpp | sed -n '740,830p' && nl -ba src/metal/test_metal.cpp | sed -n '880,930p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+  1560	        acc_a += float(da) * ws * xas[c / 32];
+  1561	        acc_b += float(db) * ws * xbs[c / 32];
+  1562	    }
+  1563	    acc_a = simd_sum(acc_a);
+  1564	    acc_b = simd_sum(acc_b);
+  1565	    if (lane == 0) { out[row] = acc_a; out[args.rows + row] = acc_b; }
+  1566	}
+  1567	
+  1568	// Tiled simdgroup-matrix GEMM (x_rows 1..12) for chunked prefill and
+  1569	// batched MTP verification. A 128-thread threadgroup (4 simdgroups) owns a
+  1570	// 32-row x 16-token output tile and walks K in 64-column tiles: weights are
+  1571	// staged in threadgroup memory as raw dequantized integers (exact in f32),
+  1572	// activations as their int8 value times the per-32-column activation scale,
+  1573	// and each simdgroup accumulates its 8-row stripe with 8x8x8
+  1574	// multiply-accumulates. Every K-tile coincides with (or subdivides) one
+  1575	// weight-scale group, so accumulators flush through per-simdgroup scratch
+  1576	// once per tile, scaled by the row's weight scale, into per-lane running
+  1577	// totals. This replaces a packed-dot scalar variant that was issue-bound at
+  1578	// ~4 ops per multiply-add (2 char->int converts, mul, add): the matrix unit
+  1579	// converts operands once per staged tile, not once per MAC. Numerics: the
+  1580	// weight side stays integer-exact; the activation side rounds once per
+  1581	// value at staging; cross-tile accumulation is sequential in K per output
+  1582	// element. Not bit-identical to the serial GEMV (whose per-lane K-striping
+  1583	// plus simd_sum tree orders float additions differently), but the committed-
+  1584	// token A/B gates cover the difference, as with the earlier tile kernel.
+  1585	// Row slots past rows-1 clamp their loads and drop their stores; token
+  1586	// slots past x_rows-1 stage zeros and skip their stores.
+  1587	kernel void q27_matmul_q4_mm(
+  1588	        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+  1589	        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+  1590	        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+  1591	        uint2 group [[threadgroup_position_in_grid]],
+  1592	        uint tid [[thread_index_in_threadgroup]],
+  1593	        ushort lane [[thread_index_in_simdgroup]],
+  1594	        ushort sg [[simdgroup_index_in_threadgroup]]) {
+  1595	    threadgroup float Wt[32 * 64];   // [row within tile][col within K-tile]
+  1596	    threadgroup float Xt[64 * 16];   // [col within K-tile][token], prescaled
+  1597	    threadgroup float Sc[4 * 128];   // per-simdgroup flush scratch
+  1598	    const uint row0 = group.x * 32;
+  1599	    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+  1600	    if (row0 >= args.rows) return;
+  1601	    const uint rlast = args.rows - 1;
+  1602	    // Staging assignments: one weight row / 16 columns and one token /
+  1603	    // 8 transposed columns per thread.
+  1604	    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+  1605	    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 2);
+  1606	    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+  1607	    const uint xtok = tok0 + xloc;                       // device rows are global
+  1608	    const bool xvalid = xtok < args.x_rows;
+  1609	    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+  1610	    const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
+  1611	    // The flush scratch holds both 8x8 tiles row-major: element i covers
+  1612	    // tile i/64, row (i%64)/8, token (i/64)*8 + i%8. Each lane owns
+  1613	    // elements lane, lane+32, lane+64, lane+96 as its running totals:
+  1614	    // components x/z sit in row lane/8, components y/w in row lane/8 + 4.
+  1615	    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+  1616	    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 64);
+  1617	    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 64);
+  1618	    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1619	    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1620	    float4 racc = 0.0f;
+  1621	    threadgroup float *sc = Sc + sg * 128;
+  1622	    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+  1623	        {
+  1624	            const uint2 wp = *(device const uint2 *)(wsrc + (c0 + wcb) / 2);
+  1625	            threadgroup float *dst = Wt + wrow * 64 + wcb;
+  1626	            dst[0]  = float(int(wp.x         & 15u) - 8);
+  1627	            dst[1]  = float(int((wp.x >>  4) & 15u) - 8);
+  1628	            dst[2]  = float(int((wp.x >>  8) & 15u) - 8);
+  1629	            dst[3]  = float(int((wp.x >> 12) & 15u) - 8);
+  1630	            dst[4]  = float(int((wp.x >> 16) & 15u) - 8);
+  1631	            dst[5]  = float(int((wp.x >> 20) & 15u) - 8);
+  1632	            dst[6]  = float(int((wp.x >> 24) & 15u) - 8);
+  1633	            dst[7]  = float(int((wp.x >> 28)      ) - 8);
+  1634	            dst[8]  = float(int(wp.y         & 15u) - 8);
+  1635	            dst[9]  = float(int((wp.y >>  4) & 15u) - 8);
+  1636	            dst[10] = float(int((wp.y >>  8) & 15u) - 8);
+  1637	            dst[11] = float(int((wp.y >> 12) & 15u) - 8);
+  1638	            dst[12] = float(int((wp.y >> 16) & 15u) - 8);
+  1639	            dst[13] = float(int((wp.y >> 20) & 15u) - 8);
+  1640	            dst[14] = float(int((wp.y >> 24) & 15u) - 8);
+  1641	            dst[15] = float(int((wp.y >> 28)      ) - 8);
+  1642	        }
+  1643	        {
+  1644	            const float xs = xvalid ? x_scales[xsbase + (c0 + xcb) / 32] : 0.0f;
+  1645	            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+  1646	            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+  1647	            threadgroup float *dst = Xt + xcb * 16 + xloc;
+  1648	            dst[0 * 16] = float(xa.x) * xs; dst[1 * 16] = float(xa.y) * xs;
+  1649	            dst[2 * 16] = float(xa.z) * xs; dst[3 * 16] = float(xa.w) * xs;
+  1650	            dst[4 * 16] = float(xb.x) * xs; dst[5 * 16] = float(xb.y) * xs;
+  1651	            dst[6 * 16] = float(xb.z) * xs; dst[7 * 16] = float(xb.w) * xs;
+  1652	        }
+  1653	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  1654	        for (uint k8 = 0; k8 < 64; k8 += 8) {
+  1655	            simdgroup_float8x8 a, b;
+  1656	            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+  1657	            simdgroup_load(b, Xt + k8 * 16, 16);
+  1658	            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+  1659	            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+  1660	            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+  1661	        }
+  1662	        threadgroup_barrier(mem_flags::mem_threadgroup);
+  1663	        simdgroup_store(acc0, sc, 8);
+  1664	        simdgroup_store(acc1, sc + 64, 8);
+  1665	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  1666	        const float wsA = float(weight_scales[wsrowA + c0 / 64]);
+  1667	        const float wsB = float(weight_scales[wsrowB + c0 / 64]);
+  1668	        racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+  1669	                float4(wsA, wsB, wsA, wsB);
+  1670	        simdgroup_barrier(mem_flags::mem_threadgroup);
+  1671	        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1672	        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1673	    }
+  1674	    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+  1675	    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+  1676	    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+  1677	    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+  1678	    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+  1679	}
+  1680	
+  1681	kernel void q27_matmul_q8_mm(
+  1682	        device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+  1683	        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+  1684	        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+  1685	        uint2 group [[threadgroup_position_in_grid]],
+  1686	        uint tid [[thread_index_in_threadgroup]],
+  1687	        ushort lane [[thread_index_in_simdgroup]],
+  1688	        ushort sg [[simdgroup_index_in_threadgroup]]) {
+  1689	    threadgroup float Wt[32 * 64];
+  1690	    threadgroup float Xt[64 * 16];
+  1691	    threadgroup float Sc[4 * 128];
+  1692	    const uint row0 = group.x * 32;
+  1693	    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+  1694	    if (row0 >= args.rows) return;
+  1695	    const uint rlast = args.rows - 1;
+  1696	    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+  1697	    device const char *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
+  1698	    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+  1699	    const uint xtok = tok0 + xloc;                       // device rows are global
+  1700	    const bool xvalid = xtok < args.x_rows;
+  1701	    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+  1702	    const uint xsbase = min(xtok, args.x_rows - 1) * (args.cols / 32);
+  1703	    // Lane element rows as in the Q4 kernel; the 64-column K-tile subdivides
+  1704	    // the 128-column Q8 scale group, so the per-tile flush scale stays
+  1705	    // constant within the tile as required.
+  1706	    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+  1707	    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+  1708	    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+  1709	    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1710	    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  1711	    float4 racc = 0.0f;
+  1712	    threadgroup float *sc = Sc + sg * 128;
+  1713	    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+  1714	        {
+  1715	            const int4 wp = *(device const int4 *)(wsrc + c0 + wcb);
+  1716	            const char4 w0 = as_type<char4>(wp.x), w1 = as_type<char4>(wp.y);
+  1717	            const char4 w2 = as_type<char4>(wp.z), w3 = as_type<char4>(wp.w);
+  1718	            threadgroup float *dst = Wt + wrow * 64 + wcb;
+  1719	            dst[0]  = float(w0.x); dst[1]  = float(w0.y); dst[2]  = float(w0.z); dst[3]  = float(w0.w);
+  1720	            dst[4]  = float(w1.x); dst[5]  = float(w1.y); dst[6]  = float(w1.z); dst[7]  = float(w1.w);
+  1721	            dst[8]  = float(w2.x); dst[9]  = float(w2.y); dst[10] = float(w2.z); dst[11] = float(w2.w);
+  1722	            dst[12] = float(w3.x); dst[13] = float(w3.y); dst[14] = float(w3.z); dst[15] = float(w3.w);
+  1723	        }
+  1724	        {
+  1725	            const float xs = xvalid ? x_scales[xsbase + (c0 + xcb) / 32] : 0.0f;
+
+[32m succeeded in 0ms:[0m
+  1460	        const uint c = chunk * 1024 + lane * 32;
+  1461	        acc += float(dot0 + dot1) *
+  1462	               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+  1463	    }
+  1464	    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+  1465	        const uint wp = uint(weights[(ulong)row * (args.cols / 8) + c / 8]) >> (c % 8);
+  1466	        const char4 xp = *(device const char4 *)(x + c);
+  1467	        const int tot = int(xp.x) + int(xp.y) + int(xp.z) + int(xp.w);
+  1468	        const int pos = select(0, int(xp.x), bool(wp & 1u)) +
+  1469	                        select(0, int(xp.y), bool(wp & 2u)) +
+  1470	                        select(0, int(xp.z), bool(wp & 4u)) +
+  1471	                        select(0, int(xp.w), bool(wp & 8u));
+  1472	        acc += float(2 * pos - tot) *
+  1473	               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+  1474	    }
+  1475	    acc = simd_sum(acc);
+  1476	    if (lane == 0) out[row] = acc;
+  1477	}
+  1478	
+  1479	// Dual-row ternary dot: unpack each 2-bit code ONCE, MAC into both rows.
+  1480	// The packed-dot GEMV is issue-bound on the unpack (shift/mask/sub per
+  1481	// code), not on the weight stream, so sharing the unpack — not the bytes —
+  1482	// is where an N=2 batch can win. Integer sums are exact and order-
+  1483	// independent, so each row's dot equals the single-row kernel's bit for bit.
+  1484	inline void q27_dot16_t2_dual(uint packed, int4 xpa, int4 xpb,
+  1485	                              thread int& sa, thread int& sb) {
+  1486	    const char4 a0 = as_type<char4>(xpa.x), a1 = as_type<char4>(xpa.y);
+  1487	    const char4 a2 = as_type<char4>(xpa.z), a3 = as_type<char4>(xpa.w);
+  1488	    const char4 b0 = as_type<char4>(xpb.x), b1 = as_type<char4>(xpb.y);
+  1489	    const char4 b2 = as_type<char4>(xpb.z), b3 = as_type<char4>(xpb.w);
+  1490	    int w;
+  1491	    w = int(packed         & 3u) - 1; sa += w * a0.x; sb += w * b0.x;
+  1492	    w = int((packed >>  2) & 3u) - 1; sa += w * a0.y; sb += w * b0.y;
+  1493	    w = int((packed >>  4) & 3u) - 1; sa += w * a0.z; sb += w * b0.z;
+  1494	    w = int((packed >>  6) & 3u) - 1; sa += w * a0.w; sb += w * b0.w;
+  1495	    w = int((packed >>  8) & 3u) - 1; sa += w * a1.x; sb += w * b1.x;
+  1496	    w = int((packed >> 10) & 3u) - 1; sa += w * a1.y; sb += w * b1.y;
+  1497	    w = int((packed >> 12) & 3u) - 1; sa += w * a1.z; sb += w * b1.z;
+  1498	    w = int((packed >> 14) & 3u) - 1; sa += w * a1.w; sb += w * b1.w;
+  1499	    w = int((packed >> 16) & 3u) - 1; sa += w * a2.x; sb += w * b2.x;
+  1500	    w = int((packed >> 18) & 3u) - 1; sa += w * a2.y; sb += w * b2.y;
+  1501	    w = int((packed >> 20) & 3u) - 1; sa += w * a2.z; sb += w * b2.z;
+  1502	    w = int((packed >> 22) & 3u) - 1; sa += w * a2.w; sb += w * b2.w;
+  1503	    w = int((packed >> 24) & 3u) - 1; sa += w * a3.x; sb += w * b3.x;
+  1504	    w = int((packed >> 26) & 3u) - 1; sa += w * a3.y; sb += w * b3.y;
+  1505	    w = int((packed >> 28) & 3u) - 1; sa += w * a3.z; sb += w * b3.z;
+  1506	    w = int((packed >> 30)      ) - 1; sa += w * a3.w; sb += w * b3.w;
+  1507	}
+  1508	
+  1509	// N=2 slot-batched ternary GEMV (multislot Phase 2 probe): one pass over
+  1510	// the weight stream computes two activation rows, sharing the per-code
+  1511	// unpack via q27_dot16_t2_dual. Layouts match the MM kernels: x row-major
+  1512	// [2, cols], x_scales [2, cols/32], out token-major [2, rows]. Per-row
+  1513	// K-striping, scale-multiply order, and simd_sum are IDENTICAL to
+  1514	// q27_matvec_t2_quantized, and the integer dots are exact, so each row's
+  1515	// output is bit-identical to the single-row kernel. (The fused-pair
+  1516	// precedent — two weights, one x — lost on register pressure; here the
+  1517	// shared work is the unpack, the actual issue-bound resource.)
+  1518	// PARKED by measurement (2026-07-16, multislot Phase-2 probe): aggregate
+  1519	// s_k 1.093 vs the 1.31 decision line — kept as the probe's reference
+  1520	// surface, never engine-routed.
+  1521	kernel void q27_matvec_t2_quantized_x2(device const uchar *weights [[buffer(0)]],
+  1522	                                        device const half *weight_scales [[buffer(1)]],
+  1523	                                        device const char *x [[buffer(2)]],
+  1524	                                        device const float *x_scales [[buffer(3)]],
+  1525	                                        device float *out [[buffer(4)]],
+  1526	                                        constant MatvecArgs &args [[buffer(5)]],
+  1527	                                        uint group [[threadgroup_position_in_grid]],
+  1528	                                        ushort lane [[thread_index_in_simdgroup]],
+  1529	                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  1530	    const uint row = group * 8 + simdgroup;
+  1531	    if (row >= args.rows) return;
+  1532	    device const uint2 *w2 = (device const uint2 *)(weights + (ulong)row * (args.cols / 4));
+  1533	    device const int4 *xa16 = (device const int4 *)x;
+  1534	    device const int4 *xb16 = (device const int4 *)(x + args.cols);
+  1535	    device const float *xas = x_scales;
+  1536	    device const float *xbs = x_scales + args.cols / 32;
+  1537	    const ulong scale_base = (ulong)row * (args.cols / 128);
+  1538	    float acc_a = 0.0f, acc_b = 0.0f;
+  1539	    const uint chunks = args.cols / 1024;
+  1540	    for (uint chunk = 0; chunk < chunks; chunk++) {
+  1541	        const uint idx = chunk * 32 + lane;      // one uint2 = 32 columns
+  1542	        const uint2 wp = w2[idx];
+  1543	        const uint c = chunk * 1024 + lane * 32;
+  1544	        const float ws = float(weight_scales[scale_base + c / 128]);
+  1545	        int da = 0, db = 0;
+  1546	        q27_dot16_t2_dual(wp.x, xa16[idx * 2],     xb16[idx * 2],     da, db);
+  1547	        q27_dot16_t2_dual(wp.y, xa16[idx * 2 + 1], xb16[idx * 2 + 1], da, db);
+  1548	        acc_a += float(da) * ws * xas[c / 32];
+  1549	        acc_b += float(db) * ws * xbs[c / 32];
+  1550	    }
+  1551	    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+  1552	        const uchar wp = weights[(ulong)row * (args.cols / 4) + c / 4];
+  1553	        const float ws = float(weight_scales[scale_base + c / 128]);
+  1554	        const char4 xa = *(device const char4 *)(x + c);
+  1555	        const char4 xb = *(device const char4 *)(x + args.cols + c);
+  1556	        const int da = (int(wp         & 3u) - 1) * xa.x + (int((wp >> 2) & 3u) - 1) * xa.y +
+  1557	                       (int((wp >> 4) & 3u) - 1) * xa.z + (int((wp >> 6)      ) - 1) * xa.w;
+  1558	        const int db = (int(wp         & 3u) - 1) * xb.x + (int((wp >> 2) & 3u) - 1) * xb.y +
+  1559	                       (int((wp >> 4) & 3u) - 1) * xb.z + (int((wp >> 6)      ) - 1) * xb.w;
+  1560	        acc_a += float(da) * ws * xas[c / 32];
+  1561	        acc_b += float(db) * ws * xbs[c / 32];
+  1562	    }
+  1563	    acc_a = simd_sum(acc_a);
+  1564	    acc_b = simd_sum(acc_b);
+  1565	    if (lane == 0) { out[row] = acc_a; out[args.rows + row] = acc_b; }
+
+[32m succeeded in 0ms:[0m
+   740	        auto weight_b = backend.upload(tb);
+   741	        auto xb = backend.allocate(cols * 4);
+   742	        backend.write(*xb, 0, x.data(), cols * 4);
+   743	        auto ya = backend.allocate(rows_a * 4), yb = backend.allocate(rows_b * 4);
+   744	        backend.matvec_pair(weight_a, *ya, weight_b, *yb, *xb);
+   745	        std::vector<float> got_a(rows_a), got_b(rows_b);
+   746	        backend.read(*ya, 0, got_a.data(), rows_a * 4);
+   747	        backend.read(*yb, 0, got_b.data(), rows_b * 4);
+   748	        for (uint32_t r = 0; r < rows_a; r++) {
+   749	            double want = 0;
+   750	            for (uint32_t c = 0; c < cols; c++) want += (double)(float)wa[(size_t)r * cols + c] * x[c];
+   751	            if (!close(got_a[r], (float)want, 2e-3f)) {
+   752	                fprintf(stderr, "F16 pair wide A cols=%u row %u: got %.7g want %.7g\n", cols, r, got_a[r], (float)want);
+   753	                return 1;
+   754	            }
+   755	        }
+   756	        for (uint32_t r = 0; r < rows_b; r++) {
+   757	            double want = 0;
+   758	            for (uint32_t c = 0; c < cols; c++) want += (double)(float)wb[(size_t)r * cols + c] * x[c];
+   759	            if (!close(got_b[r], (float)want, 2e-3f)) {
+   760	                fprintf(stderr, "F16 pair wide B cols=%u row %u: got %.7g want %.7g\n", cols, r, got_b[r], (float)want);
+   761	                return 1;
+   762	            }
+   763	        }
+   764	    }
+   765	    return 0;
+   766	}
+   767	
+   768	int test_quantized_wide(q27::MetalBackend& backend, q27::DType dtype) {
+   769	    const uint32_t group = dtype == q27::DType::Q4_G64 ? 64 : 128;
+   770	    // main chunk + tail, then a production column count
+   771	    const uint32_t widths[2] = {1024 + group, 5120};
+   772	    for (uint32_t cols : widths) {
+   773	        constexpr uint32_t rows = 5;
+   774	        const uint32_t groups = cols / group;
+   775	        std::vector<int8_t> w(rows * cols);
+   776	        for (uint32_t r = 0; r < rows; r++)
+   777	            for (uint32_t c = 0; c < cols; c++)
+   778	                w[(size_t)r * cols + c] = (int8_t)((int)((r * 13 + c * 7) % 29) - 14);
+   779	        std::vector<uint8_t> data;
+   780	        if (dtype == q27::DType::T2_G128) {
+   781	            data.assign((size_t)rows * cols / 4, 0);
+   782	            for (uint32_t r = 0; r < rows; r++)
+   783	                for (uint32_t c = 0; c < cols; c++) {
+   784	                    const int q = (int)((r * 13 + c * 7) % 3) - 1;
+   785	                    w[(size_t)r * cols + c] = (int8_t)q;
+   786	                    data[(size_t)r * cols / 4 + c / 4] |= (uint8_t)((q + 1) << ((c % 4) * 2));
+   787	                }
+   788	        } else if (dtype == q27::DType::B1_G128) {
+   789	            data.assign((size_t)rows * cols / 8, 0);
+   790	            for (uint32_t r = 0; r < rows; r++)
+   791	                for (uint32_t c = 0; c < cols; c++) {
+   792	                    const int q = ((r * 13 + c * 7) % 5) < 2 ? -1 : 1;
+   793	                    w[(size_t)r * cols + c] = (int8_t)q;
+   794	                    if (q > 0) data[(size_t)r * cols / 8 + c / 8] |= (uint8_t)(1u << (c % 8));
+   795	                }
+   796	        } else if (dtype == q27::DType::Q4_G64) {
+   797	            data.resize((size_t)rows * cols / 2);
+   798	            for (uint32_t r = 0; r < rows; r++)
+   799	                for (uint32_t c = 0; c < cols; c++) {
+   800	                    int q = ((int)w[(size_t)r * cols + c] % 8 + 8) % 16 - 8;
+   801	                    w[(size_t)r * cols + c] = (int8_t)q;
+   802	                    uint8_t nibble = (uint8_t)(q + 8);
+   803	                    size_t i = (size_t)r * cols / 2 + c / 2;
+   804	                    if (c & 1) data[i] = (uint8_t)((data[i] & 15) | (nibble << 4));
+   805	                    else data[i] = (uint8_t)((data[i] & 240) | nibble);
+   806	                }
+   807	        } else {
+   808	            data.assign((const uint8_t*)w.data(), (const uint8_t*)w.data() + w.size());
+   809	        }
+   810	        const uint16_t scale_bits[4] = {0x3400, 0x3800, 0x3c00, 0x4000};
+   811	        const float scale_f32[4] = {0.25f, 0.5f, 1.0f, 2.0f};
+   812	        std::vector<uint16_t> scales(rows * groups);
+   813	        for (size_t i = 0; i < scales.size(); i++) scales[i] = scale_bits[i % 4];
+   814	        q27::Tensor tensor;
+   815	        tensor.name = "wide";
+   816	        tensor.dtype = dtype;
+   817	        tensor.shape = {rows, cols};
+   818	        tensor.data = data.data();
+   819	        tensor.data_size = data.size();
+   820	        tensor.scales = (const uint8_t*)scales.data();
+   821	        tensor.scales_size = scales.size() * 2;
+   822	        auto weight = backend.upload(tensor);
+   823	
+   824	        // Distinct magnitude per 32-column block so every activation scale differs.
+   825	        std::vector<float> x(cols);
+   826	        for (uint32_t c = 0; c < cols; c++)
+   827	            x[c] = (float)((int)((c * 11) % 23) - 11) / 11.0f * (float)(1 + c / 32 % 7);
+   828	        auto xb = backend.allocate(cols * 4);
+   829	        backend.write(*xb, 0, x.data(), cols * 4);
+   830	        auto xq = backend.allocate_quantized(cols);
+   880	    a.data=q4.data(); a.data_size=q4.size(); a.scales=(const uint8_t*)s4.data(); a.scales_size=s4.size()*2;
+   881	    q27::Tensor b; b.name="mixed-q8"; b.dtype=q27::DType::Q8_G128; b.shape={1,cols};
+   882	    b.data=(const uint8_t*)q8.data(); b.data_size=q8.size(); b.scales=(const uint8_t*)s8.data(); b.scales_size=s8.size()*2;
+   883	    auto aw=backend.upload(a); auto bw=backend.upload(b); auto xb=backend.allocate(cols*4);
+   884	    auto ao=backend.allocate(4); auto bo=backend.allocate(4); auto ar=backend.allocate(4); auto br=backend.allocate(4);
+   885	    auto quant=backend.allocate_quantized(cols); backend.write(*xb,0,x.data(),cols*4);
+   886	    backend.begin_commands(); backend.quantize(*xb,quant); backend.matvec_quantized(aw,quant,*ar); backend.matvec_quantized(bw,quant,*br); backend.end_commands();
+   887	    backend.matvec_quantized_pair(aw,*ao,bw,*bo,quant);
+   888	    float expected_a,expected_b,got_a,got_b; backend.read(*ar,0,&expected_a,4); backend.read(*br,0,&expected_b,4);
+   889	    backend.read(*ao,0,&got_a,4); backend.read(*bo,0,&got_b,4);
+   890	    if(got_a!=expected_a || got_b!=expected_b) { fprintf(stderr,"mixed quantized pair fallback mismatch\n"); return 1; }
+   891	    return 0;
+   892	}
+   893	
+   894	} // namespace
+   895	
+   896	int main() {
+   897	    try {
+   898	        q27::MetalBackend backend;
+   899	        printf("Metal device: %s\n", backend.name().c_str());
+   900	        printf("working set %.1f GiB, max buffer %.1f GiB, threadgroup memory %.1f KiB\n",
+   901	               backend.recommended_working_set_size() / 1073741824.0,
+   902	               backend.max_buffer_length() / 1073741824.0,
+   903	               backend.max_threadgroup_memory_length() / 1024.0);
+   904	        if (test_mmap_upload(backend) || test_dispatch_validation(backend) ||
+   905	            test_f32(backend) || test_f16(backend) ||
+   906	            test_q8(backend) || test_q4(backend) || test_t2(backend) || test_b1(backend) ||
+   907	            test_quantized_wide(backend, q27::DType::Q4_G64) ||
+   908	            test_quantized_wide(backend, q27::DType::Q8_G128) ||
+   909	            test_quantized_wide(backend, q27::DType::T2_G128) ||
+   910	            test_quantized_wide(backend, q27::DType::B1_G128) ||
+   911	            test_t2_wide(backend) ||
+   912	            test_b1_wide(backend) ||
+   913	            test_t3_wide(backend) ||
+   914	            test_f16_pair_wide(backend) ||
+   915	            test_mixed_pair(backend) ||
+   916	            (backend.supports_quantized_matmul() &&
+   917	             (test_matmul_tiles(backend,q27::DType::Q4_G64) || test_matmul_tiles(backend,q27::DType::Q8_G128) ||
+   918	              test_matmul_tiles(backend,q27::DType::T2_G128) ||
+   919	              test_matmul_tiles(backend,q27::DType::B1_G128))))
+   920	            return 1;
+   921	        puts("Metal matvec: OK");
+   922	        return 0;
+   923	    } catch (const std::exception& error) {
+   924	        fprintf(stderr, "%s\n", error.what());
+   925	        return 1;
+   926	    }
+   927	}
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "rg -n \"kernel void q27_matmul_q4_mm|kernel void q27_matmul_q8_mm\\(\" src/metal/q27_kernels.metal"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+1587:kernel void q27_matmul_q4_mm(
+1681:kernel void q27_matmul_q8_mm(
+2529:kernel void q27_matmul_q4_mm_h(
+
+[35m[3mcodex[0m[0m
+So far I don’t see a direct `/2` or `/64` stride mismatch: the Q4 half weight byte load and scale row/index align with the float Q4 kernel and host range checks. I’m doing one more pass over tile tests and host pipeline gating for issues that would only appear in partial row/token tiles or missing pipeline availability.
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/test_metal.cpp | sed -n '600,740p'"[0m in /Users/macthedan/projects/q27
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/test_metal.cpp | sed -n '830,880p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+   830	        auto xq = backend.allocate_quantized(cols);
+   831	        auto yb = backend.allocate(rows * 4);
+   832	        auto y2 = backend.allocate(rows * 4);
+   833	        auto y3 = backend.allocate(rows * 4);
+   834	        backend.begin_commands();
+   835	        backend.quantize(*xb, xq);
+   836	        backend.matvec_quantized(weight, xq, *yb);
+   837	        backend.end_commands();
+   838	        backend.matvec_quantized_pair(weight, *y2, weight, *y3, xq);
+   839	
+   840	        std::vector<int8_t> xv(cols);
+   841	        std::vector<float> xs(cols / 32);
+   842	        backend.read(*xq.values, 0, xv.data(), cols);
+   843	        backend.read(*xq.scales, 0, xs.data(), xs.size() * 4);
+   844	        std::vector<float> got(rows), got2(rows), got3(rows);
+   845	        backend.read(*yb, 0, got.data(), rows * 4);
+   846	        backend.read(*y2, 0, got2.data(), rows * 4);
+   847	        backend.read(*y3, 0, got3.data(), rows * 4);
+   848	        for (uint32_t r = 0; r < rows; r++) {
+   849	            double want = 0.0, magnitude = 0.0;
+   850	            for (uint32_t b = 0; b < cols / 32; b++) {
+   851	                int dot = 0;
+   852	                for (uint32_t i = b * 32; i < b * 32 + 32; i++)
+   853	                    dot += (int)w[(size_t)r * cols + i] * (int)xv[i];
+   854	                const double term =
+   855	                    (double)dot * scale_f32[(r * groups + b * 32 / group) % 4] * xs[b];
+   856	                want += term;
+   857	                magnitude += std::fabs(term);
+   858	            }
+   859	            // Absolute bound scaled by the sum of |block terms|, so a
+   860	            // cancellation-heavy row cannot hide a wrong-scale bug behind a
+   861	            // relative check, and the double-vs-float summation-order
+   862	            // difference stays within it.
+   863	            const float bound = (float)(magnitude * 1e-5 + 1e-3);
+   864	            const auto ok = [&](float value) { return std::fabs(value - (float)want) <= bound; };
+   865	            if (!ok(got[r]) || !ok(got2[r]) || !ok(got3[r])) {
+   866	                fprintf(stderr, "%s wide cols=%u row %u: got %.7g pair %.7g/%.7g want %.7g\n",
+   867	                        q27::dtype_name(dtype), cols, r, got[r], got2[r], got3[r], (float)want);
+   868	                return 1;
+   869	            }
+   870	        }
+   871	    }
+   872	    return 0;
+   873	}
+   874	
+   875	int test_mixed_pair(q27::MetalBackend& backend) {
+   876	    constexpr int cols=128; std::vector<float> x(cols); for(int i=0;i<cols;i++) x[i]=(i%13-6)/7.0f;
+   877	    std::vector<uint8_t> q4(cols/2,0x99); std::vector<int8_t> q8(cols,2);
+   878	    std::vector<uint16_t> s4={0x3c00,0x3c00},s8={0x3c00};
+   879	    q27::Tensor a; a.name="mixed-q4"; a.dtype=q27::DType::Q4_G64; a.shape={1,cols};
+   880	    a.data=q4.data(); a.data_size=q4.size(); a.scales=(const uint8_t*)s4.data(); a.scales_size=s4.size()*2;
+
+[32m succeeded in 0ms:[0m
+   600	
+   601	        std::vector<float> x(cols);
+   602	        for (uint32_t c = 0; c < cols; c++)
+   603	            x[c] = (float)((int)((c * 11) % 23) - 11) / 11.0f * (float)(1 + c / 32 % 7);
+   604	        auto xb = backend.allocate(cols * 4);
+   605	        backend.write(*xb, 0, x.data(), cols * 4);
+   606	        auto y3 = backend.allocate(rows * 4);
+   607	        auto y2 = backend.allocate(rows * 4);
+   608	        backend.matvec(w3, *xb, *y3);
+   609	        backend.matvec(w2, *xb, *y2);
+   610	        std::vector<float> got(rows), ref(rows);
+   611	        backend.read(*y3, 0, got.data(), rows * 4);
+   612	        backend.read(*y2, 0, ref.data(), rows * 4);
+   613	        for (uint32_t r = 0; r < rows; r++) {
+   614	            double want = 0.0, magnitude = 0.0;
+   615	            for (uint32_t g = 0; g < groups; g++) {
+   616	                double dot = 0.0;
+   617	                for (uint32_t c = g * 128; c < g * 128 + 128; c++)
+   618	                    dot += (double)w[(size_t)r * cols + c] * x[c];
+   619	                const double term = dot * scale_f32[((size_t)r * groups + g) % 4];
+   620	                want += term;
+   621	                magnitude += std::fabs(term);
+   622	            }
+   623	            const float bound = (float)(magnitude * 1e-5 + 1e-3);
+   624	            if (std::fabs(got[r] - (float)want) > bound) {
+   625	                fprintf(stderr, "T3 wide cols=%u row %u: got %.7g want %.7g\n",
+   626	                        cols, r, got[r], (float)want);
+   627	                return 1;
+   628	            }
+   629	            if (std::fabs(got[r] - ref[r]) > bound) {
+   630	                fprintf(stderr, "T3 vs T2 cols=%u row %u: %.7g vs %.7g\n",
+   631	                        cols, r, got[r], ref[r]);
+   632	                return 1;
+   633	            }
+   634	        }
+   635	    }
+   636	    return 0;
+   637	}
+   638	
+   639	// The tiled simdgroup-matrix GEMM keeps the weight side integer-exact and
+   640	// rounds the activation side once per value at staging, but accumulates
+   641	// K-tiles in a different float-addition order than the serial GEMV, so the
+   642	// comparison is tolerance-based. Shapes cover several K-tile counts, row
+   643	// remainders against the 32-row tile (9, 17), and every token-group width,
+   644	// per the width-gated fast-path lesson: a gate shape must actually enter
+   645	// the fast path it gates.
+   646	int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
+   647	                      uint32_t rows,uint32_t cols,uint32_t tokens=12) {
+   648	    std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:
+   649	                              dtype==q27::DType::T2_G128?(size_t)rows*cols/4:
+   650	                              dtype==q27::DType::B1_G128?(size_t)rows*cols/8:(size_t)rows*cols,0);
+   651	    for(uint32_t r=0;r<rows;r++) for(uint32_t c=0;c<cols;c++) {
+   652	        int q=(int)((r*7+c*3)%15)-7;
+   653	        if(dtype==q27::DType::Q4_G64) {
+   654	            size_t i=(size_t)r*cols/2+c/2; uint8_t nibble=(uint8_t)(q+8);
+   655	            if(c&1) data[i]=(data[i]&15)|(nibble<<4); else data[i]=(data[i]&240)|nibble;
+   656	        } else if(dtype==q27::DType::T2_G128) {
+   657	            q=(int)((r*7+c*3)%3)-1;
+   658	            data[(size_t)r*cols/4+c/4]|=(uint8_t)((q+1)<<((c%4)*2));
+   659	        } else if(dtype==q27::DType::B1_G128) {
+   660	            q=((r*7+c*3)%5)<2?-1:1;
+   661	            if(q>0) data[(size_t)r*cols/8+c/8]|=(uint8_t)(1u<<(c%8));
+   662	        } else data[(size_t)r*cols+c]=(uint8_t)(int8_t)q;
+   663	    }
+   664	    uint32_t groups=cols/(dtype==q27::DType::Q4_G64?64:128);
+   665	    const uint16_t scale_values[4]={0x3400,0x3800,0x3c00,0x4000};
+   666	    std::vector<uint16_t> scales(rows*groups);
+   667	    for(uint32_t r=0;r<rows;r++) for(uint32_t g=0;g<groups;g++) scales[r*groups+g]=scale_values[(r+g)%4];
+   668	    q27::Tensor tensor; tensor.name="matmul-tiles"; tensor.dtype=dtype; tensor.shape={rows,cols};
+   669	    tensor.data=data.data(); tensor.data_size=data.size(); tensor.scales=(const uint8_t*)scales.data(); tensor.scales_size=scales.size()*2;
+   670	    auto weight=backend.upload(tensor); std::vector<float> x(tokens*cols);
+   671	    for(uint32_t t=0;t<tokens;t++) for(uint32_t c=0;c<cols;c++)
+   672	        x[(size_t)t*cols+c]=(((int)((t+1)*11+c*5)%31)-15)*(float)(c/32+1)/(float)(t+3);
+   673	    std::vector<float> reference(tokens*rows);
+   674	    for(uint32_t t=0;t<tokens;t++) {
+   675	        auto xb=backend.allocate(cols*4),yb=backend.allocate(rows*4); backend.write(*xb,0,x.data()+(size_t)t*cols,cols*4);
+   676	        auto q=backend.allocate_quantized(cols); backend.begin_commands(); backend.quantize(*xb,q); backend.matvec_quantized(weight,q,*yb); backend.end_commands();
+   677	        backend.read(*yb,0,reference.data()+(size_t)t*rows,rows*4);
+   678	    }
+   679	    auto all_x=backend.allocate(x.size()*4); backend.write(*all_x,0,x.data(),x.size()*4);
+   680	    // Dispatch the parametrized width too — a repro case that only sizes
+   681	    // buffers without dispatching passes vacuously (codex P2, 2026-07-15).
+   682	    // 17/33 exercise partial second/third 16-token tiles on grid.y.
+   683	    for(uint32_t n:{1u,4u,5u,8u,9u,12u,17u,33u,tokens}) {
+   684	        if(n>tokens) continue;
+   685	        auto q=backend.allocate_quantized(n*cols); auto out=backend.allocate((uint64_t)n*rows*4);
+   686	        backend.begin_commands(); backend.quantize(*all_x,q); backend.matmul_quantized(weight,q,n,*out); backend.end_commands();
+   687	        std::vector<float> got(n*rows); backend.read(*out,0,got.data(),got.size()*4);
+   688	        for(size_t i=0;i<got.size();i++) if(!close(got[i],reference[i],3e-4f)) {
+   689	            fprintf(stderr,"%s matmul rows=%u cols=%u n=%u i=%zu got %.9g want %.9g\n",
+   690	                    q27::dtype_name(dtype),rows,cols,n,i,got[i],reference[i]); return 1;
+   691	        }
+   692	    }
+   693	    return 0;
+   694	}
+   695	
+   696	int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
+   697	    return test_matmul_shape(backend,dtype,9,256) ||
+   698	           test_matmul_shape(backend,dtype,9,1024) ||
+   699	           test_matmul_shape(backend,dtype,17,1152) ||
+   700	           // Wide-chunk token tiling: full tiles (96 = 6x16) and a partial
+   701	           // final tile (20 = 16 + 4) across the same row/col remainders.
+   702	           test_matmul_shape(backend,dtype,17,1152,96) ||
+   703	           test_matmul_shape(backend,dtype,9,256,20) ||
+   704	           // artifact-K repro: width-17 divergence hunt (cols=5120)
+   705	           test_matmul_shape(backend,dtype,33,5120,17) ||
+   706	           test_matmul_shape(backend,dtype,10240,5120,17) ||
+   707	           // Row remainder past a full 32-row tile (100 = 3x32 + 4), token
+   708	           // remainder past two 16-token tiles (33), and exact fits (64).
+   709	           // cols stays moderate: the Q4/Q8 kernels stage pre-scaled fp32
+   710	           // activations, so high-cancellation cols=5120 outputs amplify
+   711	           // ordinary rounding past the gate (the exact-int T2 paths get
+   712	           // their 5120 coverage from the width-17 artifact repros above).
+   713	           test_matmul_shape(backend,dtype,100,1152,33) ||
+   714	           test_matmul_shape(backend,dtype,64,128,64);
+   715	}
+   716	
+   717	// Production-width GEMV parity. The packed-dot kernels take a vectorized
+   718	// main loop only when cols >= 1024, so the narrow test_q8/test_q4 shapes
+   719	// never reach it; this caught a wrong per-lane activation-scale index that
+   720	// the 64/128-column tests could not see. Scales are deliberately varied per
+   721	// weight group and per 32-column activation block.
+   722	// Wide-shape gate for the threadgroup-per-row F16 pair kernel: the packed
+   723	// vector main loop and the 8-simdgroup reduction tree only fill up past a few
+   724	// hundred columns, so this runs the production alpha/beta shape (48 x 5120),
+   725	// an odd width that leaves a scalar tail, and asymmetric row counts.
+   726	int test_f16_pair_wide(q27::MetalBackend& backend) {
+   727	    for (uint32_t cols : {1030u, 5120u}) {
+   728	        constexpr uint32_t rows_a = 48, rows_b = 16;
+   729	        std::vector<_Float16> wa((size_t)rows_a * cols), wb((size_t)rows_b * cols);
+   730	        for (size_t i = 0; i < wa.size(); i++) wa[i] = (_Float16)(((int)((i * 7) % 31) - 15) * 0.0625f);
+   731	        for (size_t i = 0; i < wb.size(); i++) wb[i] = (_Float16)(((int)((i * 11) % 27) - 13) * 0.125f);
+   732	        std::vector<float> x(cols);
+   733	        for (uint32_t c = 0; c < cols; c++) x[c] = (float)((int)((c * 13) % 21) - 10) / 10.0f;
+   734	
+   735	        q27::Tensor ta; ta.name = "pair-wide-a"; ta.dtype = q27::DType::F16; ta.shape = {rows_a, cols};
+   736	        ta.data = reinterpret_cast<const uint8_t*>(wa.data()); ta.data_size = wa.size() * 2;
+   737	        q27::Tensor tb; tb.name = "pair-wide-b"; tb.dtype = q27::DType::F16; tb.shape = {rows_b, cols};
+   738	        tb.data = reinterpret_cast<const uint8_t*>(wb.data()); tb.data_size = wb.size() * 2;
+   739	        auto weight_a = backend.upload(ta);
+   740	        auto weight_b = backend.upload(tb);
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc 'rg -n "supports_quantized_matmul|q4_quantized_matmul_h|t2_quantized_matmul_h|q8_quantized_matmul_h|q27_matmul_q8_mm_h" src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal'[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+src/metal/metal_backend.h:262:    bool supports_quantized_matmul() const;
+src/metal/metal_backend.mm:184:    id<MTLComputePipelineState> t2_quantized_matmul_h;
+src/metal/metal_backend.mm:185:    id<MTLComputePipelineState> q4_quantized_matmul_h;
+src/metal/metal_backend.mm:603:            impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
+src/metal/metal_backend.mm:604:            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm_h");
+src/metal/metal_backend.mm:1228:        // exact-integer range — the parked q27_matmul_q8_mm_h records the
+src/metal/metal_backend.mm:1237:                                     weight.dtype==DType::T2_G128?(h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):
+src/metal/metal_backend.mm:1239:                                     (h?impl_->q4_quantized_matmul_h:impl_->q4_quantized_matmul)];
+src/metal/metal_backend.mm:2713:bool MetalBackend::supports_quantized_matmul() const {
+src/metal/q27_kernels.metal:2646:kernel void q27_matmul_q8_mm_h(
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/metal_backend.mm | sed -n '160,205p' && nl -ba src/metal/metal_backend.mm | sed -n '2688,2710p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+   160	struct ConvChunkArgs { uint32_t channels, tokens; };
+   161	struct DeltaChunkArgs { uint32_t value_heads, qk_heads, head_dim, tokens; };
+   162	struct L2RowsArgs { uint32_t heads, head_dim, row_stride, tokens; float eps; };
+   163	struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, position, tokens; float freq_base; };
+   164	struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
+   165	struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
+   166	struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode, head, flags, scale_off; };
+   167	struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
+   168	struct ArgmaxRowsArgs { uint32_t n, rows; };
+   169	struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
+   170	
+   171	} // namespace
+   172	
+   173	struct MetalBackend::Impl {
+   174	    id<MTLDevice> device;
+   175	    id<MTLCommandQueue> queue;
+   176	    id<MTLLibrary> library;
+   177	    id<MTLComputePipelineState> f32;
+   178	    id<MTLComputePipelineState> f16;
+   179	    id<MTLComputePipelineState> q8;
+   180	    id<MTLComputePipelineState> q4;
+   181	    id<MTLComputePipelineState> t2;
+   182	    id<MTLComputePipelineState> t3;
+   183	    id<MTLComputePipelineState> b1;
+   184	    id<MTLComputePipelineState> t2_quantized_matmul_h;
+   185	    id<MTLComputePipelineState> q4_quantized_matmul_h;
+   186	    id<MTLComputePipelineState> mask_logits_p;
+   187	    // Half-staging chunk GEMMs: default ON (T2 landed at 1.22x chunk rate at
+   188	    // quality parity — the GEMM envelope class, docs/plans/2026-07-15-
+   189	    // margin-aware-gates.md; Q4/Q8 ports pre-registered in 2026-07-17-t2-
+   190	    // prefill-throughput.md); Q27_METAL_GEMM_HALF=0 opts out and exactly
+   191	    // reproduces the float-staged routes (used to attribute the kl-kv
+   192	    // calibration shift to the digit, 2026-07-16-kv-codec-step1.md).
+   193	    bool gemm_half = true;
+   194	    id<MTLComputePipelineState> quantize;
+   195	    id<MTLComputePipelineState> q8_quantized;
+   196	    id<MTLComputePipelineState> q4_quantized;
+   197	    id<MTLComputePipelineState> t2_quantized;
+   198	    id<MTLComputePipelineState> b1_quantized;
+   199	    id<MTLComputePipelineState> t2_quantized_x2;
+   200	    id<MTLComputePipelineState> t2_x2;
+   201	    id<MTLComputePipelineState> f16_pair;
+   202	    id<MTLComputePipelineState> q4_quantized_matmul;
+   203	    id<MTLComputePipelineState> q8_quantized_matmul;
+   204	    id<MTLComputePipelineState> t2_quantized_matmul;
+   205	    id<MTLComputePipelineState> b1_quantized_matmul;
+  2688	    impl_->profiled_command_buffers = 0;
+  2689	    impl_->gpu_busy_seconds = 0.0;
+  2690	    impl_->cpu_wait_seconds = 0.0;
+  2691	}
+  2692	
+  2693	uint64_t MetalBackend::recommended_working_set_size() const {
+  2694	    return (uint64_t)impl_->device.recommendedMaxWorkingSetSize;
+  2695	}
+  2696	
+  2697	uint32_t MetalBackend::gqa_block_size() const {
+  2698	    return impl_->gqa_block;
+  2699	}
+  2700	
+  2701	void MetalBackend::set_gemm_half(bool enabled) {
+  2702	    impl_->gemm_half = enabled;
+  2703	}
+  2704	
+  2705	void MetalBackend::set_gqa_threshold(uint32_t threshold) {
+  2706	    impl_->gqa_threshold = threshold;
+  2707	}
+  2708	
+  2709	uint64_t MetalBackend::max_buffer_length() const {
+  2710	    return (uint64_t)impl_->device.maxBufferLength;
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "nl -ba src/metal/metal_backend.mm | sed -n '2710,2722p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+  2710	    return (uint64_t)impl_->device.maxBufferLength;
+  2711	}
+  2712	
+  2713	bool MetalBackend::supports_quantized_matmul() const {
+  2714	    return impl_->q4_quantized_matmul && impl_->q8_quantized_matmul && impl_->t2_quantized_matmul;
+  2715	}
+  2716	
+  2717	uint64_t MetalBackend::max_threadgroup_memory_length() const {
+  2718	    return (uint64_t)impl_->device.maxThreadgroupMemoryLength;
+  2719	}
+  2720	
+  2721	} // namespace q27
+
+[35m[3mexec[0m[0m
+[1m/bin/zsh -lc "rg -n \"make_pipeline\" src/metal/metal_backend.mm && nl -ba src/metal/metal_backend.mm | sed -n '120,155p'"[0m in /Users/macthedan/projects/q27
+[32m succeeded in 0ms:[0m
+109:id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device, id<MTLLibrary> library,
+577:        impl_->f32 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f32");
+578:        impl_->f16 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16");
+579:        impl_->q8 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_g128");
+580:        impl_->q4 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_g64");
+581:        impl_->t2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128");
+582:        impl_->t3 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t3_g128");
+583:        impl_->b1 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_g128");
+584:        impl_->mask_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_mask_logits");
+585:        impl_->b1_select_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_select");
+586:        impl_->b1_signxor_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_signxor");
+587:        impl_->b1_popcount_p = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_popcount");
+588:        impl_->b1_x_prep_p = make_pipeline(impl_->device, impl_->library, @"q27_b1_x_prep");
+589:        impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
+590:        impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
+591:        impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
+592:        impl_->t2_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized");
+593:        impl_->b1_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_quantized");
+594:        impl_->t2_quantized_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized_x2");
+595:        impl_->t2_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128_x2");
+596:        impl_->f16_pair = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair");
+600:            impl_->q4_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm");
+601:            impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
+602:            impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
+603:            impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
+604:            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm_h");
+605:            impl_->b1_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_b1_mm");
+606:            impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
+607:            impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
+608:            impl_->mma_roofline_b_eq_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b_eq");
+609:            impl_->mma_roofline_cx_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_cx");
+610:            impl_->mma_roofline_f_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_f");
+611:            impl_->mm_dr_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr");
+612:            impl_->mm_dr2_p = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_dr2");
+613:            impl_->x_to_half_t_p = make_pipeline(impl_->device, impl_->library, @"q27_x_int8_to_half_t");
+617:        impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
+618:        impl_->embedding_t2 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2");
+619:        impl_->embedding_b1 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1");
+620:        impl_->embedding_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8_dev");
+621:        impl_->embedding_t2_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_dev");
+622:        impl_->embedding_b1_dev = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1_dev");
+623:        impl_->embedding_t2_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2_rows");
+624:        impl_->embedding_b1_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_b1_rows");
+625:        impl_->rms = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm");
+626:        impl_->rms_quantized = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_quantized");
+627:        impl_->rms_heads = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_heads");
+628:        impl_->l2_heads = make_pipeline(impl_->device, impl_->library, @"q27_l2norm_heads");
+629:        impl_->silu = make_pipeline(impl_->device, impl_->library, @"q27_silu_mul");
+630:        impl_->add = make_pipeline(impl_->device, impl_->library, @"q27_add_inplace");
+631:        impl_->concat = make_pipeline(impl_->device, impl_->library, @"q27_concat");
+632:        impl_->copy_bytes = make_pipeline(impl_->device, impl_->library, @"q27_copy_bytes");
+633:        impl_->sigmoid_gate = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul");
+634:        impl_->rope = make_pipeline(impl_->device, impl_->library, @"q27_rope_neox");
+635:        impl_->argmax = make_pipeline(impl_->device, impl_->library, @"q27_argmax");
+636:        impl_->kv_store = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16");
+637:        impl_->turbo_wht = make_pipeline(impl_->device, impl_->library, @"q27_turbo_wht");
+638:        impl_->kv_store_turbo3 = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3");
+639:        impl_->attention_turbo3 = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3");
+640:        impl_->attention = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16");
+641:        impl_->gates = make_pipeline(impl_->device, impl_->library, @"q27_gdn_gates");
+642:        impl_->conv = make_pipeline(impl_->device, impl_->library, @"q27_conv_step");
+643:        impl_->delta = make_pipeline(impl_->device, impl_->library, @"q27_delta_step");
+644:        impl_->gated_norm = make_pipeline(impl_->device, impl_->library, @"q27_gated_norm_gdn");
+645:        impl_->embedding_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8_rows");
+646:        impl_->rms_rows_quantized = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_rows_quantized");
+647:        impl_->f16_pair_rows = make_pipeline(impl_->device, impl_->library, @"q27_matvec_f16_pair_rows");
+648:        impl_->gates_rows = make_pipeline(impl_->device, impl_->library, @"q27_gdn_gates_rows");
+649:        impl_->conv_chunked = make_pipeline(impl_->device, impl_->library, @"q27_conv_chunk");
+650:        impl_->delta_chunked = make_pipeline(impl_->device, impl_->library, @"q27_delta_chunk");
+651:        impl_->l2_rows = make_pipeline(impl_->device, impl_->library, @"q27_l2norm_rows");
+652:        impl_->rope_rows = make_pipeline(impl_->device, impl_->library, @"q27_rope_neox_rows");
+653:        impl_->kv_store_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_rows");
+654:        impl_->kv_store_turbo3_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3_rows");
+655:        impl_->kv_store_attrib_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_attrib_rows");
+656:        impl_->attention_causal = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal");
+657:        impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
+658:        impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
+659:        impl_->argmax_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_argmax_rows");
+660:        impl_->nll_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_nll_rows");
+661:        impl_->attention_f16_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_gqa");
+662:        impl_->attention_turbo3_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa");
+663:        impl_->attention_gqa_merge_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge");
+664:        impl_->attention_f16_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa");
+665:        impl_->attention_turbo3_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa");
+666:        impl_->attention_gqa_merge_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge_rows");
+667:        impl_->attention_turbo3_gqa_hm_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_hm");
+668:        impl_->attention_turbo3_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t2");
+669:        impl_->attention_turbo3_causal_gqa_t4_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t4");
+670:        impl_->attention_turbo3_causal_gqa_bf2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_bf2");
+671:        impl_->attention_f16_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa_t2");
+686:        impl_->topk_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_topk_logits");
+687:        // topk() dispatches 1024 threads; make_pipeline only guarantees 256
+1530:                impl_->q4_r2_p = make_pipeline(impl_->device, impl_->library,
+   120	                                 std::string(name.UTF8String) + ": " +
+   121	                                 std::string(error.localizedDescription.UTF8String));
+   122	    if (pipeline.threadExecutionWidth != 32 || pipeline.maxTotalThreadsPerThreadgroup < 256)
+   123	        throw std::runtime_error("q27 Metal: matvec requires simd width 32 and 256-thread groups");
+   124	    return pipeline;
+   125	}
+   126	
+   127	// Threadgroup widths pinned by kernel-side contracts (k3 audit A2/A3/E6).
+   128	// kTurboThreads: the turbo3 WHT/KV-store kernels' butterfly barriers are only
+   129	// well-formed at exactly 128 threads. kReduceThreads: the per-head attention
+   130	// merge trees hardcode 8 simdgroup partials, the rmsnorm quantize strides
+   131	// walk block += 8, and q27_l2norm_rows passes a literal 8 to reduce_sum —
+   132	// all assume kReduceThreads/32 == 8. Changing either width means changing
+   133	// those kernels in lockstep.
+   134	constexpr uint32_t kTurboThreads = 128;
+   135	constexpr uint32_t kReduceThreads = 256;
+   136	
+   137	struct MatvecArgs {
+   138	    uint32_t rows;
+   139	    uint32_t cols;
+   140	};
+   141	struct MatvecPairArgs { uint32_t rows_a, rows_b, cols; };
+   142	struct MatmulArgs { uint32_t rows,cols,x_rows,simdgroups; };
+   143	struct VectorArgs { uint32_t n, groups; float eps; };
+   144	struct HeadArgs { uint32_t heads, head_dim, stride, groups; float eps; };
+   145	struct GateArgs { uint32_t heads, head_dim; };
+   146	struct ConcatArgs { uint32_t a_count, b_count; };
+   147	struct RopeArgs { uint32_t heads, head_dim, n_rot, stride, position; float freq_base; };
+   148	struct KvStoreArgs { uint32_t position, row_length; };
+   149	struct TurboWhtArgs { uint32_t heads, stride, inverse; };
+   150	struct TurboStoreArgs { uint32_t position, kv_heads; };
+   151	struct AttentionArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim; float scale; };
+   152	struct AttentionGqaArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim, block, n_blocks; float scale; };
+   153	struct AttentionGqaCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, block, n_blocks_max, tokens; float scale; };
+   154	struct TopkArgs { uint32_t n, k, capacity; };
+   155	struct DeltaArgs { uint32_t value_heads, qk_heads, head_dim; };
+
+[35m[3mcodex[0m[0m
+The tests exercise the partial row and token tiles the new kernel relies on, but I can’t run them in this sandbox because the workspace is read-only and the Metal toolchain emits cache writes. I’ll keep the review to static findings and note that limitation.
+[35m[3mcodex[0m[0m
+**Findings**
+
+P1: None found.
+
+P2: None found.
+
+P3: None found.
+
+I checked the Q4 half kernel against `q27_matmul_q4_mm` and `q27_matmul_t2_mm_h`. The Q4-specific substitutions look consistent: packed weight row stride uses `cols / 2`, weight scale row stride and flush index use `cols / 64`, the final activation scale index stays within `cols / 32`, and the LUT decodes bytes low-nibble first to match the float kernel’s LSB-first unpack.
+
+The row and token clamping pattern matches the mature half T2 path: out-of-range row loads clamp and stores are guarded; out-of-range token lanes read the last valid token/scales but never store. The barrier structure also matches the T2 half schedule: per-simdgroup scratch only needs simdgroup barriers, and the final threadgroup barrier protects `Wt`/`Xt` before the next tile staging.
+
+No dangling Q8 route showed up. `q27_matmul_q8_mm_h` is present only as a parked kernel/comment reference; backend dispatch still routes `Q8_G128` to `q27_matmul_q8_mm`.
+
+I could not run the Metal tests here because the sandbox is read-only and the local Metal tooling tries to write cache files, so this is a static review only.
+[2mtokens used[0m
+75,616
+**Findings**
+
+P1: None found.
+
+P2: None found.
+
+P3: None found.
+
+I checked the Q4 half kernel against `q27_matmul_q4_mm` and `q27_matmul_t2_mm_h`. The Q4-specific substitutions look consistent: packed weight row stride uses `cols / 2`, weight scale row stride and flush index use `cols / 64`, the final activation scale index stays within `cols / 32`, and the LUT decodes bytes low-nibble first to match the float kernel’s LSB-first unpack.
+
+The row and token clamping pattern matches the mature half T2 path: out-of-range row loads clamp and stores are guarded; out-of-range token lanes read the last valid token/scales but never store. The barrier structure also matches the T2 half schedule: per-simdgroup scratch only needs simdgroup barriers, and the final threadgroup barrier protects `Wt`/`Xt` before the next tile staging.
+
+No dangling Q8 route showed up. `q27_matmul_q8_mm_h` is present only as a parked kernel/comment reference; backend dispatch still routes `Q8_G128` to `q27_matmul_q8_mm`.
+
+I could not run the Metal tests here because the sandbox is read-only and the local Metal tooling tries to write cache files, so this is a static review only.

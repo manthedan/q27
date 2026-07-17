@@ -1,0 +1,12 @@
+quiet_q4_bench: watcher up 14:06:08, waiting for idle>=600s and no hold file
+quiet_q4_bench: watcher up 15:30:27, waiting for idle>=0s and no hold file
+quiet window detected 15:30:27 — stopping T2 server
+quiet_q4_bench: benches done 15:56:03 — restarting T2 server
+server healthy
+quiet ship-line bench (8352/96, dtype q4q8, machine idle>=10min)
+  float 8352 tok/s: 25.96 21.9   (max 25.96; quiet baseline 23.2)
+  half  8352 tok/s: 22.2 23.83   (min 22.20)
+  float 960  tok/s: 25.29        half 960 tok/s: 30.65
+  ratio min(half)/max(float) = 0.855  (ship line >= 1.7, i.e. >= 39 tok/s)
+VERDICT: PARK — <1.7x; route Q4 back to the float-staged kernel, keep the parked half kernels + this honest table per the pre-registration
+quiet_q4_bench: done 15:56:12
