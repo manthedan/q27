@@ -80,6 +80,37 @@ Mini: E8 probe task, queued behind mini-e2-gqa-partials.
    now also assert x1_ equality between chunked and serial teacher-forced
    passes (this is what makes A1 a gated fix, not a drive-by).
 
-## RESULTS
+## RESULTS (2026-07-17)
 
-(pending)
+Batch landed as 76cf1ab..HEAD: lanes 5905428 (kernels) / 3767b4c (backend) /
+27bbfec (engine), seam ec55466 (SHADER_ABI 7→8 + gated_norm_gdn tie — codex
+P2/P3 on lane 3), codex round 35f71bf on lane 1 (P2: teacher-force advances
+position_ only after its coherence copies; P3: fsync chain reaches fclose;
+P3: dir opens before rename). Codex verdicts: lane 2 NO FINDINGS, lane 3
+P2+P3 adopted, lane 1 P2+2×P3 adopted; its review independently verified all
+five encode_token call sites preserve per-row position observations. Lane 1
+deviation accepted: encode_chunk deleted (same advance-before-finish defect;
+prefill_chunk calls chunk_forward directly).
+
+All five pre-registered legs PASS:
+1. **Suites** — test-cpu + test-metal green on the merged tree (and on lane 2
+   standalone, which doubled as the MSL syntax check: no offline metal
+   toolchain on this machine, kernels compile at runtime).
+2. **D1 sizing** — post-change official-tier 8K NLL **1.8349** (PPL 6.264) vs
+   divide-form baseline 1.8353: Δ = −0.02% relative, band ±0.5%
+   ([1.8261, 1.8445]). Rare-event class confirmed; position bands match to
+   the 4th decimal (1.5742/1.9217 vs 1.5744/1.9222).
+   logs/k3-fixes-20260717/d1-nll-official.out.
+3. **Snapshot crash gate** — ALL PASS: before-fsync crash leaves no target
+   (fresh path) / previous snapshot intact+loadable (overwrite path);
+   after-rename crash loads byte-identically to an uncrashed save.
+   DEVIATION from pre-registration: ran on the T2 artifact, not B1 — the
+   gate script's standard subject; save/load state logic is tier-independent.
+4. **Failpoint gate** — PASS (N=4, injection after 1 step): throw surfaced,
+   position held at pos0+1, reset()+regenerate byte-identical to the unarmed
+   reference. New tools/failpoint_gate.{cpp,sh}.
+5. **Chunk-parity hidden-row leg** — PASS: widths {17,48,96} bit-identical to
+   the width-12 baseline on logits AND the x1_ hidden row (T2, 96 positions).
+
+Registered residue: E8 → mini (queued behind gqa_partials); C1 parked behind
+GPU-sampling stage 3; no CUDA changes, so no yukon action from this batch.
