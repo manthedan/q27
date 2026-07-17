@@ -105,14 +105,22 @@ one (attn layer, KV head, K|V) to turbo3 against a full-fp16 baseline.
    K's 58% mean share was an 8K figure). Per the pre-registration this
    flags an interaction effect: a dedicated L7 h1 pair run (K+V jointly
    vs each alone) is the follow-up if step 4 wants to lean on this head.
-3. **The pos-1000 event has no single-cell owner.** Largest single-cell
-   KL near pos 1000 is 0.0285 (L27 h1 K) — two orders below the
-   both-sides 2.94 event; nothing approaches the 0.3 screen. The step-1
-   tail event is a multi-cell sum, and per-cell allocation has the
-   weaker lever the pre-registration anticipated. Note the single-cell
-   damage concentrates at pos 641 instead (5 of the top-5 cells max
-   there or at 640) — position 641 is the globally KV-fragile position
-   of this corpus window at 2K, not position 1000.
+3. **The pos-1000 event has no single-cell owner.** Proof from the
+   committed per-cell data (the instrument records each cell's global
+   max/argmax plus its >0.1-nat run structure, not per-position KL —
+   codex correctly flagged that argmax proximity alone cannot rule an
+   owner out, so the bound chain is): 125/128 cells have global max
+   < 0.1, which bounds their KL at every position including 1000; the
+   three cells above 0.1 are also bounded — L7 h1 K and V each have
+   exactly ONE position > 0.1 in the whole pass and it is 641 (runs
+   lines in cell_010/011.log), so their pos-1000 KL is ≤ 0.1, and
+   L11 h3 V's global max is 0.162 < 0.3. Every cell is < 0.3 at
+   pos 1000 — the 0.3 screen fails for all 128, the step-1 2.94-nat
+   event is a multi-cell sum, and per-cell allocation has the weaker
+   lever the pre-registration anticipated. Note the single-cell damage
+   concentrates at pos 641 instead (5 of the top-5 cells max there or
+   at 640) — position 641 is the globally KV-fragile position of this
+   corpus window at 2K, not position 1000.
 4. **Strong sub-additivity: Σ(128 cell means) = 0.0284 vs both-sides
    0–2k ≈ 0.0123 — parts sum to 2.32× the joint damage.** (Anchor
    caveat: 0.0122604 is the GEMM_HALF=0 calibration bucket; step 1's
