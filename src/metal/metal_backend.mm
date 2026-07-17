@@ -2190,7 +2190,10 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
     check_range(kc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib K cache");
     check_range(vc.size(), (uint64_t)position * row_floats * 2, row_floats * tokens * 2, "attrib V cache");
     if (needs_aux) {
-        const uint64_t need = ((uint64_t)scale_off + 2ull * 16384) * 4;
+        // Highest index the kernel touches for this layer: the V side's
+        // slice at this scale_off — NOT the layer offset added to both full
+        // side regions (codex P1 on b1bed0e).
+        const uint64_t need = ((uint64_t)scale_off + 16384 + (uint64_t)kv_heads * 256) * 4;
         check_range(metal_buffer(*aux).size(), 0, need, "attrib aux");
     }
     TurboAttribArgs args{position, kv_heads, tokens, mode, head, flags, scale_off};
