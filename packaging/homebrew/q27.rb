@@ -11,7 +11,7 @@ class Q27 < Formula
   desc "Ternary-quantized 27B LLM inference engine for Apple silicon (Metal)"
   homepage "https://github.com/manthedan/q27"
   url "https://github.com/manthedan/q27/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "SHA256_PLACEHOLDER"
+  sha256 "42877ca9042daacfa5d580339da1444b61ee4923c41c17735a68b986ba5e1d07"
   license "MIT"
 
   depends_on :macos
