@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble a mixed-tier q27 pack from two same-model q27 containers.
+"""Assemble a mixed-tier q27 pack from two compatible Bonsai containers.
 
 Mixed weight-tier census (docs/plans/2026-07-17-mixed-tier-census.md):
 every tensor comes from the BASE pack except those matching --take, which

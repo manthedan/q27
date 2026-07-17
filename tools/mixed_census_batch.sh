@@ -6,8 +6,10 @@
 # arms with a completed log are skipped, so a crashed batch re-runs only
 # what is missing. One model load at a time by construction (serial loop).
 set -u
-cd "$(dirname "$0")/.."
-[ -z "${SWEEP_CAFF:-}" ] && exec env SWEEP_CAFF=1 caffeinate -i "$0" "$@"
+set -o pipefail
+DRIVER=${0:A}  # save before entering fingerprint(); zsh sets $0 to the function name there
+cd "$(dirname "$DRIVER")/.."
+[ -z "${SWEEP_CAFF:-}" ] && exec env SWEEP_CAFF=1 caffeinate -i "$DRIVER" "$@"
 
 BIN=build/q27-metal
 B1=models/bonsai-27b-b1/bonsai-27b-b1.q27
@@ -15,16 +17,48 @@ T2=models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27
 TOK=models/qwen36-27b-mtp/qwen36-27b-mtp.tok
 C=data/wikitext2-test.tokens.bin
 OUT=logs/mixed_census
-ARM_PACK=models/census_arm.q27      # transient, deleted after each arm
+ARM_PACK="models/census_arm.$$.q27"  # run-unique transient
+LOCK="${OUT}.lock"
 mkdir -p "$OUT"
-trap 'rm -f "$ARM_PACK"' EXIT
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "census: $LOCK exists; another batch owns the shared results (remove only after verifying it is stale)"
+    exit 1
+fi
+echo "$$" > "$LOCK/pid"
+cleanup() { rm -f "$ARM_PACK"; rm -rf "$LOCK"; }
+trap cleanup EXIT
 
-if pgrep -f "q27-metal " >/dev/null 2>&1; then
-    echo "census: another q27-metal process is running; refusing to start"; exit 1
+if pgrep -x q27-metal >/dev/null 2>&1 || pgrep -x q27-metal-server >/dev/null 2>&1; then
+    echo "census: another q27 Metal process is running; refusing to start"; exit 1
 fi
 
 export Q27_METAL_GEMM_HALF=1 Q27_METAL_GQA_TILE=2
 export Q27_METAL_GQA_THRESHOLD=2048 Q27_METAL_GQA_BLOCK=1024
+
+# Same-machine/driver identity for resume. Hash the platform UUID rather
+# than writing it to a committed fingerprint; OS build + GPU identify the
+# Metal runtime available to this binary. Every probe fails closed: an
+# empty hash must never turn "same unknown Mac" into a valid resume.
+platform_fail() {
+    echo "census: cannot establish machine/Metal runtime identity" | tee "$OUT/ABORTED"
+    exit 1
+}
+HW_MODEL=$(sysctl -n hw.model 2>/dev/null) || platform_fail
+[ -n "$HW_MODEL" ] || platform_fail
+HW_UUID=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null |
+    awk -F'"' '/IOPlatformUUID/{print $(NF-1); exit}') || platform_fail
+[ -n "$HW_UUID" ] || platform_fail
+HW_HASH=$(printf '%s' "$HW_UUID" | shasum -a 256 | awk '{print $1}') || platform_fail
+case "$HW_HASH" in (''|*[!0-9a-f]*) platform_fail;; esac
+[ "${#HW_HASH}" = 64 ] || platform_fail
+unset HW_UUID
+OS_VERSION=$(sw_vers -productVersion 2>/dev/null) || platform_fail
+OS_VERSION_BUILD=$(sw_vers -buildVersion 2>/dev/null) || platform_fail
+[ -n "$OS_VERSION" ] && [ -n "$OS_VERSION_BUILD" ] || platform_fail
+OS_BUILD="$OS_VERSION-$OS_VERSION_BUILD"
+METAL_GPU=$(system_profiler SPDisplaysDataType 2>/dev/null |
+    awk -F': ' '/Chipset Model/{print $2; exit}') || platform_fail
+[ -n "$METAL_GPU" ] || platform_fail
 
 # Run the engine under a clean environment so inherited Q27/Metal debug,
 # codec, shader-override, or residency knobs cannot redefine an arm. The
@@ -46,9 +80,20 @@ make build/q27-metal > "$OUT/rebuild.log" 2>&1 || {
 # corpora, route pins, or driver revisions into one readout. Include both
 # HEAD and this script's bytes: the latter catches an uncommitted edit too.
 fingerprint() {
-    echo "$(git rev-parse HEAD 2>/dev/null || echo nogit) driver=$(md5 -q "$0") mixer=$(md5 -q tools/q27_mix.py) host=$(md5 -q "$BIN") shader=$(md5 -q src/metal/q27_kernels.metal) b1=$(md5 -q "$B1") t2=$(md5 -q "$T2") tok=$(md5 -q "$TOK") corpus=$(md5 -q "$C") clean_env=1 gemm_half=$Q27_METAL_GEMM_HALF tile=$Q27_METAL_GQA_TILE thr=$Q27_METAL_GQA_THRESHOLD blk=$Q27_METAL_GQA_BLOCK nll_long=8192 ctx=8192"
+    local head driver mixer host shader b1 t2 tok corpus
+    head=$(git rev-parse HEAD 2>/dev/null) || return 1
+    driver=$(md5 -q "$DRIVER") || return 1
+    mixer=$(md5 -q tools/q27_mix.py) || return 1
+    host=$(md5 -q "$BIN") || return 1
+    shader=$(md5 -q src/metal/q27_kernels.metal) || return 1
+    b1=$(md5 -q "$B1") || return 1
+    t2=$(md5 -q "$T2") || return 1
+    tok=$(md5 -q "$TOK") || return 1
+    corpus=$(md5 -q "$C") || return 1
+    echo "$head driver=$driver mixer=$mixer host=$host shader=$shader b1=$b1 t2=$t2 tok=$tok corpus=$corpus hw_model=$HW_MODEL hw_hash=$HW_HASH os_build=$OS_BUILD metal_gpu=$METAL_GPU clean_env=1 gemm_half=$Q27_METAL_GEMM_HALF tile=$Q27_METAL_GQA_TILE thr=$Q27_METAL_GQA_THRESHOLD blk=$Q27_METAL_GQA_BLOCK nll_long=8192 ctx=8192"
 }
-FP="$(fingerprint)"
+FP=$(fingerprint) ||
+    { echo "census: cannot fingerprint a required input" | tee "$OUT/ABORTED"; exit 1; }
 if [ -f "$OUT/fingerprint" ]; then
     [ "$(cat "$OUT/fingerprint")" = "$FP" ] ||
         { echo "census: fingerprint mismatch — move $OUT aside" | tee "$OUT/ABORTED"; exit 1; }
@@ -66,31 +111,45 @@ rm -f "$OUT/ABORTED"
 # artifact. Recheck the complete identity around every measurement so an
 # edit during this multi-day process cannot silently split the experiment.
 check_fingerprint() {
-    [ "$(fingerprint)" = "$FP" ] ||
+    local now
+    now=$(fingerprint) ||
+        { echo "census: cannot fingerprint a required input" | tee "$OUT/ABORTED"; exit 1; }
+    [ "$now" = "$FP" ] ||
         { echo "census: input changed while batch was running — aborting" | tee "$OUT/ABORTED"; exit 1; }
 }
 
 nll_run() {
-    local model=$1 log=$2
+    local model=$1 log=$2 expected_md5=$3
+    local tmp="$log.tmp"
+    # Only the atomic final pathname means complete: it is published after
+    # both the global identity and this exact model file pass post-run checks.
     [ -s "$log" ] && grep -q "overall mean NLL" "$log" && return 0
+    rm -f "$tmp"
     for attempt in 1 2; do
         check_fingerprint
-        q27 "$model" "$TOK" --nll "$C" --nll-long 8192 --ctx 8192 > "$log" 2>&1
-        if grep -q "overall mean NLL" "$log"; then
+        q27 "$model" "$TOK" --nll "$C" --nll-long 8192 --ctx 8192 > "$tmp" 2>&1
+        if grep -q "overall mean NLL" "$tmp"; then
             check_fingerprint
+            [ "$(md5 -q "$model")" = "$expected_md5" ] ||
+                { echo "census: model changed during $(basename "$log")" | tee "$OUT/ABORTED"; exit 1; }
+            mv "$tmp" "$log" ||
+                { echo "census: cannot publish $(basename "$log")" | tee "$OUT/ABORTED"; exit 1; }
             return 0
         fi
-        [ "$attempt" = 1 ] &&
-            { mv "$log" "$log.attempt1"
-              echo "census: $(basename "$log") attempt 1 failed; retrying once"; }
+        if [ "$attempt" = 1 ]; then
+            mv "$tmp" "$log.attempt1" ||
+                { echo "census: cannot preserve failed $(basename "$log")" | tee "$OUT/ABORTED"; exit 1; }
+            echo "census: $(basename "$log") attempt 1 failed; retrying once"
+        fi
     done
+    mv "$tmp" "$log" 2>/dev/null || true
     echo "census: NLL run FAILED twice (see $log)" | tee "$OUT/ABORTED"; exit 1
 }
 
 # Baselines anchor the gap on THIS box and binary (the recorded 1.055
 # B1/T2 ratio is a 24 GB M4 number; ratios must be same-machine).
-nll_run "$B1" "$OUT/base_b1.log"
-nll_run "$T2" "$OUT/base_t2.log"
+nll_run "$B1" "$OUT/base_b1.log" "$(md5 -q "$B1")"
+nll_run "$T2" "$OUT/base_t2.log" "$(md5 -q "$T2")"
 
 arm() {
     local name=$1 take=$2
@@ -100,10 +159,15 @@ arm() {
     python3 tools/q27_mix.py "$B1" "$T2" "$ARM_PACK" --take "$take" \
         > "$OUT/mix_$name.log" 2>&1 ||
         { echo "census: mix FAILED for $name" | tee "$OUT/ABORTED"; exit 1; }
+    local arm_md5
+    arm_md5=$(md5 -q "$ARM_PACK") ||
+        { echo "census: cannot fingerprint transient pack for $name" | tee "$OUT/ABORTED"; exit 1; }
     q27 "$ARM_PACK" "$TOK" --validate-only --ctx 8 >> "$OUT/mix_$name.log" 2>&1 ||
         { echo "census: validate FAILED for $name" | tee "$OUT/ABORTED"; exit 1; }
     check_fingerprint
-    nll_run "$ARM_PACK" "$log"
+    [ "$(md5 -q "$ARM_PACK")" = "$arm_md5" ] ||
+        { echo "census: transient pack changed during validation for $name" | tee "$OUT/ABORTED"; exit 1; }
+    nll_run "$ARM_PACK" "$log" "$arm_md5"
     rm -f "$ARM_PACK"
 }
 
@@ -122,10 +186,14 @@ arm attnkv_late  "blk\\.$L\\.attn_(k|v)\\.weight"
 arm attnout_early "blk\\.$E\\.attn_output\\.weight"
 arm attnout_mid   "blk\\.$M\\.attn_output\\.weight"
 arm attnout_late  "blk\\.$L\\.attn_output\\.weight"
-# FFN classes x bands (every block).
-arm ffngu_early  "blk\\.$E\\.ffn_(gate|up)\\.weight"
-arm ffngu_mid    "blk\\.$M\\.ffn_(gate|up)\\.weight"
-arm ffngu_late   "blk\\.$L\\.ffn_(gate|up)\\.weight"
+# FFN classes x bands (every block). Gate and up are separate: their
+# combined 13.9-14.6% byte cost exceeded the census's <=10% eligibility bar.
+arm ffngate_early "blk\\.$E\\.ffn_gate\\.weight"
+arm ffngate_mid   "blk\\.$M\\.ffn_gate\\.weight"
+arm ffngate_late  "blk\\.$L\\.ffn_gate\\.weight"
+arm ffnup_early   "blk\\.$E\\.ffn_up\\.weight"
+arm ffnup_mid     "blk\\.$M\\.ffn_up\\.weight"
+arm ffnup_late    "blk\\.$L\\.ffn_up\\.weight"
 arm ffndown_early "blk\\.$E\\.ffn_down\\.weight"
 arm ffndown_mid   "blk\\.$M\\.ffn_down\\.weight"
 arm ffndown_late  "blk\\.$L\\.ffn_down\\.weight"
