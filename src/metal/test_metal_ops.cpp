@@ -933,6 +933,79 @@ int test_attention_gqa_tiled_parity() {
 // the exact top-k (value desc, index asc tie-break), stay within capacity
 // on realistic logits, and signal fallback (count > capacity) on
 // degenerate tie storms.
+// fp8-KV control arm (docs/plans/2026-07-17-fp8-kv-control.md): the attrib
+// store's mode 4 must land every value on the OCP e4m3 grid with true RNE,
+// subnormals at 2^-9, and +-448 saturation — on BOTH sides. Golden cases
+// pin the tie/boundary behavior by hand; a CPU mirror sweeps the rest.
+// A stale shader would store clean fp16 (unknown mode), so the golden
+// cases double as the anti-vacuity guard for the instrument itself.
+int test_kv_e4m3_store(q27::MetalBackend& backend) {
+    constexpr uint32_t kvh = 1, dim = 256;
+    int failures = 0;
+    auto ref = [](float x) -> float {
+        double a = std::fabs((double)x);
+        if (a == 0.0) return x;
+        double q;
+        if (a > 448.0) q = 448.0;
+        else if (a < 0.015625) q = std::nearbyint(a * 512.0) / 512.0;
+        else {
+            int e; std::frexp(a, &e);
+            const double step = std::ldexp(1.0, e - 4);
+            q = std::min(std::nearbyint(a / step) * step, 448.0);
+        }
+        return x < 0 ? -(float)q : (float)q;
+    };
+    // Hand-computed goldens: RNE ties both directions, subnormal ties,
+    // min-normal boundary, saturation from both sides, sign mirror.
+    const std::pair<float, float> golden[] = {
+        {1.0625f, 1.0f},                  // midpoint, rounds to even (000)
+        {1.1875f, 1.25f},                 // midpoint, rounds to even (010)
+        {0.0009765625f, 0.0f},            // 2^-10: subnormal tie to 0
+        {0.0029296875f, 0.00390625f},     // 3*2^-10: subnormal tie to 2 ulp
+        {0.0146484375f, 0.015625f},       // tie at 7.5 ulp -> 8 = min normal
+        {0.017f, 0.017578125f},           // 8.704 ulp -> 9
+        {432.0f, 448.0f},                 // 13.5 step tie -> even 14
+        {447.0f, 448.0f},
+        {449.0f, 448.0f},                 // above max: saturate
+        {1.0e6f, 448.0f},
+        {-1.0e6f, -448.0f},
+        {-1.0625f, -1.0f},
+        {448.0f, 448.0f},
+    };
+    std::vector<float> k(dim), v(dim);
+    const size_t ng = sizeof golden / sizeof golden[0];
+    for (uint32_t d = 0; d < dim; d++) {
+        // Goldens up front (both sides, opposite signs in v), then a sweep
+        // crossing every binade from subnormals to saturation.
+        if (d < ng) { k[d] = golden[d].first; v[d] = -golden[d].first; }
+        else {
+            k[d] = 0.9f * std::exp2(float(int(d % 41) - 22)) * (1.0f + 0.037f * float(d % 13));
+            v[d] = -1.1f * std::exp2(float(int(d % 37) - 18)) * (1.0f + 0.051f * float(d % 7));
+        }
+    }
+    auto kb = upload_buffer(backend, k), vb = upload_buffer(backend, v);
+    auto kc = backend.allocate((uint64_t)kvh * dim * 2), vc = backend.allocate((uint64_t)kvh * dim * 2);
+    backend.kv_store_f16_attrib_rows(*kb, *vb, *kc, *vc, 0, kvh, 1, 4, ~0u, 0, 0, nullptr);
+    std::vector<uint16_t> kh(dim), vh(dim);
+    backend.read(*kc, 0, kh.data(), dim * 2);
+    backend.read(*vc, 0, vh.data(), dim * 2);
+    auto as_float = [](uint16_t h) {
+        __fp16 f; std::memcpy(&f, &h, 2); return (float)f;
+    };
+    for (uint32_t d = 0; d < dim; d++) {
+        const float wk = d < ng ? golden[d].second : ref(k[d]);
+        const float wv = d < ng ? -golden[d].second : ref(v[d]);
+        if (as_float(kh[d]) != wk || as_float(vh[d]) != wv) {
+            fprintf(stderr, "e4m3 store[%u]: k %.10g->%.10g want %.10g, v %.10g->%.10g want %.10g\n",
+                    d, k[d], as_float(kh[d]), wk, v[d], as_float(vh[d]), wv);
+            failures++;
+            if (failures > 4) return failures;
+        }
+    }
+    printf("e4m3 fp8 KV store: golden ties/saturation/subnormals + full-binade sweep exact on both sides\n");
+    return failures;
+}
+
 int test_topk(q27::MetalBackend& backend) {
     int failures = 0;
     uint32_t lcg = 13579;
@@ -1670,6 +1743,7 @@ int main() {
                        test_attention_gqa_path() + test_attention_gqa_straddle() +
                        test_attention_fp16_window(backend) +
                        test_attention_gqa_tiled_parity() +
+                       test_kv_e4m3_store(backend) +
                        test_topk(backend) + test_argmax_stress(backend) +
                        test_tensor_extent(backend) + test_mask_logits(backend) +
                        test_gdn(backend) + test_chunked(backend);

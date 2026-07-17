@@ -36,6 +36,63 @@ Same-protocol KL vs the recorded turbo3 numbers (mean 0.0115, max 2.83):
 
 ~3–4 days honest scope. No model quality claims until --kl-kv lands.
 
-## RESULTS
+## Method amendment (2026-07-17, recorded BEFORE the readout ran)
 
-(pending)
+The full-dtype build order is inverted: the QUALITY readout ships first
+as `--kl-kv-fp8` — attrib-store mode 4, an e4m3 round-trip of BOTH
+sides at store time on the fp16-cache subject — and the production fp8
+dtype (store/dequant kernels across the ~8-consumer turbo3 mirror, third
+`--kv` value) is built only if the readout says fp8 wins and bytes then
+matter.
+
+Why the round-trip arm is valid here when it was demoted for turbo3
+tails: the demotion was about SEMANTICS divergence — turbo3's
+production attention dequantizes and sums in the WHT domain, so
+attrib-domain values ≠ production values at knife-edge positions. e4m3
+is transform-free: the round-tripped fp16 values are bit-identical to
+what a real fp8 cache would dequantize into attention. The arm is
+production-exact for this codec, means AND tails, so the comparison
+against the PRODUCTION turbo3 numbers (kl8k.log: mean 0.0115289, max
+2.82816 @8K) is apples-to-apples. Bytes need no measurement — e4m3 is
+1 B/elem by construction (1024 B/token/side vs turbo3's 400).
+
+Guard rails: SHADER_ABI 10→11 (a stale shader silently stores clean
+fp16 for an unknown mode — KL would read 0, vacuously "fp8 perfect";
+the mode-3 landing hit exactly this class); unit test pins the e4m3
+grid bit-exactly on both sides (RNE ties both directions, subnormal
+ties at 2^-9, min-normal boundary, ±448 saturation) against hand
+goldens + a CPU mirror across every binade, and doubles as the
+anti-vacuity guard.
+
+## RESULTS (2026-07-17, mini; logs/fp8_kv/)
+
+Protocol: production-exact e4m3 arm (method amendment above) vs the
+recorded PRODUCTION turbo3 run (kl8k.log), same corpus, same 8,191
+positions, same route envs.
+
+- **8K formal arm: fp8 mean 0.000626 nats, max 0.0941 @7719, p99
+  0.00565 — vs turbo3's 0.0115289 / 2.82816. Mean 18.4× LOWER (the
+  band asked ≤1.1×), max 30× lower, depth-flat (0.00057 → 0.00064
+  running mean), ZERO positions above 0.1.** The pos-1000 event does
+  not exist under e4m3. 1,536-pos smoke agrees (0.00058 / 0.0355; sits
+  2.6× above the fp16-route envelope floor, so the read is not
+  vacuous — and the ABI bump + bit-exact store test guard the
+  silent-fp16 failure mode independently.
+- **Band 1 fires: turbo3's WHT+3-bit structure is NOT earning its keep
+  on quality. It is a RATE point, now validated as only that: its whole
+  case is 2.56× fewer bytes (800 vs 2048 B/token both-sides).** P1
+  steps 2–4 pivot, per pre-registration, to "when do bytes matter"
+  (context-depth banded).
+- Trade table at 8K (bytes relative to turbo3):
+  turbo3 1.0× → mean 0.0115, max 2.83;
+  funded L7-full 1.258× → 0.0104, 0.755;
+  fp8 2.56× → 0.00063, 0.094;
+  fp16 5.12× → 0.
+  fp8 beats the funded config 8× on max and 16× on mean for ~2× its
+  byte premium — the mid-rate L7 code (option 2 of the funding
+  decision) now competes against "fp8 on the hot cells", which needs
+  no format design at all.
+- Production-dtype work (the ~8-kernel turbo3 mirror, third --kv
+  value) stays UNBUILT per the amendment until a serving decision
+  actually wants fp8 bytes in the cache; the quality question this
+  plan was opened for is answered.

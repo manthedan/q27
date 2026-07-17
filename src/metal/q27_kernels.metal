@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 10
+// Q27_SHADER_ABI 11
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -3754,6 +3754,31 @@ kernel void q27_turbo_wht(device float *x [[buffer(0)]],
     xh[j] = xs[j] * turbo_inv_sqrt_128 * float(args.inverse ? turbo_s1[j] : turbo_s2[j]);
 }
 
+// OCP e4m3 round-trip (fp8-KV control arm, docs/plans/2026-07-17-fp8-kv-
+// control.md): RNE onto the e4m3 grid — 3 mantissa bits, exponent
+// [-6..8], subnormal step 2^-9, saturate to +-448 (no inf; 480 is the
+// NaN encoding). Because the codec is transform-free, round-tripped
+// values are bit-identical to what a real e4m3 cache would feed
+// attention, so the attrib-store arm is production-exact for this codec
+// (unlike turbo3, whose production attention sums in the WHT domain).
+// frexp is exact and division by a power of two is exact, so rint gives
+// true round-nearest-even on the grid. Finite inputs only (KV rows).
+inline float q27_e4m3_roundtrip(float x) {
+    const float a = fabs(x);
+    if (a == 0.0f) return x;                      // signed zero unchanged
+    float q;
+    if (a > 448.0f) {
+        q = 448.0f;                               // saturate, no infinity
+    } else if (a < 0.015625f) {                   // below min normal 2^-6
+        q = rint(a * 512.0f) * 0.001953125f;      // subnormal grid 2^-9
+    } else {
+        int e; frexp(a, e);                       // a in [2^(e-1), 2^e)
+        const float step = exp2(float(e - 4));    // 2^(exp-3), exp = e-1
+        q = min(rint(a / step) * step, 448.0f);
+    }
+    return x < 0.0f ? -q : q;
+}
+
 struct TurboStoreArgs { uint position; uint kv_heads; };
 kernel void q27_kv_store_turbo3(device const float *k [[buffer(0)]],
                                  device const float *v [[buffer(1)]],
@@ -3922,6 +3947,9 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
 // ~0u round-trips every head of the selected side. Mode 3 (step-4
 // exception probe) round-trips BOTH sides and reuses head as a per-layer
 // 8-bit exception mask (bit = head*2 + side): set bits stay clean fp16.
+// Mode 4 (fp8-KV control arm) round-trips BOTH sides of every head
+// through the e4m3 grid; head is ignored. Transform-free, so this arm is
+// production-exact — see q27_e4m3_roundtrip.
 // flags: step-2 scaling
 // arms (docs/plans/2026-07-16-kv-codec-step2.md) — SCALE32 keeps the
 // group scale in f32 through the round-trip, FEATURE descales each
@@ -3963,6 +3991,7 @@ kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
     // Mode 3 (step-4 exception probe): quantize BOTH sides unless this
     // (head, side) bit is set in the per-layer exception mask riding
     // args.head — bit = head*2 + side, matching census cell numbering.
+    if (args.mode == 4u) { dst[j] = half(q27_e4m3_roundtrip(src[j])); return; }
     if (args.mode == 3u) {
         if (args.head & (1u << (h * 2u + group.y))) { dst[j] = half(src[j]); return; }
     } else if (args.mode != (group.y ? 2u : 1u) ||

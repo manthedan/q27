@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width | --suffix-serial width | --oracle width] [--kv fp16|turbo3] "
-                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-cell N | --kl-kv-except LIST | --kl-kv-stats FILE] [--kv-rt-scale32] [--kv-rt-feature FILE] [--chunk-parity N] "
+                "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-fp8 | --kl-kv-cell N | --kl-kv-except LIST | --kl-kv-stats FILE] [--kv-rt-scale32] [--kv-rt-feature FILE] [--chunk-parity N] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--save-state file | --load-state file] [--dump-logits file]\n",
                 argv[0]);
@@ -200,10 +200,13 @@ int main(int argc, char** argv) {
                 }
                 kl_kv = true; kv_except_set = true;
             }
-            else if (arg == "--kl-kv-k" || arg == "--kl-kv-v") {
-                const uint32_t side = (arg == "--kl-kv-k") ? 1 : 2;
+            else if (arg == "--kl-kv-k" || arg == "--kl-kv-v" || arg == "--kl-kv-fp8") {
+                // fp8-KV control arm (2026-07-17-fp8-kv-control.md): mode 4,
+                // e4m3 round-trip of BOTH sides — production-exact for a
+                // transform-free codec, unlike the turbo3 side arms.
+                const uint32_t side = (arg == "--kl-kv-k") ? 1 : (arg == "--kl-kv-v") ? 2 : 4;
                 if (kv_attrib && kv_attrib != side)
-                    throw std::runtime_error("--kl-kv-k and --kl-kv-v are alternative arms; pass one");
+                    throw std::runtime_error("--kl-kv-k/--kl-kv-v/--kl-kv-fp8 are alternative arms; pass one");
                 kl_kv = true; kv_attrib = side;
             }
             else if (arg == "--chunk-parity" && i + 1 < argc) chunk_parity = parse_u32(argv[++i], "--chunk-parity");
@@ -305,8 +308,8 @@ int main(int argc, char** argv) {
         if (!kv_stats_out.empty() && (kv_attrib || kl_self || kv_cell != UINT32_MAX ||
                                       kv_rt_scale32 || !kv_rt_feature.empty()))
             throw std::runtime_error("--kl-kv-stats is its own pass; drop other kl-kv arms/modifiers");
-        if ((kv_rt_scale32 || !kv_rt_feature.empty()) && !kv_attrib)
-            throw std::runtime_error("--kv-rt-scale32/--kv-rt-feature modify a side arm; add --kl-kv-k or --kl-kv-v");
+        if ((kv_rt_scale32 || !kv_rt_feature.empty()) && (!kv_attrib || kv_attrib == 4))
+            throw std::runtime_error("--kv-rt-scale32/--kv-rt-feature modify a turbo3 side arm; add --kl-kv-k or --kl-kv-v (not --kl-kv-fp8)");
         if (kv_except_set && (kv_attrib || kl_self || kv_cell != UINT32_MAX ||
                               !kv_stats_out.empty() || kv_rt_scale32 || !kv_rt_feature.empty()))
             throw std::runtime_error("--kl-kv-except is its own arm; drop other kl-kv arms/modifiers");
@@ -741,6 +744,7 @@ int main(int argc, char** argv) {
                                                      std::to_string(kv_except.size()) + " cells")
                                   : kv_attrib == 1 ? "turbo3 K-only round-trip"
                                   : kv_attrib == 2 ? "turbo3 V-only round-trip"
+                                  : kv_attrib == 4 ? "e4m3 fp8 both-sides round-trip (production-exact)"
                                   : "turbo3";
             if (kv_rt_scale32) arm_name += " +scale32";
             if (!kv_rt_feature.empty()) arm_name += " +feature";

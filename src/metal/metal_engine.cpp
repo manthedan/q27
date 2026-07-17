@@ -473,8 +473,11 @@ void MetalEngine::set_chunked_prefill(bool enabled) {
 }
 
 void MetalEngine::set_kv_attrib(uint32_t mode) {
-    if (mode > 2)
-        throw std::runtime_error("q27 Metal: KV attribution mode must be 0 (off), 1 (K), or 2 (V)");
+    // Mode 4 (fp8-KV control arm): e4m3 round-trip of BOTH sides, every
+    // head — production-exact for a transform-free codec. Mode 3 is set
+    // via set_kv_attrib_except only (it needs the cell masks).
+    if (mode > 2 && mode != 4)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 0 (off), 1 (K), 2 (V), or 4 (e4m3 both sides)");
     if (mode && turbo3_kv_)
         throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
     // Any change after rows are cached — including turning attribution off
@@ -491,7 +494,8 @@ void MetalEngine::set_kv_attrib(uint32_t mode) {
 }
 
 void MetalEngine::set_kv_attrib_rt(bool scale32, const float* feature_scales) {
-    if (!kv_attrib_ || (kv_attrib_flags_ & 4u) || kv_attrib_ == 3)
+    // Side arms (1/2) only: modes 3/4 have no turbo3 scale to modify.
+    if (!kv_attrib_ || (kv_attrib_flags_ & 4u) || kv_attrib_ >= 3)
         throw std::runtime_error("q27 Metal: KV round-trip modifiers need a side arm (set_kv_attrib first)");
     if (position_)
         throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");

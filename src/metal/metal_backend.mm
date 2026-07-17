@@ -63,7 +63,7 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 10";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 11";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -2531,8 +2531,8 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
                                             uint32_t scale_off, BackendBuffer* aux) {
     if (!kv_heads || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid KV attribution store");
-    if (mode != 1 && mode != 2 && mode != 3)
-        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K), 2 (V), or 3 (except-mask)");
+    if (mode != 1 && mode != 2 && mode != 3 && mode != 4)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K), 2 (V), 3 (except-mask), or 4 (e4m3 both sides)");
     if (mode == 3) {
         // Exception mode: head carries the per-layer (head, side) bitmask
         // (bit = head*2 + side); flags modifiers are side-arm-only.
@@ -2540,6 +2540,10 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
             throw std::runtime_error("q27 Metal: KV exception mask out of range");
         if (flags)
             throw std::runtime_error("q27 Metal: KV exception mode takes no round-trip flags");
+    } else if (mode == 4) {
+        // fp8 control arm: head is ignored, no turbo3 scale to modify.
+        if (flags)
+            throw std::runtime_error("q27 Metal: KV e4m3 mode takes no round-trip flags");
     } else if (head != UINT32_MAX && head >= kv_heads)
         throw std::runtime_error("q27 Metal: KV attribution head out of range");
     if (flags & ~7u)
