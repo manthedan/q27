@@ -60,6 +60,9 @@ Per COORDINATION.md: pgrep + `curl :8213/health` before launch; one
 - [ ] `tools/responses_parity_gate.sh` — /v1/responses function_call
       items, stream lifecycle, round-trip, custom tool, 400 class
       (G8a–G8d, G9).
+- [ ] `tools/trace_gate.sh <trace.jsonl>` — with the server started
+      `--trace`, the suites above leave a complete session stream:
+      boot, all 5 api families, outcomes, 400s, per-boot monotonic tms.
 - [ ] `tools/multislot_gates.py` — two-slot admission, fair lease, 503.
 - [ ] `tools/suffix_gate.sh` — suffix drafter byte-identity off-vs-on.
 - [ ] Cancel smoke: kill a long prefill client-side; slot frees within
