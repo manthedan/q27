@@ -16,6 +16,9 @@ class MetalBackend final : public ComputeBackend {
 
     std::string name() const override;
     std::shared_ptr<BackendBuffer> allocate(uint64_t bytes) override;
+    // GPU-private allocation (never host-read/written): used for the
+    // engines' blocked-GQA partials scratch.
+    std::shared_ptr<BackendBuffer> allocate_private(uint64_t bytes);
     void write(BackendBuffer& dst, uint64_t offset, const void* src,
                uint64_t bytes) override;
     void read(const BackendBuffer& src, uint64_t offset, void* dst,
@@ -118,12 +121,13 @@ class MetalBackend final : public ComputeBackend {
                           const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                           BackendBuffer& out,
                           uint32_t seq_len, uint32_t q_heads, uint32_t kv_heads,
-                          uint32_t head_dim, float scale) override;
+                          uint32_t head_dim, float scale,
+                          BackendBuffer* partials) override;
     void attention_f16(const BackendBuffer& q, uint32_t q_stride,
                        const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                        BackendBuffer& out, uint32_t seq_len,
                        uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                       float scale) override;
+                       float scale, BackendBuffer* partials) override;
     void gdn_gates(const BackendBuffer& alpha, const BackendBuffer& beta_raw,
                    const BackendTensor& ssm_a, const BackendTensor& ssm_dt,
                    BackendBuffer& g, BackendBuffer& beta, uint32_t heads) override;
@@ -180,22 +184,24 @@ class MetalBackend final : public ComputeBackend {
                               const BackendBuffer& v_cache,
                               BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                               uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                              float scale) override;
+                              float scale, BackendBuffer* partials) override;
     void attention_turbo3_causal(const BackendBuffer& q, uint32_t q_stride,
                                  uint32_t q_row_stride, const BackendBuffer& k_cache,
                                  const BackendBuffer& v_cache,
                                  BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                  uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                 float scale) override;
+                                 float scale, BackendBuffer* partials) override;
     // Phase-0 probes for cache-block scheduling R1/R1b — bench-only entry
     // points (build/metal_attn_bench), never engine-routed; see
     // docs/plans/2026-07-15-cache-block-scheduling.md. k/v caches hold rows
     // head-major: (kvh * seq_cap + pos) * 100 bytes.
+    // Probe entries always run blocked, so partials is required (callers are
+    // benches; they allocate their own scratch sized for their sweep).
     void attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32_t q_stride,
                                         const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                         BackendBuffer& out, uint32_t seq_len, uint32_t seq_cap,
                                         uint32_t q_heads, uint32_t kv_heads,
-                                        uint32_t head_dim, float scale);
+                                        uint32_t head_dim, float scale, BackendBuffer& partials);
     // tile must be 2 or 4; interleaved (production-layout) caches.
     // R3 probe (bench-only): barrier-free direct-read block-partial causal
     // GQA at token factor 2 with an explicit block-size override.
@@ -204,13 +210,15 @@ class MetalBackend final : public ComputeBackend {
                                         const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                         BackendBuffer& out, uint32_t base_len,
                                         uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                                        uint32_t tokens, uint32_t block, float scale);
+                                        uint32_t tokens, uint32_t block, float scale,
+                                        BackendBuffer& partials);
     void attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uint32_t q_stride,
                                            uint32_t q_row_stride,
                                            const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                            BackendBuffer& out, uint32_t base_len,
                                            uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                                           uint32_t tokens, uint32_t tile, float scale);
+                                           uint32_t tokens, uint32_t tile, float scale,
+                                           BackendBuffer& partials);
     void sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,
                                uint32_t heads, uint32_t head_dim, uint32_t tokens) override;
     void argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows,
@@ -225,12 +233,9 @@ class MetalBackend final : public ComputeBackend {
     void profile_reset();
 
     uint64_t recommended_working_set_size() const;
-    // Effective causal-GQA block size (Q27_METAL_GQA_BLOCK or 1024): the
-    // admission accounting sizes the shared partial buffer from it.
+    // Effective causal-GQA block size (Q27_METAL_GQA_BLOCK or 1024): engines
+    // size their per-engine partials buffer from it at construction.
     uint32_t gqa_block_size() const;
-    // Whether the blocked (partials-allocating) GQA route is reachable at
-    // this context: threshold nonzero and context deep enough to route it.
-    bool gqa_blocked_reachable(uint32_t context) const;
     // Envelope-instrument hooks (docs/plans/2026-07-16-envelope-instrument.md):
     // flip the backend-global reduction-order knobs between two engines'
     // lockstep passes. Instrument use only — production reads the env once.

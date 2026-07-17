@@ -137,16 +137,20 @@ class ComputeBackend {
     virtual void kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& v,
                                  BackendBuffer& k_cache, BackendBuffer& v_cache,
                                  uint32_t position, uint32_t kv_heads) = 0;
+    // partials: caller-owned scratch for the blocked-GQA softmax partials;
+    // may be null only when the call cannot route to the blocked kernels
+    // (see attention_f16_causal below).
     virtual void attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
                                   const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                   BackendBuffer& out,
                                   uint32_t seq_len, uint32_t q_heads, uint32_t kv_heads,
-                                  uint32_t head_dim, float scale) = 0;
+                                  uint32_t head_dim, float scale,
+                                  BackendBuffer* partials) = 0;
     virtual void attention_f16(const BackendBuffer& q, uint32_t q_stride,
                                const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                BackendBuffer& out, uint32_t seq_len,
                                uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                               float scale) = 0;
+                               float scale, BackendBuffer* partials) = 0;
     virtual void gdn_gates(const BackendBuffer& alpha, const BackendBuffer& beta_raw,
                            const BackendTensor& ssm_a, const BackendTensor& ssm_dt,
                            BackendBuffer& g, BackendBuffer& beta, uint32_t heads) = 0;
@@ -254,15 +258,19 @@ class ComputeBackend {
         (void)tokens; (void)mode; (void)head; (void)flags; (void)scale_off; (void)aux;
         throw std::runtime_error("q27: backend has no KV attribution store");
     }
+    // partials: caller-owned scratch for the blocked-GQA softmax partials
+    // (engines allocate it once at construction, sized for their own
+    // max context — docs/plans/2026-07-17-metal-review-triage.md E2). May
+    // be null only when the call cannot route to the blocked kernels.
     virtual void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
                                       uint32_t q_row_stride, const BackendBuffer& k_cache,
                                       const BackendBuffer& v_cache,
                                       BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                       uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                      float scale) {
+                                      float scale, BackendBuffer* partials) {
         (void)q; (void)q_stride; (void)q_row_stride; (void)k_cache; (void)v_cache;
         (void)out; (void)base_len; (void)q_heads; (void)kv_heads;
-        (void)head_dim; (void)tokens; (void)scale;
+        (void)head_dim; (void)tokens; (void)scale; (void)partials;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
     virtual void attention_turbo3_causal(const BackendBuffer& q, uint32_t q_stride,
@@ -270,10 +278,10 @@ class ComputeBackend {
                                          const BackendBuffer& v_cache,
                                          BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                          uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                         float scale) {
+                                         float scale, BackendBuffer* partials) {
         (void)q; (void)q_stride; (void)q_row_stride; (void)k_cache; (void)v_cache;
         (void)out; (void)base_len; (void)q_heads; (void)kv_heads;
-        (void)head_dim; (void)tokens; (void)scale;
+        (void)head_dim; (void)tokens; (void)scale; (void)partials;
         throw std::runtime_error("q27: backend has no chunked execution");
     }
     virtual void sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer& qg,

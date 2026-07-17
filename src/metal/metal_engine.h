@@ -59,14 +59,21 @@ class MetalEngine {
     // These mirror the constructor's allocations and capture_state()'s
     // snapshot composition — keep them paired with those sites.
     bool has_mtp() const { return has_mtp_; }
+    // KV caches plus this engine's blocked-GQA partials scratch — every
+    // ctx-scaled reservation the constructor charges against the shared
+    // cross-engine budget (audit E2: partials are per-engine now).
     uint64_t kv_reserved_bytes() const { return engine_cache_bytes_; }
     uint64_t snapshot_bytes() const;               // worst case at max_context_
     // Per-engine non-KV buffers; the chunk/verify/replay terms exist only
     // when chunked prefill is available (pre-Apple7 devices skip them).
+    // The GQA partials are charged inside kv_reserved_bytes, not here.
     static uint64_t fixed_state_bytes(bool chunked);
-    // Backend-shared causal-GQA partial buffer at the widest available
+    // Per-engine causal-GQA partials buffer at the widest available
     // attention width (one token when chunked prefill is unavailable),
     // sized from the backend's EFFECTIVE block (Q27_METAL_GQA_BLOCK-aware).
+    // Allocated eagerly by the constructor; the dispatch hot path only
+    // bounds-checks (audit C3). Sizing never depends on the GQA threshold,
+    // so runtime threshold flips (envelope instrument) only change routing.
     static uint64_t gqa_partial_peak(uint32_t context, uint32_t block, bool chunked);
 
     void reset();
@@ -294,6 +301,10 @@ class MetalEngine {
     uint32_t kv_attrib_flags_ = 0;
     std::shared_ptr<BackendBuffer> kv_attrib_aux_;
     uint64_t engine_cache_bytes_ = 0;
+    // Blocked-GQA softmax partials, engine-owned (audit E2): allocated once
+    // in the constructor at gqa_partial_peak, GPU-private, freed with the
+    // engine. Passed into every backend attention call.
+    std::shared_ptr<BackendBuffer> gqa_partials_;
     uint32_t position_ = 0;
     SpecStats last_spec_stats_;
     SuffixStats last_suffix_stats_;

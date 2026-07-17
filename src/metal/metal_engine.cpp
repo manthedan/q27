@@ -235,8 +235,18 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     has_mtp_ = model_.find("blk.64.attn_norm.weight") != nullptr;
     const uint64_t cache_row_bytes = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                                 : (uint64_t)N_KV * HEAD_DIM * 2;
+    // Per-engine blocked-GQA partials (audit E2): sized once here for this
+    // engine's own context at the widest attention width this device can
+    // dispatch, and reserved alongside the caches — it is the other
+    // ctx-scaled allocation. Sizing deliberately ignores the GQA threshold:
+    // the envelope instrument flips it at runtime, which must only change
+    // routing, never invalidate the buffer.
+    const bool chunk_capable = backend_.supports_quantized_matmul();
+    const uint64_t partial_bytes =
+        gqa_partial_peak(max_context_, backend_.gqa_block_size(), chunk_capable);
     const uint64_t total_cache_bytes =
-        (16ull + (has_mtp_ ? 1 : 0)) * 2 * max_context_ * cache_row_bytes;
+        (16ull + (has_mtp_ ? 1 : 0)) * 2 * max_context_ * cache_row_bytes
+        + partial_bytes;
     // Budget the combined caches of every engine on this mapping, not just
     // this one — two engines can each pass a per-engine check while jointly
     // overcommitting the device.
@@ -302,11 +312,13 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     q5120_=backend_.allocate_quantized(N_EMBD); q6144_=backend_.allocate_quantized(GDN_V);
     q10240_=backend_.allocate_quantized(GDN_CH); q17408_=backend_.allocate_quantized(N_FFN);
 
+    gqa_partials_ = backend_.allocate_private(partial_bytes);
+
     // Layer-major chunked prefill routes projections through the simdgroup
     // GEMM, so it requires the same device family. The per-chunk activation
     // buffers total a few MiB. Every attention kernel is online-softmax now,
     // so no probability scratch exists on any path at any context length.
-    chunked_prefill_ = backend_.supports_quantized_matmul();
+    chunked_prefill_ = chunk_capable;
     if (chunked_prefill_) {
         ch_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
         cx1_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
@@ -444,8 +456,8 @@ void MetalEngine::reset() {
 // G6 admission accounting. snapshot_bytes mirrors capture_state()'s
 // allocations at worst case (position_ == max_context_); fixed_state_bytes
 // mirrors the constructor's non-KV buffers (the >= 1 MB class; scalar-sized
-// allocations omitted); gqa_partial_peak mirrors the backend's causal-GQA
-// partial sizing at the widest chunk. Keep paired with those sites.
+// allocations omitted); gqa_partial_peak mirrors the constructor's own
+// per-engine partials allocation (audit E2). Keep paired with those sites.
 uint64_t MetalEngine::snapshot_bytes() const {
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
@@ -485,18 +497,14 @@ uint64_t MetalEngine::fixed_state_bytes(bool chunked) {
 }
 
 uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block, bool chunked) {
-    // Caller passes block == 0 when the blocked GQA route is unreachable
-    // (threshold disabled or context below it): no partials ever allocate.
-    if (!block) return 0;
     const uint64_t b = std::max(block, 1u);
     const uint64_t blocks = 1 + ((uint64_t)std::max(context, 1u) - 1) / b;
     // Without chunked prefill the causal-GQA path only ever sees one query
-    // token (serial decode), so the widest partial buffer is one row. The
-    // buffer grows by allocate-then-replace as context deepens, so the old
-    // and new allocations coexist transiently — charge 2x the final peak
-    // (monotonic growth makes old + new < 2 x new; codex P2).
+    // token (serial decode), so the widest partial buffer is one row.
+    // Allocated eagerly per engine (audit E2), so there is no transient
+    // allocate-then-replace coexistence to double-charge anymore.
     const uint64_t tokens = chunked ? PREFILL_CHUNK_MAX : 1;
-    return 2 * tokens * N_HEAD * blocks * 258 * 4;
+    return tokens * N_HEAD * blocks * 258 * 4;
 }
 
 std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
@@ -830,7 +838,8 @@ void MetalEngine::attention_block(uint32_t layer) {
         backend_.kv_store_turbo3(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, position_, N_KV);
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
                                   *attn_out_, position_ + 1, N_HEAD, N_KV,
-                                  HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
+                                  HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
+                                  gqa_partials_.get());
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
         if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))
@@ -842,7 +851,8 @@ void MetalEngine::attention_block(uint32_t layer) {
             backend_.kv_store_f16(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, position_, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
                                *attn_out_, position_ + 1, N_HEAD, N_KV,
-                               HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
+                               HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
+                               gqa_partials_.get());
     }
     backend_.sigmoid_gate_mul(*attn_out_, *qg_, N_HEAD, HEAD_DIM);
     const BackendTensor& attn_out_w = layer_weight(layer, "attn_output.weight");
@@ -952,7 +962,7 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
         backend_.attention_turbo3_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                          *state.k_cache, *state.v_cache,
                                          *cattn_out_, position_ + 1, N_HEAD, N_KV,
-                                         HEAD_DIM, count, scale);
+                                         HEAD_DIM, count, scale, gqa_partials_.get());
         backend_.turbo_wht(*cattn_out_, count * N_HEAD, HEAD_DIM, true);
     } else {
         if (kv_attrib_ && (kv_attrib_layer_ == UINT32_MAX || kv_attrib_layer_ == layer))
@@ -966,7 +976,7 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
         backend_.attention_f16_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                       *state.k_cache, *state.v_cache,
                                       *cattn_out_, position_ + 1, N_HEAD, N_KV,
-                                      HEAD_DIM, count, scale);
+                                      HEAD_DIM, count, scale, gqa_partials_.get());
     }
     backend_.sigmoid_gate_mul_rows(*cattn_out_, *cqg_, N_HEAD, HEAD_DIM, count);
     BackendQuantized x6 = quantized_view(cq6144_, count * N_HEAD * HEAD_DIM);
@@ -1182,7 +1192,8 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
         backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV);
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *mtp_k_cache_, *mtp_v_cache_,
                                   *attn_out_, position + 1, N_HEAD, N_KV,
-                                  HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
+                                  HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
+                                  gqa_partials_.get());
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
         if (kv_attrib_ && kv_attrib_layer_ == UINT32_MAX)
@@ -1193,7 +1204,8 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
             backend_.kv_store_f16(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV * HEAD_DIM);
         backend_.attention_f16(*qg_, 2 * HEAD_DIM, *mtp_k_cache_, *mtp_v_cache_,
                                *attn_out_, position + 1, N_HEAD, N_KV,
-                               HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM));
+                               HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
+                               gqa_partials_.get());
     }
     backend_.sigmoid_gate_mul(*attn_out_, *qg_, N_HEAD, HEAD_DIM);
     backend_.quantize(*attn_out_, q6144_);

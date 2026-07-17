@@ -314,13 +314,14 @@ struct Runtime {
         shared=q27::MetalEngine::open_shared(model);
         slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
         // G6 admission (docs/plans/2026-07-16-g6-admission.md): additional
-        // slots must fit the FULL per-slot footprint — KV + fixed engine
-        // state + snapshot capacity x snapshot bytes — plus the backend-
-        // shared GQA partial peak, against the device budget
-        // (Q27_METAL_BUDGET_MB test/override hook; default = half the
-        // recommended working set, the engine KV check's convention). The
-        // engine's own KV check stays underneath as defense in depth; a
-        // budget below even one slot still serves one (never zero).
+        // slots must fit the FULL per-slot footprint — KV + this slot's own
+        // GQA partials (per-engine since audit E2, charged inside
+        // kv_reserved_bytes) + fixed engine state + snapshot capacity x
+        // snapshot bytes — against the device budget (Q27_METAL_BUDGET_MB
+        // test/override hook; default = half the recommended working set,
+        // the engine KV check's convention). The engine's own KV check
+        // stays underneath as defense in depth; a budget below even one
+        // slot still serves one (never zero).
         const char* budget_env=getenv("Q27_METAL_BUDGET_MB");
         uint64_t budget=shared->backend.recommended_working_set_size()/2;
         if(budget_env) {
@@ -336,18 +337,14 @@ struct Runtime {
         const uint64_t per_slot=e0.kv_reserved_bytes()
                                +q27::MetalEngine::fixed_state_bytes(e0.chunked_prefill())
                                +(uint64_t)cache_entries*e0.snapshot_bytes();
-        const uint64_t shared_term=q27::MetalEngine::gqa_partial_peak(
-                ctx,shared->backend.gqa_blocked_reachable(ctx)
-                        ?shared->backend.gqa_block_size():0,
-                e0.chunked_prefill());
         for(uint32_t s=1;s<slot_count;s++) {
-            const uint64_t need=(uint64_t)(slots.size()+1)*per_slot+shared_term;
+            const uint64_t need=(uint64_t)(slots.size()+1)*per_slot;
             if(need>budget) {
                 fprintf(stderr,"multislot: slot %u admission rejected: %.0f MB needed "
-                        "(%zu+1 slots x %.0f MB/slot + %.0f MB partials) > %.0f MB budget%s; "
+                        "(%zu+1 slots x %.0f MB/slot incl partials) > %.0f MB budget%s; "
                         "serving with %zu slot(s)\n",
                         s,need/1048576.0,slots.size(),per_slot/1048576.0,
-                        shared_term/1048576.0,budget/1048576.0,
+                        budget/1048576.0,
                         budget_env?" (Q27_METAL_BUDGET_MB)":"",slots.size());
                 break;
             }

@@ -238,6 +238,10 @@ int main(int argc, char** argv) {
     auto ring = alloc_f32((uint64_t)3 * GDN_CH);
     const uint64_t cache_row_bytes = turbo3 ? (uint64_t)N_KV * 2 * 50
                                             : (uint64_t)N_KV * HEAD_DIM * 2;
+    // Blocked-GQA partials scratch (caller-owned since audit E2), chunk
+    // width x deepest fold this bench reaches.
+    auto partials = backend.allocate_private(
+        96ull * N_HEAD * (1 + ((uint64_t)ctx - 1) / 128) * 258 * 4);
     auto k_cache = backend.allocate((uint64_t)ctx * cache_row_bytes);
     auto v_cache = backend.allocate((uint64_t)ctx * cache_row_bytes);
     backend.zero(*recurrent); backend.zero(*ring);
@@ -281,14 +285,16 @@ int main(int argc, char** argv) {
                                          N_KV, count);
             backend.attention_turbo3_causal(*cqg, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                             *k_cache, *v_cache, *cattn_out,
-                                            position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale);
+                                            position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale,
+                                            partials.get());
             backend.turbo_wht(*cattn_out, count * N_HEAD, HEAD_DIM, true);
         } else {
             backend.kv_store_f16_rows(*ckbuf, *cvbuf, *k_cache, *v_cache, position,
                                       N_KV * HEAD_DIM, count);
             backend.attention_f16_causal(*cqg, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                          *k_cache, *v_cache, *cattn_out,
-                                         position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale);
+                                         position + 1, N_HEAD, N_KV, HEAD_DIM, count, scale,
+                                         partials.get());
         }
         backend.sigmoid_gate_mul_rows(*cattn_out, *cqg, N_HEAD, HEAD_DIM, count);
         q27::BackendQuantized x6 = quantized_view(cq6144, count * N_HEAD * HEAD_DIM);

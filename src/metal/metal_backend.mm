@@ -283,23 +283,23 @@ struct MetalBackend::Impl {
     // GQA KV-reuse decode attention: sequences at or beyond the threshold
     // route to the blocked kernels that read each KV row once for all
     // q_heads/kv_heads query heads. 0 disables; 1 forces every sequence
-    // (parity testing). The block partials scratch grows as context deepens
-    // and is GPU-private (never host-read).
+    // (parity testing). The block partials scratch is caller-owned (each
+    // engine allocates its own at construction — audit E2), GPU-private,
+    // and only bounds-checked here: no growth on the hot path (audit C3).
     uint32_t gqa_threshold = 2048;
-    id<MTLBuffer> gqa_partials;
 
     void attention_gqa_dispatch(bool turbo3, const MetalBuffer& qb, uint32_t q_stride,
                                 const MetalBuffer& kc, const MetalBuffer& vc,
                                 MetalBuffer& output, uint32_t seq_len, uint32_t q_heads,
-                                uint32_t kv_heads, uint32_t head_dim, float scale) {
+                                uint32_t kv_heads, uint32_t head_dim, float scale,
+                                MetalBuffer& gqa_partials) {
         const uint32_t block = gqa_block;
         const uint32_t n_blocks = 1 + (seq_len - 1) / block;   // seq_len >= 1 host-checked
         const uint32_t gqa = q_heads / kv_heads;
         const uint64_t partial_bytes = (uint64_t)q_heads * n_blocks * 258 * 4;
-        if (!gqa_partials || gqa_partials.length < partial_bytes)
-            gqa_partials = [device newBufferWithLength:(NSUInteger)partial_bytes
-                                               options:MTLResourceStorageModePrivate];
-        if (!gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+        if (gqa_partials.size() < partial_bytes)
+            throw std::runtime_error("q27 Metal: GQA partials buffer too small "
+                                     "(engine-owned, sized at construction)");
         AttentionGqaArgs args{q_stride, seq_len, q_heads, kv_heads, head_dim,
                               block, n_blocks, scale};
         @autoreleasepool {
@@ -310,14 +310,14 @@ struct MetalBackend::Impl {
             [enc setBuffer:qb.handle() offset:0 atIndex:0];
             [enc setBuffer:kc.handle() offset:0 atIndex:1];
             [enc setBuffer:vc.handle() offset:0 atIndex:2];
-            [enc setBuffer:gqa_partials offset:0 atIndex:3];
+            [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
             [enc setBytes:&args length:sizeof(args) atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks, 1)
                 threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
             // Same serial encoder: the merge reads the partials the first
             // dispatch wrote; serial compute encoders order dispatches.
             [enc setComputePipelineState:attention_gqa_merge_p];
-            [enc setBuffer:gqa_partials offset:0 atIndex:0];
+            [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
             [enc setBuffer:output.handle() offset:0 atIndex:1];
             [enc setBytes:&args length:sizeof(args) atIndex:2];
             [enc dispatchThreadgroups:MTLSizeMake(q_heads, 1, 1)
@@ -331,17 +331,17 @@ struct MetalBackend::Impl {
                                        const MetalBuffer& vc, MetalBuffer& output,
                                        uint32_t base_len, uint32_t q_heads, uint32_t kv_heads,
                                        uint32_t head_dim, uint32_t tokens, float scale,
-                                       uint64_t q_byte_offset, uint64_t out_byte_offset) {
+                                       uint64_t q_byte_offset, uint64_t out_byte_offset,
+                                       MetalBuffer& gqa_partials) {
         const uint32_t block = gqa_block;
         const uint32_t max_seq = base_len + tokens - 1;     // overflow host-checked
         const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
         const uint32_t gqa = q_heads / kv_heads;
         const uint64_t partial_bytes =
             (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
-        if (!gqa_partials || gqa_partials.length < partial_bytes)
-            gqa_partials = [device newBufferWithLength:(NSUInteger)partial_bytes
-                                               options:MTLResourceStorageModePrivate];
-        if (!gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+        if (gqa_partials.size() < partial_bytes)
+            throw std::runtime_error("q27 Metal: GQA partials buffer too small "
+                                     "(engine-owned, sized at construction)");
         AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
                                     head_dim, block, n_blocks_max, tokens, scale};
         // R1b: factor-2 token tiling — bit-identical per token to the untiled
@@ -357,14 +357,14 @@ struct MetalBackend::Impl {
             [enc setBuffer:qb.handle() offset:(NSUInteger)q_byte_offset atIndex:0];
             [enc setBuffer:kc.handle() offset:0 atIndex:1];
             [enc setBuffer:vc.handle() offset:0 atIndex:2];
-            [enc setBuffer:gqa_partials offset:0 atIndex:3];
+            [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
             [enc setBytes:&args length:sizeof(args) atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, tiled ? (tokens + 1) / 2 : tokens)
                 threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
             // Same serial encoder: the merge reads the partials the first
             // dispatch wrote; serial compute encoders order dispatches.
             [enc setComputePipelineState:attention_gqa_merge_rows_p];
-            [enc setBuffer:gqa_partials offset:0 atIndex:0];
+            [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
             [enc setBuffer:output.handle() offset:(NSUInteger)out_byte_offset atIndex:1];
             [enc setBytes:&args length:sizeof(args) atIndex:2];
             [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
@@ -678,6 +678,16 @@ std::shared_ptr<BackendBuffer> MetalBackend::allocate(uint64_t bytes) {
         throw std::runtime_error("q27 Metal: invalid buffer length");
     id<MTLBuffer> buffer = [impl_->device newBufferWithLength:(NSUInteger)bytes
                                                       options:MTLResourceStorageModeShared];
+    if (!buffer) throw std::runtime_error("q27 Metal: buffer allocation failed");
+    return std::make_shared<MetalBuffer>(buffer);
+}
+
+std::shared_ptr<BackendBuffer> MetalBackend::allocate_private(uint64_t bytes) {
+    if (!bytes || bytes > (uint64_t)impl_->device.maxBufferLength ||
+        bytes > (uint64_t)std::numeric_limits<NSUInteger>::max())
+        throw std::runtime_error("q27 Metal: invalid buffer length");
+    id<MTLBuffer> buffer = [impl_->device newBufferWithLength:(NSUInteger)bytes
+                                                      options:MTLResourceStorageModePrivate];
     if (!buffer) throw std::runtime_error("q27 Metal: buffer allocation failed");
     return std::make_shared<MetalBuffer>(buffer);
 }
@@ -1705,7 +1715,7 @@ void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
                                      const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                      BackendBuffer& out, uint32_t seq_len,
                                      uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                                     float scale) {
+                                     float scale, BackendBuffer* partials) {
     if (!seq_len || !kv_heads || q_heads%kv_heads || head_dim != 256)
         throw std::runtime_error("q27 Metal: invalid turbo3 attention dimensions");
     const MetalBuffer& qb=metal_buffer(q); const MetalBuffer& kc=metal_buffer(k_cache); const MetalBuffer& vc=metal_buffer(v_cache);
@@ -1716,7 +1726,10 @@ void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
     check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"turbo3 attention output");
     const uint32_t gqa=q_heads/kv_heads;
     if (impl_->gqa_threshold && seq_len >= impl_->gqa_threshold && gqa >= 2 && gqa <= 8) {
-        impl_->attention_gqa_dispatch(true,qb,q_stride,kc,vc,output,seq_len,q_heads,kv_heads,head_dim,scale);
+        if (!partials)
+            throw std::runtime_error("q27 Metal: blocked GQA route needs a partials buffer");
+        impl_->attention_gqa_dispatch(true,qb,q_stride,kc,vc,output,seq_len,q_heads,kv_heads,head_dim,scale,
+                                      metal_buffer(*partials));
         return;
     }
     AttentionArgs args{q_stride,seq_len,q_heads,kv_heads,head_dim,scale};
@@ -1736,7 +1749,8 @@ void MetalBackend::attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32
                                                   const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                                   BackendBuffer& out, uint32_t seq_len, uint32_t seq_cap,
                                                   uint32_t q_heads, uint32_t kv_heads,
-                                                  uint32_t head_dim, float scale) {
+                                                  uint32_t head_dim, float scale,
+                                                  BackendBuffer& partials) {
     const uint32_t gqa = kv_heads ? q_heads / kv_heads : 0;
     if (!seq_len || seq_len > seq_cap || !kv_heads || q_heads % kv_heads ||
         head_dim != 256 || gqa < 2 || gqa > 8)
@@ -1753,10 +1767,8 @@ void MetalBackend::attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32
     const uint32_t block = impl_->gqa_block;
     const uint32_t n_blocks = 1 + (seq_len - 1) / block;
     const uint64_t partial_bytes = (uint64_t)q_heads * n_blocks * 258 * 4;
-    if (!impl_->gqa_partials || impl_->gqa_partials.length < partial_bytes)
-        impl_->gqa_partials = [impl_->device newBufferWithLength:(NSUInteger)partial_bytes
-                                                         options:MTLResourceStorageModePrivate];
-    if (!impl_->gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+    MetalBuffer& gqa_partials = metal_buffer(partials);
+    check_range(gqa_partials.size(), 0, partial_bytes, "hm probe partials");
     struct HmArgs { uint32_t q_stride, seq_len, seq_cap, q_heads, kv_heads, head_dim, block, n_blocks; float scale; };
     HmArgs args{q_stride, seq_len, seq_cap, q_heads, kv_heads, head_dim, block, n_blocks, scale};
     AttentionGqaArgs margs{q_stride, seq_len, q_heads, kv_heads, head_dim, block, n_blocks, scale};
@@ -1766,12 +1778,12 @@ void MetalBackend::attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32
         [enc setBuffer:qb.handle() offset:0 atIndex:0];
         [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
-        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:3];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks, 1)
             threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
         [enc setComputePipelineState:impl_->attention_gqa_merge_p];
-        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:0];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
         [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&margs length:sizeof(margs) atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads, 1, 1)
@@ -1791,7 +1803,8 @@ void MetalBackend::attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32
                                                   const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                                   BackendBuffer& out, uint32_t base_len,
                                                   uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                                                  uint32_t tokens, uint32_t block, float scale) {
+                                                  uint32_t tokens, uint32_t block, float scale,
+                                                  BackendBuffer& partials) {
     const uint32_t gqa = kv_heads ? q_heads / kv_heads : 0;
     if (!base_len || !tokens || !kv_heads || q_heads % kv_heads || head_dim != 256 ||
         gqa < 2 || gqa > 8 || !block || block % 8 ||
@@ -1811,10 +1824,8 @@ void MetalBackend::attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "bf probe output");
     const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
     const uint64_t partial_bytes = (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
-    if (!impl_->gqa_partials || impl_->gqa_partials.length < partial_bytes)
-        impl_->gqa_partials = [impl_->device newBufferWithLength:(NSUInteger)partial_bytes
-                                                         options:MTLResourceStorageModePrivate];
-    if (!impl_->gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+    MetalBuffer& gqa_partials = metal_buffer(partials);
+    check_range(gqa_partials.size(), 0, partial_bytes, "bf probe partials");
     AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
                                 head_dim, block, n_blocks_max, tokens, scale};
     @autoreleasepool {
@@ -1823,12 +1834,12 @@ void MetalBackend::attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32
         [enc setBuffer:qb.handle() offset:0 atIndex:0];
         [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
-        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:3];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, (tokens + 1) / 2)
             threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
         [enc setComputePipelineState:impl_->attention_gqa_merge_rows_p];
-        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:0];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
         [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
@@ -1842,7 +1853,8 @@ void MetalBackend::attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uin
                                                      const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                                      BackendBuffer& out, uint32_t base_len,
                                                      uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                                                     uint32_t tokens, uint32_t tile, float scale) {
+                                                     uint32_t tokens, uint32_t tile, float scale,
+                                                     BackendBuffer& partials) {
     const uint32_t gqa = kv_heads ? q_heads / kv_heads : 0;
     if (!base_len || !tokens || !kv_heads || q_heads % kv_heads || head_dim != 256 ||
         gqa < 2 || gqa > 8 || (tile != 2 && tile != 4) ||
@@ -1863,10 +1875,8 @@ void MetalBackend::attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uin
     const uint32_t block = impl_->gqa_block;
     const uint32_t n_blocks_max = 1 + (max_seq - 1) / block;
     const uint64_t partial_bytes = (uint64_t)tokens * q_heads * n_blocks_max * 258 * 4;
-    if (!impl_->gqa_partials || impl_->gqa_partials.length < partial_bytes)
-        impl_->gqa_partials = [impl_->device newBufferWithLength:(NSUInteger)partial_bytes
-                                                         options:MTLResourceStorageModePrivate];
-    if (!impl_->gqa_partials) throw std::runtime_error("q27 Metal: GQA partial allocation failed");
+    MetalBuffer& gqa_partials = metal_buffer(partials);
+    check_range(gqa_partials.size(), 0, partial_bytes, "tiled probe partials");
     AttentionGqaCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads,
                                 head_dim, block, n_blocks_max, tokens, scale};
     @autoreleasepool {
@@ -1877,12 +1887,12 @@ void MetalBackend::attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uin
         [enc setBuffer:qb.handle() offset:0 atIndex:0];
         [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
-        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:3];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, (tokens + tile - 1) / tile)
             threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
         [enc setComputePipelineState:impl_->attention_gqa_merge_rows_p];
-        [enc setBuffer:impl_->gqa_partials offset:0 atIndex:0];
+        [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
         [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
@@ -1895,7 +1905,7 @@ void MetalBackend::attention_f16(const BackendBuffer& q, uint32_t q_stride,
                                   const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                   BackendBuffer& out, uint32_t seq_len,
                                   uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                                  float scale) {
+                                  float scale, BackendBuffer* partials) {
     if (!seq_len || !kv_heads || q_heads%kv_heads || !head_dim || head_dim > 256)
         throw std::runtime_error("q27 Metal: invalid attention dimensions");
     const MetalBuffer& qb=metal_buffer(q); const MetalBuffer& kc=metal_buffer(k_cache); const MetalBuffer& vc=metal_buffer(v_cache);
@@ -1906,7 +1916,10 @@ void MetalBackend::attention_f16(const BackendBuffer& q, uint32_t q_stride,
     check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"attention output");
     const uint32_t gqa=q_heads/kv_heads;
     if (impl_->gqa_threshold && seq_len >= impl_->gqa_threshold && gqa >= 2 && gqa <= 8) {
-        impl_->attention_gqa_dispatch(false,qb,q_stride,kc,vc,output,seq_len,q_heads,kv_heads,head_dim,scale);
+        if (!partials)
+            throw std::runtime_error("q27 Metal: blocked GQA route needs a partials buffer");
+        impl_->attention_gqa_dispatch(false,qb,q_stride,kc,vc,output,seq_len,q_heads,kv_heads,head_dim,scale,
+                                      metal_buffer(*partials));
         return;
     }
     AttentionArgs args{q_stride,seq_len,q_heads,kv_heads,head_dim,scale};
@@ -2304,7 +2317,7 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
                                         const BackendBuffer& v_cache,
                                         BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                         uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                        float scale) {
+                                        float scale, BackendBuffer* partials) {
     if (!base_len || !kv_heads || q_heads % kv_heads || !head_dim || head_dim > 256 ||
         !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked attention dimensions");
@@ -2331,11 +2344,14 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
         gqa_from = base_len >= impl_->gqa_threshold ? 0
                  : std::min(tokens, impl_->gqa_threshold - base_len);
     if (gqa_from < tokens) {
+        if (!partials)
+            throw std::runtime_error("q27 Metal: blocked GQA route needs a partials buffer");
         impl_->attention_gqa_causal_dispatch(false, qb, q_stride, q_row_stride, kc, vc, output,
                                              base_len + gqa_from, q_heads, kv_heads, head_dim,
                                              tokens - gqa_from, scale,
                                              (uint64_t)gqa_from * q_row_stride * 4,
-                                             (uint64_t)gqa_from * q_heads * head_dim * 4);
+                                             (uint64_t)gqa_from * q_heads * head_dim * 4,
+                                             metal_buffer(*partials));
         if (gqa_from == 0) return;
     }
     AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, gqa_from, scale};
@@ -2355,7 +2371,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
                                            const BackendBuffer& v_cache,
                                            BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                            uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                           float scale) {
+                                           float scale, BackendBuffer* partials) {
     if (!base_len || !kv_heads || q_heads % kv_heads || head_dim != 256 || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked turbo3 attention dimensions");
     const MetalBuffer& qb = metal_buffer(q); const MetalBuffer& kc = metal_buffer(k_cache);
@@ -2381,11 +2397,14 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
         gqa_from = base_len >= impl_->gqa_threshold ? 0
                  : std::min(tokens, impl_->gqa_threshold - base_len);
     if (gqa_from < tokens) {
+        if (!partials)
+            throw std::runtime_error("q27 Metal: blocked GQA route needs a partials buffer");
         impl_->attention_gqa_causal_dispatch(true, qb, q_stride, q_row_stride, kc, vc, output,
                                              base_len + gqa_from, q_heads, kv_heads, head_dim,
                                              tokens - gqa_from, scale,
                                              (uint64_t)gqa_from * q_row_stride * 4,
-                                             (uint64_t)gqa_from * q_heads * head_dim * 4);
+                                             (uint64_t)gqa_from * q_heads * head_dim * 4,
+                                             metal_buffer(*partials));
         if (gqa_from == 0) return;
     }
     AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, gqa_from, scale};
@@ -2489,10 +2508,6 @@ uint64_t MetalBackend::recommended_working_set_size() const {
 
 uint32_t MetalBackend::gqa_block_size() const {
     return impl_->gqa_block;
-}
-
-bool MetalBackend::gqa_blocked_reachable(uint32_t context) const {
-    return impl_->gqa_threshold != 0 && context >= impl_->gqa_threshold;
 }
 
 void MetalBackend::set_gemm_half(bool enabled) {

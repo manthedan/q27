@@ -1,0 +1,2 @@
+turbo3 synthetic attention: nrmse 0.10952, cosine 0.993990
+Metal decode primitives, FP16/turbo3 attention (incl. GQA KV-reuse path), GDN, and chunked prefill ops: OK

@@ -97,9 +97,19 @@ head-of-line blocking behind a long generation.
    No "~one decode token" claim anywhere.
 3. **Admission budget** = fixed engine state (weights are shared; per-slot
    KV + GDN + logits + scratch) + configured snapshot capacity × snapshot
-   bytes + GQA partial peak (worst-case simdgroup partial buffer at the
-   configured context), checked against a configured device budget before
+   bytes + GQA partials, checked against a configured device budget before
    constructing slot 2. Reservation accounting already RAII-safe (P0 #2).
+   [E2, 2026-07-16: the GQA partial buffer moved from a backend-shared
+   lazily-grown-to-peak allocation to per-engine eager allocation folded
+   into each slot's `kv_reserved_bytes` — G6's `need` is now
+   `(slots+1) × per_slot` with no shared term. At 2 slots the boundary is
+   provably unchanged (old n·p + 2x = new n·(p+x) at n=2, with the peak
+   halved since eager allocation has no grow-then-replace transient);
+   >2 slots are now correctly charged per-slot. Sizing is
+   threshold-independent (max_ctx, block, chunk-capability only) so the
+   envelope instrument's runtime threshold flips cannot undersize it.
+   Gates: unit suite + G1–G7 + A/B byte-identity (chunk/serial/gen) vs
+   the pre-E2 binary — all pass, logs/e2_gates/.]
 4. **Lock order: route mutex → GPU lease.** The route mutex protects slot
    assignment/admission/prefix-cache metadata and is never held across a
    GPU dispatch; the GPU lease serializes command-buffer submission and is

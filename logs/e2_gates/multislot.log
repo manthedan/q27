@@ -1,0 +1,4 @@
+[greedy] /stats: {"gate_wait_by_arrival": {"idle": {"max_ms": 0.000375, "mean_ms": 0.00016137499999999998, "requests": 16}, "prefill": {"max_ms": 86.310209, "mean_ms": 44.372496, "requests": 10}}, "queue_wait_by_arrival": {"idle": {"max_ms": 0.001542, "mean_ms": 0.0006824374999999999, "requests": 16}, "prefill": {"max_ms": 9189.14325, "mean_ms": 1821.6145917000001, "requests": 10}}, "slots": 2, "snapshots": {"disk_hits": 0, "disk_saves": 0, "enabled": false}}
+[greedy] G6 PASS (slots=1 under 1000 MB budget, 3 x 503 overloaded_error, 9 completed)
+[greedy] G7 PASS (hinted save persisted, fresh-process disk hit byte-identical to cold, perturbed prefix missed, 1 MB budget evicted)
+[greedy] G1/G2/G3/G4/G5/G6/G7 PASS (solo texts 256/311 chars)

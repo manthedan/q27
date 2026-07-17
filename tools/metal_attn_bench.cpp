@@ -160,6 +160,11 @@ int main(int argc, char** argv) {
     backend.write(*qbuf, 0, qhost.data(), qhost.size() * 4);
     auto out_a = backend.allocate((uint64_t)tokens * N_HEAD * HEAD_DIM * 4);
     auto out_b = backend.allocate((uint64_t)tokens * N_HEAD * HEAD_DIM * 4);
+    // Blocked-GQA partials scratch (caller-owned since audit E2): sized for
+    // the deepest fold this bench dispatches — the R3 sweep's smallest block
+    // (128) produces the most partial rows.
+    auto partials = backend.allocate_private(
+        (uint64_t)tokens * N_HEAD * (1 + ((uint64_t)seq - 1) / 128) * 258 * 4);
 
     // Caches.
     std::vector<std::shared_ptr<q27::BackendBuffer>> kc(copies), vc(copies);
@@ -191,14 +196,16 @@ int main(int argc, char** argv) {
     for (uint32_t t = 0; t < tokens; t++) chunk_gb += (double)(base_len + t) * row_bytes * 2;
 
     auto decode_op = [&](q27::BackendBuffer& k, q27::BackendBuffer& v, q27::BackendBuffer& out) {
-        if (turbo3) backend.attention_turbo3(*qbuf, Q_STRIDE, k, v, out, seq, N_HEAD, N_KV, HEAD_DIM, SCALE);
-        else backend.attention_f16(*qbuf, Q_STRIDE, k, v, out, seq, N_HEAD, N_KV, HEAD_DIM, SCALE);
+        if (turbo3) backend.attention_turbo3(*qbuf, Q_STRIDE, k, v, out, seq, N_HEAD, N_KV, HEAD_DIM, SCALE, partials.get());
+        else backend.attention_f16(*qbuf, Q_STRIDE, k, v, out, seq, N_HEAD, N_KV, HEAD_DIM, SCALE, partials.get());
     };
     auto chunk_op = [&](q27::BackendBuffer& k, q27::BackendBuffer& v, q27::BackendBuffer& out) {
         if (turbo3) backend.attention_turbo3_causal(*qbuf, Q_STRIDE, Q_ROW_STRIDE, k, v, out,
-                                                    base_len, N_HEAD, N_KV, HEAD_DIM, tokens, SCALE);
+                                                    base_len, N_HEAD, N_KV, HEAD_DIM, tokens, SCALE,
+                                                    partials.get());
         else backend.attention_f16_causal(*qbuf, Q_STRIDE, Q_ROW_STRIDE, k, v, out,
-                                          base_len, N_HEAD, N_KV, HEAD_DIM, tokens, SCALE);
+                                          base_len, N_HEAD, N_KV, HEAD_DIM, tokens, SCALE,
+                                          partials.get());
     };
 
     // ---- Verify probes bit-identical before timing anything ----
@@ -206,7 +213,7 @@ int main(int argc, char** argv) {
         backend.begin_commands(); decode_op(*kc[0], *vc[0], *out_a); backend.end_commands();
         backend.begin_commands();
         backend.attention_turbo3_gqa_headmajor(*qbuf, Q_STRIDE, *kh[0], *vh[0], *out_b,
-                                               seq, seq, N_HEAD, N_KV, HEAD_DIM, SCALE);
+                                               seq, seq, N_HEAD, N_KV, HEAD_DIM, SCALE, *partials);
         backend.end_commands();
         if (!read_equal(backend, *out_a, *out_b, (uint64_t)N_HEAD * HEAD_DIM * 4,
                         "head-major decode probe")) return 1;
@@ -215,7 +222,7 @@ int main(int argc, char** argv) {
             backend.begin_commands();
             backend.attention_turbo3_causal_gqa_tiled(*qbuf, Q_STRIDE, Q_ROW_STRIDE, *kc[0], *vc[0],
                                                       *out_b, base_len, N_HEAD, N_KV, HEAD_DIM,
-                                                      tokens, tile, SCALE);
+                                                      tokens, tile, SCALE, *partials);
             backend.end_commands();
             char what[64];
             snprintf(what, sizeof what, "token-tiled causal probe t%u", tile);
@@ -228,7 +235,7 @@ int main(int argc, char** argv) {
         backend.begin_commands();
         backend.attention_turbo3_causal_gqa_bf(*qbuf, Q_STRIDE, Q_ROW_STRIDE, *kc[0], *vc[0],
                                                *out_b, base_len, N_HEAD, N_KV, HEAD_DIM,
-                                               tokens, 1024, SCALE);
+                                               tokens, 1024, SCALE, *partials);
         backend.end_commands();
         if (!read_equal(backend, *out_a, *out_b, (uint64_t)tokens * N_HEAD * HEAD_DIM * 4,
                         "barrier-free causal probe bf2 @ block 1024"))
@@ -246,7 +253,8 @@ int main(int argc, char** argv) {
     if (turbo3) {
         const double t_hm = wall_per_op(backend, reps, [&](uint32_t r) {
             backend.attention_turbo3_gqa_headmajor(*qbuf, Q_STRIDE, *kh[r % copies], *vh[r % copies],
-                                                   *out_a, seq, seq, N_HEAD, N_KV, HEAD_DIM, SCALE);
+                                                   *out_a, seq, seq, N_HEAD, N_KV, HEAD_DIM, SCALE,
+                                                   *partials);
         });
         printf("decode  gqa-hm    : %8.3f ms/dispatch, %6.1f GB/s logical (%.2fx)\n",
                t_hm * 1e3, decode_gb / t_hm / 1e9, t_decode / t_hm);
@@ -263,7 +271,7 @@ int main(int argc, char** argv) {
                 backend.attention_turbo3_causal_gqa_tiled(*qbuf, Q_STRIDE, Q_ROW_STRIDE,
                                                           *kc[r % copies], *vc[r % copies], *out_a,
                                                           base_len, N_HEAD, N_KV, HEAD_DIM,
-                                                          tokens, tile, SCALE);
+                                                          tokens, tile, SCALE, *partials);
             });
             if (tile == 2) t_t2 = t_tiled;
             printf("chunk%-3u gqa-t%u    : %8.3f ms/dispatch, %6.1f GB/s logical (%.2fx)\n",
@@ -276,7 +284,7 @@ int main(int argc, char** argv) {
                 backend.attention_turbo3_causal_gqa_bf(*qbuf, Q_STRIDE, Q_ROW_STRIDE,
                                                        *kc[r % copies], *vc[r % copies], *out_a,
                                                        base_len, N_HEAD, N_KV, HEAD_DIM,
-                                                       tokens, block, SCALE);
+                                                       tokens, block, SCALE, *partials);
             });
             printf("chunk%-3u gqa-bf2 B%-5u: %8.3f ms/dispatch, %6.1f GB/s logical (%.2fx vs t2)\n",
                    tokens, block, t_bf * 1e3, chunk_gb / t_bf / 1e9, t_t2 / t_bf);

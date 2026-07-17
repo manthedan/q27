@@ -1,0 +1,12 @@
+make: `build/q27-metal' is up to date.
+make: `build/q27-metal-server' is up to date.
+make: `build/test_metal_ops' is up to date.
+== gate 1: unit suite ==
+unit suite PASS
+== gate 2: multislot G1..G7 ==
+multislot PASS
+== gate 3: A/B byte-identity vs pre-E2 binary ==
+A/B chunk: byte-identical
+A/B serial: byte-identical
+A/B generation: identical
+E2 GATES: ALL PASS

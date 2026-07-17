@@ -141,7 +141,8 @@ int test_attention(q27::MetalBackend& backend) {
     for(uint32_t p=0;p<seq;p++){auto k=upload_buffer(backend,keys[p]),v=upload_buffer(backend,vals[p]);backend.kv_store_f16(*k,*v,*kc,*vc,p,dim);}
     std::vector<float> q={1,.5f,0,0, 9,9,9,9, 0,1,0,0, 8,8,8,8}; auto qb=upload_buffer(backend,q);
     auto out=backend.allocate(qh*dim*4);
-    backend.attention_f16(*qb,stride,*kc,*vc,*out,seq,qh,kvh,dim,0.5f); auto got=read_f32(backend,*out,qh*dim);
+    auto partials=backend.allocate_private((uint64_t)qh*(1+(seq-1)/128)*258*4);
+    backend.attention_f16(*qb,stride,*kc,*vc,*out,seq,qh,kvh,dim,0.5f,partials.get()); auto got=read_f32(backend,*out,qh*dim);
     int failures=0;
     for(uint32_t h=0;h<qh;h++){std::vector<float>s(seq);float mx=-1e30f;for(uint32_t p=0;p<seq;p++){s[p]=0;for(uint32_t d=0;d<dim;d++)s[p]+=q[h*stride+d]*keys[p][d];s[p]*=.5f;mx=std::max(mx,s[p]);}float den=0;for(float&v:s){v=std::exp(v-mx);den+=v;}for(float&v:s)v/=den;for(uint32_t d=0;d<dim;d++){float want=0;for(uint32_t p=0;p<seq;p++)want+=s[p]*vals[p][d];if(!near(got[h*dim+d],want,8e-4f)){fprintf(stderr,"attention[%u,%u] got %.8g want %.8g\n",h,d,got[h*dim+d],want);failures++;}}}
     return failures;
@@ -176,7 +177,8 @@ int test_attention_production_shape(q27::MetalBackend& backend) {
         for (auto& value : q) value = uniform() * 1.5f;
         auto qb = upload_buffer(backend, q);
         auto out = backend.allocate((uint64_t)qh * dim * 4);
-        backend.attention_f16(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale);
+        auto partials = backend.allocate_private((uint64_t)qh * (1 + ((uint64_t)seq - 1) / 128) * 258 * 4);
+        backend.attention_f16(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale, partials.get());
         auto got = read_f32(backend, *out, (uint64_t)qh * dim);
         for (uint32_t h = 0; h < qh; h++) {
             const uint32_t kh = h / (qh / kvh);
@@ -244,10 +246,11 @@ int test_turbo3(q27::MetalBackend& backend) {
     for(size_t i=0;i<q.size();i++) q[i]=.2f*std::sin(float(i)*.031f)+.1f*std::cos(float(i)*.053f);
     auto qbase=upload_buffer(backend,q),qt3=upload_buffer(backend,q);
     auto out16=backend.allocate((uint64_t)qh*dim*4),out3=backend.allocate((uint64_t)qh*dim*4);
-    backend.attention_f16(*qbase,stride,*k16,*v16,*out16,seq,qh,kvh,dim,1/std::sqrt(float(dim)));
+    auto partials=backend.allocate_private((uint64_t)qh*(1+((uint64_t)seq-1)/128)*258*4);
+    backend.attention_f16(*qbase,stride,*k16,*v16,*out16,seq,qh,kvh,dim,1/std::sqrt(float(dim)),partials.get());
     backend.begin_commands();
     backend.turbo_wht(*qt3,qh,stride,false);
-    backend.attention_turbo3(*qt3,stride,*kt3,*vt3,*out3,seq,qh,kvh,dim,1/std::sqrt(float(dim)));
+    backend.attention_turbo3(*qt3,stride,*kt3,*vt3,*out3,seq,qh,kvh,dim,1/std::sqrt(float(dim)),partials.get());
     backend.turbo_wht(*out3,qh,dim,true);
     backend.end_commands();
     auto baseline=read_f32(backend,*out16,qh*dim),compressed=read_f32(backend,*out3,qh*dim);
@@ -305,7 +308,8 @@ int test_turbo3_production_shape(q27::MetalBackend& backend) {
         backend.turbo_wht(*qb, qh, stride, false);
         auto q_wht = read_f32(backend, *qb, q.size());
         auto out = backend.allocate((uint64_t)qh * dim * 4);
-        backend.attention_turbo3(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale);
+        auto partials = backend.allocate_private((uint64_t)qh * (1 + ((uint64_t)seq - 1) / 128) * 258 * 4);
+        backend.attention_turbo3(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale, partials.get());
         auto got = read_f32(backend, *out, (uint64_t)qh * dim);
         for (uint32_t h = 0; h < qh; h++) {
             const uint32_t kh = h / (qh / kvh);
@@ -381,7 +385,8 @@ int test_attention_gqa_path() {
         for (auto& value : q) value = uniform() * 1.5f;
         auto qb = upload_buffer(backend, q);
         auto out = backend.allocate((uint64_t)qh * dim * 4);
-        backend.attention_f16(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale);
+        auto partials = backend.allocate_private((uint64_t)qh * (1 + ((uint64_t)seq - 1) / 128) * 258 * 4);
+        backend.attention_f16(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale, partials.get());
         auto got = read_f32(backend, *out, (uint64_t)qh * dim);
         for (uint32_t h = 0; h < qh; h++) {
             const uint32_t kh = h / (qh / kvh);
@@ -443,7 +448,8 @@ int test_attention_gqa_path() {
         backend.turbo_wht(*qb, qh, stride, false);
         auto q_wht = read_f32(backend, *qb, q.size());
         auto out = backend.allocate((uint64_t)qh * dim * 4);
-        backend.attention_turbo3(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale);
+        auto partials = backend.allocate_private((uint64_t)qh * (1 + ((uint64_t)seq - 1) / 128) * 258 * 4);
+        backend.attention_turbo3(*qb, stride, *kc, *vc, *out, seq, qh, kvh, dim, scale, partials.get());
         auto got = read_f32(backend, *out, (uint64_t)qh * dim);
         for (uint32_t h = 0; h < qh; h++) {
             const uint32_t kh = h / (qh / kvh);
@@ -505,8 +511,10 @@ int test_attention_gqa_path() {
         for (auto& value : q) value = uniform() * 1.5f;
         auto qb = upload_buffer(backend, q);
         auto out = backend.allocate((uint64_t)tokens * qh * dim * 4);
+        auto partials = backend.allocate_private(
+            (uint64_t)tokens * qh * (1 + ((uint64_t)max_seq - 1) / 128) * 258 * 4);
         backend.attention_f16_causal(*qb, stride, q_row_stride, *kc, *vc, *out,
-                                     base, qh, kvh, dim, tokens, scale);
+                                     base, qh, kvh, dim, tokens, scale, partials.get());
         auto got = read_f32(backend, *out, (uint64_t)tokens * qh * dim);
         for (uint32_t t = 0; t < tokens; t++) {
             const uint32_t seq = base + t;
@@ -565,8 +573,10 @@ int test_attention_gqa_path() {
         backend.turbo_wht(*qb, tokens * qh, stride, false);
         auto q_wht = read_f32(backend, *qb, q.size());
         auto out = backend.allocate((uint64_t)tokens * qh * dim * 4);
+        auto partials = backend.allocate_private(
+            (uint64_t)tokens * qh * (1 + ((uint64_t)max_seq - 1) / 128) * 258 * 4);
         backend.attention_turbo3_causal(*qb, stride, q_row_stride, *kc, *vc, *out,
-                                        base, qh, kvh, dim, tokens, scale);
+                                        base, qh, kvh, dim, tokens, scale, partials.get());
         auto got = read_f32(backend, *out, (uint64_t)tokens * qh * dim);
         for (uint32_t t = 0; t < tokens; t++) {
             const uint32_t seq = base + t;
@@ -646,15 +656,18 @@ int test_attention_gqa_straddle() {
     backend.turbo_wht(*qb, tokens * qh, stride, false);
     auto q_wht = read_f32(backend, *qb, q.size());
     auto out_chunk = backend.allocate((uint64_t)tokens * qh * dim * 4);
+    auto partials = backend.allocate_private(
+        (uint64_t)tokens * qh * (1 + ((uint64_t)max_seq - 1) / 128) * 258 * 4);
     backend.attention_turbo3_causal(*qb, stride, q_row_stride, *kc, *vc, *out_chunk,
-                                    base, qh, kvh, dim, tokens, scale);
+                                    base, qh, kvh, dim, tokens, scale, partials.get());
     auto chunk = read_f32(backend, *out_chunk, (uint64_t)tokens * qh * dim);
 
     auto qrow = backend.allocate((uint64_t)q_row_stride * 4);
     auto out_dec = backend.allocate((uint64_t)qh * dim * 4);
     for (uint32_t t = 0; t < tokens; t++) {
         backend.write(*qrow, 0, q_wht.data() + (uint64_t)t * q_row_stride, (uint64_t)q_row_stride * 4);
-        backend.attention_turbo3(*qrow, stride, *kc, *vc, *out_dec, base + t, qh, kvh, dim, scale);
+        backend.attention_turbo3(*qrow, stride, *kc, *vc, *out_dec, base + t, qh, kvh, dim, scale,
+                                 partials.get());
         auto dec = read_f32(backend, *out_dec, (uint64_t)qh * dim);
         if (std::memcmp(dec.data(), chunk.data() + (uint64_t)t * qh * dim,
                         (size_t)qh * dim * sizeof(float)) != 0) {
@@ -729,11 +742,15 @@ int test_attention_gqa_tiled_parity() {
                            q27::BackendBuffer& vcache) {
                 auto qb = upload_buffer(backend, q);
                 auto out = backend.allocate((uint64_t)c.tokens * qh * dim * 4);
+                auto partials = backend.allocate_private(
+                    (uint64_t)c.tokens * qh * (1 + ((uint64_t)max_seq - 1) / 128) * 258 * 4);
                 backend.begin_commands();
                 if (turbo3) backend.attention_turbo3_causal(*qb, stride, q_row_stride, kcache, vcache,
-                                                            *out, c.base, qh, kvh, dim, c.tokens, scale);
+                                                            *out, c.base, qh, kvh, dim, c.tokens, scale,
+                                                            partials.get());
                 else backend.attention_f16_causal(*qb, stride, q_row_stride, kcache, vcache,
-                                                  *out, c.base, qh, kvh, dim, c.tokens, scale);
+                                                  *out, c.base, qh, kvh, dim, c.tokens, scale,
+                                                  partials.get());
                 backend.end_commands();
                 return read_f32(backend, *out, (uint64_t)c.tokens * qh * dim);
             };
@@ -1271,14 +1288,16 @@ int test_chunked(q27::MetalBackend& backend) {
         backend.kv_store_f16_rows(*knb, *vnb, *kc, *vc, warm, row, T);
         auto qb = upload_buffer(backend, q);
         auto chunk_out = backend.allocate((uint64_t)T * qh * dim * 4);
+        auto partials = backend.allocate_private(
+            (uint64_t)T * qh * (1 + ((uint64_t)(warm + T) - 1) / 128) * 258 * 4);
         backend.attention_f16_causal(*qb, stride, qh * stride, *kc, *vc, *chunk_out,
-                                     warm + 1, qh, kvh, dim, T, 0.5f);
+                                     warm + 1, qh, kvh, dim, T, 0.5f, partials.get());
         auto got = read_f32(backend, *chunk_out, (size_t)T * qh * dim);
         auto serial_out = backend.allocate((uint64_t)qh * dim * 4);
         for (uint32_t t = 0; t < T; t++) {
             auto q_row = row_view(*qb, t, qh * stride);
             backend.attention_f16(*q_row, stride, *kc, *vc, *serial_out,
-                                  warm + 1 + t, qh, kvh, dim, 0.5f);
+                                  warm + 1 + t, qh, kvh, dim, 0.5f, partials.get());
             auto want = read_f32(backend, *serial_out, (size_t)qh * dim);
             for (uint32_t i = 0; i < qh * dim; i++)
                 if (!near(got[t*qh*dim+i], want[i], 1e-5f)) { fail("causal attention", t*qh*dim+i, got[t*qh*dim+i], want[i]); break; }
@@ -1313,14 +1332,16 @@ int test_chunked(q27::MetalBackend& backend) {
         backend.kv_store_f16_rows(*knb, *vnb, *kc, *vc, warm, row, T);
         auto qb = upload_buffer(backend, q);
         auto chunk_out = backend.allocate((uint64_t)T * qh * dim * 4);
+        auto partials = backend.allocate_private(
+            (uint64_t)T * qh * (1 + ((uint64_t)(warm + T) - 1) / 128) * 258 * 4);
         backend.attention_f16_causal(*qb, stride, qh * stride, *kc, *vc, *chunk_out,
-                                     warm + 1, qh, kvh, dim, T, 0.0625f);
+                                     warm + 1, qh, kvh, dim, T, 0.0625f, partials.get());
         auto got = read_f32(backend, *chunk_out, (size_t)T * qh * dim);
         auto serial_out = backend.allocate((uint64_t)qh * dim * 4);
         for (uint32_t t = 0; t < T; t++) {
             auto q_row = row_view(*qb, t, qh * stride);
             backend.attention_f16(*q_row, stride, *kc, *vc, *serial_out,
-                                  warm + 1 + t, qh, kvh, dim, 0.0625f);
+                                  warm + 1 + t, qh, kvh, dim, 0.0625f, partials.get());
             auto want = read_f32(backend, *serial_out, (size_t)qh * dim);
             for (uint32_t i = 0; i < qh * dim; i++)
                 if (got[t*qh*dim+i] != want[i]) { fail("causal attention wide", t*qh*dim+i, got[t*qh*dim+i], want[i]); break; }
@@ -1364,14 +1385,18 @@ int test_chunked(q27::MetalBackend& backend) {
         auto qb = upload_buffer(backend, q);
         backend.turbo_wht(*qb, T * qh, stride, false);
         auto chunk_out = backend.allocate((uint64_t)T * qh * dim * 4);
+        auto partials = backend.allocate_private(
+            (uint64_t)T * qh * (1 + ((uint64_t)(warm + T) - 1) / 128) * 258 * 4);
         backend.attention_turbo3_causal(*qb, stride, qh * stride, *kc, *vc, *chunk_out,
-                                        warm + 1, qh, kvh, dim, T, 1.0f / std::sqrt(float(dim)));
+                                        warm + 1, qh, kvh, dim, T, 1.0f / std::sqrt(float(dim)),
+                                        partials.get());
         auto got = read_f32(backend, *chunk_out, (size_t)T * qh * dim);
         auto serial_out = backend.allocate((uint64_t)qh * dim * 4);
         for (uint32_t t = 0; t < T; t++) {
             auto q_row = row_view(*qb, t, qh * stride);
             backend.attention_turbo3(*q_row, stride, *kc, *vc, *serial_out,
-                                     warm + 1 + t, qh, kvh, dim, 1.0f / std::sqrt(float(dim)));
+                                     warm + 1 + t, qh, kvh, dim, 1.0f / std::sqrt(float(dim)),
+                                     partials.get());
             auto want = read_f32(backend, *serial_out, (size_t)qh * dim);
             // The chunk kernel mirrors the decode kernel's online-softmax
             // structure exactly, so the comparison is bit-exact.

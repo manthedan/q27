@@ -221,6 +221,10 @@ int main(int argc, char** argv) {
     auto ring = alloc_f32((uint64_t)3 * GDN_CH);
     const uint64_t cache_row_bytes = turbo3 ? (uint64_t)N_KV * 2 * 50
                                             : (uint64_t)N_KV * HEAD_DIM * 2;
+    // Blocked-GQA partials scratch (caller-owned since audit E2), decode
+    // width, sized for the deepest position this bench reaches.
+    auto partials = backend.allocate_private(
+        (uint64_t)N_HEAD * (1 + ((uint64_t)seq - 1) / 128) * 258 * 4);
     auto k_cache = backend.allocate((uint64_t)(seq + 1) * cache_row_bytes);
     auto v_cache = backend.allocate((uint64_t)(seq + 1) * cache_row_bytes);
     backend.zero(*recurrent); backend.zero(*ring);
@@ -272,12 +276,13 @@ int main(int argc, char** argv) {
             backend.turbo_wht(*qg, N_HEAD, 2 * HEAD_DIM, false);
             backend.kv_store_turbo3(*kbuf, *vbuf, *k_cache, *v_cache, position, N_KV);
             backend.attention_turbo3(*qg, 2 * HEAD_DIM, *k_cache, *v_cache,
-                                     *attn_out, position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
+                                     *attn_out, position + 1, N_HEAD, N_KV, HEAD_DIM, scale,
+                                     partials.get());
             backend.turbo_wht(*attn_out, N_HEAD, HEAD_DIM, true);
         } else {
             backend.kv_store_f16(*kbuf, *vbuf, *k_cache, *v_cache, position, N_KV * HEAD_DIM);
             backend.attention_f16(*qg, 2 * HEAD_DIM, *k_cache, *v_cache, *attn_out,
-                                  position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
+                                  position + 1, N_HEAD, N_KV, HEAD_DIM, scale, partials.get());
         }
         backend.sigmoid_gate_mul(*attn_out, *qg, N_HEAD, HEAD_DIM);
         if (!t2) backend.quantize(*attn_out, q6144);

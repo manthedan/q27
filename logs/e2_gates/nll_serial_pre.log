@@ -1,0 +1,7 @@
+Metal model ready on Apple M4 in 6.63 s
+nll-long: 4097 tokens, single pass, no resets
+
+nll-long wall: 411.24 s (9.96 tok/s), overall mean NLL 2.4426 PPL 11.503
+long-context NLL by target position (4097 tokens, no resets):
+  0-2k    : mean NLL 2.2417  PPL    9.410  (n=2047)
+  2k-8k   : mean NLL 2.6434  PPL   14.060  (n=2049)
