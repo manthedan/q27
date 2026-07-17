@@ -57,8 +57,10 @@ uint64_t tensor_bytes(const q27::BackendTensor& t) {
     if (t.dtype == DType::F16) data *= 2;
     if (t.dtype == DType::Q4_G64) data /= 2;
     if (t.dtype == DType::T2_G128) data /= 4;
+    if (t.dtype == DType::B1_G128) data /= 8;
     const uint64_t group = t.dtype == DType::Q4_G64 ? 64 :
-        (t.dtype == DType::Q8_G128 || t.dtype == DType::T2_G128) ? 128 : 0;
+        (t.dtype == DType::Q8_G128 || t.dtype == DType::T2_G128 ||
+         t.dtype == DType::B1_G128) ? 128 : 0;
     return data + (group ? t.rows * (t.cols / group) * 2 : 0);
 }
 
@@ -68,7 +70,8 @@ Synthetic make_quant(q27::MetalBackend& backend, uint32_t rows, uint32_t cols, D
     Synthetic s;
     const uint64_t group = dtype == DType::Q4_G64 ? 64 : 128;
     const uint64_t data_bytes = (uint64_t)rows * cols /
-        (dtype == DType::Q4_G64 ? 2 : dtype == DType::T2_G128 ? 4 : 1);
+        (dtype == DType::Q4_G64 ? 2 : dtype == DType::T2_G128 ? 4
+                                    : dtype == DType::B1_G128 ? 8 : 1);
     s.tensor.dtype = dtype;
     s.tensor.rows = rows;
     s.tensor.cols = cols;
@@ -135,7 +138,7 @@ Synthetic make_f32(q27::MetalBackend& backend, const std::vector<uint64_t>& shap
 
 int main(int argc, char** argv) {
     uint32_t tokens = 16, seq = 128;
-    bool turbo3 = false, t2 = false;
+    bool turbo3 = false, t2 = false, b1 = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--tokens" && i + 1 < argc) tokens = (uint32_t)atoi(argv[++i]);
@@ -148,24 +151,27 @@ int main(int argc, char** argv) {
         else if (arg == "--dtype" && i + 1 < argc) {
             const std::string d = argv[++i];
             if (d == "t2") t2 = true;
-            else if (d != "q4q8") { fprintf(stderr, "invalid --dtype (q4q8|t2)\n"); return 1; }
+            else if (d == "b1") b1 = true;
+            else if (d != "q4q8") { fprintf(stderr, "invalid --dtype (q4q8|t2|b1)\n"); return 1; }
         }
-        else { fprintf(stderr, "usage: %s [--tokens N] [--seq LEN] [--kv fp16|turbo3] [--dtype q4q8|t2]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "usage: %s [--tokens N] [--seq LEN] [--kv fp16|turbo3] [--dtype q4q8|t2|b1]\n", argv[0]); return 1; }
     }
     if (!tokens || !seq) { fprintf(stderr, "invalid --tokens/--seq\n"); return 1; }
 
     q27::MetalBackend backend;
     printf("backend: %s, %u simulated tokens at context %u, %s KV%s\n",
            backend.name().c_str(), tokens, seq, turbo3 ? "turbo3" : "fp16",
-           t2 ? ", ternary weights" : "");
+           t2 ? ", ternary weights" : b1 ? ", binary weights" : "");
 
     // --dtype t2 replays the ternary-tier decode: every projection and the
     // head/embedding table T2, projections dispatched through the
     // float-activation GEMV exactly as MetalEngine::project routes them.
     // ssm_alpha/beta stay F16 in the q4q8 mix and T2 in the ternary mix, as
     // the artifacts pack them.
-    const DType bulk = t2 ? DType::T2_G128 : DType::Q4_G64;
-    const DType vocab_dtype = t2 ? DType::T2_G128 : DType::Q8_G128;
+    // --dtype b1 mirrors t2 with the binary dtype end-to-end (alpha/beta
+    // included, exactly as the bonsai-b1-v1 pack routes).
+    const DType bulk = t2 ? DType::T2_G128 : b1 ? DType::B1_G128 : DType::Q4_G64;
+    const DType vocab_dtype = t2 ? DType::T2_G128 : b1 ? DType::B1_G128 : DType::Q8_G128;
 
     // One synthetic weight set per layer type; a block streams far more bytes
     // than any cache level, so reuse across the 48/16/64 repeats is
@@ -173,10 +179,10 @@ int main(int argc, char** argv) {
     Synthetic gdn_qkv = make_quant(backend, GDN_CH, N_EMBD, bulk);
     Synthetic gdn_gate = make_quant(backend, GDN_V, N_EMBD, bulk);
     Synthetic gdn_out = make_quant(backend, N_EMBD, GDN_V, bulk);
-    Synthetic ssm_alpha = t2 ? make_quant(backend, GDN_HEADS, N_EMBD, bulk)
-                             : make_f16(backend, GDN_HEADS, N_EMBD);
-    Synthetic ssm_beta = t2 ? make_quant(backend, GDN_HEADS, N_EMBD, bulk)
-                            : make_f16(backend, GDN_HEADS, N_EMBD);
+    Synthetic ssm_alpha = (t2 || b1) ? make_quant(backend, GDN_HEADS, N_EMBD, bulk)
+                                     : make_f16(backend, GDN_HEADS, N_EMBD);
+    Synthetic ssm_beta = (t2 || b1) ? make_quant(backend, GDN_HEADS, N_EMBD, bulk)
+                                    : make_f16(backend, GDN_HEADS, N_EMBD);
     Synthetic ssm_a = make_f32(backend, {GDN_HEADS});
     Synthetic ssm_dt = make_f32(backend, {GDN_HEADS});
     Synthetic ssm_conv = make_f32(backend, {GDN_CH, 4});
@@ -240,13 +246,13 @@ int main(int argc, char** argv) {
 
     auto proj = [&](const q27::BackendTensor& w, q27::BackendBuffer& xf,
                     const q27::BackendQuantized& xq, q27::BackendBuffer& out) {
-        if (w.dtype == DType::T2_G128) backend.matvec(w, xf, out);
+        if (w.dtype == DType::T2_G128 || w.dtype == DType::B1_G128) backend.matvec(w, xf, out);
         else backend.matvec_quantized(w, xq, out);
     };
     auto proj_pair = [&](const q27::BackendTensor& a, q27::BackendBuffer& a_out,
                          const q27::BackendTensor& b, q27::BackendBuffer& b_out,
                          q27::BackendBuffer& xf, const q27::BackendQuantized& xq) {
-        if (a.dtype == DType::T2_G128) { proj(a, xf, xq, a_out); proj(b, xf, xq, b_out); }
+        if (a.dtype == DType::T2_G128 || a.dtype == DType::B1_G128) { proj(a, xf, xq, a_out); proj(b, xf, xq, b_out); }
         else backend.matvec_quantized_pair(a, a_out, b, b_out, xq);
     };
     auto gdn_block = [&]() {
@@ -258,7 +264,7 @@ int main(int argc, char** argv) {
         backend.delta_step(*recurrent, *recurrent, *conv_out, *g, *beta, *delta_out,
                            GDN_HEADS, GDN_QK_HEADS, GDN_DIM);
         backend.gated_norm_gdn(*delta_out, ssm_norm.tensor, *z, *gated_out, GDN_HEADS, GDN_DIM, EPS);
-        if (!t2) backend.quantize(*gated_out, q6144);
+        if (!t2 && !b1) backend.quantize(*gated_out, q6144);
         proj(gdn_out.tensor, *gated_out, q6144, *y);
     };
     auto attention_block = [&]() {
@@ -280,13 +286,13 @@ int main(int argc, char** argv) {
                                   position + 1, N_HEAD, N_KV, HEAD_DIM, scale);
         }
         backend.sigmoid_gate_mul(*attn_out, *qg, N_HEAD, HEAD_DIM);
-        if (!t2) backend.quantize(*attn_out, q6144);
+        if (!t2 && !b1) backend.quantize(*attn_out, q6144);
         proj(attn_out_w.tensor, *attn_out, q6144, *y);
     };
     auto ffn_block = [&]() {
         proj_pair(ffn_gate_w.tensor, *ffn_gate, ffn_up_w.tensor, *ffn_up, *x1, q5120);
         backend.silu_mul(*ffn_gate, *ffn_up, *ffn_gate, N_FFN);
-        if (!t2) backend.quantize(*ffn_gate, q17408);
+        if (!t2 && !b1) backend.quantize(*ffn_gate, q17408);
         proj(ffn_down_w.tensor, *ffn_gate, q17408, *y);
     };
     auto token_step = [&](uint32_t token) {

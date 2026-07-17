@@ -409,3 +409,39 @@ any run:
 Machine: quiet 24 GB M4 (Daniel's go this window covers the runs).
 Correctness legs tolerate contention; leg 3 is timing and runs last,
 alone. RESULTS below when run.
+
+### Phase 0A-q27 RESULTS (2026-07-16 night, quiet 24 GB M4, Daniel's go)
+
+1. **NLL ratio leg: BOTH GATES PASS.** 8K single-pass wikitext-2, identical
+   invocations: B1 PPL 14.311, T2 13.559, official 6.267 →
+   **B1/T2 = 1.055** (band [1.05, 1.30]; vendor-protocol was 1.16 — the
+   gap compresses at long context) and **B1/official = 2.28×** (band
+   ≤ 3.5×, matching the vendor's ~2.2–2.4× indicative). The pack and
+   kernels reproduce vendor quality through our engine.
+   (`logs/b1-quality-20260716/nll-*.out`)
+2. **Behavioral probes: 4/4 PASS** (recorded Phase 0A prompts through our
+   server, machine-checked): json exact keys/types/arity no fences;
+   constraints all seven honored (checker initially demanded `1.`-style
+   delimiters, model used bare numbers — checker corrected, output was
+   compliant as written); codeedit exact boundary fix (`s <=
+   out[-1][1]`), code only; toolcall correct function + exact args — after
+   fixing a REAL Metal-server gap the probe exposed (tools were never
+   rendered into the prompt; see 2026-07-17-parity-audit-triage.md).
+3. **Decode economics: CONDITIONAL band.** Artifact decode **17.28 /
+   17.09 tok/s** (two warm 128-token runs) vs the pre-registered bands —
+   below the ≥18 strong line, well above the 15 floor. Resident ceiling
+   (`metal_decode_bench --dtype b1`, added tonight; corrected same night
+   for a codex-caught guard bug that left the engine-skipped activation
+   quantization in the b1 route): **19.39 tok/s at 69.9 GB/s** effective
+   vs T2's same-bench 11.54 at 78.5 — artifact runs at 89% of its
+   ceiling (paging residue), and the B1 kernel streams at 0.89 of T2's
+   rate at full-decode width (Phase 0B measured GEMV-only
+   parity; the residue is issue-rate at decode's dispatch mix). Per the
+   band: **fund one kernel look** — registered as the B1 select kernel's
+   round 2, quiet-machine regated, ship line ≥ 18 tok/s artifact decode.
+
+**Phase 0A-q27 verdict: B1 is a serving tier through our own stack** —
+quality reproduced (1.055× T2, 2.28× official), agentic probes clean,
+17+ tok/s today (1.5× T2's 11.5) with a funded path to 18+. Remaining
+Phase 4 residue unchanged: vendor-fork byte gate + unpacked-masters
+cross-check (mini), NLL ladder 8K→32K, CUDA byte gate at merge.

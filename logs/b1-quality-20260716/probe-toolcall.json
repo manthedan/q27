@@ -1,0 +1,22 @@
+{
+ "choices": [
+  {
+   "finish_reason": "stop",
+   "index": 0,
+   "message": {
+    "content": "<think>\n\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Taipei\", \"unit\": \"c\"}}\n</tool_call>",
+    "role": "assistant"
+   }
+  }
+ ],
+ "created": 1784263951,
+ "id": "chatcmpl-metal",
+ "model": "q27-metal",
+ "object": "chat.completion",
+ "q27_prefix_hit": 0,
+ "usage": {
+  "completion_tokens": 37,
+  "prompt_tokens": 196,
+  "total_tokens": 233
+ }
+}
