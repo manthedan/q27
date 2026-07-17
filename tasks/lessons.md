@@ -25,3 +25,16 @@ empirically (digit-identical re-run of a completed cell), document the
 migration next to the data, and only then rewrite the fingerprint.
 Preserve a failed run's log BEFORE relaunching: the resume's `> "$log"`
 redirect truncates it at process start, not at first output.
+
+## Background jobs must be caffeinated end-to-end (2026-07-16)
+Two rounds of background-task kills (~10 min apart, idle unattended
+mini) hit exactly the jobs launched WITHOUT caffeinate (E2 gate suite,
+codex reviews); the 4-hour census survived because its driver wrapped
+every cell in `caffeinate -i`. System sleep reaps background children.
+- The METAL_PROGRESS protocol rule ("caffeinate every long run") applies
+  to ALL background work, including codex reviews and gate suites, not
+  just timed measurement runs.
+- Wrap the LAUNCH (`caffeinate -i script.sh`), not just inner commands —
+  the gap between inner caffeinated children is enough to sleep in.
+- Never edit a shell script while zsh is executing it (incremental
+  read) — fix drivers between runs, not during.
