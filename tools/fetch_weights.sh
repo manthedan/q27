@@ -16,6 +16,7 @@ REPO="prism-ml/Ternary-Bonsai-27B-gguf"
 REV="20e435f518bd5b882795954aba81e80a91894321"
 FILE="Ternary-Bonsai-27B-Q2_0.gguf"
 SRC_SHA="868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757"
+SRC_SIZE=7165121600   # bytes, from HF paths-info (guards the 416 resume case)
 OUT_SHA="25392b471d2e5c55798c2ea77d8b53fbbd1f720318e5ff23bd8c49e5d378e549"
 DEST="models/ternary-bonsai-27b"
 ARTIFACT="$DEST/ternary-bonsai-27b-t2.q27"
@@ -48,9 +49,20 @@ if [ ! -f "$GGUF" ] || [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" != "$SRC_SHA
         # resume; only a COMPLETED download with a wrong checksum triggers
         # the clean restart (codex P2 — transient errors must not discard
         # gigabytes of good partial data).
-        curl -L --fail --continue-at - \
-            "https://huggingface.co/$REPO/resolve/$REV/$FILE" -o "$GGUF" ||
-            { echo "fetch: download interrupted — re-run to resume from the partial file"; exit 1; }
+        if ! curl -L --fail --continue-at - \
+            "https://huggingface.co/$REPO/resolve/$REV/$FILE" -o "$GGUF"; then
+            # A full-length-but-corrupt local file makes the resume request
+            # a range at/past EOF (HTTP 416) — that is the corrupt-file
+            # case, not a transport failure: fall through to the clean
+            # attempt instead of wedging every rerun (codex P2). Anything
+            # short of full length is a genuine interruption: preserve the
+            # partial for the next run's resume.
+            local_size=$(stat -f %z "$GGUF" 2>/dev/null || echo 0)
+            if [ "$local_size" -lt "$SRC_SIZE" ]; then
+                echo "fetch: download interrupted — re-run to resume from the partial file"; exit 1
+            fi
+            echo "fetch: resume rejected on a full-length file (corrupt bytes likely)"
+        fi
         [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" = "$SRC_SHA" ] && break
         [ "$attempt" = "clean" ] &&
             { echo "fetch: source GGUF sha256 MISMATCH after clean download — aborting"; exit 1; }
