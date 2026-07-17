@@ -236,6 +236,18 @@ class MetalEngine {
     // to one attention layer (absolute index, layer%4==3) and one KV head.
     // UINT32_MAX for layer/head widens that axis back to "all".
     void set_kv_attrib_cell(uint32_t mode, uint32_t layer, uint32_t head);
+    // Step-2 scaling arms (docs/plans/2026-07-16-kv-codec-step2.md), on top
+    // of an already-selected side arm: scale32 keeps the group scale in f32
+    // through the round-trip; feature_scales (2*16*4*256 floats,
+    // [side][attn_idx][head][dim]) descale each dimension before the
+    // quantizer and rescale after the inverse transform. Instrument-only,
+    // main-stream attention layers (never the MTP layer).
+    void set_kv_attrib_rt(bool scale32, const float* feature_scales);
+    // Stats pass: subject stores clean fp16 (KL vs baseline is exactly 0 —
+    // a rode-along canary) while per-feature sum-of-squares accumulates for
+    // both sides. read_kv_attrib_stats returns the 2*16*4*256 accumulator.
+    void set_kv_attrib_stats();
+    void read_kv_attrib_stats(std::vector<float>& out);
 
   private:
     static constexpr uint32_t N_LAYER = 64;
@@ -279,6 +291,8 @@ class MetalEngine {
     uint32_t kv_attrib_ = 0;
     uint32_t kv_attrib_layer_ = UINT32_MAX;
     uint32_t kv_attrib_head_ = UINT32_MAX;
+    uint32_t kv_attrib_flags_ = 0;
+    std::shared_ptr<BackendBuffer> kv_attrib_aux_;
     uint64_t engine_cache_bytes_ = 0;
     uint32_t position_ = 0;
     SpecStats last_spec_stats_;

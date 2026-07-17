@@ -3232,13 +3232,24 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
 // a KL delta against the fp16 baseline is attributable to that one side's
 // quantization alone.
 // head selects a single KV head for cell-granular attribution (census);
-// ~0u round-trips every head of the selected side.
-struct TurboAttribArgs { uint position; uint kv_heads; uint tokens; uint mode; uint head; };
+// ~0u round-trips every head of the selected side. flags: step-2 scaling
+// arms (docs/plans/2026-07-16-kv-codec-step2.md) — SCALE32 keeps the
+// group scale in f32 through the round-trip, FEATURE descales each
+// dimension by aux[scale_off + side/head/dim] before the quantizer and
+// rescales after the inverse transform, STATS stores clean fp16 while
+// accumulating per-feature sum-of-squares for BOTH sides into aux
+// (atomic f32). aux layout: [side(K=0,V=1)][attn_idx][head][256 dims].
+constant uint Q27_ATTRIB_SCALE32 = 1;
+constant uint Q27_ATTRIB_FEATURE = 2;
+constant uint Q27_ATTRIB_STATS   = 4;
+struct TurboAttribArgs { uint position; uint kv_heads; uint tokens; uint mode; uint head;
+                         uint flags; uint scale_off; };
 kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
                                           device const float *v [[buffer(1)]],
                                           device half *kc [[buffer(2)]],
                                           device half *vc [[buffer(3)]],
                                           constant TurboAttribArgs &args [[buffer(4)]],
+                                          device float *aux [[buffer(5)]],
                                           uint3 group [[threadgroup_position_in_grid]],
                                           uint j [[thread_index_in_threadgroup]]) {
     const uint h = group.x >> 1, g = group.x & 1, token = group.z;
@@ -3247,12 +3258,24 @@ kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
         (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
     device half *dst = (group.y ? vc : kc) +
         (ulong)(args.position + token) * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
+    const uint aux_at = args.scale_off + group.y * 16384u + h * 256u + g * 128u + j;
+    if (args.flags & Q27_ATTRIB_STATS) {
+        // Stats pass: the stored cache stays clean fp16 (the subject IS the
+        // baseline; its KL rides along as a zero canary) while per-feature
+        // sum-of-squares accumulates for BOTH sides.
+        atomic_fetch_add_explicit((device atomic_float *)&aux[aux_at],
+                                  src[j] * src[j], memory_order_relaxed);
+        dst[j] = half(src[j]);
+        return;
+    }
     // group.y and h are uniform across the threadgroup, so this early exit
     // and the barriers below never diverge within a threadgroup.
     if (args.mode != (group.y ? 2u : 1u) ||
         (args.head != ~0u && h != args.head)) { dst[j] = half(src[j]); return; }
+    const float sj = (args.flags & Q27_ATTRIB_FEATURE) ? aux[aux_at] : 1.0f;
     threadgroup float xs[128], red[128];
-    xs[j] = src[j]; red[j] = src[j] * src[j];
+    const float x0 = src[j] / sj;
+    xs[j] = x0; red[j] = x0 * x0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = 64; s; s >>= 1) {
         if (j < s) red[j] += red[j + s];
@@ -3268,13 +3291,15 @@ kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
         if (j < s) red[j] += red[j + s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // Scale passes through half exactly as the packed block header does, so
-    // the reconstructed values match what turbo3 attention would dequantize.
+    // The group scale passes through half exactly as the packed block header
+    // does — unless the SCALE32 arm keeps it f32 to isolate scale precision
+    // from scale structure.
     const float cn = sqrt(red[0]);
-    const float scale = float(half(cn > 1e-10f ? norm / cn : norm));
+    const float raw_scale = cn > 1e-10f ? norm / cn : norm;
+    const float scale = (args.flags & Q27_ATTRIB_SCALE32) ? raw_scale : float(half(raw_scale));
     xs[j] = turbo_centroids[index] * scale * float(turbo_s2[j]);
     turbo_butterfly(xs, j);
-    dst[j] = half(xs[j] * turbo_inv_sqrt_128 * float(turbo_s1[j]));
+    dst[j] = half(xs[j] * turbo_inv_sqrt_128 * float(turbo_s1[j]) * sj);
 }
 
 // Chunk-causal turbo3 attention, online-softmax. Mirrors the turbo3 decode
