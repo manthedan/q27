@@ -1,0 +1,175 @@
+#!/bin/zsh
+# Mixed weight-tier census batch (docs/plans/2026-07-17-mixed-tier-census.md):
+# baselines (all-B1, all-T2) then one class-flip arm at a time — build the
+# mixed pack with q27_mix.py, validate, 8K wikitext NLL, DELETE the pack
+# (13 GiB free on the mini; one arm pack exists at any moment). Resumable:
+# arms with a completed log are skipped, so a crashed batch re-runs only
+# what is missing. One model load at a time by construction (serial loop).
+set -u
+cd "$(dirname "$0")/.."
+[ -z "${SWEEP_CAFF:-}" ] && exec env SWEEP_CAFF=1 caffeinate -i "$0" "$@"
+
+BIN=build/q27-metal
+B1=models/bonsai-27b-b1/bonsai-27b-b1.q27
+T2=models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27
+TOK=models/qwen36-27b-mtp/qwen36-27b-mtp.tok
+C=data/wikitext2-test.tokens.bin
+OUT=logs/mixed_census
+ARM_PACK=models/census_arm.q27      # transient, deleted after each arm
+mkdir -p "$OUT"
+trap 'rm -f "$ARM_PACK"' EXIT
+
+if pgrep -f "q27-metal " >/dev/null 2>&1; then
+    echo "census: another q27-metal process is running; refusing to start"; exit 1
+fi
+
+export Q27_METAL_GEMM_HALF=1 Q27_METAL_GQA_TILE=2
+export Q27_METAL_GQA_THRESHOLD=2048 Q27_METAL_GQA_BLOCK=1024
+
+# Run the engine under a clean environment so inherited Q27/Metal debug,
+# codec, shader-override, or residency knobs cannot redefine an arm. The
+# shader path is consequently the checkout file hashed below.
+q27() {
+    env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+        Q27_METAL_GEMM_HALF="$Q27_METAL_GEMM_HALF" \
+        Q27_METAL_GQA_TILE="$Q27_METAL_GQA_TILE" \
+        Q27_METAL_GQA_THRESHOLD="$Q27_METAL_GQA_THRESHOLD" \
+        Q27_METAL_GQA_BLOCK="$Q27_METAL_GQA_BLOCK" \
+        "$BIN" "$@"
+}
+
+# Stale-binary rule (2026-07-15 lesson): rebuild before any measurement.
+make build/q27-metal > "$OUT/rebuild.log" 2>&1 || {
+    echo "census: rebuild failed (see $OUT/rebuild.log)" | tee "$OUT/ABORTED"; exit 1; }
+
+# Resumability must never combine arms from different binaries, artifacts,
+# corpora, route pins, or driver revisions into one readout. Include both
+# HEAD and this script's bytes: the latter catches an uncommitted edit too.
+fingerprint() {
+    echo "$(git rev-parse HEAD 2>/dev/null || echo nogit) driver=$(md5 -q "$0") mixer=$(md5 -q tools/q27_mix.py) host=$(md5 -q "$BIN") shader=$(md5 -q src/metal/q27_kernels.metal) b1=$(md5 -q "$B1") t2=$(md5 -q "$T2") tok=$(md5 -q "$TOK") corpus=$(md5 -q "$C") clean_env=1 gemm_half=$Q27_METAL_GEMM_HALF tile=$Q27_METAL_GQA_TILE thr=$Q27_METAL_GQA_THRESHOLD blk=$Q27_METAL_GQA_BLOCK nll_long=8192 ctx=8192"
+}
+FP="$(fingerprint)"
+if [ -f "$OUT/fingerprint" ]; then
+    [ "$(cat "$OUT/fingerprint")" = "$FP" ] ||
+        { echo "census: fingerprint mismatch — move $OUT aside" | tee "$OUT/ABORTED"; exit 1; }
+else
+    # rebuild.log is produced above; any other file means this is not a
+    # fresh experiment and must not be blessed retroactively.
+    stale=$(find "$OUT" -type f ! -name rebuild.log -print -quit)
+    [ -z "$stale" ] ||
+        { echo "census: $OUT has unfingerprinted results; move it aside" | tee "$OUT/ABORTED"; exit 1; }
+    echo "$FP" > "$OUT/fingerprint"
+fi
+rm -f "$OUT/ABORTED"
+
+# The shader and mixer are read at runtime and each child reopens every
+# artifact. Recheck the complete identity around every measurement so an
+# edit during this multi-day process cannot silently split the experiment.
+check_fingerprint() {
+    [ "$(fingerprint)" = "$FP" ] ||
+        { echo "census: input changed while batch was running — aborting" | tee "$OUT/ABORTED"; exit 1; }
+}
+
+nll_run() {
+    local model=$1 log=$2
+    [ -s "$log" ] && grep -q "overall mean NLL" "$log" && return 0
+    for attempt in 1 2; do
+        check_fingerprint
+        q27 "$model" "$TOK" --nll "$C" --nll-long 8192 --ctx 8192 > "$log" 2>&1
+        if grep -q "overall mean NLL" "$log"; then
+            check_fingerprint
+            return 0
+        fi
+        [ "$attempt" = 1 ] &&
+            { mv "$log" "$log.attempt1"
+              echo "census: $(basename "$log") attempt 1 failed; retrying once"; }
+    done
+    echo "census: NLL run FAILED twice (see $log)" | tee "$OUT/ABORTED"; exit 1
+}
+
+# Baselines anchor the gap on THIS box and binary (the recorded 1.055
+# B1/T2 ratio is a 24 GB M4 number; ratios must be same-machine).
+nll_run "$B1" "$OUT/base_b1.log"
+nll_run "$T2" "$OUT/base_t2.log"
+
+arm() {
+    local name=$1 take=$2
+    local log="$OUT/arm_$name.log"
+    [ -s "$log" ] && grep -q "overall mean NLL" "$log" && return 0
+    check_fingerprint
+    python3 tools/q27_mix.py "$B1" "$T2" "$ARM_PACK" --take "$take" \
+        > "$OUT/mix_$name.log" 2>&1 ||
+        { echo "census: mix FAILED for $name" | tee "$OUT/ABORTED"; exit 1; }
+    q27 "$ARM_PACK" "$TOK" --validate-only --ctx 8 >> "$OUT/mix_$name.log" 2>&1 ||
+        { echo "census: validate FAILED for $name" | tee "$OUT/ABORTED"; exit 1; }
+    check_fingerprint
+    nll_run "$ARM_PACK" "$log"
+    rm -f "$ARM_PACK"
+}
+
+# Depth bands over the 64 blocks (thirds).
+E='([0-9]|1[0-9]|20)'      # blk 0-20
+M='(2[1-9]|3[0-9]|4[0-2])' # blk 21-42
+L='(4[3-9]|5[0-9]|6[0-3])' # blk 43-63
+
+# Attention classes x bands (attention layers are blk 3,7,...,63).
+arm attnq_early  "blk\\.$E\\.attn_q\\.weight"
+arm attnq_mid    "blk\\.$M\\.attn_q\\.weight"
+arm attnq_late   "blk\\.$L\\.attn_q\\.weight"
+arm attnkv_early "blk\\.$E\\.attn_(k|v)\\.weight"
+arm attnkv_mid   "blk\\.$M\\.attn_(k|v)\\.weight"
+arm attnkv_late  "blk\\.$L\\.attn_(k|v)\\.weight"
+arm attnout_early "blk\\.$E\\.attn_output\\.weight"
+arm attnout_mid   "blk\\.$M\\.attn_output\\.weight"
+arm attnout_late  "blk\\.$L\\.attn_output\\.weight"
+# FFN classes x bands (every block).
+arm ffngu_early  "blk\\.$E\\.ffn_(gate|up)\\.weight"
+arm ffngu_mid    "blk\\.$M\\.ffn_(gate|up)\\.weight"
+arm ffngu_late   "blk\\.$L\\.ffn_(gate|up)\\.weight"
+arm ffndown_early "blk\\.$E\\.ffn_down\\.weight"
+arm ffndown_mid   "blk\\.$M\\.ffn_down\\.weight"
+arm ffndown_late  "blk\\.$L\\.ffn_down\\.weight"
+# GDN classes, full depth (48 GDN blocks; small tensors or single class).
+arm gdn_qkv      "attn_qkv\\.weight"
+arm gdn_gate     "attn_gate\\.weight"
+arm gdn_out      "ssm_out\\.weight"
+arm gdn_alphabeta "ssm_(alpha|beta)\\.weight"
+# These special matrices were called "tier-pinned" in the sketch, but the
+# source artifacts actually differ B1->T2 and each costs 4.7% of the full
+# delta. Test separately; both are eligible under the <=10% census gate.
+arm embedding   '^token_embd\.weight$'
+arm output_head '^output\.weight$'
+# The siblings' same-dtype tensors are not byte-identical. Test them as one
+# zero-byte-delta cohort so their contribution cannot be misclassified as a
+# diffuse quantized-matrix gap; zoom by class only if this cohort indicts.
+arm shared_f32 '(^output_norm\.weight$|\.(attn_norm|post_attention_norm|attn_q_norm|attn_k_norm|ssm_norm)\.weight$|\.ssm_(a|dt\.bias|conv1d\.weight)$)'
+
+# Summary table: arm, overall NLL, delta vs B1 base, gap recovered.
+check_fingerprint
+python3 - "$OUT" <<'PY' | tee "$OUT/census_summary.txt"
+import glob, os, re, sys
+out = sys.argv[1]
+def nll(path):
+    for line in open(path):
+        m = re.search(r"overall mean NLL ([0-9.]+)", line)
+        if m: return float(m.group(1))
+    return None
+b1, t2 = nll(f"{out}/base_b1.log"), nll(f"{out}/base_t2.log")
+gap = b1 - t2
+print(f"base B1 {b1:.4f}  base T2 {t2:.4f}  gap {gap:.4f} nats")
+rows = []
+for f in sorted(glob.glob(f"{out}/arm_*.log")):
+    name = os.path.basename(f)[4:-4]
+    v = nll(f)
+    if v is None: continue
+    take_mb = None
+    mix = f"{out}/mix_{name}.log"
+    if os.path.exists(mix):
+        m = re.search(r"byte delta \+?([0-9.]+) MB", open(mix).read())
+        if m: take_mb = float(m.group(1))
+    rows.append((name, v, (b1 - v) / gap if gap else 0.0, take_mb))
+rows.sort(key=lambda r: -r[2])
+for name, v, rec, mb in rows:
+    print(f"{name:16s} NLL {v:.4f}  gap recovered {100*rec:5.1f}%  bytes +{mb or 0:7.1f} MB")
+PY
+echo "census batch: COMPLETE"

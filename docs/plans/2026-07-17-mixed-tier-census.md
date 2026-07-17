@@ -1,4 +1,4 @@
-# Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, QUEUED not started)
+# Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, INSTRUMENT READY; measurement pending)
 
 k3 roadmap item #2, adopted 2026-07-17 (Daniel: "sounds good, do it" —
 queued behind the funded kernel rounds and the fp8-KV control arm). The
@@ -18,8 +18,9 @@ Zoom to per-tensor only inside the classes the first pass indicts.
 - Arm = one repacked artifact with a single class flipped B1→T2 (base:
   all-B1), measured on the standing 8K wikitext NLL protocol.
 - Classes: attn {q, k/v, out} × depth bands {early, mid, late},
-  ffn {gate/up, down} × bands, gdn {qkv, gate, alpha/beta}, embeddings/
-  head (already tier-pinned — verify and exclude).
+  ffn {gate/up, down} × bands, gdn {qkv, gate, out, alpha/beta},
+  embeddings, output head, plus the zero-byte-delta shared-dtype cohort
+  described below.
 - Repack: `bonsai-mixed-v1` quant_policy — per-tensor dtype routing in
   repack.py; validate_architecture's matrix_dtype_ok admits {T2, B1}
   under the mixed policy with BOTH layout-meta code strings present.
@@ -36,6 +37,66 @@ Zoom to per-tensor only inside the classes the first pass indicts.
   concentrated, and the two-tier ladder stands).
 - Every shipped pack passes the suffix byte-identity battery and the
   behavioral probe set (4/4) before any serving claim.
+
+## Pre-run implementation and method amendment (2026-07-17, before readout)
+
+`tools/q27_mix.py` reassembles the two compatible containers byte-for-byte,
+sets `bonsai-mixed-v1`, carries both layout declarations, and refuses
+incompatible tensor inventories, non-Bonsai dtype mismatches, vacuous
+selections, and source/output aliases. `validate_architecture()` admits
+T2/B1 per tensor under only that policy; dispatch was already dtype-local.
+A built mixed alpha/beta arm validated and generated `Paris.` on the mini;
+the full Metal suite is green.
+
+The source siblings share tensor names and shapes but are separately trained:
+344 of their 353 same-dtype tensors differ in bytes. Therefore `--take` means
+**donor bytes even when dtype is unchanged**, and the first-pass census adds
+one `shared_f32` arm covering output/block norms, GDN conv/a/dt/norm tensors,
+and attention q/k norms. It costs zero bytes. Omitting it would use the full
+B1→T2 gap as the recovery denominator while making that part of the gap
+unreachable, biasing the pre-registered diffuse-gap verdict. If the cohort
+recovers ≥15%, the planned zoom-by-class applies before composing a pack.
+
+The sketch's “embeddings/head already tier-pinned — verify and exclude” is
+corrected before readout: the actual artifacts carry B1 versus T2 copies,
+each donor flip costs 158.9 MB (4.7% of the full 3,361.7 MB delta), and thus
+each qualifies for the pre-registered ≤10% census gate. They run as separate
+`embedding` and `output_head` arms rather than being silently unreachable.
+
+`tools/mixed_census_batch.sh` runs the two same-machine baselines plus 22
+serial class arms, one transient pack at a time. It self-caffeinates, retries
+one transient failure, runs the engine under a clean environment with the
+four numeric-route knobs explicitly pinned, and fingerprints HEAD, driver,
+mixer, host binary, runtime Metal shader, both packs, tokenizer, corpus, and
+all protocol knobs before allowing a resume. Because the mixer, shader, and
+artifacts are reopened by each child, that complete fingerprint is recomputed
+before and after every measurement; a mid-run change aborts instead of
+splitting the experiment. Results have not started.
+
+## Execution registration (2026-07-17 midday, mini — recorded before the batch ran)
+
+- B1 material: masters no longer on the mini — rebuilt from the pinned
+  vendor GGUF (`prism-ml/Bonsai-27B-gguf` rev f10afb3,
+  `Bonsai-27B-Q1_0.gguf`, sha256 17ef842e… verified against the LFS
+  oid), repack.py lossless (498 byte-copies, RMSE 0.0000), engine
+  validate + greedy smoke green. GGUF deleted after repack (13 GiB
+  free box).
+- Mixed packs assembled byte-level from the two q27 containers
+  (`tools/q27_mix.py` — no quantization runs; policy/dtype/shape/name
+  cross-validation, both tiers' layout meta merged, policy
+  bonsai-mixed-v1). Engine admits {T2,B1} matrices under the mixed
+  policy; embeddings/head and ssm alpha/beta accept either tier.
+- Batch: `tools/mixed_census_batch.sh` — same-box baselines (all-B1,
+  all-T2 — the recorded 1.055 ratio is a 24 GB M4 number, so the gap
+  is re-anchored here), then 19 arms, one transient pack at a time
+  (build → validate → 8K NLL → delete), fingerprinted for resume,
+  caffeinated, serial. Arms: attn {q, k/v, out} × bands {early 0–20,
+  mid 21–42, late 43–63}; ffn {gate/up, down} × bands; gdn {qkv, gate,
+  out, alpha/beta} full-depth (gdn_out added beyond the sketch —
+  ssm_out was missing from the class list). Embeddings/head excluded
+  per plan (tier-pinned; a possible zoom later).
+- Protocol: 8K wikitext NLL (`--nll-long 8192 --ctx 8192`), route pins
+  GEMM_HALF=1 TILE=2 THRESHOLD=2048 BLOCK=1024.
 
 ## RESULTS
 

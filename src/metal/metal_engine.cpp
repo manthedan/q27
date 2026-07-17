@@ -90,12 +90,16 @@ void MetalEngine::validate_architecture() const {
     if (meta.value("general.architecture", std::string()) != "qwen35")
         throw std::runtime_error("q27 Metal: expected qwen35 architecture");
     // Bonsai artifacts (T2 ternary / B1 binary repacks): 64 blocks, no MTP
-    // layer, bonsai-dtype embeddings/head/alpha/beta. Everything else
-    // matches the official tier; the two bonsai packs differ only in dtype.
+    // layer, bonsai-dtype embeddings/head/alpha/beta. The sibling packs
+    // share this architecture even though their trained tensor bytes differ.
     const std::string policy = meta.value("quant_policy", std::string());
     const bool ternary = policy == "bonsai-t2-v1";
     const bool binary = policy == "bonsai-b1-v1";
-    const bool bonsai = ternary || binary;
+    // Mixed-tier census packs (docs/plans/2026-07-17-mixed-tier-census.md,
+    // tools/q27_mix.py): per-tensor T2/B1 routing over the same bonsai
+    // shape. Both tiers' layout declarations are demanded below.
+    const bool mixed = policy == "bonsai-mixed-v1";
+    const bool bonsai = ternary || binary || mixed;
     exact("qwen35.block_count", bonsai ? 64 : 65); exact("qwen35.embedding_length", N_EMBD);
     exact("qwen35.feed_forward_length", N_FFN); exact("qwen35.attention.head_count", N_HEAD);
     exact("qwen35.attention.head_count_kv", N_KV); exact("qwen35.attention.key_length", HEAD_DIM);
@@ -113,12 +117,12 @@ void MetalEngine::validate_architecture() const {
     // The kernels hardcode the pack encodings; the meta strings are the
     // repack's declaration of what it wrote (codex P3 on the B1 wiring —
     // the T2 twin closes the same pre-existing gap).
-    if (ternary) {
+    if (ternary || mixed) {
         exact("group_t2", 128);
         exact_str("t2_codes", "0=-1,1=0,2=+1;3 forbidden");
         exact_str("t2_slot_order", "seq-lsb-first");
     }
-    if (binary) {
+    if (binary || mixed) {
         exact("group_b1", 128);
         exact_str("b1_codes", "1=+d,0=-d");
         exact_str("b1_bit_order", "seq-lsb-first");
@@ -160,6 +164,7 @@ void MetalEngine::validate_architecture() const {
     auto matrix_dtype_ok = [&](DType dtype) {
         if (ternary) return dtype == DType::T2_G128;
         if (binary) return dtype == DType::B1_G128;
+        if (mixed) return dtype == DType::T2_G128 || dtype == DType::B1_G128;
         return dtype == DType::Q4_G64 || dtype == DType::Q8_G128;
     };
     auto matrix = [&](const std::string& name, uint64_t rows, uint64_t cols) {
@@ -168,10 +173,21 @@ void MetalEngine::validate_architecture() const {
             throw std::runtime_error("q27 Metal: required matrix mismatch: " + name);
     };
 
+    // Tensors whose tier follows the pack policy: mixed admits either
+    // bonsai dtype (per-tensor routing decides at dispatch), the pure
+    // packs stay pinned exactly.
+    auto require_tier = [&](const std::string& name, DType pure,
+                            std::initializer_list<uint64_t> shape) {
+        if (!mixed) { require(name, pure, shape); return; }
+        const Tensor* tensor = model_.find(name);
+        if (!tensor || (tensor->dtype != DType::T2_G128 && tensor->dtype != DType::B1_G128) ||
+            tensor->shape != std::vector<uint64_t>(shape))
+            throw std::runtime_error("q27 Metal: required tensor mismatch: " + name);
+    };
     const DType vocab_dtype = ternary ? DType::T2_G128
-                            : binary ? DType::B1_G128 : DType::Q8_G128;
-    require("token_embd.weight", vocab_dtype, {VOCAB, N_EMBD});
-    require("output.weight", vocab_dtype, {VOCAB, N_EMBD});
+                            : binary ? DType::B1_G128 : DType::Q8_G128;   // unused under mixed
+    require_tier("token_embd.weight", vocab_dtype, {VOCAB, N_EMBD});
+    require_tier("output.weight", vocab_dtype, {VOCAB, N_EMBD});
     require("output_norm.weight", DType::F32, {N_EMBD});
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         const std::string p = "blk." + std::to_string(layer) + ".";
@@ -190,12 +206,15 @@ void MetalEngine::validate_architecture() const {
         } else {
             matrix(p + "attn_qkv.weight", GDN_CH, N_EMBD);
             matrix(p + "attn_gate.weight", GDN_V, N_EMBD);
-            require(p + "ssm_alpha.weight", ternary ? DType::T2_G128
-                                            : binary ? DType::B1_G128 : DType::F16,
-                    {GDN_HEADS, N_EMBD});
-            require(p + "ssm_beta.weight", ternary ? DType::T2_G128
-                                           : binary ? DType::B1_G128 : DType::F16,
-                    {GDN_HEADS, N_EMBD});
+            if (bonsai) {
+                require_tier(p + "ssm_alpha.weight", ternary ? DType::T2_G128 : DType::B1_G128,
+                             {GDN_HEADS, N_EMBD});
+                require_tier(p + "ssm_beta.weight", ternary ? DType::T2_G128 : DType::B1_G128,
+                             {GDN_HEADS, N_EMBD});
+            } else {
+                require(p + "ssm_alpha.weight", DType::F16, {GDN_HEADS, N_EMBD});
+                require(p + "ssm_beta.weight", DType::F16, {GDN_HEADS, N_EMBD});
+            }
             require(p + "ssm_a", DType::F32, {GDN_HEADS});
             require(p + "ssm_dt.bias", DType::F32, {GDN_HEADS});
             require(p + "ssm_conv1d.weight", DType::F32, {GDN_CH, 4});
