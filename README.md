@@ -211,9 +211,11 @@ Quality and correctness instruments ride the same binary: `--nll`,
 ## Server
 
 Both backends serve the native Anthropic Messages API plus OpenAI
-`/v1/chat/completions` and `/v1/completions`, with true token streaming,
-stop handling, disconnect cancellation, tool-call constraint decoding,
-and `count_tokens`, all shaped so Claude Code compacts correctly.
+`/v1/chat/completions`, `/v1/completions`, and `/v1/responses`, with true
+token streaming, stop handling, disconnect cancellation, tool-call
+constraint decoding, and `count_tokens`, all shaped so Claude Code
+compacts correctly and Codex CLI gets its full item lifecycle
+(function_call items, reasoning items, custom_tool_call bridging).
 
 ```bash
 ./build/q27-server model.q27 model.tok --port 8080          # CUDA
@@ -227,6 +229,11 @@ export ANTHROPIC_BASE_URL="http://localhost:8080"
 export ANTHROPIC_API_KEY="placeholder"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="q27"   # server is single-model
 claude
+
+# Codex CLI (Responses API), one-shot provider override:
+codex -c model_provider=q27 -c model=q27-metal \
+  -c 'model_providers.q27.base_url="http://localhost:8080/v1"' \
+  -c 'model_providers.q27.wire_api="responses"'
 ```
 
 The CUDA server's zero-config defaults are the measured Claude-Code
@@ -234,7 +241,21 @@ stack (fp8 KV on sm_89+, suffix drafter, fast-head, auto-sized `--ctx`),
 and `Q27_PROFILE=ref` restores conservative reference behavior. The
 Metal server runs two slots on one model mapping with a fair FIFO GPU
 lease, adaptive prefill quanta (96/48/12), full per-slot memory admission
-accounting, and a dedicated 503 on overload.
+accounting, and a dedicated 503 on overload. `/health` reports the
+resident model artifact by name.
+
+**Metal serving knobs (shipped semantics; promoted to CLI flags at
+Homebrew Phase 2 — env first for now):**
+
+| knob | default | effect |
+|---|---|---|
+| `--trace <path>` | off | whole-session JSONL: rendered prompts, prefix/snapshot decisions, tool recoveries, cancels, errors |
+| `Q27_METAL_SNAPSHOT_DIR` | off | disk prefix snapshots (load-bearing for agent TTFT: measured 8.1 s vs 4:54 cold at 8,256 tokens) |
+| `Q27_METAL_SNAPSHOT_MAX_MB` | 8192 | snapshot directory budget, LRU demote |
+| `Q27_METAL_SNAPSHOT_AUTO` | 4096 | prompts ≥ N tokens auto-save at a 96-aligned boundary; 0 = hint-only |
+| `Q27_METAL_MAX_TOKENS_DEFAULT` | per-endpoint | generation cap when the client sends none/null (pi sends null; 16384 recommended for agents) |
+| `Q27_METAL_BUDGET_MB` | half working set | multislot admission budget (test/override hook) |
+| `Q27_METAL_KV_FP16_CELLS` | off | turbo3 KV fp16 exception cells (production: `8,9,10,11,12,13,14,15`) |
 
 **The server has no auth and binds 127.0.0.1 by default.** Reaching it
 from other machines or containers requires an explicit `--host 0.0.0.0`.

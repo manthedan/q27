@@ -179,6 +179,13 @@ release, and `q27 pull` never needs a network call to know what exists.
   `q27 serve` boots; `curl localhost:8080/v1/messages` returns tokens;
   second concurrent `q27 serve` is refused by the pgrep guard.
 - **Phase 2 — formula in the tap (B4).** Tag `v0.1.0`, land `q27.rb`.
+  Pre-tag task (triage knobs note): promote the shipped-semantics env
+  knobs to documented CLI flags with env fallback — `--snapshot-dir`
+  (`Q27_METAL_SNAPSHOT_DIR`), `--snapshot-max-mb`, `--snapshot-auto`,
+  `--max-tokens-default`, `--budget-mb`; `Q27_METAL_KV_FP16_CELLS` stays
+  an engine env until the plumbing round (engine ctor threading), and
+  the wrapper passes it through. Probe knobs (`Q27_METAL_PROFILE`,
+  `Q27_MTP_TRACE`, bench flags) stay probes forever.
   Gate: on a machine (or clean user account) that has never seen the
   repo: `brew install manthedan/tap/q27 && brew test q27`, then the full
   Phase-1 gate sequence, then the Claude Code smoke
