@@ -230,6 +230,37 @@ Gap decomposition (real agentic decode): stock llama.cpp **62** → +ngram-mod
 **~62** (≈0) → +MTP **116–117** (×1.9, and vLLM independently agrees) → q27's MTP
 engine **203** (×1.73 on top).
 
+## Single-box serving: 2-slot continuous-batching aggregate
+
+The cross-engine numbers above are single-stream by design. This table is
+q27-only: what continuous batching (a serving default since 2026-07-16)
+adds when two slots decode at once. Method: `tools/batch_ab.sh`
+(`LEGS="A B D" REPS=3 MAXTOK=512`) — fresh w16 server per leg, two ~25-27K
+prompts (codegen + docs) warmed once so per-slot prefix snapshots land,
+then 3 measured reps firing both simultaneously; the metric is
+`(dec_codegen + dec_docs) / concurrent window`, median over reps. Leg A
+pins `Q27_BATCH=0` (the FIFO round-interleave baseline); leg B is the
+defaults-on path (`Q27_BATCH=1`; graph replay + cap 64 land from the
+serving profile — the script's gate env sets only KV/PMIN/MAXD, so it
+cannot suppress them); leg D replays the payloads solo under both to
+price the k=1 fallthrough (bar: |delta| < 2%).
+
+Measured 2026-07-16 at `c0c5c5e` (v0.2.0, rebuilt binaries):
+
+| KV | A: FIFO interleave | B: batched + graphs | B/A | solo delta (D) |
+|---|---|---|---|---|
+| fp8 | 168.9 t/s | **237.7 t/s** | **1.41x** | +0.06% / +0.00% |
+| turbo3 | 158.5 t/s | **224.2 t/s** | **1.41x** | +0.07% / -0.06% |
+
+The arc that got here (2 slots, fp8 aggregate): FIFO 1.00x → P1 fused
+verify 1.21x → P2 sweep fusion 1.31x → P3 shape-keyed CUDA-graph replay
+1.41x, solo cost ~0% at every stage (BUILDLOG 2026-07-14..16). Greedy
+text: docs is byte-identical A-vs-B on both KVs; codegen can fork through
+the documented A1 suffix-trim policy (it did here — 4 trim rounds/leg fp8,
+2 turbo3); turbo3 replays are additionally trajectory-sensitive to
+concurrency rep-to-rep on BOTH legs (quantized-KV tie re-rolls; the docs
+md5 sets still match A vs B).
+
 ## History / non-reproducible baselines
 
 An earlier cross-engine run used 3 **private** greenfield tasks (not
