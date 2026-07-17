@@ -244,18 +244,25 @@ lease, adaptive prefill quanta (96/48/12), full per-slot memory admission
 accounting, and a dedicated 503 on overload. `/health` reports the
 resident model artifact by name.
 
-**Metal serving knobs (shipped semantics; promoted to CLI flags at
-Homebrew Phase 2 — env first for now):**
+**Metal serving knobs (shipped semantics; CLI flags since Homebrew
+Phase-2 pre-tag — each flag falls back to its env twin when absent, and
+an explicit flag wins over the env):**
 
-| knob | default | effect |
-|---|---|---|
-| `--trace <path>` | off | whole-session JSONL: rendered prompts, prefix/snapshot decisions, tool recoveries, cancels, errors |
-| `Q27_METAL_SNAPSHOT_DIR` | off | disk prefix snapshots (load-bearing for agent TTFT: measured 8.1 s vs 4:54 cold at 8,256 tokens) |
-| `Q27_METAL_SNAPSHOT_MAX_MB` | 8192 | snapshot directory budget, LRU demote |
-| `Q27_METAL_SNAPSHOT_AUTO` | 4096 | prompts ≥ N tokens auto-save at a 96-aligned boundary; 0 = hint-only |
-| `Q27_METAL_MAX_TOKENS_DEFAULT` | per-endpoint | generation cap when the client sends none/null (pi sends null; 16384 recommended for agents) |
-| `Q27_METAL_BUDGET_MB` | half working set | multislot admission budget (test/override hook) |
-| `Q27_METAL_KV_FP16_CELLS` | off | turbo3 KV fp16 exception cells (production: `8,9,10,11,12,13,14,15`) |
+```bash
+./build/q27-metal-server model.q27 model.tok --port 8080 \
+  --snapshot-dir ~/.q27/snapshots --max-tokens-default 16384 \
+  --trace ~/.q27/trace.jsonl
+```
+
+| knob | env fallback | default | effect |
+|---|---|---|---|
+| `--trace <path>` | — | off | whole-session JSONL: rendered prompts, prefix/snapshot decisions, tool recoveries, cancels, errors |
+| `--snapshot-dir <path>` | `Q27_METAL_SNAPSHOT_DIR` | off | disk prefix snapshots (load-bearing for agent TTFT: measured 8.1 s vs 4:54 cold at 8,256 tokens) |
+| `--snapshot-max-mb N` | `Q27_METAL_SNAPSHOT_MAX_MB` | 8192 | snapshot directory budget, LRU demote |
+| `--snapshot-auto N` | `Q27_METAL_SNAPSHOT_AUTO` | 4096 | prompts ≥ N tokens auto-save at a 96-aligned boundary; 0 = hint-only |
+| `--max-tokens-default N` | `Q27_METAL_MAX_TOKENS_DEFAULT` | per-endpoint | generation cap when the client sends none/null (pi sends null; 16384 recommended for agents) |
+| `--budget-mb N` | `Q27_METAL_BUDGET_MB` | half working set | multislot admission budget (test/override hook) |
+| `Q27_METAL_KV_FP16_CELLS` | env-only (engine ctor plumbing pending) | off | turbo3 KV fp16 exception cells (production: `8,9,10,11,12,13,14,15`) |
 
 **The server has no auth and binds 127.0.0.1 by default.** Reaching it
 from other machines or containers requires an explicit `--host 0.0.0.0`.

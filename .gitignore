@@ -8,3 +8,4 @@ data/
 
 # Claude Code local state — settings live user-level on each machine
 .claude/
+bonsai-27b-whitepaper.pdf

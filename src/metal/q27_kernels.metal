@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 12
+// Q27_SHADER_ABI 13
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -1433,9 +1433,15 @@ inline int q27_dot16_b1(uint bits, int4 xp) {
     return 2 * pos - tot;
 }
 
-// Packed-dot binary GEMV, same skeleton as the T2 kernel: a lane's 32
+// Packed-dot binary GEMV, promoted round-2 form (docs/plans/2026-07-17-b1-
+// select-round2.md, bench mix speedup 2.36x): 4 rows per simdgroup with the
+// lane's 32-column int8 x-slice and activation scale loaded once per chunk
+// serving all 4 rows — the 1-row original re-issued the full x load per row
+// and its lone 4 B weight chain couldn't fill the issue window. A lane's 32
 // columns (one uint of code bits) are 32-aligned, so they share one
-// activation-scale block and sit inside one 128-column weight-scale group.
+// activation-scale block and sit inside one 128-column weight-scale group;
+// per-row chunk order, dot form, and scale-multiply order match the 1-row
+// original bit for bit (byte gate). Clamped edge rows compute, don't store.
 kernel void q27_matvec_b1_quantized(device const uchar *weights [[buffer(0)]],
                                      device const half *weight_scales [[buffer(1)]],
                                      device const char *x [[buffer(2)]],
@@ -1445,35 +1451,118 @@ kernel void q27_matvec_b1_quantized(device const uchar *weights [[buffer(0)]],
                                      uint group [[threadgroup_position_in_grid]],
                                      ushort lane [[thread_index_in_simdgroup]],
                                      ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    const uint row = group * 8 + simdgroup;
-    if (row >= args.rows) return;
-    device const uint *w1 = (device const uint *)(weights + (ulong)row * (args.cols / 8));
+    const uint row0 = (group * 8 + (uint)simdgroup) * 4;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
     device const int4 *x16 = (device const int4 *)x;
-    const ulong scale_base = (ulong)row * (args.cols / 128);
-    float acc = 0.0f;
+    const uint sgroups = args.cols / 128;
+    device const uint *w[4];
+    ulong sbase[4];
+    for (uint r = 0; r < 4; r++) {
+        const uint row = min(row0 + r, rlast);
+        w[r] = (device const uint *)(weights + (ulong)row * (args.cols / 8));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float4 acc = 0.0f;
     const uint chunks = args.cols / 1024;
     for (uint chunk = 0; chunk < chunks; chunk++) {
         const uint idx = chunk * 32 + lane;      // one uint = 32 columns
-        const uint wp = w1[idx];
-        const int dot0 = q27_dot16_b1(wp, x16[idx * 2]);
-        const int dot1 = q27_dot16_b1(wp >> 16, x16[idx * 2 + 1]);
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
         const uint c = chunk * 1024 + lane * 32;
-        acc += float(dot0 + dot1) *
-               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 4; r++) {
+            const uint wp = w[r][idx];
+            const int dot0 = q27_dot16_b1(wp, xp0);
+            const int dot1 = q27_dot16_b1(wp >> 16, xp1);
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
     }
     for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
-        const uint wp = uint(weights[(ulong)row * (args.cols / 8) + c / 8]) >> (c % 8);
         const char4 xp = *(device const char4 *)(x + c);
         const int tot = int(xp.x) + int(xp.y) + int(xp.z) + int(xp.w);
-        const int pos = select(0, int(xp.x), bool(wp & 1u)) +
-                        select(0, int(xp.y), bool(wp & 2u)) +
-                        select(0, int(xp.z), bool(wp & 4u)) +
-                        select(0, int(xp.w), bool(wp & 8u));
-        acc += float(2 * pos - tot) *
-               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 4; r++) {
+            const uint wp = uint(((device const uchar *)w[r])[c / 8]) >> (c % 8);
+            const int pos = select(0, int(xp.x), bool(wp & 1u)) +
+                            select(0, int(xp.y), bool(wp & 2u)) +
+                            select(0, int(xp.z), bool(wp & 4u)) +
+                            select(0, int(xp.w), bool(wp & 8u));
+            acc[r] += float(2 * pos - tot) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
     }
-    acc = simd_sum(acc);
-    if (lane == 0) out[row] = acc;
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// B1 select round-2 residue (docs/plans/2026-07-17-b1-select-round2.md):
+// the r2 4-row arm was PROMOTED into q27_matvec_b1_quantized above (bench
+// mix speedup 2.36x); matvec_b1r2_probe candidate 2 aliases the production
+// PSO so recorded A/B invocations keep working. r3 below is the retained
+// 8-row issue-depth arm — never run in the round (r2 cleared the sub-line
+// first), bench-only, never engine-routed.
+// r3 — the 8-row issue-depth probe (run only if r2 misses the sub-line):
+// same lane-held x-slice, 8 independent 4 B weight chains per lane, at the
+// cost of x8 simd_sum/scale chains. Same byte-identity contract as r2.
+kernel void q27_matvec_b1_quantized_r3(device const uchar *weights [[buffer(0)]],
+                                        device const half *weight_scales [[buffer(1)]],
+                                        device const char *x [[buffer(2)]],
+                                        device const float *x_scales [[buffer(3)]],
+                                        device float *out [[buffer(4)]],
+                                        constant MatvecArgs &args [[buffer(5)]],
+                                        uint group [[threadgroup_position_in_grid]],
+                                        ushort lane [[thread_index_in_simdgroup]],
+                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = (group * 8 + (uint)simdgroup) * 8;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    device const int4 *x16 = (device const int4 *)x;
+    const uint sgroups = args.cols / 128;
+    device const uint *w[8];
+    ulong sbase[8];
+    for (uint r = 0; r < 8; r++) {
+        const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+        w[r] = (device const uint *)(weights + (ulong)row * (args.cols / 8));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;      // one uint = 32 columns
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
+        const uint c = chunk * 1024 + lane * 32;
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 8; r++) {
+            const uint wp = w[r][idx];
+            const int dot0 = q27_dot16_b1(wp, xp0);
+            const int dot1 = q27_dot16_b1(wp >> 16, xp1);
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
+    }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const char4 xp = *(device const char4 *)(x + c);
+        const int tot = int(xp.x) + int(xp.y) + int(xp.z) + int(xp.w);
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 8; r++) {
+            const uint wp = uint(((device const uchar *)w[r])[c / 8]) >> (c % 8);
+            const int pos = select(0, int(xp.x), bool(wp & 1u)) +
+                            select(0, int(xp.y), bool(wp & 2u)) +
+                            select(0, int(xp.z), bool(wp & 4u)) +
+                            select(0, int(xp.w), bool(wp & 8u));
+            acc[r] += float(2 * pos - tot) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
+    }
+    for (uint r = 0; r < 8; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
 }
 
 // Dual-row ternary dot: unpack each 2-bit code ONCE, MAC into both rows.

@@ -30,7 +30,8 @@ struct Shape {
 };
 
 uint64_t data_divisor(DType dtype) {
-    return dtype == DType::Q4_G64 ? 2 : dtype == DType::T2_G128 ? 4 : 1;
+    return dtype == DType::Q4_G64 ? 2 : dtype == DType::T2_G128 ? 4 :
+           dtype == DType::B1_G128 ? 8 : 1;
 }
 
 uint64_t data_bytes_for(const Shape& s) {
@@ -766,11 +767,189 @@ int run_official_probe(q27::MetalBackend& backend, int reps, int q4_candidate) {
     return 0;
 }
 
+// B1 select round-2 candidate leg (--b1-candidate N, docs/plans/2026-07-17-
+// b1-select-round2.md): the bonsai-tier per-token projection mix through
+// the production int8-activation B1 select GEMV (the same-run A/B control)
+// against one candidate arm (1 = production through the probe path, parity
+// leg; 2 = 4 rows/simdgroup; 3 = 8 rows/simdgroup). Candidate arms must
+// pass the exact CPU int8-activation model (1e-3, denominator floor) AND
+// byte-identity vs the production kernel BEFORE any timing — the round's
+// kernel contract is same dot, same scale-multiply order. Sub-line (round
+// doc): a candidate that fails to beat the production mix wall by >= 10%
+// is not promoted regardless of artifact hopes.
+int run_b1_round2(q27::MetalBackend& backend, int reps, int b1_candidate) {
+    struct ProbeShape { Shape shape; double per_token_count; };
+    const ProbeShape probes[] = {
+        {{"ffn gate/up   [17408x5120]", 17408, 5120, DType::B1_G128, false}, 128},
+        {{"ffn down      [5120x17408]", 5120, 17408, DType::B1_G128, false}, 64},
+        {{"gdn qkv       [10240x5120]", 10240, 5120, DType::B1_G128, false}, 48},
+        {{"gdn gate      [6144x5120]",  6144, 5120, DType::B1_G128, false}, 48},
+        {{"ssm/attn out  [5120x6144]",  5120, 6144, DType::B1_G128, false}, 64},
+        {{"attn q        [12288x5120]", 12288, 5120, DType::B1_G128, false}, 16},
+        {{"attn k/v      [1024x5120]",  1024, 5120, DType::B1_G128, false}, 32},
+        {{"output head   [248320x5120]", 248320, 5120, DType::B1_G128, false}, 1},
+    };
+    printf("B1 round-2 leg: candidate %d (%s) vs same-run production "
+           "q27_matvec_b1_quantized on the bonsai per-token mix\n", b1_candidate,
+           b1_candidate == 1 ? "production through the probe path, A/B parity" :
+           b1_candidate == 2 ? "4 rows/simdgroup, lane-held x-slice" :
+                               "8 rows/simdgroup, issue-depth probe");
+    printf("%-30s %8s %8s %8s %8s | %6s\n",
+           "shape", "prod ms", "cand ms", "p GB/s", "c GB/s", "r");
+    double prod_wall = 0.0, cand_wall = 0.0, total_bytes = 0.0;
+    for (const ProbeShape& p : probes) {
+        const Shape& s = p.shape;
+        const uint32_t nb = s.cols / 128;
+        // Synthetic B1 bits + NONUNIFORM exactly-representable fp16 scales
+        // (the b1-leg pattern: uniform 1.0 scales would leave a wrong scale
+        // index invisible to the gate).
+        static const uint16_t kScaleBits[7] = {0x3800, 0x3a00, 0x3c00, 0x3d00,
+                                               0x3e00, 0x3f00, 0x4000};
+        static const double kScaleVal[7] = {0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0};
+        auto scale_idx = [](uint32_t r, uint32_t g) { return (r * 31u + g) % 7u; };
+        std::vector<uint8_t> bits((uint64_t)s.rows * s.cols / 8);
+        for (size_t i = 0; i < bits.size(); i++) bits[i] = (uint8_t)(i * 2654435761u >> 24);
+        std::vector<uint16_t> bscales((uint64_t)s.rows * nb);
+        for (uint32_t r = 0; r < s.rows; r++)
+            for (uint32_t g = 0; g < nb; g++)
+                bscales[(uint64_t)r * nb + g] = kScaleBits[scale_idx(r, g)];
+        q27::Tensor tensor;
+        tensor.name = s.name;
+        tensor.dtype = DType::B1_G128;
+        tensor.shape = {s.rows, s.cols};
+        tensor.data = bits.data();
+        tensor.data_size = bits.size();
+        tensor.scales = reinterpret_cast<const uint8_t*>(bscales.data());
+        tensor.scales_size = bscales.size() * sizeof(uint16_t);
+        q27::BackendTensor weight = backend.upload(tensor);
+
+        // Activations + the exact CPU int8 model of q27_quantize_x (per
+        // 32-block amax/127, reciprocal-multiply + rint, clamp ±127 — the
+        // official-leg pattern verbatim).
+        std::vector<float> x(s.cols);
+        for (uint32_t i = 0; i < s.cols; i++) x[i] = (float)((int)(i % 23) - 11) / 11.0f;
+        std::vector<int8_t> xq8(s.cols);
+        std::vector<float> xsc(s.cols / 32);
+        for (uint32_t b = 0; b < s.cols / 32; b++) {
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 32; i++) amax = std::fmax(amax, std::fabs(x[b * 32 + i]));
+            const float sc = amax / 127.0f;
+            xsc[b] = sc;
+            const float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+            for (uint32_t i = 0; i < 32; i++) {
+                const int q = (int)std::rint(x[b * 32 + i] * inv);
+                xq8[b * 32 + i] = (int8_t)std::min(127, std::max(-127, q));
+            }
+        }
+        // CPU double model of the kernels' per-32-column exact integer dot:
+        // idot = 2*sum_{bit=1} xq8 - sum(xq8), scaled by the (row, c/128)
+        // weight scale and the block's activation scale.
+        std::vector<double> ref_i(s.rows);
+        for (uint32_t r = 0; r < s.rows; r++) {
+            const uint64_t rb = (uint64_t)r * s.cols / 8;
+            double acc = 0.0;
+            for (uint32_t b32 = 0; b32 < s.cols / 32; b32++) {
+                long pos = 0, tot = 0;
+                for (uint32_t i = 0; i < 32; i++) {
+                    const uint32_t c = b32 * 32 + i;
+                    const int xv = xq8[c];
+                    tot += xv;
+                    if (bits[rb + c / 8] >> (c % 8) & 1) pos += xv;
+                }
+                acc += kScaleVal[scale_idx(r, b32 * 32 / 128)] *
+                       (double)(2 * pos - tot) * (double)xsc[b32];
+            }
+            ref_i[r] = acc;
+        }
+
+        auto xb = backend.allocate(x.size() * sizeof(float));
+        backend.write(*xb, 0, x.data(), x.size() * sizeof(float));
+        q27::BackendQuantized xq = backend.allocate_quantized(s.cols);
+        backend.quantize(*xb, xq);
+        auto yprod = backend.allocate((uint64_t)s.rows * sizeof(float));
+        auto ycand = backend.allocate((uint64_t)s.rows * sizeof(float));
+
+        // Correctness gates before any timing.
+        backend.begin_commands();
+        backend.matvec_quantized(weight, xq, *yprod);
+        backend.matvec_b1r2_probe(b1_candidate, weight, xq, *ycand);
+        backend.end_commands();
+        std::vector<float> yp(s.rows), yc(s.rows);
+        backend.read(*yprod, 0, yp.data(), s.rows * sizeof(float));
+        backend.read(*ycand, 0, yc.data(), s.rows * sizeof(float));
+        double sum_abs_x = 0.0;
+        for (uint32_t i = 0; i < s.cols; i++) sum_abs_x += std::fabs(x[i]);
+        const double denom_floor = 1e-3 * sum_abs_x;
+        double ep = 0.0, ec = 0.0;
+        for (uint32_t r = 0; r < s.rows; r++) {
+            ep = std::fmax(ep, std::fabs(yp[r] - ref_i[r]) /
+                                   std::fmax(std::fabs(ref_i[r]), denom_floor));
+            ec = std::fmax(ec, std::fabs(yc[r] - ref_i[r]) /
+                                   std::fmax(std::fabs(ref_i[r]), denom_floor));
+        }
+        if (ep > 1e-3 || ec > 1e-3) {
+            fprintf(stderr, "FAIL: %s — vs CPU int8-activation model (prod %.2e, "
+                    "cand %.2e, bound 1e-3)\n", s.name, ep, ec);
+            return 1;
+        }
+        bool nonzero = false;
+        for (uint32_t r = 0; r < s.rows; r++)
+            if (yp[r] != 0.0f) { nonzero = true; break; }
+        if (!nonzero || (s.rows > 1 && yp[0] == yp[1])) {
+            fprintf(stderr, "FAIL: %s — anti-vacuity (zero or row-identical output)\n",
+                    s.name);
+            return 1;
+        }
+        if (memcmp(yc.data(), yp.data(), s.rows * sizeof(float)) != 0) {
+            fprintf(stderr, "FAIL: %s — candidate %d output is not byte-identical to "
+                    "the production kernel\n", s.name, b1_candidate);
+            return 1;
+        }
+
+        auto time_arm = [&](bool cand) {
+            auto body = [&](int count) {
+                backend.begin_commands();
+                for (int i = 0; i < count; i++) {
+                    if (cand) backend.matvec_b1r2_probe(b1_candidate, weight, xq, *ycand);
+                    else backend.matvec_quantized(weight, xq, *yprod);
+                }
+                backend.end_commands();
+            };
+            body(2); // warmup / first touch
+            auto start = std::chrono::steady_clock::now();
+            body(reps);
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count() / reps;
+        };
+        const double p_ms = time_arm(false) * 1e3;
+        const double c_ms = time_arm(true) * 1e3;
+        const double wbytes = (double)weight_bytes(s);
+        const double p_gbs = wbytes / (p_ms * 1e-3) / 1e9;
+        const double c_gbs = wbytes / (c_ms * 1e-3) / 1e9;
+        printf("%-30s %8.3f %8.3f %8.2f %8.2f | %6.3f\n",
+               s.name, p_ms, c_ms, p_gbs, c_gbs, p_ms / c_ms);
+        prod_wall += p.per_token_count * p_ms;
+        cand_wall += p.per_token_count * c_ms;
+        total_bytes += wbytes * p.per_token_count;
+    }
+    printf("identity: candidate byte-identical to production on all shapes; both match "
+           "the CPU int8-activation model <= 1e-3 max rel\n");
+    const double speedup = prod_wall / cand_wall;
+    printf("per-token B1 GEMV wall over the mix: production %.2f ms (%.2f GB/s "
+           "byte-weighted), candidate %.2f ms (%.2f GB/s)\n",
+           prod_wall, total_bytes / (prod_wall * 1e-3) / 1e9,
+           cand_wall, total_bytes / (cand_wall * 1e-3) / 1e9);
+    printf("candidate %d mix speedup = %.3f (round sub-line >= 1.10 to promote; "
+           "ship line is the quiet artifact decode >= 18 tok/s)\n",
+           b1_candidate, speedup);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     int reps = 20;
-    int q4_candidate = 0;
+    int q4_candidate = 0, b1_candidate = 0;
     bool t2 = false, t3 = false, slot2 = false, b1 = false, official = false;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -791,11 +970,17 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "invalid --q4-candidate (1=production 2=r2 3=production-alias; 4 was killed 2026-07-17)\n");
                 return 1;
             }
+        } else if (arg == "--b1-candidate" && i + 1 < argc) {
+            b1_candidate = atoi(argv[++i]);
+            if (b1_candidate < 1 || b1_candidate > 3) {
+                fprintf(stderr, "invalid --b1-candidate (1=production-parity 2=4-row 3=8-row)\n");
+                return 1;
+            }
         } else if (!arg.empty() && arg[0] != '-') {
             reps = atoi(arg.c_str());
         } else {
             fprintf(stderr, "usage: %s [reps] [--dtype q4q8|t2|t3] [--slot2] [--b1] "
-                    "[--official] [--q4-candidate N]\n", argv[0]);
+                    "[--official] [--q4-candidate N] [--b1-candidate N]\n", argv[0]);
             return 1;
         }
     }
@@ -858,6 +1043,7 @@ int main(int argc, char** argv) {
     if (slot2) return run_slot2_probe(backend, reps);
     if (b1) return run_b1_probe(backend, reps);
     if (official) return run_official_probe(backend, reps, q4_candidate);
+    if (b1_candidate) return run_b1_round2(backend, reps, b1_candidate);
 
     double total_seconds = 0.0, total_bytes = 0.0;
     for (size_t si = 0; si < n_shapes; si++) {

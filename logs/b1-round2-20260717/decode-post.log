@@ -1,0 +1,2 @@
+weight stream per token: 3.36 GiB
+decode step: 52.0 ms/token, 19.23 tok/s, effective weight stream 69.3 GB/s

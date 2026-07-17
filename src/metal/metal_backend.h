@@ -83,6 +83,16 @@ class MetalBackend final : public ComputeBackend {
     // production startup never creates them. Never engine-routed.
     void matvec_q4_probe(int candidate, const BackendTensor& weight,
                          const BackendQuantized& x, BackendBuffer& y);
+    // B1 select round-2 candidate arms (bench-only, docs/plans/2026-07-17-
+    // b1-select-round2.md): candidate 1 = the production B1 select GEMV
+    // through the probe path (A/B parity in one code path), 2 = alias of
+    // the production kernel (the 4-row r2 arm was PROMOTED, 2026-07-17
+    // round), 3 = the retained 8-row issue-depth arm (never run in the
+    // round). Validation as matvec_quantized; the r3 PSO builds lazily on
+    // first call, so production startup never creates it. Never
+    // engine-routed.
+    void matvec_b1r2_probe(int candidate, const BackendTensor& weight,
+                           const BackendQuantized& x, BackendBuffer& y);
     void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
                           uint32_t x_rows,BackendBuffer& y) override;
     void embedding_q8(const BackendTensor& weight, uint32_t token,

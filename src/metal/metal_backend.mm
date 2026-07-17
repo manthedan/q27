@@ -63,7 +63,7 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 12";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 13";
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -281,6 +281,10 @@ struct MetalBackend::Impl {
     // never creates it. r4 was promoted into q4_quantized; the q8 twin was
     // killed by measurement (2026-07-17 round doc).
     id<MTLComputePipelineState> q4_r2_p;
+    // B1 round-2 retained 8-row arm (bench-only): built on first
+    // matvec_b1r2_probe use, same lazy pattern as q4_r2_p above. The 4-row
+    // r2 arm was promoted into b1_quantized (2026-07-17 round).
+    id<MTLComputePipelineState> b1_r3_p;
     // Arm K (function-constant probe): one specialized PSO per baked cols.
     std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
     id<MTLComputePipelineState> mm_dr_p;
@@ -1115,9 +1119,11 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
         [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        // Q4 runs the promoted 4-rows-per-simdgroup kernel (32 rows/group,
-        // q4 round 2026-07-17); the other dtypes keep 1 row/simdgroup.
-        const NSUInteger rpg = weight.dtype==DType::Q4_G64 ? 32 : 8;
+        // Q4 and B1 run their promoted 4-rows-per-simdgroup kernels (32
+        // rows/group; q4 round + b1 select round 2, both 2026-07-17); the
+        // other dtypes keep 1 row/simdgroup.
+        const NSUInteger rpg = (weight.dtype==DType::Q4_G64 ||
+                                weight.dtype==DType::B1_G128) ? 32 : 8;
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+rpg-1)/rpg,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("quantized matvec");
     }
@@ -1575,6 +1581,75 @@ void MetalBackend::matvec_q4_probe(int candidate, const BackendTensor& weight,
                 (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         if (own) impl_->finish_command("q4 probe");
+    }
+}
+
+// B1 select round-2 candidate arms (bench-only, docs/plans/2026-07-17-b1-
+// select-round2.md): validation as matvec_quantized, then candidate
+// routing. Candidate 1 re-dispatches the production PSO so the bench's A/B
+// runs one code path; 2/3 are the multi-row arms. Candidate PSOs build
+// lazily on first use (the roofline-k pattern) — production startup never
+// creates them. Never engine-routed.
+void MetalBackend::matvec_b1r2_probe(int candidate, const BackendTensor& weight,
+                                     const BackendQuantized& x, BackendBuffer& y) {
+    if (candidate < 1 || candidate > 3)
+        throw std::runtime_error("q27 Metal: invalid b1 round-2 probe candidate");
+    if (weight.dtype != DType::B1_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: b1 round-2 probe requires B1_G128 weight");
+    if (!weight.rows || !weight.cols || weight.rows > UINT32_MAX ||
+        weight.cols > UINT32_MAX || weight.cols % 128)
+        throw std::runtime_error("q27 Metal: invalid b1 round-2 probe dimensions");
+    if (x.count != weight.cols || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: b1 round-2 probe activation mismatch");
+    check_range(y.size(), 0, weight.rows * 4, "b1 r2 probe output");
+    const MetalBuffer& data = metal_buffer(*weight.data);
+    const MetalBuffer& ws = metal_buffer(*weight.scales);
+    const MetalBuffer& xv = metal_buffer(*x.values);
+    const MetalBuffer& xs = metal_buffer(*x.scales);
+    MetalBuffer& out = metal_buffer(y);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size),
+                weight.data_offset, weight.rows * weight.cols / 8, "b1 r2 probe weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size),
+                weight.scales_offset, weight.rows * (weight.cols / 128) * 2,
+                "b1 r2 probe weight scales");
+    check_range(xv.size(), 0, x.count, "b1 r2 probe values");
+    check_range(xs.size(), 0, (uint64_t)(x.count / 32) * 4, "b1 r2 probe activation scales");
+    id<MTLComputePipelineState> pso = nil;
+    const char* label = nullptr;
+    switch (candidate) {
+        case 1:
+        case 2:
+            // r2 was PROMOTED into the production kernel (b1 round 2,
+            // 2026-07-17) — candidate 2 aliases it so recorded A/B
+            // invocations keep working.
+            pso = impl_->b1_quantized;
+            label = "q27_matvec_b1_quantized";
+            break;
+        default:
+            if (!impl_->b1_r3_p)
+                impl_->b1_r3_p = make_pipeline(impl_->device, impl_->library,
+                                               @"q27_matvec_b1_quantized_r3");
+            pso = impl_->b1_r3_p;
+            label = "q27_matvec_b1_quantized_r3";
+            break;
+    }
+    // Rows per 256-thread group: post-promotion production runs 4 rows per
+    // simdgroup (32/group); r3 runs 8 (64/group).
+    const uint32_t rows_per_group = candidate == 3 ? 64 : 32;
+    MatvecArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, label);
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2];
+        [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("b1 r2 probe");
     }
 }
 

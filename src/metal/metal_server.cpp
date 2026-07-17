@@ -445,9 +445,15 @@ struct Runtime {
     // the snapshot store, meaningful only when snapstore.enabled().
     size_t snap_auto_min=0;
 
+    // Serving knobs promoted to CLI flags (homebrew Phase-2 pre-tag):
+    // budget_mb / snapshot_dir / snapshot_max_mb / snapshot_auto carry the
+    // parsed flag values, already range-validated in main; the sentinel
+    // (0 / empty / 0 / -1) means "flag absent, fall back to the env twin".
+    // An explicit flag always wins over the env.
     Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
             uint32_t width,uint32_t sfx_width,size_t cache_entries,bool constrain,
-            uint32_t slot_count)
+            uint32_t slot_count,uint32_t budget_mb,const std::string& snapshot_dir,
+            uint32_t snapshot_max_mb,long long snapshot_auto)
         :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
          constrain_tools(constrain) {
         // Server identity (homebrew plan Q2): /health and the boot trace name
@@ -468,14 +474,15 @@ struct Runtime {
         // slots must fit the FULL per-slot footprint — KV + this slot's own
         // GQA partials (per-engine since audit E2, charged inside
         // kv_reserved_bytes) + fixed engine state + snapshot capacity x
-        // snapshot bytes — against the device budget (Q27_METAL_BUDGET_MB
-        // test/override hook; default = half the recommended working set,
-        // the engine KV check's convention). The engine's own KV check
-        // stays underneath as defense in depth; a budget below even one
-        // slot still serves one (never zero).
+        // snapshot bytes — against the device budget (--budget-mb flag,
+        // env fallback Q27_METAL_BUDGET_MB; default = half the recommended
+        // working set, the engine KV check's convention). The engine's own
+        // KV check stays underneath as defense in depth; a budget below
+        // even one slot still serves one (never zero).
         const char* budget_env=getenv("Q27_METAL_BUDGET_MB");
         uint64_t budget=shared->backend.recommended_working_set_size()/2;
-        if(budget_env) {
+        if(budget_mb) budget=(uint64_t)budget_mb*1024ull*1024ull; // --budget-mb, validated at parse
+        else if(budget_env) {
             // Fail loud on a malformed override: "-1" through strtoull would
             // wrap to an effectively unlimited budget and bypass the gate.
             char* end=nullptr; errno=0;
@@ -496,7 +503,7 @@ struct Runtime {
                         "serving with %zu slot(s)\n",
                         s,need/1048576.0,slots.size(),per_slot/1048576.0,
                         budget/1048576.0,
-                        budget_env?" (Q27_METAL_BUDGET_MB)":"",slots.size());
+                        budget_mb?" (--budget-mb)":(budget_env?" (Q27_METAL_BUDGET_MB)":""),slots.size());
                 break;
             }
             try { slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries)); }
@@ -506,14 +513,19 @@ struct Runtime {
                 break;
             }
         }
-        // Prefix snapshots Phase 2: opt-in via Q27_METAL_SNAPSHOT_DIR;
-        // budget via Q27_METAL_SNAPSHOT_MAX_MB (validated, fail-loud, same
-        // class as Q27_METAL_BUDGET_MB; default 8192 MB). The artifact
-        // identity hash (~3 s over the 7 GB mapping) is primed HERE, at
-        // startup, so the first hinted request never stalls the lease on it.
-        if(const char* sdir=getenv("Q27_METAL_SNAPSHOT_DIR"); sdir && *sdir) {
+        // Prefix snapshots Phase 2: opt-in via --snapshot-dir (env fallback
+        // Q27_METAL_SNAPSHOT_DIR); budget via --snapshot-max-mb /
+        // Q27_METAL_SNAPSHOT_MAX_MB (validated, fail-loud, same class as
+        // the admission budget; default 8192 MB). The artifact identity
+        // hash (~3 s over the 7 GB mapping) is primed HERE, at startup, so
+        // the first hinted request never stalls the lease on it.
+        std::string sdir=snapshot_dir;
+        if(sdir.empty())
+            if(const char* senv=getenv("Q27_METAL_SNAPSHOT_DIR"); senv && *senv) sdir=senv;
+        if(!sdir.empty()) {
             uint64_t snap_mb=8192;
-            if(const char* smax=getenv("Q27_METAL_SNAPSHOT_MAX_MB"); smax && *smax) {
+            if(snapshot_max_mb) snap_mb=snapshot_max_mb; // --snapshot-max-mb, validated at parse
+            else if(const char* smax=getenv("Q27_METAL_SNAPSHOT_MAX_MB"); smax && *smax) {
                 char* end=nullptr; errno=0;
                 const unsigned long long mb=strtoull(smax,&end,10);
                 if(errno || end==smax || *end || !mb || mb>(1ull<<24))
@@ -523,7 +535,7 @@ struct Runtime {
             std::error_code ec;
             std::filesystem::create_directories(sdir,ec);
             if(ec || !std::filesystem::is_directory(sdir))
-                throw std::runtime_error(std::string("Q27_METAL_SNAPSHOT_DIR is not a usable directory: ")+sdir);
+                throw std::runtime_error("snapshot dir (--snapshot-dir / Q27_METAL_SNAPSHOT_DIR) is not a usable directory: "+sdir);
             const unsigned char* sha=slots[0]->engine.snapshot_identity();
             // Full 160-bit identity in the tag: a truncated prefix could
             // collide across artifacts sharing a directory and let one
@@ -561,9 +573,11 @@ struct Runtime {
             // "snapshot" hint. With the snapshot dir already opted in,
             // prompts at/above the threshold behave as hinted; the existing
             // covered-prefix skip and LRU budget bound the write traffic.
-            // Q27_METAL_SNAPSHOT_AUTO overrides (tokens; 0 disables auto).
+            // --snapshot-auto / Q27_METAL_SNAPSHOT_AUTO overrides (tokens;
+            // 0 disables auto).
             snap_auto_min=4096;
-            if(const char* sauto=getenv("Q27_METAL_SNAPSHOT_AUTO"); sauto && *sauto) {
+            if(snapshot_auto>=0) snap_auto_min=(size_t)snapshot_auto; // --snapshot-auto, validated at parse
+            else if(const char* sauto=getenv("Q27_METAL_SNAPSHOT_AUTO"); sauto && *sauto) {
                 char* end=nullptr; errno=0;
                 const unsigned long long v=strtoull(sauto,&end,10);
                 if(errno || end==sauto || *end || v>(1ull<<24))
@@ -571,7 +585,7 @@ struct Runtime {
                 snap_auto_min=(size_t)v;
             }
             fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB, auto>=%zu tokens, tag %s\n",
-                    sdir,(unsigned long long)snap_mb,snap_auto_min,tag.c_str());
+                    sdir.c_str(),(unsigned long long)snap_mb,snap_auto_min,tag.c_str());
         }
         if(constrain_tools) {
             vocab_bytes_v=tokenizer.vocab_bytes();
@@ -1143,18 +1157,22 @@ q27::SamplingParams sampling_params(const json& body) {
 
 // Per-endpoint defaults mirror the CUDA server (codex P3 on this round):
 // /v1/messages 1024, OpenAI completions/chat 256, responses 4096.
-// Q27_METAL_MAX_TOKENS_DEFAULT overrides all of them for requests that
-// omit max_tokens (or send null, which json::value also defaults): pi.dev
-// sends max_tokens:null, and the CUDA-parity 256 truncates real agent
-// turns mid-answer ("maximum output token limit", 2026-07-17). Explicit
-// client values always win; the context preflight still clamps to the
-// remaining window.
+// --max-tokens-default (flag wins; env fallback Q27_METAL_MAX_TOKENS_DEFAULT)
+// overrides all of them for requests that omit max_tokens (or send null,
+// which json::value also defaults): pi.dev sends max_tokens:null, and the
+// CUDA-parity 256 truncates real agent turns mid-answer ("maximum output
+// token limit", 2026-07-17). Explicit client values always win; the
+// context preflight still clamps to the remaining window.
+// Set once in main (before the server accepts) from --max-tokens-default;
+// 0 = flag absent.
+long long max_tokens_default_flag=0;
 uint32_t max_tokens(const json& body,long long dflt) {
     static const long long env_dflt=[]{
         const char* e=getenv("Q27_METAL_MAX_TOKENS_DEFAULT");
         return e&&*e?atoll(e):0ll;
     }();
     if(env_dflt>0) dflt=env_dflt;
+    if(max_tokens_default_flag>0) dflt=max_tokens_default_flag; // flag wins over env
     long long value=body.value("max_tokens",body.value("max_output_tokens",dflt));
     if(value<0 || value>UINT32_MAX) throw std::runtime_error("invalid max_tokens");
     return (uint32_t)value;
@@ -1173,13 +1191,21 @@ void json_response(httplib::Response& response,const json& value,int status=200)
 
 int main(int argc,char** argv) {
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n",argv[0]);
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n"
+                       "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
+                       "       (the snapshot/max-tokens/budget flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,MAX_TOKENS_DEFAULT,BUDGET_MB}; an explicit flag wins)\n",argv[0]);
         return 1;
     }
     try {
         std::string model=argv[1],tok=argv[2],host="127.0.0.1";
-        std::string trace_path;
+        std::string trace_path,snapshot_dir;
         uint32_t port=8080,context=8192,width=0,suffix_width=0,prefix_entries=1,slot_count=2;
+        // Shipped-semantics knobs as flags (homebrew Phase-2 pre-tag);
+        // sentinel = flag absent, Runtime falls back to the env twin.
+        // snapshot_auto keeps a signed sentinel because 0 is meaningful
+        // (hint-only saves).
+        uint32_t budget_mb=0,snapshot_max_mb=0,max_tokens_default=0;
+        long long snapshot_auto=-1;
         bool turbo3=false; bool constrain_tools=false;
         for(int i=3;i<argc;i++) {
             std::string arg=argv[i];
@@ -1193,6 +1219,14 @@ int main(int argc,char** argv) {
             else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
             else if(arg=="--constrain-tools") constrain_tools=true;
             else if(arg=="--trace" && i+1<argc) trace_path=argv[++i];
+            else if(arg=="--snapshot-dir" && i+1<argc) { snapshot_dir=argv[++i]; if(snapshot_dir.empty()) throw std::runtime_error("invalid --snapshot-dir"); }
+            // The env twins reject 0 as malformed, and 0 here would silently
+            // collapse into the "flag absent" sentinel — so it fails loud
+            // in-branch (post-loop checks can no longer tell 0 from unset).
+            else if(arg=="--snapshot-max-mb" && i+1<argc) { snapshot_max_mb=parse_u32(argv[++i],"--snapshot-max-mb"); if(!snapshot_max_mb||snapshot_max_mb>(1u<<24)) throw std::runtime_error("--snapshot-max-mb must be an integer 1..16777216"); }
+            else if(arg=="--snapshot-auto" && i+1<argc) { snapshot_auto=parse_u32(argv[++i],"--snapshot-auto"); if(snapshot_auto>(1ll<<24)) throw std::runtime_error("--snapshot-auto must be an integer 0..16777216"); }
+            else if(arg=="--max-tokens-default" && i+1<argc) { max_tokens_default=parse_u32(argv[++i],"--max-tokens-default"); if(!max_tokens_default) throw std::runtime_error("--max-tokens-default must be >= 1"); }
+            else if(arg=="--budget-mb" && i+1<argc) { budget_mb=parse_u32(argv[++i],"--budget-mb"); if(!budget_mb||budget_mb>(1u<<24)) throw std::runtime_error("--budget-mb must be an integer 1..16777216"); }
             else throw std::runtime_error("unknown/incomplete argument: "+arg);
         }
         if(port>65535) throw std::runtime_error("port out of range");
@@ -1211,7 +1245,9 @@ int main(int argc,char** argv) {
         // holds with one competing slot; >2 needs the scheduler and the
         // width/stats model extended first (codex P2 on d243f92).
         if(slot_count<1 || slot_count>2) throw std::runtime_error("--slots must be 1..2 in multislot Phase 1");
-        Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count);
+        max_tokens_default_flag=max_tokens_default;
+        Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count,
+                        budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto);
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
             runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
