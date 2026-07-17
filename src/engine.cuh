@@ -212,6 +212,35 @@ struct Engine {
     std::vector<int> snap_toks;
     bool have_snap = false;
     int perm = 0;
+    // ---- P3 T2 (capture plan 2026-07-16): device-resolved GDN role tables.
+    // d_gdn_tab = ONE flat init-time upload of [2][N_LAYER][W_MAX] float*:
+    // ring half first, S half second; entry [il][ph] = the physical buffer
+    // RBuf/SBuf return when (role+perm)%W_MAX == ph (attn layers stay
+    // nullptr, never indexed). The conv_step_t/delta_step_t twins index
+    // (table + il*W_MAX) with *d_perm_scalar, so a captured fused round no
+    // longer bakes host-resolved role pointers -- the T3 enabler for
+    // cross-round graph exec reuse. Tables are read ONLY when a caller asks
+    // gdn_mix for use_tables: the fused path does from T2 on (mix_all in
+    // conductor.h, eager first per the plan gate; T3 captures the same
+    // launches); the solo path never passes the flag, so its kernels/
+    // pointers are byte-for-byte untouched. h_perm_pin is the PINNED
+    // per-engine staging int the caller cudaMemcpyAsyncs to d_perm_scalar
+    // on cstm before each fused round / graph launch (pinned: no new
+    // pageable-blocking semantics; at most one DISTINCT VALUE in flight per
+    // round -- the guard-trip fallback may enqueue a second byte-identical
+    // copy (perm is constant within a round); the round sync fences the
+    // next rewrite).
+    float** d_gdn_tab = nullptr;   // base == ring half
+    float** d_gdn_S_tab = nullptr; // = d_gdn_tab + N_LAYER*W_MAX
+    int* d_perm_scalar = nullptr;
+    int* h_perm_pin = nullptr;
+    // Stage the CURRENT host perm to the device scalar on st (T3 calls this
+    // per capture-mode round, before the graph launch on the same stream).
+    void stage_perm_async(cudaStream_t st) {
+        *h_perm_pin = perm;
+        CUDA_CHECK(cudaMemcpyAsync(d_perm_scalar, h_perm_pin, sizeof(int),
+                                   cudaMemcpyHostToDevice, st));
+    }
     // ---- GRAPH ZOO (read before any width/depth change: miss one and a decode
     // path silently runs a stale graph). perm is mod-W_MAX=12 (12 GDN state
     // buffers), so every spec/gated set below is [..][perm=0..11]. Two NON-spec
@@ -726,6 +755,29 @@ struct Engine {
                     (size_t)(W_MAX + 1) * ((size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH) * 4;
                 attn_cache_idx.push_back(-1);
             }
+        }
+        // P3 T2: upload the device role-pointer tables (ring half + S half,
+        // one flat alloc) and the perm scalar, ONCE, now that every role
+        // buffer above has its final address. Inert unless the conv/delta
+        // table twins run (gdn_mix use_tables; see the member block).
+        {
+            const size_t half = (size_t)N_LAYER * W_MAX;
+            std::vector<float*> tab(2 * half, nullptr);
+            for (int il = 0; il < N_LAYER; il++) {
+                if (attn_layer[il]) continue;
+                for (int ph = 0; ph < W_MAX; ph++) {
+                    tab[(size_t)il * W_MAX + ph] = ph == 0 ? conv_ring[il] : ring_sp[ph - 1][il];
+                    tab[half + (size_t)il * W_MAX + ph] = ph == 0 ? S[il] : S_sp[ph - 1][il];
+                }
+            }
+            CUDA_CHECK(cudaMalloc((void**)&d_gdn_tab, 2 * half * sizeof(float*)));
+            CUDA_CHECK(cudaMemcpy(d_gdn_tab, tab.data(), 2 * half * sizeof(float*),
+                                  cudaMemcpyHostToDevice));
+            d_gdn_S_tab = d_gdn_tab + half;
+            CUDA_CHECK(cudaMalloc((void**)&d_perm_scalar, sizeof(int)));
+            CUDA_CHECK(cudaMemset(d_perm_scalar, 0, sizeof(int)));
+            CUDA_CHECK(cudaMallocHost((void**)&h_perm_pin, sizeof(int)));
+            *h_perm_pin = 0;
         }
         if (own_weights) {
             fprintf(stderr, "uploading weights...\n");
@@ -1345,13 +1397,35 @@ struct Engine {
     // value, same launch sequence). Width stays MEMBER vw: each engine's mix
     // walks its OWN granted lanes 0..vw-1, never the union width (the
     // conductor sets vw per round via set_round_width before the fused round).
-    void gdn_mix(int il, cudaStream_t st) {
+    // P3 T2: use_tables=false (every existing call site) keeps the shipped
+    // conv_step/delta_step launches with host-resolved RBuf/SBuf pointers --
+    // the solo path is untouched by construction. use_tables=true swaps in
+    // the TABLE TWINS (identical math, device-resolved role pointers via
+    // d_gdn_tab + *d_perm_scalar); the FUSED path passes it (mix_all,
+    // conductor.h -- eager from T2 on, captured in T3), after the caller's
+    // stage_perm_async has landed the round's perm in the scalar.
+    void gdn_mix(int il, cudaStream_t st, bool use_tables = false) {
         const float eps = EPS;
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         // P12: per-lane recurrent chain -- role k reads role k-1 (written fresh
         // earlier this round) and writes role k. Only lanes < vw are live; a
         // width-vw graph skips the rest, leaving their (never-read) role buffers
         // untouched. Lane a (role 0, the pending token) always runs.
+        if (use_tables) {
+            float* const* rt = d_gdn_tab + (size_t)il * W_MAX;
+            float* const* stab = d_gdn_S_tab + (size_t)il * W_MAX;
+            q27k::conv_step_t(rt, d_perm_scalar, 0, 0, W_MAX, qkv, cw, convout, GDN_CH, st);
+            for (int L = 1; L < vw; L++)
+                q27k::conv_step_t(rt, d_perm_scalar, L - 1, L, W_MAX, qkv_L[L], cw,
+                                  convout_L[L], GDN_CH, st);
+            q27k::l2norm3(LANESW(convout), 32,
+                          GDN_DIM, eps, st, vw);
+            q27k::delta_step_t(stab, d_perm_scalar, 0, 0, W_MAX, convout, g, beta, o, st);
+            for (int L = 1; L < vw; L++)
+                q27k::delta_step_t(stab, d_perm_scalar, L - 1, L, W_MAX, convout_L[L], g_L[L],
+                                   beta_L[L], o_L[L], st);
+            return;
+        }
         q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, st); // lane 0
         for (int L = 1; L < vw; L++)
             q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, st);
@@ -1755,6 +1829,52 @@ struct Engine {
         spec_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
         reset_gdn_mtp();
+        // Q27_GRAPH_TRACE=1: attribute device memory to each instantiated
+        // graph family (3090 OOM diagnosis 2026-07-16). memGetInfo brackets
+        // every instantiate; a FAILED instantiate prints the table before
+        // aborting so the failing run still attributes what was consumed.
+        static const char* const fam_name[] = {"spec",   "draft",    "draft_lo",    "draft_step",
+                                               "verify", "verify_w", "spec_sample", "verify_sample_w"};
+        enum { F_SPEC, F_DRAFT, F_DRAFT_LO, F_STEP, F_VERIFY, F_VERIFY_W, F_SSAMPLE, F_VSAMPLE_W, F_N };
+        size_t fam_bytes[F_N] = {};
+        int fam_n[F_N] = {};
+        const bool gtrace = getenv("Q27_GRAPH_TRACE") && atoi(getenv("Q27_GRAPH_TRACE")) != 0;
+        auto gtrace_dump = [&]() {
+            size_t fr = 0, tot = 0;
+            cudaMemGetInfo(&fr, &tot);
+            size_t all = 0;
+            for (int f = 0; f < F_N; f++) all += fam_bytes[f];
+            for (int f = 0; f < F_N; f++)
+                if (fam_n[f])
+                    fprintf(stderr, "graph-trace: %-16s %4d execs %9.1f MB\n", fam_name[f],
+                            fam_n[f], fam_bytes[f] / 1e6);
+            fprintf(stderr, "graph-trace: TOTAL %.1f MB across families; device free %.0f/%.0f MB\n",
+                    all / 1e6, fr / 1e6, tot / 1e6);
+        };
+        auto ginst = [&](cudaGraphExec_t* ex, cudaGraph_t g, int fam) {
+            size_t f0 = 0, t0 = 0;
+            if (gtrace) cudaMemGetInfo(&f0, &t0);
+            cudaError_t ge = cudaGraphInstantiate(ex, g, nullptr, nullptr, 0);
+            if (ge != cudaSuccess) {
+                fprintf(stderr, "cudaGraphInstantiate FAILED in family %s (exec #%d, perm %d): %s\n",
+                        fam_name[fam], fam_n[fam] + 1, perm, cudaGetErrorString(ge));
+                if (gtrace) {
+                    size_t f1 = 0, t1 = 0; // codex P3: attribute the failing attempt too
+                    cudaMemGetInfo(&f1, &t1);
+                    if (f1 <= f0)
+                        fprintf(stderr, "graph-trace: failing attempt consumed %.1f MB\n",
+                                (f0 - f1) / 1e6);
+                    gtrace_dump();
+                }
+                CUDA_CHECK(ge);
+            }
+            fam_n[fam]++;
+            if (gtrace) {
+                size_t f1 = 0, t1 = 0;
+                cudaMemGetInfo(&f1, &t1);
+                if (f1 <= f0) fam_bytes[fam] += f0 - f1; // async frees can grow `free`
+            }
+        };
         // capture all 12 cyclic permutations (capture records; does not execute)
         for (int p = 0; p < W_MAX; p++) {
             perm = p;
@@ -1764,7 +1884,7 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_round_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
-            CUDA_CHECK(cudaGraphInstantiate(&spec_graph[p], gr, nullptr, nullptr, 0));
+            ginst(&spec_graph[p], gr, F_SPEC);
             CUDA_CHECK(cudaGraphDestroy(gr));
             // P12b: the gated draft graph produces gate_maxd drafts + margins.
             dmax = gate_maxd;
@@ -1776,7 +1896,7 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_draft_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gd));
-            CUDA_CHECK(cudaGraphInstantiate(&draft_graph[p], gd, nullptr, nullptr, 0));
+            ginst(&draft_graph[p], gd, F_DRAFT);
             CUDA_CHECK(cudaGraphDestroy(gd));
             // P13 adaptive maxd: also capture the depth-4 draft (draft_graph_lo)
             // so spec_round can pick draft depth per round. gate_maxd is forced to
@@ -1792,7 +1912,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_draft_launches();
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gdl));
-                CUDA_CHECK(cudaGraphInstantiate(&draft_graph_lo[p], gdl, nullptr, nullptr, 0));
+                ginst(&draft_graph_lo[p], gdl, F_DRAFT_LO);
                 CUDA_CHECK(cudaGraphDestroy(gdl));
                 dmax = gate_maxd;
             }
@@ -1805,13 +1925,13 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_draft_step_launches(k);
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gs));
-                CUDA_CHECK(cudaGraphInstantiate(&draft_step_graph[k][p], gs, nullptr, nullptr, 0));
+                ginst(&draft_step_graph[k][p], gs, F_STEP);
                 CUDA_CHECK(cudaGraphDestroy(gs));
             }
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_verify_launches(solo_view());
             CUDA_CHECK(cudaStreamEndCapture(stm, &gv));
-            CUDA_CHECK(cudaGraphInstantiate(&verify_graph[p], gv, nullptr, nullptr, 0));
+            ginst(&verify_graph[p], gv, F_VERIFY);
             CUDA_CHECK(cudaGraphDestroy(gv));
             // P12/P12b: per-width verify graphs (W = cap+1 lanes, 2..6). Same
             // buffers as the widest verify; only ntok/nbatch shrink + finish caps
@@ -1824,7 +1944,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
-                CUDA_CHECK(cudaGraphInstantiate(&verify_graph_w[W][p], gw, nullptr, nullptr, 0));
+                ginst(&verify_graph_w[W][p], gw, F_VERIFY_W);
                 CUDA_CHECK(cudaGraphDestroy(gw));
             }
             // width-12 P1: the suffix drafter's wide verify. Suffix rounds
@@ -1836,8 +1956,7 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gs_));
-                CUDA_CHECK(
-                    cudaGraphInstantiate(&verify_graph_w[sfx_w][p], gs_, nullptr, nullptr, 0));
+                ginst(&verify_graph_w[sfx_w][p], gs_, F_VERIFY_W);
                 CUDA_CHECK(cudaGraphDestroy(gs_));
             }
             vw = 5;
@@ -1858,7 +1977,7 @@ struct Engine {
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_sample_round_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
-            CUDA_CHECK(cudaGraphInstantiate(&spec_sample_graph[p], gr, nullptr, nullptr, 0));
+            ginst(&spec_sample_graph[p], gr, F_SSAMPLE);
             CUDA_CHECK(cudaGraphDestroy(gr));
             // P14: per-width sampled verify graphs (W=2..5), mirroring the greedy
             // verify_graph_w loop. The sampled tail is always depth-4, so the
@@ -1870,12 +1989,12 @@ struct Engine {
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
                 spec_verify_launches_sampled(solo_view());
                 CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
-                CUDA_CHECK(
-                    cudaGraphInstantiate(&verify_sample_graph_w[W][p], gw, nullptr, nullptr, 0));
+                ginst(&verify_sample_graph_w[W][p], gw, F_VSAMPLE_W);
                 CUDA_CHECK(cudaGraphDestroy(gw));
             }
             vw = 5;
         }
+        if (gtrace) gtrace_dump();
         perm = 0;
         // P12: confidence-gated depth. Q27_PMIN=theta engages the gate (drafter
         // top1-top2 margin >= theta extends the verify one lane deeper). <=0 or
@@ -2136,6 +2255,26 @@ struct Engine {
         gs.verify_ms += verify_ms;
         gs.draft_steps += steps;
     }
+    // ---- P3 T3 exec-cache accessors (A4; plan 2026-07-16-batch-p3-capture) --
+    // why: the conductor's graph-cache shape key includes each member's
+    // KV-cache kind -- attn_mix's kv_store/attn_decode kernel family
+    // branches on it at capture time. Init-fixed per engine, keyed anyway:
+    // a recycled Engine* address must never hit a differently-configured
+    // engine's cached exec.
+    int kv_cache_kind() const { return kv_kind; }
+    // why: the T3 ALWAYS-ON hit guard re-derives the device state a cached
+    // exec's table twins consume -- the GDN role-table base, the perm
+    // scalar the twins dereference, and the pinned staging int
+    // stage_perm_async copies from -- and compares each against the
+    // capture-stored snapshot (B8 discipline) before any replay.
+    float* const* gdn_role_tab() const { return d_gdn_tab; }
+    const int* perm_scalar_dev() const { return d_perm_scalar; }
+    const int* perm_pin_host() const { return h_perm_pin; }
+    // why: the guard's staging-expectation check -- stage_perm_async(cstm)
+    // must already have run this round, so the pinned int must carry the
+    // CURRENT perm; a stale value means the copy the twins depend on was
+    // never staged and a replay would consume last round's rotation.
+    int cur_perm() const { return perm; }
     //
     // Set the granted verify width for the NEXT (eager, fused) round. vw is
     // capture-time state for the graph zoo, so this must only be called on
