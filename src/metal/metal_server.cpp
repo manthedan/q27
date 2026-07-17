@@ -1133,14 +1133,34 @@ int main(int argc,char** argv) {
         // response.completed. Codex keys off the JSON `type` field.
         server.Post("/v1/responses",guarded([&](const json& body,httplib::Response& r){
             std::string input=body.contains("input")?text_content(body["input"]):"";
+            // Validate BEFORE the preamble (codex P1): an item-array input
+            // that text_content cannot flatten must fail loud here — a
+            // nonempty preamble would otherwise slip past the empty-ids
+            // check and generate from the tool declarations alone.
+            if(input.empty()) throw std::runtime_error("input is empty");
             // Tools preamble parity (codex P1 on the parity-audit merge):
             // this endpoint feeds raw flattened text to the model (no chat
             // template), so without the schemas prepended the constrainer
             // could mask decoding toward tools the model has never seen.
-            // Full CUDA-style Responses normalization (instructions,
+            // Flat Responses function entries are normalized to the nested
+            // shape tools_preamble renders on the chat/CUDA paths (codex
+            // P2); hosted tool types are skipped, never rejected. Full
+            // CUDA-style Responses normalization (instructions,
             // function_call bridging, custom tools) is a recorded follow-up.
-            if(body.contains("tools") && body["tools"].is_array() && !body["tools"].empty())
-                input=q27::tools_preamble(body["tools"])+"\n\n"+input;
+            if(body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
+                json norm=json::array();
+                for(const auto& t:body["tools"]) {
+                    if(!t.is_object()) continue;
+                    if(t.contains("function") && t["function"].is_object()) norm.push_back(t);
+                    else if(t.value("type","")=="function" && t.contains("name"))
+                        norm.push_back({{"type","function"},
+                            {"function",{{"name",t.value("name","")},
+                                         {"description",t.value("description","")},
+                                         {"parameters",t.contains("parameters")?t["parameters"]
+                                                                                :json::object()}}}});
+                }
+                if(!norm.empty()) input=q27::tools_preamble(norm)+"\n\n"+input;
+            }
             auto ids=to_u32(runtime.tokenizer.encode(input));
             const uint32_t n=max_tokens(body);
             const q27::SamplingParams sampling=sampling_params(body);
