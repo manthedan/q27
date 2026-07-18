@@ -24,8 +24,9 @@ See `THIRD_PARTY_NOTICES.md` for attribution.
 - all exception containment at the C ABI.
 
 The C process owns the transcript, terminal loop, streaming output, and
-interrupt decision. There is no server, socket, HTTP, SSE, or API-shape
-translation.
+interrupt decision. A dedicated pthread now opens, owns, drives, and closes the
+engine; the UI thread submits synchronous typed generation commands. There is
+no server, socket, HTTP, SSE, or API-shape translation.
 
 Build on macOS:
 
@@ -54,8 +55,14 @@ On the M1 mixed tier, with no resident q27 process and no coordination hold:
   `one`, then `two` (52/1 and 68/1 prompt/output tokens);
 - both runs used `--no-think`, context 512, and no server process.
 
-This establishes direct C → C++ → Metal feasibility. It does not establish
-incremental state reuse, tool execution, cancellation recovery, or parity.
+A follow-up worker smoke returned exactly `worker` through the dedicated
+engine-owner thread. `build/test_q27_agent_worker` uses a fake adapter to gate
+startup failure propagation, state transitions, accounting, and embedded-NUL
+message/output transport without loading a model.
+
+This establishes direct C → worker → C++ → Metal feasibility. It does not
+establish incremental state reuse, tool execution, cancellation recovery, or
+parity.
 
 ## Graduation gates
 
@@ -73,12 +80,13 @@ Phase 0 graduates only when a coordinated model window demonstrates:
 
 After Phase 0, port from the pinned DS4 agent in this order:
 
-1. worker/UI queues and noninteractive event stream;
-2. file read/search/edit tools and bounded asynchronous shell jobs;
-3. q27 `<tool_call>` parsing and constrained generation (not DSML);
-4. transcript/session persistence using `Q27SNAP1` (not DS4 payloads);
-5. compaction;
-6. optional terminal UI and browser tooling.
+1. ~~dedicated engine-owner worker and synchronous typed commands~~;
+2. queued UI events and a noninteractive event stream;
+3. file read/search/edit tools and bounded asynchronous shell jobs;
+4. q27 `<tool_call>` parsing and constrained generation (not DSML);
+5. transcript/session persistence using `Q27SNAP1` (not DS4 payloads);
+6. compaction;
+7. optional terminal UI and browser tooling.
 
 Before step 3, add a q27 `AgentSession` contract that can finalize the last
 emitted token and append new tokens without reset. Only then may the harness

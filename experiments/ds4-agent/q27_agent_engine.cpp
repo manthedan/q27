@@ -73,7 +73,7 @@ extern "C" q27_agent_status q27_agent_generate(
     if (output_tokens) *output_tokens = 0;
     if (!engine || !messages || message_count == 0 || !sink || !alive || max_tokens == 0) {
         set_error(error, error_cap, "invalid generation arguments");
-        return Q27_AGENT_ERROR;
+        return Q27_AGENT_REJECTED;
     }
 
     try {
@@ -82,12 +82,12 @@ extern "C" q27_agent_status q27_agent_generate(
         for (size_t i = 0; i < message_count; ++i) {
             if (!messages[i].role || !messages[i].content) {
                 set_error(error, error_cap, "message role/content must not be null");
-                return Q27_AGENT_ERROR;
+                return Q27_AGENT_REJECTED;
             }
             const std::string role(messages[i].role);
             if (role != "system" && role != "user" && role != "assistant" && role != "tool") {
                 set_error(error, error_cap, "unsupported message role");
-                return Q27_AGENT_ERROR;
+                return Q27_AGENT_REJECTED;
             }
             chat.emplace_back(role,
                               std::string(messages[i].content, messages[i].content_len));
@@ -97,13 +97,13 @@ extern "C" q27_agent_status q27_agent_generate(
             engine->tokenizer->apply_chat_template(chat, enable_thinking != 0);
         if (encoded.empty()) {
             set_error(error, error_cap, "rendered prompt is empty");
-            return Q27_AGENT_ERROR;
+            return Q27_AGENT_REJECTED;
         }
         if (encoded.size() > engine->context ||
             static_cast<uint64_t>(encoded.size()) + max_tokens >
                 static_cast<uint64_t>(engine->context) + 1) {
             set_error(error, error_cap, "prompt plus max_tokens exceeds context");
-            return Q27_AGENT_ERROR;
+            return Q27_AGENT_REJECTED;
         }
 
         std::vector<uint32_t> ids;

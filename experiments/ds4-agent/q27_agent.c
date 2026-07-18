@@ -9,7 +9,7 @@
  * DS4's tools, jobs, persistence, and terminal UI. See THIRD_PARTY_NOTICES.md.
  */
 
-#include "q27_agent_engine.h"
+#include "q27_agent_worker.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -252,7 +252,7 @@ static int read_line_interruptible(input_reader *reader, char **line,
     }
 }
 
-static int run_turn(q27_agent_engine *engine, transcript *chat, int think,
+static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
                     uint32_t max_tokens) {
     if (interrupted) {
         fprintf(stderr, "q27-agent: pending interrupt; generation not started\n");
@@ -272,8 +272,8 @@ static int run_turn(q27_agent_engine *engine, transcript *chat, int think,
     output_buffer output = {0};
     char error[512] = {0};
     uint32_t prompt_tokens = 0, output_tokens = 0;
-    q27_agent_status status = q27_agent_generate(
-        engine, view, chat->len, think, max_tokens, output_sink,
+    q27_agent_status status = q27_agent_worker_generate(
+        worker, view, chat->len, think, max_tokens, output_sink,
         continue_running, &output, &prompt_tokens, &output_tokens,
         error, sizeof(error));
     free(view);
@@ -376,10 +376,10 @@ int main(int argc, char **argv) {
     }
 
     char error[512] = {0};
-    q27_agent_engine *engine = q27_agent_engine_open(
+    q27_agent_worker *worker = q27_agent_worker_start(
         model, tokenizer, context, error, sizeof(error));
-    if (!engine) {
-        fprintf(stderr, "q27-agent: engine open failed: %s\n",
+    if (!worker) {
+        fprintf(stderr, "q27-agent: worker start failed: %s\n",
                 error[0] ? error : "unknown error");
         close_signal_pipe();
         return 1;
@@ -391,7 +391,7 @@ int main(int argc, char **argv) {
 
     if (ok && prompt) {
         ok = transcript_append(&chat, "user", prompt) &&
-             run_turn(engine, &chat, think, max_tokens);
+             run_turn(worker, &chat, think, max_tokens);
     } else if (ok) {
         char *line = NULL;
         size_t len = 0, cap = 0;
@@ -421,13 +421,13 @@ int main(int argc, char **argv) {
                 (len == 2 && !memcmp(line, ":q", 2))) break;
             if (len == 0) continue;
             ok = transcript_append_len(&chat, "user", line, len) &&
-                 run_turn(engine, &chat, think, max_tokens);
+                 run_turn(worker, &chat, think, max_tokens);
         }
         free(line);
     }
 
     transcript_free(&chat);
-    q27_agent_engine_close(engine);
+    q27_agent_worker_stop(worker);
     close_signal_pipe();
     return ok && !interrupted ? 0 : 1;
 }

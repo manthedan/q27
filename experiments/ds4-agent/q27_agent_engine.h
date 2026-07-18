@@ -24,7 +24,8 @@ typedef int (*q27_agent_alive_check)(void *opaque);
 typedef enum {
     Q27_AGENT_OK = 0,
     Q27_AGENT_CANCELLED = 1,
-    Q27_AGENT_ERROR = 2
+    Q27_AGENT_REJECTED = 2, // request validation failed; engine remains reusable
+    Q27_AGENT_ERROR = 3     // engine/runtime failure; worker may be poisoned
 } q27_agent_status;
 
 q27_agent_engine *q27_agent_engine_open(const char *model_path,
