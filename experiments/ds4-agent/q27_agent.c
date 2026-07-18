@@ -73,6 +73,7 @@ static void usage(FILE *out, const char *argv0) {
         "  -n, --max-tokens N      maximum generated tokens (default 512)\n"
         "  -c, --context N         engine context (default 8192)\n"
         "      --no-think          append the Qwen no-thinking prefix\n"
+        "      --output-format F   text (default) or jsonl events\n"
         "  -h, --help              show this help\n",
         argv0);
 }
@@ -155,48 +156,105 @@ static int continue_running(void *opaque) {
     return !interrupted;
 }
 
-static int output_sink(const char *bytes, size_t len, void *opaque) {
-    output_buffer *out = opaque;
-    if (interrupted) return 0;
-    if (len && fwrite(bytes, 1, len, stdout) != len) {
-        out->failed = 1;
-        return 0;
-    }
-    if (fflush(stdout) == EOF) {
-        out->failed = 1;
-        return 0;
-    }
-    if (len > SIZE_MAX - out->len - 1) {
-        out->failed = 1;
-        return 0;
-    }
+static int output_append(output_buffer *out, const unsigned char *bytes, size_t len) {
+    if (len > SIZE_MAX - out->len - 1) return 0;
     size_t need = out->len + len + 1;
     if (need > out->cap) {
         size_t next = out->cap ? out->cap : 4096;
         while (next < need) {
-            if (next > SIZE_MAX / 2) {
-                out->failed = 1;
-                return 0;
-            }
+            if (next > SIZE_MAX / 2) return 0;
             next *= 2;
         }
         char *grown = realloc(out->bytes, next);
-        if (!grown) {
-            out->failed = 1;
-            return 0;
-        }
+        if (!grown) return 0;
         out->bytes = grown;
         out->cap = next;
     }
-    memcpy(out->bytes + out->len, bytes, len);
+    if (len) memcpy(out->bytes + out->len, bytes, len);
     out->len += len;
     out->bytes[out->len] = '\0';
     return 1;
 }
 
+static const char *event_type_name(q27_agent_event_type type) {
+    switch (type) {
+    case Q27_EVENT_STATE: return "state";
+    case Q27_EVENT_TEXT_DELTA: return "text_delta";
+    case Q27_EVENT_TURN_DONE: return "turn_done";
+    case Q27_EVENT_REJECTED: return "rejected";
+    case Q27_EVENT_ERROR: return "error";
+    }
+    return "unknown";
+}
+
+static const char *status_name(q27_agent_status status) {
+    switch (status) {
+    case Q27_AGENT_OK: return "ok";
+    case Q27_AGENT_CANCELLED: return "cancelled";
+    case Q27_AGENT_REJECTED: return "rejected";
+    case Q27_AGENT_ERROR: return "error";
+    }
+    return "unknown";
+}
+
+static const char *worker_state_name(q27_agent_worker_state state) {
+    switch (state) {
+    case Q27_WORKER_STARTING: return "starting";
+    case Q27_WORKER_IDLE: return "idle";
+    case Q27_WORKER_GENERATING: return "generating";
+    case Q27_WORKER_STOPPING: return "stopping";
+    case Q27_WORKER_ERROR: return "error";
+    case Q27_WORKER_STOPPED: return "stopped";
+    }
+    return "unknown";
+}
+
+static char *base64_encode(const unsigned char *data, size_t len) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (len > SIZE_MAX - 2) return NULL;
+    size_t groups = (len + 2) / 3;
+    if (groups > (SIZE_MAX - 1) / 4) return NULL;
+    size_t out_len = 4 * groups;
+    char *out = malloc(out_len + 1);
+    if (!out) return NULL;
+    size_t i = 0, o = 0;
+    while (i < len) {
+        uint32_t a = data[i++];
+        uint32_t b = i < len ? data[i++] : 0;
+        uint32_t c = i < len ? data[i++] : 0;
+        uint32_t triple = (a << 16) | (b << 8) | c;
+        out[o++] = table[(triple >> 18) & 63];
+        out[o++] = table[(triple >> 12) & 63];
+        out[o++] = table[(triple >> 6) & 63];
+        out[o++] = table[triple & 63];
+    }
+    if (len % 3 == 1) out[out_len - 2] = out[out_len - 1] = '=';
+    else if (len % 3 == 2) out[out_len - 1] = '=';
+    out[out_len] = '\0';
+    return out;
+}
+
+static int print_json_event(const q27_agent_event *event) {
+    char *data = base64_encode(event->data, event->data_len);
+    if (!data) return 0;
+    int ok = fprintf(stdout,
+        "{\"seq\":%llu,\"command_id\":%llu,\"type\":\"%s\","
+        "\"state\":\"%s\",\"status\":\"%s\",\"data_b64\":\"%s\","
+        "\"prompt_tokens\":%u,\"output_tokens\":%u}\n",
+        (unsigned long long)event->sequence,
+        (unsigned long long)event->command_id,
+        event_type_name(event->type), worker_state_name(event->state),
+        status_name(event->status), data,
+        event->prompt_tokens, event->output_tokens) >= 0 &&
+        fflush(stdout) != EOF;
+    free(data);
+    return ok;
+}
+
 // Returns 1 for a complete line (without newline), 0 for clean EOF,
 // -1 for a read error, and -2 for a signal notification. Reading through
-// poll + the self-pipe closes the check-before-getline signal race.
+// poll + the self-pipe closes the check-before-blocking-read signal race.
 static int read_line_interruptible(input_reader *reader, char **line,
                                    size_t *line_len, size_t *line_cap,
                                    int *had_newline) {
@@ -253,7 +311,7 @@ static int read_line_interruptible(input_reader *reader, char **line,
 }
 
 static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
-                    uint32_t max_tokens) {
+                    uint32_t max_tokens, int jsonl) {
     if (interrupted) {
         fprintf(stderr, "q27-agent: pending interrupt; generation not started\n");
         return 0;
@@ -269,19 +327,75 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
         view[i].content_len = chat->items[i].content_len;
     }
 
-    output_buffer output = {0};
     char error[512] = {0};
-    uint32_t prompt_tokens = 0, output_tokens = 0;
-    q27_agent_status status = q27_agent_worker_generate(
-        worker, view, chat->len, think, max_tokens, output_sink,
-        continue_running, &output, &prompt_tokens, &output_tokens,
-        error, sizeof(error));
+    uint64_t command_id = 0;
+    q27_agent_status submitted = q27_agent_worker_submit(
+        worker, view, chat->len, think, max_tokens,
+        continue_running, NULL, &command_id, error, sizeof(error));
+    // submit deep-copies every message; the UI transcript is no longer pinned
+    // for the duration of generation.
     free(view);
-    if (!output.failed && (status == Q27_AGENT_OK || output.len > 0) &&
-        (fputc('\n', stdout) == EOF || fflush(stdout) == EOF))
-        output.failed = 1;
+    if (submitted != Q27_AGENT_OK) {
+        fprintf(stderr, "q27-agent: submission rejected: %s\n",
+                error[0] ? error : "unknown error");
+        return 0;
+    }
 
-    if (output.failed) {
+    output_buffer output = {0};
+    q27_agent_status status = Q27_AGENT_ERROR;
+    uint32_t prompt_tokens = 0, output_tokens = 0;
+    int terminal = 0;
+    while (!terminal) {
+        q27_agent_event event;
+        int got = q27_agent_worker_next_event(worker, &event,
+                                               error, sizeof(error));
+        if (got <= 0) {
+            fprintf(stderr, "q27-agent: event stream ended before terminal: %s\n",
+                    got < 0 && error[0] ? error : "worker stopped");
+            free(output.bytes);
+            return 0;
+        }
+        if (event.command_id != command_id) {
+            fprintf(stderr, "q27-agent: event command mismatch\n");
+            q27_agent_event_free(&event);
+            free(output.bytes);
+            q27_agent_worker_request_stop(worker);
+            return 0;
+        }
+        if (event.type == Q27_EVENT_TEXT_DELTA) {
+            if (!output_append(&output, event.data, event.data_len))
+                output.failed = 1;
+            if (!jsonl && !output.failed && event.data_len &&
+                (fwrite(event.data, 1, event.data_len, stdout) != event.data_len ||
+                 fflush(stdout) == EOF))
+                output.failed = 1;
+        }
+        if (jsonl && !output.failed && !print_json_event(&event))
+            output.failed = 1;
+
+        terminal = event.type == Q27_EVENT_TURN_DONE ||
+                   event.type == Q27_EVENT_REJECTED ||
+                   event.type == Q27_EVENT_ERROR;
+        if (terminal) {
+            status = event.status;
+            prompt_tokens = event.prompt_tokens;
+            output_tokens = event.output_tokens;
+            size_t n = event.data_len < sizeof(error) - 1 ?
+                       event.data_len : sizeof(error) - 1;
+            if (n) memcpy(error, event.data, n);
+            error[n] = '\0';
+        }
+        q27_agent_event_free(&event);
+        if (output.failed) {
+            q27_agent_worker_request_stop(worker);
+            fprintf(stderr, "q27-agent: output failure\n");
+            free(output.bytes);
+            return 0;
+        }
+    }
+
+    if (!jsonl && (status == Q27_AGENT_OK || output.len > 0) &&
+        (fputc('\n', stdout) == EOF || fflush(stdout) == EOF)) {
         fprintf(stderr, "q27-agent: output failure\n");
         free(output.bytes);
         return 0;
@@ -315,7 +429,7 @@ int main(int argc, char **argv) {
         "You are q27-agent, an experimental local coding assistant. "
         "Answer concisely. Tool execution is not enabled in this Phase-0 build.";
     uint32_t context = 8192, max_tokens = 512;
-    int think = 1;
+    int think = 1, jsonl = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -340,6 +454,13 @@ int main(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--no-think")) {
             think = 0;
+        } else if (!strcmp(arg, "--output-format")) {
+            if (++i == argc ||
+                (strcmp(argv[i], "text") && strcmp(argv[i], "jsonl"))) {
+                fprintf(stderr, "q27-agent: output format must be text or jsonl\n");
+                return 2;
+            }
+            jsonl = !strcmp(argv[i], "jsonl");
         } else if (arg[0] == '-') {
             fprintf(stderr, "q27-agent: unknown option: %s\n", arg);
             return 2;
@@ -391,7 +512,7 @@ int main(int argc, char **argv) {
 
     if (ok && prompt) {
         ok = transcript_append(&chat, "user", prompt) &&
-             run_turn(worker, &chat, think, max_tokens);
+             run_turn(worker, &chat, think, max_tokens, jsonl);
     } else if (ok) {
         char *line = NULL;
         size_t len = 0, cap = 0;
@@ -421,7 +542,7 @@ int main(int argc, char **argv) {
                 (len == 2 && !memcmp(line, ":q", 2))) break;
             if (len == 0) continue;
             ok = transcript_append_len(&chat, "user", line, len) &&
-                 run_turn(worker, &chat, think, max_tokens);
+                 run_turn(worker, &chat, think, max_tokens, jsonl);
         }
         free(line);
     }

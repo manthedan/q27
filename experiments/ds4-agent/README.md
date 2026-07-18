@@ -24,9 +24,10 @@ See `THIRD_PARTY_NOTICES.md` for attribution.
 - all exception containment at the C ABI.
 
 The C process owns the transcript, terminal loop, streaming output, and
-interrupt decision. A dedicated pthread now opens, owns, drives, and closes the
-engine; the UI thread submits synchronous typed generation commands. There is
-no server, socket, HTTP, SSE, or API-shape translation.
+interrupt decision. A dedicated pthread opens, owns, drives, and closes the
+engine. Submission deep-copies the complete message array; the UI thread then
+drains a bounded owned event queue (`state`, binary `text_delta`, and exactly
+one terminal). There is no server, socket, HTTP, SSE, or API-shape translation.
 
 Build on macOS:
 
@@ -36,7 +37,15 @@ make build/q27-agent
   --no-think --max-tokens 32
 ```
 
-Interactive mode omits `--prompt`; `:quit` exits.
+Interactive mode omits `--prompt`; `:quit` exits. Machine-readable events use:
+
+```sh
+./build/q27-agent MODEL.q27 MODEL.tok --prompt 'Reply: ready' \
+  --no-think --output-format jsonl
+```
+
+Every JSONL row carries monotonic `seq`, `command_id`, event `type`, state,
+status, accounting, and exact `data_b64` bytes. Diagnostics remain on stderr.
 
 ### Deliberate limitation
 
@@ -55,10 +64,13 @@ On the M1 mixed tier, with no resident q27 process and no coordination hold:
   `one`, then `two` (52/1 and 68/1 prompt/output tokens);
 - both runs used `--no-think`, context 512, and no server process.
 
-A follow-up worker smoke returned exactly `worker` through the dedicated
-engine-owner thread. `build/test_q27_agent_worker` uses a fake adapter to gate
-startup failure propagation, state transitions, accounting, and embedded-NUL
-message/output transport without loading a model.
+Follow-up worker/event smokes returned exactly `worker` and `events` through
+the dedicated engine-owner thread. The JSONL smoke produced exactly
+`state → text_delta → turn_done`; decoding `data_b64` yielded `events`.
+`build/test_q27_agent_worker` uses a fake adapter to gate startup failure,
+deep binary message ownership, monotonic lifecycle events, request rejection,
+4094-event queue backpressure (5000 deltas), cancellation terminals, and
+shutdown ordering without loading a model. Its ASan/UBSan leg is clean.
 
 This establishes direct C → worker → C++ → Metal feasibility. It does not
 establish incremental state reuse, tool execution, cancellation recovery, or
@@ -81,13 +93,15 @@ Phase 0 graduates only when a coordinated model window demonstrates:
 After Phase 0, port from the pinned DS4 agent in this order:
 
 1. ~~dedicated engine-owner worker and synchronous typed commands~~;
-2. queued UI events and a noninteractive event stream;
-3. file read/search/edit tools and bounded asynchronous shell jobs;
-4. q27 `<tool_call>` parsing and constrained generation (not DSML);
-5. transcript/session persistence using `Q27SNAP1` (not DS4 payloads);
-6. compaction;
-7. optional terminal UI and browser tooling.
+2. ~~queued UI events and a noninteractive JSONL event stream~~;
+3. q27 `AgentSession` append/finalize contract;
+4. file read/search/edit tools and bounded asynchronous shell jobs;
+5. q27 `<tool_call>` parsing and constrained generation (not DSML);
+6. transcript/session persistence using `Q27SNAP1` (not DS4 payloads);
+7. compaction;
+8. optional terminal UI and browser tooling.
 
-Before step 3, add a q27 `AgentSession` contract that can finalize the last
-emitted token and append new tokens without reset. Only then may the harness
-claim incremental prefill or resident-session performance.
+The next slice is the q27 `AgentSession` contract: finalize the last emitted
+token and append new tokens without reset, with fail-closed reset/re-prefill on
+any token-prefix mismatch. Only then may the harness claim incremental prefill
+or resident-session performance.
