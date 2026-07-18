@@ -6,21 +6,14 @@
 #pragma once
 
 #include "../third_party/json.hpp"
+#include "strip_ctrl.h"
 
 #include <string>
 
 namespace q27 {
 
-// Strip ChatML role delimiters from untrusted content/roles so they can't forge
-// prompt structure (Security #7): the tokenizer matches <|im_start|>/<|im_end|>
-// as control tokens anywhere, so a document or tool result containing them would
-// otherwise become real role boundaries. Operator content that legitimately
-// includes the literal markers loses them -- the safe tradeoff vs injection.
-inline std::string strip_ctrl(std::string s) {
-    for (const std::string& m : {std::string("<|im_start|>"), std::string("<|im_end|>")})
-        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
-    return s;
-}
+// strip_ctrl now lives in strip_ctrl.h (single definition shared with
+// tokenizer.cpp's apply_chat_template; see that header's note).
 
 // Tools preamble, verbatim structure from the chat template. `tools` entries
 // must already be in {"type":"function","function":{...}} shape.

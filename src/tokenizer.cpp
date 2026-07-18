@@ -1,4 +1,5 @@
 #include "tokenizer.h"
+#include "strip_ctrl.h"
 
 #include <cstdio>
 #include <cstring>
@@ -353,15 +354,13 @@ int Tokenizer::token_id(const std::string& s) const {
 }
 
 // Strip ChatML role delimiters from untrusted roles/content so they can't
-// forge prompt structure (Security #7 -- same policy as api_common.h
-// strip_ctrl, applied here so EVERY template caller is covered; review
-// 2026-07-09 P1 #5: the OpenAI chat path reached this function with raw
-// client strings and bypassed the Anthropic path's sanitizer).
-static std::string strip_chatml(std::string s) {
-    for (const std::string& m : {std::string("<|im_start|>"), std::string("<|im_end|>")})
-        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
-    return s;
-}
+// forge prompt structure (Security #7; review 2026-07-09 P1 #5: the OpenAI
+// chat path reached this function with raw client strings and bypassed the
+// Anthropic path's sanitizer). Delegates to the single shared definition in
+// strip_ctrl.h — this was a byte-identical duplicate, a drift hazard: a
+// marker added to one copy and not the other would reopen the forgery hole
+// on this path.
+static std::string strip_chatml(std::string s) { return strip_ctrl(std::move(s)); }
 
 std::vector<int> Tokenizer::apply_chat_template(
     const std::vector<std::pair<std::string, std::string>>& messages, bool think) const {
