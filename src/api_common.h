@@ -547,6 +547,23 @@ inline std::string infer_tool_name_unwrapped(const json& tools, json& args) {
     return "";
 }
 
+// Drift mode 10 (2026-07-17, pi live traffic, T2 tier): unescaped double
+// quotes inside a string value — shell quoting written verbatim into the
+// command string (`... || echo "empty dir"`). In valid JSON a closing quote
+// is always followed — past whitespace — by one of , } ] : or end-of-buffer,
+// so a quote followed by anything else cannot terminate the string: treat it
+// as literal content and re-escape it. Valid JSON is preserved exactly (its
+// closing quotes all satisfy the lookahead); EOF right after a quote stays a
+// terminator so the truncation-repair path sees the same framing as before.
+inline bool quote_terminates_string(const std::string& s, size_t j) {
+    for (size_t k = j + 1; k < s.size(); k++) {
+        char c = s[k];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        return c == ',' || c == '}' || c == ']' || c == ':';
+    }
+    return true;
+}
+
 // Recover a name-dropped mode-6 BATCH: {"name":<ws>{ARGS}[ {"name":<ws>{ARGS}]... where
 // each outer {"name": never closes (net +1 depth per unit) so the main balanced scan
 // misses the whole run (observed on CC greedy: six {"name":\n{"file_path":...} Read calls).
@@ -567,7 +584,13 @@ inline void scan_namedropped(const std::string& text, const json* tools,
             if (esc) { esc = false; san += ch; continue; }
             if (in_str) {
                 if (ch == '\\') { esc = true; san += ch; continue; }
-                if (ch == '"') { in_str = false; san += ch; continue; }
+                if (ch == '"') {
+                    // mode 10: a quote not followed by a JSON delimiter is
+                    // literal content, not a terminator — re-escape it.
+                    if (quote_terminates_string(text, j)) { in_str = false; san += ch; }
+                    else san += "\\\"";
+                    continue;
+                }
                 if (ch == '\n') { san += "\\n"; continue; }
                 if (ch == '\r') { san += "\\r"; continue; }
                 if (ch == '\t') { san += "\\t"; continue; }
@@ -622,6 +645,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         return out;
     }
     bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
+    bool m10 = false;                                    // mode 10: in-string quote re-escaped
     // drift mode 9 (2026-07-11, codex-harnessed traffic): the model drops the
     // OPENING quote of the "arguments" key ({"name":"X",\narguments":{...}}).
     // "arguments" is the tool-call schema key, so quoting a bare `arguments":`
@@ -650,7 +674,13 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             if (esc) { esc = false; san += ch; continue; }
             if (in_str) {
                 if (ch == '\\') { esc = true; san += ch; continue; }
-                if (ch == '"') { in_str = false; san += ch; continue; }
+                if (ch == '"') {
+                    // tenth drift mode: an in-string quote not followed by a
+                    // JSON delimiter is literal content — re-escape it.
+                    if (quote_terminates_string(text, j)) { in_str = false; san += ch; }
+                    else { san += "\\\""; m10 = true; }
+                    continue;
+                }
                 // fifth drift mode: literal newlines/tabs inside the string
                 if (ch == '\n') { san += "\\n"; m5 = true; continue; }
                 if (ch == '\r') { san += "\\r"; m5 = true; continue; }
@@ -787,7 +817,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     // drift mode(s) the fallback chain rescued, or flag an intended call it could
     // NOT recover. Log-only; the parse result is unchanged.
     if (!out.empty()) {
-        char modes[8]; int mi = 0;
+        char modes[10]; int mi = 0;
         modes[mi++] = '1';               // baseline: dropped-<tool_call>-wrapper recovery
         if (m2) modes[mi++] = '2';
         if (m3) modes[mi++] = '3';
@@ -795,6 +825,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         if (m5) modes[mi++] = '5';
         if (m6) modes[mi++] = '6';
         if (m8) modes[mi++] = '8';
+        if (m10) modes[mi++] = 'a';      // mode 10 ('a': single-char catalog)
         modes[mi] = 0;
         fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
     } else if (text_in.find("{\"name\"") != std::string::npos ||

@@ -419,8 +419,36 @@ int main(int argc, char** argv) {
         auto v13 = q27::parse_bare_tool_calls(
             "{\"name\":\n{\"x\":\"1\",\"y\":\"2\"}}", &pre, &tools13);
         bool ok13 = v13.empty();
+        // tenth observed mode (2026-07-17, pi live traffic, T2 tier — exact
+        // payload): wrapper-less bare call whose command string carries
+        // UNESCAPED shell quotes written verbatim (`... || echo "empty
+        // dir"`), which also swallow the value's own closing quote. A quote
+        // not followed (past whitespace) by , } ] : or EOF cannot terminate
+        // a valid-JSON string, so it re-escapes as literal content; the
+        // quote after `dir` IS followed by } and closes the value, so the
+        // recovered command keeps the model's one unbalanced shell quote —
+        // the shell errors and the agent loop retries, instead of the call
+        // dead-ending as prose.
+        auto v14 = q27::parse_bare_tool_calls(
+            "Let me check the environment and then build something impressive.\n\n"
+            "{\"name\": \"bash\", \"arguments\": {\"command\": \"which node && node --version "
+            "&& which python3 && python3 --version && ls /Users/macthedan/local_robot/ "
+            "2>/dev/null || echo \"empty dir\"}}", &pre);
+        bool ok14 = v14.size() == 1 && v14[0].name == "bash" &&
+                    v14[0].arguments.value("command", "").find("which node") == 0 &&
+                    v14[0].arguments.value("command", "").find("echo \"empty dir") !=
+                        std::string::npos &&
+                    pre == "Let me check the environment and then build something impressive.";
+        // and a quote legitimately followed by a comma/brace still terminates:
+        // well-formed multi-key calls parse exactly as before
+        auto v15 = q27::parse_bare_tool_calls(
+            "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\", \"timeout\": 5}}",
+            &pre);
+        bool ok15 = v15.size() == 1 && v15[0].name == "bash" &&
+                    v15[0].arguments.value("command", "") == "ls -la" &&
+                    v15[0].arguments.value("timeout", 0) == 5;
         bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 &&
-                  ok10 && ok11 && ok12 && ok13;
+                  ok10 && ok11 && ok12 && ok13 && ok14 && ok15;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }
