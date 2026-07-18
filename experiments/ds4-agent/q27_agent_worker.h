@@ -3,6 +3,7 @@
 #define Q27_AGENT_WORKER_H
 
 #include "q27_agent_engine.h"
+#include "q27_agent_tools.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -17,6 +18,7 @@ typedef enum {
     Q27_WORKER_STARTING = 0,
     Q27_WORKER_IDLE,
     Q27_WORKER_GENERATING,
+    Q27_WORKER_TOOL_RUNNING,
     Q27_WORKER_STOPPING,
     Q27_WORKER_ERROR,
     Q27_WORKER_STOPPED
@@ -25,7 +27,9 @@ typedef enum {
 typedef enum {
     Q27_EVENT_STATE = 0,
     Q27_EVENT_TEXT_DELTA,
+    Q27_EVENT_TOOL_OUTPUT,
     Q27_EVENT_TURN_DONE,
+    Q27_EVENT_TOOL_DONE,
     Q27_EVENT_REJECTED,
     Q27_EVENT_ERROR
 } q27_agent_event_type;
@@ -42,12 +46,21 @@ typedef struct {
     uint32_t cached_tokens;
     uint32_t prefill_tokens;
     uint32_t output_tokens;
+    q27_agent_tool_kind tool_kind;
+    int32_t tool_exit_code;
+    uint32_t tool_flags;
+    uint32_t tool_output_bytes;
 } q27_agent_event;
 
 q27_agent_worker *q27_agent_worker_start(const char *model_path,
                                           const char *tokenizer_path,
                                           uint32_t context,
                                           char *error, size_t error_cap);
+q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
+                                             const char *tokenizer_path,
+                                             uint32_t context,
+                                             const char *workspace_root,
+                                             char *error, size_t error_cap);
 
 // Deep-copies every message before returning. alive/opaque remain borrowed
 // until the command's terminal event is consumed; the owner must keep them
@@ -58,6 +71,17 @@ q27_agent_status q27_agent_worker_submit(
     size_t message_count,
     int enable_thinking,
     uint32_t max_tokens,
+    q27_agent_alive_check alive,
+    void *opaque,
+    uint64_t *command_id,
+    char *error, size_t error_cap);
+
+// Deep-copies all request bytes. Exactly one generation or tool command may be
+// active. Tool execution is serialized on the worker, bounded by the request,
+// and publishes output/tool_done through the same owned event queue.
+q27_agent_status q27_agent_worker_submit_tool(
+    q27_agent_worker *worker,
+    const q27_agent_tool_request *request,
     q27_agent_alive_check alive,
     void *opaque,
     uint64_t *command_id,

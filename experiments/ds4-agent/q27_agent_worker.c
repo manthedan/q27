@@ -1,12 +1,17 @@
+#define _GNU_SOURCE
+#define _DARWIN_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "q27_agent_worker.h"
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #define EVENT_MAX_COUNT 4096u
 #define EVENT_MAX_BYTES (1024u * 1024u)
@@ -22,12 +27,26 @@ typedef struct {
     size_t len;
 } owned_messages;
 
+typedef struct {
+    q27_agent_tool_request request;
+    char *path;
+    unsigned char *input;
+    unsigned char *replacement;
+} owned_tool_request;
+
+typedef enum {
+    REQUEST_NONE = 0,
+    REQUEST_GENERATE,
+    REQUEST_TOOL
+} request_kind;
+
 struct q27_agent_worker {
     pthread_t thread;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     char *model_path;
     char *tokenizer_path;
+    int workspace_fd;
     uint32_t context;
 
     q27_agent_worker_state state;
@@ -39,7 +58,9 @@ struct q27_agent_worker {
     int command_active;
     int terminal_pending;
 
+    request_kind request_type;
     owned_messages request;
+    owned_tool_request tool_request;
     int enable_thinking;
     uint32_t max_tokens;
     q27_agent_alive_check alive;
@@ -64,6 +85,9 @@ typedef struct {
     q27_agent_alive_check external_alive;
     void *external_opaque;
     uint64_t command_id;
+    q27_agent_tool_kind tool_kind;
+    uint64_t deadline_ms;
+    int deadline_expired;
     int queue_error;
 } generation_context;
 
@@ -118,6 +142,72 @@ static int messages_clone(const q27_agent_message *source, size_t count,
             .content_len = source[i].content_len};
     }
     return 1;
+}
+
+static void tool_request_free(owned_tool_request *owned) {
+    if (!owned) return;
+    free(owned->path);
+    free(owned->input);
+    free(owned->replacement);
+    *owned = (owned_tool_request){0};
+}
+
+static int tool_request_clone(const q27_agent_tool_request *source,
+                              owned_tool_request *out,
+                              char *error, size_t error_cap) {
+    *out = (owned_tool_request){0};
+    if (!source || source->kind < Q27_TOOL_READ ||
+        source->kind > Q27_TOOL_SHELL || !source->max_output_bytes ||
+        source->max_output_bytes > 256u * 1024u ||
+        source->input_len > 8u * 1024u * 1024u ||
+        source->replacement_len > 8u * 1024u * 1024u ||
+        (source->input_len && !source->input) ||
+        (source->replacement_len && !source->replacement)) {
+        copy_error(error, error_cap, "invalid tool request");
+        return 0;
+    }
+    if (source->kind != Q27_TOOL_SHELL && (!source->path || !*source->path)) {
+        copy_error(error, error_cap, "tool path is required");
+        return 0;
+    }
+    if (source->kind == Q27_TOOL_SHELL &&
+        (!source->input_len || !source->timeout_ms || source->timeout_ms > 60000 ||
+         memchr(source->input, '\0', source->input_len))) {
+        copy_error(error, error_cap, "invalid shell command or timeout");
+        return 0;
+    }
+    if (source->kind == Q27_TOOL_SEARCH && !source->input_len) {
+        copy_error(error, error_cap, "search needle is required");
+        return 0;
+    }
+    if (source->kind == Q27_TOOL_EDIT && !source->input_len) {
+        copy_error(error, error_cap, "edit old bytes are required");
+        return 0;
+    }
+    if (source->path) {
+        out->path = strdup(source->path);
+        if (!out->path) goto oom;
+    }
+    if (source->input_len) {
+        out->input = malloc(source->input_len);
+        if (!out->input) goto oom;
+        memcpy(out->input, source->input, source->input_len);
+    }
+    if (source->replacement_len) {
+        out->replacement = malloc(source->replacement_len);
+        if (!out->replacement) goto oom;
+        memcpy(out->replacement, source->replacement, source->replacement_len);
+    }
+    out->request = *source;
+    out->request.path = out->path;
+    out->request.input = out->input;
+    out->request.replacement = out->replacement;
+    return 1;
+
+oom:
+    tool_request_free(out);
+    copy_error(error, error_cap, "out of memory copying tool request");
+    return 0;
 }
 
 static void event_node_free(event_node *node) {
@@ -202,8 +292,18 @@ static int event_enqueue(q27_agent_worker *worker, q27_agent_event event,
     return 1;
 }
 
+static uint64_t worker_monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
 static int combined_alive(void *opaque) {
     generation_context *context = opaque;
+    if (context->deadline_ms && worker_monotonic_ms() >= context->deadline_ms) {
+        context->deadline_expired = 1;
+        return 0;
+    }
     pthread_mutex_lock(&context->worker->mu);
     int stopped = context->worker->stop;
     pthread_mutex_unlock(&context->worker->mu);
@@ -228,13 +328,33 @@ static int event_text_sink(const char *bytes, size_t len, void *opaque) {
     return queued;
 }
 
+static int event_tool_sink(const unsigned char *bytes, size_t len, void *opaque) {
+    generation_context *context = opaque;
+    q27_agent_event event = {
+        .type = Q27_EVENT_TOOL_OUTPUT,
+        .command_id = context->command_id,
+        .state = Q27_WORKER_TOOL_RUNNING,
+        .status = Q27_AGENT_OK,
+        .tool_kind = context->tool_kind,
+        .data = (unsigned char *)bytes,
+        .data_len = len
+    };
+    int queued = event_enqueue(context->worker, event,
+                               combined_alive, context, 0);
+    if (!queued && combined_alive(context)) context->queue_error = 1;
+    return queued;
+}
+
 static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
+                             q27_agent_event_type terminal_type,
                              q27_agent_status status, uint32_t prompt_tokens,
                              uint32_t cached_tokens, uint32_t prefill_tokens,
-                             uint32_t output_tokens, const char *error) {
+                             uint32_t output_tokens,
+                             const q27_agent_tool_result *tool_result,
+                             q27_agent_tool_kind tool_kind,
+                             const char *error) {
     q27_agent_event event = {
-        .type = status == Q27_AGENT_REJECTED ? Q27_EVENT_REJECTED :
-                status == Q27_AGENT_ERROR ? Q27_EVENT_ERROR : Q27_EVENT_TURN_DONE,
+        .type = terminal_type,
         .command_id = command_id,
         .state = status == Q27_AGENT_ERROR ? Q27_WORKER_ERROR : Q27_WORKER_IDLE,
         .status = status,
@@ -242,6 +362,10 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
         .cached_tokens = cached_tokens,
         .prefill_tokens = prefill_tokens,
         .output_tokens = output_tokens,
+        .tool_kind = tool_kind,
+        .tool_exit_code = tool_result ? tool_result->exit_code : 0,
+        .tool_flags = tool_result ? tool_result->flags : 0,
+        .tool_output_bytes = tool_result ? tool_result->output_bytes : 0,
         .data = (unsigned char *)(error ? error : ""),
         .data_len = error ? strlen(error) : 0
     };
@@ -293,8 +417,12 @@ static void *worker_main(void *opaque) {
             break;
         }
 
+        const request_kind kind = worker->request_type;
+        worker->request_type = REQUEST_NONE;
         owned_messages messages = worker->request;
         worker->request = (owned_messages){0};
+        owned_tool_request tool = worker->tool_request;
+        worker->tool_request = (owned_tool_request){0};
         const int enable_thinking = worker->enable_thinking;
         const uint32_t max_tokens = worker->max_tokens;
         q27_agent_alive_check alive = worker->alive;
@@ -302,21 +430,29 @@ static void *worker_main(void *opaque) {
         const uint64_t command_id = worker->command_id;
         worker->request_ready = 0;
         worker->generation_active = 1;
-        worker->state = worker->stop ? Q27_WORKER_STOPPING :
-                                       Q27_WORKER_GENERATING;
+        const q27_agent_worker_state running_state =
+            kind == REQUEST_TOOL ? Q27_WORKER_TOOL_RUNNING :
+                                   Q27_WORKER_GENERATING;
+        worker->state = worker->stop ? Q27_WORKER_STOPPING : running_state;
         pthread_mutex_unlock(&worker->mu);
 
         q27_agent_event state_event = {
             .type = Q27_EVENT_STATE, .command_id = command_id,
-            .state = Q27_WORKER_GENERATING, .status = Q27_AGENT_OK};
+            .state = running_state, .status = Q27_AGENT_OK,
+            .tool_kind = tool.request.kind};
         int state_queued = event_enqueue(worker, state_event,
                                          alive, alive_opaque, 0);
 
         generation_context context = {
             .worker = worker, .external_alive = alive,
-            .external_opaque = alive_opaque, .command_id = command_id};
+            .external_opaque = alive_opaque, .command_id = command_id,
+            .tool_kind = tool.request.kind,
+            .deadline_ms = kind == REQUEST_TOOL &&
+                           tool.request.kind == Q27_TOOL_SHELL ?
+                           worker_monotonic_ms() + tool.request.timeout_ms : 0};
         uint32_t prompt_tokens = 0, cached_tokens = 0;
         uint32_t prefill_tokens = 0, output_tokens = 0;
+        q27_agent_tool_result tool_result = {0};
         error[0] = '\0';
         q27_agent_status status;
         if (!state_queued) {
@@ -324,6 +460,24 @@ static void *worker_main(void *opaque) {
                                                Q27_AGENT_CANCELLED;
             if (status == Q27_AGENT_ERROR)
                 copy_error(error, sizeof(error), "state event publication failed");
+        } else if (kind == REQUEST_TOOL) {
+            status = q27_agent_tool_execute(
+                worker->workspace_fd, &tool.request,
+                event_tool_sink, combined_alive, &context, &tool_result);
+            if (context.queue_error && status == Q27_AGENT_CANCELLED) {
+                status = Q27_AGENT_ERROR;
+                copy_error(error, sizeof(error), "tool event publication failed");
+            } else if (context.deadline_expired &&
+                       status == Q27_AGENT_CANCELLED) {
+                status = Q27_AGENT_OK;
+                tool_result.exit_code = -1;
+                tool_result.flags |= Q27_TOOL_FLAG_TIMED_OUT;
+                copy_error(tool_result.message, sizeof(tool_result.message),
+                           "shell job timed out");
+                copy_error(error, sizeof(error), tool_result.message);
+            } else if (tool_result.message[0]) {
+                copy_error(error, sizeof(error), tool_result.message);
+            }
         } else {
             status = q27_agent_generate(
                 engine, messages.items, messages.len, enable_thinking, max_tokens,
@@ -335,21 +489,31 @@ static void *worker_main(void *opaque) {
                 copy_error(error, sizeof(error), "text event publication failed");
             }
         }
+        const q27_agent_tool_kind completed_tool_kind = tool.request.kind;
         messages_free(&messages);
-        publish_terminal(worker, command_id, status, prompt_tokens,
-                         cached_tokens, prefill_tokens, output_tokens, error);
+        tool_request_free(&tool);
+        q27_agent_event_type terminal_type = kind == REQUEST_TOOL ?
+            Q27_EVENT_TOOL_DONE :
+            status == Q27_AGENT_REJECTED ? Q27_EVENT_REJECTED :
+            status == Q27_AGENT_ERROR ? Q27_EVENT_ERROR : Q27_EVENT_TURN_DONE;
+        publish_terminal(worker, command_id, terminal_type, status, prompt_tokens,
+                         cached_tokens, prefill_tokens, output_tokens,
+                         kind == REQUEST_TOOL ? &tool_result : NULL,
+                         completed_tool_kind, error);
     }
 
     q27_agent_engine_close(engine);
     return NULL;
 }
 
-q27_agent_worker *q27_agent_worker_start(const char *model_path,
-                                          const char *tokenizer_path,
-                                          uint32_t context,
-                                          char *error, size_t error_cap) {
-    if (!model_path || !tokenizer_path) {
-        copy_error(error, error_cap, "model and tokenizer paths are required");
+q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
+                                             const char *tokenizer_path,
+                                             uint32_t context,
+                                             const char *workspace_root,
+                                             char *error, size_t error_cap) {
+    if (!model_path || !tokenizer_path || !workspace_root) {
+        copy_error(error, error_cap,
+                   "model, tokenizer, and workspace paths are required");
         return NULL;
     }
     q27_agent_worker *worker = calloc(1, sizeof(*worker));
@@ -357,14 +521,21 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
         copy_error(error, error_cap, "out of memory");
         return NULL;
     }
+    worker->workspace_fd = -1;
     worker->model_path = strdup(model_path);
     worker->tokenizer_path = strdup(tokenizer_path);
+    worker->workspace_fd = open(workspace_root,
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     worker->context = context;
     worker->state = Q27_WORKER_STARTING;
-    if (!worker->model_path || !worker->tokenizer_path) {
-        copy_error(error, error_cap, "out of memory");
+    struct stat workspace_stat;
+    if (!worker->model_path || !worker->tokenizer_path ||
+        worker->workspace_fd < 0 || fstat(worker->workspace_fd, &workspace_stat) != 0 ||
+        !S_ISDIR(workspace_stat.st_mode)) {
+        copy_error(error, error_cap, "could not pin workspace directory");
         free(worker->model_path);
         free(worker->tokenizer_path);
+        if (worker->workspace_fd >= 0) close(worker->workspace_fd);
         free(worker);
         return NULL;
     }
@@ -376,6 +547,7 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
         if (mu_ok) pthread_mutex_destroy(&worker->mu);
         free(worker->model_path);
         free(worker->tokenizer_path);
+        if (worker->workspace_fd >= 0) close(worker->workspace_fd);
         free(worker);
         return NULL;
     }
@@ -386,6 +558,7 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
         pthread_mutex_destroy(&worker->mu);
         free(worker->model_path);
         free(worker->tokenizer_path);
+        if (worker->workspace_fd >= 0) close(worker->workspace_fd);
         free(worker);
         return NULL;
     }
@@ -402,10 +575,19 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
         pthread_mutex_destroy(&worker->mu);
         free(worker->model_path);
         free(worker->tokenizer_path);
+        if (worker->workspace_fd >= 0) close(worker->workspace_fd);
         free(worker);
         return NULL;
     }
     return worker;
+}
+
+q27_agent_worker *q27_agent_worker_start(const char *model_path,
+                                          const char *tokenizer_path,
+                                          uint32_t context,
+                                          char *error, size_t error_cap) {
+    return q27_agent_worker_start_at(model_path, tokenizer_path, context, ".",
+                                     error, error_cap);
 }
 
 q27_agent_status q27_agent_worker_submit(
@@ -430,6 +612,7 @@ q27_agent_status q27_agent_worker_submit(
         copy_error(error, error_cap, "worker is not idle");
         return Q27_AGENT_REJECTED;
     }
+    worker->request_type = REQUEST_GENERATE;
     worker->request = copied;
     worker->enable_thinking = enable_thinking;
     worker->max_tokens = max_tokens;
@@ -439,6 +622,41 @@ q27_agent_status q27_agent_worker_submit(
     worker->command_active = 1;
     worker->request_ready = 1;
     worker->state = Q27_WORKER_GENERATING;
+    if (command_id) *command_id = worker->command_id;
+    pthread_cond_broadcast(&worker->cv);
+    pthread_mutex_unlock(&worker->mu);
+    return Q27_AGENT_OK;
+}
+
+q27_agent_status q27_agent_worker_submit_tool(
+    q27_agent_worker *worker, const q27_agent_tool_request *request,
+    q27_agent_alive_check alive, void *opaque, uint64_t *command_id,
+    char *error, size_t error_cap) {
+    if (command_id) *command_id = 0;
+    if (!worker || !request || !alive) {
+        copy_error(error, error_cap, "invalid worker tool submission");
+        return Q27_AGENT_REJECTED;
+    }
+    owned_tool_request copied;
+    if (!tool_request_clone(request, &copied, error, error_cap))
+        return Q27_AGENT_REJECTED;
+
+    pthread_mutex_lock(&worker->mu);
+    if (worker->state != Q27_WORKER_IDLE || worker->stop ||
+        worker->command_active || worker->request_ready) {
+        pthread_mutex_unlock(&worker->mu);
+        tool_request_free(&copied);
+        copy_error(error, error_cap, "worker is not idle");
+        return Q27_AGENT_REJECTED;
+    }
+    worker->request_type = REQUEST_TOOL;
+    worker->tool_request = copied;
+    worker->alive = alive;
+    worker->alive_opaque = opaque;
+    worker->command_id = ++worker->next_command_id;
+    worker->command_active = 1;
+    worker->request_ready = 1;
+    worker->state = Q27_WORKER_TOOL_RUNNING;
     if (command_id) *command_id = worker->command_id;
     pthread_cond_broadcast(&worker->cv);
     pthread_mutex_unlock(&worker->mu);
@@ -471,6 +689,7 @@ int q27_agent_worker_next_event(q27_agent_worker *worker,
     *event = node->event;
     node->event.data = NULL;
     const int terminal = event->type == Q27_EVENT_TURN_DONE ||
+                         event->type == Q27_EVENT_TOOL_DONE ||
                          event->type == Q27_EVENT_REJECTED ||
                          event->type == Q27_EVENT_ERROR;
     if (terminal && event->command_id == worker->command_id) {
@@ -530,6 +749,7 @@ void q27_agent_worker_stop(q27_agent_worker *worker) {
         worker->stop_hook(worker->stop_hook_opaque, 1, worker->generation_active);
 #endif
     messages_free(&worker->request);
+    tool_request_free(&worker->tool_request);
     event_node *node = worker->event_head;
     while (node) {
         event_node *next = node->next;
@@ -541,6 +761,7 @@ void q27_agent_worker_stop(q27_agent_worker *worker) {
     pthread_mutex_destroy(&worker->mu);
     free(worker->model_path);
     free(worker->tokenizer_path);
+    if (worker->workspace_fd >= 0) close(worker->workspace_fd);
     free(worker);
 }
 

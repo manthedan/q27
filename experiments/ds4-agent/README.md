@@ -47,6 +47,38 @@ Interactive mode omits `--prompt`; `:quit` exits. Machine-readable events use:
 Every JSONL row carries monotonic `seq`, `command_id`, event `type`, state,
 status, accounting, and exact `data_b64` bytes. Diagnostics remain on stderr.
 
+## Bounded native tools
+
+Interactive users can exercise the control plane directly:
+
+```text
+:read relative/path
+:search relative/path literal needle
+:shell command
+```
+
+The C API additionally exposes exact binary atomic edit requests. This slice
+intentionally does **not** parse model output or let an engine callback launch
+a tool; model-driven `<tool_call>` parsing remains the next protocol slice.
+Generation and tools share one-command admission and the same bounded owned
+event queue (`tool_running → tool_output* → tool_done`).
+
+File tools are rooted at a directory descriptor pinned when `--workspace`
+(default `.`) opens; later pathname replacement cannot retarget it. They reject
+absolute paths, `..`, empty components, and every symlink component, accept
+regular files up to 8 MiB, and cap output at 256 KiB. Search/edit use
+cancellation-aware linear matching. Edit requires exactly one old-byte match,
+uses bounded nonblocking lock acquisition, preserves mode, and atomically
+exchanges the new file with the destination (Darwin/Linux), validating the
+displaced inode and complete bytes before deleting it or atomically rolling
+back. Shell is explicitly user-issued and not model-triggered. It starts in the
+workspace, combines exact stdout/stderr bytes, caps output at 256 KiB, and caps
+runtime at 60 seconds. To make that bound cover the complete process tree, the
+job denies process creation (Darwin sandbox policy / Linux seccomp): builtins
+and a final external `exec` work, while pipelines, background jobs, and
+forking commands fail. The sole process group is killed/reaped on timeout,
+cancellation, or output overflow.
+
 ### Resident session contract
 
 Every turn still re-renders the complete transcript for validation. Reuse is
@@ -77,9 +109,13 @@ Follow-up worker/event smokes returned exactly `worker` and `events` through
 the dedicated engine-owner thread. The JSONL smoke produced exactly
 `state → text_delta → turn_done`; decoding `data_b64` yielded `events`.
 `build/test_q27_agent_worker` uses a fake adapter to gate startup failure,
-deep binary message ownership, monotonic lifecycle events, request rejection,
-4094-event queue backpressure (5000 deltas), cancellation terminals, and
-shutdown ordering without loading a model. Its ASan/UBSan leg is clean.
+deep binary message/tool ownership, monotonic generation and tool lifecycle
+events, request rejection, 4094-event queue backpressure (5000 deltas),
+cancellation terminals, and shutdown ordering without loading a model.
+`build/test_q27_agent_tools` gates binary read/search/edit/shell output, path
+and symlink rejection, exact-one edit publication/mode preservation, shell
+workspace, timeout, cancellation, and output bounds. Their ASan/UBSan legs are
+clean.
 
 A two-turn resident-session smoke returned exactly `one`, then `two`. The
 first turn reported `prompt=51 cached=0 prefill=51 output=1`; the second
@@ -89,8 +125,8 @@ gates pending-token finalization, append offsets, prefix and engine-position
 mismatch fallback, and cancellation/error invalidation.
 
 This establishes direct C → worker → C++ → resident Metal-session feasibility.
-It does not yet establish tool execution, snapshots, compaction, or broad
-parity.
+It establishes explicit control-plane tool execution, but not model-driven
+tool calls, snapshots, compaction, or broad parity.
 
 ## Graduation gates
 
@@ -111,13 +147,13 @@ After Phase 0, port from the pinned DS4 agent in this order:
 1. ~~dedicated engine-owner worker and synchronous typed commands~~;
 2. ~~queued UI events and a noninteractive JSONL event stream~~;
 3. ~~q27 `AgentSession` append/finalize contract~~;
-4. file read/search/edit tools and bounded asynchronous shell jobs;
+4. ~~file read/search/edit tools and bounded asynchronous shell jobs~~;
 5. q27 `<tool_call>` parsing and constrained generation (not DSML);
 6. transcript/session persistence using `Q27SNAP1` (not DS4 payloads);
 7. compaction;
 8. optional terminal UI and browser tooling.
 
-The next slice is a narrow read/search/edit tool layer plus bounded
-asynchronous shell jobs. Tool execution must consume and publish through the
-same owned command/event boundary; no tool may run directly from an engine
-callback.
+The next slice is q27 `<tool_call>` parsing and constrained generation (not
+DSML), followed by tool-result transcript append through the proven resident
+session boundary. Automatic execution must remain opt-in and preserve the
+explicit event/terminal contract.

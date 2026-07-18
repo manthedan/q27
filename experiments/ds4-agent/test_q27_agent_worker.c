@@ -134,7 +134,12 @@ typedef struct {
     uint32_t prefill_tokens;
     uint32_t output_tokens;
     int states;
+    int tool_outputs;
     int terminals;
+    q27_agent_tool_kind tool_kind;
+    int32_t tool_exit_code;
+    uint32_t tool_flags;
+    uint32_t tool_output_bytes;
 } drained;
 
 static int drain_command(q27_agent_worker *worker, uint64_t command_id,
@@ -151,14 +156,17 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
         }
         out->last_sequence = event.sequence;
         if (event.type == Q27_EVENT_STATE) out->states++;
-        if (event.type == Q27_EVENT_TEXT_DELTA) {
-            out->deltas++;
+        if (event.type == Q27_EVENT_TEXT_DELTA ||
+            event.type == Q27_EVENT_TOOL_OUTPUT) {
+            if (event.type == Q27_EVENT_TEXT_DELTA) out->deltas++;
+            else out->tool_outputs++;
             if (event.data_len <= sizeof(out->bytes) - out->len) {
                 memcpy(out->bytes + out->len, event.data, event.data_len);
                 out->len += event.data_len;
             }
         }
         int terminal = event.type == Q27_EVENT_TURN_DONE ||
+                       event.type == Q27_EVENT_TOOL_DONE ||
                        event.type == Q27_EVENT_REJECTED ||
                        event.type == Q27_EVENT_ERROR;
         if (terminal) {
@@ -169,6 +177,10 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
             out->cached_tokens = event.cached_tokens;
             out->prefill_tokens = event.prefill_tokens;
             out->output_tokens = event.output_tokens;
+            out->tool_kind = event.tool_kind;
+            out->tool_exit_code = event.tool_exit_code;
+            out->tool_flags = event.tool_flags;
+            out->tool_output_bytes = event.tool_output_bytes;
         }
         q27_agent_event_free(&event);
         if (terminal) return 1;
@@ -244,6 +256,29 @@ int main(void) {
           "terminal session accounting survives event queue");
     CHECK(q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "terminal consumption reopens admission");
+
+    char shell_command[] = "printf 't\\000l'";
+    q27_agent_tool_request tool_request = {
+        .kind = Q27_TOOL_SHELL,
+        .input = (const unsigned char *)shell_command,
+        .input_len = strlen(shell_command),
+        .timeout_ms = 1000,
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_worker_submit_tool(worker, &tool_request, alive, NULL,
+                                       &command, error, sizeof(error)) ==
+              Q27_AGENT_OK,
+          "asynchronous shell tool submits");
+    memset(shell_command, '!', strlen(shell_command));
+    CHECK(drain_command(worker, command, &result), "shell tool drains");
+    CHECK(result.states == 1 && result.tool_outputs >= 1 &&
+          result.terminals == 1 && result.len == 3 &&
+          !memcmp(result.bytes, "t\0l", 3),
+          "tool output uses the owned binary event stream");
+    CHECK(result.terminal_status == Q27_AGENT_OK &&
+          result.tool_kind == Q27_TOOL_SHELL && result.tool_exit_code == 0 &&
+          result.tool_flags == 0 && result.tool_output_bytes == 3 &&
+          q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
+          "tool terminal accounting reopens shared admission");
 
     q27_agent_message bad = {.role = "user", .content = "bad", .content_len = 3};
     CHECK(q27_agent_worker_submit(worker, &bad, 1, 0, 8, alive, NULL,
