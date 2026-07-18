@@ -26,12 +26,16 @@ idle_s() { ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/{printf "%d",$NF
 server_pid() { ps -Ao pid,args | awk -v p="./build/q27-metal-server" -v port="$PORT" '$2==p && $0 ~ ("--port " port) {print $1}' | head -1; }
 
 start_server() {
-    env Q27_METAL_SNAPSHOT_DIR=/Users/macthedan/.q27/snapshots \
-        Q27_METAL_MAX_TOKENS_DEFAULT=16384 \
-        nohup caffeinate -i nice ./build/q27-metal-server \
+    # Mirror the canonical serving line (flag form since the knobs->flags
+    # promotion; --trace was silently dropped by the 2026-07-17 restart —
+    # the registered script debt this block closes).
+    nohup caffeinate -i nice ./build/q27-metal-server \
         models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27 \
         models/qwen36-27b-mtp/qwen36-27b-mtp.tok \
-        --ctx 131072 --port $PORT --suffix 32 > "$SERVER_LOG" 2>&1 &
+        --ctx 131072 --port $PORT --suffix 32 \
+        --snapshot-dir /Users/macthedan/.q27/snapshots \
+        --max-tokens-default 16384 \
+        --trace /Users/macthedan/.q27/trace.jsonl > "$SERVER_LOG" 2>&1 &
     for _ in $(seq 1 60); do
         [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:$PORT/health 2>/dev/null)" = "200" ] && return 0
         sleep 2
