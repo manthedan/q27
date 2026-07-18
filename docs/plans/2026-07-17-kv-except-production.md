@@ -1,7 +1,7 @@
 # KV exception cells in production: fp16 L7 h1 on the turbo3 engine
 
 Status: PRE-REGISTERED before implementation (2026-07-17 ~02:30, mini).
-Daniel approved the design step ("sure, try it"). Parent:
+the operator approved the design step ("sure, try it"). Parent:
 2026-07-17-kv-codec-step4-probe.md §4b — the L7 h1 pair is jointly
 necessary (K alone: nothing; V alone: amplifies 1.35×; pair: full
 2.20× tail cut) at +6.4% KV bytes. This lands the fp16-pair option:
@@ -141,7 +141,7 @@ noise.** All five pre-registered gates now dispositioned: 1 PASS,
 5 (multislot) runs env-unset and is unaffected — the env knob is
 default-off and byte-identical.
 
-## Final disposition (handed to Daniel, not decided unilaterally)
+## Final disposition (handed to the operator, not decided unilaterally)
 
 The machinery ships default-off and gated; the SELECTION question has
 three priced options:
@@ -161,9 +161,9 @@ transferred within band twice) but NOT for knife-edge tail selection;
 production arms at 1,536 positions (~2 min) are the standard tail
 instrument from here.
 
-## Decision: Daniel funded option 1 — L7-full (2026-07-17)
+## Decision: the operator funded option 1 — L7-full (2026-07-17)
 
-Daniel: "fund full l7". The production exception list is
+operator: "fund full l7". The production exception list is
 `Q27_METAL_KV_FP16_CELLS=8,9,10,11,12,13,14,15` (L7 h0–h3, K+V,
 +25.8% turbo3 KV bytes) — the blessed setting for turbo3 long-context
 serving on this artifact. Options 2 (mid-rate code, ~+12.9%) and 3

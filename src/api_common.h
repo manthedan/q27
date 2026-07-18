@@ -20,6 +20,15 @@
 namespace q27 {
 using json = nlohmann::json;
 
+// nlohmann::json::value() does not use its default when a key exists with
+// JSON null; get<T>() throws instead. API clients (notably pi) send
+// max_tokens:null to mean "unspecified", so nullable scalar options need an
+// explicit helper. Non-null type errors remain loud.
+inline int64_t json_i64_or(const json& body, const char* key, int64_t dflt) {
+    auto it = body.find(key);
+    return it == body.end() || it->is_null() ? dflt : it->get<int64_t>();
+}
+
 // Incremental UTF-8 boundary gate for streaming token pieces. BPE token
 // boundaries can split a multi-byte character (em dash E2 80 94 is a Qwopus
 // favorite), the raw piece is then invalid UTF-8, and nlohmann json::dump
@@ -354,6 +363,276 @@ inline std::string strip_ws2(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
+// Minimal JSON structural context for mode-10 quote repair. A colon can
+// terminate a quoted OBJECT KEY, but inside a string VALUE it is ordinary
+// content (for example the raw shell fragment `echo "key": value`).
+struct JsonQuoteContext {
+    struct Frame { char kind; bool expect_key; };
+    std::vector<Frame> stack;
+    bool opening_string_is_key() const {
+        return !stack.empty() && stack.back().kind=='{' && stack.back().expect_key;
+    }
+    void structural(char c) {
+        if(c=='{') stack.push_back({'{',true});
+        else if(c=='[') stack.push_back({'[',false});
+        else if(c=='}') { if(!stack.empty() && stack.back().kind=='{') stack.pop_back(); }
+        else if(c==']') { if(!stack.empty() && stack.back().kind=='[') stack.pop_back(); }
+        else if(c==':' && !stack.empty() && stack.back().kind=='{') stack.back().expect_key=false;
+        else if(c==',' && !stack.empty() && stack.back().kind=='{') stack.back().expect_key=true;
+    }
+};
+
+inline bool quote_terminates_string(const std::string& s, size_t j, bool string_is_key) {
+    for (size_t k = j + 1; k < s.size(); k++) {
+        char c = s[k];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        return string_is_key ? c == ':' : (c == ',' || c == '}' || c == ']');
+    }
+    return true; // preserve the end-of-buffer truncation rule
+}
+
+// Incremental tool-call argument streamer (pre-registered:
+// docs/plans/2026-07-17-incremental-tool-call-streaming.md). Feeds the
+// splitter's TOOL-channel bytes as they decode; once the call head parses
+// ({"name": "X", "arguments": {  — tolerating the mode-9 missing opening
+// quote on the arguments key), the arguments object streams out SANITIZED
+// (mode-5 control-char escaping, mode-10 in-string quote re-escaping, and
+// mode-3 <content>-tag repair applied inline; a quote or </content> holds
+// for exactly one non-whitespace byte of lookahead) as production-shape
+// argument fragments. Heads that deviate
+// (mode 6/7/8 shapes) or exceed the bound never stream: the raw body is
+// preserved byte-exact for the buffered parse+recovery path. The trade is
+// pre-registered: a streamed call whose body ends unbalanced reaches the
+// client unbalanced (production semantics — the model's bytes are the
+// model's bytes); end-of-call repair applies only to un-streamed calls.
+struct ToolCallStreamer {
+    enum State { HEAD, ARGS, DONE, INVALID_DONE, FALLBACK };
+    State state = HEAD;
+    std::string raw;      // entire body verbatim (fallback + logging)
+    std::string name;     // valid once opened
+    bool opened = false;  // head parsed; an opener chunk belongs on the wire
+
+    bool active() const { return !raw.empty(); }
+    bool invalid() const { return invalid_done_; }
+    void reset() { *this = ToolCallStreamer(); }
+
+    // Feed body bytes; returns the sanitized argument fragment to stream
+    // (often empty). *opened_now fires on the feed that completes the head.
+    std::string feed(const std::string& t, bool* opened_now) {
+        if (opened_now) *opened_now = false;
+        raw += t;
+        if (state == DONE || state == INVALID_DONE) { add_trail(t); return ""; }
+        if (state == FALLBACK) return "";
+        std::string out;
+        if (state == HEAD) {
+            head_ += t;
+            size_t consumed = 0;
+            int m = match_head(head_, name, consumed);
+            if (m == 0) {
+                if (head_.size() > 512) state = FALLBACK;
+                return "";
+            }
+            if (m < 0) { state = FALLBACK; return ""; }
+            state = ARGS;
+            opened = true;
+            if (opened_now) *opened_now = true;
+            std::string rest = head_.substr(consumed);
+            head_.clear();
+            scan(rest, out);
+            sanitized_ += out;
+            validate_done();
+            return out;
+        }
+        scan(t, out);
+        sanitized_ += out;
+        validate_done();
+        return out;
+    }
+
+    // Wrapper closed (or turn flushed). True = the args object completed
+    // cleanly (DONE). Mid-ARGS: resolves a pending quote per the EOF rule
+    // (terminator), appends the final bytes to *tail, returns false — the
+    // handler closes the call as-is. HEAD/FALLBACK: false, nothing streamed.
+    bool finalize(std::string* tail) {
+        if (state == DONE) return true;
+        if (state == ARGS) {
+            if (!tag_.empty()) { *tail += tag_; tag_.clear(); } // partial tag: literal
+            if (pend_q_ || pend_tag_) {          // EOF rule: terminator
+                *tail += '"';
+                *tail += pend_ws_;
+                pend_q_ = pend_tag_ = false;
+            }
+        }
+        return false;
+    }
+
+    // Bytes seen after the streamed call's arguments object closed. A
+    // wrapper can pack more than one call; these are NOT framing — the
+    // handler runs them through the bare-call recovery chain (review
+    // 2026-07-17: the DONE-state byte drop silently lost every call after
+    // the first, a regression vs the buffered path).
+    const std::string& trail() const { return trail_; }
+
+  private:
+    std::string head_;
+    std::string trail_;
+    std::string sanitized_;
+    bool invalid_done_ = false;
+    int depth_ = 0;
+    bool in_str_ = false, esc_ = false, string_is_key_ = false;
+    JsonQuoteContext json_ctx_;
+    bool pend_q_ = false;   // in-string quote awaiting one-byte lookahead
+    bool pend_tag_ = false; // full </content> matched, awaiting the same lookahead
+    bool outer_seen_ = false; // the call object's OWN closing } consumed from the trail
+    std::string pend_ws_;   // whitespace held behind the pending quote/tag
+    std::string tag_;       // partial <content>/</content> capture (mode 3)
+
+    // Post-DONE bytes: the head consumed the call object's opening { without
+    // counting it, so exactly one closing } after the args object is the
+    // call's own framing — swallow it once; everything else is trail.
+    void add_trail(const std::string& s) {
+        size_t k = 0;
+        if (!outer_seen_) {
+            while (k < s.size() && is_ws(s[k])) k++;
+            if (k == s.size()) return;      // only ws so far: keep waiting
+            outer_seen_ = true;
+            if (s[k] == '}') k++;
+        }
+        trail_ += s.substr(k);
+    }
+
+    static bool is_ws(char c) { return c==' '||c=='\t'||c=='\r'||c=='\n'; }
+
+    void validate_done() {
+        if(state!=DONE) return;
+        try {
+            json parsed=json::parse(sanitized_);
+            if(!parsed.is_object()) throw std::runtime_error("tool arguments are not an object");
+        } catch(...) {
+            invalid_done_=true;
+            // The opener is already on wire, so this is not an ordinary
+            // buffered fallback. Preserve all later feeds as recovery trail
+            // for packed calls that start in a subsequent token.
+            state=INVALID_DONE;
+        }
+    }
+
+    void scan(const std::string& in, std::string& out) {
+        for (size_t i = 0; i < in.size() && state == ARGS; ) {
+            const char c = in[i];
+            if (!tag_.empty()) {
+                // Mode-3 tag capture: held bytes that may still complete
+                // <content> (value position — the tag opens the string the
+                // model forgot) or </content> (in-string — maybe the close
+                // the model wrote instead of a quote). The streamer applies
+                // the same repair the buffered escape_content_tags path did;
+                // a mismatch flushes the held bytes as ordinary input and
+                // reprocesses c.
+                const char* want = in_str_ ? "</content>" : "<content>";
+                const size_t wl = in_str_ ? 10 : 9;
+                if (c == want[tag_.size()]) {
+                    tag_ += c; i++;
+                    if (tag_.size() == wl) {
+                        tag_.clear();
+                        if (in_str_) pend_tag_ = true;       // shape 2: lookahead decides
+                        else { out += '"'; in_str_ = true; string_is_key_ = false; } // shape 1: value opens as string
+                    }
+                    continue;
+                }
+                out += tag_;   // literal bytes (in-string they need no escaping)
+                tag_.clear();
+                continue;      // reprocess c
+            }
+            if (pend_q_ || pend_tag_) {
+                if (is_ws(c)) { pend_ws_ += c; i++; continue; }
+                const bool terminates = string_is_key_ ? c == ':'
+                    : (c == ',' || c == '}' || c == ']');
+                if (terminates) {
+                    out += '"'; out += pend_ws_;   // terminator: ws is framing
+                    in_str_ = false;
+                } else {
+                    // literal: ws is content, escaped in-string
+                    out += pend_tag_ ? "</content>" : "\\\"";
+                    for (char w : pend_ws_)
+                        out += w=='\n' ? "\\n" : w=='\r' ? "\\r"
+                             : w=='\t' ? "\\t" : std::string(1, w);
+                }
+                pend_ws_.clear();
+                pend_q_ = pend_tag_ = false;
+                // fall through: c processes normally in its resolved context
+            }
+            if (esc_) { esc_ = false; out += c; i++; continue; }
+            if (in_str_) {
+                if (c == '\\') { esc_ = true; out += c; i++; continue; }
+                if (c == '"') { pend_q_ = true; i++; continue; }
+                if (c == '<') { tag_ += c; i++; continue; }
+                if (c == '\n') { out += "\\n"; i++; continue; }
+                if (c == '\r') { out += "\\r"; i++; continue; }
+                if (c == '\t') { out += "\\t"; i++; continue; }
+                out += c; i++;
+                continue;
+            }
+            if (c == '<') { tag_ += c; i++; continue; } // never valid JSON here
+            out += c; i++;
+            if (c == '"') {
+                string_is_key_ = json_ctx_.opening_string_is_key();
+                in_str_ = true;
+            } else {
+                json_ctx_.structural(c);
+                if (c == '{') depth_++;
+                else if (c == '}' && --depth_ == 0) {
+                    state = DONE;
+                    add_trail(in.substr(i)); // possible packed second call, not framing
+                }
+            }
+        }
+    }
+
+    // 1 = matched (name_out set, consumed = index OF the args '{'),
+    // 0 = undecided (need more bytes), -1 = not this shape (fallback).
+    static int match_head(const std::string& b, std::string& name_out,
+                          size_t& consumed) {
+        size_t i = 0;
+        auto skip = [&]() { while (i < b.size() && is_ws(b[i])) i++; return i < b.size(); };
+        auto lit = [&](const char* s) -> int {
+            for (size_t k = 0; s[k]; k++, i++) {
+                if (i >= b.size()) return 0;
+                if (b[i] != s[k]) return -1;
+            }
+            return 1;
+        };
+        int r;
+        if (!skip()) return 0;
+        if ((r = lit("{")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit("\"name\"")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit(":")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit("\"")) <= 0) return r;
+        std::string nm;
+        for (;; i++) {
+            if (i >= b.size()) return 0;
+            if (b[i] == '\\') return -1;   // escaped names: buffered path
+            if (b[i] == '"') { i++; break; }
+            nm += b[i];
+        }
+        if (nm.empty()) return -1;
+        if (!skip()) return 0;
+        if ((r = lit(",")) <= 0) return r;
+        if (!skip()) return 0;
+        if (b[i] == '"') i++;              // mode-9: opening quote optional
+        if ((r = lit("arguments\"")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit(":")) <= 0) return r;
+        if (!skip()) return 0;
+        if (b[i] != '{') return -1;        // non-object args: buffered path
+        name_out = nm;
+        consumed = i;
+        return 1;
+    }
+};
+
 // Fallback for models that drop the <tool_call> wrapper and emit the call
 // JSON as plain text (observed on long write calls under no-think greedy;
 // llama.cpp's chat parser has the same class of tolerance). Scans for the
@@ -547,6 +826,12 @@ inline std::string infer_tool_name_unwrapped(const json& tools, json& args) {
     return "";
 }
 
+// Drift mode 10 (2026-07-17, pi live traffic, T2 tier): unescaped double
+// quotes inside a string value — shell quoting written verbatim into the
+// command string (`... || echo "empty dir"`). JsonQuoteContext distinguishes
+// key strings (only ':' may follow) from value strings (only , } ] may
+// follow), so punctuation inside shell content is not mistaken for framing.
+
 // Recover a name-dropped mode-6 BATCH: {"name":<ws>{ARGS}[ {"name":<ws>{ARGS}]... where
 // each outer {"name": never closes (net +1 depth per unit) so the main balanced scan
 // misses the whole run (observed on CC greedy: six {"name":\n{"file_path":...} Read calls).
@@ -560,23 +845,36 @@ inline void scan_namedropped(const std::string& text, const json* tools,
         size_t q = p + 8;
         while (q < text.size() && (text[q]==' '||text[q]=='\t'||text[q]=='\r'||text[q]=='\n')) q++;
         if (q >= text.size() || text[q] != '{') { p += 8; continue; }
-        int depth = 0; bool in_str = false, esc = false; size_t e = std::string::npos;
+        int depth = 0; bool in_str = false, esc = false, string_is_key = false;
+        JsonQuoteContext json_ctx;
+        size_t e = std::string::npos;
         std::string san;
         for (size_t j = q; j < text.size(); j++) {
             char ch = text[j];
             if (esc) { esc = false; san += ch; continue; }
             if (in_str) {
                 if (ch == '\\') { esc = true; san += ch; continue; }
-                if (ch == '"') { in_str = false; san += ch; continue; }
+                if (ch == '"') {
+                    // mode 10: a quote not followed by a JSON delimiter is
+                    // literal content, not a terminator — re-escape it.
+                    if (quote_terminates_string(text, j, string_is_key)) { in_str = false; san += ch; }
+                    else san += "\\\"";
+                    continue;
+                }
                 if (ch == '\n') { san += "\\n"; continue; }
                 if (ch == '\r') { san += "\\r"; continue; }
                 if (ch == '\t') { san += "\\t"; continue; }
                 san += ch; continue;
             }
             san += ch;
-            if (ch == '"') in_str = true;
-            else if (ch == '{') depth++;
-            else if (ch == '}' && --depth == 0) { e = j; break; }
+            if (ch == '"') {
+                string_is_key = json_ctx.opening_string_is_key();
+                in_str = true;
+            } else {
+                json_ctx.structural(ch);
+                if (ch == '{') depth++;
+                else if (ch == '}' && --depth == 0) { e = j; break; }
+            }
         }
         if (e == std::string::npos) break;   // truncated final unit
         try {
@@ -598,11 +896,16 @@ inline void scan_namedropped(const std::string& text, const json* tools,
 // objects anywhere in the text are collected (skipping unbalanced wrappers
 // like the literal {"tool_call": opener, which nets +1 depth per blob and
 // never closes); a trailing truncated {"name" candidate gets framing repair
-// (close open string, strip junk tags, close braces). prefix = text before
-// the first recovered call. `tools` (optional) enables mode-6 name inference.
+// ONLY when allow_trunc_repair (the default) — repair is semantically an
+// end-of-turn rescue, so callers scanning mid-turn segments (responses
+// per-segment recovery) pass false: a segment boundary is not a truncation
+// and inventing framing there false-positives prose fragments into calls
+// (codex P2, 2026-07-17). prefix = text before the first recovered call.
+// `tools` (optional) enables mode-6 name inference.
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
-                                                   const json* tools = nullptr) {
+                                                   const json* tools = nullptr,
+                                                   bool allow_trunc_repair = true) {
     std::vector<ToolCall> out;
     if (tool_strict()) {
         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
@@ -617,6 +920,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         return out;
     }
     bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
+    bool m10 = false;                                    // mode 10: in-string quote re-escaped
     // drift mode 9 (2026-07-11, codex-harnessed traffic): the model drops the
     // OPENING quote of the "arguments" key ({"name":"X",\narguments":{...}}).
     // "arguments" is the tool-call schema key, so quoting a bare `arguments":`
@@ -636,33 +940,63 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     size_t first = std::string::npos;
     size_t i = text.find('{');
     while (i != std::string::npos) {
-        int depth = 0;
-        bool in_str = false, esc = false;
-        size_t end = std::string::npos;
-        std::string san;  // segment with raw in-string control chars escaped
-        for (size_t j = i; j < text.size(); j++) {
-            char ch = text[j];
-            if (esc) { esc = false; san += ch; continue; }
-            if (in_str) {
-                if (ch == '\\') { esc = true; san += ch; continue; }
-                if (ch == '"') { in_str = false; san += ch; continue; }
-                // fifth drift mode: literal newlines/tabs inside the string
-                if (ch == '\n') { san += "\\n"; m5 = true; continue; }
-                if (ch == '\r') { san += "\\r"; m5 = true; continue; }
-                if (ch == '\t') { san += "\\t"; m5 = true; continue; }
+        // Segment scan, two-pass on the mode-10 lookahead: the lookahead's
+        // premise — valid JSON framing follows every real closing quote —
+        // only holds when the segment reaches balance. On an unbalanced-to-
+        // EOF segment the re-escape can swallow trailing prose (or a whole
+        // second call) into an open string that the truncation repair then
+        // "successfully" closes into one merged garbage command (review
+        // 2026-07-17). Unbalanced-with-m10 segments rescan with the
+        // unconditional terminator and take the pre-mode-10 repair path.
+        bool m5_here = false, m10_here = false;
+        auto scan_seg = [&](bool m10_look, std::string& san) -> size_t {
+            san.clear();
+            m5_here = m10_here = false;
+            int depth = 0;
+            bool in_str = false, esc = false, string_is_key = false;
+            JsonQuoteContext json_ctx;
+            for (size_t j = i; j < text.size(); j++) {
+                char ch = text[j];
+                if (esc) { esc = false; san += ch; continue; }
+                if (in_str) {
+                    if (ch == '\\') { esc = true; san += ch; continue; }
+                    if (ch == '"') {
+                        // tenth drift mode: an in-string quote not followed by a
+                        // JSON delimiter is literal content — re-escape it.
+                        if (!m10_look || quote_terminates_string(text, j, string_is_key)) { in_str = false; san += ch; }
+                        else { san += "\\\""; m10_here = true; }
+                        continue;
+                    }
+                    // fifth drift mode: literal newlines/tabs inside the string
+                    if (ch == '\n') { san += "\\n"; m5_here = true; continue; }
+                    if (ch == '\r') { san += "\\r"; m5_here = true; continue; }
+                    if (ch == '\t') { san += "\\t"; m5_here = true; continue; }
+                    san += ch;
+                    continue;
+                }
                 san += ch;
-                continue;
+                if (ch == '"') {
+                    string_is_key = json_ctx.opening_string_is_key();
+                    in_str = true;
+                } else {
+                    json_ctx.structural(ch);
+                    if (ch == '{') depth++;
+                    else if (ch == '}' && --depth == 0) return j;
+                }
             }
-            san += ch;
-            if (ch == '"') in_str = true;
-            else if (ch == '{') depth++;
-            else if (ch == '}' && --depth == 0) { end = j; break; }
-        }
+            return std::string::npos;
+        };
+        std::string san;  // segment with raw in-string control chars escaped
+        size_t end = scan_seg(true, san);
+        if (end == std::string::npos && m10_here) end = scan_seg(false, san);
+        if (m5_here) m5 = true;
+        if (m10_here) m10 = true;
         if (end == std::string::npos) {
             // unbalanced to EOF: repair only a {"name" candidate (truncated
-            // final call); otherwise keep scanning inner objects. `san` holds
+            // final call), and only when the caller guarantees the buffer is
+            // end-of-turn; otherwise keep scanning inner objects. `san` holds
             // the sanitized remainder (scan ran to EOF).
-            if (san.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
+            if (!allow_trunc_repair || san.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
             std::string r = san;
             while (true) {
                 size_t e2 = r.find_last_not_of(" \t\r\n");
@@ -781,7 +1115,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     // drift mode(s) the fallback chain rescued, or flag an intended call it could
     // NOT recover. Log-only; the parse result is unchanged.
     if (!out.empty()) {
-        char modes[8]; int mi = 0;
+        char modes[10]; int mi = 0;
         modes[mi++] = '1';               // baseline: dropped-<tool_call>-wrapper recovery
         if (m2) modes[mi++] = '2';
         if (m3) modes[mi++] = '3';
@@ -789,6 +1123,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         if (m5) modes[mi++] = '5';
         if (m6) modes[mi++] = '6';
         if (m8) modes[mi++] = '8';
+        if (m10) modes[mi++] = 'a';      // mode 10 ('a': single-char catalog)
         modes[mi] = 0;
         fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
     } else if (text_in.find("{\"name\"") != std::string::npos ||

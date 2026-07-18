@@ -1,0 +1,4 @@
+Metal model ready on Apple M4 in 2.03 s
+96 tokens in 5.83 s (16.45 tok/s), position 100
+speculation: 95 rounds, 0 drafts, 0 accepted (0.0%)
+suffix bursts: 0 fired (0 @<=16 lanes, 0 @32, 0 @48), 95 serial-fallback rounds

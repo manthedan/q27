@@ -2,7 +2,7 @@
 
 Status: PRE-REGISTERED before measurement (results appended below the
 line). Machine: 24 GB M4 (T2 for correctness gates; official tier + timing
-on a quiet machine, Daniel-authorized). Follow-on from the day's two
+on a quiet machine, operator-authorized). Follow-on from the day's two
 closures: DSpark PARKED (2026-07-16-dspark-port-phase0.md — every drafter
 shape now measured dead on M4) and lever 2 LANDED (S(48) = 3.94×,
 w ∈ {16,32,48} full-tile sweet spots). Suffix bursts are the named w=48
@@ -101,7 +101,7 @@ bursts); P2 tool-constraint rejection at driver entry AND in suffix_round
 (burst argmax is unmasked; same contract as GPU-resident greedy). Codex
 found no state/position/KV divergence vs the serial walk. Correctness
 gates 2–4 staged in `tools/suffix_burst_gates_2026-07-16.sh` — **runs on
-Daniel's go** (T2, ~7.15 GB, correctness class, desktop-contention
+the operator's go** (T2, ~7.15 GB, correctness class, desktop-contention
 tolerant); gate 6 timing needs the quiet machine.
 
 ## Kill lines
@@ -121,7 +121,7 @@ revival (parked with prejudice this morning).
 
 ---
 
-## RESULTS (2026-07-16 night, quiet 24 GB M4, Daniel-provided quiet window) — SHIP LINE MET
+## RESULTS (2026-07-16 night, quiet 24 GB M4, operator-provided quiet window) — SHIP LINE MET
 
 Gates 2–4 + 6 all PASS (`logs/suffix-gates-20260716/verdicts.txt`):
 byte identity across --suffix-serial 12 / --suffix 16/32/48 and both
@@ -188,3 +188,29 @@ suffix-mode variant of the multislot gate harness (G1–G3/G5 under
 two-slot contention with `--suffix`) — registered, not run; and the
 economics on real agentic traffic (tool-call loops via the server) ride
 the standing quiet-machine protocol.
+
+## Review-2 amendments (2026-07-18 — dispositions:
+2026-07-18-expert-review-2-triage.md)
+
+- **Sampled-path battery pre-registered:** bursts currently engage only
+  at temperature 0 (server gates `sfx` on `temperature==0.0f` — coverage
+  limitation, not a bug). The sampled acceptance rule: one batched
+  forward over the draft block, sample each position, commit the longest
+  prefix matching the sampled target tokens, resample at first mismatch
+  (distributionally identical to serial sampling). Battery must
+  demonstrate it before bursts engage under temperature > 0.
+- **Finite-class optimality certificate (from review 1) and the
+  closed-condition formulation (review 2):** γ* ≈ 0.89 per-position
+  agreement at w=16 for a serial learned drafter on this hardware class
+  (drafter floor = F ≈ 14 ms, not bytes); measured DSpark τ = 3.209 is
+  far below. The window reopens iff π/β changes (M5/cooperative tensors),
+  a block-parallel drafter escapes the F floor with better acceptance, or
+  trees. **Cruel corollary recorded: every F reduction raises the
+  learned-drafter bar further.**
+- **Tree speculation, narrow version only:** branch only where the
+  suffix automaton has multiple high-count continuations; external
+  hybrid-architecture datapoint ~+15% (draft-ceiling bound) vs +35–42%
+  on pure attention. GDN branch state costs recorded as the caution.
+- **w=48 widening stands:** review 2's "S peaks at w ≈ 3–8" conflicts
+  with our measured tile-flat cost curve (sweet spots {16,32,48}, S(48)
+  = 3.94×); measurement wins.

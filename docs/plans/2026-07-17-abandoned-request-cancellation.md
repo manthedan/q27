@@ -86,7 +86,7 @@ Codex round — 1 P1, 2 P2, 1 P3, all adopted:
   cancel into the generic error path).
 
 **Rider (same deploy): `Q27_METAL_MAX_TOKENS_DEFAULT`** — pi sends
-`max_tokens:null`, and the CUDA-parity 256 default truncated Daniel's live
+`max_tokens:null`, and the CUDA-parity 256 default truncated the operator's live
 agent turn ("maximum output token limit"). The env knob overrides the
 per-endpoint defaults for requests that omit max_tokens; explicit client
 values and the context preflight clamp still win. Serving line now carries

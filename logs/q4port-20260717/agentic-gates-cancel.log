@@ -1,0 +1,20 @@
+G2 count_tokens=200
+PASS: G2 count_tokens == usage.input_tokens (200)
+PASS: G3 tool_use block name=get_weather
+PASS: G3 input.city='Paris'
+PASS: G3 stop_reason=tool_use
+PASS: G3s content_block_start(tool_use) event
+PASS: G3s input_json_delta event
+PASS: G3s stop_reason=tool_use
+PASS: G4 round-2 text: The weather in Paris right now is 14 degrees C, sunny, with light wind.
+PASS: G4 stop_reason=end_turn
+PASS: G5 message.tool_calls name=get_weather
+PASS: G5 arguments is JSON-encoded string
+PASS: G5 finish_reason=tool_calls
+PASS: G5s delta.tool_calls chunk (full wire shape)
+PASS: G5s finish_reason=tool_calls
+PASS: G5 round-2 content: The weather in Paris right now is 14 degrees C, sunny, with light wind.
+PASS: G6 400 + 'prompt is too long'
+PASS: G7 cch-varied prompt full prefix hit (539/539)
+----
+agentic parity gates: ALL PASS

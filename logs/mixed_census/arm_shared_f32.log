@@ -1,0 +1,10 @@
+Metal model ready on Apple M4 in 2.67 s
+nll-long: 8192 tokens, single pass, no resets
+  nll pos 384/8191  nll pos 768/8191  nll pos 1152/8191  nll pos 1536/8191  nll pos 1920/8191  nll pos 2052: running mean 2.3273 (ppl 10.250)
+  nll pos 2304/8191  nll pos 2688/8191  nll pos 3072/8191  nll pos 3456/8191  nll pos 3840/8191  nll pos 4104: running mean 2.5096 (ppl 12.300)
+  nll pos 4224/8191  nll pos 4608/8191  nll pos 4992/8191  nll pos 5376/8191  nll pos 5760/8191  nll pos 6144/8191  nll pos 6144: running mean 2.6463 (ppl 14.101)
+  nll pos 6528/8191  nll pos 6912/8191  nll pos 7296/8191  nll pos 7680/8191  nll pos 8064/8191
+nll-long wall: 312.46 s (26.21 tok/s), overall mean NLL 2.6641 PPL 14.355
+long-context NLL by target position (8192 tokens, no resets):
+  0-2k    : mean NLL 2.3292  PPL   10.270  (n=2047)
+  2k-8k   : mean NLL 2.7756  PPL   16.049  (n=6144)

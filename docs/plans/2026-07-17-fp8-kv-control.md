@@ -1,6 +1,6 @@
 # FP8-KV control arm — pre-registration (2026-07-17, QUEUED not started)
 
-k3 roadmap item #1, adopted 2026-07-17 (Daniel: "sounds good, do it" —
+k3 roadmap item #1, adopted 2026-07-17 (operator: "sounds good, do it" —
 queued behind the two funded kernel rounds). The missing baseline for the
 KV-codec P1 workstream: turbo3 (WHT + 3-bit + per-block scale, 100 B per
 head-token-half... 50 B per 128-half) is measured at KL mean 0.0115 / max

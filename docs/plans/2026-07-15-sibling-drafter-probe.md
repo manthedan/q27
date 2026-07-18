@@ -72,7 +72,7 @@ for all drafters. 1.1–1.25× → insufficient headroom for a sibling. >1.25×
 wide-chunks GEMM work — no final call on speculation until macro-panel GEMM
 and resident-greedy land (see expert-review-integration).
 
-### Gate 0 result (2026-07-16, 24 GB M4, Daniel-authorized; `logs/oracle-gate0-20260716/`)
+### Gate 0 result (2026-07-16, 24 GB M4, operator-authorized; `logs/oracle-gate0-20260716/`)
 
 Measured with the new `--oracle W` harness (`MetalEngine::oracle_round`:
 mtp_round's batched verify/commit machinery with the layer-64 draft stage
@@ -135,7 +135,7 @@ Consequences, priced:
 ## Phase 0 verdict (2026-07-15 night, 24 GB M4, fork `prism-b9591-62061f9`)
 
 Run as part of the overnight vendor-stack batch (`logs/overnight-20260715/`,
-Daniel-authorized). All comparisons within-session — the machine was under
+operator-authorized). All comparisons within-session — the machine was under
 desktop load (T2 tg128 measured 6.21 tonight vs 8.59/8.41 quiet), so ratios,
 not absolute rates, are the results.
 

@@ -1,8 +1,8 @@
 # Paper-scan triage — 3-month HF Daily Papers sweep, verified against repo state (2026-07-16 pm)
 
 Status: TRIAGED. Source: external scan of Daily Papers 2026-04-16..07-16
-(Daniel-provided). This doc records the verification and the reconciled
-priorities; the scan itself is with Daniel. **Verification result: the scan
+(operator-provided). This doc records the verification and the reconciled
+priorities; the scan itself is with the operator. **Verification result: the scan
 is sound** — 3/3 load-bearing papers spot-checked real (arXiv links below),
 and every project-facing claim checked traces to a real chronicle
 measurement — except its P0 ("three confirmed correctness issues"), which

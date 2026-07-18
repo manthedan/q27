@@ -1,7 +1,7 @@
 #!/bin/sh
 # Yukon CUDA oracle re-gate after the 2026-07-16 upstream merge (signalnine
 # continuous-batching stream: engine.cuh/server.cu/conductor.h refactor).
-# STAGED; run only on Daniel's explicit go — loads the model on yukon AND
+# STAGED; run only on the operator's explicit go — loads the model on yukon AND
 # the T2/official artifact locally (GPU-serialized machine rules apply).
 #
 # 1. Rebuild yukon's checkout at the merged metal branch (upstream claims

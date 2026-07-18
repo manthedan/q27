@@ -3,6 +3,9 @@ models/
 __pycache__/
 build/
 scratchpad/
+# local NLL corpus (12 MB) — the lessons' swept-binary class; never package
+data/
 
 # Claude Code local state — settings live user-level on each machine
 .claude/
+bonsai-27b-whitepaper.pdf

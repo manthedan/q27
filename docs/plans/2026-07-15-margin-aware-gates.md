@@ -1,6 +1,6 @@
 # Margin-aware quality gates — adopting the numeric-equivalence contract
 
-Daniel approved (2026-07-15 night) moving off byte-identity as the DEFAULT
+the operator approved (2026-07-15 night) moving off byte-identity as the DEFAULT
 gate for kernel changes, adopting the external expert's five-level contract
 (2026-07-15-expert-review-integration.md, "Numeric-equivalence contract").
 This doc operationalizes it for q27.

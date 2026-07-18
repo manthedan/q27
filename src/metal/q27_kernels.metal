@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 12
+// Q27_SHADER_ABI 13
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -1433,9 +1433,15 @@ inline int q27_dot16_b1(uint bits, int4 xp) {
     return 2 * pos - tot;
 }
 
-// Packed-dot binary GEMV, same skeleton as the T2 kernel: a lane's 32
+// Packed-dot binary GEMV, promoted round-2 form (docs/plans/2026-07-17-b1-
+// select-round2.md, bench mix speedup 2.36x): 4 rows per simdgroup with the
+// lane's 32-column int8 x-slice and activation scale loaded once per chunk
+// serving all 4 rows — the 1-row original re-issued the full x load per row
+// and its lone 4 B weight chain couldn't fill the issue window. A lane's 32
 // columns (one uint of code bits) are 32-aligned, so they share one
-// activation-scale block and sit inside one 128-column weight-scale group.
+// activation-scale block and sit inside one 128-column weight-scale group;
+// per-row chunk order, dot form, and scale-multiply order match the 1-row
+// original bit for bit (byte gate). Clamped edge rows compute, don't store.
 kernel void q27_matvec_b1_quantized(device const uchar *weights [[buffer(0)]],
                                      device const half *weight_scales [[buffer(1)]],
                                      device const char *x [[buffer(2)]],
@@ -1445,35 +1451,118 @@ kernel void q27_matvec_b1_quantized(device const uchar *weights [[buffer(0)]],
                                      uint group [[threadgroup_position_in_grid]],
                                      ushort lane [[thread_index_in_simdgroup]],
                                      ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    const uint row = group * 8 + simdgroup;
-    if (row >= args.rows) return;
-    device const uint *w1 = (device const uint *)(weights + (ulong)row * (args.cols / 8));
+    const uint row0 = (group * 8 + (uint)simdgroup) * 4;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
     device const int4 *x16 = (device const int4 *)x;
-    const ulong scale_base = (ulong)row * (args.cols / 128);
-    float acc = 0.0f;
+    const uint sgroups = args.cols / 128;
+    device const uint *w[4];
+    ulong sbase[4];
+    for (uint r = 0; r < 4; r++) {
+        const uint row = min(row0 + r, rlast);
+        w[r] = (device const uint *)(weights + (ulong)row * (args.cols / 8));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float4 acc = 0.0f;
     const uint chunks = args.cols / 1024;
     for (uint chunk = 0; chunk < chunks; chunk++) {
         const uint idx = chunk * 32 + lane;      // one uint = 32 columns
-        const uint wp = w1[idx];
-        const int dot0 = q27_dot16_b1(wp, x16[idx * 2]);
-        const int dot1 = q27_dot16_b1(wp >> 16, x16[idx * 2 + 1]);
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
         const uint c = chunk * 1024 + lane * 32;
-        acc += float(dot0 + dot1) *
-               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 4; r++) {
+            const uint wp = w[r][idx];
+            const int dot0 = q27_dot16_b1(wp, xp0);
+            const int dot1 = q27_dot16_b1(wp >> 16, xp1);
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
     }
     for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
-        const uint wp = uint(weights[(ulong)row * (args.cols / 8) + c / 8]) >> (c % 8);
         const char4 xp = *(device const char4 *)(x + c);
         const int tot = int(xp.x) + int(xp.y) + int(xp.z) + int(xp.w);
-        const int pos = select(0, int(xp.x), bool(wp & 1u)) +
-                        select(0, int(xp.y), bool(wp & 2u)) +
-                        select(0, int(xp.z), bool(wp & 4u)) +
-                        select(0, int(xp.w), bool(wp & 8u));
-        acc += float(2 * pos - tot) *
-               float(weight_scales[scale_base + c / 128]) * x_scales[c / 32];
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 4; r++) {
+            const uint wp = uint(((device const uchar *)w[r])[c / 8]) >> (c % 8);
+            const int pos = select(0, int(xp.x), bool(wp & 1u)) +
+                            select(0, int(xp.y), bool(wp & 2u)) +
+                            select(0, int(xp.z), bool(wp & 4u)) +
+                            select(0, int(xp.w), bool(wp & 8u));
+            acc[r] += float(2 * pos - tot) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
     }
-    acc = simd_sum(acc);
-    if (lane == 0) out[row] = acc;
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
+// B1 select round-2 residue (docs/plans/2026-07-17-b1-select-round2.md):
+// the r2 4-row arm was PROMOTED into q27_matvec_b1_quantized above (bench
+// mix speedup 2.36x); matvec_b1r2_probe candidate 2 aliases the production
+// PSO so recorded A/B invocations keep working. r3 below is the retained
+// 8-row issue-depth arm — never run in the round (r2 cleared the sub-line
+// first), bench-only, never engine-routed.
+// r3 — the 8-row issue-depth probe (run only if r2 misses the sub-line):
+// same lane-held x-slice, 8 independent 4 B weight chains per lane, at the
+// cost of x8 simd_sum/scale chains. Same byte-identity contract as r2.
+kernel void q27_matvec_b1_quantized_r3(device const uchar *weights [[buffer(0)]],
+                                        device const half *weight_scales [[buffer(1)]],
+                                        device const char *x [[buffer(2)]],
+                                        device const float *x_scales [[buffer(3)]],
+                                        device float *out [[buffer(4)]],
+                                        constant MatvecArgs &args [[buffer(5)]],
+                                        uint group [[threadgroup_position_in_grid]],
+                                        ushort lane [[thread_index_in_simdgroup]],
+                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = (group * 8 + (uint)simdgroup) * 8;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    device const int4 *x16 = (device const int4 *)x;
+    const uint sgroups = args.cols / 128;
+    device const uint *w[8];
+    ulong sbase[8];
+    for (uint r = 0; r < 8; r++) {
+        const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+        w[r] = (device const uint *)(weights + (ulong)row * (args.cols / 8));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;      // one uint = 32 columns
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
+        const uint c = chunk * 1024 + lane * 32;
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 8; r++) {
+            const uint wp = w[r][idx];
+            const int dot0 = q27_dot16_b1(wp, xp0);
+            const int dot1 = q27_dot16_b1(wp >> 16, xp1);
+            acc[r] += float(dot0 + dot1) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
+    }
+    for (uint c = chunks * 1024 + lane * 4; c < args.cols; c += 128) {
+        const char4 xp = *(device const char4 *)(x + c);
+        const int tot = int(xp.x) + int(xp.y) + int(xp.z) + int(xp.w);
+        const float xs = x_scales[c / 32];
+        for (uint r = 0; r < 8; r++) {
+            const uint wp = uint(((device const uchar *)w[r])[c / 8]) >> (c % 8);
+            const int pos = select(0, int(xp.x), bool(wp & 1u)) +
+                            select(0, int(xp.y), bool(wp & 2u)) +
+                            select(0, int(xp.z), bool(wp & 4u)) +
+                            select(0, int(xp.w), bool(wp & 8u));
+            acc[r] += float(2 * pos - tot) *
+                      float(weight_scales[sbase[r] + c / 128]) * xs;
+        }
+    }
+    for (uint r = 0; r < 8; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
 }
 
 // Dual-row ternary dot: unpack each 2-bit code ONCE, MAC into both rows.
@@ -2250,6 +2339,495 @@ kernel void q27_matmul_t2_mm_h(
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
 
+
+// Byte -> 2 Q4 halves (low nibble first, code n -> n-8): one constant-
+// memory gather replaces two shift/mask/int-sub/convert chains. 1 KB,
+// values -8..+7 are all exact in half.
+constant half2 q27_q4_half2_lut[256] = {
+    half2(-8.0h, -8.0h),
+    half2(-7.0h, -8.0h),
+    half2(-6.0h, -8.0h),
+    half2(-5.0h, -8.0h),
+    half2(-4.0h, -8.0h),
+    half2(-3.0h, -8.0h),
+    half2(-2.0h, -8.0h),
+    half2(-1.0h, -8.0h),
+    half2(0.0h, -8.0h),
+    half2(1.0h, -8.0h),
+    half2(2.0h, -8.0h),
+    half2(3.0h, -8.0h),
+    half2(4.0h, -8.0h),
+    half2(5.0h, -8.0h),
+    half2(6.0h, -8.0h),
+    half2(7.0h, -8.0h),
+    half2(-8.0h, -7.0h),
+    half2(-7.0h, -7.0h),
+    half2(-6.0h, -7.0h),
+    half2(-5.0h, -7.0h),
+    half2(-4.0h, -7.0h),
+    half2(-3.0h, -7.0h),
+    half2(-2.0h, -7.0h),
+    half2(-1.0h, -7.0h),
+    half2(0.0h, -7.0h),
+    half2(1.0h, -7.0h),
+    half2(2.0h, -7.0h),
+    half2(3.0h, -7.0h),
+    half2(4.0h, -7.0h),
+    half2(5.0h, -7.0h),
+    half2(6.0h, -7.0h),
+    half2(7.0h, -7.0h),
+    half2(-8.0h, -6.0h),
+    half2(-7.0h, -6.0h),
+    half2(-6.0h, -6.0h),
+    half2(-5.0h, -6.0h),
+    half2(-4.0h, -6.0h),
+    half2(-3.0h, -6.0h),
+    half2(-2.0h, -6.0h),
+    half2(-1.0h, -6.0h),
+    half2(0.0h, -6.0h),
+    half2(1.0h, -6.0h),
+    half2(2.0h, -6.0h),
+    half2(3.0h, -6.0h),
+    half2(4.0h, -6.0h),
+    half2(5.0h, -6.0h),
+    half2(6.0h, -6.0h),
+    half2(7.0h, -6.0h),
+    half2(-8.0h, -5.0h),
+    half2(-7.0h, -5.0h),
+    half2(-6.0h, -5.0h),
+    half2(-5.0h, -5.0h),
+    half2(-4.0h, -5.0h),
+    half2(-3.0h, -5.0h),
+    half2(-2.0h, -5.0h),
+    half2(-1.0h, -5.0h),
+    half2(0.0h, -5.0h),
+    half2(1.0h, -5.0h),
+    half2(2.0h, -5.0h),
+    half2(3.0h, -5.0h),
+    half2(4.0h, -5.0h),
+    half2(5.0h, -5.0h),
+    half2(6.0h, -5.0h),
+    half2(7.0h, -5.0h),
+    half2(-8.0h, -4.0h),
+    half2(-7.0h, -4.0h),
+    half2(-6.0h, -4.0h),
+    half2(-5.0h, -4.0h),
+    half2(-4.0h, -4.0h),
+    half2(-3.0h, -4.0h),
+    half2(-2.0h, -4.0h),
+    half2(-1.0h, -4.0h),
+    half2(0.0h, -4.0h),
+    half2(1.0h, -4.0h),
+    half2(2.0h, -4.0h),
+    half2(3.0h, -4.0h),
+    half2(4.0h, -4.0h),
+    half2(5.0h, -4.0h),
+    half2(6.0h, -4.0h),
+    half2(7.0h, -4.0h),
+    half2(-8.0h, -3.0h),
+    half2(-7.0h, -3.0h),
+    half2(-6.0h, -3.0h),
+    half2(-5.0h, -3.0h),
+    half2(-4.0h, -3.0h),
+    half2(-3.0h, -3.0h),
+    half2(-2.0h, -3.0h),
+    half2(-1.0h, -3.0h),
+    half2(0.0h, -3.0h),
+    half2(1.0h, -3.0h),
+    half2(2.0h, -3.0h),
+    half2(3.0h, -3.0h),
+    half2(4.0h, -3.0h),
+    half2(5.0h, -3.0h),
+    half2(6.0h, -3.0h),
+    half2(7.0h, -3.0h),
+    half2(-8.0h, -2.0h),
+    half2(-7.0h, -2.0h),
+    half2(-6.0h, -2.0h),
+    half2(-5.0h, -2.0h),
+    half2(-4.0h, -2.0h),
+    half2(-3.0h, -2.0h),
+    half2(-2.0h, -2.0h),
+    half2(-1.0h, -2.0h),
+    half2(0.0h, -2.0h),
+    half2(1.0h, -2.0h),
+    half2(2.0h, -2.0h),
+    half2(3.0h, -2.0h),
+    half2(4.0h, -2.0h),
+    half2(5.0h, -2.0h),
+    half2(6.0h, -2.0h),
+    half2(7.0h, -2.0h),
+    half2(-8.0h, -1.0h),
+    half2(-7.0h, -1.0h),
+    half2(-6.0h, -1.0h),
+    half2(-5.0h, -1.0h),
+    half2(-4.0h, -1.0h),
+    half2(-3.0h, -1.0h),
+    half2(-2.0h, -1.0h),
+    half2(-1.0h, -1.0h),
+    half2(0.0h, -1.0h),
+    half2(1.0h, -1.0h),
+    half2(2.0h, -1.0h),
+    half2(3.0h, -1.0h),
+    half2(4.0h, -1.0h),
+    half2(5.0h, -1.0h),
+    half2(6.0h, -1.0h),
+    half2(7.0h, -1.0h),
+    half2(-8.0h, 0.0h),
+    half2(-7.0h, 0.0h),
+    half2(-6.0h, 0.0h),
+    half2(-5.0h, 0.0h),
+    half2(-4.0h, 0.0h),
+    half2(-3.0h, 0.0h),
+    half2(-2.0h, 0.0h),
+    half2(-1.0h, 0.0h),
+    half2(0.0h, 0.0h),
+    half2(1.0h, 0.0h),
+    half2(2.0h, 0.0h),
+    half2(3.0h, 0.0h),
+    half2(4.0h, 0.0h),
+    half2(5.0h, 0.0h),
+    half2(6.0h, 0.0h),
+    half2(7.0h, 0.0h),
+    half2(-8.0h, 1.0h),
+    half2(-7.0h, 1.0h),
+    half2(-6.0h, 1.0h),
+    half2(-5.0h, 1.0h),
+    half2(-4.0h, 1.0h),
+    half2(-3.0h, 1.0h),
+    half2(-2.0h, 1.0h),
+    half2(-1.0h, 1.0h),
+    half2(0.0h, 1.0h),
+    half2(1.0h, 1.0h),
+    half2(2.0h, 1.0h),
+    half2(3.0h, 1.0h),
+    half2(4.0h, 1.0h),
+    half2(5.0h, 1.0h),
+    half2(6.0h, 1.0h),
+    half2(7.0h, 1.0h),
+    half2(-8.0h, 2.0h),
+    half2(-7.0h, 2.0h),
+    half2(-6.0h, 2.0h),
+    half2(-5.0h, 2.0h),
+    half2(-4.0h, 2.0h),
+    half2(-3.0h, 2.0h),
+    half2(-2.0h, 2.0h),
+    half2(-1.0h, 2.0h),
+    half2(0.0h, 2.0h),
+    half2(1.0h, 2.0h),
+    half2(2.0h, 2.0h),
+    half2(3.0h, 2.0h),
+    half2(4.0h, 2.0h),
+    half2(5.0h, 2.0h),
+    half2(6.0h, 2.0h),
+    half2(7.0h, 2.0h),
+    half2(-8.0h, 3.0h),
+    half2(-7.0h, 3.0h),
+    half2(-6.0h, 3.0h),
+    half2(-5.0h, 3.0h),
+    half2(-4.0h, 3.0h),
+    half2(-3.0h, 3.0h),
+    half2(-2.0h, 3.0h),
+    half2(-1.0h, 3.0h),
+    half2(0.0h, 3.0h),
+    half2(1.0h, 3.0h),
+    half2(2.0h, 3.0h),
+    half2(3.0h, 3.0h),
+    half2(4.0h, 3.0h),
+    half2(5.0h, 3.0h),
+    half2(6.0h, 3.0h),
+    half2(7.0h, 3.0h),
+    half2(-8.0h, 4.0h),
+    half2(-7.0h, 4.0h),
+    half2(-6.0h, 4.0h),
+    half2(-5.0h, 4.0h),
+    half2(-4.0h, 4.0h),
+    half2(-3.0h, 4.0h),
+    half2(-2.0h, 4.0h),
+    half2(-1.0h, 4.0h),
+    half2(0.0h, 4.0h),
+    half2(1.0h, 4.0h),
+    half2(2.0h, 4.0h),
+    half2(3.0h, 4.0h),
+    half2(4.0h, 4.0h),
+    half2(5.0h, 4.0h),
+    half2(6.0h, 4.0h),
+    half2(7.0h, 4.0h),
+    half2(-8.0h, 5.0h),
+    half2(-7.0h, 5.0h),
+    half2(-6.0h, 5.0h),
+    half2(-5.0h, 5.0h),
+    half2(-4.0h, 5.0h),
+    half2(-3.0h, 5.0h),
+    half2(-2.0h, 5.0h),
+    half2(-1.0h, 5.0h),
+    half2(0.0h, 5.0h),
+    half2(1.0h, 5.0h),
+    half2(2.0h, 5.0h),
+    half2(3.0h, 5.0h),
+    half2(4.0h, 5.0h),
+    half2(5.0h, 5.0h),
+    half2(6.0h, 5.0h),
+    half2(7.0h, 5.0h),
+    half2(-8.0h, 6.0h),
+    half2(-7.0h, 6.0h),
+    half2(-6.0h, 6.0h),
+    half2(-5.0h, 6.0h),
+    half2(-4.0h, 6.0h),
+    half2(-3.0h, 6.0h),
+    half2(-2.0h, 6.0h),
+    half2(-1.0h, 6.0h),
+    half2(0.0h, 6.0h),
+    half2(1.0h, 6.0h),
+    half2(2.0h, 6.0h),
+    half2(3.0h, 6.0h),
+    half2(4.0h, 6.0h),
+    half2(5.0h, 6.0h),
+    half2(6.0h, 6.0h),
+    half2(7.0h, 6.0h),
+    half2(-8.0h, 7.0h),
+    half2(-7.0h, 7.0h),
+    half2(-6.0h, 7.0h),
+    half2(-5.0h, 7.0h),
+    half2(-4.0h, 7.0h),
+    half2(-3.0h, 7.0h),
+    half2(-2.0h, 7.0h),
+    half2(-1.0h, 7.0h),
+    half2(0.0h, 7.0h),
+    half2(1.0h, 7.0h),
+    half2(2.0h, 7.0h),
+    half2(3.0h, 7.0h),
+    half2(4.0h, 7.0h),
+    half2(5.0h, 7.0h),
+    half2(6.0h, 7.0h),
+    half2(7.0h, 7.0h),
+};
+
+
+// Q4 chunk GEMM on the half-staging pattern of q27_matmul_t2_mm_h (variant
+// G-prime, docs/plans/2026-07-15-gemm-half-staging.md follow-up; port pre-
+// registered in 2026-07-17-t2-prefill-throughput.md): half tiles, raw Q4
+// codes (-8..+7) and raw int8 activations both integer-exact in half, FLOAT
+// accumulators (mixed-precision MMA). Products are bounded by 8*128 = 1024 <
+// 2048, so every product is exact in half regardless of where the MMA
+// rounds, and float accumulation keeps sums exact to 2^24 — stronger than
+// the float-staged q27_matmul_q4_mm it replaces, whose activation side
+// rounded once per value at staging. The Q4 scale group is 64 columns, so
+// each staged 64-K tile coincides with exactly one weight-scale group
+// (index c0/64, row stride cols/64); activation scales fold per 32-K
+// sub-slab at the flush exactly as in the T2 kernel.
+kernel void q27_matmul_q4_mm_h(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 2);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 64);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 64);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            // 16 columns = 8 bytes per thread: one byte-LUT gather per
+            // nibble pair, low nibble first (matches the float kernel's
+            // LSB-first order). wcb is a multiple of 16 -> half2-aligned.
+            const uint2 wp = *(device const uint2 *)(wsrc + (c0 + wcb) / 2);
+            threadgroup half2 *dst = (threadgroup half2 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_q4_half2_lut[wp.x         & 0xffu];
+            dst[1] = q27_q4_half2_lut[(wp.x >>  8) & 0xffu];
+            dst[2] = q27_q4_half2_lut[(wp.x >> 16) & 0xffu];
+            dst[3] = q27_q4_half2_lut[wp.x >> 24         ];
+            dst[4] = q27_q4_half2_lut[wp.y         & 0xffu];
+            dst[5] = q27_q4_half2_lut[(wp.y >>  8) & 0xffu];
+            dst[6] = q27_q4_half2_lut[(wp.y >> 16) & 0xffu];
+            dst[7] = q27_q4_half2_lut[wp.y >> 24         ];
+        }
+        {
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            // Raw int8 values: exact in half. The per-token 32-group scale
+            // folds at the flush below; invalid token slots stage clamped
+            // real values whose outputs are never stored.
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 64]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 64]);
+        // The two 32-K sub-slabs (activation-scale groups) accumulate into
+        // separate tile pairs so both fold in ONE barrier region per staged 64.
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// PARKED (2026-07-17, never engine-routed): Q8 on the half-staging
+// pattern FAILED the shape suite — 5.5e-4 at the high-cancellation
+// 33x5120 repro vs the 3e-4 bound. Unlike Q4/T2, Q8 PRODUCTS (up to
+// 127*127) exceed half's 2048 exact-integer range, and the failure shows
+// the mixed-precision MMA rounds products at HALF precision, not at the
+// float accumulator's — the empirical answer to the open question the Q4
+// port's exactness argument sidesteps (its products are <= 1024, exact
+// regardless). A split-nibble Q8 staging would restore exactness at 2x
+// the MMA work for a ~8%-of-wall kernel: not worth it. Q8 chunk GEMM
+// stays float-staged; kernel kept as the record of the attempt.
+kernel void q27_matmul_q8_mm_h(
+        device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const char *x [[buffer(2)]], device const float *x_scales [[buffer(3)]],
+        device float *out [[buffer(4)]], constant MatmulArgs &args [[buffer(5)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 256];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const char *wsrc = weights + (ulong)min(row0 + wrow, rlast) * args.cols;
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
+    device const char *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 256;
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const int4 wp = *(device const int4 *)(wsrc + c0 + wcb);
+            const char4 w0 = as_type<char4>(wp.x), w1 = as_type<char4>(wp.y);
+            const char4 w2 = as_type<char4>(wp.z), w3 = as_type<char4>(wp.w);
+            threadgroup half *dst = Wt + wrow * 64 + wcb;
+            dst[0]  = half(w0.x); dst[1]  = half(w0.y); dst[2]  = half(w0.z); dst[3]  = half(w0.w);
+            dst[4]  = half(w1.x); dst[5]  = half(w1.y); dst[6]  = half(w1.z); dst[7]  = half(w1.w);
+            dst[8]  = half(w2.x); dst[9]  = half(w2.y); dst[10] = half(w2.z); dst[11] = half(w2.w);
+            dst[12] = half(w3.x); dst[13] = half(w3.y); dst[14] = half(w3.z); dst[15] = half(w3.w);
+        }
+        {
+            const char4 xa = *(device const char4 *)(xsrc + c0 + xcb);
+            const char4 xb = *(device const char4 *)(xsrc + c0 + xcb + 4);
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y);
+            dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y);
+            dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        for (uint k8 = 0; k8 < 32; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        for (uint k8 = 32; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc2, a, b, acc2);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc3, a, b, acc3);
+        }
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_store(acc2, sc + 128, 8);
+        simdgroup_store(acc3, sc + 192, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const ulong xrow_a = (ulong)min(tokA, args.x_rows - 1) * (args.cols / 32);
+            const ulong xrow_b = (ulong)min(tokB, args.x_rows - 1) * (args.cols / 32);
+            const float xsA0 = x_scales[xrow_a + c0 / 32],     xsB0 = x_scales[xrow_b + c0 / 32];
+            const float xsA1 = x_scales[xrow_a + c0 / 32 + 1], xsB1 = x_scales[xrow_b + c0 / 32 + 1];
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA * xsA0, wsB * xsA0, wsA * xsB0, wsB * xsB0);
+            racc += float4(sc[lane + 128], sc[lane + 160], sc[lane + 192], sc[lane + 224]) *
+                    float4(wsA * xsA1, wsB * xsA1, wsA * xsB1, wsB * xsB1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
 
 // Nibble -> 4 binary-code halves (bit j = element j, LSB-first): one
 // constant-memory gather replaces four shift/mask/select chains. Bit b

@@ -1,0 +1,5 @@
+chunk-parity(half) exit=0
+nll8k(float) exit=0
+nll8k(half) exit=0
+server health 200
+DONE

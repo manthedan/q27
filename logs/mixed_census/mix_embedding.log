@@ -1,0 +1,5 @@
+mix: 1 tensors from donor, 850 from base, byte delta +158.9 MB
+  take token_embd.weight
+mix: wrote models/census_arm.61541.q27
+Metal model ready on Apple M4 in 0.90 s
+artifacts and Metal architecture: OK

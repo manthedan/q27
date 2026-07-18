@@ -1,0 +1,3 @@
+backend: Apple M4, 960-token synthetic prompt in chunks of 96, fp16 KV
+weight stream per chunk: 12.08 GiB
+prefill: 3796.0 ms/chunk, 25.29 tok/s, effective weight stream 3.4 GB/s

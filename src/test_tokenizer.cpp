@@ -244,6 +244,18 @@ static int anthropic_api_selftest() {
                "schema/description defaults");
         expect(q27::anthropic_tools_json(json::object()).is_array(), "no tools -> empty array");
     }
+    {
+        json body={{"max_tokens",nullptr},{"max_output_tokens",77}};
+        auto fallback=q27::json_i64_or(body,"max_output_tokens",256);
+        expect(fallback==77, "nullable integer fallback key");
+        expect(q27::json_i64_or(body,"max_tokens",fallback)==77,
+               "null max_tokens uses fallback");
+        body["max_tokens"]=123;
+        expect(q27::json_i64_or(body,"max_tokens",fallback)==123,
+               "explicit max_tokens wins");
+        expect(q27::json_i64_or(json::object(),"max_tokens",4096)==4096,
+               "missing max_tokens uses default");
+    }
     printf("anthropic api shapes: %s\n", fail ? "FAIL" : "PASS");
     return fail;
 }
@@ -419,10 +431,196 @@ int main(int argc, char** argv) {
         auto v13 = q27::parse_bare_tool_calls(
             "{\"name\":\n{\"x\":\"1\",\"y\":\"2\"}}", &pre, &tools13);
         bool ok13 = v13.empty();
+        // tenth observed mode (2026-07-17, pi live traffic, T2 tier — exact
+        // payload): wrapper-less bare call whose command string carries
+        // UNESCAPED shell quotes written verbatim (`... || echo "empty
+        // dir"`), which also swallow the value's own closing quote. A quote
+        // not followed (past whitespace) by , } ] : or EOF cannot terminate
+        // a valid-JSON string, so it re-escapes as literal content; the
+        // quote after `dir` IS followed by } and closes the value, so the
+        // recovered command keeps the model's one unbalanced shell quote —
+        // the shell errors and the agent loop retries, instead of the call
+        // dead-ending as prose.
+        auto v14 = q27::parse_bare_tool_calls(
+            "Let me check the environment and then build something impressive.\n\n"
+            "{\"name\": \"bash\", \"arguments\": {\"command\": \"which node && node --version "
+            "&& which python3 && python3 --version && ls /Users/macthedan/local_robot/ "
+            "2>/dev/null || echo \"empty dir\"}}", &pre);
+        bool ok14 = v14.size() == 1 && v14[0].name == "bash" &&
+                    v14[0].arguments.value("command", "").find("which node") == 0 &&
+                    v14[0].arguments.value("command", "").find("echo \"empty dir") !=
+                        std::string::npos &&
+                    pre == "Let me check the environment and then build something impressive.";
+        // and a quote legitimately followed by a comma/brace still terminates:
+        // well-formed multi-key calls parse exactly as before
+        auto v15 = q27::parse_bare_tool_calls(
+            "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\", \"timeout\": 5}}",
+            &pre);
+        bool ok15 = v15.size() == 1 && v15[0].name == "bash" &&
+                    v15[0].arguments.value("command", "") == "ls -la" &&
+                    v15[0].arguments.value("timeout", 0) == 5;
+        // v16: the mode-10 lookahead must not swallow what follows a
+        // TRUNCATED call — the re-escape only holds for balanced segments;
+        // an unbalanced segment rescans with the unconditional terminator so
+        // a trailing second call recovers instead of merging into the open
+        // command string (review 2026-07-17: merged-garbage bash + lost
+        // view call).
+        auto v16 = q27::parse_bare_tool_calls(
+            "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"\n\n"
+            "Now let me check the files before proceeding.",
+            &pre, nullptr, true);
+        bool ok16 = v16.empty();   // truncated call stays text — never a
+                                   // "successful" parse of command+prose
+        // A colon only terminates an object KEY. Inside a command VALUE, raw
+        // shell quotes around a colon-bearing fragment remain literal.
+        auto v17 = q27::parse_bare_tool_calls(
+            "{\"name\":\"bash\",\"arguments\":{\"command\":\"echo \"key\": value\"}}",
+            &pre);
+        bool ok17 = v17.size()==1 && v17[0].name=="bash" &&
+                    v17[0].arguments.value("command","")=="echo \"key\": value";
         bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 &&
-                  ok10 && ok11 && ok12 && ok13;
+                  ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
+    }
+
+    // Incremental tool-call argument streamer (2026-07-17-incremental-
+    // tool-call-streaming.md): the wrapped-call body fed in awkward
+    // token-sized cuts must stream a head (opened + name) plus sanitized
+    // argument fragments whose concatenation is parse-EQUAL to the
+    // buffered parse; deviant heads must fall back with raw byte-exact;
+    // truncated bodies must finalize unclean without inventing framing.
+    {
+        auto stream_cut=[](const std::string& body, size_t cut_every,
+                           std::string& frags, int& n_frags, bool& opened,
+                           bool& clean, std::string& name, std::string& raw){
+            q27::ToolCallStreamer ts;
+            for (size_t p = 0; p < body.size(); p += cut_every) {
+                bool o=false;
+                std::string f=ts.feed(body.substr(p,cut_every),&o);
+                opened|=o;
+                if(!f.empty()){ frags+=f; n_frags++; }
+            }
+            std::string tail; clean=ts.finalize(&tail); frags+=tail;
+            name=ts.name; raw=ts.raw;
+        };
+        // s1: well-formed call, 3-byte cuts (splits "name", the arguments
+        // key, and in-string content across feeds); must open, stream >1
+        // fragment, close clean, and parse-equal the buffered path.
+        std::string b1="{\"name\": \"write\", \"arguments\": {\"path\": \"/w/a.ts\", \"n\": 3}}";
+        std::string f1,nm1,raw1; int c1n=0; bool op1=false,cl1=false;
+        stream_cut(b1,3,f1,c1n,op1,cl1,nm1,raw1);
+        bool s1=op1 && cl1 && c1n>1 && nm1=="write" &&
+                nlohmann::json::parse(f1)==nlohmann::json::parse(
+                    "{\"path\": \"/w/a.ts\", \"n\": 3}");
+        // s2: mode-5 inline — literal newline/tab inside the content string
+        // sanitize to \n \t while streaming; parse-equal with real controls.
+        std::string b2="{\"name\": \"write\", \"arguments\": {\"content\": \"a\nb\tc\"}}";
+        std::string f2,nm2,raw2; int c2n=0; bool op2=false,cl2=false;
+        stream_cut(b2,4,f2,c2n,op2,cl2,nm2,raw2);
+        bool s2=op2 && cl2 &&
+                nlohmann::json::parse(f2).value("content","")=="a\nb\tc";
+        // s3: mode-10 inline — verbatim shell quotes re-escape via one-byte
+        // lookahead (quote before h: literal; after i-space: literal; the
+        // final quote before } terminates). 1-byte cuts force the pending-
+        // quote path across feed boundaries.
+        std::string b3="{\"name\": \"bash\", \"arguments\": {\"command\": \"echo \"hi\" ok\"}}";
+        std::string f3,nm3,raw3; int c3n=0; bool op3=false,cl3=false;
+        stream_cut(b3,1,f3,c3n,op3,cl3,nm3,raw3);
+        bool s3=op3 && cl3 && nm3=="bash" &&
+                nlohmann::json::parse(f3).value("command","")=="echo \"hi\" ok";
+        std::string b3b="{\"name\":\"bash\",\"arguments\":{\"command\":\"echo \"key\": value\"}}";
+        std::string f3b,nm3b,raw3b; int c3bn=0; bool op3b=false,cl3b=false;
+        stream_cut(b3b,1,f3b,c3bn,op3b,cl3b,nm3b,raw3b);
+        bool s3b=op3b && cl3b && nm3b=="bash" &&
+                 nlohmann::json::parse(f3b).value("command","")=="echo \"key\": value";
+        // Structurally closed braces are not enough: an unclosed array makes
+        // the sanitized arguments invalid and must finalize unclean/fallback.
+        std::string b3c="{\"name\":\"bash\",\"arguments\":{\"a\":[1}}";
+        std::string f3c,nm3c,raw3c; int c3cn=0; bool op3c=false,cl3c=false;
+        stream_cut(b3c,1,f3c,c3cn,op3c,cl3c,nm3c,raw3c);
+        bool s3c=op3c && !cl3c && raw3c==b3c;
+        // Once invalidity is known, later token feeds still belong to the
+        // recovery trail (a packed second call must not disappear).
+        q27::ToolCallStreamer t3d; bool opened3d=false;
+        (void)t3d.feed(b3c,&opened3d);
+        (void)t3d.feed("{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}",nullptr);
+        std::string pre3d;
+        auto calls3d=q27::parse_bare_tool_calls(t3d.trail(),&pre3d,nullptr,false);
+        bool s3d=opened3d && t3d.invalid() && calls3d.size()==1 &&
+                 calls3d[0].name=="bash" && calls3d[0].arguments.value("command","")=="pwd";
+        // s4: mode-6 head (name-dropped) must never stream — fallback with
+        // the raw body preserved byte-exact for the recovery chain.
+        std::string b4="{\"name\":\n{\"file_path\": \"/w/a.md\"}}";
+        std::string f4,nm4,raw4; int c4n=0; bool op4=false,cl4=false;
+        stream_cut(b4,5,f4,c4n,op4,cl4,nm4,raw4);
+        bool s4=!op4 && f4.empty() && raw4==b4;
+        // s5: truncated mid-string — finalize unclean, fragments carry the
+        // unbalanced prefix as-is (production semantics, no invented framing).
+        std::string b5="{\"name\": \"write\", \"arguments\": {\"content\": \"abc";
+        std::string f5,nm5,raw5; int c5n=0; bool op5=false,cl5=false;
+        stream_cut(b5,7,f5,c5n,op5,cl5,nm5,raw5);
+        bool s5=op5 && !cl5 && f5.rfind("{\"content\": \"abc",0)==0;
+        // s6: mode-9 head (missing opening quote on the arguments key)
+        // still streams.
+        std::string b6="{\"name\": \"bash\",\narguments\": {\"command\": \"ls\"}}";
+        std::string f6,nm6,raw6; int c6n=0; bool op6=false,cl6=false;
+        stream_cut(b6,3,f6,c6n,op6,cl6,nm6,raw6);
+        bool s6=op6 && cl6 && nm6=="bash" &&
+                nlohmann::json::parse(f6).value("command","")=="ls";
+        // s7: TWO well-formed calls packed in one wrapper (review
+        // 2026-07-17: the DONE-state byte drop lost the second silently).
+        // The first streams; the bytes after its arguments close land in
+        // trail() and must recover through the bare-call chain.
+        {
+            q27::ToolCallStreamer ts;
+            std::string b7="{\"name\":\"read\",\"arguments\":{\"file\":\"a\"}}"
+                           "{\"name\":\"read\",\"arguments\":{\"file\":\"b\"}}";
+            std::string f7; bool op7=false;
+            for(size_t p=0;p<b7.size();p+=3){
+                bool o=false; f7+=ts.feed(b7.substr(p,3),&o); op7|=o;
+            }
+            std::string tail; bool cl7=ts.finalize(&tail); f7+=tail;
+            auto bcs=q27::parse_bare_tool_calls(
+                q27::strip_ws2(ts.trail()),nullptr,nullptr,true);
+            bool s7=op7 && cl7 &&
+                    nlohmann::json::parse(f7).value("file","")=="a" &&
+                    bcs.size()==1 && bcs[0].name=="read" &&
+                    bcs[0].arguments.value("file","")=="b";
+            // s8: mode-3 shape 1 — <content> tag in value position opens the
+            // string the model forgot; interior raw quotes/newlines escape;
+            // the last </content> closes it. Must parse-equal the buffered
+            // escape_content_tags path.
+            std::string b8="{\"name\": \"write\", \"arguments\": {\"path\": \"a.md\", "
+                           "\"content\": <content>Line \"q\" one\ntwo</content>}}";
+            std::string f8,nm8,raw8; int c8n=0; bool op8=false,cl8=false;
+            stream_cut(b8,3,f8,c8n,op8,cl8,nm8,raw8);
+            auto buf8=q27::parse_tool_call(b8);
+            bool s8=op8 && cl8 && buf8.ok &&
+                    nlohmann::json::parse(f8)==buf8.arguments;
+            // s9: mode-3 shape 2 — stray </content> instead of the closing
+            // quote; 1-byte cuts force the tag capture across feed
+            // boundaries. And a literal in-string </content> followed by
+            // more content must stay literal (s9b).
+            std::string b9="{\"name\": \"write\", \"arguments\": {\"path\": \"b.md\", "
+                           "\"content\": \"RAW \"x\" line</content>}}";
+            std::string f9,nm9,raw9; int c9n=0; bool op9=false,cl9=false;
+            stream_cut(b9,1,f9,c9n,op9,cl9,nm9,raw9);
+            bool s9=op9 && cl9 &&
+                    nlohmann::json::parse(f9).value("content","")=="RAW \"x\" line";
+            std::string b9b="{\"name\": \"write\", \"arguments\": {\"c\": \"a</content>b\"}}";
+            std::string f9b,nm9b,raw9b; int c9bn=0; bool op9b=false,cl9b=false;
+            stream_cut(b9b,1,f9b,c9bn,op9b,cl9b,nm9b,raw9b);
+            bool s9b=op9b && cl9b &&
+                     nlohmann::json::parse(f9b).value("c","")=="a</content>b";
+            bool ok=s1&&s2&&s3&&s3b&&s3c&&s3d&&s4&&s5&&s6&&s7&&s8&&s9&&s9b;
+            printf("incremental tool-call streamer: %s\n", ok?"PASS":"FAIL");
+            if(!ok){
+                fprintf(stderr,"  s1=%d s2=%d s3=%d s3b=%d s3c=%d s3d=%d s4=%d s5=%d s6=%d s7=%d s8=%d s9=%d s9b=%d\n",
+                        s1,s2,s3,s3b,s3c,s3d,s4,s5,s6,s7,s8,s9,s9b);
+                return 1;
+            }
+        }
     }
 
     // P7: ToolGrammar -- char-level pushdown machine enforcing the

@@ -1,0 +1,9 @@
+PASS: sfx-serial-rep committed bytes identical to serial
+PASS: sfx16-rep committed bytes identical to serial
+PASS: sfx32-rep committed bytes identical to serial
+PASS: sfx48-rep committed bytes identical to serial
+PASS: dispatch trace shows live >= 16 (w16 arm) and >= 32 (w48 arm)
+PASS: sfx32-rep3 committed bytes identical to serial
+PASS: acceptance walk rejected at least one lane (walk is live)
+PASS: neutral prompt — committed bytes identical
+WARN: neutral prompt fired bursts (greedy continuation is periodic on this box; economics prior, not a correctness failure)

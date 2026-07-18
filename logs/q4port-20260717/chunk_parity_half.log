@@ -1,0 +1,6 @@
+Metal model ready on Apple M4 in 0.13 s (two engines, one mapping, fp16 KV)
+chunk-parity: 384 positions, widths {17,48,96} vs width-12 baseline
+chunk-parity: PASS — widths {17,48,96} bit-identical to the width-12 baseline (logits + hidden row)
+width 17 vs 12: rows differing 0/384, max|dlogit| 0 (mean 0), KL mean 0 max 0 nats, top-1 flips 0/384 (ref margin min 0 max 0), top-20 overlap 100.00%, NLL 1.946779 vs 1.946779 (max |dNLL| 0), hidden row identical
+width 48 vs 12: rows differing 0/384, max|dlogit| 0 (mean 0), KL mean 0 max 0 nats, top-1 flips 0/384 (ref margin min 0 max 0), top-20 overlap 100.00%, NLL 1.946779 vs 1.946779 (max |dNLL| 0), hidden row identical
+width 96 vs 12: rows differing 0/384, max|dlogit| 0 (mean 0), KL mean 0 max 0 nats, top-1 flips 0/384 (ref margin min 0 max 0), top-20 overlap 100.00%, NLL 1.946779 vs 1.946779 (max |dNLL| 0), hidden row identical

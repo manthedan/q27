@@ -1,6 +1,6 @@
 # e4m3 on the hot cells — pre-registration (2026-07-17, before any arm ran)
 
-Daniel: "hot cells" (follow-up to the fp8-KV control arm's band-1 result,
+the operator: "hot cells" (follow-up to the fp8-KV control arm's band-1 result,
 2026-07-17-fp8-kv-control.md). Question: does e4m3 fidelity on ONLY layer
 7's 8 cells — turbo3 everywhere else — kill the production pos-1000 event
 the way the funded fp16 L7-full config does? Prices at stake per token
@@ -65,7 +65,7 @@ max 2.94 / mean 0.0116; funded fp16 L7-full 0.7546 / 0.0104.
 2. **8K formal**: max ≤ 1.30 AND mean ≤ 0.0116 → e4m3-L7 GRADUATES as
    a priced alternative: +9.75% for the event kill, vs +25.8% funded.
    The selection between them (and whether to fund the 1-byte side
-   format) is Daniel's, per standing practice.
+   format) is the operator's, per standing practice.
 3. Suite green + default-off byte identity ride along (codec unset =
    fp16 sides; the funded config's behavior must be bit-unchanged).
 
@@ -91,7 +91,7 @@ Dispositions:
 - Option 2 (mid-rate ~2× turbo3-family code on L7, ~+12.9%) is now
   strongly disfavored by evidence, not just unmeasured: an 8-bit
   FLOAT code failed to kill; a ~6-bit code has no plausible path.
-  Recommend closing it unless Daniel wants the arm anyway.
+  Recommend closing it unless the operator wants the arm anyway.
 - The e4m3 machinery (codec knob, ABI 12, snapshot/tag identity)
   stays in-tree as the reproducible killed experiment, default-off,
   funded-config behavior bit-unchanged (codec-0 store byte-identity

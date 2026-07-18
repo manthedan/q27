@@ -1,0 +1,3 @@
+backend: Apple M4, 16 simulated tokens at context 128, fp16 KV, binary weights
+weight stream per token: 3.36 GiB
+decode step: 53.7 ms/token, 18.64 tok/s, effective weight stream 67.2 GB/s

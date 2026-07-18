@@ -1,8 +1,9 @@
 # Handoff — mixed-tier census → ship gates (2026-07-17, mini)
 
 Read this + `docs/plans/2026-07-17-mixed-tier-census.md` (the plan doc is the
-authoritative record; its RESULTS / combo / ship-gate sections are complete
-through tonight).
+authoritative record; its RESULTS / combo / original ship-gate sections are
+complete). Later expert-review amendments add A5/A6 and product gates before
+any serving claim; `docs/HANDOFF-2026-07-17.md` is the newer global handoff.
 
 ## Where things stand
 
@@ -20,16 +21,18 @@ through tonight).
      anchor 2.5885 EXACT (beats
      all-T2, 0.9925), suffix battery 8/8 — but **behavioral probes 3/4 =
      SHIP GATE FAIL**: constraints probe collapses at greedy into a
-     thinking-mode repetition loop to the 6144 cap. Controls all pass
-     same-box/server/protocol: B1, T2, alphabeta-only, qkv-only. The loop
-     is EMERGENT from the qkv+alphabeta combination (cross-checkpoint
+     thinking-mode repetition loop to the 6144 cap. Same-box controls all
+     avoid the loop: alphabeta-only passes exactly; B1, T2, and qkv-only
+     are finite near-passes whose sole miss is final `done` vs `done.`.
+     The catastrophic loop is EMERGENT from the qkv+alphabeta combination
+     (cross-checkpoint
      co-adaptation; NLL is blind to it).
    - `cheap_pair` = B1 + T2{gdn_alphabeta, attnq_mid(blk 21–42)}.
-     **PASSES THE COMPLETE SHIP GATE — first mixed pack to do so.** NLL
+     **PASSES THE COMPLETE ORIGINAL SHIP GATE — first mixed pack to do so.** NLL
      anchor 2.6355 EXACT (1.0105 vs T2), 3.83 GB, suffix 8/8, probes 4/4.
-     Promoted as the **M1 serving tier** at
+     Retained as the provisional **M1 candidate** at
      `models/bonsai-27b-m1/bonsai-27b-m1.q27` (md5 91db7fdd…;
-     CHECKSUMS.md5 written).
+     CHECKSUMS.md5 written); amended product gates remain.
 
 3. **Suffix battery instrument fixes (committed, in
    `tools/suffix_burst_gates_2026-07-16.sh`)**: gate 3b awk compared the
@@ -44,11 +47,12 @@ through tonight).
 
 ## Continuation decision
 
-1. `cheap_pair` was promoted as **M1** and moved into its final local model
-   home with checksum; the failing `gdn_pair` was moved under an explicit
+1. `cheap_pair` was moved into the provisional **M1 candidate** model home
+   with checksum; the failing `gdn_pair` was moved under an explicit
    `-experimental` name. The rescue investigation is parked rather than
    spending another model-run budget without separate funding.
-2. The plan doc, README, and METAL_PROGRESS record the promotion. Codex
+2. The plan doc, README, and METAL_PROGRESS record the candidate selection
+   and later amended gates. Codex
    review of the original ship-gate changes ran clean (one wording fix
    adopted). No commit trailers, ever.
 

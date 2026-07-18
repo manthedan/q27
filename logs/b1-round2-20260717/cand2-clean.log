@@ -1,0 +1,14 @@
+backend: Apple M4, 20 reps per shape
+B1 round-2 leg: candidate 2 (4 rows/simdgroup, lane-held x-slice) vs same-run production q27_matvec_b1_quantized on the bonsai per-token mix
+shape                           prod ms  cand ms   p GB/s   c GB/s |      r
+ffn gate/up   [17408x5120]        0.539    0.212    23.26    59.08 |  2.540
+ffn down      [5120x17408]        0.544    0.235    23.05    53.40 |  2.317
+gdn qkv       [10240x5120]        0.326    0.158    22.63    46.72 |  2.065
+gdn gate      [6144x5120]         0.203    0.100    21.77    44.42 |  2.040
+ssm/attn out  [5120x6144]         0.217    0.100    20.36    44.07 |  2.164
+attn q        [12288x5120]        0.414    0.160    21.36    55.27 |  2.588
+attn k/v      [1024x5120]         0.046    0.034    16.15    21.54 |  1.334
+output head   [248320x5120]       7.515    2.646    23.79    67.58 |  2.841
+identity: candidate byte-identical to production on all shapes; both match the CPU int8-activation model <= 1e-3 max rel
+per-token B1 GEMV wall over the mix: production 158.66 ms (22.69 GB/s byte-weighted), candidate 67.26 ms (53.52 GB/s)
+candidate 2 mix speedup = 2.359 (round sub-line >= 1.10 to promote; ship line is the quiet artifact decode >= 18 tok/s)

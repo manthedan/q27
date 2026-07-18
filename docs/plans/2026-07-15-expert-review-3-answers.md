@@ -5,7 +5,7 @@
 we sent the expert six questions where outside knowledge exceeds what we can
 measure locally. This round is design guidance, not a code review — there is
 nothing to verify at file:line; statuses are ADOPT / RECORDED. Full response
-text is with Daniel. The expert confirmed every prediction outcome we
+text is with the operator. The expert confirmed every prediction outcome we
 relayed (R1b "factor 2 may win" → measured 2.0×; Phase B premise → killed at
 0.96×) and the feedback visibly sharpened this round — **keep sending
 outcome reports with every future round.**

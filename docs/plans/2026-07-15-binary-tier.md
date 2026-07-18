@@ -90,7 +90,7 @@ coexist on either machine, but **the one-model-load rule stays in force** —
 it exists because of a real crash; amend it only deliberately, with a
 measured pressure test, never implicitly.
 
-### Phase 0A results (2026-07-15 night, 24 GB M4 — Daniel-authorized overnight batch, `logs/overnight-20260715/`)
+### Phase 0A results (2026-07-15 night, 24 GB M4 — operator-authorized overnight batch, `logs/overnight-20260715/`)
 
 Two sessions, ratios within-session (machine under desktop load in session
 B: T2 tg128 6.21 vs 8.59 in session A vs 8.41 recorded quiet):
@@ -303,7 +303,7 @@ one-model-load rule.
 
 ---
 
-## Phase 0B RESULTS (2026-07-16 night, 24 GB M4, Daniel-authorized "do 5"; not a guaranteed-quiet machine — verdicts sit far from band edges, quiet re-run optional)
+## Phase 0B RESULTS (2026-07-16 night, 24 GB M4, operator-authorized "do 5"; not a guaranteed-quiet machine — verdicts sit far from band edges, quiet re-run optional)
 
 `./build/metal_gemv_bench --b1`, production projection mix, reference =
 production T2 select-form float matvec, correctness-gated before timing
@@ -406,11 +406,11 @@ any run:
    look), < **15 investigate before serving claims** (T2 serves at ~11;
    a B1 below 15 fails to clear the tier's reason to exist by margin).
 
-Machine: quiet 24 GB M4 (Daniel's go this window covers the runs).
+Machine: quiet 24 GB M4 (the operator's go this window covers the runs).
 Correctness legs tolerate contention; leg 3 is timing and runs last,
 alone. RESULTS below when run.
 
-### Phase 0A-q27 RESULTS (2026-07-16 night, quiet 24 GB M4, Daniel's go)
+### Phase 0A-q27 RESULTS (2026-07-16 night, quiet 24 GB M4, the operator's go)
 
 1. **NLL ratio leg: BOTH GATES PASS.** 8K single-pass wikitext-2, identical
    invocations: B1 PPL 14.311, T2 13.559, official 6.267 →

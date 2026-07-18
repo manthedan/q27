@@ -1,0 +1,4 @@
+output head   [248320x5120]       2.794    2.684    63.98    66.61 |  1.041
+identity: candidate byte-identical to production on all shapes; both match the CPU int8-activation model <= 1e-3 max rel
+per-token B1 GEMV wall over the mix: production 69.33 ms (51.92 GB/s byte-weighted), candidate 77.08 ms (46.70 GB/s)
+candidate 1 mix speedup = 0.899 (round sub-line >= 1.10 to promote; ship line is the quiet artifact decode >= 18 tok/s)

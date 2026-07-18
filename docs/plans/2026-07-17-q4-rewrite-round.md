@@ -1,7 +1,7 @@
 # Official-tier Q4 matvec rewrite round — pre-registration (2026-07-17)
 
 The one round E6 funded (docs/plans/2026-07-17-e6-q4q8-gemv.md RESULTS:
-R = 0.716). Daniel's go 2026-07-17 ("sounds good, do it" on the composite
+R = 0.716). the operator's go 2026-07-17 ("sounds good, do it" on the composite
 queue). Ship line carried verbatim: **R ≥ 0.90 on the E6 leg re-run, byte
 gates green; < 0.90 ships nothing** and the tier keeps the current kernels.
 

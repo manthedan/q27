@@ -96,4 +96,4 @@ downloadable via scripts/docs in-tree.
 
 Thanks — happy to walk through any of it live.
 
-Daniel
+— manthedan

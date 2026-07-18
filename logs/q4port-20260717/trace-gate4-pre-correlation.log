@@ -1,0 +1,4 @@
+trace-kinds: ['boot', 'error', 'outcome', 'prefix', 'request']
+trace-apis: requests=['chat', 'completions', 'count_tokens', 'messages', 'responses'] outcomes=['chat', 'completions', 'messages', 'responses'] errors=8
+PASS: trace stream complete (boot, 5 api families, outcomes, 400s, prefix decisions, monotonic tms)
+PASS: trace gate: ALL PASS

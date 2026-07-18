@@ -1,8 +1,10 @@
 // Model-free unit tests for the Metal server's streaming helpers:
-// UTF-8 boundary gating, stop-sequence holdback, and SSE event framing.
+// UTF-8 boundary gating, stop-sequence holdback, SSE event framing, and the
+// StreamSplitter channel router (incl. the adjacent-call boundary segment).
 // These run without the model artifact (part of `make test-metal`) and are
 // the regression net for the wire shapes the CUDA reference server defines.
 #include "stream_format.h"
+#include "../stream_split.h"
 
 #include <cstdio>
 #include <string>
@@ -136,10 +138,69 @@ int test_sse_framing() {
 
 } // namespace
 
+// ---- StreamSplitter ----
+namespace {
+using Seg = std::pair<q27::StreamSplitter::Chan, std::string>;
+bool segs_eq(const std::vector<Seg>& got, std::initializer_list<Seg> want) {
+    return got == std::vector<Seg>(want);
+}
+int test_splitter() {
+    using C = q27::StreamSplitter::Chan;
+    const C TEXT = q27::StreamSplitter::TEXT, THINK = q27::StreamSplitter::THINK,
+            TOOL = q27::StreamSplitter::TOOL;
+    {   // plain text/think routing
+        q27::StreamSplitter sp;
+        check(segs_eq(sp.feed("hello<think>t</think>world"),
+                      {{TEXT,"hello"},{THINK,"t"},{TEXT,"world"}}),
+              "splitter: text/think/text routing");
+        check(sp.flush().empty(), "splitter: clean flush");
+    }
+    {   // adjacent wrapped calls in ONE feed: an empty TEXT boundary segment
+        // must separate them (codex P2 2026-07-17 — consumers buffer one TOOL
+        // segment and flush on any non-TOOL segment; without the boundary the
+        // calls fold into one buffer and a malformed tail call is lost)
+        q27::StreamSplitter sp;
+        check(segs_eq(sp.feed("<tool_call>A</tool_call><tool_call>B</tool_call>"),
+                      {{TOOL,"A"},{TEXT,""},{TOOL,"B"}}),
+              "splitter: adjacent calls emit a boundary segment");
+    }
+    {   // same adjacency across feed boundaries
+        q27::StreamSplitter sp;
+        check(segs_eq(sp.feed("<tool_call>A</tool_call>"), {{TOOL,"A"}}),
+              "splitter: first call routed");
+        check(segs_eq(sp.feed("<tool_call>B</tool_call>"), {{TEXT,""},{TOOL,"B"}}),
+              "splitter: cross-feed adjacency emits the boundary");
+    }
+    {   // closer split across feeds, then an adjacent call
+        q27::StreamSplitter sp;
+        check(segs_eq(sp.feed("<tool_call>A</tool_"), {{TOOL,"A"}}),
+              "splitter: partial closer held back, head emitted");
+        check(segs_eq(sp.feed("call><tool_call>B</tool_call>"), {{TEXT,""},{TOOL,"B"}}),
+              "splitter: split-closer adjacency emits the boundary");
+    }
+    {   // controls: real text between calls, think after a call, and text
+        // before a call must NOT grow boundary segments
+        q27::StreamSplitter sp;
+        check(segs_eq(sp.feed("<tool_call>A</tool_call>x<tool_call>B</tool_call>"),
+                      {{TOOL,"A"},{TEXT,"x"},{TOOL,"B"}}),
+              "splitter: text between calls, no boundary segment");
+        q27::StreamSplitter sp2;
+        check(segs_eq(sp2.feed("<tool_call>A</tool_call><think>t</think>"),
+                      {{TOOL,"A"},{THINK,"t"}}),
+              "splitter: think after call, no boundary segment");
+        q27::StreamSplitter sp3;
+        check(segs_eq(sp3.feed("x<tool_call>A</tool_call>"), {{TEXT,"x"},{TOOL,"A"}}),
+              "splitter: text before call, no boundary segment");
+    }
+    return 0;
+}
+} // namespace
+
 int main() {
     test_utf8_gate();
     test_stop_buffer();
     test_sse_framing();
+    test_splitter();
     if (failures) { fprintf(stderr, "%d stream-format check(s) failed\n", failures); return 1; }
     puts("Metal stream format: OK");
     return 0;

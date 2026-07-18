@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <CommonCrypto/CommonDigest.h>
 #include "metal_backend.h"
 
 #include <algorithm>
@@ -63,7 +64,19 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 12";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 13";
+
+std::string source_sha1(NSString* source) {
+    NSData* data=[source dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(data.bytes,(CC_LONG)data.length,digest);
+    static const char hex[]="0123456789abcdef";
+    std::string out(40,'0');
+    for(int i=0;i<CC_SHA1_DIGEST_LENGTH;i++) {
+        out[2*i]=hex[digest[i]>>4]; out[2*i+1]=hex[digest[i]&15];
+    }
+    return out;
+}
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -173,6 +186,7 @@ struct KvStoreHeadRowsArgs { uint32_t position, src_stride, row_length, tokens, 
 } // namespace
 
 struct MetalBackend::Impl {
+    std::string shader_hash;
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
@@ -184,13 +198,20 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> t3;
     id<MTLComputePipelineState> b1;
     id<MTLComputePipelineState> t2_quantized_matmul_h;
+    id<MTLComputePipelineState> q4_quantized_matmul_h;
     id<MTLComputePipelineState> mask_logits_p;
-    // Half-staging T2 chunk GEMM: default ON (landed at 1.22x chunk rate at
+    // Half-staging chunk GEMMs: default ON (T2 landed at 1.22x chunk rate at
     // quality parity — the GEMM envelope class, docs/plans/2026-07-15-
     // margin-aware-gates.md); Q27_METAL_GEMM_HALF=0 opts out and exactly
-    // reproduces the float-staged route (used to attribute the kl-kv
+    // reproduces the float-staged routes (used to attribute the kl-kv
     // calibration shift to the digit, 2026-07-16-kv-codec-step1.md).
     bool gemm_half = true;
+    // Q4 half port remains probe-only pending a valid quiet gate
+    // (2026-07-17-t2-prefill-throughput.md asks >=1.7x). The 0.855 run was
+    // forced with idle>=0 and is explicitly rejected in
+    // logs/q4port-20260717/QUIET_BENCH_EVIDENCE.md. Correctness-gated;
+    // never the default until a valid quiet run clears the ship line.
+    bool gemm_half_q4 = false;
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> q8_quantized;
     id<MTLComputePipelineState> q4_quantized;
@@ -275,6 +296,10 @@ struct MetalBackend::Impl {
     // never creates it. r4 was promoted into q4_quantized; the q8 twin was
     // killed by measurement (2026-07-17 round doc).
     id<MTLComputePipelineState> q4_r2_p;
+    // B1 round-2 retained 8-row arm (bench-only): built on first
+    // matvec_b1r2_probe use, same lazy pattern as q4_r2_p above. The 4-row
+    // r2 arm was promoted into b1_quantized (2026-07-17 round).
+    id<MTLComputePipelineState> b1_r3_p;
     // Arm K (function-constant probe): one specialized PSO per baked cols.
     std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
     id<MTLComputePipelineState> mm_dr_p;
@@ -298,9 +323,10 @@ struct MetalBackend::Impl {
 
     // Model mappings that fit maxBufferLength are wrapped as a single
     // MTLBuffer (tensors bind at offsets), and on macOS 15+ that buffer joins
-    // a residency set attached to the queue: pages stay wired between command
-    // buffers, so file-backed weight pages are neither faulted in token by
-    // token on first touch nor evictable under memory pressure mid-run.
+    // a residency set attached to the queue. requestResidency is preparatory
+    // and best-effort per Apple (steps may be postponed under system load),
+    // not a hard wire: in practice it faults pages in at load and makes
+    // eviction under mid-run pressure far less likely.
     std::map<const void*, std::weak_ptr<MetalBuffer>> model_wraps;
     API_AVAILABLE(macos(15.0)) id<MTLResidencySet> residency_set;
 
@@ -570,7 +596,9 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
 #pragma clang diagnostic pop
         }
         NSError* error = nil;
-        impl_->library = [impl_->device newLibraryWithSource:load_kernel_source()
+        NSString* kernel_source=load_kernel_source();
+        impl_->shader_hash=source_sha1(kernel_source);
+        impl_->library = [impl_->device newLibraryWithSource:kernel_source
                                                       options:options
                                                         error:&error];
         if (!impl_->library)
@@ -603,6 +631,10 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
+            // q27_matmul_q4_mm_h is probe-only pending its valid quiet gate
+            // and routes only under Q27_METAL_GEMM_HALF_Q4=1 — built lazily on
+            // first use so production startup never compiles it (same pattern
+            // as the probe-only q4_r2_p/b1_r3_p PSOs).
             impl_->b1_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_b1_mm");
             impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
             impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
@@ -614,6 +646,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->x_to_half_t_p = make_pipeline(impl_->device, impl_->library, @"q27_x_int8_to_half_t");
             if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
                 impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
+            if (const char* env = getenv("Q27_METAL_GEMM_HALF_Q4"); env && *env)
+                impl_->gemm_half_q4 = strtoul(env, nullptr, 10) != 0;
         }
         impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
         impl_->embedding_t2 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2");
@@ -729,6 +763,15 @@ std::string MetalBackend::name() const {
     return std::string(impl_->device.name.UTF8String);
 }
 
+const char* MetalBackend::shader_abi_tag() { return kShaderAbiTag; }
+
+std::string MetalBackend::shader_source_sha1() const { return impl_->shader_hash; }
+bool MetalBackend::gemm_half_enabled() const { return impl_->gemm_half; }
+bool MetalBackend::gemm_half_q4_enabled() const { return impl_->gemm_half_q4; }
+uint32_t MetalBackend::gqa_tile() const { return impl_->gqa_tile; }
+uint32_t MetalBackend::gqa_block() const { return impl_->gqa_block; }
+uint32_t MetalBackend::gqa_threshold() const { return impl_->gqa_threshold; }
+
 std::shared_ptr<BackendBuffer> MetalBackend::allocate(uint64_t bytes) {
     if (!bytes || bytes > (uint64_t)impl_->device.maxBufferLength ||
         bytes > (uint64_t)std::numeric_limits<NSUInteger>::max())
@@ -834,9 +877,10 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
                 [set addAllocation:buffer];
                 [set commit];
                 [set requestResidency];
-                // The set retains the buffer and keeps its pages wired; drop
-                // it when the last tensor goes away so a later munmap cannot
-                // leave the set holding a dead address range.
+                // The set retains the buffer and requests residency for its
+                // pages (best-effort, not wired); drop it when the last tensor
+                // goes away so a later munmap cannot leave the set holding a
+                // dead address range.
                 wrapped = std::shared_ptr<MetalBuffer>(
                     new MetalBuffer(buffer), [set](MetalBuffer* wrapper) {
                         if (@available(macOS 15.0, *)) {
@@ -1106,9 +1150,11 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
         [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        // Q4 runs the promoted 4-rows-per-simdgroup kernel (32 rows/group,
-        // q4 round 2026-07-17); the other dtypes keep 1 row/simdgroup.
-        const NSUInteger rpg = weight.dtype==DType::Q4_G64 ? 32 : 8;
+        // Q4 and B1 run their promoted 4-rows-per-simdgroup kernels (32
+        // rows/group; q4 round + b1 select round 2, both 2026-07-17); the
+        // other dtypes keep 1 row/simdgroup.
+        const NSUInteger rpg = (weight.dtype==DType::Q4_G64 ||
+                                weight.dtype==DType::B1_G128) ? 32 : 8;
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+rpg-1)/rpg,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("quantized matvec");
     }
@@ -1223,15 +1269,29 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
     MatmulArgs args{(uint32_t)weight.rows,(uint32_t)weight.cols,x_rows,1};
     @autoreleasepool {
         // Q27_METAL_GEMM_HALF=1: half-staging T2 GEMM (A/B lever, see
-        // docs/plans/2026-07-15-gemm-half-staging.md).
-        const bool t2h = impl_->gemm_half && weight.dtype==DType::T2_G128;
+        // docs/plans/2026-07-15-gemm-half-staging.md). Q4's half twin is
+        // correctness-gated but default-off pending its valid >=1.7x quiet
+        // ship-line run (QUIET_BENCH_EVIDENCE.md rejects the idle>=0 run);
+        // Q27_METAL_GEMM_HALF_Q4=1 routes it for re-measurement only. Q8
+        // stays on the float-staged kernel: its half variant failed the
+        // shape suite (5.5e-4 at the high-cancellation 33x5120 repro vs the
+        // 3e-4 bound) because half-operand MMA products up to 127*127 round
+        // past half's 2048 exact-integer range — the parked
+        // q27_matmul_q8_mm_h records the attempt.
+        const bool h = impl_->gemm_half;
+        const bool h4 = impl_->gemm_half_q4;
+        if (h4 && !impl_->q4_quantized_matmul_h)
+            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library,
+                                                         @"q27_matmul_q4_mm_h");
         bool own; auto enc=impl_->encoder_for_operation(own,
             weight.dtype==DType::Q8_G128?"q27_matmul_q8_mm":
-            weight.dtype==DType::T2_G128?(t2h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):
-            weight.dtype==DType::B1_G128?"q27_matmul_b1_mm":"q27_matmul_q4_mm");
+            weight.dtype==DType::T2_G128?(h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):
+            weight.dtype==DType::B1_G128?"q27_matmul_b1_mm":
+            (h4?"q27_matmul_q4_mm_h":"q27_matmul_q4_mm"));
         [enc setComputePipelineState:weight.dtype==DType::Q8_G128?impl_->q8_quantized_matmul:
-                                     weight.dtype==DType::T2_G128?(t2h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):
-                                     weight.dtype==DType::B1_G128?impl_->b1_quantized_matmul:impl_->q4_quantized_matmul];
+                                     weight.dtype==DType::T2_G128?(h?impl_->t2_quantized_matmul_h:impl_->t2_quantized_matmul):
+                                     weight.dtype==DType::B1_G128?impl_->b1_quantized_matmul:
+                                     (h4?impl_->q4_quantized_matmul_h:impl_->q4_quantized_matmul)];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
@@ -1555,6 +1615,75 @@ void MetalBackend::matvec_q4_probe(int candidate, const BackendTensor& weight,
                 (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         if (own) impl_->finish_command("q4 probe");
+    }
+}
+
+// B1 select round-2 candidate arms (bench-only, docs/plans/2026-07-17-b1-
+// select-round2.md): validation as matvec_quantized, then candidate
+// routing. Candidate 1 re-dispatches the production PSO so the bench's A/B
+// runs one code path; 2/3 are the multi-row arms. Candidate PSOs build
+// lazily on first use (the roofline-k pattern) — production startup never
+// creates them. Never engine-routed.
+void MetalBackend::matvec_b1r2_probe(int candidate, const BackendTensor& weight,
+                                     const BackendQuantized& x, BackendBuffer& y) {
+    if (candidate < 1 || candidate > 3)
+        throw std::runtime_error("q27 Metal: invalid b1 round-2 probe candidate");
+    if (weight.dtype != DType::B1_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: b1 round-2 probe requires B1_G128 weight");
+    if (!weight.rows || !weight.cols || weight.rows > UINT32_MAX ||
+        weight.cols > UINT32_MAX || weight.cols % 128)
+        throw std::runtime_error("q27 Metal: invalid b1 round-2 probe dimensions");
+    if (x.count != weight.cols || !x.values || !x.scales)
+        throw std::runtime_error("q27 Metal: b1 round-2 probe activation mismatch");
+    check_range(y.size(), 0, weight.rows * 4, "b1 r2 probe output");
+    const MetalBuffer& data = metal_buffer(*weight.data);
+    const MetalBuffer& ws = metal_buffer(*weight.scales);
+    const MetalBuffer& xv = metal_buffer(*x.values);
+    const MetalBuffer& xs = metal_buffer(*x.scales);
+    MetalBuffer& out = metal_buffer(y);
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size),
+                weight.data_offset, weight.rows * weight.cols / 8, "b1 r2 probe weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size),
+                weight.scales_offset, weight.rows * (weight.cols / 128) * 2,
+                "b1 r2 probe weight scales");
+    check_range(xv.size(), 0, x.count, "b1 r2 probe values");
+    check_range(xs.size(), 0, (uint64_t)(x.count / 32) * 4, "b1 r2 probe activation scales");
+    id<MTLComputePipelineState> pso = nil;
+    const char* label = nullptr;
+    switch (candidate) {
+        case 1:
+        case 2:
+            // r2 was PROMOTED into the production kernel (b1 round 2,
+            // 2026-07-17) — candidate 2 aliases it so recorded A/B
+            // invocations keep working.
+            pso = impl_->b1_quantized;
+            label = "q27_matvec_b1_quantized";
+            break;
+        default:
+            if (!impl_->b1_r3_p)
+                impl_->b1_r3_p = make_pipeline(impl_->device, impl_->library,
+                                               @"q27_matvec_b1_quantized_r3");
+            pso = impl_->b1_r3_p;
+            label = "q27_matvec_b1_quantized_r3";
+            break;
+    }
+    // Rows per 256-thread group: post-promotion production runs 4 rows per
+    // simdgroup (32/group); r3 runs 8 (64/group).
+    const uint32_t rows_per_group = candidate == 3 ? 64 : 32;
+    MatvecArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, label);
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2];
+        [enc setBuffer:xs.handle() offset:0 atIndex:3];
+        [enc setBuffer:out.handle() offset:0 atIndex:4];
+        [enc setBytes:&args length:sizeof(args) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(
+                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (own) impl_->finish_command("b1 r2 probe");
     }
 }
 
