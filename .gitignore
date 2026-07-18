@@ -9,3 +9,6 @@ data/
 # Claude Code local state — settings live user-level on each machine
 .claude/
 bonsai-27b-whitepaper.pdf
+
+# KL baseline dumps (GiB-scale f32 logits; regenerable via --logits-dump)
+*.logits

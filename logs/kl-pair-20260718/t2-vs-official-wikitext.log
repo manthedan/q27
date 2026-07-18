@@ -1,0 +1,12 @@
+kl-vs-dump ready on Apple M4 in 4.08 s (models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27 vs logs/kl-pair-20260718/official-wikitext-4k.logits)
+kl-vs-dump: 4095 positions, single pass, no resets
+  kl pos 384/4095  kl pos 768/4095  kl pos 1152/4095  kl pos 1536/4095  kl pos 1920/4095  kl pos 2052: running mean 0.669493 nats
+  kl pos 2304/4095  kl pos 2688/4095  kl pos 3072/4095  kl pos 3456/4095  kl pos 3840/4095
+kl-vs-dump tail: p50 0.4198  p90 1.83  p99 5.221  p99.5 6.278  max 10.15 @pos 170
+kl-vs-dump runs >0.1: 3164 positions, 545 runs, longest 52 @pos 3170
+kl-vs-dump runs >0.5: 1851 positions, 851 runs, longest 11 @pos 3719
+kl-vs-dump wall: 242.21 s (16.91 pos/s), overall mean KL 0.749878 nats, max 10.1477
+kl-vs-dump: wrote 4095 per-position KLs to logs/kl-pair-20260718/t2-vs-official-wikitext.kl
+paired-logit forward-KL dump→model by target position (4096 tokens, no resets):
+  0-2k    : mean KL 0.669728 nats  max 10.1477  (n=2047)
+  2k-8k   : mean KL 0.82999 nats  max 8.62395  (n=2048)

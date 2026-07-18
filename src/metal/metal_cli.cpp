@@ -16,7 +16,11 @@
 #include <vector>
 
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -149,7 +153,7 @@ int main(int argc, char** argv) {
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width | --suffix-serial width | --oracle width] [--kv fp16|turbo3] "
                 "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-fp8 | --kl-kv-cell N | --kl-kv-except LIST | --kl-kv-stats FILE] [--kv-rt-scale32] [--kv-rt-feature FILE] [--chunk-parity N] "
-                "[--kl-pair MODEL_B --kl-pair-out FILE] "
+                "[--kl-pair MODEL_B --kl-pair-out FILE | --logits-dump FILE | --kl-vs-dump FILE] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--save-state file | --load-state file] [--dump-logits file]\n",
                 argv[0]);
@@ -174,6 +178,11 @@ int main(int argc, char** argv) {
         // argument is model B (the "q" side). Two independent mappings,
         // fp16-KV both, lockstep teacher forcing.
         std::string kl_pair_path, kl_pair_out;
+        // A5 sequential two-pass amendment (2026-07-18-kl-pair-a5.md):
+        // --logits-dump streams every teacher-forced position's f32 logits
+        // to FILE (row i = position i, VOCAB f32 each, no header);
+        // --kl-vs-dump replays a baseline dump against this process's model.
+        std::string logits_dump, kl_vs_dump;
         for (int i = 3; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--tokens" && i + 1 < argc) token_list = argv[++i];
@@ -224,6 +233,8 @@ int main(int argc, char** argv) {
             else if (arg == "--envelope" && i + 1 < argc) envelope_mode = argv[++i];
             else if (arg == "--kl-pair" && i + 1 < argc) kl_pair_path = argv[++i];
             else if (arg == "--kl-pair-out" && i + 1 < argc) kl_pair_out = argv[++i];
+            else if (arg == "--logits-dump" && i + 1 < argc) logits_dump = argv[++i];
+            else if (arg == "--kl-vs-dump" && i + 1 < argc) kl_vs_dump = argv[++i];
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
@@ -343,11 +354,26 @@ int main(int argc, char** argv) {
             if (kl_pair_path == model_path)
                 throw std::runtime_error("--kl-pair needs two distinct models; for same-model plumbing use --kl-kv-self");
         }
-        if (!kl_pair_out.empty() && kl_pair_path.empty())
-            throw std::runtime_error("--kl-pair-out requires --kl-pair");
+        if (!kl_pair_out.empty() && kl_pair_path.empty() && kl_vs_dump.empty())
+            throw std::runtime_error("--kl-pair-out requires --kl-pair or --kl-vs-dump");
+        // A5 sequential two-pass arms (2026-07-18 amendment): one model per
+        // process, fp16-KV, greedy teacher-forced on the --nll path.
+        if (!logits_dump.empty() || !kl_vs_dump.empty()) {
+            const char* arm = !logits_dump.empty() ? "--logits-dump" : "--kl-vs-dump";
+            if (!logits_dump.empty() && !kl_vs_dump.empty())
+                throw std::runtime_error("--logits-dump and --kl-vs-dump are separate passes; run one");
+            if (nll_path.empty())
+                throw std::runtime_error(std::string(arm) + " rides the --nll FILE --nll-long N input path");
+            if (kl_kv || chunk_parity || !envelope_mode.empty() || turbo3_kv || !kl_pair_path.empty())
+                throw std::runtime_error(std::string(arm) + " is its own instrument; drop --kl-kv*/--chunk-parity/--envelope/--kv/--kl-pair");
+            if (mtp_width || suffix_width || oracle_width || eos_gate || sampling.temperature > 0 ||
+                !dump_logits.empty() || !save_state_path.empty() || !load_state_path.empty() ||
+                validate_only || !token_list.empty() || !prompt_text.empty())
+                throw std::runtime_error(std::string(arm) + " is greedy teacher-forced only; drop speculative/sampling/state/prompt/validate modes");
+        }
         if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty() &&
-            load_state_path.empty() && kl_pair_path.empty())
-            throw std::runtime_error("--tokens, --prompt, --nll, --load-state, --kl-pair, or --validate-only is required");
+            load_state_path.empty() && kl_pair_path.empty() && logits_dump.empty() && kl_vs_dump.empty())
+            throw std::runtime_error("--tokens, --prompt, --nll, --load-state, --kl-pair, --logits-dump, --kl-vs-dump, or --validate-only is required");
         if (!nll_path.empty() && (mtp_width || suffix_width || oracle_width || sampling.temperature > 0 || !dump_logits.empty()))
             throw std::runtime_error("--nll cannot be combined with speculative/sampling/dump modes");
 
@@ -982,6 +1008,156 @@ int main(int argc, char** argv) {
                 if (!ok) throw std::runtime_error("failed writing --kl-pair-out: " + kl_pair_out);
                 fprintf(stderr, "kl-pair: wrote %u per-position KLs to %s\n", n, kl_pair_out.c_str());
             }
+            return 0;
+        }
+
+        // A5 sequential two-pass (2026-07-18 amendment): --logits-dump streams
+        // every teacher-forced position's f32 logits row to FILE (row i =
+        // position i, VOCAB f32 each, no header). One model per process, so
+        // the 17 GiB baseline runs alone within the M4's budget; candidates
+        // replay against the dump via --kl-vs-dump below.
+        if (!logits_dump.empty()) {
+            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
+            if (tokens.size() < 2) throw std::runtime_error("--logits-dump needs at least two tokens");
+            if (tokens.size() - 1 > context)
+                throw std::runtime_error("--logits-dump sequence exceeds --ctx; raise --ctx");
+            q27::MetalEngine engine(model_path, context, false);
+            if (serial_prefill) engine.set_chunked_prefill(false);
+            auto ready = std::chrono::steady_clock::now();
+            fprintf(stderr, "logits-dump ready on %s in %.2f s (%s)\n",
+                    engine.backend().name().c_str(),
+                    std::chrono::duration<double>(ready - start).count(),
+                    model_path.c_str());
+            const uint32_t vocab = q27::MetalEngine::vocabulary_size();
+            const uint32_t n = (uint32_t)tokens.size() - 1;
+            FILE* f = fopen(logits_dump.c_str(), "wb");
+            if (!f) throw std::runtime_error("cannot open --logits-dump: " + logits_dump);
+            fprintf(stderr, "logits-dump: %u positions x %u f32 -> %s (%.2f GiB)\n",
+                    n, vocab, logits_dump.c_str(),
+                    (double)n * vocab * 4 / (1 << 30));
+            std::vector<float> p;
+            auto dump_start = std::chrono::steady_clock::now();
+            uint32_t done = 0, chunk_index = 0;
+            bool ok = true;
+            while (done < n) {
+                const uint32_t take = std::min(12u, n - done);
+                engine.teacher_force_logits(tokens.data() + done, take, p);
+                if (fwrite(p.data(), 4, (size_t)take * vocab, f) != (size_t)take * vocab) {
+                    ok = false; break;
+                }
+                done += take;
+                if (++chunk_index % 32 == 0) fprintf(stderr, "  dump pos %u/%u\r", done, n);
+            }
+            if (fflush(f) != 0) ok = false;
+            if (fclose(f) != 0) ok = false;
+            auto dump_done = std::chrono::steady_clock::now();
+            if (!ok) throw std::runtime_error("short write on --logits-dump: " + logits_dump);
+            if (n >= 12) fprintf(stderr, "\n");
+            fprintf(stderr, "logits-dump wall: %.2f s (%.2f pos/s), wrote %u positions\n",
+                    std::chrono::duration<double>(dump_done - dump_start).count(),
+                    n / std::chrono::duration<double>(dump_done - dump_start).count(), n);
+            return 0;
+        }
+
+        // Pass 2: replay a baseline logits dump against this process's model.
+        // The dump is mmapped (read-only) chunk-by-chunk so even a 5 GiB 8K
+        // dump adds no meaningful resident pressure; per-position forward_kl,
+        // buckets, tail, and runs reporting are identical to --kl-pair's, and
+        // --kl-pair-out carries the per-position values for the bootstrap.
+        if (!kl_vs_dump.empty()) {
+            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
+            if (tokens.size() < 2) throw std::runtime_error("--kl-vs-dump needs at least two tokens");
+            if (tokens.size() - 1 > context)
+                throw std::runtime_error("--kl-vs-dump sequence exceeds --ctx; raise --ctx");
+            const uint32_t vocab = q27::MetalEngine::vocabulary_size();
+            const uint32_t n = (uint32_t)tokens.size() - 1;
+            const uint64_t expect_bytes = (uint64_t)n * vocab * 4;
+            const uint64_t dump_bytes = std::filesystem::file_size(kl_vs_dump);
+            if (dump_bytes != expect_bytes)
+                throw std::runtime_error("--kl-vs-dump size mismatch: " + kl_vs_dump +
+                                         " is " + std::to_string(dump_bytes) +
+                                         " bytes, expected " + std::to_string(expect_bytes) +
+                                         " (" + std::to_string(n) + " positions x " +
+                                         std::to_string(vocab) + " f32) — regenerate the dump at the same --nll-long");
+            int dfd = open(kl_vs_dump.c_str(), O_RDONLY);
+            if (dfd < 0) throw std::runtime_error("cannot open --kl-vs-dump: " + kl_vs_dump);
+            void* map = mmap(nullptr, dump_bytes, PROT_READ, MAP_PRIVATE, dfd, 0);
+            if (map == MAP_FAILED) { close(dfd); throw std::runtime_error("cannot mmap --kl-vs-dump: " + kl_vs_dump); }
+            const float* baseline = (const float*)map;
+            q27::MetalEngine engine(model_path, context, false);
+            if (serial_prefill) engine.set_chunked_prefill(false);
+            auto ready = std::chrono::steady_clock::now();
+            fprintf(stderr, "kl-vs-dump ready on %s in %.2f s (%s vs %s)\n",
+                    engine.backend().name().c_str(),
+                    std::chrono::duration<double>(ready - start).count(),
+                    model_path.c_str(), kl_vs_dump.c_str());
+            fprintf(stderr, "kl-vs-dump: %u positions, single pass, no resets\n", n);
+            std::vector<float> q;
+            std::vector<double> kl(n);
+            auto kl_start = std::chrono::steady_clock::now();
+            uint32_t done = 0, chunk_index = 0;
+            while (done < n) {
+                const uint32_t take = std::min(12u, n - done);
+                engine.teacher_force_logits(tokens.data() + done, take, q);
+                for (uint32_t r = 0; r < take; r++)
+                    kl[done + r] = q27::forward_kl(baseline + (size_t)(done + r) * vocab,
+                                                   q.data() + (size_t)r * vocab, vocab);
+                done += take;
+                if (++chunk_index % 32 == 0) fprintf(stderr, "  kl pos %u/%u\r", done, n);
+                if (done / 2048 != (done - take) / 2048) {
+                    double running = 0.0;
+                    for (uint32_t i = 0; i < done; i++) running += kl[i];
+                    fprintf(stderr, "  kl pos %u: running mean %.6g nats\n", done, running / done);
+                }
+            }
+            auto kl_done = std::chrono::steady_clock::now();
+            if (n >= 12) fprintf(stderr, "\n");
+            print_kl_buckets(kl, "paired-logit forward-KL dump→model");
+            double mean = 0.0, peak = 0.0;
+            uint32_t peak_pos = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                mean += kl[i];
+                if (kl[i] > peak) { peak = kl[i]; peak_pos = i; }
+            }
+            mean /= n;
+            std::vector<double> sorted(kl);
+            std::sort(sorted.begin(), sorted.end());
+            auto quantile = [&](double p) {
+                return sorted[std::min((size_t)((double)n * p), (size_t)n - 1)];
+            };
+            fprintf(stderr, "kl-vs-dump tail: p50 %.4g  p90 %.4g  p99 %.4g  p99.5 %.4g  max %.4g @pos %u\n",
+                    quantile(0.50), quantile(0.90), quantile(0.99), quantile(0.995), peak, peak_pos);
+            for (double thr : {0.1, 0.5}) {
+                uint32_t above = 0, runs = 0, cur = 0, longest = 0, longest_at = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    if (kl[i] > thr) {
+                        if (!cur) runs++;
+                        cur++; above++;
+                        if (cur > longest) { longest = cur; longest_at = i + 1 - cur; }
+                    } else cur = 0;
+                }
+                fprintf(stderr, "kl-vs-dump runs >%.1f: %u positions, %u runs, longest %u", thr, above, runs, longest);
+                if (longest) fprintf(stderr, " @pos %u", longest_at);
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "kl-vs-dump wall: %.2f s (%.2f pos/s), overall mean KL %.6g nats, max %.6g\n",
+                    std::chrono::duration<double>(kl_done - kl_start).count(),
+                    n / std::chrono::duration<double>(kl_done - kl_start).count(),
+                    mean, peak);
+            if (!kl_pair_out.empty()) {
+                FILE* f = fopen(kl_pair_out.c_str(), "w");
+                if (!f) { munmap(map, dump_bytes); close(dfd); throw std::runtime_error("cannot open --kl-pair-out: " + kl_pair_out); }
+                bool ok = true;
+                for (uint32_t i = 0; i < n; i++)
+                    if (fprintf(f, "%.9g\n", kl[i]) < 0) { ok = false; break; }
+                if (fclose(f) != 0) ok = false;
+                if (!ok) { munmap(map, dump_bytes); close(dfd); throw std::runtime_error("failed writing --kl-pair-out: " + kl_pair_out); }
+                fprintf(stderr, "kl-vs-dump: wrote %u per-position KLs to %s\n", n, kl_pair_out.c_str());
+            }
+            munmap(map, dump_bytes);
+            close(dfd);
             return 0;
         }
 
