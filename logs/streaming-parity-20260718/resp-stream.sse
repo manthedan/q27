@@ -1,0 +1,107 @@
+event: response.created
+data: {"response":{"id":"resp_metal_d07605484d9e4740_18","object":"response","status":"in_progress"},"type":"response.created"}
+
+: keepalive
+
+event: response.output_item.added
+data: {"item":{"arguments":"","call_id":"call_metal_d07605484d9e4740_18_0","id":"fc_metal_d07605484d9e4740_18_0","name":"write_file","status":"in_progress","type":"function_call"},"output_index":0,"type":"response.output_item.added"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"{\"","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"content","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\":","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" \"","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"hello","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" world","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":",","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" this","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" is","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" a","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" fairly","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" long","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" piece","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" of","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" content","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" so","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" the","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" arguments","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" stream","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" in","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" several","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" fragments","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\",","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" \"","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"path","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\":","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":" \"/","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"tmp","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"/out","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":".txt","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\"}","item_id":"fc_metal_d07605484d9e4740_18_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.output_item.done
+data: {"item":{"arguments":"{\"content\": \"hello world, this is a fairly long piece of content so the arguments stream in several fragments\", \"path\": \"/tmp/out.txt\"}","call_id":"call_metal_d07605484d9e4740_18_0","id":"fc_metal_d07605484d9e4740_18_0","name":"write_file","status":"completed","type":"function_call"},"output_index":0,"type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"id":"resp_metal_d07605484d9e4740_18","object":"response","output":[{"arguments":"{\"content\": \"hello world, this is a fairly long piece of content so the arguments stream in several fragments\", \"path\": \"/tmp/out.txt\"}","call_id":"call_metal_d07605484d9e4740_18_0","id":"fc_metal_d07605484d9e4740_18_0","name":"write_file","status":"completed","type":"function_call"}],"status":"completed","usage":{"input_tokens":227,"input_tokens_details":{"cached_tokens":0},"output_tokens":55,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":282}},"type":"response.completed"}
+

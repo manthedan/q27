@@ -2157,9 +2157,83 @@ int main(int argc,char** argv) {
                         }
                         emit_tool_block(c.name,c.arguments);
                     };
+                    // Incremental tool-call argument streaming (2026-07-18
+                    // streaming-parity-messages-responses.md): wrapped calls
+                    // stream production-shape input_json_delta fragments as
+                    // they generate — the SAME ToolCallStreamer proven on
+                    // /v1/chat/completions. Deviant heads fall back to the
+                    // buffered emit_tool path above, raw byte-exact.
+                    q27::ToolCallStreamer ts;
+                    int cur_tool_idx=-1;   // content-block index of the in-flight streamed call
+                    auto close_stream_block=[&](){
+                        if(cur_tool_idx<0) return;
+                        ev("content_block_stop",{{"type","content_block_stop"},{"index",cur_tool_idx}});
+                        cur_tool_idx=-1;
+                    };
+                    auto recover_trail=[&](const std::string& raw,bool allow_repair){
+                        const std::string tr=q27::strip_ws2(raw);
+                        if(tr.empty()) return;
+                        std::string pre;
+                        auto bcs=q27::parse_bare_tool_calls(tr,&pre,&tools,allow_repair);
+                        if(!pre.empty()) {
+                            text_accum+=pre; open_block(0);
+                            ev("content_block_delta",{{"type","content_block_delta"},{"index",idx},
+                                {"delta",{{"type","text_delta"},{"text",pre}}}});
+                        }
+                        if(!bcs.empty()) {
+                            fprintf(stderr,"[tool-stream] %zu trailing call(s) recovered after streamed call\n",bcs.size());
+                            runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},
+                                {"stream",true},{"trailing",true},{"count",bcs.size()}});
+                            for(auto& bc:bcs) emit_tool_block(bc.name,bc.arguments);
+                        } else if(pre.empty() && tr.find_first_not_of("}] \t\r\n")!=std::string::npos) {
+                            text_accum+=tr; open_block(0);
+                            ev("content_block_delta",{{"type","content_block_delta"},{"index",idx},
+                                {"delta",{{"type","text_delta"},{"text",tr}}}});
+                        }
+                    };
+                    auto close_tool=[&](){
+                        if(!ts.active()) return;
+                        std::string tail;
+                        const bool clean=ts.finalize(&tail);
+                        if(ts.invalid()) {
+                            // Streaming is irreversible: opener + prior arg
+                            // deltas are already on wire; recover packed trail.
+                            close_stream_block();
+                            recover_trail(ts.trail(),false);
+                        } else if(ts.opened) {
+                            if(!tail.empty() && cur_tool_idx>=0)
+                                ev("content_block_delta",{{"type","content_block_delta"},{"index",cur_tool_idx},
+                                    {"delta",{{"type","input_json_delta"},{"partial_json",tail}}}});
+                            if(!clean)
+                                fprintf(stderr,"[tool-stream] streamed call closed unbalanced (production semantics, sent as-is)\n");
+                            close_stream_block();
+                            recover_trail(ts.trail(),true);
+                        } else {
+                            tool_buf=ts.raw;
+                            emit_tool();
+                        }
+                        ts.reset();
+                    };
                     auto emit_seg=[&](q27::StreamSplitter::Chan ch,const std::string& t){
-                        if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
-                        if(!tool_buf.empty()) emit_tool();
+                        if(ch==q27::StreamSplitter::TOOL) {
+                            bool opened=false;
+                            const std::string frag=ts.feed(t,&opened);
+                            if(opened) {
+                                any_call=true;
+                                close_block();
+                                cur_tool_idx=block_counter++;
+                                const std::string tid="toolu_metal_"+runtime.boot_id+"_"+std::to_string(rid)+"_"+
+                                                      std::to_string(tool_counter++);
+                                ev("content_block_start",{{"type","content_block_start"},{"index",cur_tool_idx},
+                                    {"content_block",{{"type","tool_use"},{"id",tid},{"name",ts.name},
+                                                      {"input",json::object()}}}});
+                            }
+                            if(!frag.empty() && cur_tool_idx>=0)
+                                ev("content_block_delta",{{"type","content_block_delta"},{"index",cur_tool_idx},
+                                    {"delta",{{"type","input_json_delta"},{"partial_json",frag}}}});
+                            return;
+                        }
+                        close_tool();
                         if(t.empty()) return;
                         const int chan=ch==q27::StreamSplitter::THINK?1:0;
                         // suppress pure-whitespace text before/between blocks
@@ -2199,6 +2273,7 @@ int main(int argc,char** argv) {
                                       return httplib::detail::is_socket_alive(sock); },mid);
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
+                        close_tool();   // close any in-flight streamed call (finalize + trail recovery)
                         if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
                             // wrapper-less recovery: text already streamed as
@@ -2670,13 +2745,107 @@ int main(int argc,char** argv) {
                             bare_pending.clear();
                             bare_holding=false;
                         };
+                        // Incremental tool-call argument streaming (2026-07-18
+                        // streaming-parity-messages-responses.md): wrapped
+                        // calls stream function_call_arguments.delta fragments
+                        // as they generate — the SAME ToolCallStreamer proven
+                        // on /v1/chat/completions and /v1/messages. Deviant
+                        // heads fall back to the buffered flush_tool path,
+                        // raw byte-exact. custom_tool_call stays whole-item.
+                        q27::ToolCallStreamer ts;
+                        int st_idx=-1;             // output_index of in-flight streamed call
+                        std::string st_iid, st_cid, st_acc;  // item/call ids + accumulated args
+                        auto st_arg_delta=[&](const std::string& frag){
+                            if(frag.empty() || st_idx<0) return;
+                            st_acc+=frag;
+                            ev({{"type","response.function_call_arguments.delta"},
+                                {"item_id",st_iid},{"output_index",st_idx},{"delta",frag}});
+                        };
+                        auto recover_trail=[&](const std::string& raw,bool allow_repair){
+                            const std::string tr=q27::strip_ws2(raw);
+                            if(tr.empty()) return;
+                            std::string pre;
+                            auto bcs=q27::parse_bare_tool_calls(tr,&pre,
+                                tools.empty()?nullptr:&tools,allow_repair);
+                            if(!pre.empty()) emit_text(pre);
+                            if(!bcs.empty()) {
+                                fprintf(stderr,"[tool-stream] %zu trailing call(s) recovered after streamed call (resp)\n",bcs.size());
+                                runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},
+                                    {"stream",true},{"trailing",true},{"count",bcs.size()}});
+                                if(!pre.empty()) flush_text();
+                                for(auto& bc:bcs) push_call(bc.name,bc.arguments,false);
+                            } else if(pre.empty() && tr.find_first_not_of("}] \t\r\n")!=std::string::npos) {
+                                emit_text(tr);
+                            }
+                        };
+                        auto close_stream_tool=[&](bool incomplete_item){
+                            if(!ts.active()) return;
+                            std::string tail;
+                            const bool clean=ts.finalize(&tail);
+                            if(ts.invalid()) {
+                                // Streaming is irreversible: added + arg deltas
+                                // already on wire. Close the item done with the
+                                // accumulated args so the lifecycle pairs, then
+                                // recover packed trail. Unclean: mark incomplete
+                                // so clients do not execute (mirrors chat).
+                                st_arg_delta(tail);
+                                json it={{"type","function_call"},{"id",st_iid},{"call_id",st_cid},
+                                    {"status","incomplete"},{"name",ts.name},{"arguments",st_acc}};
+                                ev({{"type","response.output_item.done"},{"output_index",st_idx},{"item",it}});
+                                items.push_back(it);
+                                out_index=st_idx+1; st_idx=-1; st_iid.clear(); st_cid.clear(); st_acc.clear();
+                                recover_trail(ts.trail(),false);
+                            } else if(ts.opened) {
+                                st_arg_delta(tail);
+                                if(!clean)
+                                    fprintf(stderr,"[tool-stream] streamed call closed unbalanced (production semantics, sent as-is)\n");
+                                json it={{"type","function_call"},{"id",st_iid},{"call_id",st_cid},
+                                    {"status",incomplete_item?"incomplete":"completed"},
+                                    {"name",ts.name},{"arguments",st_acc}};
+                                ev({{"type","response.output_item.done"},{"output_index",st_idx},{"item",it}});
+                                items.push_back(it);
+                                out_index=st_idx+1; st_idx=-1; st_iid.clear(); st_cid.clear(); st_acc.clear();
+                                // A wrapper can pack more than one call: bytes
+                                // after the streamed call's args closed are not
+                                // framing — recover through the bare-call chain.
+                                recover_trail(ts.trail(),true);
+                            } else {
+                                tool_buf=ts.raw;
+                                flush_tool(false,incomplete_item);
+                            }
+                            ts.reset();
+                        };
                         auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                             if(ch==q27::StreamSplitter::TOOL) {
                                 flush_bare(false);
                                 if(!think.empty()) flush_think();
                                 if(!text.empty()) flush_text();
-                                tool_buf+=t; return;
+                                // Intercept with the streamer: on a clean head,
+                                // open a function_call item and stream arg deltas;
+                                // on FALLBACK the raw is handed to flush_tool.
+                                bool opened=false;
+                                const std::string frag=ts.feed(t,&opened);
+                                if(opened) {
+                                    const int call_index=tool_counter++;
+                                    st_idx=out_index;
+                                    st_cid="call_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
+                                    st_iid="fc_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
+                                    ev({{"type","response.output_item.added"},{"output_index",st_idx},
+                                        {"item",{{"type","function_call"},{"id",st_iid},{"call_id",st_cid},
+                                                 {"status","in_progress"},{"name",ts.name},{"arguments",""}}}});
+                                }
+                                if(!frag.empty()) st_arg_delta(frag);
+                                // FALLBACK: not yet open and head deviated — hand
+                                // the verbatim raw to the buffered path.
+                                if(!ts.opened && ts.active() && frag.empty() && !opened) {
+                                    if(ts.state==q27::ToolCallStreamer::FALLBACK) {
+                                        tool_buf=ts.raw; ts.reset();
+                                        flush_tool(false);
+                                    }
+                                }
+                                return;
                             }
+                            close_stream_tool(false);
                             if(!tool_buf.empty()) flush_tool(false);
                             // codex P2: a THINK transition must close an open
                             // text item first (same rule as TOOL) — else
@@ -2752,6 +2921,7 @@ int main(int argc,char** argv) {
                         }
                         const bool incomplete=outcome.finish==Runtime::Finish::Length;
                         for(auto& [ch,t]:sp.flush()) route(ch,t);
+                        close_stream_tool(incomplete);   // close any in-flight streamed call
                         if(!tool_buf.empty()) flush_tool(true,incomplete);
                         flush_think(incomplete);
                         flush_bare(true,incomplete);

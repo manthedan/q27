@@ -114,3 +114,57 @@ Emitter-only change inside two handlers that already have the streamer,
 splitter, keepalive, and recovery wired. No engine/GPU change. The risk is
 wire-format, addressed by the gates + quiet-gap deploy + armed trace.
 Estimated under a session, plus battery time.
+
+## RESULTS (2026-07-18) — SHIP
+
+Both endpoints implemented by reusing the proven `q27::ToolCallStreamer`
+and changing only the emitter lambdas. Diff is 173 insertions / 3
+deletions in `src/metal/metal_server.cpp` (the 3 deletions are the old
+TOOL-buffering lines the streamer interception replaces; the completions
+cancellation path is untouched).
+
+- **G1 unit (PASS):** the `incremental tool-call streamer` api_common
+  battery in `src/test_tokenizer.cpp` (wired into `make test-cpu`)
+  asserts parse-EQUAL fragment concatenation (s8: streamed fragments
+  `json::parse`-equal the buffered `parse_tool_call` arguments), mode-6
+  head fallback raw byte-exact (s4), truncated ARGS unclean (s5), packed
+  two-call trail recovery (s7), and the mode-3/9/10 sanitize shapes
+  (s8/s9/s9b). ALL PASS.
+- **G2 live wire-shape (PASS):** `tools/agentic_parity_gate.sh` ALL PASS
+  (G3s input_json_delta event, G5s delta.tool_calls chunk);
+  `tools/responses_parity_gate.sh` ALL PASS (G8b(ii) paired added/done
+  function_call lifecycle, G8b(i)/G8b(i-r) message+reasoning lifecycle).
+  A real wrapped `write_file` call streamed **31 `input_json_delta`
+  fragments** on /v1/messages (added with empty `input`, deltas, stop;
+  concatenation parses, keys `content`/`path`) and **31
+  `function_call_arguments.delta` fragments** on /v1/responses
+  (`output_item.added` with empty arguments + `in_progress`, deltas,
+  `output_item.done` whose `arguments` byte-equals the concatenation of
+  all deltas and parses). Both far exceed the ≥2-fragment ship line.
+- **G3 non-streaming parity (PASS):** the non-streaming /v1/responses
+  path returns a whole `function_call` item with full arguments
+  (`{"city":"Paris"}`), status `completed`, unchanged; the buffered
+  emitter was not altered.
+
+**Verdict: SHIP.** Wire parity with production Anthropic
+(`input_json_delta`) and OpenAI responses (`function_call_arguments.delta`)
+achieved; the silent multi-minute stretch on long write calls is closed on
+all three streaming endpoints.
+
+**Recorded deviations / notes:**
+- `custom_tool_call` stays whole-item (its input is a plain string, not
+  streamed JSON) — as pre-registered.
+- `tools/trace_gate.sh` "forced cancellation ID missing after gate offset"
+  binding sub-check FAILS when the gate runs in the same boot immediately
+  after the full parity battery. Root cause is a load-dependent timing
+  race in the gate's own probe (`curl --max-time 0.05` aborts before the
+  busy server begins prefill, so no cancel is registered for that probe),
+  NOT a streaming-parity defect: a manual idle-server cancel registers
+  both request and cancel with matching ids, and the diff does not touch
+  the completions cancellation path. The gate's stream-completeness
+  assertion (all 5 API families, outcomes, 400s, cancels, recoveries,
+  monotonic tms) PASSES. This race predates this change and is worth a
+  follow-up (raise the abort window or retry the probe).
+- One-model rule respected throughout: gates ran against the single
+  resident :8213 server (torn down + restarted for the failpoints arm per
+  the operator's no-live-traffic ruling).
