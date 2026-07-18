@@ -232,6 +232,14 @@ static SnapPeekInfo snap_peek_adapter(const std::string& path) {
     SnapPeekInfo o; o.position=i.position; o.logits_resident=i.logits_resident; o.tokens=i.tokens;
     return o;
 }
+// SHA1 token-key hash for DiskSnapshotStore (production); injected so the
+// store header stays platform-crypto-free (autoreview P1).
+static void snap_hash_sha1(const uint32_t* tokens,uint32_t count,char out_hex[41]) {
+    unsigned char sha[20];
+    CC_SHA1(tokens,(CC_LONG)(count*4),sha);
+    for(int i=0;i<20;i++) snprintf(out_hex+2*i,3,"%02x",sha[i]);
+    out_hex[40]='\0';
+}
 
 // Whole-session trace stream (triage I2, docs/plans/2026-07-17-ds4-product-
 // triage.md): one JSONL stream of the events the parity rounds kept having
@@ -433,7 +441,7 @@ struct Runtime {
     bool constrain_tools=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
-    DiskSnapshotStore snapstore{&snap_peek_adapter};
+    DiskSnapshotStore snapstore{&snap_peek_adapter,&snap_hash_sha1};
     TraceLog trace;
     std::string model_name,model_sha1_cache,boot_id,server_sha1,tokenizer_name,tokenizer_sha1;
     std::string os_sysname,os_release,os_machine;

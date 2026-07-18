@@ -43,6 +43,29 @@ uint64_t parse_u64(const std::string& text,const char* option) {
     if(used!=text.size()) throw std::runtime_error(std::string("invalid ")+option);
     return value;
 }
+
+// A5 logits-dump binding header (autoreview P1, 2026-07-18): the raw dump
+// is otherwise self-describing only by byte count, and two corpora at the
+// same --nll-long produce identically sized dumps — pairing a candidate
+// corpus with the WRONG dump was silently accepted, yielding plausible but
+// meaningless KL. The versioned header binds each dump to its token stream
+// (count + FNV-1a hash) and vocabulary; --kl-vs-dump validates all three
+// before replaying. Layout is fixed-size, little-endian, single write.
+struct LogitsDumpHeader {
+    char magic[8];            // "Q27LDMP1"
+    uint32_t version;         // 1
+    uint32_t vocab;
+    uint64_t n_positions;     // teacher-forced rows that follow
+    uint64_t token_hash;      // FNV-1a over the n_positions+1 token ids
+};
+constexpr char LDMP_MAGIC[8] = {'Q','2','7','L','D','M','P','1'};
+
+uint64_t fnv1a_tokens(const uint32_t* tokens, size_t count) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t k = 0; k < count; k++)
+        for (int b = 0; b < 4; b++) { h ^= (tokens[k] >> (b*8)) & 0xff; h *= 1099511628211ull; }
+    return h;
+}
 float parse_float(const std::string& text,const char* option) {
     size_t used=0; float value=0;
     try { value=std::stof(text,&used); }
@@ -1033,9 +1056,19 @@ int main(int argc, char** argv) {
             const uint32_t n = (uint32_t)tokens.size() - 1;
             FILE* f = fopen(logits_dump.c_str(), "wb");
             if (!f) throw std::runtime_error("cannot open --logits-dump: " + logits_dump);
-            fprintf(stderr, "logits-dump: %u positions x %u f32 -> %s (%.2f GiB)\n",
+            // Bind the dump to this exact token stream before any logits so a
+            // same-sized wrong corpus cannot be silently replayed (P1).
+            LogitsDumpHeader hdr{};
+            memcpy(hdr.magic, LDMP_MAGIC, 8);
+            hdr.version = 1;
+            hdr.vocab = vocab;
+            hdr.n_positions = n;
+            hdr.token_hash = fnv1a_tokens(tokens.data(), tokens.size());
+            if (fwrite(&hdr, sizeof hdr, 1, f) != 1)
+                throw std::runtime_error("failed writing --logits-dump header: " + logits_dump);
+            fprintf(stderr, "logits-dump: %u positions x %u f32 -> %s (%.2f GiB, token_hash %016llx)\n",
                     n, vocab, logits_dump.c_str(),
-                    (double)n * vocab * 4 / (1 << 30));
+                    (double)n * vocab * 4 / (1 << 30), (unsigned long long)hdr.token_hash);
             std::vector<float> p;
             auto dump_start = std::chrono::steady_clock::now();
             uint32_t done = 0, chunk_index = 0;
@@ -1073,19 +1106,31 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("--kl-vs-dump sequence exceeds --ctx; raise --ctx");
             const uint32_t vocab = q27::MetalEngine::vocabulary_size();
             const uint32_t n = (uint32_t)tokens.size() - 1;
-            const uint64_t expect_bytes = (uint64_t)n * vocab * 4;
             const uint64_t dump_bytes = std::filesystem::file_size(kl_vs_dump);
-            if (dump_bytes != expect_bytes)
+            int dfd = open(kl_vs_dump.c_str(), O_RDONLY);
+            if (dfd < 0) throw std::runtime_error("cannot open --kl-vs-dump: " + kl_vs_dump);
+            // Validate the binding header BEFORE trusting the payload (P1):
+            // a same-byte-count dump from a different corpus must be rejected
+            // loudly, not replayed into meaningless KL.
+            LogitsDumpHeader hdr{};
+            if (read(dfd, &hdr, sizeof hdr) != (ssize_t)sizeof hdr) { close(dfd); throw std::runtime_error("--kl-vs-dump too short for header: " + kl_vs_dump); }
+            if (memcmp(hdr.magic, LDMP_MAGIC, 8) != 0) { close(dfd); throw std::runtime_error("--kl-vs-dump is not a Q27LDMP1 dump (regenerate with current --logits-dump): " + kl_vs_dump); }
+            if (hdr.version != 1) { close(dfd); throw std::runtime_error("--kl-vs-dump unsupported version " + std::to_string(hdr.version) + ": " + kl_vs_dump); }
+            if (hdr.vocab != vocab) { close(dfd); throw std::runtime_error("--kl-vs-dump vocab mismatch: dump " + std::to_string(hdr.vocab) + " vs engine " + std::to_string(vocab)); }
+            if (hdr.n_positions != n) { close(dfd); throw std::runtime_error("--kl-vs-dump position count mismatch: dump " + std::to_string(hdr.n_positions) + " vs corpus " + std::to_string(n) + " — regenerate at the same --nll-long"); }
+            const uint64_t want_hash = fnv1a_tokens(tokens.data(), tokens.size());
+            if (hdr.token_hash != want_hash) { close(dfd); throw std::runtime_error("--kl-vs-dump token-stream mismatch: dump was teacher-forced on a DIFFERENT corpus (hash " +
+                    std::to_string(hdr.token_hash) + " vs " + std::to_string(want_hash) + ") — refusing to replay: " + kl_vs_dump); }
+            const uint64_t expect_bytes = (uint64_t)sizeof hdr + (uint64_t)n * vocab * 4;
+            if (dump_bytes != expect_bytes) { close(dfd);
                 throw std::runtime_error("--kl-vs-dump size mismatch: " + kl_vs_dump +
                                          " is " + std::to_string(dump_bytes) +
                                          " bytes, expected " + std::to_string(expect_bytes) +
-                                         " (" + std::to_string(n) + " positions x " +
-                                         std::to_string(vocab) + " f32) — regenerate the dump at the same --nll-long");
-            int dfd = open(kl_vs_dump.c_str(), O_RDONLY);
-            if (dfd < 0) throw std::runtime_error("cannot open --kl-vs-dump: " + kl_vs_dump);
+                                         " (header + " + std::to_string(n) + " positions x " +
+                                         std::to_string(vocab) + " f32) — regenerate the dump at the same --nll-long"); }
             void* map = mmap(nullptr, dump_bytes, PROT_READ, MAP_PRIVATE, dfd, 0);
             if (map == MAP_FAILED) { close(dfd); throw std::runtime_error("cannot mmap --kl-vs-dump: " + kl_vs_dump); }
-            const float* baseline = (const float*)map;
+            const float* baseline = (const float*)((const char*)map + sizeof hdr);
             q27::MetalEngine engine(model_path, context, false);
             if (serial_prefill) engine.set_chunked_prefill(false);
             auto ready = std::chrono::steady_clock::now();

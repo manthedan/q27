@@ -1,0 +1,62 @@
+{
+  "findings": [
+    {
+      "title": "[P1] Keep the snapshot-store CPU test portable",
+      "body": "`test-cpu` now unconditionally builds `test_snapshot_evict_store`, which includes this header, but `CommonCrypto` is only available on Apple platforms. On supported Linux/CUDA hosts, `make test-cpu` therefore fails at compilation before any tests run. Use the repository's portable SHA implementation or conditionally build this target on Darwin.",
+      "priority": "P1",
+      "confidence": 0.99,
+      "category": "regression",
+      "code_location": {
+        "file_path": "src/metal/disk_snapshot_store.h",
+        "line": 25
+      }
+    },
+    {
+      "title": "[P1] Bind logits dumps to the token stream before replay",
+      "body": "The replay path validates only the raw dump byte count. Two corpora with the same `--nll-long` value, such as the committed 4096-token code and wikitext runs, produce identically sized dumps, so accidentally pairing a candidate corpus with the other dump is silently accepted and yields plausible but meaningless KL values. Add a versioned header or sidecar containing and validating the token-stream hash/count, vocabulary, and baseline artifact identity.",
+      "priority": "P1",
+      "confidence": 0.98,
+      "category": "bug",
+      "code_location": {
+        "file_path": "src/metal/metal_cli.cpp",
+        "line": 1077
+      }
+    },
+    {
+      "title": "[P2] Do not use the public boot ID as the drain credential",
+      "body": "The admin check accepts any loopback request whose header equals `boot_id`, while the unauthenticated `/health` response exposes that same value. Any local process can fetch health and then drain the server, forcing inference requests to return 503; an external request forwarded through a local reverse proxy may also satisfy the loopback check. Use a separate non-public secret or an OS-permission-based admin channel.",
+      "priority": "P2",
+      "confidence": 0.97,
+      "category": "security",
+      "code_location": {
+        "file_path": "src/metal/metal_server.cpp",
+        "line": 1381
+      }
+    },
+    {
+      "title": "[P2] Preserve snapshot validity metadata in the cache",
+      "body": "A cache hit fabricates `position = tokens.size()` and `logits_resident = true`, discarding the values read from the snapshot. `path_for()` also pre-populates this cache for cancellation snapshots saved with non-resident logits. If a later request exactly matches such a banked prefix, `best_match()` can treat stale logits as resident and resume generation from them; cached malformed-position files similarly bypass the metadata checks. Cache the complete `SnapPeekInfo`, not only tokens.",
+      "priority": "P2",
+      "confidence": 0.94,
+      "category": "bug",
+      "code_location": {
+        "file_path": "src/metal/disk_snapshot_store.h",
+        "line": 75
+      }
+    },
+    {
+      "title": "[P2] Include snapshot spine pinning in serving provenance",
+      "body": "The normalized protocol identity includes the other snapshot controls but omits the new resolved `snapshot_spine_pin` setting. Consequently servers with materially different eviction behavior report identical identities, so replay/performance artifacts can be compared as if their runtime configuration matched, and restart tooling cannot detect losing an explicit `--snapshot-spine-pin 0`. Store the resolved value in runtime state and add it to the identity schema and consumers.",
+      "priority": "P2",
+      "confidence": 0.96,
+      "category": "regression",
+      "code_location": {
+        "file_path": "src/metal/metal_server.cpp",
+        "line": 482
+      }
+    }
+  ],
+  "overall_correctness": "patch is incorrect",
+  "overall_explanation": "The patch introduces a supported-platform test build failure, permits silent cross-corpus KL comparisons, exposes an ineffective admin authorization mechanism, loses correctness-relevant snapshot metadata, and omits a new behavior-affecting setting from provenance. These are actionable correctness, security, and reproducibility defects.",
+  "overall_confidence": 0.98
+}

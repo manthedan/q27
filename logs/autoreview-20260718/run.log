@@ -1,0 +1,24 @@
+autoreview target: branch
+branch: metal
+reviewers: codex model=gpt-5.6-sol thinking=high
+tools: on
+web_search: on
+ref: origin/metal
+bundle: 200070 chars
+review still running: codex elapsed=60s pid=9515
+review still running: codex elapsed=120s pid=9515
+review still running: codex elapsed=180s pid=9515
+review still running: codex elapsed=240s pid=9515
+review still running: codex elapsed=300s pid=9515
+review still running: codex elapsed=360s pid=9515
+Traceback (most recent call last):
+  File [35m"/Users/macthedan/.factory/skills/autoreview/scripts/autoreview"[0m, line [35m1264[0m, in [35m<module>[0m
+    raise SystemExit([31mmain[0m[1;31m()[0m)
+                     [31m~~~~[0m[1;31m^^[0m
+  File [35m"/Users/macthedan/.factory/skills/autoreview/scripts/autoreview"[0m, line [35m1232[0m, in [35mmain[0m
+    with [31mPath(args.output).open[0m[1;31m("w")[0m as handle:
+         [31m~~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^^^^^[0m
+  File [35m"/opt/homebrew/Caskroom/miniforge/base/lib/python3.13/pathlib/_local.py"[0m, line [35m537[0m, in [35mopen[0m
+    return [31mio.open[0m[1;31m(self, mode, buffering, encoding, errors, newline)[0m
+           [31m~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mIsADirectoryError[0m: [35m[Errno 21] Is a directory: 'logs/autoreview-20260718'[0m

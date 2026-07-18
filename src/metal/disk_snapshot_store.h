@@ -22,8 +22,6 @@
 
 #include "snapshot_evict.h"
 
-#include <CommonCrypto/CommonDigest.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -46,8 +44,13 @@ class DiskSnapshotStore {
   public:
     // peek: path -> SnapPeekInfo (throws on unreadable/foreign file).
     using PeekFn = SnapPeekInfo (*)(const std::string&);
+    // hash: token bytes -> 40-hex-char key (production: SHA1; the offline
+    // gate: any deterministic hex). Injected so this header carries no
+    // platform crypto dependency (autoreview P1: CommonCrypto is Apple-only,
+    // and test-cpu builds this header on Linux/CUDA hosts too).
+    using HashFn = void (*)(const uint32_t* tokens, uint32_t count, char out_hex[41]);
 
-    explicit DiskSnapshotStore(PeekFn peek) : peek_(peek) {}
+    explicit DiskSnapshotStore(PeekFn peek, HashFn hash) : peek_(peek), hash_(hash) {}
 
     // tag = artifact/KV identity prefix baked into every filename, so one
     // directory shared by different artifacts or fp16/turbo3 servers never
@@ -71,12 +74,18 @@ class DiskSnapshotStore {
             if(e.path().filename().string().rfind(tag_,0)!=0) continue;
             const std::string pstr=e.path().string();
             SnapPeekInfo info;
-            auto tc=tokens_.find(pstr);
-            if(tc!=tokens_.end()) { info.position=(uint32_t)tc->second.size(); info.logits_resident=true; info.tokens=tc->second; }
+            auto tc=meta_.find(pstr);
+            if(tc!=meta_.end()) { info=tc->second; }
             else {
                 try { info=peek_(pstr); }
                 catch(...) { continue; }   // corrupt/foreign file: never a hit
-                tokens_[pstr]=info.tokens;
+                // Cache the FULL peek (position + logits_resident + tokens):
+                // caching only tokens would fabricate logits_resident=true
+                // for a mid-prefill (stale-logits) banked snapshot, letting a
+                // later exact-length request resume from non-existent pending
+                // logits (autoreview P2). The metadata checks below depend on
+                // the real values.
+                meta_[pstr]=info;
             }
             // Saves record exactly the encoded prefix; anything else is not
             // resumable by token matching.
@@ -95,12 +104,13 @@ class DiskSnapshotStore {
     }
 
     std::string path_for(const uint32_t* tokens,uint32_t count) {
-        unsigned char sha[20];
-        CC_SHA1(tokens,(CC_LONG)(count*4),sha);
         char hex[41];
-        for(int i=0;i<20;i++) snprintf(hex+2*i,3,"%02x",sha[i]);
+        hash_(tokens,count,hex); hex[40]='\0';
         const std::string p=dir_+"/"+tag_+hex+".q27snap";
-        // Register the key so eviction never re-reads this file's tokens.
+        // Register the key's tokens so the eviction spine check never
+        // re-reads this file. NOT registered in meta_: path_for runs before
+        // save_state writes the blob, so logits_resident is not yet known —
+        // best_match must peek the finished file fresh (autoreview P2).
         std::lock_guard<std::mutex> lk(m_);
         if(tokens_.find(p)==tokens_.end()) tokens_[p]=std::vector<uint32_t>(tokens,tokens+count);
         return p;
@@ -152,6 +162,7 @@ class DiskSnapshotStore {
             if(std::filesystem::remove(f.path,ec)) {
                 total-=f.size; n++; freed+=f.size;
                 tokens_.erase(f.path);
+                meta_.erase(f.path);
                 if(f.spine) evicted_spine++; else evicted_leaf++;
             }
         }
@@ -161,7 +172,9 @@ class DiskSnapshotStore {
     std::atomic<uint64_t> hits{0}, saves{0}, evicted_spine{0}, evicted_leaf{0};
   private:
     PeekFn peek_;
+    HashFn hash_;
     std::string dir_; uint64_t max_bytes_=0; std::string tag_; std::mutex m_;
     bool spine_pin_=false;
-    std::map<std::string,std::vector<uint32_t>> tokens_;   // path -> stored token ids (lazy)
+    std::map<std::string,std::vector<uint32_t>> tokens_;   // path -> token ids (eviction spine check)
+    std::map<std::string,SnapPeekInfo> meta_;              // path -> full peek (best_match; real values only)
 };

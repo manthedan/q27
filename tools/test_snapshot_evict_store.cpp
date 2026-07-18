@@ -76,6 +76,17 @@ static SnapPeekInfo stub_peek(const std::string& path) {
     return o;
 }
 
+// Deterministic portable token-key hash for the offline gate (no platform
+// crypto): FNV-1a over the token bytes, expanded to 40 hex chars. Only
+// uniqueness/determinism matter here, not cryptographic strength.
+static void stub_hash(const uint32_t* tokens, uint32_t count, char out_hex[41]) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t k = 0; k < count; k++)
+        for (int b = 0; b < 4; b++) { h ^= (tokens[k] >> (b*8)) & 0xff; h *= 1099511628211ull; }
+    for (int i = 0; i < 40; i++) { h ^= h >> 33; h *= 0xff51afd7ed558ccdull; out_hex[i] = "0123456789abcdef"[(h >> 60) & 0xf]; }
+    out_hex[40] = '\0';
+}
+
 static bool exists(const std::string& p) { std::error_code ec; return fs::exists(p,ec); }
 
 int main() {
@@ -90,7 +101,7 @@ int main() {
         const std::string dir = std::string(::getenv("TMPDIR")?:"/tmp") +
                                 "/t1store." + (pin?"on":"off");
         std::error_code ec; fs::remove_all(dir,ec); fs::create_directories(dir,ec);
-        DiskSnapshotStore store(&stub_peek);
+        DiskSnapshotStore store(&stub_peek,&stub_hash);
         // Force a CHOICE. Spine chain s1+s2 = 2 KB total; leaf = 600 KB;
         // combined 602 KB over a 601 KB budget -> 1 KB must be evicted.
         //   pin OFF (flat LRU): evicts the OLDEST file = spine s1 (1 KB),
