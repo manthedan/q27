@@ -188,3 +188,29 @@ suffix-mode variant of the multislot gate harness (G1–G3/G5 under
 two-slot contention with `--suffix`) — registered, not run; and the
 economics on real agentic traffic (tool-call loops via the server) ride
 the standing quiet-machine protocol.
+
+## Review-2 amendments (2026-07-18 — dispositions:
+2026-07-18-expert-review-2-triage.md)
+
+- **Sampled-path battery pre-registered:** bursts currently engage only
+  at temperature 0 (server gates `sfx` on `temperature==0.0f` — coverage
+  limitation, not a bug). The sampled acceptance rule: one batched
+  forward over the draft block, sample each position, commit the longest
+  prefix matching the sampled target tokens, resample at first mismatch
+  (distributionally identical to serial sampling). Battery must
+  demonstrate it before bursts engage under temperature > 0.
+- **Finite-class optimality certificate (from review 1) and the
+  closed-condition formulation (review 2):** γ* ≈ 0.89 per-position
+  agreement at w=16 for a serial learned drafter on this hardware class
+  (drafter floor = F ≈ 14 ms, not bytes); measured DSpark τ = 3.209 is
+  far below. The window reopens iff π/β changes (M5/cooperative tensors),
+  a block-parallel drafter escapes the F floor with better acceptance, or
+  trees. **Cruel corollary recorded: every F reduction raises the
+  learned-drafter bar further.**
+- **Tree speculation, narrow version only:** branch only where the
+  suffix automaton has multiple high-count continuations; external
+  hybrid-architecture datapoint ~+15% (draft-ceiling bound) vs +35–42%
+  on pure attention. GDN branch state costs recorded as the caution.
+- **w=48 widening stands:** review 2's "S peaks at w ≈ 3–8" conflicts
+  with our measured tile-flat cost curve (sweet spots {16,32,48}, S(48)
+  = 3.94×); measurement wins.

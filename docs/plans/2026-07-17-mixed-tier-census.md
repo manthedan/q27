@@ -166,3 +166,25 @@ EXPERT-BRIEF-2026-07-17 — full dispositions in
 - **Low-rank delta probe adopted (CPU-only, high-value):** SVD of
   W_T2 − dequant(W_B1) on gdn_qkv; a low-rank/head-structured delta turns
   +315 MB into tens of MB of F16/Q8 correction.
+
+## Review-2 amendments (2026-07-18 — full dispositions:
+2026-07-18-expert-review-2-triage.md)
+
+- **Combination-arm sequence ADOPTED (A0–A7, supersedes "combination arm"
+  as the next step; the 2^5 factorial is the escalation path if any
+  interaction signal appears):** A0 re-anchor · A1 qkv + per-position
+  paired bootstrap CI (CI must exclude 100%) · A2 alphabeta · A3 joint
+  with additivity classification ([0.8,1.2]×Σ lone Δ pre-registered;
+  sub-additive <0.8 → per-layer bisection A3a/A3b, mirroring the KV
+  census's honest Σ-means precedent) · A4 held-out code + multilingual
+  replication · **A5 KL(mixed ‖ official 17 GiB) < KL(T2 ‖ official) —
+  the decisive quality gate** (cross-model driver to author: --kl-kv is a
+  same-model KV comparator; tokenizer byte-identical; driver + one
+  session, not "one afternoon") · A6 capability battery (maps to the
+  landed cb099ee spot-check machinery, conjunctive with the NLL band,
+  disagreements adjudicated by A5) · A7 shared_f32 as the ≈0 control
+  (already ran; publication carries it).
+- **Mechanism falsification pair adopted into Phase E:** graft qkv but
+  keep B1's β → recovery should collapse disproportionately; graft
+  alphabeta INTO T2 → near-zero effect. Both firing confirms the
+  delta-rule eigenvalue/addressing mechanism on this family.

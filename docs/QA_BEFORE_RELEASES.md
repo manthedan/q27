@@ -101,3 +101,18 @@ Per COORDINATION.md: pgrep + `curl :8213/health` before launch; one
 - [ ] Homebrew formula `url`/`sha256` updated on the tag tarball;
       `brew install --build-from-source` smoke on a clean CLT machine
       (the no-toolchain-beyond-CLT target).
+
+## 6. Cross-feature and environment (expert review 2, 2026-07-18)
+
+- [ ] **Feature-interaction matrix:** suffix bursts × disk snapshots ×
+      two-slot scheduling × KV exception cells — each gated alone to
+      date; one seeded end-to-end matrix run (each pair, one seed) as
+      "pass alone, fail together" insurance before the mixed-pack ship.
+- [ ] **Thermal governance:** every bench artifact carries a powermetrics
+      thermal-pressure log line; benches that gate ship decisions record
+      power state (twice-burned: gate-3 wall anomaly, the 12.66→10.57
+      ceiling drift).
+- [ ] **Temperature coverage statement:** release notes state that
+      suffix bursts / MTP / tool-constraint engage at temperature 0 only
+      (metal_server.cpp:660-661,952) until the sampled-path acceptance
+      battery lands (pre-registered in the suffix plan).
