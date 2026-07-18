@@ -1,0 +1,71 @@
+# Handoff — mixed-tier census → ship gates (2026-07-17, mini)
+
+Read this + `docs/plans/2026-07-17-mixed-tier-census.md` (the plan doc is the
+authoritative record; its RESULTS / combo / ship-gate sections are complete
+through tonight).
+
+## Where things stand
+
+1. **First-pass census (25 arms) + combo phase (3 arms): DONE, committed
+   `1890f67`.** Same-box anchors B1 2.6610 / T2 2.6081 (gap 0.0529 nats).
+   Gate-passing classes: gdn_qkv (114.4%), gdn_alphabeta (46.9%), attnq_mid
+   (17.6%). Non-additivity proven both directions. Raw:
+   `logs/mixed_census/census_summary.txt`, `logs/mixed_combo/combo_summary.txt`.
+
+2. **Ship gates: RUN and committed (the commit that adds this handoff;
+   evidence in `logs/m1-ship-20260717/`).**
+   - `gdn_pair` = B1 + T2{gdn_qkv, gdn_alphabeta}. Experimental pack
+     `models/bonsai-27b-gdn-pair-experimental/bonsai-27b-gdn-pair-experimental.q27`
+     (4,110,049,792 bytes, md5 107647e9…, CHECKSUMS.md5 written). NLL
+     anchor 2.5885 EXACT (beats
+     all-T2, 0.9925), suffix battery 8/8 — but **behavioral probes 3/4 =
+     SHIP GATE FAIL**: constraints probe collapses at greedy into a
+     thinking-mode repetition loop to the 6144 cap. Controls all pass
+     same-box/server/protocol: B1, T2, alphabeta-only, qkv-only. The loop
+     is EMERGENT from the qkv+alphabeta combination (cross-checkpoint
+     co-adaptation; NLL is blind to it).
+   - `cheap_pair` = B1 + T2{gdn_alphabeta, attnq_mid(blk 21–42)}.
+     **PASSES THE COMPLETE SHIP GATE — first mixed pack to do so.** NLL
+     anchor 2.6355 EXACT (1.0105 vs T2), 3.83 GB, suffix 8/8, probes 4/4.
+     Promoted as the **M1 serving tier** at
+     `models/bonsai-27b-m1/bonsai-27b-m1.q27` (md5 91db7fdd…;
+     CHECKSUMS.md5 written).
+
+3. **Suffix battery instrument fixes (committed, in
+   `tools/suffix_burst_gates_2026-07-16.sh`)**: gate 3b awk compared the
+   words `accepted`/`live` (fields 5/3) not the numbers (6/4) — leg was
+   unsatisfiable on any pack ever; added standing `rep3`
+   incrementing-chapter arm (forces live lane rejections, bytes identical);
+   gate 4 neutral-silence demoted to WARN (economics prior — T2's greedy
+   neutral continuation is periodic on the mini, bytes identical);
+   MODEL/OUT now env-overridable. Under the fixed instrument all four
+   packs run clean batteries same-box (B1 8/8, T2 8/8+WARN,
+   experimental `gdn_pair` 8/8, M1/`cheap_pair` 8/8).
+
+## Continuation decision
+
+1. `cheap_pair` was promoted as **M1** and moved into its final local model
+   home with checksum; the failing `gdn_pair` was moved under an explicit
+   `-experimental` name. The rescue investigation is parked rather than
+   spending another model-run budget without separate funding.
+2. The plan doc, README, and METAL_PROGRESS record the promotion. Codex
+   review of the original ship-gate changes ran clean (one wording fix
+   adopted). No commit trailers, ever.
+
+## Registered residue (not run)
+
+- Parked gdn_pair rescue: band-restricted partial qkv grafts; per-layer
+  loop localization; vendor-B.1 sampling variant (informative only — the
+  registered probe protocol is greedy).
+- Combo summary's published `combo_summary.txt` pack-GB column carries the
+  (fixed-in-script) GiB/MB unit bug; plan doc records corrected values.
+
+## Gotchas that cost time today
+
+- `codex exec` without `< /dev/null` blocks on stdin forever.
+- Committing (HEAD change) or editing a fingerprinted driver while its
+  batch runs trips `check_fingerprint` and aborts the run — hold commits
+  until batches complete.
+- `q27-metal-server` needed a rebuild before it accepted the mixed policy
+  (stale-binary rule applies to the SERVER binary too).
+- Both batch drivers now share `logs/q27_metal_batch.lock` (post-codex fix).

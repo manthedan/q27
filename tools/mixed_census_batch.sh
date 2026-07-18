@@ -18,10 +18,14 @@ TOK=models/qwen36-27b-mtp/qwen36-27b-mtp.tok
 C=data/wikitext2-test.tokens.bin
 OUT=logs/mixed_census
 ARM_PACK="models/census_arm.$$.q27"  # run-unique transient
-LOCK="${OUT}.lock"
+# Shared across ALL NLL batch drivers (census, combo, future): the lock
+# guards exclusive Metal/measurement access, not just this results dir —
+# two different drivers passing their own pgrep checks pre-launch could
+# otherwise run concurrently and contaminate both experiments.
+LOCK="logs/q27_metal_batch.lock"
 mkdir -p "$OUT"
 if ! mkdir "$LOCK" 2>/dev/null; then
-    echo "census: $LOCK exists; another batch owns the shared results (remove only after verifying it is stale)"
+    echo "census: $LOCK exists; another q27 batch driver is running (remove only after verifying it is stale)"
     exit 1
 fi
 echo "$$" > "$LOCK/pid"

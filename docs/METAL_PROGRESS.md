@@ -1,7 +1,7 @@
 # Metal implementation progress
 
-**Updated:** 2026-07-16
-**Test devices:** Apple M4 24 GiB (official + T2 tiers) and mac-mini M4 16 GiB (T2)
+**Updated:** 2026-07-17
+**Test devices:** Apple M4 24 GiB (official + T2/B1 tiers) and mac-mini M4 16 GiB (T2/B1/M1)
 
 This file is two things: a **current-state summary** (this section — kept
 accurate) and an **append-only chronicle** of dated entries below (the
@@ -10,7 +10,7 @@ the behavioral reference. The old checkpoint ledger and "mature-decode
 critical path" sections further down are HISTORICAL (2026-07-14 vintage) —
 do not read them as current.
 
-## Current state (2026-07-16 night)
+## Current state (2026-07-17 night)
 
 ### Shipped and gated (base M4, T2 tier unless noted)
 
@@ -20,12 +20,12 @@ do not read them as current.
 | Serial decode | GPU-resident greedy (K=8 steps/command buffer) | 98–99.2% of resident GEMV ceiling |
 | Attention | R1b factor-2 token-tiled causal GQA + GQA KV reuse shipped | ~2× at 16–32K; −19.9% matched 16K NLL wall |
 | Verification | `VERIFY_CHUNK_MAX = 48`, decoupled from the width-12 NLL/KL contract; round cost flat per 16-token tile, sweet spots w ∈ {16, 32, 48} | oracle S(48) = 3.94× |
-| MTP | Batched verify ≤ 12 (widening = 24 GB residue); early-EOS clamp fixed + gated | 58.5% acceptance, official tier |
-| Suffix bursts | Batched verification implemented (match-capped, full-tile snap, serial control kept); **correctness gates staged, economics pending** | traffic prior: cctx fires L≥12 at 35% |
-| Multislot | Phase 1 complete: 2 slots, FIFO ticket lease, 96/48/12 quanta, full admission accounting, dedicated 503, gates G1–G6 | busy-arrival wait ≤ 84 ms |
-| Snapshots | Phase 1 shipped: disk save/load, byte-identical fresh-process resume | ~450× vs re-prefill (0.12 s vs ~52 s) |
-| Quality | 32K turbo3 NLL depth-flat; needles 6/6 at 32K; `--kl-kv` + `--envelope` instruments | PPL 5.318; KL mean 0.0115 nats (tail max 2.83 = KV-codec P1 target) |
-| Tiers | Official 17 GiB (MTP) + T2 7.15 GB serve; **B1 quality GO** (PPL ~1.16× vs T2), kernel Phase 0B pending; dspark drafter pack repacked losslessly (dtypes 6/7) | — |
+| MTP | Batched verify ≤ 12; official-tier 2-slot G1/G2/G3/G5 gates pass with live speculation | 813 committed / 281 rounds (2.89 tok/round) |
+| Suffix bursts | **Shipped through CLI + server**; match-capped full-tile verification, byte-identity and live-EOS gated | 2.34× repetition-heavy; −0.1% neutral |
+| Multislot | 2 slots, FIFO ticket lease, 96/48/12 quanta, full admission accounting, cancellation-safe queue, gates G1–G7 | busy-arrival wait ≤ 84 ms |
+| Snapshots | Durable disk resume + auto-save for long prompts + bank-on-cancel | cold 4:54 → 8.1 s on changed-message prefix hit |
+| Quality | 32K turbo3 NLL depth-flat; needles 6/6; funded L7-full fp16 exceptions remove the KV tail event | max KL 2.94→0.755, mean −11%, KV bytes +25.8% |
+| Tiers | Official 17 GiB (MTP), T2 7.15 GB, B1 3.79 GB, and **M1 mixed 3.83 GB** serve; M1 closes 48% of B1→T2 NLL gap and passes every ship gate | M1/T2 NLL 1.0105; suffix 8/8; probes 4/4 |
 
 ### Parked by measurement (mechanism recorded in the chronicle entry)
 
@@ -50,21 +50,21 @@ fixtures + one-command re-gate banked for M5/M6)** · slim verifiers
   Makefile/README; re-run the fits-leg after the NEXT upstream merge
   (upstream flipped `Q27_BATCH=1 Q27_BATCH_GRAPH=1` default-ON
   2026-07-17T00:16Z, which re-opens the memory question).
-- Official-tier multislot MTP gates (G1/G2/G3/G5 with real speculation
-  rounds) not yet run — 24 GB machine residue.
 - Envelope constants PROVISIONAL (one nonzero pair per class; two-variant
   + holdout ensemble queued).
-- Server: queued streaming requests cannot cancel before slot admission
-  (no writability probe during `slot_free_` wait); slot selection is
-  first-idle with no prefix-match probe (belongs with snapshots Phase 2).
+- Server: slot selection is first-idle with no prefix-match probe; the
+  `/v1/responses` endpoint still flattens structured function calls.
+- CUDA server still lacks the Metal server's non-streaming disconnect
+  cancellation; port the vendored httplib liveness hook at the next merge.
+- The NLL-winning `gdn_pair` graft is not a serving candidate (3/4 probes);
+  rescue work is parked until separately funded.
 
 ### Active work
 
-KV-codec P1 (mini: tail instrumentation → KVarN scaling → 128-cell census
-→ RoPE-pair simulation) · snapshots Phase 2 (server keying, boundary
-policy, LRU) · suffix-burst gates (staged, awaiting go) + economics leg
-(quiet machine) · official-tier timing legs (quiet machine) · B1 Phase 0B
-(next new performance workstream).
+Quiet-machine ship/kill bench for the correctness-gated Q4 chunk-GEMM half
+port · B1 select round 2 (ship line ≥18 tok/s artifact) · envelope
+ensemble + cross-tier oracle sweep · KV-codec serving-format selection
+between funded L7-full and fp8 · `/v1/responses` structured function calls.
 
 ---
 
@@ -339,6 +339,8 @@ Remaining high-impact work, reordered by measured leverage: (1) prefill: Instrum
 **Expert review of the 2026-07-17 brief triaged — every checkable claim verified against source, eight "absent" items adopted, one stale premise of ours corrected by the reviewer (2026-07-17 night).** Full dispositions: `docs/plans/2026-07-17-expert-review-triage.md`. Verification results: (a) the reviewer's alphabeta premise was wrong in detail and their conclusion STRENGTHENED — FORMAT.md stores `ssm_alpha/beta` as F32 (B1) vs ternary (T2) (F16-both is the official-tier policy), so the 46.9% arm replaced higher-precision base values with lower-precision donor values and still gained: encoding can explain none of it; pure training signal in the recurrent pathway. Census claim relabeled "quality difference concentrated in GDN" (the "binary quantization error concentrated in GDN" claim awaits the source×encoding control; common pre-QAT master recorded as a vendor ask). (b) The B1-vs-T2 bandwidth-gap two-point fit reproduces (recomputed: B≈92.3 GB/s shared, c≈13.0 ms/tok intercept) — leading hypothesis is now accounting/intercept, with the N∈{1,2,4,8} projection-repeat slope sweep pre-registered as the discriminating probe (+ 32-bit-load and scale-free arms if slopes differ; GB-vs-GiB unit-normalization debt adopted). (c) Residency: the "wired" comment overstatement verified and fixed (requestResidency is best-effort); the turnaround-wrong-sign argument accepted (synthetic pays 1 readback/token vs production 1/8 — consistent with entry 207's paging+thermal attribution); **the genuinely new experiment adopted: the synthetic ceiling reuses one representative tensor per class — compact footprint — so a 4-arm byte-identical full-footprint bench (synthetic / anonymous shared / file-backed / private) is pre-registered** with the reviewer's readout table. (d) Speculation: finite-class optimality certificate + session-level bootstrap CIs (gate-6 amendment) adopted; adaptive multi-source zero-byte drafting is the funded-in-principle next lever; tree-speculation caution recorded (GDN branch state costs the free tile). (e) Equivalence: margin-certified teacher-forced differential contract adopted (the argmax certificate m > 2ε∞ turns "low-margin token" into a proof obligation) — amends the margin-aware-gates plan. (f) All eight "conspicuously absent" items adopted, incl. the **low-rank delta probe (SVD of W_T2 − dequant(W_B1) on gdn_qkv — CPU-only, potentially tens of MB instead of 315)**, direct composed-pack decode bench (no pack-size inference), session-reset vs continuous-state NLL, execution-order layout arm, and the **first live capability/agentic run elevated to top product risk** (first GPU-slot item after the current window). The reviewer also caught that our brief's Q3 premise was stale (entry 207 had already attributed the decode gap — launch paging + thermal, GPU busy 96%); brief corrected in place. Census publication requirements now include absolute NLLs, same-machine anchors, paired ΔNLL primary, all-arms reporting, resample intervals. Recommended 7-step sequence adopted as ordered.
 
 **Expert review 2 ("Deep Research Review") triaged — convergence with review 1 on every large item, sharper instruments adopted, two conflicts resolved by our measurements (2026-07-18).** Dispositions: `docs/plans/2026-07-18-expert-review-2-triage.md`. Verified arithmetic: (a) the review's strongest number reproduces — entry 207's profile (GEMV 84.7% of a ~91 ms token ⇒ 13.9 ms non-GEMV) matches their fitted F = 14.2 ms within 2% on a different machine/instrument, promoting the dilution model from leading hypothesis to PRIMARY (B1's next 15% lives in the fixed ~14 ms, not the GEMV; F-halving ⇒ 19.2 → 22.2 tok/s); probe ladder merged: profiler-shares first (predicts GEMV ≈73% of B1 token at 93–97 GB/s), then the N-sweep, then footprint/scale arms; the R1-vs-R2 constant difference (92.3/13.0 vs 95.3/14.2) is the GB/GiB unit mixing R1 flagged — per-token-bytes instrumentation lands with the probe. (b) The **γ* ≈ 0.89 closed condition verified internally consistent** (drafter floor = F, not bytes: 0.5 GB drafter ≈ 19.5 ms ≈ 0.24 token-times/proposal; τ(16,γ) ≥ BE+16d solves to γ ≈ 0.89 break-even, ~0.93 ship) — the trained-drafter window is now a stated condition, not a vibe; the cruel corollary recorded (every F reduction raises the bar). Adopted: the **A0–A7 combination-arm sequence** (per-position bootstrap CI; additivity classification [0.8,1.2]×ΣΔ with per-layer bisection fallback; held-out code+multilingual replication; **KL(mixed‖official 17 GiB) < KL(T2‖official) as the decisive quality gate** — driver to author, --kl-kv is same-model; A6 maps to the landed cb099ee capability machinery conjunctively; shared_f32 ≈0 control already ran); the **β-gate falsification pair** (qkv-with-B1-β should collapse recovery; alphabeta-into-T2 should do nothing) into Phase E; residency toolbox merge (purgeable-state audit, anonymous+mlock arm E, chunked-staging private blit resolving the 2×-footprint concern, wired_limit sysctl to ops docs); **thermal governance** (powermetrics in every bench artifact + admission rule); gate length derived from measured flip probability + Kahan-compensated flush + batch-invariant discipline as margin-contract amendments; **feature-interaction matrix into the QA checklist**; vendor asks consolidated (pre-QAT masters + a "B1+" build with fp16 GDN qkv — the census publication is the business case). Conflicts resolved: their "S peaks at w ≈ 3–8" REJECTED — our measured tile-flat curve (S(48) = 3.94×) wins wherever the flat R(w) model disagrees; w=48 widening stands. Verified in source: suffix/MTP/constraint engage at temperature 0 only (metal_server.cpp:660-661,952) — sampled-path acceptance battery pre-registered, QA notes the limitation. Their "no capability evals anywhere" was OVERTAKEN by cb099ee + 9649f2b before their snapshot. Trees recorded narrow (multi-continuation suffix hits only; external hybrid +15% datapoint, draft-ceiling bound). Both reviews' endorsements of the census publication stand; persistent drafter store + energy column (our ideas 1/6) independently converged — promoted to plan candidates.
+
+**Mixed-tier census → M1 serving tier SHIPPED; NLL-winning GDN graft correctly rejected by behavioral gates (2026-07-17 evening, 16 GB mini; plan+results: `2026-07-17-mixed-tier-census.md`, evidence: `logs/mixed_census/`, `logs/mixed_combo/`, `logs/m1-ship-20260717/`).** Same-box 8K anchors B1/T2 = 2.6610/2.6081. Of 25 class-band grafts, only GDN QKV (114.4% gap recovery), GDN alpha/beta (46.9%), and mid-depth attention-Q (17.6%) cleared the registered ≥15%-at-≤10%-bytes census gate; composition proved non-additive in both directions. `gdn_pair` reached NLL 2.5885 (0.9925× T2) at 4.11 GB and suffix 8/8, but FAILED the required 4/4 probes: its constraints leg entered a 6144-token thinking repetition loop that did not occur on B1, T2, alpha/beta-only, or QKV-only controls. NLL therefore did not overrule behavior. `cheap_pair` (B1 + T2 alpha/beta + attention-Q blocks 21–42) reproduced NLL 2.6355 exactly (1.0105× T2) at 3.83 GB, suffix 8/8, and probes 4/4, so it is promoted as **M1** at `models/bonsai-27b-m1/bonsai-27b-m1.q27` (md5 `91db7fdd368ba3558e59bb5e111bbd07`). The failing candidate is retained only as `bonsai-27b-gdn-pair-experimental` and its rescue is parked. The suffix gate instrument was also repaired: numeric awk fields fixed, a live-rejection `rep3` arm added, and neutral silence demoted to WARN while byte identity remains hard; fixed battery re-runs passed B1, T2, M1, and the experimental pack.
 
 ## Mature-decode critical path (HISTORICAL — 2026-07-14 checklist, superseded)
 

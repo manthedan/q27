@@ -108,7 +108,8 @@ and the ternary tier is repacked from PrismML's QAT pack:
 | q6 (6.0 bpw) | `qwen36-27b-mtp-q6.q27` | larger | 32 GB | +0.35% PPL margin over Q5_K_M |
 | q6k (6.8 bpw) | `qwen36-27b-mtp-q6k.q27` | larger | 32 GB | GGUF-matching quality, ~10% slower |
 | **T2 ternary** (2.25 bpw) | repack of `Ternary-Bonsai-27B-Q2_0.gguf` | 7.15 GB | 16 GB Mac | fully-resident 27B on small machines; ~2.1–2.3× PPL vs official, task quality holds |
-| B1 binary (1.125 bpw) | not yet produced | 3.9 GB | n/a | quality gate passed; native kernel decision (Phase 0B) pending |
+| **M1 mixed** | `bonsai-27b-m1.q27` | 3.83 GB | 16 GB Mac | B1-size serving point with 48% of the B1→T2 NLL gap closed; full ship gate passed |
+| B1 binary (1.125 bpw) | `bonsai-27b-b1.q27` | 3.79 GB | 16 GB Mac | smallest fully-resident tier; full quality/probe battery passed |
 
 ```bash
 # official tier + tokenizer (swap --include for the tier you picked)
@@ -124,8 +125,13 @@ losslessly (bit-exact round-trip gated) with:
 python3 tools/repack.py Ternary-Bonsai-27B-Q2_0.gguf ternary-bonsai-27b-t2.q27
 ```
 
-Verify every download against its `CHECKSUMS.md5`. The fine-tune variant
-of the official model is `signalnine/Qwopus3.6-27B-v2-MTP-q27`.
+M1 is a byte-level graft of the companion B1/T2 checkpoints: B1 bulk plus
+T2 GDN alpha/beta and attention-Q in blocks 21–42. Its 8K NLL, suffix
+byte-identity battery, and 4/4 behavioral probes are recorded in
+[`docs/plans/2026-07-17-mixed-tier-census.md`](docs/plans/2026-07-17-mixed-tier-census.md).
+
+Verify every download against its `CHECKSUMS.md5`. Fine-tune variant of
+the official model: `signalnine/Qwopus3.6-27B-v2-MTP-q27`.
 
 ## Speed
 
