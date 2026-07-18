@@ -240,6 +240,55 @@ cheap_pair NLL 2.6355  gap recovered  48.2%  vs T2 1.0105  +42.3 MB   3.83 GB  S
   and the 4/4 behavioral probe set on the composed pack. That is the
   next gate for `gdn_pair` (and `cheap_pair` as the byte-cheap option).
 
+## Ship gates run (2026-07-17 evening, mini — `logs/m1-ship-20260717/`)
+
+Persistent `gdn_pair` pack built as `models/bonsai-27b-m1/bonsai-27b-m1.q27`
+(4,110,049,792 bytes exactly as predicted, md5 in CHECKSUMS.md5): validate
+OK, greedy smoke " Paris.", and an 8K NLL identity anchor under the census
+route pins reproduced the combo measurement EXACTLY (2.5885) — the persistent
+artifact is measurement-identical to the gated candidate.
+
+Instrument fixes made before trusting the suffix battery (all in
+`tools/suffix_burst_gates_2026-07-16.sh`, which also gained env-overridable
+MODEL/OUT): (1) gate 3b's awk compared the literal words `accepted`/`live`
+(fields 5/3) instead of their values (fields 6/4) — the leg was
+unsatisfiable on ANY pack, so no historical battery can have passed it;
+(2) a standing `rep3` incrementing-chapter arm was added because the
+canonical repetition prompt legitimately all-accepts (periodic greedy
+continuation) and cannot exercise rejection — rep3 forces live lane
+rejections (observed `live 16 accepted 3`) with committed bytes identical;
+(3) gate 4's "zero bursts on neutral" assertion is an economics prior, not
+a correctness contract — T2's own greedy continuation of the neutral prompt
+goes periodic on the mini and fires 3 bursts with bytes still identical —
+so silence is now WARN and byte-identity remains the hard assertion.
+Under the fixed instrument: m1 8/8 PASS, and the parents re-run clean
+same-box (B1 8/8; T2 8/8 + the documented WARN).
+
+**Behavioral probes: `gdn_pair` passes only 3/4 — ship gate FAIL (4/4 required).** The
+constraints leg collapses at greedy into a thinking-mode repetition loop
+("water bottle (2) -> " …) to the full 6144-token cap with empty final
+content. Same-box, same-server, same-protocol controls: B1 PASS, T2 PASS,
+alphabeta-only graft PASS, qkv-only graft PASS. The loop appears ONLY in
+the qkv+alphabeta composition — an emergent cross-checkpoint co-adaptation
+pathology of exactly the class the pre-readout amendment warned about, and
+one wikitext NLL cannot see (the same pack beats all-T2 on NLL while
+failing an agentic-collapse probe). json/codeedit/toolcall legs PASS.
+Registered rescue residue (not run): band-restricted partial qkv grafts;
+vendor-B.1 sampling variant (temp 0.7/top-p 0.95/top-k 20 — NOT the
+registered greedy protocol, so it can inform but not substitute); per-layer
+loop localization.
+
+**`cheap_pair` passes the COMPLETE ship gate — first mixed pack to do so.**
+Rebuilt pack (md5 91db7fdd368ba3558e59bb5e111bbd07): 8K NLL identity anchor
+2.6355 EXACT; suffix battery 8/8 PASS; probes 4/4 PASS (json exact
+keys/types; constraints all honored, `finish stop`; codeedit boundary fix
+exact; toolcall get_weather city=Taipei with schema-valid optional
+unit="c"). Ship band: 1.0105 vs T2 at 3.83 GB. Serving point: ~48% of the
+B1→T2 gap closed for +42.3 MB over B1 (+1.1% bytes). Artifact awaits a
+tier name and location (currently `models/probe_cheap.q27`); `bonsai-27b-m1`
+holds the NLL-stronger but probe-failing `gdn_pair` for the rescue
+investigation.
+
 Ship bands are unchanged from the pre-registration: NLL mixed/T2 ≤ 1.06
 at ≤ 5.0 GB → ship candidate (then suffix byte-identity battery +
 behavioral probes before any serving claim); 1.06–1.12 conditional;

@@ -6,9 +6,11 @@
 set -u  # no -e: each gate checks its own exit and the verdict file decides
 cd "$(dirname "$0")/.."
 
-MODEL=models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27
+# Overridable so the battery runs on any tier artifact (B1 2026-07-16,
+# mixed m1 2026-07-17); defaults preserve the original T2 invocation.
+MODEL=${MODEL:-models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27}
 TOK=models/qwen36-27b-mtp/qwen36-27b-mtp.tok  # shared 248320 vocab across tiers
-OUT=logs/suffix-gates-20260716
+OUT=${OUT:-logs/suffix-gates-20260716}
 mkdir -p "$OUT"
 VERDICTS="$OUT/verdicts.txt"
 : > "$VERDICTS"
@@ -56,24 +58,46 @@ else
   verdict "FAIL: wide lanes never dispatched — burst gating or snap policy is wrong (or prompt failed to fire)"
 fi
 
+# The canonical REP prompt is perfectly periodic, so greedy continuation
+# legitimately accepts every lane and gate 3b cannot observe a rejection.
+# This arm repeats a long sentence with an incrementing chapter counter:
+# bursts still fire (long identical spans) but the model advances the
+# counter where history proposes the stale one — forcing live rejections.
+REP3="Chapter 1: The quick brown fox jumps over the lazy dog and runs far away into the deep dark forest. Chapter 2: The quick brown fox jumps over the lazy dog and runs far away into the deep dark forest. Chapter 3: The quick brown fox jumps over the lazy dog and runs far away into the deep dark"
+run serial-rep3 "$REP3" || verdict "FAIL: serial-rep3 run rc"
+run sfx32-rep3  "$REP3" --suffix 32 || verdict "FAIL: sfx32-rep3 run rc"
+if cmp -s "$OUT/serial-rep3.txt" "$OUT/sfx32-rep3.txt"; then
+  verdict "PASS: sfx32-rep3 committed bytes identical to serial"
+else
+  verdict "FAIL: sfx32-rep3 committed bytes differ from serial (inspect: known tolerance class only if low-margin, else bug)"
+fi
+
 # Gate 3b — acceptance walk is LIVE (not teacher-forced): some round must
 # reject a lane (accepted < live-1) somewhere across the burst arms.
-if grep -hE 'suffix round: live' "$OUT"/sfx*-rep.err \
-   | awk '{ if ($5 < $3 - 1) found=1 } END { exit !found }'; then
+# (2026-07-17 fix: the original awk compared the literal words 'accepted'
+# and 'live' — fields 5 and 3 — which coerce to 0, making the check
+# unsatisfiable on any pack. Fields 6 and 4 are the numbers.)
+if grep -hE 'suffix round: live' "$OUT"/sfx*-rep*.err \
+   | awk '{ if ($6 < $4 - 1) found=1 } END { exit !found }'; then
   verdict "PASS: acceptance walk rejected at least one lane (walk is live)"
 else
   verdict "FAIL: every lane of every round accepted — walk may be vacuous (or prompt is degenerate; change prompt before trusting)"
 fi
 
-# Gate 4 — stats honesty: fired + fallback rounds == speculation rounds, and
-# neutral traffic goes silent with byte-identity.
+# Gate 4 — neutral-prompt byte-identity. The correctness contract is that
+# the committed stream is identical whether or not the drafter engages.
+# Burst SILENCE on this prompt is an economics prior, not a contract: if
+# the model's own greedy continuation goes periodic (T2 does at n=96 on
+# the mini, 2026-07-17 — bytes still identical), bursts legitimately fire.
+# Silence is reported as WARN, never FAIL.
 run serial-neu "$NEU" || verdict "FAIL: serial-neu run rc"
 run sfx48-neu  "$NEU" --suffix 48 || verdict "FAIL: sfx48-neu run rc"
-if cmp -s "$OUT/serial-neu.txt" "$OUT/sfx48-neu.txt" \
-   && grep -q 'suffix bursts: 0 fired' "$OUT/sfx48-neu.err"; then
-  verdict "PASS: neutral prompt — zero bursts, committed bytes identical"
+if cmp -s "$OUT/serial-neu.txt" "$OUT/sfx48-neu.txt"; then
+  verdict "PASS: neutral prompt — committed bytes identical"
+  grep -q 'suffix bursts: 0 fired' "$OUT/sfx48-neu.err" ||
+    verdict "WARN: neutral prompt fired bursts (greedy continuation is periodic on this box; economics prior, not a correctness failure)"
 else
-  verdict "FAIL: neutral prompt regressed (bursts fired or bytes differ)"
+  verdict "FAIL: neutral prompt committed bytes differ from serial"
 fi
 
 echo; echo "=== $VERDICTS ==="; cat "$VERDICTS"
