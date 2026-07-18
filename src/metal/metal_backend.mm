@@ -614,7 +614,10 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
-            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm_h");
+            // q27_matmul_q4_mm_h is PARKED (0.855x vs the 1.7x ship line) and
+            // routes only under Q27_METAL_GEMM_HALF_Q4=1 — built lazily on
+            // first use so production startup never compiles it (same pattern
+            // as the probe-only q4_r2_p/b1_r3_p PSOs).
             impl_->b1_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_b1_mm");
             impl_->mma_roofline_a_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_a");
             impl_->mma_roofline_b_p = make_pipeline(impl_->device, impl_->library, @"q27_mma_roofline_b");
@@ -1251,6 +1254,9 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
         // q27_matmul_q8_mm_h records the attempt.
         const bool h = impl_->gemm_half;
         const bool h4 = impl_->gemm_half_q4;
+        if (h4 && !impl_->q4_quantized_matmul_h)
+            impl_->q4_quantized_matmul_h = make_pipeline(impl_->device, impl_->library,
+                                                         @"q27_matmul_q4_mm_h");
         bool own; auto enc=impl_->encoder_for_operation(own,
             weight.dtype==DType::Q8_G128?"q27_matmul_q8_mm":
             weight.dtype==DType::T2_G128?(h?"q27_matmul_t2_mm_h":"q27_matmul_t2_mm"):

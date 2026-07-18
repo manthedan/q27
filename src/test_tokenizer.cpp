@@ -447,8 +447,20 @@ int main(int argc, char** argv) {
         bool ok15 = v15.size() == 1 && v15[0].name == "bash" &&
                     v15[0].arguments.value("command", "") == "ls -la" &&
                     v15[0].arguments.value("timeout", 0) == 5;
+        // v16: the mode-10 lookahead must not swallow what follows a
+        // TRUNCATED call — the re-escape only holds for balanced segments;
+        // an unbalanced segment rescans with the unconditional terminator so
+        // a trailing second call recovers instead of merging into the open
+        // command string (review 2026-07-17: merged-garbage bash + lost
+        // view call).
+        auto v16 = q27::parse_bare_tool_calls(
+            "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"\n\n"
+            "Now let me check the files before proceeding.",
+            &pre, nullptr, true);
+        bool ok16 = v16.empty();   // truncated call stays text — never a
+                                   // "successful" parse of command+prose
         bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 &&
-                  ok10 && ok11 && ok12 && ok13 && ok14 && ok15;
+                  ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }
@@ -517,12 +529,58 @@ int main(int argc, char** argv) {
         stream_cut(b6,3,f6,c6n,op6,cl6,nm6,raw6);
         bool s6=op6 && cl6 && nm6=="bash" &&
                 nlohmann::json::parse(f6).value("command","")=="ls";
-        bool ok=s1&&s2&&s3&&s4&&s5&&s6;
-        printf("incremental tool-call streamer: %s\n", ok?"PASS":"FAIL");
-        if(!ok){
-            fprintf(stderr,"  s1=%d s2=%d s3=%d s4=%d s5=%d s6=%d\n",
-                    s1,s2,s3,s4,s5,s6);
-            return 1;
+        // s7: TWO well-formed calls packed in one wrapper (review
+        // 2026-07-17: the DONE-state byte drop lost the second silently).
+        // The first streams; the bytes after its arguments close land in
+        // trail() and must recover through the bare-call chain.
+        {
+            q27::ToolCallStreamer ts;
+            std::string b7="{\"name\":\"read\",\"arguments\":{\"file\":\"a\"}}"
+                           "{\"name\":\"read\",\"arguments\":{\"file\":\"b\"}}";
+            std::string f7; bool op7=false;
+            for(size_t p=0;p<b7.size();p+=3){
+                bool o=false; f7+=ts.feed(b7.substr(p,3),&o); op7|=o;
+            }
+            std::string tail; bool cl7=ts.finalize(&tail); f7+=tail;
+            auto bcs=q27::parse_bare_tool_calls(
+                q27::strip_ws2(ts.trail()),nullptr,nullptr,true);
+            bool s7=op7 && cl7 &&
+                    nlohmann::json::parse(f7).value("file","")=="a" &&
+                    bcs.size()==1 && bcs[0].name=="read" &&
+                    bcs[0].arguments.value("file","")=="b";
+            // s8: mode-3 shape 1 — <content> tag in value position opens the
+            // string the model forgot; interior raw quotes/newlines escape;
+            // the last </content> closes it. Must parse-equal the buffered
+            // escape_content_tags path.
+            std::string b8="{\"name\": \"write\", \"arguments\": {\"path\": \"a.md\", "
+                           "\"content\": <content>Line \"q\" one\ntwo</content>}}";
+            std::string f8,nm8,raw8; int c8n=0; bool op8=false,cl8=false;
+            stream_cut(b8,3,f8,c8n,op8,cl8,nm8,raw8);
+            auto buf8=q27::parse_tool_call(b8);
+            bool s8=op8 && cl8 && buf8.ok &&
+                    nlohmann::json::parse(f8)==buf8.arguments;
+            // s9: mode-3 shape 2 — stray </content> instead of the closing
+            // quote; 1-byte cuts force the tag capture across feed
+            // boundaries. And a literal in-string </content> followed by
+            // more content must stay literal (s9b).
+            std::string b9="{\"name\": \"write\", \"arguments\": {\"path\": \"b.md\", "
+                           "\"content\": \"RAW \"x\" line</content>}}";
+            std::string f9,nm9,raw9; int c9n=0; bool op9=false,cl9=false;
+            stream_cut(b9,1,f9,c9n,op9,cl9,nm9,raw9);
+            bool s9=op9 && cl9 &&
+                    nlohmann::json::parse(f9).value("content","")=="RAW \"x\" line";
+            std::string b9b="{\"name\": \"write\", \"arguments\": {\"c\": \"a</content>b\"}}";
+            std::string f9b,nm9b,raw9b; int c9bn=0; bool op9b=false,cl9b=false;
+            stream_cut(b9b,1,f9b,c9bn,op9b,cl9b,nm9b,raw9b);
+            bool s9b=op9b && cl9b &&
+                     nlohmann::json::parse(f9b).value("c","")=="a</content>b";
+            bool ok=s1&&s2&&s3&&s4&&s5&&s6&&s7&&s8&&s9&&s9b;
+            printf("incremental tool-call streamer: %s\n", ok?"PASS":"FAIL");
+            if(!ok){
+                fprintf(stderr,"  s1=%d s2=%d s3=%d s4=%d s5=%d s6=%d s7=%d s8=%d s9=%d s9b=%d\n",
+                        s1,s2,s3,s4,s5,s6,s7,s8,s9,s9b);
+                return 1;
+            }
         }
     }
 

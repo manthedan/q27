@@ -73,4 +73,70 @@ function_call_arguments deltas, CUDA server adoption at next merge.
 
 ## RESULTS
 
-(pending)
+Shipped 2026-07-17 (commit 1adb0cd): unit battery + agentic battery +
+trace gate ALL PASS on the deployed binary; wire dump shows a
+get_weather call streaming as an opener chunk plus six argument
+fragments concatenating to valid JSON. G5s gate updated to
+production-shape accumulation (the old assertion crashed on the
+opener's empty arguments).
+
+## Review round (workflow autoreview, 2026-07-17 night)
+
+17/17 candidates verified, 0 refuted. Four confirmed correctness
+defects in this feature's span, all fixed same-night and proven both
+ways
+(sabotage builds against the pre-fix parser FAIL the new battery
+cases):
+
+1. **DONE-state byte drop (packed wrapper).** The streamer discarded
+   everything after the first arguments object closed, silently losing
+   any second call packed in one wrapper — a regression vs the
+   buffered recovery chain. Fix: post-DONE bytes accumulate in
+   `trail()` (the call object's own closing `}` swallowed once as
+   framing); `close_tool` runs the trail through
+   `parse_bare_tool_calls` and emits recovered calls whole; non-call
+   trail surfaces as text; pure framing junk is discarded. Battery s7.
+2. **Mode-3 not streamed.** The buffered path repaired
+   `<content>`-tagged bodies via escape_content_tags; the streamer
+   shipped them raw (client-side JSON parse failure, no recovery — an
+   UNregistered trade). Fix: inline mode-3 in the streamer — a
+   value-position `<content>` opens the string the model forgot
+   (shape 1); an in-string `</content>` holds for the same
+   one-non-ws-byte lookahead as mode-10 quotes and closes the string
+   only before a JSON delimiter (shape 2); literal in-string
+   `</content>` mid-value stays literal. Battery s8/s9/s9b at 1-byte
+   cuts.
+3. **Mode-10 lookahead × truncation repair (bare scan).** On a
+   truncated call followed by prose, the lookahead re-escaped the
+   real closing quote, swallowed the prose into the open string, and
+   the truncation repair then "successfully" parsed one merged garbage
+   command. Fix: the lookahead's premise (valid framing follows every
+   real close) only holds for BALANCED segments — an unbalanced
+   segment with mode-10 re-escapes rescans with the unconditional
+   terminator and takes the pre-mode-10 repair path. Battery v16
+   (chosen adversarially: a trailing second call re-synchronizes the
+   old scanner via colon lookahead and does NOT discriminate; prose
+   does).
+4. **Keepalive blind spots.** The 5 s keepalive lived only in the
+   per-token callback — queue wait (250 ms ticks) and prefill (tens of
+   seconds cold at big contexts) stayed wire-silent past the 18 s
+   stall window the fix was shipped for. Fix: each streaming handler's
+   keepalive hoisted into a named lambda fired from BOTH the token
+   callback and the liveness probe; `Runtime::run` now invokes the
+   probe with `route_` UNLOCKED in the queue-wait loop (a stalled
+   client's TCP backpressure must not block other requests' slot
+   acquisition; cancel bookkeeping relocks first).
+
+Registered residues from the review: (a) the in-string sanitizer state
+machine now exists in three places (bare scan, scan_namedropped,
+streamer) with two idioms — a shared char-level stepper is the
+refactor, deferred (risk-heavy, no behavior delta); (b)
+/v1/completions streaming carries NO keepalive by design — the replay
+bench's TTFT reads first-byte, and a prefill keepalive would fake it;
+(c) the MTP/non-chunked prefill path has no live() ticks, so no
+keepalive there either (MTP is off on the serving line); (d) cleanups
+landed: dead post-close_tool emit_tool deleted, parked
+q27_matmul_q4_mm_h PSO now lazy-built (startup never compiles it),
+quiet_q4_bench re-armed legs use Q27_METAL_GEMM_HALF_Q4 (a rerun under
+the old knob benched float-vs-float), replay bench headline separates
+trace-priced from cap-priced (corpus-derived, approximate) turns.

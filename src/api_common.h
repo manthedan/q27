@@ -359,9 +359,10 @@ inline std::string strip_ws2(const std::string& s) {
 // splitter's TOOL-channel bytes as they decode; once the call head parses
 // ({"name": "X", "arguments": {  — tolerating the mode-9 missing opening
 // quote on the arguments key), the arguments object streams out SANITIZED
-// (mode-5 control-char escaping and mode-10 in-string quote re-escaping
-// applied inline; a quote holds for exactly one non-whitespace byte of
-// lookahead) as production-shape argument fragments. Heads that deviate
+// (mode-5 control-char escaping, mode-10 in-string quote re-escaping, and
+// mode-3 <content>-tag repair applied inline; a quote or </content> holds
+// for exactly one non-whitespace byte of lookahead) as production-shape
+// argument fragments. Heads that deviate
 // (mode 6/7/8 shapes) or exceed the bound never stream: the raw body is
 // preserved byte-exact for the buffered parse+recovery path. The trade is
 // pre-registered: a streamed call whose body ends unbalanced reaches the
@@ -382,7 +383,8 @@ struct ToolCallStreamer {
     std::string feed(const std::string& t, bool* opened_now) {
         if (opened_now) *opened_now = false;
         raw += t;
-        if (state == FALLBACK || state == DONE) return "";
+        if (state == DONE) { add_trail(t); return ""; }
+        if (state == FALLBACK) return "";
         std::string out;
         if (state == HEAD) {
             head_ += t;
@@ -411,55 +413,112 @@ struct ToolCallStreamer {
     // handler closes the call as-is. HEAD/FALLBACK: false, nothing streamed.
     bool finalize(std::string* tail) {
         if (state == DONE) return true;
-        if (state == ARGS && pend_q_) {
-            *tail += '"';
-            *tail += pend_ws_;
-            pend_q_ = false;
+        if (state == ARGS) {
+            if (!tag_.empty()) { *tail += tag_; tag_.clear(); } // partial tag: literal
+            if (pend_q_ || pend_tag_) {          // EOF rule: terminator
+                *tail += '"';
+                *tail += pend_ws_;
+                pend_q_ = pend_tag_ = false;
+            }
         }
         return false;
     }
 
+    // Bytes seen after the streamed call's arguments object closed. A
+    // wrapper can pack more than one call; these are NOT framing — the
+    // handler runs them through the bare-call recovery chain (review
+    // 2026-07-17: the DONE-state byte drop silently lost every call after
+    // the first, a regression vs the buffered path).
+    const std::string& trail() const { return trail_; }
+
   private:
     std::string head_;
+    std::string trail_;
     int depth_ = 0;
     bool in_str_ = false, esc_ = false;
     bool pend_q_ = false;   // in-string quote awaiting one-byte lookahead
-    std::string pend_ws_;   // whitespace held behind the pending quote
+    bool pend_tag_ = false; // full </content> matched, awaiting the same lookahead
+    bool outer_seen_ = false; // the call object's OWN closing } consumed from the trail
+    std::string pend_ws_;   // whitespace held behind the pending quote/tag
+    std::string tag_;       // partial <content>/</content> capture (mode 3)
+
+    // Post-DONE bytes: the head consumed the call object's opening { without
+    // counting it, so exactly one closing } after the args object is the
+    // call's own framing — swallow it once; everything else is trail.
+    void add_trail(const std::string& s) {
+        size_t k = 0;
+        if (!outer_seen_) {
+            while (k < s.size() && is_ws(s[k])) k++;
+            if (k == s.size()) return;      // only ws so far: keep waiting
+            outer_seen_ = true;
+            if (s[k] == '}') k++;
+        }
+        trail_ += s.substr(k);
+    }
 
     static bool is_ws(char c) { return c==' '||c=='\t'||c=='\r'||c=='\n'; }
 
     void scan(const std::string& in, std::string& out) {
-        for (size_t i = 0; i < in.size() && state == ARGS; i++) {
+        for (size_t i = 0; i < in.size() && state == ARGS; ) {
             const char c = in[i];
-            if (pend_q_) {
-                if (is_ws(c)) { pend_ws_ += c; continue; }
+            if (!tag_.empty()) {
+                // Mode-3 tag capture: held bytes that may still complete
+                // <content> (value position — the tag opens the string the
+                // model forgot) or </content> (in-string — maybe the close
+                // the model wrote instead of a quote). The streamer applies
+                // the same repair the buffered escape_content_tags path did;
+                // a mismatch flushes the held bytes as ordinary input and
+                // reprocesses c.
+                const char* want = in_str_ ? "</content>" : "<content>";
+                const size_t wl = in_str_ ? 10 : 9;
+                if (c == want[tag_.size()]) {
+                    tag_ += c; i++;
+                    if (tag_.size() == wl) {
+                        tag_.clear();
+                        if (in_str_) pend_tag_ = true;       // shape 2: lookahead decides
+                        else { out += '"'; in_str_ = true; } // shape 1: value opens as string
+                    }
+                    continue;
+                }
+                out += tag_;   // literal bytes (in-string they need no escaping)
+                tag_.clear();
+                continue;      // reprocess c
+            }
+            if (pend_q_ || pend_tag_) {
+                if (is_ws(c)) { pend_ws_ += c; i++; continue; }
                 if (c == ',' || c == '}' || c == ']' || c == ':') {
                     out += '"'; out += pend_ws_;   // terminator: ws is framing
                     in_str_ = false;
                 } else {
-                    out += "\\\"";                 // literal: ws is content,
-                    for (char w : pend_ws_)        // escaped in-string
+                    // literal: ws is content, escaped in-string
+                    out += pend_tag_ ? "</content>" : "\\\"";
+                    for (char w : pend_ws_)
                         out += w=='\n' ? "\\n" : w=='\r' ? "\\r"
                              : w=='\t' ? "\\t" : std::string(1, w);
                 }
                 pend_ws_.clear();
-                pend_q_ = false;
+                pend_q_ = pend_tag_ = false;
                 // fall through: c processes normally in its resolved context
             }
-            if (esc_) { esc_ = false; out += c; continue; }
+            if (esc_) { esc_ = false; out += c; i++; continue; }
             if (in_str_) {
-                if (c == '\\') { esc_ = true; out += c; continue; }
-                if (c == '"') { pend_q_ = true; continue; }
-                if (c == '\n') { out += "\\n"; continue; }
-                if (c == '\r') { out += "\\r"; continue; }
-                if (c == '\t') { out += "\\t"; continue; }
-                out += c;
+                if (c == '\\') { esc_ = true; out += c; i++; continue; }
+                if (c == '"') { pend_q_ = true; i++; continue; }
+                if (c == '<') { tag_ += c; i++; continue; }
+                if (c == '\n') { out += "\\n"; i++; continue; }
+                if (c == '\r') { out += "\\r"; i++; continue; }
+                if (c == '\t') { out += "\\t"; i++; continue; }
+                out += c; i++;
                 continue;
             }
-            out += c;
+            if (c == '<') { tag_ += c; i++; continue; } // never valid JSON here
+            out += c; i++;
             if (c == '"') in_str_ = true;
             else if (c == '{') depth_++;
-            else if (c == '}' && --depth_ == 0) state = DONE; // outer framing after this is discarded
+            else if (c == '}' && --depth_ == 0) {
+                state = DONE;
+                add_trail(in.substr(i)); // possible packed second call, not framing
+            }
         }
     }
 
@@ -819,34 +878,51 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     size_t first = std::string::npos;
     size_t i = text.find('{');
     while (i != std::string::npos) {
-        int depth = 0;
-        bool in_str = false, esc = false;
-        size_t end = std::string::npos;
-        std::string san;  // segment with raw in-string control chars escaped
-        for (size_t j = i; j < text.size(); j++) {
-            char ch = text[j];
-            if (esc) { esc = false; san += ch; continue; }
-            if (in_str) {
-                if (ch == '\\') { esc = true; san += ch; continue; }
-                if (ch == '"') {
-                    // tenth drift mode: an in-string quote not followed by a
-                    // JSON delimiter is literal content — re-escape it.
-                    if (quote_terminates_string(text, j)) { in_str = false; san += ch; }
-                    else { san += "\\\""; m10 = true; }
+        // Segment scan, two-pass on the mode-10 lookahead: the lookahead's
+        // premise — valid JSON framing follows every real closing quote —
+        // only holds when the segment reaches balance. On an unbalanced-to-
+        // EOF segment the re-escape can swallow trailing prose (or a whole
+        // second call) into an open string that the truncation repair then
+        // "successfully" closes into one merged garbage command (review
+        // 2026-07-17). Unbalanced-with-m10 segments rescan with the
+        // unconditional terminator and take the pre-mode-10 repair path.
+        bool m5_here = false, m10_here = false;
+        auto scan_seg = [&](bool m10_look, std::string& san) -> size_t {
+            san.clear();
+            m5_here = m10_here = false;
+            int depth = 0;
+            bool in_str = false, esc = false;
+            for (size_t j = i; j < text.size(); j++) {
+                char ch = text[j];
+                if (esc) { esc = false; san += ch; continue; }
+                if (in_str) {
+                    if (ch == '\\') { esc = true; san += ch; continue; }
+                    if (ch == '"') {
+                        // tenth drift mode: an in-string quote not followed by a
+                        // JSON delimiter is literal content — re-escape it.
+                        if (!m10_look || quote_terminates_string(text, j)) { in_str = false; san += ch; }
+                        else { san += "\\\""; m10_here = true; }
+                        continue;
+                    }
+                    // fifth drift mode: literal newlines/tabs inside the string
+                    if (ch == '\n') { san += "\\n"; m5_here = true; continue; }
+                    if (ch == '\r') { san += "\\r"; m5_here = true; continue; }
+                    if (ch == '\t') { san += "\\t"; m5_here = true; continue; }
+                    san += ch;
                     continue;
                 }
-                // fifth drift mode: literal newlines/tabs inside the string
-                if (ch == '\n') { san += "\\n"; m5 = true; continue; }
-                if (ch == '\r') { san += "\\r"; m5 = true; continue; }
-                if (ch == '\t') { san += "\\t"; m5 = true; continue; }
                 san += ch;
-                continue;
+                if (ch == '"') in_str = true;
+                else if (ch == '{') depth++;
+                else if (ch == '}' && --depth == 0) return j;
             }
-            san += ch;
-            if (ch == '"') in_str = true;
-            else if (ch == '{') depth++;
-            else if (ch == '}' && --depth == 0) { end = j; break; }
-        }
+            return std::string::npos;
+        };
+        std::string san;  // segment with raw in-string control chars escaped
+        size_t end = scan_seg(true, san);
+        if (end == std::string::npos && m10_here) end = scan_seg(false, san);
+        if (m5_here) m5 = true;
+        if (m10_here) m10 = true;
         if (end == std::string::npos) {
             // unbalanced to EOF: repair only a {"name" candidate (truncated
             // final call), and only when the caller guarantees the buffer is

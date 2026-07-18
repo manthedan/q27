@@ -705,7 +705,18 @@ struct Runtime {
                         return false;
                     });
                 if(admitted_now) break;
-                if(live && !live()) {
+                // live() runs unlocked: the streaming handlers' probe now
+                // also emits a wire keepalive (queue wait is the longest
+                // silent stretch), and a stalled client's TCP backpressure
+                // must not block every other request's slot acquisition
+                // through route_. The cancel bookkeeping below relocks first.
+                bool gone=false;
+                lk.unlock();
+                try { gone=live && !live(); }
+                catch(...) { lk.lock(); throw; }   // TurnPass unwinds under the lock
+                lk.lock();
+                drain_cancelled();
+                if(gone) {
                     queue_waiters--;
                     cancelled_queue++;
                     trace.event({{"kind","cancel"},{"phase","queue"},{"id",trace_id}});
@@ -1559,6 +1570,18 @@ int main(int argc,char** argv) {
                         else last_wire=std::chrono::steady_clock::now();
                         return alive;
                     };
+                    // Keepalive through silent stretches: agent clients run
+                    // stall detectors (pi disconnected an 18 s hush,
+                    // 2026-07-17), and the longest hushes are BEFORE the
+                    // first token — queue wait behind a long turn, then a
+                    // cold prefill of tens of seconds at big contexts. Fired
+                    // from the liveness probe (250 ms queue ticks + every
+                    // prefill chunk) and from the per-token callback. An
+                    // empty delta is wire-legal and ignored by clients.
+                    auto keepalive=[&]{
+                        if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5))
+                            chunk(json::object(),nullptr);
+                    };
                     try {
                         // Opening role delta (OpenAI streaming convention);
                         // also the client-gone probe before generation starts.
@@ -1603,6 +1626,35 @@ int main(int argc,char** argv) {
                                     fprintf(stderr,"[tool-stream] streamed call closed "
                                             "unbalanced (production semantics, sent as-is)\n");
                                 tool_counter++;
+                                // A wrapper can pack more than one call: bytes
+                                // after the streamed call's arguments closed
+                                // are not framing. Recover them through the
+                                // bare-call chain and emit whole (review
+                                // 2026-07-17: the DONE-state byte drop lost
+                                // every call after the first, silently).
+                                const std::string tr=q27::strip_ws2(ts.trail());
+                                if(!tr.empty()) {
+                                    std::string pre;
+                                    auto bcs=q27::parse_bare_tool_calls(tr,&pre,&tools,true);
+                                    if(!pre.empty()) { text_accum+=pre; chunk({{"content",pre}},nullptr); }
+                                    if(!bcs.empty()) {
+                                        fprintf(stderr,"[tool-stream] %zu trailing call(s) recovered after streamed call\n",bcs.size());
+                                        runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"stream",true},{"trailing",true},{"count",bcs.size()}});
+                                        for(auto& bc:bcs) {
+                                            chunk({{"tool_calls",json::array({{{"index",tool_counter},
+                                                {"id","call_metal_"+std::to_string(rid)+"_"+std::to_string(tool_counter)},
+                                                {"type","function"},
+                                                {"function",{{"name",bc.name},{"arguments",bc.arguments.dump()}}}}})}},nullptr);
+                                            tool_counter++;
+                                        }
+                                    } else if(pre.empty() &&
+                                              tr.find_first_not_of("}] \t\r\n")!=std::string::npos) {
+                                        // nothing call-shaped and not pure
+                                        // framing junk: surface as text
+                                        text_accum+=tr;
+                                        chunk({{"content",tr}},nullptr);
+                                    }
+                                }
                             } else {
                                 tool_buf=ts.raw;
                                 emit_tool();
@@ -1631,21 +1683,13 @@ int main(int argc,char** argv) {
                         auto outcome=runtime.run(ids,n,sampling,stops,
                             [&](const std::string& piece)->bool {
                                 for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
-                                // Keepalive through silent stretches: a wrapped
-                                // tool call buffers whole in tool_buf (nothing
-                                // on the wire for the entire body — minutes for
-                                // a big write), and agent clients run stall
-                                // detectors (pi disconnected an 18 s hush,
-                                // 2026-07-17). An empty delta is wire-legal and
-                                // ignored by clients.
-                                if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5))
-                                    chunk(json::object(),nullptr);
+                                keepalive();
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
-                            [sock]{ return httplib::detail::is_socket_alive(sock); },id);
+                            [&,sock]{ keepalive();
+                                      return httplib::detail::is_socket_alive(sock); },id);
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         close_tool();               // wrapper never closed: finalize
-                        if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
                             // Wrapper-less recovery: the text already streamed
                             // as content deltas (cosmetic); the tool_calls
@@ -1889,17 +1933,22 @@ int main(int argc,char** argv) {
                             sink.done();
                             return true;
                         }
+                        // Keepalive through silent stretches (see the chat
+                        // twin — queue wait + prefill + tool_buf buffering):
+                        // Anthropic's wire has a documented ping event for
+                        // exactly this.
+                        auto keepalive=[&]{
+                            if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5))
+                                ev("ping",{{"type","ping"}});
+                        };
                         auto outcome=runtime.run(ids,n,sampling,stops,
                             [&](const std::string& piece)->bool {
                                 for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
-                                // Keepalive through the silent tool_buf stretch
-                                // (see the chat twin): Anthropic's wire has a
-                                // documented ping event for exactly this.
-                                if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5))
-                                    ev("ping",{{"type","ping"}});
+                                keepalive();
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
-                            [sock]{ return httplib::detail::is_socket_alive(sock); },mid);
+                            [&,sock]{ keepalive();
+                                      return httplib::detail::is_socket_alive(sock); },mid);
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
@@ -2291,21 +2340,26 @@ int main(int argc,char** argv) {
                             sink.done(); return true;
                         }
                         q27::StreamSplitter sp;
+                        // Keepalive through silent stretches (see the chat
+                        // twin — queue wait + prefill + tool_buf buffering).
+                        // The Responses wire has no ping event; an SSE comment
+                        // line is spec-legal and invisible to eventsource
+                        // parsers.
+                        auto keepalive=[&]{
+                            if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5)) {
+                                const char ka[]=": keepalive\n\n";
+                                if(!sink.write(ka,sizeof(ka)-1)) alive=false;
+                                else last_wire=std::chrono::steady_clock::now();
+                            }
+                        };
                         auto outcome=runtime.run(ids,n,sampling,stops,
                             [&](const std::string& piece)->bool {
                                 for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
-                                // Keepalive through the silent tool_buf stretch
-                                // (see the chat twin). The Responses wire has no
-                                // ping event; an SSE comment line is spec-legal
-                                // and invisible to eventsource parsers.
-                                if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5)) {
-                                    const char ka[]=": keepalive\n\n";
-                                    if(!sink.write(ka,sizeof(ka)-1)) alive=false;
-                                    else last_wire=std::chrono::steady_clock::now();
-                                }
+                                keepalive();
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
-                            [sock]{ return httplib::detail::is_socket_alive(sock); },resp_id);
+                            [&,sock]{ keepalive();
+                                      return httplib::detail::is_socket_alive(sock); },resp_id);
                         for(auto& [ch,t]:sp.flush()) route(ch,t);
                         if(!tool_buf.empty()) flush_tool(true);
                         flush_think();

@@ -157,6 +157,12 @@ def main():
     priced = [r for r in rows if r["output_tokens"] is not None]
     if not priced:
         sys.exit("no turns with token accounting (pass --server-trace)")
+    # cap rows are priced from the CORPUS token count, not the replay
+    # server's trace — approximate by construction. Report them separately;
+    # "exact" must mean trace-joined only (review 2026-07-17: the old
+    # headline claimed exact accounting it did not have).
+    n_trace = sum(1 for r in priced if r["accounting"] == "trace")
+    n_cap = sum(1 for r in priced if r["accounting"] == "cap")
     tot_out = sum(r["output_tokens"] for r in priced)
     tot_wall = sum(r["wall_s"] for r in priced)
     tot_prompt = sum(r["prompt_tokens"] for r in priced)
@@ -165,6 +171,7 @@ def main():
     hits = [r["prefix_hit"] for r in priced if r.get("prefix_hit") is not None]
     summary = {
         "turns": len(rows), "priced_turns": len(priced),
+        "trace_priced_turns": n_trace, "cap_priced_turns": n_cap,
         "unpriced_turns": approx,
         "agentic_effective_output_tok_s": tot_out / tot_wall,
         "context_throughput_tok_s": tot_prompt / tot_ttft if tot_ttft else None,
@@ -173,8 +180,9 @@ def main():
         "total_wall_s": tot_wall,
         "prefix_hit_tokens": sum(hits) if hits else None,
     }
-    print("\nagentic replay: %d turns (%d priced exactly, %d unpriced)"
-          % (summary["turns"], len(priced), approx))
+    print("\nagentic replay: %d turns (%d priced from trace, "
+          "%d cap-priced from corpus [approx], %d unpriced)"
+          % (summary["turns"], n_trace, n_cap, approx))
     print("  agentic effective output tok/s: %.2f  (%d tokens / %.1f s wall)"
           % (summary["agentic_effective_output_tok_s"], tot_out, tot_wall))
     print("  ttft median %.2f s, p95 %.2f s; context throughput %.1f tok/s"

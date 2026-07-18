@@ -47,7 +47,11 @@ rate() { grep -oE '[0-9]+\.[0-9]+ tok/s' "$1" | tail -1 | grep -oE '^[0-9.]+'; }
 
 run_leg() { # name env prompt log
     local name="$1" half="$2" prompt="$3" log="$LOGDIR/quiet_$1.log"
-    Q27_METAL_GEMM_HALF=$half ./build/metal_prefill_bench --dtype q4q8 --prompt "$prompt" > "$log" 2>&1
+    # Q27_METAL_GEMM_HALF_Q4 since the park commit (79a2cf3) — the old
+    # Q27_METAL_GEMM_HALF no longer routes the Q4 GEMM, and a re-armed rerun
+    # under it would bench float-vs-float and print a fabricated ratio
+    # (review 2026-07-17).
+    Q27_METAL_GEMM_HALF_Q4=$half ./build/metal_prefill_bench --dtype q4q8 --prompt "$prompt" > "$log" 2>&1
     rate "$log"
 }
 
@@ -88,7 +92,7 @@ if suspect:
     print("VERDICT: SUSPECT — float baseline failed to reproduce the quiet 23.2 tok/s;"
           " treat as contaminated, delete this verdict to re-arm the watcher")
 elif ship:
-    print("VERDICT: SHIP — q27_matmul_q4_mm_h stays default-ON (Q27_METAL_GEMM_HALF=1)")
+    print("VERDICT: SHIP — q27_matmul_q4_mm_h stays default-ON (Q27_METAL_GEMM_HALF_Q4=1)")
 else:
     print("VERDICT: PARK — <1.7x; route Q4 back to the float-staged kernel, keep the"
           " parked half kernels + this honest table per the pre-registration")
