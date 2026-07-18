@@ -72,8 +72,40 @@ raise SystemExit(0 if ok else 1)' || fail "forced engine error lost/inaccurately
 
 CANCEL_MARK="q27-trace-cancel-$$-$RANDOM"
 CANCEL_BODY=$(python3 -c 'import json,sys; print(json.dumps({"model":"q27-metal","max_tokens":32,"prompt":sys.argv[1]+" "+"cancel prefill "*20000,"stream":True}))' "$CANCEL_MARK")
-curl -s --max-time 0.05 -H "Content-Type: application/json" "$BASE/v1/completions" -d "$CANCEL_BODY" >/dev/null 2>&1 || true
-sleep 2   # allow the per-chunk liveness probe and trace flush to observe close
+# Load-dependent race (2026-07-18): a single 50 ms abort can fire before a
+# busy server begins prefill, so no cancel registers for THIS mark. Retry
+# the probe a few times with a slightly wider window, and only stop early
+# once a cancel event for a request carrying THIS mark has actually landed
+# in the trace. Worst case ~6 s; the binding assertion below then has a
+# real cancel to find instead of racing the probe.
+cancel_registered() {
+    python3 - "$TRACE" "$TRACE_OFFSET" "$CANCEL_MARK" <<'PY'
+import json,sys
+path,offset,mark=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+reqs=set(); cancels=set()
+try:
+    with open(path,"rb") as f:
+        while True:
+            pos=f.tell(); raw=f.readline()
+            if not raw: break
+            try: d=json.loads(raw)
+            except Exception: continue
+            if pos<offset: continue
+            rid=d.get("id")
+            if d.get("kind")=="request" and rid and mark in str(d.get("rendered","")): reqs.add(rid)
+            elif d.get("kind")=="cancel" and rid: cancels.add(rid)
+except FileNotFoundError:
+    pass
+raise SystemExit(0 if (reqs & cancels) else 1)
+PY
+}
+attempt=0
+while [ $attempt -lt 3 ]; do
+    curl -s --max-time 0.2 -H "Content-Type: application/json" "$BASE/v1/completions" -d "$CANCEL_BODY" >/dev/null 2>&1 || true
+    sleep 2   # allow the per-chunk liveness probe and trace flush to observe close
+    cancel_registered && break
+    attempt=$((attempt+1))
+done
 
 [ -s "$TRACE" ] || { fail "trace file missing/empty: $TRACE"; exit 1; }
 [ -n "$RM_ID" ] && [ -n "$RE_ID" ] || { fail "forced Responses legs returned no response IDs"; exit 1; }
