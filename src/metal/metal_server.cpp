@@ -1550,11 +1550,13 @@ int main(int argc,char** argv) {
             r.set_chunked_content_provider("text/event-stream",
                 [&runtime,ids,n,sampling,stops,id,rid,created,tools,has_tools,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
                     bool alive=true;
+                    auto last_wire=std::chrono::steady_clock::now();
                     auto chunk=[&](const json& delta,const json& finish){
                         std::string s=q27::sse_data({{"id",id},{"object","chat.completion.chunk"},
                             {"created",created},{"model","q27-metal"},
                             {"choices",json::array({{{"index",0},{"delta",delta},{"finish_reason",finish}}})}});
                         if(!sink.write(s.data(),s.size())) alive=false;
+                        else last_wire=std::chrono::steady_clock::now();
                         return alive;
                     };
                     try {
@@ -1590,6 +1592,15 @@ int main(int argc,char** argv) {
                         auto outcome=runtime.run(ids,n,sampling,stops,
                             [&](const std::string& piece)->bool {
                                 for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
+                                // Keepalive through silent stretches: a wrapped
+                                // tool call buffers whole in tool_buf (nothing
+                                // on the wire for the entire body — minutes for
+                                // a big write), and agent clients run stall
+                                // detectors (pi disconnected an 18 s hush,
+                                // 2026-07-17). An empty delta is wire-legal and
+                                // ignored by clients.
+                                if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5))
+                                    chunk(json::object(),nullptr);
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
                             [sock]{ return httplib::detail::is_socket_alive(sock); },id);
@@ -1753,9 +1764,11 @@ int main(int argc,char** argv) {
             r.set_chunked_content_provider("text/event-stream",
                 [&runtime,ids,n,sampling,stops,mid,rid,tools,has_tools,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
                     bool alive=true;
+                    auto last_wire=std::chrono::steady_clock::now();
                     auto ev=[&](const char* name,const json& j){
                         std::string s=q27::sse_event(name,j);
                         if(!sink.write(s.data(),s.size())) alive=false;
+                        else last_wire=std::chrono::steady_clock::now();
                         return alive;
                     };
                     // Block bookkeeping mirrors server.cu's streaming handler:
@@ -1839,6 +1852,11 @@ int main(int argc,char** argv) {
                         auto outcome=runtime.run(ids,n,sampling,stops,
                             [&](const std::string& piece)->bool {
                                 for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
+                                // Keepalive through the silent tool_buf stretch
+                                // (see the chat twin): Anthropic's wire has a
+                                // documented ping event for exactly this.
+                                if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5))
+                                    ev("ping",{{"type","ping"}});
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
                             [sock]{ return httplib::detail::is_socket_alive(sock); },mid);
@@ -2112,9 +2130,11 @@ int main(int argc,char** argv) {
             r.set_chunked_content_provider("text/event-stream",
                 [&runtime,ids,n,sampling,stops,rn,resp_id,msg_id,tools,custom_names,tnames,snap_hint,sock](size_t,httplib::DataSink& sink)->bool {
                     bool alive=true;
+                    auto last_wire=std::chrono::steady_clock::now();
                     auto ev=[&](const json& j){
                         std::string s=q27::sse_event(j.value("type",std::string("x")),j);
                         if(!sink.write(s.data(),s.size())) alive=false;
+                        else last_wire=std::chrono::steady_clock::now();
                         return alive;
                     };
                     // codex P3: item-lifecycle state + machinery hoisted
@@ -2234,6 +2254,15 @@ int main(int argc,char** argv) {
                         auto outcome=runtime.run(ids,n,sampling,stops,
                             [&](const std::string& piece)->bool {
                                 for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+                                // Keepalive through the silent tool_buf stretch
+                                // (see the chat twin). The Responses wire has no
+                                // ping event; an SSE comment line is spec-legal
+                                // and invisible to eventsource parsers.
+                                if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5)) {
+                                    const char ka[]=": keepalive\n\n";
+                                    if(!sink.write(ka,sizeof(ka)-1)) alive=false;
+                                    else last_wire=std::chrono::steady_clock::now();
+                                }
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
                             [sock]{ return httplib::detail::is_socket_alive(sock); },resp_id);

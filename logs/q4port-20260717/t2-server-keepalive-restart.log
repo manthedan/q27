@@ -1,0 +1,4 @@
+multislot: slot 1 admission rejected: 34322 MB needed (1+1 slots x 17161 MB/slot incl partials) > 9093 MB budget; serving with 1 slot(s)
+prefix-snapshots: dir /Users/macthedan/.q27/snapshots, budget 8192 MB, auto>=4096 tokens, tag 76d7f5820aae30f5410b73884e4d202a43ab7145f-
+q27 Metal server listening on http://127.0.0.1:8213 (ctx=131072, kv=fp16, mtp=0, slots=1)
+[ctx-limit] prompt=140020 max=131039 -> 400
