@@ -142,6 +142,23 @@ static int transcript_append(transcript *t, const char *role, const char *conten
     return transcript_append_len(t, role, content, strlen(content));
 }
 
+static int transcript_append_assistant(transcript *t, const char *content,
+                                       size_t content_len, int think) {
+    static const char no_think_prefix[] = "<think>\n\n</think>\n\n";
+    if (think)
+        return transcript_append_len(t, "assistant", content, content_len);
+    const size_t prefix_len = sizeof(no_think_prefix) - 1;
+    if (content_len > SIZE_MAX - prefix_len) return 0;
+    char *combined = malloc(prefix_len + content_len);
+    if (!combined) return 0;
+    memcpy(combined, no_think_prefix, prefix_len);
+    if (content_len) memcpy(combined + prefix_len, content, content_len);
+    int ok = transcript_append_len(t, "assistant", combined,
+                                   prefix_len + content_len);
+    free(combined);
+    return ok;
+}
+
 static void transcript_free(transcript *t) {
     for (size_t i = 0; i < t->len; ++i) {
         free(t->items[i].role);
@@ -241,12 +258,14 @@ static int print_json_event(const q27_agent_event *event) {
     int ok = fprintf(stdout,
         "{\"seq\":%llu,\"command_id\":%llu,\"type\":\"%s\","
         "\"state\":\"%s\",\"status\":\"%s\",\"data_b64\":\"%s\","
-        "\"prompt_tokens\":%u,\"output_tokens\":%u}\n",
+        "\"prompt_tokens\":%u,\"cached_tokens\":%u,"
+        "\"prefill_tokens\":%u,\"output_tokens\":%u}\n",
         (unsigned long long)event->sequence,
         (unsigned long long)event->command_id,
         event_type_name(event->type), worker_state_name(event->state),
         status_name(event->status), data,
-        event->prompt_tokens, event->output_tokens) >= 0 &&
+        event->prompt_tokens, event->cached_tokens, event->prefill_tokens,
+        event->output_tokens) >= 0 &&
         fflush(stdout) != EOF;
     free(data);
     return ok;
@@ -343,7 +362,8 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
 
     output_buffer output = {0};
     q27_agent_status status = Q27_AGENT_ERROR;
-    uint32_t prompt_tokens = 0, output_tokens = 0;
+    uint32_t prompt_tokens = 0, cached_tokens = 0;
+    uint32_t prefill_tokens = 0, output_tokens = 0;
     int terminal = 0;
     while (!terminal) {
         q27_agent_event event;
@@ -379,6 +399,8 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
         if (terminal) {
             status = event.status;
             prompt_tokens = event.prompt_tokens;
+            cached_tokens = event.cached_tokens;
+            prefill_tokens = event.prefill_tokens;
             output_tokens = event.output_tokens;
             size_t n = event.data_len < sizeof(error) - 1 ?
                        event.data_len : sizeof(error) - 1;
@@ -411,15 +433,18 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
         free(output.bytes);
         return 0;
     }
-    if (!transcript_append_len(chat, "assistant",
-                               output.bytes ? output.bytes : "", output.len)) {
+    if (!transcript_append_assistant(chat,
+                                     output.bytes ? output.bytes : "",
+                                     output.len, think)) {
         fprintf(stderr, "q27-agent: could not retain assistant turn\n");
         free(output.bytes);
         return 0;
     }
     free(output.bytes);
-    fprintf(stderr, "[q27-agent prompt=%u output=%u; phase0 full-prefill]\n",
-            prompt_tokens, output_tokens);
+    fprintf(stderr,
+            "[q27-agent prompt=%u cached=%u prefill=%u output=%u; %s]\n",
+            prompt_tokens, cached_tokens, prefill_tokens, output_tokens,
+            cached_tokens ? "exact-prefix session reuse" : "reset/re-prefill");
     return 1;
 }
 
@@ -427,7 +452,7 @@ int main(int argc, char **argv) {
     const char *model = NULL, *tokenizer = NULL, *prompt = NULL;
     const char *system =
         "You are q27-agent, an experimental local coding assistant. "
-        "Answer concisely. Tool execution is not enabled in this Phase-0 build.";
+        "Answer concisely. Tool execution is not enabled in this build.";
     uint32_t context = 8192, max_tokens = 512;
     int think = 1, jsonl = 0;
 
@@ -517,7 +542,7 @@ int main(int argc, char **argv) {
         char *line = NULL;
         size_t len = 0, cap = 0;
         input_reader reader = {0};
-        fprintf(stderr, "q27-agent Phase 0; enter :quit to exit\n");
+        fprintf(stderr, "q27-agent native session; enter :quit to exit\n");
         while (ok) {
             if (interrupted) { ok = 0; break; }
             fputs("q27> ", stderr);

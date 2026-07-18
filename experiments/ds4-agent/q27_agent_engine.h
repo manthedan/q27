@@ -34,9 +34,10 @@ q27_agent_engine *q27_agent_engine_open(const char *model_path,
                                          char *error, size_t error_cap);
 void q27_agent_engine_close(q27_agent_engine *engine);
 
-// Phase 0 deliberately re-renders and re-prefills the complete transcript on
-// every call. This proves the direct engine boundary before the fork adopts
-// append-only session ownership. No server or HTTP protocol is involved.
+// Renders the complete transcript on every call, but reuses resident state
+// only when its exact generated-token ledger is a stable prefix of that render
+// and the Metal position agrees. Any mismatch resets and re-prefills. Any
+// cancellation/runtime error invalidates reuse for the next call.
 q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      const q27_agent_message *messages,
                                      size_t message_count,
@@ -46,6 +47,8 @@ q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      q27_agent_alive_check alive,
                                      void *opaque,
                                      uint32_t *prompt_tokens,
+                                     uint32_t *cached_tokens,
+                                     uint32_t *prefill_tokens,
                                      uint32_t *output_tokens,
                                      char *error, size_t error_cap);
 

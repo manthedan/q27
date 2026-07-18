@@ -39,6 +39,8 @@ typedef struct {
     unsigned char *data;
     size_t data_len;
     uint32_t prompt_tokens;
+    uint32_t cached_tokens;
+    uint32_t prefill_tokens;
     uint32_t output_tokens;
 } q27_agent_event;
 

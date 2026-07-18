@@ -37,7 +37,8 @@ q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
     size_t message_count, int enable_thinking, uint32_t max_tokens,
     q27_agent_text_sink sink, q27_agent_alive_check alive, void *opaque,
-    uint32_t *prompt_tokens, uint32_t *output_tokens,
+    uint32_t *prompt_tokens, uint32_t *cached_tokens,
+    uint32_t *prefill_tokens, uint32_t *output_tokens,
     char *error, size_t error_cap) {
     (void)enable_thinking;
     (void)max_tokens;
@@ -57,6 +58,8 @@ q27_agent_status q27_agent_generate(
             if (!sink("z", 1, opaque)) return Q27_AGENT_CANCELLED;
         }
         *prompt_tokens = 7;
+        *cached_tokens = 3;
+        *prefill_tokens = 4;
         *output_tokens = 5000;
         return Q27_AGENT_OK;
     }
@@ -68,6 +71,8 @@ q27_agent_status q27_agent_generate(
     const char reply[] = {'a', '\0', 'b'};
     if (!sink(reply, sizeof(reply), opaque)) return Q27_AGENT_CANCELLED;
     *prompt_tokens = 11;
+    *cached_tokens = 5;
+    *prefill_tokens = 6;
     *output_tokens = 1;
     return Q27_AGENT_OK;
 }
@@ -125,6 +130,8 @@ typedef struct {
     q27_agent_status terminal_status;
     q27_agent_worker_state terminal_state;
     uint32_t prompt_tokens;
+    uint32_t cached_tokens;
+    uint32_t prefill_tokens;
     uint32_t output_tokens;
     int states;
     int terminals;
@@ -159,6 +166,8 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
             out->terminal_status = event.status;
             out->terminal_state = event.state;
             out->prompt_tokens = event.prompt_tokens;
+            out->cached_tokens = event.cached_tokens;
+            out->prefill_tokens = event.prefill_tokens;
             out->output_tokens = event.output_tokens;
         }
         q27_agent_event_free(&event);
@@ -230,8 +239,9 @@ int main(void) {
     CHECK(result.len == 3 && memcmp(result.bytes, "a\0b", 3) == 0,
           "binary delta survives event queue");
     CHECK(result.terminal_status == Q27_AGENT_OK &&
-          result.prompt_tokens == 11 && result.output_tokens == 1,
-          "terminal accounting survives event queue");
+          result.prompt_tokens == 11 && result.cached_tokens == 5 &&
+          result.prefill_tokens == 6 && result.output_tokens == 1,
+          "terminal session accounting survives event queue");
     CHECK(q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "terminal consumption reopens admission");
 

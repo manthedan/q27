@@ -20,8 +20,8 @@ See `THIRD_PARTY_NOTICES.md` for attribution.
 
 - q27 tokenizer and ChatML rendering;
 - one `MetalEngine` and its shared mapping;
-- reset/prefill and serial greedy generation;
-- all exception containment at the C ABI.
+- exact token-ledger validation, reset/append prefill, and serial greedy generation;
+- final emitted-token ingestion and all exception containment at the C ABI.
 
 The C process owns the transcript, terminal loop, streaming output, and
 interrupt decision. A dedicated pthread opens, owns, drives, and closes the
@@ -47,12 +47,21 @@ Interactive mode omits `--prompt`; `:quit` exits. Machine-readable events use:
 Every JSONL row carries monotonic `seq`, `command_id`, event `type`, state,
 status, accounting, and exact `data_b64` bytes. Diagnostics remain on stderr.
 
-### Deliberate limitation
+### Resident session contract
 
-Every turn re-renders and re-prefills the complete transcript. This is correct
-for the Phase-0 control-path experiment, but it does **not** claim DS4's live
-session/KV benefit. The adapter reports `phase0 full-prefill` after each turn
-so benchmark output cannot be mistaken for an incremental harness result.
+Every turn still re-renders the complete transcript for validation. Reuse is
+allowed only when the prior exact prompt-plus-generated token ledger is a
+stable prefix and `MetalEngine::position()` matches its encoded length. The
+adapter finalizes each emitted token into resident state when context permits,
+then ingests only the newly rendered ChatML suffix. Any token or position
+mismatch resets and re-prefills; cancellation or runtime error invalidates the
+ledger so the next valid request also resets.
+
+The no-thinking prefix is retained in the private assistant transcript, even
+though it is not duplicated on stdout. This makes the next render token-exact
+instead of silently dropping the prefix previously ingested before output.
+Terminal accounting reports total `prompt`, already encoded `cached`, newly
+encoded `prefill`, and `output` tokens, so reuse cannot be inferred from timing.
 
 ## First smoke result (2026-07-18)
 
@@ -72,8 +81,15 @@ deep binary message ownership, monotonic lifecycle events, request rejection,
 4094-event queue backpressure (5000 deltas), cancellation terminals, and
 shutdown ordering without loading a model. Its ASan/UBSan leg is clean.
 
-This establishes direct C → worker → C++ → Metal feasibility. It does not
-establish incremental state reuse, tool execution, cancellation recovery, or
+A two-turn resident-session smoke returned exactly `one`, then `two`. The
+first turn reported `prompt=51 cached=0 prefill=51 output=1`; the second
+reported `prompt=73 cached=52 prefill=21 output=1`, proving exact-prefix reuse
+rather than another full reset. The CPU `AgentSession` selftest separately
+gates pending-token finalization, append offsets, prefix and engine-position
+mismatch fallback, and cancellation/error invalidation.
+
+This establishes direct C → worker → C++ → resident Metal-session feasibility.
+It does not yet establish tool execution, snapshots, compaction, or broad
 parity.
 
 ## Graduation gates
@@ -85,8 +101,8 @@ Phase 0 graduates only when a coordinated model window demonstrates:
 3. Ctrl-C returns cleanly and a subsequent fresh run succeeds;
 4. emitted bytes match the direct Metal CLI/server greedy result for the same
    rendered prompt, modulo the documented API prose trimming convention;
-5. ASan/UBSan-clean C-side transcript and output handling in a fake-adapter
-   test (to be added before tool execution).
+5. ASan/UBSan-clean C-side transcript, session-ledger, and output handling in
+   fake-adapter tests.
 
 ## Next port slice
 
@@ -94,14 +110,14 @@ After Phase 0, port from the pinned DS4 agent in this order:
 
 1. ~~dedicated engine-owner worker and synchronous typed commands~~;
 2. ~~queued UI events and a noninteractive JSONL event stream~~;
-3. q27 `AgentSession` append/finalize contract;
+3. ~~q27 `AgentSession` append/finalize contract~~;
 4. file read/search/edit tools and bounded asynchronous shell jobs;
 5. q27 `<tool_call>` parsing and constrained generation (not DSML);
 6. transcript/session persistence using `Q27SNAP1` (not DS4 payloads);
 7. compaction;
 8. optional terminal UI and browser tooling.
 
-The next slice is the q27 `AgentSession` contract: finalize the last emitted
-token and append new tokens without reset, with fail-closed reset/re-prefill on
-any token-prefix mismatch. Only then may the harness claim incremental prefill
-or resident-session performance.
+The next slice is a narrow read/search/edit tool layer plus bounded
+asynchronous shell jobs. Tool execution must consume and publish through the
+same owned command/event boundary; no tool may run directly from an engine
+callback.

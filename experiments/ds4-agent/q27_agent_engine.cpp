@@ -1,4 +1,5 @@
 #include "q27_agent_engine.h"
+#include "q27_agent_session.h"
 
 #include "../../src/metal/metal_engine.h"
 #include "../../src/tokenizer.h"
@@ -16,6 +17,9 @@ struct q27_agent_engine {
     std::unique_ptr<q27::Tokenizer> tokenizer;
     std::shared_ptr<q27::MetalEngine::Shared> shared;
     std::unique_ptr<q27::MetalEngine> session;
+    q27::agent::AgentSession agent_session;
+    bool poisoned = false;
+    char poison_error[256] = {0};
     uint32_t context;
 
     q27_agent_engine(const char *model_path, const char *tokenizer_path, uint32_t ctx)
@@ -67,13 +71,22 @@ extern "C" q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
     size_t message_count, int enable_thinking, uint32_t max_tokens,
     q27_agent_text_sink sink, q27_agent_alive_check alive, void *opaque,
-    uint32_t *prompt_tokens, uint32_t *output_tokens,
+    uint32_t *prompt_tokens, uint32_t *cached_tokens,
+    uint32_t *prefill_tokens, uint32_t *output_tokens,
     char *error, size_t error_cap) {
     if (prompt_tokens) *prompt_tokens = 0;
+    if (cached_tokens) *cached_tokens = 0;
+    if (prefill_tokens) *prefill_tokens = 0;
     if (output_tokens) *output_tokens = 0;
-    if (!engine || !messages || message_count == 0 || !sink || !alive || max_tokens == 0) {
+    if (!engine || !messages || message_count == 0 || !sink || !alive ||
+        max_tokens == 0) {
         set_error(error, error_cap, "invalid generation arguments");
         return Q27_AGENT_REJECTED;
+    }
+    if (engine->poisoned) {
+        set_error(error, error_cap, engine->poison_error[0] ?
+                  engine->poison_error : "engine was poisoned after final-token ingestion");
+        return Q27_AGENT_ERROR;
     }
 
     try {
@@ -85,12 +98,14 @@ extern "C" q27_agent_status q27_agent_generate(
                 return Q27_AGENT_REJECTED;
             }
             const std::string role(messages[i].role);
-            if (role != "system" && role != "user" && role != "assistant" && role != "tool") {
+            if (role != "system" && role != "user" && role != "assistant" &&
+                role != "tool") {
                 set_error(error, error_cap, "unsupported message role");
                 return Q27_AGENT_REJECTED;
             }
             chat.emplace_back(role,
-                              std::string(messages[i].content, messages[i].content_len));
+                              std::string(messages[i].content,
+                                          messages[i].content_len));
         }
 
         const std::vector<int> encoded =
@@ -109,54 +124,146 @@ extern "C" q27_agent_status q27_agent_generate(
         std::vector<uint32_t> ids;
         ids.reserve(encoded.size());
         for (int token : encoded) {
-            if (token < 0) throw std::runtime_error("tokenizer returned a negative id");
+            if (token < 0)
+                throw std::runtime_error("tokenizer returned a negative id");
             ids.push_back(static_cast<uint32_t>(token));
         }
         if (prompt_tokens) *prompt_tokens = static_cast<uint32_t>(ids.size());
 
-        // Phase 0 reset/re-prefill contract. Drive bounded GPU quanta here
-        // instead of calling ingest_prompt(), whose whole-prompt operation has
-        // no cancellation hook. The final token goes through step() to leave
-        // the same resident logits/pending token as ordinary prefill.
-        if (!alive(opaque)) return Q27_AGENT_CANCELLED;
-        engine->session->reset();
+        const q27::agent::AgentSession::Plan plan =
+            engine->agent_session.plan(ids, engine->session->position());
+        if (cached_tokens)
+            *cached_tokens = static_cast<uint32_t>(plan.cached_tokens);
+
+        auto cancelled = [&]() {
+            engine->agent_session.invalidate();
+            return Q27_AGENT_CANCELLED;
+        };
+        if (!alive(opaque)) return cancelled();
+
         size_t offset = 0;
-        const size_t chunkable = engine->session->chunked_prefill() ? ids.size() - 1 : 0;
-        while (chunkable - offset >= 2) {
+        uint32_t current = 0;
+        if (plan.reset) {
+            // Prefix or position mismatch: discard both ledgers before the
+            // first GPU mutation, then establish a fresh exact prompt.
+            engine->agent_session.invalidate();
+            engine->session->reset();
+        } else {
+            offset = plan.append_offset;
+            if (plan.finalize_pending) {
+                current = engine->session->step(ids[offset - 1]);
+                if (prefill_tokens) ++*prefill_tokens;
+                if (!engine->agent_session.mark_pending_encoded())
+                    throw std::runtime_error("agent session pending-token mismatch");
+                if (!alive(opaque)) return cancelled();
+            }
+        }
+
+        // Ingest only the unstable suffix. As in MetalEngine::prefill, leave
+        // the final prompt token on step() so resident logits/pending are
+        // exact. Every GPU call is a bounded cancellation quantum.
+        const size_t chunkable = engine->session->chunked_prefill() ?
+                                 ids.size() - 1 : 0;
+        while (offset < chunkable && chunkable - offset >= 2) {
             const uint32_t count = static_cast<uint32_t>(std::min<size_t>(
                 q27::MetalEngine::prefill_chunk_max(), chunkable - offset));
             engine->session->prefill_chunk(ids.data() + offset, count);
             offset += count;
-            if (!alive(opaque)) return Q27_AGENT_CANCELLED;
+            if (prefill_tokens) *prefill_tokens += count;
+            if (!alive(opaque)) return cancelled();
         }
-        uint32_t current = 0;
         while (offset < ids.size()) {
             current = engine->session->step(ids[offset++]);
-            if (!alive(opaque)) return Q27_AGENT_CANCELLED;
+            if (prefill_tokens) ++*prefill_tokens;
+            if (!alive(opaque)) return cancelled();
         }
+        if (offset == plan.append_offset && !plan.finalize_pending)
+            current = engine->session->pending_from_logits();
+
+        // The GPU and ledger now agree at the complete rendered prompt.
+        engine->agent_session.commit_prompt(ids);
 
         const uint32_t eos = static_cast<uint32_t>(engine->tokenizer->eos());
         uint32_t produced = 0;
         while (produced < max_tokens && current != eos) {
-            const std::string bytes = engine->tokenizer->decode_one(static_cast<int>(current));
-            if (!bytes.empty() && !sink(bytes.data(), bytes.size(), opaque)) {
-                if (output_tokens) *output_tokens = produced;
-                return Q27_AGENT_CANCELLED;
-            }
-            ++produced;
-            if (produced == max_tokens) break;
             if (!alive(opaque)) {
                 if (output_tokens) *output_tokens = produced;
-                return Q27_AGENT_CANCELLED;
+                return cancelled();
+            }
+            const std::string bytes =
+                engine->tokenizer->decode_one(static_cast<int>(current));
+            if (!bytes.empty() && !sink(bytes.data(), bytes.size(), opaque)) {
+                if (output_tokens) *output_tokens = produced;
+                return cancelled();
+            }
+            ++produced;
+            // The callback is irreversible: publish accounting before any
+            // allocation, Metal step, or other bookkeeping can fail.
+            if (output_tokens) *output_tokens = produced;
+
+            // Once max_tokens is visible, generation succeeded. Even ledger
+            // allocation is now best-effort and may only disable reuse.
+            if (produced == max_tokens) {
+                try {
+                    if (!engine->agent_session.record_emitted(current))
+                        throw std::runtime_error(
+                            "agent session emitted-token mismatch");
+                } catch (...) {
+                    engine->agent_session.invalidate();
+                    break;
+                }
+                // Final-token Metal ingestion is also bookkeeping:
+                // cancellation invalidates reuse, while a runtime failure
+                // poisons the next command, but neither reverses this result.
+                if (engine->session->position() < engine->context) {
+                    if (!alive(opaque)) {
+                        engine->agent_session.invalidate();
+                        break;
+                    }
+                    try {
+                        current = engine->session->step(current);
+                        if (!engine->agent_session.mark_pending_encoded())
+                            throw std::runtime_error(
+                                "agent session final-token mismatch");
+                    } catch (const std::exception& e) {
+                        engine->agent_session.invalidate();
+                        engine->poisoned = true;
+                        set_error(engine->poison_error,
+                                  sizeof(engine->poison_error), e.what());
+                        break;
+                    } catch (...) {
+                        engine->agent_session.invalidate();
+                        engine->poisoned = true;
+                        set_error(engine->poison_error,
+                                  sizeof(engine->poison_error),
+                                  "unknown final-token ingestion failure");
+                        break;
+                    }
+                    if (!alive(opaque)) engine->agent_session.invalidate();
+                }
+                break;
+            }
+            if (!engine->agent_session.record_emitted(current))
+                throw std::runtime_error("agent session emitted-token mismatch");
+            if (!alive(opaque)) {
+                if (output_tokens) *output_tokens = produced;
+                return cancelled();
             }
             current = engine->session->step(current);
+            if (!engine->agent_session.mark_pending_encoded())
+                throw std::runtime_error("agent session token-step mismatch");
+            if (!alive(opaque)) {
+                if (output_tokens) *output_tokens = produced;
+                return cancelled();
+            }
         }
         if (output_tokens) *output_tokens = produced;
-        if (!alive(opaque)) return Q27_AGENT_CANCELLED;
         return Q27_AGENT_OK;
     } catch (const std::exception& e) {
+        engine->agent_session.invalidate();
         set_error(error, error_cap, e.what());
     } catch (...) {
+        engine->agent_session.invalidate();
         set_error(error, error_cap, "unknown generation failure");
     }
     return Q27_AGENT_ERROR;

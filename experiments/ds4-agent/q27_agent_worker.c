@@ -230,6 +230,7 @@ static int event_text_sink(const char *bytes, size_t len, void *opaque) {
 
 static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
                              q27_agent_status status, uint32_t prompt_tokens,
+                             uint32_t cached_tokens, uint32_t prefill_tokens,
                              uint32_t output_tokens, const char *error) {
     q27_agent_event event = {
         .type = status == Q27_AGENT_REJECTED ? Q27_EVENT_REJECTED :
@@ -238,6 +239,8 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
         .state = status == Q27_AGENT_ERROR ? Q27_WORKER_ERROR : Q27_WORKER_IDLE,
         .status = status,
         .prompt_tokens = prompt_tokens,
+        .cached_tokens = cached_tokens,
+        .prefill_tokens = prefill_tokens,
         .output_tokens = output_tokens,
         .data = (unsigned char *)(error ? error : ""),
         .data_len = error ? strlen(error) : 0
@@ -312,7 +315,8 @@ static void *worker_main(void *opaque) {
         generation_context context = {
             .worker = worker, .external_alive = alive,
             .external_opaque = alive_opaque, .command_id = command_id};
-        uint32_t prompt_tokens = 0, output_tokens = 0;
+        uint32_t prompt_tokens = 0, cached_tokens = 0;
+        uint32_t prefill_tokens = 0, output_tokens = 0;
         error[0] = '\0';
         q27_agent_status status;
         if (!state_queued) {
@@ -324,7 +328,8 @@ static void *worker_main(void *opaque) {
             status = q27_agent_generate(
                 engine, messages.items, messages.len, enable_thinking, max_tokens,
                 event_text_sink, combined_alive, &context,
-                &prompt_tokens, &output_tokens, error, sizeof(error));
+                &prompt_tokens, &cached_tokens, &prefill_tokens,
+                &output_tokens, error, sizeof(error));
             if (context.queue_error && status == Q27_AGENT_CANCELLED) {
                 status = Q27_AGENT_ERROR;
                 copy_error(error, sizeof(error), "text event publication failed");
@@ -332,7 +337,7 @@ static void *worker_main(void *opaque) {
         }
         messages_free(&messages);
         publish_terminal(worker, command_id, status, prompt_tokens,
-                         output_tokens, error);
+                         cached_tokens, prefill_tokens, output_tokens, error);
     }
 
     q27_agent_engine_close(engine);
