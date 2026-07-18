@@ -32,7 +32,7 @@ MODES = ("choice", "numeric", "freeform")
 EXPECTED_COUNTS = {"choice": 60, "numeric": 40, "freeform": 20}
 PROTOCOL_KEYS = {"context", "kv", "mtp", "suffix", "slots", "prefix_entries",
     "constrain_tools", "snapshots", "snapshot_auto_min", "snapshot_max_bytes",
-    "max_tokens_default", "kv_fp16_except",
+    "snapshot_spine_pin", "max_tokens_default", "kv_fp16_except",
     "kv_fp16_cell_masks", "kv_side_codec", "gemm_half", "gemm_half_q4",
     "gqa_tile", "gqa_block", "gqa_threshold", "gpu_sample", "resident",
     "bare_system", "tool_strict", "test_failpoints", "tokenizer", "tokenizer_sha1"}
@@ -102,7 +102,7 @@ def validate_provenance(dir_, arm):
     runtime = got.get("runtime")
     required = {"identity_schema", "server_sha1", "shader_abi", "shader_sha1",
                 "protocol", "platform", "eval_host_id"}
-    if not isinstance(runtime, dict) or set(runtime) != required or runtime.get("identity_schema") != 2:
+    if not isinstance(runtime, dict) or set(runtime) != required or runtime.get("identity_schema") != 3:
         sys.exit("missing/incomplete runtime provenance for %s: %r" % (arm, runtime))
     protocol = runtime.get("protocol")
     if not isinstance(protocol, dict) or set(protocol) != PROTOCOL_KEYS:

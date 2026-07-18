@@ -237,7 +237,7 @@ with tempfile.TemporaryDirectory() as td:
             arm, model, md5, sha1, nbytes = line.rstrip("\n").split("\t")
             manifests[arm] = {"arm": arm, "model": model, "md5": md5,
                               "resident_sha1": sha1, "bytes": int(nbytes)}
-    runtime = {"identity_schema": 2, "server_sha1": "a" * 40,
+    runtime = {"identity_schema": 3, "server_sha1": "a" * 40,
                "shader_abi": "// Q27_SHADER_ABI 13", "shader_sha1": "b" * 40,
                "eval_host_id": "h" * 64,
                "platform": {"sysname": "Darwin", "release": "test",
@@ -245,6 +245,7 @@ with tempfile.TemporaryDirectory() as td:
                "protocol": {"context":131072,"kv":"turbo3","mtp":0,"suffix":0,
                    "slots":1,"prefix_entries":1,"constrain_tools":False,
                    "snapshots":False,"snapshot_auto_min":0,"snapshot_max_bytes":0,
+                   "snapshot_spine_pin":True,
                    "max_tokens_default":0,"kv_fp16_except":False,
                    "kv_fp16_cell_masks":"0"*32,"kv_side_codec":"none",
                    "gemm_half":True,"gemm_half_q4":False,"gqa_tile":2,

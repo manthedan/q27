@@ -34,6 +34,20 @@ idle_s() { ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/{printf "%d",$NF
 # (whose command line also contains the pattern): match argv[0] exactly.
 # Killing the wrapper orphans the 17 GB server — the 2026-07-17 OOM crashes.
 server_pid() { ps -Ao pid,args | awk -v port="$PORT" '$2 ~ /(^|\/)q27-metal-server$/ && $0 ~ ("--port " port) {print $1}' | head -1; }
+# Admin credential for drain/resume (autoreview P2: no longer the public
+# boot_id). Read the token the server printed to its stderr log at startup;
+# the running server's stderr is redirect-appended to a log we can read.
+# We locate it via the process's own log: the canonical restart log for a
+# server this script started, else the newest server log under logs/.
+admin_token() {
+    local tok log
+    for log in "$SERVER_LOG" $(ls -t logs/server-restarts/*.log logs/*/t2-server*.log 2>/dev/null); do
+        [ -f "$log" ] || continue
+        tok=$(grep 'admin token (X-Q27-Admin-Token):' "$log" 2>/dev/null | tail -1 | awk '{print $NF}')
+        [ -n "$tok" ] && { printf '%s' "$tok"; return 0; }
+    done
+    return 1
+}
 # Detection is broader than termination: never kill an unrelated model job,
 # but refuse to load while ANY known q27 model consumer remains resident.
 model_pids() { ps -Ao pid,args | awk -v me="$$" '$1!=me && $2 ~ /(^|\/)[^\/]*(q27|metal|failpoint)[^\/]*$/ {print $1" "$0}'; }
@@ -127,7 +141,8 @@ cleanup_exit() {
     trap - EXIT HUP INT TERM
     [ -z "$VERDICT_TMP" ] || rm -f "$VERDICT_TMP"
     if [ "$SERVICE_DRAINED" = 1 ] && [ -n "$(server_pid)" ]; then
-        if curl -fsS --max-time 3 -X POST -H "X-Q27-Boot-ID: $ORIGINAL_BOOT" \
+        local tok; tok=$(admin_token)
+        if [ -n "$tok" ] && curl -fsS --max-time 3 -X POST -H "X-Q27-Admin-Token: $tok" \
             "http://127.0.0.1:$PORT/admin/resume" >/dev/null 2>&1; then
             NEEDS_RESTART=0
         else rc=1
@@ -231,7 +246,7 @@ try:
     need(h["status"]=="ok" and h["model"]=="ternary-bonsai-27b-t2.q27")
     need(h["artifact_sha1"]==model_sha and r["server_sha1"]==server_sha)
     need(p["tokenizer_sha1"]==tok_sha and p["tokenizer"]=="qwen36-27b-mtp.tok")
-    need(r["identity_schema"]==2 and isinstance(h["boot_id"],str) and h["boot_id"])
+    need(r["identity_schema"]==3 and isinstance(h["boot_id"],str) and h["boot_id"])
     need(h["trace"]=={"enabled":True,"healthy":True})
     need(h["serving"]=={"draining":False,"active_requests":0})
     need(p["context"]==131072 and p["kv"]=="fp16" and p["mtp"]==0)
@@ -260,7 +275,8 @@ trap cleanup_exit EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-curl -fsS --max-time 4 -X POST -H "X-Q27-Boot-ID: $ORIGINAL_BOOT" \
+ADMIN_TOKEN=$(admin_token) || { echo "FAIL: cannot read admin token from server log" >&2; exit 1; }
+curl -fsS --max-time 4 -X POST -H "X-Q27-Admin-Token: $ADMIN_TOKEN" \
     "http://127.0.0.1:$PORT/admin/drain" >/dev/null || {
     echo "FAIL: cannot drain canonical service" >&2; exit 1;
 }

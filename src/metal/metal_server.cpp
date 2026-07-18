@@ -444,6 +444,8 @@ struct Runtime {
     DiskSnapshotStore snapstore{&snap_peek_adapter,&snap_hash_sha1};
     TraceLog trace;
     std::string model_name,model_sha1_cache,boot_id,server_sha1,tokenizer_name,tokenizer_sha1;
+    std::string admin_token;   // separate from boot_id: never served over HTTP (autoreview P2)
+    bool snapshot_spine_pin_config=false;
     std::string os_sysname,os_release,os_machine;
     bool turbo3_kv=false, test_failpoints=false;
     size_t prefix_entries_config=0;
@@ -479,7 +481,7 @@ struct Runtime {
             const uint8_t m=e.kv_fp16_head_masks()[i];
             cell_masks+=hex[m>>4]; cell_masks+=hex[m&15];
         }
-        return {{"identity_schema",2},{"server_sha1",server_sha1},
+        return {{"identity_schema",3},{"server_sha1",server_sha1},
                 {"platform",{{"sysname",os_sysname},{"release",os_release},{"machine",os_machine},
                     {"metal_device",shared->backend.name()}}},
                 {"shader_abi",q27::MetalBackend::shader_abi_tag()},
@@ -489,6 +491,7 @@ struct Runtime {
                     {"prefix_entries",prefix_entries_config},{"constrain_tools",constrain_tools},
                     {"snapshots",snapstore.enabled()},{"snapshot_auto_min",snap_auto_min},
                     {"snapshot_max_bytes",snapshot_max_bytes_config},
+                    {"snapshot_spine_pin",snapshot_spine_pin_config},
                     {"max_tokens_default",max_tokens_default_config},
                     {"kv_fp16_except",e.kv_fp16_except()},{"kv_fp16_cell_masks",cell_masks},
                     {"kv_side_codec",e.kv_fp16_except()?(e.kv_side_codec()?"e4m3":"fp16"):"none"},
@@ -530,6 +533,20 @@ struct Runtime {
                 (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
             char buf[17]; std::snprintf(buf,sizeof buf,"%016llx",(unsigned long long)x);
             boot_id=buf;
+        }
+        {
+            // Admin credential, INDEPENDENT of boot_id (autoreview P2):
+            // boot_id namespaces response ids and is intentionally public
+            // (served by /health), so it cannot authorize /admin/*. This
+            // token is drawn separately and never served over HTTP.
+            std::random_device rd;
+            uint64_t a=((uint64_t)rd()<<32)^rd()^
+                (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+            uint64_t b=((uint64_t)rd()<<32)^rd();
+            char buf[33]; std::snprintf(buf,sizeof buf,"%016llx%016llx",
+                (unsigned long long)a,(unsigned long long)b);
+            admin_token=buf;
+            if(const char* at=getenv("Q27_METAL_ADMIN_TOKEN"); at && *at) admin_token=at;
         }
         if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
@@ -643,6 +660,7 @@ struct Runtime {
                     throw std::runtime_error("Q27_METAL_SNAPSHOT_SPINE_PIN must be 0 or 1");
                 spin=(v!=0);
             }
+            snapshot_spine_pin_config=spin;
             snapstore.init(sdir,snapshot_max_bytes_config,tag.c_str(),spin);
             // A restart over an oversized directory must come back under
             // budget without waiting for the next save (codex P2 on 607160e).
@@ -1386,7 +1404,9 @@ int main(int argc,char** argv) {
         });
         auto admin_ok=[&runtime](const httplib::Request& req) {
             const bool loopback=req.remote_addr=="127.0.0.1" || req.remote_addr=="::1";
-            return loopback && req.get_header_value("X-Q27-Boot-ID")==runtime.boot_id;
+            // Separate admin credential, not the public boot_id (P2).
+            return loopback && !runtime.admin_token.empty() &&
+                   req.get_header_value("X-Q27-Admin-Token")==runtime.admin_token;
         };
         server.Post("/admin/drain",[&runtime,admin_ok](const httplib::Request& req,httplib::Response& r){
             if(!admin_ok(req)) { json_response(r,{{"error","forbidden"}},403); return; }
@@ -2799,6 +2819,8 @@ int main(int argc,char** argv) {
 
         fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u, slots=%zu)\n",
                 host.c_str(),port,context,turbo3?"turbo3":"fp16",width,runtime.slots.size());
+        // Operator-only: the admin credential goes to stderr (never HTTP).
+        fprintf(stderr,"q27 Metal server admin token (X-Q27-Admin-Token): %s\n",runtime.admin_token.c_str());
         if(!server.listen(host.c_str(),(int)port)) throw std::runtime_error("server listen failed");
         return 0;
     } catch(const std::exception& e) { fprintf(stderr,"%s\n",e.what()); return 1; }

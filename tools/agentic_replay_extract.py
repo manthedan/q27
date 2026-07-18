@@ -32,11 +32,12 @@ import sys
 REPLAY_APIS = {"chat", "messages", "completions", "responses"}
 PROTOCOL_KEYS = {"context", "kv", "mtp", "suffix", "slots", "prefix_entries",
     "constrain_tools", "snapshots", "snapshot_auto_min", "snapshot_max_bytes",
-    "max_tokens_default", "kv_fp16_except",
+    "snapshot_spine_pin", "max_tokens_default", "kv_fp16_except",
     "kv_fp16_cell_masks", "kv_side_codec", "gemm_half", "gemm_half_q4",
     "gqa_tile", "gqa_block", "gqa_threshold", "gpu_sample", "resident",
     "bare_system", "tool_strict", "test_failpoints", "tokenizer", "tokenizer_sha1"}
-PROTOCOL_BOOLS = {"constrain_tools", "snapshots", "kv_fp16_except", "gemm_half",
+PROTOCOL_BOOLS = {"constrain_tools", "snapshots", "snapshot_spine_pin",
+    "kv_fp16_except", "gemm_half",
     "gemm_half_q4", "gpu_sample", "resident", "bare_system", "tool_strict",
     "test_failpoints"}
 PROTOCOL_INTS = {"context", "mtp", "suffix", "slots", "prefix_entries",
@@ -106,7 +107,7 @@ def main():
                 or not hex40(e.get("artifact_sha1")):
             return None
         rt = e.get("runtime")
-        if not isinstance(rt, dict) or rt.get("identity_schema") != 2 or \
+        if not isinstance(rt, dict) or rt.get("identity_schema") != 3 or \
                 set(rt) != {"identity_schema", "server_sha1", "shader_abi", "shader_sha1", "protocol", "platform"} or \
                 not hex40(rt.get("server_sha1")) or not hex40(rt.get("shader_sha1")) \
                 or not isinstance(rt.get("shader_abi"), str) or not rt.get("shader_abi"):
