@@ -1,7 +1,7 @@
 # Metal implementation progress
 
-**Updated:** 2026-07-16
-**Test devices:** Apple M4 24 GiB (official + T2 tiers) and mac-mini M4 16 GiB (T2)
+**Updated:** 2026-07-17
+**Test devices:** Apple M4 24 GiB (official + T2/B1 tiers) and mac-mini M4 16 GiB (T2/B1/M1)
 
 This file is two things: a **current-state summary** (this section — kept
 accurate) and an **append-only chronicle** of dated entries below (the
@@ -10,7 +10,7 @@ the behavioral reference. The old checkpoint ledger and "mature-decode
 critical path" sections further down are HISTORICAL (2026-07-14 vintage) —
 do not read them as current.
 
-## Current state (2026-07-16 night)
+## Current state (2026-07-17 night)
 
 ### Shipped and gated (base M4, T2 tier unless noted)
 
@@ -20,12 +20,12 @@ do not read them as current.
 | Serial decode | GPU-resident greedy (K=8 steps/command buffer) | 98–99.2% of resident GEMV ceiling |
 | Attention | R1b factor-2 token-tiled causal GQA + GQA KV reuse shipped | ~2× at 16–32K; −19.9% matched 16K NLL wall |
 | Verification | `VERIFY_CHUNK_MAX = 48`, decoupled from the width-12 NLL/KL contract; round cost flat per 16-token tile, sweet spots w ∈ {16, 32, 48} | oracle S(48) = 3.94× |
-| MTP | Batched verify ≤ 12 (widening = 24 GB residue); early-EOS clamp fixed + gated | 58.5% acceptance, official tier |
-| Suffix bursts | Batched verification implemented (match-capped, full-tile snap, serial control kept); **correctness gates staged, economics pending** | traffic prior: cctx fires L≥12 at 35% |
-| Multislot | Phase 1 complete: 2 slots, FIFO ticket lease, 96/48/12 quanta, full admission accounting, dedicated 503, gates G1–G6 | busy-arrival wait ≤ 84 ms |
-| Snapshots | Phase 1 shipped: disk save/load, byte-identical fresh-process resume | ~450× vs re-prefill (0.12 s vs ~52 s) |
-| Quality | 32K turbo3 NLL depth-flat; needles 6/6 at 32K; `--kl-kv` + `--envelope` instruments | PPL 5.318; KL mean 0.0115 nats (tail max 2.83 = KV-codec P1 target) |
-| Tiers | Official 17 GiB (MTP) + T2 7.15 GB serve; **B1 quality GO** (PPL ~1.16× vs T2), kernel Phase 0B pending; dspark drafter pack repacked losslessly (dtypes 6/7) | — |
+| MTP | Batched verify ≤ 12; official-tier 2-slot G1/G2/G3/G5 gates pass with live speculation | 813 committed / 281 rounds (2.89 tok/round) |
+| Suffix bursts | **Shipped through CLI + server**; match-capped full-tile verification, byte-identity and live-EOS gated | 2.34× repetition-heavy; −0.1% neutral |
+| Multislot | 2 slots, FIFO ticket lease, 96/48/12 quanta, full admission accounting, cancellation-safe queue, gates G1–G7 | busy-arrival wait ≤ 84 ms |
+| Snapshots | Durable disk resume + auto-save for long prompts + bank-on-cancel | cold 4:54 → 8.1 s on changed-message prefix hit |
+| Quality | 32K turbo3 NLL depth-flat; needles 6/6; funded L7-full fp16 exceptions remove the KV tail event | max KL 2.94→0.755, mean −11%, KV bytes +25.8% |
+| Tiers | Official 17 GiB (MTP), T2 7.15 GB, B1 3.79 GB, and **M1 mixed 3.83 GB** serve; M1 closes 48% of B1→T2 NLL gap and passes every ship gate | M1/T2 NLL 1.0105; suffix 8/8; probes 4/4 |
 
 ### Parked by measurement (mechanism recorded in the chronicle entry)
 
@@ -50,21 +50,21 @@ fixtures + one-command re-gate banked for M5/M6)** · slim verifiers
   Makefile/README; re-run the fits-leg after the NEXT upstream merge
   (upstream flipped `Q27_BATCH=1 Q27_BATCH_GRAPH=1` default-ON
   2026-07-17T00:16Z, which re-opens the memory question).
-- Official-tier multislot MTP gates (G1/G2/G3/G5 with real speculation
-  rounds) not yet run — 24 GB machine residue.
 - Envelope constants PROVISIONAL (one nonzero pair per class; two-variant
   + holdout ensemble queued).
-- Server: queued streaming requests cannot cancel before slot admission
-  (no writability probe during `slot_free_` wait); slot selection is
-  first-idle with no prefix-match probe (belongs with snapshots Phase 2).
+- Server: slot selection is first-idle with no prefix-match probe; the
+  `/v1/responses` endpoint still flattens structured function calls.
+- CUDA server still lacks the Metal server's non-streaming disconnect
+  cancellation; port the vendored httplib liveness hook at the next merge.
+- The NLL-winning `gdn_pair` graft is not a serving candidate (3/4 probes);
+  rescue work is parked until separately funded.
 
 ### Active work
 
-KV-codec P1 (mini: tail instrumentation → KVarN scaling → 128-cell census
-→ RoPE-pair simulation) · snapshots Phase 2 (server keying, boundary
-policy, LRU) · suffix-burst gates (staged, awaiting go) + economics leg
-(quiet machine) · official-tier timing legs (quiet machine) · B1 Phase 0B
-(next new performance workstream).
+Quiet-machine ship/kill bench for the correctness-gated Q4 chunk-GEMM half
+port · B1 select round 2 (ship line ≥18 tok/s artifact) · envelope
+ensemble + cross-tier oracle sweep · KV-codec serving-format selection
+between funded L7-full and fp8 · `/v1/responses` structured function calls.
 
 ---
 
@@ -327,6 +327,8 @@ Remaining high-impact work, reordered by measured leverage: (1) prefill: Instrum
 **Chunked-prefill throughput priced by real agentic traffic — measurement round complete, auto-snapshots SHIPPED, official-tier GEMM port pre-registered (2026-07-17 night, quiet 24 GB M4; Daniel's go: "yes, please try to fix").** Daniel's first real pi request ("yo" + pi's system prompt = 8,355 tokens) hit a ~5-minute TTFT and looked hung; the captured body + timed replays established **T2 chunk prefill at 27.5–40 tok/s bench, matching the served 28–29 exactly** — the serving loop adds nothing, and the roofline instrument's standing verdict holds: **M4 prefill MMA is MATURE at the T2 schedule** (staging levers all previously parked; pure-MMA ceiling ~3.4 TF/s). No regression anywhere: the official tier benches 23.2 tok/s at 8352 tokens with **q27_matmul_q4_mm at 91.8% of the wall** — exactly its introducing commit's recorded ceiling (efb5d5d, "5.7 → 21.3 tok/s"); prefill was simply never optimized past first light, and tonight was the first time an agent-sized prompt priced that in. The one real kernel prize: the Q4 MM kernel runs the SAME FLOPs as T2's mature GEMM ~1.9× slower (equal effective GB/s over 2× the bytes) — the schedule port is pre-registered with a ≥1.7× ship line (`docs/plans/2026-07-17-t2-prefill-throughput.md`). **Serving fix shipped: auto-snapshots** — with Q27_METAL_SNAPSHOT_DIR opted in, prompts ≥ 4096 tokens (Q27_METAL_SNAPSHOT_AUTO; 0 = hint-only) behave as hinted, so agent clients that never send the "snapshot" hint get the disk-prefix mitigation automatically; gates PASS on the live T2 server (cold no-hint pi body auto-saved once at 4:54, then a *different* user message answered in **8.1 s with prefix_hit 8256/8368**; small prompts save nothing). Codex: no P1; the same-path save-race P2 REJECTED with evidence (save_state is lease-serialized), the write-churn P2 adopted as a documented trade + off-switch. Operational note: the serving launch line now carries the snapshot dir and it is LOAD-BEARING for agent TTFT; the earlier pile-up (abandoned requests grinding a slot for disconnected clients) remains registered debt with the cancel-before-admission item.
 
 **Abandoned-request cancellation SHIPPED — the pile-up class is dead; plus the pi truncation fix (2026-07-17 midday, 24 GB M4; while the Q4-port ship bench waits for a quiet machine).** The registered debt behind the morning's "not working" incident is closed (`docs/plans/2026-07-17-abandoned-request-cancellation.md`): a 2-line vendored httplib patch (`Request::sock`, set in `Server::process_request`) gives every handler a liveness probe (`is_socket_alive`: zero-timeout select + MSG_PEEK), and `Runtime::run()` now probes it at the two blind phases — queue wait (250 ms timed-wait ticks; dead tickets self-evacuate without ever touching the GPU) and per prefill chunk (with **snapshot banking on cancel**: an armed auto/hint save target writes at the current position first, so a client-timeout retry restores from disk instead of livelocking cold — gated live: kill → bank → retry restores → deeper bank). Non-streaming generation probes every 16 tokens; streaming keeps its per-piece writability check. Gates: 2 s kill of a 90 s prefill freed the slot within one chunk (follow-up probe answered in 1.15 s), queued-kill left the slot holder untouched, agentic battery ALL PASS, pi smoke instant. Codex earned its keep: **P1 caught pre-deploy** — the naive cancel path let a mid-queue ticket's TurnPass advance `slot_serving_` out of order and wedge the FIFO; fixed with a `cancelled_tickets_` set + disarmed TurnPass + fast-forward drain in every wait predicate AND at arrival (a stale cancelled front would otherwise falsely 503 the QUEUE_MAX check), re-gated with a 3-deep queue. Adopted P2s: ClientGone answers **499** (never an empty 200 on a probe false-negative); half-close-reads-as-dead accepted as documented. P3: cancel-save is best-effort. **Rider:** `Q27_METAL_MAX_TOKENS_DEFAULT` (serving line: 16384) — pi sends `max_tokens:null` and the CUDA-parity 256 default truncated Daniel's live agent turn mid-answer; verified 649 streamed tokens on a no-max_tokens request. Residue: MTP/serial prefill stays single-quantum (unprobed, documented); CUDA server still has the non-streaming blind spot — port the patch at next merge. Same session, other lanes: mini's kv-except snapshot v2 push had a toolchain-dependent build break (`std::array` member without `<array>`) — fixed and pushed same hour; the Q4 chunk-GEMM half port sits fully correctness-gated (shape suite both env settings, chunk-width parity exactly zero, 8K NLL +0.005%, codex clean) with its ship/kill call HELD on the pre-registered quiet-machine bench (Daniel will call the window; contaminated daytime numbers recorded honestly in the plan doc), and the Q8 half twin FAILED the shape suite — the empirical proof that Apple's mixed-precision MMA rounds products at half precision (Q4/T2/B1 products ≤ 1024 are exact; Q8's 127×127 are not) — parked never-routed with the verdict in its comment.
+
+**Mixed-tier census → M1 serving tier SHIPPED; NLL-winning GDN graft correctly rejected by behavioral gates (2026-07-17 evening, 16 GB mini; plan+results: `2026-07-17-mixed-tier-census.md`, evidence: `logs/mixed_census/`, `logs/mixed_combo/`, `logs/m1-ship-20260717/`).** Same-box 8K anchors B1/T2 = 2.6610/2.6081. Of 25 class-band grafts, only GDN QKV (114.4% gap recovery), GDN alpha/beta (46.9%), and mid-depth attention-Q (17.6%) cleared the registered ≥15%-at-≤10%-bytes census gate; composition proved non-additive in both directions. `gdn_pair` reached NLL 2.5885 (0.9925× T2) at 4.11 GB and suffix 8/8, but FAILED the required 4/4 probes: its constraints leg entered a 6144-token thinking repetition loop that did not occur on B1, T2, alpha/beta-only, or QKV-only controls. NLL therefore did not overrule behavior. `cheap_pair` (B1 + T2 alpha/beta + attention-Q blocks 21–42) reproduced NLL 2.6355 exactly (1.0105× T2) at 3.83 GB, suffix 8/8, and probes 4/4, so it is promoted as **M1** at `models/bonsai-27b-m1/bonsai-27b-m1.q27` (md5 `91db7fdd368ba3558e59bb5e111bbd07`). The failing candidate is retained only as `bonsai-27b-gdn-pair-experimental` and its rescue is parked. The suffix gate instrument was also repaired: numeric awk fields fixed, a live-rejection `rep3` arm added, and neutral silence demoted to WARN while byte identity remains hard; fixed battery re-runs passed B1, T2, M1, and the experimental pack.
 
 ## Mature-decode critical path (HISTORICAL — 2026-07-14 checklist, superseded)
 

@@ -1,4 +1,4 @@
-# Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, FIRST-PASS CENSUS COMPLETE; combo phase running)
+# Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, CENSUS + COMBO + SHIP GATES COMPLETE)
 
 k3 roadmap item #2, adopted 2026-07-17 (Daniel: "sounds good, do it" —
 queued behind the funded kernel rounds and the fp8-KV control arm). The
@@ -242,8 +242,8 @@ cheap_pair NLL 2.6355  gap recovered  48.2%  vs T2 1.0105  +42.3 MB   3.83 GB  S
 
 ## Ship gates run (2026-07-17 evening, mini — `logs/m1-ship-20260717/`)
 
-Persistent `gdn_pair` pack built as `models/bonsai-27b-m1/bonsai-27b-m1.q27`
-(4,110,049,792 bytes exactly as predicted, md5 in CHECKSUMS.md5): validate
+Persistent `gdn_pair` pack was initially built under the provisional M1
+name (4,110,049,792 bytes exactly as predicted, md5 in CHECKSUMS.md5): validate
 OK, greedy smoke " Paris.", and an 8K NLL identity anchor under the census
 route pins reproduced the combo measurement EXACTLY (2.5885) — the persistent
 artifact is measurement-identical to the gated candidate.
@@ -261,8 +261,8 @@ rejections (observed `live 16 accepted 3`) with committed bytes identical;
 a correctness contract — T2's own greedy continuation of the neutral prompt
 goes periodic on the mini and fires 3 bursts with bytes still identical —
 so silence is now WARN and byte-identity remains the hard assertion.
-Under the fixed instrument: m1 8/8 PASS, and the parents re-run clean
-same-box (B1 8/8; T2 8/8 + the documented WARN).
+Under the fixed instrument: the provisional `gdn_pair` 8/8 PASS, and the
+parents re-run clean same-box (B1 8/8; T2 8/8 + the documented WARN).
 
 **Behavioral probes: `gdn_pair` passes only 3/4 — ship gate FAIL (4/4 required).** The
 constraints leg collapses at greedy into a thinking-mode repetition loop
@@ -284,10 +284,20 @@ Rebuilt pack (md5 91db7fdd368ba3558e59bb5e111bbd07): 8K NLL identity anchor
 keys/types; constraints all honored, `finish stop`; codeedit boundary fix
 exact; toolcall get_weather city=Taipei with schema-valid optional
 unit="c"). Ship band: 1.0105 vs T2 at 3.83 GB. Serving point: ~48% of the
-B1→T2 gap closed for +42.3 MB over B1 (+1.1% bytes). Artifact awaits a
-tier name and location (currently `models/probe_cheap.q27`); `bonsai-27b-m1`
-holds the NLL-stronger but probe-failing `gdn_pair` for the rescue
-investigation.
+B1→T2 gap closed for +42.3 MB over B1 (+1.1% bytes).
+
+**Promotion decision (2026-07-17): `cheap_pair` is the M1 serving tier.**
+The gated bytes now live at
+`models/bonsai-27b-m1/bonsai-27b-m1.q27`; the sibling `CHECKSUMS.md5`
+records md5 91db7fdd368ba3558e59bb5e111bbd07. M1 means the B1 base with T2
+`ssm_alpha`/`ssm_beta` and attention-Q in blocks 21–42. The NLL-stronger
+but probe-failing `gdn_pair` is retained explicitly as a non-serving
+experiment at
+`models/bonsai-27b-gdn-pair-experimental/bonsai-27b-gdn-pair-experimental.q27`
+(md5 107647e9cba0f01a003934011644c2fe); its rescue investigation is parked
+until separately funded. This naming keeps the serving path fail-closed:
+only the artifact that passed every registered gate carries the M1 tier
+name.
 
 Ship bands are unchanged from the pre-registration: NLL mixed/T2 ≤ 1.06
 at ≤ 5.0 GB → ship candidate (then suffix byte-identity battery +

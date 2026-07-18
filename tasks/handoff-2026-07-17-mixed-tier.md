@@ -14,9 +14,10 @@ through tonight).
 
 2. **Ship gates: RUN and committed (the commit that adds this handoff;
    evidence in `logs/m1-ship-20260717/`).**
-   - `gdn_pair` = B1 + T2{gdn_qkv, gdn_alphabeta}. Persistent pack
-     `models/bonsai-27b-m1/bonsai-27b-m1.q27` (4,110,049,792 bytes, md5
-     107647e9…, CHECKSUMS.md5 written). NLL anchor 2.5885 EXACT (beats
+   - `gdn_pair` = B1 + T2{gdn_qkv, gdn_alphabeta}. Experimental pack
+     `models/bonsai-27b-gdn-pair-experimental/bonsai-27b-gdn-pair-experimental.q27`
+     (4,110,049,792 bytes, md5 107647e9…, CHECKSUMS.md5 written). NLL
+     anchor 2.5885 EXACT (beats
      all-T2, 0.9925), suffix battery 8/8 — but **behavioral probes 3/4 =
      SHIP GATE FAIL**: constraints probe collapses at greedy into a
      thinking-mode repetition loop to the 6144 cap. Controls all pass
@@ -26,7 +27,9 @@ through tonight).
    - `cheap_pair` = B1 + T2{gdn_alphabeta, attnq_mid(blk 21–42)}.
      **PASSES THE COMPLETE SHIP GATE — first mixed pack to do so.** NLL
      anchor 2.6355 EXACT (1.0105 vs T2), 3.83 GB, suffix 8/8, probes 4/4.
-     Artifact currently `models/probe_cheap.q27` (md5 91db7fdd…).
+     Promoted as the **M1 serving tier** at
+     `models/bonsai-27b-m1/bonsai-27b-m1.q27` (md5 91db7fdd…;
+     CHECKSUMS.md5 written).
 
 3. **Suffix battery instrument fixes (committed, in
    `tools/suffix_burst_gates_2026-07-16.sh`)**: gate 3b awk compared the
@@ -36,27 +39,26 @@ through tonight).
    gate 4 neutral-silence demoted to WARN (economics prior — T2's greedy
    neutral continuation is periodic on the mini, bytes identical);
    MODEL/OUT now env-overridable. Under the fixed instrument all four
-   packs run clean batteries same-box (B1 8/8, T2 8/8+WARN, m1 8/8,
-   cheap 8/8).
+   packs run clean batteries same-box (B1 8/8, T2 8/8+WARN,
+   experimental `gdn_pair` 8/8, M1/`cheap_pair` 8/8).
 
-## Immediate next steps
+## Continuation decision
 
-1. **Daniel decisions pending**: (a) tier name/home for the gate-passing
-   `cheap_pair` artifact (rename `models/probe_cheap.q27`, write its
-   CHECKSUMS.md5, note in plan doc); (b) fund the `gdn_pair` rescue
-   investigation or park it.
-2. Codex review of the ship-gate changes already ran clean (one wording
-   fix adopted); everything through the handoff commit is in the tree.
-   No commit trailers, ever.
+1. `cheap_pair` was promoted as **M1** and moved into its final local model
+   home with checksum; the failing `gdn_pair` was moved under an explicit
+   `-experimental` name. The rescue investigation is parked rather than
+   spending another model-run budget without separate funding.
+2. The plan doc, README, and METAL_PROGRESS record the promotion. Codex
+   review of the original ship-gate changes ran clean (one wording fix
+   adopted). No commit trailers, ever.
 
 ## Registered residue (not run)
 
-- gdn_pair rescue: band-restricted partial qkv grafts; per-layer loop
-  localization; vendor-B.1 sampling variant (informative only — the
+- Parked gdn_pair rescue: band-restricted partial qkv grafts; per-layer
+  loop localization; vendor-B.1 sampling variant (informative only — the
   registered probe protocol is greedy).
 - Combo summary's published `combo_summary.txt` pack-GB column carries the
   (fixed-in-script) GiB/MB unit bug; plan doc records corrected values.
-- METAL_PROGRESS.md has no entry yet for tonight's census→ship-gate arc.
 
 ## Gotchas that cost time today
 
