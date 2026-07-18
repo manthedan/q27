@@ -147,12 +147,59 @@ changes no gate.
 
 ## Cost / risk / house rules
 
-Mini-side (has B1, T2, the gdn-pair-experimental pack, and the probe
-harness that produced the 5 controls). One resident model at a time,
-enforced by the existing combo-driver lock + pgrep fail-closed guard; the
-operator's no-live-traffic ruling permits server teardown but does NOT
-permit two concurrent 10.9 GB models on this box. Estimated: 4–6 transient
-pack builds (~4 GB each, deleted after use) + ≤20 greedy constraints runs
-(≤6144 tokens each) + ≤6 single 8K NLL runs. Fits in one mini session.
-Risk is a nondeterministic loop verdict, mitigated by 3× runs + the G1
-fail-closed control + one refine-and-rerun allowance before UNRESOLVED.
+One resident model at a time; the operator's no-live-traffic ruling
+permits server teardown but does NOT permit two concurrent 10.9 GB models
+on this box. Risk is a nondeterministic loop verdict, mitigated by 3× runs
++ the G1 fail-closed control + one refine-and-rerun allowance before
+UNRESOLVED.
+
+## RESULTS (2026-07-18) — UNRESOLVED on this M4: the loop is NOT pack-portable
+
+**G1 (fail-closed control reproduction) TRIPPED.** The investigation
+stopped at the control arm, as designed — no band arm (P1–P5) was run,
+because running them against a non-reproducing control would be void.
+
+**What was established (all on this M4, one resident model):**
+
+- P0 (full `gdn_pair` = B1 + T2 `attn_qkv` + T2 `ssm_alpha`/`ssm_beta`)
+  built locally with `tools/q27_mix.py`. Its md5 is
+  `107647e9cba0f01a003934011644c2fe` — **byte-identical to the mini's
+  `gdn-pair-experimental` pack that produced the catastrophic loop.**
+  The pack is therefore not the variable.
+- Served P0 and ran the frozen constraints probe at THREE configs:
+  ctx=8192 slots=2 (the mini's exact config, per
+  `logs/m1-ship-20260717/server.log`), and ctx=131072 slots=1. Across
+  five completed runs (2× at 8192 initial, 2× at 8192 mini-cfg, 1× at
+  131072) the result is **deterministic and identical**: finish_reason
+  `stop`, **2225 completion_tokens**, reasoning tail
+  `[Final Output Generation] -> *Proceeds*`, valid 5-item content, **zero
+  repetition spans**. No run looped.
+- One additional run hit the caller's 400 s timeout mid-generation (not a
+  loop signature — no partial loop pattern, just slow decode at 8192 ctx);
+  it does not count as a reproduction.
+
+**Verdict per the pre-registered ship/kill line: UNRESOLVED.** The control
+will not reproduce on this M4, so per the plan "the loop is not stable
+enough to localize, which is itself recorded." The refine-and-rerun
+allowance was consumed by the ctx sweep (8192→131072, both clean).
+
+**Mechanism implication (the real finding):** the composition-only
+repetition loop is **environment/hardware-dependent, not an intrinsic
+property of the gdn_pair pack.** A byte-identical pack at a byte-identical
+server config loops on the mini but decodes cleanly and deterministically
+on the M4. The pathology is a **greedy-attractor whose basin is entered
+only under specific GPU numerics** (mini vs M4 rounding / scheduling),
+consistent with the vendor-B.1 hypothesis that this is a sharp low-entropy
+basin rather than a broad degradation. Per-token NLL cannot see it on
+either box; even the behavioral probe only sees it on one.
+
+**Consequence for any future rescue:** the band-bisection MUST run on the
+mini (where the loop reproduces), not on this M4. Local execution is
+impossible — the phenomenon does not exist here. The pre-registered arms
+P0–P5, the loop detector, and the frozen prompt are unchanged and ready;
+they need a mini session with G1 re-confirmed there first (expected to
+pass, since the mini produced the original loop).
+
+**Evidence:** `logs/gdn-rescue-20260718/` — `probe-p0-*.json` (5 clean
+runs), `server-p0-*.log` (3 configs). The transient P0 pack was
+`/tmp/gdnrescue-p0.q27` (md5 above), deleted after use.

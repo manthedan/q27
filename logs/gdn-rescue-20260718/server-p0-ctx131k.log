@@ -1,0 +1,3 @@
+multislot: slot 1 admission rejected: 34322 MB needed (1+1 slots x 17161 MB/slot incl partials) > 9093 MB budget; serving with 1 slot(s)
+q27 Metal server listening on http://127.0.0.1:8213 (ctx=131072, kv=fp16, mtp=0, slots=1)
+q27 Metal server admin token (X-Q27-Admin-Token): REDACTED
