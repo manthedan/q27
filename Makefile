@@ -9,7 +9,7 @@ UNAME_S   := $(shell uname -s)
 .PHONY: all clean test-cpu test-metal
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
 
-test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store
+test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer
 	./build/test_artifacts
 	./build/test_depthctl
 	./build/test_toolconstrain
@@ -18,6 +18,17 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	./build/test_kl
 	./build/test_snapshot_evict
 	./build/test_snapshot_evict_store
+	@# test_tokenizer needs the .tok for its chatml/toolmask/tool-call/streaming
+	@# gates (the vacuous-pass trap the handoff warned about: with NO args it
+	@# runs only the self-tests and exits 1). The exact-id cases file is a
+	@# small separate corpus; an empty file skips it while the .tok-driven
+	@# gates run. Skip gracefully if the .tok is absent (e.g. a doc-only clone).
+	@if [ -f models/qwen36-27b-mtp/qwen36-27b-mtp.tok ]; then \
+		: > build/.empty-cases.txt; \
+		./build/test_tokenizer models/qwen36-27b-mtp/qwen36-27b-mtp.tok build/.empty-cases.txt; \
+	else \
+		echo "test_tokenizer: SKIPPED (models/qwen36-27b-mtp/qwen36-27b-mtp.tok not present)"; \
+	fi
 
 ifeq ($(UNAME_S),Darwin)
 test-metal: build/test_metal build/test_metal_ops build/test_metal_stream
