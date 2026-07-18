@@ -1,4 +1,4 @@
-# Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, INSTRUMENT READY; measurement pending)
+# Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, FIRST-PASS CENSUS COMPLETE; combo phase running)
 
 k3 roadmap item #2, adopted 2026-07-17 (Daniel: "sounds good, do it" —
 queued behind the funded kernel rounds and the fp8-KV control arm). The
@@ -128,6 +128,122 @@ completion. The 25-arm summary is validated and atomically published before
   captured before entering the function. No completed NLL/readout from that
   attempt is retained.
 
-## RESULTS
+## RESULTS — first-pass census (2026-07-17 afternoon, mini)
 
-(pending)
+Batch completed clean: 2 baselines + 25 arms, zero retries, zero aborts,
+every log published through the atomic zero-exit/single-finite-NLL/hash
+path, summary validated against all 25 arms before `COMPLETE`. Raw table:
+`logs/mixed_census/census_summary.txt`.
+
+Same-box anchor: base B1 2.6610, base T2 2.6081, gap 0.0529 nats
+(ppl ratio 1.0543 — matches the recorded 24 GB M4 1.055 to 3 decimals).
+
+```
+gdn_qkv          NLL 2.6005  gap recovered 114.4%  bytes   +314.6 MB
+gdn_alphabeta    NLL 2.6362  gap recovered  46.9%  bytes     +2.9 MB
+attnq_mid        NLL 2.6517  gap recovered  17.6%  bytes    +39.3 MB
+ffnup_mid        NLL 2.6541  gap recovered  13.0%  bytes   +245.1 MB
+attnkv_late      NLL 2.6589  gap recovered   4.0%  bytes     +7.9 MB
+attnout_mid      NLL 2.6623  gap recovered  -2.5%  bytes    +19.7 MB
+shared_f32       NLL 2.6641  gap recovered  -5.9%  bytes     +0.0 MB
+attnkv_early     NLL 2.6650  gap recovered  -7.6%  bytes     +6.6 MB
+embedding        NLL 2.6678  gap recovered -12.9%  bytes   +158.9 MB
+attnkv_mid       NLL 2.6686  gap recovered -14.4%  bytes     +6.6 MB
+attnq_late       NLL 2.6747  gap recovered -25.9%  bytes    +47.2 MB
+gdn_out          NLL 2.6757  gap recovered -27.8%  bytes   +188.7 MB
+attnq_early      NLL 2.6778  gap recovered -31.8%  bytes    +39.3 MB
+gdn_gate         NLL 2.6812  gap recovered -38.2%  bytes   +188.7 MB
+ffngate_mid      NLL 2.6881  gap recovered -51.2%  bytes   +245.1 MB
+ffngate_early    NLL 2.6895  gap recovered -53.9%  bytes   +234.0 MB
+ffndown_mid      NLL 2.7051  gap recovered -83.4%  bytes   +245.1 MB
+attnout_early    NLL 2.7163  gap recovered -104.5%  bytes   +19.7 MB
+attnout_late     NLL 2.7201  gap recovered -111.7%  bytes   +23.6 MB
+ffngate_late     NLL 2.7276  gap recovered -125.9%  bytes  +234.0 MB
+output_head      NLL 2.7288  gap recovered -128.2%  bytes  +158.9 MB
+ffnup_early      NLL 2.7299  gap recovered -130.2%  bytes  +234.0 MB
+ffnup_late       NLL 2.7355  gap recovered -140.8%  bytes  +234.0 MB
+ffndown_early    NLL 2.7400  gap recovered -149.3%  bytes  +234.0 MB
+ffndown_late     NLL 2.8648  gap recovered -385.3%  bytes  +234.0 MB
+```
+
+### Pre-registered gate applied (≥15% recovery at ≤10% of the 3,361.7 MB delta)
+
+Gap-carrying classes: **gdn_qkv** (114.4% at 9.4% of delta),
+**gdn_alphabeta** (46.9% at 0.09%), **attnq_mid** (17.6% at 1.2%).
+`ffnup_mid` (+13.0%) misses the 15% bar; nothing else is close. The
+`shared_f32` zero-byte cohort lands at −5.9% and is NOT gap-carrying —
+no zoom-by-class needed, and its |Δ| (~0.003 nats on an identical-cost
+graft) doubles as the scale reference: single-arm readings inside about
+±6% recovered should not be over-interpreted.
+
+### Findings
+
+1. The B1 quality deficit is overwhelmingly concentrated in the GDN/SSM
+   block: `gdn_qkv` alone recovers 114% of the gap — the graft lands
+   BELOW the pure-T2 baseline (2.6005 vs 2.6081) — and the 2.9 MB
+   `gdn_alphabeta` decay parameters recover another 47% alone, the most
+   byte-efficient result of the census by ~45×.
+2. Because `gdn_qkv` alone beats all-T2, the remaining T2 tensors are
+   net-negative GIVEN T2-tier SSM QKV. Single-class deltas are therefore
+   NOT additive; composition must be measured, not summed. This is the
+   expected signature of checkpoint grafting between separately trained
+   companions (per the pre-readout amendment), not of quantization error.
+3. Depth pattern in the transformer classes: early and late bands punish
+   grafting across every module type; the only tolerant region is
+   mid-depth (attn-Q +17.6%, ffn-up +13.0%). `ffndown_late` is the most
+   graft-sensitive site in the network (−385%, +0.204 nats over base).
+4. Per the amended close band: the 20 negative arms do NOT establish that
+   the residual gap is diffuse — only that those single-class grafts fail.
+
+## Combo phase — registration (2026-07-17 afternoon, recorded before running)
+
+Additivity is broken (finding 2), so composed candidates are measured
+directly by `tools/mixed_combo_batch.sh` — same fail-closed harness
+(own lock, own `logs/mixed_combo` results dir, fresh same-box baselines,
+fingerprinted resume, transient PID-unique packs), three registered arms
+composed ONLY from gate-passing classes:
+
+- `gdn_pair` = gdn_qkv + gdn_alphabeta (+317.5 MB → 4.11 GB pack)
+- `gate_trio` = gdn_pair + attnq_mid (+356.8 MB → 4.15 GB pack)
+- `cheap_pair` = gdn_alphabeta + attnq_mid (+42.3 MB → 3.83 GB pack)
+
+(Sizes are decimal GB from the source-inventory byte deltas, cross-checked
+by codex review; the driver's printed pack-size column in this first combo
+run mixes GiB base with decimal-MB deltas and under-reports — the unit fix
+is applied after the running batch completes, since editing the fingerprinted
+driver mid-run would abort it. No band decision is affected: the worst-case
+candidate is 4.15 GB against the 5.0 GB gate in either unit.)
+
+### Combo RESULTS (2026-07-17 evening, mini — batch clean, zero retries)
+
+Both baselines reproduced the census values exactly (B1 2.6610, T2 2.6081
+— a full-protocol determinism check). Raw table:
+`logs/mixed_combo/combo_summary.txt` (its pack-GB column carries the
+unit bug above; corrected decimal sizes shown here):
+
+```
+gdn_pair   NLL 2.5885  gap recovered 137.1%  vs T2 0.9925  +317.5 MB  4.11 GB  SHIP-BAND
+gate_trio  NLL 2.5982  gap recovered 118.7%  vs T2 0.9962  +356.8 MB  4.15 GB  SHIP-BAND
+cheap_pair NLL 2.6355  gap recovered  48.2%  vs T2 1.0105  +42.3 MB   3.83 GB  SHIP-BAND
+```
+
+- **`gdn_pair` is the headline candidate**: 4.11 GB (57% of T2's bytes)
+  and 0.0196 nats BETTER than all-T2 (ratio 0.9925). It also beats both
+  of its own supersets tried so far — adding attnq_mid (`gate_trio`)
+  costs 0.010 nats, and the all-T2 pack is another 0.010 behind that.
+- Composition is consistently sub-additive and context-dependent:
+  attnq_mid's solo +17.6% shrinks to ~+1 point on top of `gdn_alphabeta`
+  (`cheap_pair` 48.2% vs 46.9%) and to negative on top of `gdn_pair`.
+  The 2.9 MB alpha/beta graft does nearly all the work in `cheap_pair`.
+- All three land in the pre-registered ship band; per the registration,
+  a serving claim additionally requires the suffix byte-identity battery
+  and the 4/4 behavioral probe set on the composed pack. That is the
+  next gate for `gdn_pair` (and `cheap_pair` as the byte-cheap option).
+
+Ship bands are unchanged from the pre-registration: NLL mixed/T2 ≤ 1.06
+at ≤ 5.0 GB → ship candidate (then suffix byte-identity battery +
+behavioral probes before any serving claim); 1.06–1.12 conditional;
+worse → record. All three candidates are inside the size band by
+construction; `gdn_pair` and `gate_trio` test whether the all-T2
+baseline can be beaten outright at ~57% of its bytes, `cheap_pair`
+whether ~half the gap closes for ~1% extra bytes.
