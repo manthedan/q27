@@ -1,3 +1,5 @@
+CC        ?= cc
+CFLAGS    ?= -O2 -std=c11 -Wall -Wextra
 CXX       ?= g++
 CXXFLAGS  ?= -O2 -std=c++17 -Wall -Wextra
 NVCC      ?= /usr/local/cuda/bin/nvcc
@@ -54,6 +56,19 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp sr
 	$(CXX) $(CXXFLAGS) -fobjc-arc -pthread -I src/metal src/metal/metal_server.cpp src/metal/metal_engine.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
+
+build/q27_agent_c.o: experiments/ds4-agent/q27_agent.c experiments/ds4-agent/q27_agent_engine.h | build
+	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent.c -o $@
+
+build/q27-agent: build/q27_agent_c.o experiments/ds4-agent/q27_agent_engine.cpp experiments/ds4-agent/q27_agent_engine.h \
+                 src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h \
+                 src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
+                 src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -pthread -I src/metal -I experiments/ds4-agent \
+	        build/q27_agent_c.o experiments/ds4-agent/q27_agent_engine.cpp src/metal/metal_engine.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
+	        -framework Foundation -framework Metal -o $@
+
 build/metal_gemv_bench: tools/metal_gemv_bench.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
                         src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal tools/metal_gemv_bench.cpp \

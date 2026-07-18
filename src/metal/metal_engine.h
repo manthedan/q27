@@ -185,6 +185,7 @@ class MetalEngine {
     // final prompt token still goes through step() to produce logits and
     // the pending token, exactly like prefill()'s serial tail.
     void prefill_chunk(const uint32_t* tokens, uint32_t count);
+    static constexpr uint32_t prefill_chunk_max() { return PREFILL_CHUNK_MAX; }
     // One MTP draft/verify/commit round (one scheduling quantum). Appends
     // the committed tokens (always starting with `pending`) to `committed`;
     // the caller emits them and stops at `eos` itself — tokens after an EOS
