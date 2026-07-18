@@ -130,4 +130,39 @@ completion. The 25-arm summary is validated and atomically published before
 
 ## RESULTS
 
-(pending)
+(pending — full 25-arm table + absolute NLLs + recovery denominator live on
+the mini; the 2026-07-17 evening ledger entry summarizes: gdn_qkv 114.4% at
++314.6 MB, gdn_alphabeta 46.9% at +2.9 MB, nearly every other lone swap
+negative. Independent audit requires the publication, which per the
+2026-07-17 expert-review triage MUST carry: absolute NLL per arm, the
+same-machine B1/T2 anchor pair, paired ΔNLL nats/token primary (recovery %
+secondary), all arms reported, resample-based intervals.)
+
+## Expert-review amendments (2026-07-17, adopted from the review of
+EXPERT-BRIEF-2026-07-17 — full dispositions in
+2026-07-17-expert-review-triage.md)
+
+- **Claim relabeled:** the census currently supports "quality difference
+  concentrated in the GDN subsystem," NOT "binary quantization error
+  concentrated in GDN." Decisive evidence: the alphabeta arm replaced F32
+  base values with LOWER-precision ternary donor values and still recovered
+  46.9% — encoding can explain none of it; donor training signal in the
+  recurrent pathway. (The reviewer's premise that both packs store
+  alpha/beta as F16 was wrong in detail — that's the official-tier policy;
+  B1=F32, T2=ternary — and the correction strengthens their conclusion.)
+- **Experiment design adopted:** Phase A independent holdout confirmation
+  (frozen units incl. code/chat/tool-JSON/continuous-state; absolute paired
+  ΔNLL primary; document/block bootstrap) BEFORE combinations; Phase B full
+  2^5 GDN factorial with pairwise interaction terms; Phase C reciprocal
+  grafts; Phase D source×encoding control (dequant/re-encode; common
+  pre-QAT master = vendor ask); Phase E gdn_qkv localization (q/k/v split
+  after vendor row-order validation, depth, retention-half-life head
+  ranking, state-drift experiment).
+- **Ship gate amended:** NLL bands stand as discovery; the ship candidate
+  additionally requires paired capability non-inferiority vs T2 on
+  ground-truth success with the tolerated deficit and sample size fixed
+  before running, plus a direct composed-pack decode bench (no pack-size
+  inference), two-slot serving, and 131K pressure.
+- **Low-rank delta probe adopted (CPU-only, high-value):** SVD of
+  W_T2 − dequant(W_B1) on gdn_qkv; a low-rank/head-structured delta turns
+  +315 MB into tens of MB of F16/Q8 correction.

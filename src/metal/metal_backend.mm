@@ -308,9 +308,10 @@ struct MetalBackend::Impl {
 
     // Model mappings that fit maxBufferLength are wrapped as a single
     // MTLBuffer (tensors bind at offsets), and on macOS 15+ that buffer joins
-    // a residency set attached to the queue: pages stay wired between command
-    // buffers, so file-backed weight pages are neither faulted in token by
-    // token on first touch nor evictable under memory pressure mid-run.
+    // a residency set attached to the queue. requestResidency is preparatory
+    // and best-effort per Apple (steps may be postponed under system load),
+    // not a hard wire: in practice it faults pages in at load and makes
+    // eviction under mid-run pressure far less likely.
     std::map<const void*, std::weak_ptr<MetalBuffer>> model_wraps;
     API_AVAILABLE(macos(15.0)) id<MTLResidencySet> residency_set;
 
@@ -847,9 +848,10 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
                 [set addAllocation:buffer];
                 [set commit];
                 [set requestResidency];
-                // The set retains the buffer and keeps its pages wired; drop
-                // it when the last tensor goes away so a later munmap cannot
-                // leave the set holding a dead address range.
+                // The set retains the buffer and requests residency for its
+                // pages (best-effort, not wired); drop it when the last tensor
+                // goes away so a later munmap cannot leave the set holding a
+                // dead address range.
                 wrapped = std::shared_ptr<MetalBuffer>(
                     new MetalBuffer(buffer), [set](MetalBuffer* wrapper) {
                         if (@available(macOS 15.0, *)) {

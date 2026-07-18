@@ -70,17 +70,21 @@ answers created.
    residue, known NOT to be issue-rate. Smaller working set changing DRAM
    page/bank behavior? Per-group scale-walk stride? We'd like a mechanism
    hypothesis we can falsify with one probe.
-3. **The last 30% of serial decode.** T2 resident ceiling 12.4 tok/s vs
-   8.2–9.4 observed: ~37 ms/token split between mmap page-residency
-   behavior and per-step turnaround (argmax readback sync, command-buffer
-   cadence, attention/GDN residuals). On B1 the same gap is ~3% — the
-   warm pack runs at its ceiling. What is the canonical way to hold a 7
-   GB weight mapping resident under macOS memory pressure (copy to
-   `MTLResourceStorageModePrivate` at open? wired pages? is the transient
-   2× footprint during the copy the accepted price?), and is per-step
-   command-buffer turnaround on Apple Silicon a floor or a design
-   artifact? (K=8 steps per command buffer already shipped; the gap
-   predates and survives it.)
+3. **The last 30% of serial decode.** ~~T2 resident ceiling 12.4 tok/s vs
+   8.2–9.4 observed~~ **CORRECTION (2026-07-17, post-review): the gap is
+   already attributed in-repo** (ledger entry 207): launch fault-in inside
+   the timed window (fixed same-day via single-MTLBuffer + residency set)
+   plus thermal-state mismatch (the ceiling itself re-measured 12.66 →
+   10.57 mid-session), GPU busy 96% of wall — decode is kernel-bound at
+   the bandwidth limit within a few percent of the same-moment ceiling.
+   The question as written was stale; what survives for outside eyes is
+   the reviewer's own observation: our synthetic ceiling reuses one
+   representative tensor per class, so it does not reproduce the 7 GB
+   unique-address footprint (page tables/TLB/file-backing) — whether the
+   ceiling number itself is inflated by that compact footprint is
+   untested, and a four-arm full-footprint bench is now pre-registered
+   (triage doc §3). Phase-4 remainder: per-step readback turnaround and
+   the GEMV itself, not residency.
 4. **Is n-gram-class drafting the optimum at this bandwidth — and can
    that be made rigorous?** Our measured position: verify passes are
    nearly free (flat per 16-token tile), so speculation economics hinge
