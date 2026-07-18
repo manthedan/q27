@@ -453,6 +453,79 @@ int main(int argc, char** argv) {
         if (!ok) return 1;
     }
 
+    // Incremental tool-call argument streamer (2026-07-17-incremental-
+    // tool-call-streaming.md): the wrapped-call body fed in awkward
+    // token-sized cuts must stream a head (opened + name) plus sanitized
+    // argument fragments whose concatenation is parse-EQUAL to the
+    // buffered parse; deviant heads must fall back with raw byte-exact;
+    // truncated bodies must finalize unclean without inventing framing.
+    {
+        auto stream_cut=[](const std::string& body, size_t cut_every,
+                           std::string& frags, int& n_frags, bool& opened,
+                           bool& clean, std::string& name, std::string& raw){
+            q27::ToolCallStreamer ts;
+            for (size_t p = 0; p < body.size(); p += cut_every) {
+                bool o=false;
+                std::string f=ts.feed(body.substr(p,cut_every),&o);
+                opened|=o;
+                if(!f.empty()){ frags+=f; n_frags++; }
+            }
+            std::string tail; clean=ts.finalize(&tail); frags+=tail;
+            name=ts.name; raw=ts.raw;
+        };
+        // s1: well-formed call, 3-byte cuts (splits "name", the arguments
+        // key, and in-string content across feeds); must open, stream >1
+        // fragment, close clean, and parse-equal the buffered path.
+        std::string b1="{\"name\": \"write\", \"arguments\": {\"path\": \"/w/a.ts\", \"n\": 3}}";
+        std::string f1,nm1,raw1; int c1n=0; bool op1=false,cl1=false;
+        stream_cut(b1,3,f1,c1n,op1,cl1,nm1,raw1);
+        bool s1=op1 && cl1 && c1n>1 && nm1=="write" &&
+                nlohmann::json::parse(f1)==nlohmann::json::parse(
+                    "{\"path\": \"/w/a.ts\", \"n\": 3}");
+        // s2: mode-5 inline — literal newline/tab inside the content string
+        // sanitize to \n \t while streaming; parse-equal with real controls.
+        std::string b2="{\"name\": \"write\", \"arguments\": {\"content\": \"a\nb\tc\"}}";
+        std::string f2,nm2,raw2; int c2n=0; bool op2=false,cl2=false;
+        stream_cut(b2,4,f2,c2n,op2,cl2,nm2,raw2);
+        bool s2=op2 && cl2 &&
+                nlohmann::json::parse(f2).value("content","")=="a\nb\tc";
+        // s3: mode-10 inline — verbatim shell quotes re-escape via one-byte
+        // lookahead (quote before h: literal; after i-space: literal; the
+        // final quote before } terminates). 1-byte cuts force the pending-
+        // quote path across feed boundaries.
+        std::string b3="{\"name\": \"bash\", \"arguments\": {\"command\": \"echo \"hi\" ok\"}}";
+        std::string f3,nm3,raw3; int c3n=0; bool op3=false,cl3=false;
+        stream_cut(b3,1,f3,c3n,op3,cl3,nm3,raw3);
+        bool s3=op3 && cl3 && nm3=="bash" &&
+                nlohmann::json::parse(f3).value("command","")=="echo \"hi\" ok";
+        // s4: mode-6 head (name-dropped) must never stream — fallback with
+        // the raw body preserved byte-exact for the recovery chain.
+        std::string b4="{\"name\":\n{\"file_path\": \"/w/a.md\"}}";
+        std::string f4,nm4,raw4; int c4n=0; bool op4=false,cl4=false;
+        stream_cut(b4,5,f4,c4n,op4,cl4,nm4,raw4);
+        bool s4=!op4 && f4.empty() && raw4==b4;
+        // s5: truncated mid-string — finalize unclean, fragments carry the
+        // unbalanced prefix as-is (production semantics, no invented framing).
+        std::string b5="{\"name\": \"write\", \"arguments\": {\"content\": \"abc";
+        std::string f5,nm5,raw5; int c5n=0; bool op5=false,cl5=false;
+        stream_cut(b5,7,f5,c5n,op5,cl5,nm5,raw5);
+        bool s5=op5 && !cl5 && f5.rfind("{\"content\": \"abc",0)==0;
+        // s6: mode-9 head (missing opening quote on the arguments key)
+        // still streams.
+        std::string b6="{\"name\": \"bash\",\narguments\": {\"command\": \"ls\"}}";
+        std::string f6,nm6,raw6; int c6n=0; bool op6=false,cl6=false;
+        stream_cut(b6,3,f6,c6n,op6,cl6,nm6,raw6);
+        bool s6=op6 && cl6 && nm6=="bash" &&
+                nlohmann::json::parse(f6).value("command","")=="ls";
+        bool ok=s1&&s2&&s3&&s4&&s5&&s6;
+        printf("incremental tool-call streamer: %s\n", ok?"PASS":"FAIL");
+        if(!ok){
+            fprintf(stderr,"  s1=%d s2=%d s3=%d s4=%d s5=%d s6=%d\n",
+                    s1,s2,s3,s4,s5,s6);
+            return 1;
+        }
+    }
+
     // P7: ToolGrammar -- char-level pushdown machine enforcing the
     // <tool_call> body. Each observed drift mode must be UNSAMPLEABLE:
     // the machine rejects the first illegal char, and done() stays false

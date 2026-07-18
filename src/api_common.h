@@ -354,6 +354,160 @@ inline std::string strip_ws2(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
+// Incremental tool-call argument streamer (pre-registered:
+// docs/plans/2026-07-17-incremental-tool-call-streaming.md). Feeds the
+// splitter's TOOL-channel bytes as they decode; once the call head parses
+// ({"name": "X", "arguments": {  — tolerating the mode-9 missing opening
+// quote on the arguments key), the arguments object streams out SANITIZED
+// (mode-5 control-char escaping and mode-10 in-string quote re-escaping
+// applied inline; a quote holds for exactly one non-whitespace byte of
+// lookahead) as production-shape argument fragments. Heads that deviate
+// (mode 6/7/8 shapes) or exceed the bound never stream: the raw body is
+// preserved byte-exact for the buffered parse+recovery path. The trade is
+// pre-registered: a streamed call whose body ends unbalanced reaches the
+// client unbalanced (production semantics — the model's bytes are the
+// model's bytes); end-of-call repair applies only to un-streamed calls.
+struct ToolCallStreamer {
+    enum State { HEAD, ARGS, DONE, FALLBACK };
+    State state = HEAD;
+    std::string raw;      // entire body verbatim (fallback + logging)
+    std::string name;     // valid once opened
+    bool opened = false;  // head parsed; an opener chunk belongs on the wire
+
+    bool active() const { return !raw.empty(); }
+    void reset() { *this = ToolCallStreamer(); }
+
+    // Feed body bytes; returns the sanitized argument fragment to stream
+    // (often empty). *opened_now fires on the feed that completes the head.
+    std::string feed(const std::string& t, bool* opened_now) {
+        if (opened_now) *opened_now = false;
+        raw += t;
+        if (state == FALLBACK || state == DONE) return "";
+        std::string out;
+        if (state == HEAD) {
+            head_ += t;
+            size_t consumed = 0;
+            int m = match_head(head_, name, consumed);
+            if (m == 0) {
+                if (head_.size() > 512) state = FALLBACK;
+                return "";
+            }
+            if (m < 0) { state = FALLBACK; return ""; }
+            state = ARGS;
+            opened = true;
+            if (opened_now) *opened_now = true;
+            std::string rest = head_.substr(consumed);
+            head_.clear();
+            scan(rest, out);
+            return out;
+        }
+        scan(t, out);
+        return out;
+    }
+
+    // Wrapper closed (or turn flushed). True = the args object completed
+    // cleanly (DONE). Mid-ARGS: resolves a pending quote per the EOF rule
+    // (terminator), appends the final bytes to *tail, returns false — the
+    // handler closes the call as-is. HEAD/FALLBACK: false, nothing streamed.
+    bool finalize(std::string* tail) {
+        if (state == DONE) return true;
+        if (state == ARGS && pend_q_) {
+            *tail += '"';
+            *tail += pend_ws_;
+            pend_q_ = false;
+        }
+        return false;
+    }
+
+  private:
+    std::string head_;
+    int depth_ = 0;
+    bool in_str_ = false, esc_ = false;
+    bool pend_q_ = false;   // in-string quote awaiting one-byte lookahead
+    std::string pend_ws_;   // whitespace held behind the pending quote
+
+    static bool is_ws(char c) { return c==' '||c=='\t'||c=='\r'||c=='\n'; }
+
+    void scan(const std::string& in, std::string& out) {
+        for (size_t i = 0; i < in.size() && state == ARGS; i++) {
+            const char c = in[i];
+            if (pend_q_) {
+                if (is_ws(c)) { pend_ws_ += c; continue; }
+                if (c == ',' || c == '}' || c == ']' || c == ':') {
+                    out += '"'; out += pend_ws_;   // terminator: ws is framing
+                    in_str_ = false;
+                } else {
+                    out += "\\\"";                 // literal: ws is content,
+                    for (char w : pend_ws_)        // escaped in-string
+                        out += w=='\n' ? "\\n" : w=='\r' ? "\\r"
+                             : w=='\t' ? "\\t" : std::string(1, w);
+                }
+                pend_ws_.clear();
+                pend_q_ = false;
+                // fall through: c processes normally in its resolved context
+            }
+            if (esc_) { esc_ = false; out += c; continue; }
+            if (in_str_) {
+                if (c == '\\') { esc_ = true; out += c; continue; }
+                if (c == '"') { pend_q_ = true; continue; }
+                if (c == '\n') { out += "\\n"; continue; }
+                if (c == '\r') { out += "\\r"; continue; }
+                if (c == '\t') { out += "\\t"; continue; }
+                out += c;
+                continue;
+            }
+            out += c;
+            if (c == '"') in_str_ = true;
+            else if (c == '{') depth_++;
+            else if (c == '}' && --depth_ == 0) state = DONE; // outer framing after this is discarded
+        }
+    }
+
+    // 1 = matched (name_out set, consumed = index OF the args '{'),
+    // 0 = undecided (need more bytes), -1 = not this shape (fallback).
+    static int match_head(const std::string& b, std::string& name_out,
+                          size_t& consumed) {
+        size_t i = 0;
+        auto skip = [&]() { while (i < b.size() && is_ws(b[i])) i++; return i < b.size(); };
+        auto lit = [&](const char* s) -> int {
+            for (size_t k = 0; s[k]; k++, i++) {
+                if (i >= b.size()) return 0;
+                if (b[i] != s[k]) return -1;
+            }
+            return 1;
+        };
+        int r;
+        if (!skip()) return 0;
+        if ((r = lit("{")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit("\"name\"")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit(":")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit("\"")) <= 0) return r;
+        std::string nm;
+        for (;; i++) {
+            if (i >= b.size()) return 0;
+            if (b[i] == '\\') return -1;   // escaped names: buffered path
+            if (b[i] == '"') { i++; break; }
+            nm += b[i];
+        }
+        if (nm.empty()) return -1;
+        if (!skip()) return 0;
+        if ((r = lit(",")) <= 0) return r;
+        if (!skip()) return 0;
+        if (b[i] == '"') i++;              // mode-9: opening quote optional
+        if ((r = lit("arguments\"")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit(":")) <= 0) return r;
+        if (!skip()) return 0;
+        if (b[i] != '{') return -1;        // non-object args: buffered path
+        name_out = nm;
+        consumed = i;
+        return 1;
+    }
+};
+
 // Fallback for models that drop the <tool_call> wrapper and emit the call
 // JSON as plain text (observed on long write calls under no-think greedy;
 // llama.cpp's chat parser has the same class of tolerance). Scans for the

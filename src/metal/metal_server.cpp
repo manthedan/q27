@@ -1582,9 +1582,48 @@ int main(int argc,char** argv) {
                                 {"function",{{"name",c.name},{"arguments",c.arguments.dump()}}}}})}},nullptr);
                             tool_counter++;
                         };
+                        // Incremental argument streaming (pre-registered
+                        // 2026-07-17-incremental-tool-call-streaming.md):
+                        // wrapped calls stream production-shape as they
+                        // generate; deviant heads fall back to the buffered
+                        // emit_tool recovery path above, raw byte-exact.
+                        q27::ToolCallStreamer ts;
+                        auto tool_frag_chunk=[&](const std::string& frag){
+                            if(frag.empty()) return;
+                            chunk({{"tool_calls",json::array({{{"index",tool_counter},
+                                {"function",{{"arguments",frag}}}}})}},nullptr);
+                        };
+                        auto close_tool=[&](){
+                            if(!ts.active()) return;
+                            std::string tail;
+                            const bool clean=ts.finalize(&tail);
+                            if(ts.opened) {
+                                tool_frag_chunk(tail);
+                                if(!clean)
+                                    fprintf(stderr,"[tool-stream] streamed call closed "
+                                            "unbalanced (production semantics, sent as-is)\n");
+                                tool_counter++;
+                            } else {
+                                tool_buf=ts.raw;
+                                emit_tool();
+                            }
+                            ts.reset();
+                        };
                         auto emit_seg=[&](q27::StreamSplitter::Chan ch,const std::string& t){
-                            if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
-                            if(!tool_buf.empty()) emit_tool();
+                            if(ch==q27::StreamSplitter::TOOL) {
+                                bool opened=false;
+                                const std::string frag=ts.feed(t,&opened);
+                                if(opened) {
+                                    any_call=true;
+                                    chunk({{"tool_calls",json::array({{{"index",tool_counter},
+                                        {"id","call_metal_"+std::to_string(rid)+"_"+std::to_string(tool_counter)},
+                                        {"type","function"},
+                                        {"function",{{"name",ts.name},{"arguments",""}}}}})}},nullptr);
+                                }
+                                tool_frag_chunk(frag);
+                                return;
+                            }
+                            close_tool();
                             if(t.empty()) return;
                             if(ch==q27::StreamSplitter::THINK) chunk({{"reasoning_content",t}},nullptr);
                             else { text_accum+=t; chunk({{"content",t}},nullptr); }
@@ -1605,6 +1644,7 @@ int main(int argc,char** argv) {
                             },tnames,snap_hint,
                             [sock]{ return httplib::detail::is_socket_alive(sock); },id);
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
+                        close_tool();               // wrapper never closed: finalize
                         if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
                             // Wrapper-less recovery: the text already streamed

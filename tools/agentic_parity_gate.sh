@@ -68,20 +68,31 @@ printf '%s' "$C_ARGS" | python3 -c "import sys,json; json.loads(sys.stdin.read()
 [ "$C_FIN" = "tool_calls" ] && pass "G5 finish_reason=tool_calls" || fail "G5 finish_reason='$C_FIN'"
 
 S5=$(curl -s -H "Content-Type: application/json" --max-time 300 "$BASE/v1/chat/completions" -d "${C_BODY%\}},\"stream\":true}")
-# Full wire-shape check on the streamed tool_calls chunk (codex P3): index,
-# id, type, name, and arguments as a JSON-encoded string that decodes.
+# Full wire-shape check on the streamed tool_calls chunks (codex P3, updated
+# for incremental argument streaming 2026-07-17): production accumulation —
+# the opener chunk carries index/id/type/name, argument STRING FRAGMENTS
+# concatenate across chunks, and the accumulated string must decode to a
+# JSON object. Accepts the whole-in-one-chunk shape too (CUDA server).
 S5_OK=$(printf '%s' "$S5" | python3 -c "
 import sys,json
+calls={}
 ok='NO'
 for line in sys.stdin:
     if not line.startswith('data: ') or line.strip()=='data: [DONE]': continue
     d=json.loads(line[6:])
-    tcs=d.get('choices',[{}])[0].get('delta',{}).get('tool_calls')
-    if not tcs: continue
-    t=tcs[0]
-    if (t.get('index')==0 and t.get('id','').startswith('call_') and
-        t.get('type')=='function' and t['function']['name']=='get_weather' and
-        isinstance(json.loads(t['function']['arguments']),dict)): ok='YES'
+    for t in (d.get('choices',[{}])[0].get('delta',{}).get('tool_calls') or []):
+        c=calls.setdefault(t.get('index'),{'args':''})
+        for k in ('id','type'):
+            if k in t: c[k]=t[k]
+        f=t.get('function',{})
+        if 'name' in f: c['name']=f['name']
+        c['args']+=f.get('arguments','')
+c=calls.get(0)
+try:
+    if (c and c.get('id','').startswith('call_') and c.get('type')=='function'
+        and c.get('name')=='get_weather'
+        and isinstance(json.loads(c['args']),dict)): ok='YES'
+except Exception: pass
 print(ok)
 ")
 [ "$S5_OK" = "YES" ] && pass "G5s delta.tool_calls chunk (full wire shape)" || fail "G5s tool_calls chunk missing/misshapen"
