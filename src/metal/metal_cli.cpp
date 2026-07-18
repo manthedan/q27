@@ -9,10 +9,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <sys/types.h>
+#include <sys/sysctl.h>
 
 namespace {
 
@@ -106,7 +110,8 @@ void print_nll_long_buckets(const std::vector<float>& nll) {
 
 // Same position buckets as the NLL report; values are per-position forward
 // KL in nats against the fp16-KV baseline (whitepaper §4.4 methodology).
-void print_kl_buckets(const std::vector<double>& kl) {
+// `label` distinguishes same-model KV arms from cross-model A/B pairs (A5).
+void print_kl_buckets(const std::vector<double>& kl, const char* label = "KV forward-KL vs fp16 baseline") {
     static const int edges[] = {
         0, 2048, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 163840,
         196608, 229376, 262144, 327680, 1 << 30
@@ -127,8 +132,8 @@ void print_kl_buckets(const std::vector<double>& kl) {
         if (kl[i] > peak[b]) peak[b] = kl[i];
         count[b]++;
     }
-    printf("KV forward-KL vs fp16 baseline by target position (%zu tokens, no resets):\n",
-           kl.size() + 1);
+    printf("%s by target position (%zu tokens, no resets):\n",
+           label, kl.size() + 1);
     for (int b = 0; b < NB; b++) {
         if (!count[b]) continue;
         printf("  %-8s: mean KL %.6g nats  max %.6g  (n=%ld)\n",
@@ -144,6 +149,7 @@ int main(int argc, char** argv) {
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text | --nll file] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width | --suffix-serial width | --oracle width] [--kv fp16|turbo3] "
                 "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-fp8 | --kl-kv-cell N | --kl-kv-except LIST | --kl-kv-stats FILE] [--kv-rt-scale32] [--kv-rt-feature FILE] [--chunk-parity N] "
+                "[--kl-pair MODEL_B --kl-pair-out FILE] "
                 "[--temperature T --top-p P --top-k K --seed S] "
                 "[--save-state file | --load-state file] [--dump-logits file]\n",
                 argv[0]);
@@ -163,6 +169,11 @@ int main(int argc, char** argv) {
         std::string kv_rt_feature, kv_stats_out;
         uint32_t chunk_parity = 0;
         std::string envelope_mode;
+        // A5 cross-model paired-logit KL (2026-07-18-kl-pair-a5.md): argv[1]
+        // is model A (the "p" side, forward-KL convention), --kl-pair's
+        // argument is model B (the "q" side). Two independent mappings,
+        // fp16-KV both, lockstep teacher forcing.
+        std::string kl_pair_path, kl_pair_out;
         for (int i = 3; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--tokens" && i + 1 < argc) token_list = argv[++i];
@@ -211,6 +222,8 @@ int main(int argc, char** argv) {
             }
             else if (arg == "--chunk-parity" && i + 1 < argc) chunk_parity = parse_u32(argv[++i], "--chunk-parity");
             else if (arg == "--envelope" && i + 1 < argc) envelope_mode = argv[++i];
+            else if (arg == "--kl-pair" && i + 1 < argc) kl_pair_path = argv[++i];
+            else if (arg == "--kl-pair-out" && i + 1 < argc) kl_pair_out = argv[++i];
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
@@ -313,9 +326,28 @@ int main(int argc, char** argv) {
         if (kv_except_set && (kv_attrib || kl_self || kv_cell != UINT32_MAX ||
                               !kv_stats_out.empty() || kv_rt_scale32 || !kv_rt_feature.empty()))
             throw std::runtime_error("--kl-kv-except is its own arm; drop other kl-kv arms/modifiers");
+        // A5 cross-model paired-logit KL: its own instrument, fp16-KV on both
+        // sides so the KV codec cannot confound the weight comparison.
+        if (!kl_pair_path.empty()) {
+            if (nll_path.empty())
+                throw std::runtime_error("--kl-pair rides the --nll FILE --nll-long N input path");
+            if (kl_kv || chunk_parity || !envelope_mode.empty() || turbo3_kv)
+                throw std::runtime_error("--kl-pair is its own instrument; drop --kl-kv*/--chunk-parity/--envelope/--kv");
+            if (kv_attrib || kl_self || kv_cell != UINT32_MAX || kv_except_set ||
+                !kv_stats_out.empty() || kv_rt_scale32 || !kv_rt_feature.empty())
+                throw std::runtime_error("--kl-pair cannot be combined with any --kl-kv* arm/modifier");
+            if (mtp_width || suffix_width || oracle_width || eos_gate || sampling.temperature > 0 ||
+                !dump_logits.empty() || !save_state_path.empty() || !load_state_path.empty() ||
+                validate_only || !token_list.empty() || !prompt_text.empty())
+                throw std::runtime_error("--kl-pair is greedy teacher-forced only; drop speculative/sampling/state/prompt/validate modes");
+            if (kl_pair_path == model_path)
+                throw std::runtime_error("--kl-pair needs two distinct models; for same-model plumbing use --kl-kv-self");
+        }
+        if (!kl_pair_out.empty() && kl_pair_path.empty())
+            throw std::runtime_error("--kl-pair-out requires --kl-pair");
         if (nll_path.empty() && !validate_only && token_list.empty() && prompt_text.empty() &&
-            load_state_path.empty())
-            throw std::runtime_error("--tokens, --prompt, --nll, --load-state, or --validate-only is required");
+            load_state_path.empty() && kl_pair_path.empty())
+            throw std::runtime_error("--tokens, --prompt, --nll, --load-state, --kl-pair, or --validate-only is required");
         if (!nll_path.empty() && (mtp_width || suffix_width || oracle_width || sampling.temperature > 0 || !dump_logits.empty()))
             throw std::runtime_error("--nll cannot be combined with speculative/sampling/dump modes");
 
@@ -830,6 +862,125 @@ int main(int argc, char** argv) {
                 if (!ok) throw std::runtime_error("cannot write stats file: " + kv_stats_out);
                 fprintf(stderr, "kl-kv stats: wrote %s (%u positions, 2x16x4x256 features)\n",
                         kv_stats_out.c_str(), n);
+            }
+            return 0;
+        }
+
+        // A5 cross-model paired-logit KL (2026-07-18-kl-pair-a5.md): two
+        // independent mappings, fp16-KV on both, lockstep teacher forcing.
+        // Forward-KL convention: p = model A (argv[1]), q = model B
+        // (--kl-pair's argument). Both engines advance in lockstep over the
+        // same token stream; per-position q27::forward_kl runs on CPU in
+        // double precision exactly as --kl-kv does.
+        if (!kl_pair_path.empty()) {
+            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
+            if (tokens.size() < 2) throw std::runtime_error("--kl-pair needs at least two tokens");
+            if (tokens.size() - 1 > context)
+                throw std::runtime_error("--kl-pair sequence exceeds --ctx; raise --ctx");
+
+            // Memory budget check: refuse to start if the two artifacts plus
+            // a 1 GiB overhead allowance exceed physical memory — fail loudly,
+            // not OOM. (A5 is M4-only; the mini cannot hold official 17 GiB.)
+            const uint64_t bytes_a = std::filesystem::file_size(model_path);
+            const uint64_t bytes_b = std::filesystem::file_size(kl_pair_path);
+            const uint64_t overhead = 1ull << 30;
+            const uint64_t needed = bytes_a + bytes_b + overhead;
+            const uint64_t physical = [] {
+                uint64_t v = 0; size_t s = sizeof(v);
+                if (sysctlbyname("hw.memsize", &v, &s, nullptr, 0) != 0) return (uint64_t)0;
+                return v;
+            }();
+            if (physical && needed > physical) {
+                throw std::runtime_error(
+                    "--kl-pair needs " + std::to_string(needed >> 30) +
+                    " GiB resident (A=" + std::to_string(bytes_a >> 30) +
+                    " GiB, B=" + std::to_string(bytes_b >> 30) +
+                    " GiB, +1 GiB overhead) but the host has " +
+                    std::to_string(physical >> 30) + " GiB");
+            }
+
+            auto shared_a = q27::MetalEngine::open_shared(model_path);
+            auto shared_b = q27::MetalEngine::open_shared(kl_pair_path);
+            q27::MetalEngine engine_a(shared_a, context, false);
+            q27::MetalEngine engine_b(shared_b, context, false);
+            if (serial_prefill) {
+                engine_a.set_chunked_prefill(false);
+                engine_b.set_chunked_prefill(false);
+            }
+            auto ready = std::chrono::steady_clock::now();
+            fprintf(stderr, "kl-pair ready on %s in %.2f s (two mappings: A=%s, B=%s)\n",
+                    engine_a.backend().name().c_str(),
+                    std::chrono::duration<double>(ready - start).count(),
+                    model_path.c_str(), kl_pair_path.c_str());
+            const uint32_t vocab = q27::MetalEngine::vocabulary_size();
+            const uint32_t n = (uint32_t)tokens.size() - 1;
+            fprintf(stderr, "kl-pair: %u positions, single pass, no resets\n", n);
+            std::vector<float> p, q;
+            std::vector<double> kl(n);
+            auto kl_start = std::chrono::steady_clock::now();
+            uint32_t done = 0, chunk_index = 0;
+            while (done < n) {
+                const uint32_t take = std::min(12u, n - done);
+                engine_a.teacher_force_logits(tokens.data() + done, take, p);
+                engine_b.teacher_force_logits(tokens.data() + done, take, q);
+                for (uint32_t r = 0; r < take; r++)
+                    kl[done + r] = q27::forward_kl(p.data() + (size_t)r * vocab,
+                                                   q.data() + (size_t)r * vocab, vocab);
+                done += take;
+                if (++chunk_index % 32 == 0) fprintf(stderr, "  kl pos %u/%u\r", done, n);
+                if (done / 2048 != (done - take) / 2048) {
+                    double running = 0.0;
+                    for (uint32_t i = 0; i < done; i++) running += kl[i];
+                    fprintf(stderr, "  kl pos %u: running mean %.6g nats\n", done, running / done);
+                }
+            }
+            auto kl_done = std::chrono::steady_clock::now();
+            if (n >= 12) fprintf(stderr, "\n");
+            print_kl_buckets(kl, "paired-logit forward-KL A→B");
+            double mean = 0.0, peak = 0.0;
+            uint32_t peak_pos = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                mean += kl[i];
+                if (kl[i] > peak) { peak = kl[i]; peak_pos = i; }
+            }
+            mean /= n;
+            std::vector<double> sorted(kl);
+            std::sort(sorted.begin(), sorted.end());
+            auto quantile = [&](double p) {
+                return sorted[std::min((size_t)((double)n * p), (size_t)n - 1)];
+            };
+            fprintf(stderr, "kl-pair tail: p50 %.4g  p90 %.4g  p99 %.4g  p99.5 %.4g  max %.4g @pos %u\n",
+                    quantile(0.50), quantile(0.90), quantile(0.99), quantile(0.995), peak, peak_pos);
+            for (double thr : {0.1, 0.5}) {
+                uint32_t above = 0, runs = 0, cur = 0, longest = 0, longest_at = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    if (kl[i] > thr) {
+                        if (!cur) runs++;
+                        cur++; above++;
+                        if (cur > longest) { longest = cur; longest_at = i + 1 - cur; }
+                    } else cur = 0;
+                }
+                fprintf(stderr, "kl-pair runs >%.1f: %u positions, %u runs, longest %u", thr, above, runs, longest);
+                if (longest) fprintf(stderr, " @pos %u", longest_at);
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "kl-pair wall: %.2f s (%.2f pos/s through both engines), overall mean KL %.6g nats, max %.6g\n",
+                    std::chrono::duration<double>(kl_done - kl_start).count(),
+                    n / std::chrono::duration<double>(kl_done - kl_start).count(),
+                    mean, peak);
+
+            // Per-position dump for the paired bootstrap CI (A5 ship/kill
+            // line lives on the CI, not the point estimate).
+            if (!kl_pair_out.empty()) {
+                FILE* f = fopen(kl_pair_out.c_str(), "w");
+                if (!f) throw std::runtime_error("cannot open --kl-pair-out: " + kl_pair_out);
+                bool ok = true;
+                for (uint32_t i = 0; i < n; i++)
+                    if (fprintf(f, "%.9g\n", kl[i]) < 0) { ok = false; break; }
+                if (fclose(f) != 0) ok = false;
+                if (!ok) throw std::runtime_error("failed writing --kl-pair-out: " + kl_pair_out);
+                fprintf(stderr, "kl-pair: wrote %u per-position KLs to %s\n", n, kl_pair_out.c_str());
             }
             return 0;
         }
