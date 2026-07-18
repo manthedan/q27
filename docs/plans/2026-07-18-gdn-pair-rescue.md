@@ -193,13 +193,44 @@ consistent with the vendor-B.1 hypothesis that this is a sharp low-entropy
 basin rather than a broad degradation. Per-token NLL cannot see it on
 either box; even the behavioral probe only sees it on one.
 
-**Consequence for any future rescue:** the band-bisection MUST run on the
-mini (where the loop reproduces), not on this M4. Local execution is
-impossible — the phenomenon does not exist here. The pre-registered arms
-P0–P5, the loop detector, and the frozen prompt are unchanged and ready;
-they need a mini session with G1 re-confirmed there first (expected to
-pass, since the mini produced the original loop).
-
-**Evidence:** `logs/gdn-rescue-20260718/` — `probe-p0-*.json` (5 clean
-runs), `server-p0-*.log` (3 configs). The transient P0 pack was
+**Evidence (M4):** `logs/gdn-rescue-20260718/` — `probe-p0-*.json` (5
+clean runs), `server-p0-*.log` (3 configs). The transient P0 pack was
 `/tmp/gdnrescue-p0.q27` (md5 above), deleted after use.
+
+## RESULTS part 2 (2026-07-18, mini G1) — loop does NOT reproduce on the mini either
+
+Following the M4 UNRESOLVED verdict, the mini G1 control was run to
+re-confirm the loop there before any band arm (operator-approved:
+G1-first, escalate only on reproduction). Mini was idle; served the
+**byte-identical** `gdn-pair-experimental` pack (md5 `107647e9…`) at the
+original ship config (ctx 8192, slots 2, mtp 0) and ran the frozen
+constraints probe 3×. **All three runs finished `stop` at 2225 tokens,
+zero repetition spans, valid content** — identical to the M4 result, NOT
+the original loop.
+
+**The loop is gone on the mini too.** The discriminating variable is the
+**serving binary**: the mini's original loop was produced on Jul 17 by the
+pre-merge binary; the mini's binary was rebuilt Jul 18 at a HEAD that now
+includes the merged serving stack (the incremental-streaming / sanitizer
+line: `strip_ctrl` unification c0f5fa4, ToolCallStreamer, and the
+chatml/ChatML stable-boundary work). The byte-identical pack loops under
+the OLD binary and decodes cleanly under the NEW binary, on BOTH boxes.
+
+**Refined mechanism verdict (supersedes the hardware-only read above):**
+the composition-only repetition loop is **not pack-intrinsic and not
+purely GPU-hardware-dependent** — it is **sensitive to the serving/decode
+path**. The most plausible reading is that the loop was a greedy-attractor
+entered through a decode/sanitization artifact that the post-merge serving
+stack no longer produces (the same class of bug the incremental-streaming
+round fixed on the wire). This is strictly better news than the M4-only
+result: the pathology is **not reproducible on current code on either
+machine**, so there is no live hazard to localize.
+
+**Final disposition: UNRESOLVED-as-designed, now CLOSED.** G1 fails on
+both boxes under the current binary, so no band arm (P1–P5) can fire; the
+pre-registered arms, prompt, and detector are retained but the
+investigation is closed because the phenomenon no longer exists on current
+code. If the loop ever recurs, the first diagnostic is a **binary
+bisect** (old ship-run binary vs current), NOT a tensor-band bisect — the
+pack is exonerated. Mini G1 evidence: `logs/gdn-rescue-mini-20260718/` on
+the mini (3 clean probe JSONs + server log); mini left idle.
