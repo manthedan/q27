@@ -132,13 +132,15 @@ stays float-staged (~8% of wall; a split-nibble staging would restore
 exactness at 2× the MMA work — not worth it). Kernel kept in the .metal,
 never routed, verdict in its comment.
 
-**Ship-line bench: PENDING QUIET MACHINE — commit HELD.** the operator was
-actively using the box (WindowServer ~30%, Brave ~25%) and the timing legs
-were uninterpretable: the float baseline itself swung 23.44 → 18.26 tok/s
-between runs; half read 21.39/18.69/20.76 across three runs (a 960-token
-profiled pair suggested ~1.35×, hot 8352 back-to-back ~1.0×). Per the
-pre-registered band ("8352/96, quiet"), no promotion on contaminated
-numbers: a watcher (verdict file logs/q4port-20260717/quiet_bench.verdict)
-waits for ≥10 min input idle, stops the T2 server, runs float/half at 8352
-(×2) and 960, restarts the server. ≥1.7× ships default-ON; <1.7× ships
-nothing but the parked kernels + this honest table, per the kill line.
+**Ship-line bench: PENDING VALID QUIET RERUN.** The operator was actively
+using the box (WindowServer ~30%, Brave ~25%), and the initial timing legs
+were uninterpretable. A later invocation measured 0.855× but was forced
+with `idle>=0s`; its generated `machine idle>=10min` label was therefore
+false. That invocation is explicitly rejected and quarantined in
+`logs/q4port-20260717/QUIET_BENCH_EVIDENCE.md`. Per the pre-registered
+"8352/96, quiet" band, it proves neither SHIP nor PARK. The half route
+remains default-off. The hardened watcher publishes
+`logs/q4port-20260717/quiet_bench.verdict` only after ≥10 min input idle,
+all six finite legs, baseline sanity, one-model residency, and a verified
+restart of the intended T2 server. ≥1.7× ships default-ON; a valid <1.7×
+parks it.

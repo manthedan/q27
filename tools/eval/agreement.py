@@ -81,12 +81,13 @@ def main(argv=None):
 
     ex = EXTRACTORS[args.mode]
     a_items, b_items = load_jsonl(args.file_a), load_jsonl(args.file_b)
-    keys = sorted(set(a_items) & set(b_items), key=str)
-    only_a = len(a_items) - len(keys)
-    only_b = len(b_items) - len(keys)
-    if not keys:
-        sys.exit("no shared prompt_ids between %s and %s"
-                 % (args.file_a, args.file_b))
+    a_keys, b_keys = set(a_items), set(b_items)
+    if a_keys != b_keys:
+        only_a, only_b = len(a_keys - b_keys), len(b_keys - a_keys)
+        print("INPUT FAIL: prompt_id sets differ (%d only in A, %d only in B)"
+              % (only_a, only_b), file=sys.stderr)
+        return 2
+    keys = sorted(a_keys, key=str)
 
     n_agree = n_none_a = n_none_b = n_none_both = 0
     for k in keys:
@@ -103,8 +104,6 @@ def main(argv=None):
     rate = n_agree / len(keys)
     print("pairs=%d agree=%d rate=%.4f none_a=%d none_b=%d none_both=%d"
           % (len(keys), n_agree, rate, n_none_a, n_none_b, n_none_both))
-    if only_a or only_b:
-        print("unpaired: %d only in A, %d only in B" % (only_a, only_b))
     if args.min_rate is not None and rate < args.min_rate:
         print("GATE FAIL: rate %.4f < min-rate %.4f" % (rate, args.min_rate))
         return 1

@@ -57,20 +57,23 @@ before they run, and negative results are recorded with their mechanisms.
 The parked list is as load-bearing as the shipped list.
 
 - **CUDA** is the production backend. On a 5090 it is the fastest engine
-  we have measured on this model by a wide margin (see Speed). On 24 GB
-  3090-class cards the width-8 server build serves 131K context with
-  turbo3 KV. A live regression stands, though. After the conductor merge,
-  the server OOMs in `cudaGraphInstantiate` on 24 GB even at w8. A
-  pre-merge w8 build still serves, the merged CLI passes the canonical
-  gate, and the fix direction (lazy graph families) is recorded. Until it
-  lands, treat merged-*server* 3090 support as broken.
+  we have measured on this model by a wide margin (see Speed). On the 24 GB
+  3090, the merged width-8 server is validated at 16K context: it boots at
+  23,230–23,232 MiB and passes the canonical gate. The older pre-merge w8
+  build served 131K with turbo3 KV; the merged 131K fit leg remains to run.
+  Width 12 exceeds the card because its prebuilt graph families add
+  ~980 MiB, a build-width limit rather than a server regression.
 - **Metal** is mature for single-request use on base M4 and serves two
   slots. It has layer-major prefill to width 96, decode at 98–99% of its
   own resident-weight ceiling, factor-2 tiled GQA attention, batched MTP
   and suffix-burst speculation, batched verification to width 48, disk
   prefix snapshots, and a fair two-slot scheduler with full memory
-  admission accounting. Multi-slot MTP on the official tier and the
-  numerical-envelope constants are still provisional.
+  admission accounting. The ledger records an official-tier two-slot MTP
+  pass (813 committed tokens over 281 rounds), but its raw multislot harness
+  output is not committed, so release status remains provisional pending an
+  evidence-publishing rerun. The numerical-envelope constants are also
+  provisional. The mixed M1 candidate owes its own amended two-slot and
+  product gates.
 - **Continuous batching** (CUDA) passed its bars (1.31–1.35× two-slot
   aggregate) but ships default-off pending live validation.
 
@@ -108,7 +111,7 @@ and the ternary tier is repacked from PrismML's QAT pack:
 | q6 (6.0 bpw) | `qwen36-27b-mtp-q6.q27` | larger | 32 GB | +0.35% PPL margin over Q5_K_M |
 | q6k (6.8 bpw) | `qwen36-27b-mtp-q6k.q27` | larger | 32 GB | GGUF-matching quality, ~10% slower |
 | **T2 ternary** (2.25 bpw) | repack of `Ternary-Bonsai-27B-Q2_0.gguf` | 7.15 GB | 16 GB Mac | fully-resident 27B on small machines; ~2.1–2.3× PPL vs official, task quality holds |
-| **M1 mixed** | `bonsai-27b-m1.q27` | 3.83 GB | 16 GB Mac | B1-size serving point with 48% of the B1→T2 NLL gap closed; full ship gate passed |
+| **M1 candidate** (mixed; not shipped) | `bonsai-27b-m1.q27` | 3.83 GB | 16 GB Mac | closes 48% of the B1→T2 NLL gap and passes suffix/probes; capability, KL, direct-decode, multislot, and 131K gates remain |
 | B1 binary (1.125 bpw) | `bonsai-27b-b1.q27` | 3.79 GB | 16 GB Mac | smallest fully-resident tier; full quality/probe battery passed |
 
 ```bash
@@ -125,13 +128,14 @@ losslessly (bit-exact round-trip gated) with:
 python3 tools/repack.py Ternary-Bonsai-27B-Q2_0.gguf ternary-bonsai-27b-t2.q27
 ```
 
-M1 is a byte-level graft of the companion B1/T2 checkpoints: B1 bulk plus
-T2 GDN alpha/beta and attention-Q in blocks 21–42. Its 8K NLL, suffix
-byte-identity battery, and 4/4 behavioral probes are recorded in
+The provisional M1 candidate is a byte-level graft of the companion B1/T2
+checkpoints: B1 bulk plus T2 GDN alpha/beta and attention-Q in blocks 21–42.
+Its 8K NLL, suffix byte-identity battery, 4/4 behavioral probes, and the
+later gates that still block a ship claim are recorded in
 [`docs/plans/2026-07-17-mixed-tier-census.md`](docs/plans/2026-07-17-mixed-tier-census.md).
 
-Verify every download against its `CHECKSUMS.md5`. Fine-tune variant of
-the official model: `signalnine/Qwopus3.6-27B-v2-MTP-q27`.
+Verify every download against its `CHECKSUMS.md5`. The fine-tune variant
+of the official model is `signalnine/Qwopus3.6-27B-v2-MTP-q27`.
 
 ## Speed
 
@@ -141,7 +145,7 @@ CUDA numbers are upstream's, re-validated on this fork byte-exactly.
 | machine | tier | decode | notes |
 |---|---|---|---|
 | RTX 5090 | default | **202.7 t/s** agentic (231–246 t/s aggregate) | fused MTP + SuffixDraft verify; 12 pinned SWE-bench instances under Claude Code |
-| RTX 3090 (24 GB) | default + turbo3 KV | **102.2 t/s** median | w8 server, 131K context |
+| RTX 3090 (24 GB) | default + turbo3 KV | **102.2 t/s** median | pre-merge w8 server, 131K context; merged w8 fit validated at 16K |
 | M4 (24 GB) | default | ~12.5 t/s | batched MTP, 58.5% acceptance |
 | M4 (16 GB mini) | T2 | ~11.7 t/s greedy | 99% of the machine's own resident-weight ceiling |
 | M4 (24 GB) | B1 | **~18.7 t/s** greedy warm | memory wall: 3.36 GiB/token @ ~69 GB/s; select round 2 shipped (kernel 2.36×, wall noise — strictly dominates) |
@@ -187,7 +191,8 @@ a first-class subsystem.
 `Q27_KV=turbo3`, a 50-byte transformed KV codec, keeps the full
 262,144-token native window practical. On CUDA it is validated flat to
 361K tokens (needle 6/6 at depths beyond native, NLL buckets flat to
-256K) and it promotes a 24 GB 3090 from a 32K box to a 131K box. On
+256K). The pre-merge w8 server used it to promote a 24 GB 3090 from a
+32K box to a 131K box; the merged w8 server's 131K fit leg is pending. On
 Metal, 32K NLL is depth-flat (PPL 5.318 single-pass) with 6/6 needle
 retrieval, and tail-focused codec allocation is the active KV-quality
 frontier. Disk prefix snapshots restore a 2,346-token prefix byte-exactly
@@ -278,8 +283,8 @@ from other machines or containers requires an explicit `--host 0.0.0.0`.
 
 - **CUDA:** one dual-arch binary (sm_86 + sm_120). fp8-KV and e4m3 MMA
   need sm_89+, while Ampere runs fp16-MMA verify with fp16 or turbo3
-  KV. 24 GB cards use the `q27-server-w8` build (and see the regression
-  note under Status).
+  KV. 24 GB cards use the `q27-server-w8` build; width 12 exceeds the
+  measured graph-memory envelope.
 - **Metal:** developed and gated on base M4, at 24 GB and 16 GB.
   Everything targets plain `simdgroup_matrix`, with no Metal-4
   cooperative-tensor dependence. The official tier wants a 24 GB

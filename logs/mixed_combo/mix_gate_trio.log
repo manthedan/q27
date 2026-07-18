@@ -1,0 +1,15 @@
+mix: 149 tensors from donor, 702 from base, byte delta +356.8 MB
+  take blk.0.attn_qkv.weight
+  take blk.0.ssm_alpha.weight
+  take blk.0.ssm_beta.weight
+  take blk.1.attn_qkv.weight
+  take blk.1.ssm_alpha.weight
+  take blk.1.ssm_beta.weight
+  take blk.2.attn_qkv.weight
+  take blk.2.ssm_alpha.weight
+  take blk.2.ssm_beta.weight
+  take blk.4.attn_qkv.weight
+  ... and 139 more
+mix: wrote models/combo_arm.24492.q27
+Metal model ready on Apple M4 in 1.00 s
+artifacts and Metal architecture: OK

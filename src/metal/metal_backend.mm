@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <CommonCrypto/CommonDigest.h>
 #include "metal_backend.h"
 
 #include <algorithm>
@@ -64,6 +65,18 @@ uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_si
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
 constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 13";
+
+std::string source_sha1(NSString* source) {
+    NSData* data=[source dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(data.bytes,(CC_LONG)data.length,digest);
+    static const char hex[]="0123456789abcdef";
+    std::string out(40,'0');
+    for(int i=0;i<CC_SHA1_DIGEST_LENGTH;i++) {
+        out[2*i]=hex[digest[i]>>4]; out[2*i+1]=hex[digest[i]&15];
+    }
+    return out;
+}
 
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
@@ -173,6 +186,7 @@ struct KvStoreHeadRowsArgs { uint32_t position, src_stride, row_length, tokens, 
 } // namespace
 
 struct MetalBackend::Impl {
+    std::string shader_hash;
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
@@ -192,10 +206,11 @@ struct MetalBackend::Impl {
     // reproduces the float-staged routes (used to attribute the kl-kv
     // calibration shift to the digit, 2026-07-16-kv-codec-step1.md).
     bool gemm_half = true;
-    // Q4 half port PARKED at its pre-registered ship line (2026-07-17-t2-
-    // prefill-throughput.md asked >=1.7x; the quiet bench measured 0.855 —
-    // logs/q4port-20260717/quiet_bench.verdict). Correctness-gated but
-    // wall-negative: probe knob only, never the default.
+    // Q4 half port remains probe-only pending a valid quiet gate
+    // (2026-07-17-t2-prefill-throughput.md asks >=1.7x). The 0.855 run was
+    // forced with idle>=0 and is explicitly rejected in
+    // logs/q4port-20260717/QUIET_BENCH_EVIDENCE.md. Correctness-gated;
+    // never the default until a valid quiet run clears the ship line.
     bool gemm_half_q4 = false;
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> q8_quantized;
@@ -581,7 +596,9 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
 #pragma clang diagnostic pop
         }
         NSError* error = nil;
-        impl_->library = [impl_->device newLibraryWithSource:load_kernel_source()
+        NSString* kernel_source=load_kernel_source();
+        impl_->shader_hash=source_sha1(kernel_source);
+        impl_->library = [impl_->device newLibraryWithSource:kernel_source
                                                       options:options
                                                         error:&error];
         if (!impl_->library)
@@ -614,8 +631,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
-            // q27_matmul_q4_mm_h is PARKED (0.855x vs the 1.7x ship line) and
-            // routes only under Q27_METAL_GEMM_HALF_Q4=1 — built lazily on
+            // q27_matmul_q4_mm_h is probe-only pending its valid quiet gate
+            // and routes only under Q27_METAL_GEMM_HALF_Q4=1 — built lazily on
             // first use so production startup never compiles it (same pattern
             // as the probe-only q4_r2_p/b1_r3_p PSOs).
             impl_->b1_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_b1_mm");
@@ -745,6 +762,15 @@ MetalBackend::~MetalBackend() {
 std::string MetalBackend::name() const {
     return std::string(impl_->device.name.UTF8String);
 }
+
+const char* MetalBackend::shader_abi_tag() { return kShaderAbiTag; }
+
+std::string MetalBackend::shader_source_sha1() const { return impl_->shader_hash; }
+bool MetalBackend::gemm_half_enabled() const { return impl_->gemm_half; }
+bool MetalBackend::gemm_half_q4_enabled() const { return impl_->gemm_half_q4; }
+uint32_t MetalBackend::gqa_tile() const { return impl_->gqa_tile; }
+uint32_t MetalBackend::gqa_block() const { return impl_->gqa_block; }
+uint32_t MetalBackend::gqa_threshold() const { return impl_->gqa_threshold; }
 
 std::shared_ptr<BackendBuffer> MetalBackend::allocate(uint64_t bytes) {
     if (!bytes || bytes > (uint64_t)impl_->device.maxBufferLength ||
@@ -1244,8 +1270,8 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
     @autoreleasepool {
         // Q27_METAL_GEMM_HALF=1: half-staging T2 GEMM (A/B lever, see
         // docs/plans/2026-07-15-gemm-half-staging.md). Q4's half twin is
-        // PARKED (correctness-gated, wall-negative 0.855x at its >=1.7x
-        // ship line — logs/q4port-20260717/quiet_bench.verdict); probe knob
+        // correctness-gated but default-off pending its valid >=1.7x quiet
+        // ship-line run (QUIET_BENCH_EVIDENCE.md rejects the idle>=0 run);
         // Q27_METAL_GEMM_HALF_Q4=1 routes it for re-measurement only. Q8
         // stays on the float-staged kernel: its half variant failed the
         // shape suite (5.5e-4 at the high-cancellation 33x5120 repro vs the

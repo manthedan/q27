@@ -36,35 +36,62 @@ B_TEXT_BODY="{\"model\":\"q27-metal\",\"max_output_tokens\":64,\"input\":\"Say h
 SB=$(curl -s -H "Content-Type: application/json" --max-time 300 "$BASE/v1/responses" -d "$B_TEXT_BODY")
 printf '%s' "$SB" | python3 -c "
 import sys,json
-types=[]
+e=[]
 for line in sys.stdin:
     if not line.startswith('data: '): continue
-    try: types.append(json.loads(line[6:])['type'])
+    try: e.append(json.loads(line[6:]))
     except Exception: pass
-def first(t): return types.index(t) if t in types else -1
-added=first('response.output_item.added')
-part=first('response.content_part.added')
-delta=first('response.output_text.delta')
-done=first('response.output_item.done')
-comp=first('response.completed')
-ok = added>=0 and part>=0 and delta>added and delta>part and done>delta and comp>done
-print('ORDER-OK' if ok else 'ORDER-BAD:'+','.join(types[:12]))
-" | grep -q "ORDER-OK" && pass "G8b(i) added+content_part.added precede first output_text.delta" || { fail "G8b(i) lifecycle ordering wrong"; printf '%s' "$SB" | head -20; }
+def find(pred):
+    return next((i for i,x in enumerate(e) if pred(x)),-1)
+a=find(lambda x:x.get('type')=='response.output_item.added' and x.get('item',{}).get('type')=='message')
+if a<0: print('ORDER-BAD:no-message-added'); raise SystemExit
+idx=e[a].get('output_index'); iid=e[a].get('item',{}).get('id')
+p=find(lambda x:x.get('type')=='response.content_part.added' and x.get('output_index')==idx and x.get('item_id')==iid)
+d=find(lambda x:x.get('type')=='response.output_text.delta' and x.get('output_index')==idx and x.get('item_id')==iid)
+z=find(lambda x:x.get('type')=='response.output_item.done' and x.get('output_index')==idx and x.get('item',{}).get('id')==iid)
+c=find(lambda x:x.get('type')=='response.completed')
+ok=a<p<d<z<c
+print('ORDER-OK' if ok else 'ORDER-BAD:%s'%[(x.get('type'),x.get('output_index')) for x in e[:16]])
+" | grep -q "ORDER-OK" && pass "G8b(i) same message item added+part precede delta and done" || { fail "G8b(i) message lifecycle ordering wrong"; printf '%s' "$SB" | head -20; }
 printf '%s' "$SB" | grep -q '"response.completed"' && pass "G8b(i) response.completed terminator" || fail "G8b(i) no response.completed"
+
+# Reasoning-producing leg: every reasoning done must pair with its own added.
+B_REASON_BODY='{"model":"q27-metal","max_output_tokens":256,"input":"Think step by step about 17 times 19, then give the answer.","stream":true}'
+SR=$(curl -s -H "Content-Type: application/json" --max-time 300 "$BASE/v1/responses" -d "$B_REASON_BODY")
+printf '%s' "$SR" | python3 -c "
+import sys,json
+e=[]
+for line in sys.stdin:
+    if not line.startswith('data: '): continue
+    try: e.append(json.loads(line[6:]))
+    except Exception: pass
+adds={(x.get('output_index'),x.get('item',{}).get('id')):i for i,x in enumerate(e)
+      if x.get('type')=='response.output_item.added' and x.get('item',{}).get('type')=='reasoning'}
+dones=[((x.get('output_index'),x.get('item',{}).get('id')),i) for i,x in enumerate(e)
+       if x.get('type')=='response.output_item.done' and x.get('item',{}).get('type')=='reasoning']
+ok=bool(dones) and all(k in adds and adds[k]<i for k,i in dones)
+print('REASON-OK' if ok else 'REASON-BAD:adds=%r dones=%r'%(adds,dones))
+" | grep -q "REASON-OK" && pass "G8b(i-r) reasoning items have paired added-before-done lifecycle" || { fail "G8b(i-r) reasoning lifecycle missing/mispaired"; printf '%s' "$SR" | head -24; }
 
 # ---- G8b(ii): stream tool leg — done carries function_call; completed carries output+usage ----
 B_TOOL_BODY="{\"model\":\"q27-metal\",\"max_output_tokens\":400,\"tools\":$TOOLS_RESP,\"input\":\"$ASK\",\"stream\":true}"
 ST=$(curl -s -H "Content-Type: application/json" --max-time 300 "$BASE/v1/responses" -d "$B_TOOL_BODY")
 DONE_FC=$(printf '%s' "$ST" | python3 -c "
 import sys,json
+e=[]
 for line in sys.stdin:
     if not line.startswith('data: '): continue
-    try: d=json.loads(line[6:])
-    except Exception: continue
-    if d.get('type')=='response.output_item.done' and d.get('item',{}).get('type')=='function_call':
-        print(d['item'].get('name','')); break
+    try: e.append(json.loads(line[6:]))
+    except Exception: pass
+adds={(x.get('output_index'),x.get('item',{}).get('id')) for x in e
+      if x.get('type')=='response.output_item.added'}
+dones=[x for x in e if x.get('type')=='response.output_item.done']
+paired=all((x.get('output_index'),x.get('item',{}).get('id')) in adds for x in dones)
+fc=next((x.get('item',{}).get('name','') for x in dones
+         if x.get('item',{}).get('type')=='function_call'),'')
+print(('OK:' if paired else 'UNPAIRED:')+fc)
 ")
-[ "$DONE_FC" = "get_weather" ] && pass "G8b(ii) output_item.done carries the function_call" || { fail "G8b(ii) no function_call done item: '$DONE_FC'"; printf '%s' "$ST" | tail -6; }
+[ "$DONE_FC" = "OK:get_weather" ] && pass "G8b(ii) paired added/done carries function_call" || { fail "G8b(ii) missing/unpaired function_call lifecycle: '$DONE_FC'"; printf '%s' "$ST" | tail -12; }
 COMP_OK=$(printf '%s' "$ST" | python3 -c "
 import sys,json
 for line in sys.stdin:

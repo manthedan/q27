@@ -17,9 +17,11 @@ answers created.
   practical DRAM stream; ~2.5–2.65 TFLOP effective simdgroup-MMA plateau
   (no Metal-4 cooperative tensors); the physics frames everything below.
 - **Decode is at the wall on every tier we serve.** T2 (ternary 2.125 bpw,
-  7.15 GB): 8.2–9.4 tok/s observed, 12.4 resident ceiling, GEMV at 93–97
-  GB/s — at the stream bound, parity with the vendor's own fork on the
-  same pack (8.41 ± 1.36). B1 (binary 1.125 bpw, 3.79 GB): **18.6–18.8
+  7.15 GB): ~11.7 tok/s on the current mini measurement, within a few
+  percent of the same-state resident ceiling; GEMV is at the stream bound.
+  The older 8.2–9.4 vs 12.4 comparison was launch-paging/thermal
+  contaminated and is historical only. B1 (binary 1.125 bpw, 3.79 GB):
+  **18.6–18.8
   tok/s warm**, ceiling 19.2 — memory wall 3.36 GiB/token at ~69 GB/s.
 - **Prefill closed as MATURE:** 47.2 tok/s on the synthetic T2 mix vs the
   vendor fork's 52.48 — 7% gap, attribution recorded (MMA-plateau-bound;
@@ -38,9 +40,12 @@ answers created.
 - **The headline experiment:** a mixed-tier census (checkpoint grafting,
   B1 pack + selected T2 tensor classes). `gdn_qkv` alone recovered
   **114.4%** of the B1→T2 NLL gap at +314.6 MB; `gdn_alphabeta` 46.9% at
-  +2.9 MB; nearly every other lone class swap negative. A ~4.1 GB mixed
-  pack at ≥T2 quality — decoding ~17–19 tok/s — is the serving candidate
-  the combination arm now gates.
+  +2.9 MB; nearly every other lone class swap negative. Subsequent gates
+  supersede this brief's original candidate: the ~4.11 GB `gdn_pair` won
+  NLL but failed the constraints probe and is experimental only. The
+  3.83 GB `cheap_pair` is the provisional M1 candidate; direct decode,
+  A5/A6, two-slot, and 131K gates remain, so no decode rate or serving
+  claim is attached yet.
 - **Serving:** native Anthropic Messages + OpenAI chat/completions +
   `/v1/responses` (full Codex CLI lifecycle, validated end-to-end); disk
   prefix snapshots (8.1 s vs 4:54 cold at 8.3K tokens; cancel-banking

@@ -1,0 +1,2 @@
+constrain-tools: grammar-locked <tool_call> bodies (open=248058 close=248059)
+q27 Metal server listening on http://127.0.0.1:8123 (ctx=8192, kv=fp16, mtp=0, slots=2)

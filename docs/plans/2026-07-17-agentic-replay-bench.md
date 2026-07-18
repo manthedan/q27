@@ -22,9 +22,13 @@ every future number is comparable:
   p95 beside the headline (a single scalar hides the snapshot story,
   our main differentiator).
 - **context throughput** = total prompt tokens / total TTFT.
-- Token accounting is exact via the replay server's own trace
-  (id-join); turns without exact accounting are reported as unpriced,
-  never silently approximated.
+- Token accounting and terminal cause are exact via the replay server's
+  own trace (boot-unique id join). A missing join, output-count mismatch,
+  or terminal-cause mismatch invalidates the run; nothing is approximated.
+  The runner accepts only a proxy-disabled literal loopback origin, captures
+  artifact/build/shader/tokenizer/config/platform/boot plus the install-local
+  evaluation host identity, rechecks server identity after all turns, and
+  embeds that provenance in the summary.
 
 ## Mechanics (tools/, all stdlib, selftested)
 
@@ -36,12 +40,15 @@ every future number is comparable:
   comparable across packs/commits, stated in the writeup. Drops are
   counted, never silent: truncated rendered (64 KB trace cap),
   cancelled/errored turns, sub-512-token prompts (gate fixtures),
-  non-generation apis. max_tokens = the turn's recorded output_tokens
-  (replay cost matches the recorded turn shape; greedy may EOS early).
+  non-generation apis. The corpus retains max_tokens, sampling controls,
+  stop sequences, constrained-tool names, output count, terminal cause, source
+  boot ID, and full source model/runtime identity; incompatible source boots
+  fail extraction. Replay sends controls verbatim and must reproduce
+  count/cause exactly.
 - `agentic_replay_bench.py` — the serial replay runner + summary.
   AUTHORED AND MOCK-TESTED ONLY; a model consumer under
   COORDINATION.md (coordinated GPU slot, owner expects the traffic).
-- `agentic_replay_selftest.py` — 11 checks incl. must-fail directions
+- `agentic_replay_selftest.py` — 18 checks incl. must-fail directions
   (all-filtered corpus exit 2, dead server nonzero, empty corpus
   nonzero); ALL PASS.
 

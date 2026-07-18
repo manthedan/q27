@@ -1,0 +1,10 @@
+Metal model ready on Apple M4 in 1.12 s
+suffix round: live 16 accepted 15 committed 16
+suffix round: live 16 accepted 15 committed 16
+suffix round: live 16 accepted 15 committed 16
+suffix round: live 16 accepted 15 committed 16
+suffix round: live 16 accepted 15 committed 16
+suffix round: live 16 accepted 15 committed 16
+96 tokens in 3.36 s (28.60 tok/s), position 154
+speculation: 6 rounds, 90 drafts, 90 accepted (100.0%)
+suffix bursts: 6 fired (6 @<=16 lanes, 0 @32, 0 @48), 0 serial-fallback rounds

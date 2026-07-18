@@ -15,6 +15,13 @@ class MetalBackend final : public ComputeBackend {
     MetalBackend& operator=(const MetalBackend&) = delete;
 
     std::string name() const override;
+    static const char* shader_abi_tag();
+    std::string shader_source_sha1() const;
+    bool gemm_half_enabled() const;
+    bool gemm_half_q4_enabled() const;
+    uint32_t gqa_tile() const;
+    uint32_t gqa_block() const;
+    uint32_t gqa_threshold() const;
     std::shared_ptr<BackendBuffer> allocate(uint64_t bytes) override;
     // GPU-private allocation (never host-read/written): used for the
     // engines' blocked-GQA partials scratch.

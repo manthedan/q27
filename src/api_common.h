@@ -20,6 +20,15 @@
 namespace q27 {
 using json = nlohmann::json;
 
+// nlohmann::json::value() does not use its default when a key exists with
+// JSON null; get<T>() throws instead. API clients (notably pi) send
+// max_tokens:null to mean "unspecified", so nullable scalar options need an
+// explicit helper. Non-null type errors remain loud.
+inline int64_t json_i64_or(const json& body, const char* key, int64_t dflt) {
+    auto it = body.find(key);
+    return it == body.end() || it->is_null() ? dflt : it->get<int64_t>();
+}
+
 // Incremental UTF-8 boundary gate for streaming token pieces. BPE token
 // boundaries can split a multi-byte character (em dash E2 80 94 is a Qwopus
 // favorite), the raw piece is then invalid UTF-8, and nlohmann json::dump
@@ -354,6 +363,34 @@ inline std::string strip_ws2(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
+// Minimal JSON structural context for mode-10 quote repair. A colon can
+// terminate a quoted OBJECT KEY, but inside a string VALUE it is ordinary
+// content (for example the raw shell fragment `echo "key": value`).
+struct JsonQuoteContext {
+    struct Frame { char kind; bool expect_key; };
+    std::vector<Frame> stack;
+    bool opening_string_is_key() const {
+        return !stack.empty() && stack.back().kind=='{' && stack.back().expect_key;
+    }
+    void structural(char c) {
+        if(c=='{') stack.push_back({'{',true});
+        else if(c=='[') stack.push_back({'[',false});
+        else if(c=='}') { if(!stack.empty() && stack.back().kind=='{') stack.pop_back(); }
+        else if(c==']') { if(!stack.empty() && stack.back().kind=='[') stack.pop_back(); }
+        else if(c==':' && !stack.empty() && stack.back().kind=='{') stack.back().expect_key=false;
+        else if(c==',' && !stack.empty() && stack.back().kind=='{') stack.back().expect_key=true;
+    }
+};
+
+inline bool quote_terminates_string(const std::string& s, size_t j, bool string_is_key) {
+    for (size_t k = j + 1; k < s.size(); k++) {
+        char c = s[k];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        return string_is_key ? c == ':' : (c == ',' || c == '}' || c == ']');
+    }
+    return true; // preserve the end-of-buffer truncation rule
+}
+
 // Incremental tool-call argument streamer (pre-registered:
 // docs/plans/2026-07-17-incremental-tool-call-streaming.md). Feeds the
 // splitter's TOOL-channel bytes as they decode; once the call head parses
@@ -369,13 +406,14 @@ inline std::string strip_ws2(const std::string& s) {
 // client unbalanced (production semantics — the model's bytes are the
 // model's bytes); end-of-call repair applies only to un-streamed calls.
 struct ToolCallStreamer {
-    enum State { HEAD, ARGS, DONE, FALLBACK };
+    enum State { HEAD, ARGS, DONE, INVALID_DONE, FALLBACK };
     State state = HEAD;
     std::string raw;      // entire body verbatim (fallback + logging)
     std::string name;     // valid once opened
     bool opened = false;  // head parsed; an opener chunk belongs on the wire
 
     bool active() const { return !raw.empty(); }
+    bool invalid() const { return invalid_done_; }
     void reset() { *this = ToolCallStreamer(); }
 
     // Feed body bytes; returns the sanitized argument fragment to stream
@@ -383,7 +421,7 @@ struct ToolCallStreamer {
     std::string feed(const std::string& t, bool* opened_now) {
         if (opened_now) *opened_now = false;
         raw += t;
-        if (state == DONE) { add_trail(t); return ""; }
+        if (state == DONE || state == INVALID_DONE) { add_trail(t); return ""; }
         if (state == FALLBACK) return "";
         std::string out;
         if (state == HEAD) {
@@ -401,9 +439,13 @@ struct ToolCallStreamer {
             std::string rest = head_.substr(consumed);
             head_.clear();
             scan(rest, out);
+            sanitized_ += out;
+            validate_done();
             return out;
         }
         scan(t, out);
+        sanitized_ += out;
+        validate_done();
         return out;
     }
 
@@ -434,8 +476,11 @@ struct ToolCallStreamer {
   private:
     std::string head_;
     std::string trail_;
+    std::string sanitized_;
+    bool invalid_done_ = false;
     int depth_ = 0;
-    bool in_str_ = false, esc_ = false;
+    bool in_str_ = false, esc_ = false, string_is_key_ = false;
+    JsonQuoteContext json_ctx_;
     bool pend_q_ = false;   // in-string quote awaiting one-byte lookahead
     bool pend_tag_ = false; // full </content> matched, awaiting the same lookahead
     bool outer_seen_ = false; // the call object's OWN closing } consumed from the trail
@@ -458,6 +503,20 @@ struct ToolCallStreamer {
 
     static bool is_ws(char c) { return c==' '||c=='\t'||c=='\r'||c=='\n'; }
 
+    void validate_done() {
+        if(state!=DONE) return;
+        try {
+            json parsed=json::parse(sanitized_);
+            if(!parsed.is_object()) throw std::runtime_error("tool arguments are not an object");
+        } catch(...) {
+            invalid_done_=true;
+            // The opener is already on wire, so this is not an ordinary
+            // buffered fallback. Preserve all later feeds as recovery trail
+            // for packed calls that start in a subsequent token.
+            state=INVALID_DONE;
+        }
+    }
+
     void scan(const std::string& in, std::string& out) {
         for (size_t i = 0; i < in.size() && state == ARGS; ) {
             const char c = in[i];
@@ -476,7 +535,7 @@ struct ToolCallStreamer {
                     if (tag_.size() == wl) {
                         tag_.clear();
                         if (in_str_) pend_tag_ = true;       // shape 2: lookahead decides
-                        else { out += '"'; in_str_ = true; } // shape 1: value opens as string
+                        else { out += '"'; in_str_ = true; string_is_key_ = false; } // shape 1: value opens as string
                     }
                     continue;
                 }
@@ -486,7 +545,9 @@ struct ToolCallStreamer {
             }
             if (pend_q_ || pend_tag_) {
                 if (is_ws(c)) { pend_ws_ += c; i++; continue; }
-                if (c == ',' || c == '}' || c == ']' || c == ':') {
+                const bool terminates = string_is_key_ ? c == ':'
+                    : (c == ',' || c == '}' || c == ']');
+                if (terminates) {
                     out += '"'; out += pend_ws_;   // terminator: ws is framing
                     in_str_ = false;
                 } else {
@@ -513,11 +574,16 @@ struct ToolCallStreamer {
             }
             if (c == '<') { tag_ += c; i++; continue; } // never valid JSON here
             out += c; i++;
-            if (c == '"') in_str_ = true;
-            else if (c == '{') depth_++;
-            else if (c == '}' && --depth_ == 0) {
-                state = DONE;
-                add_trail(in.substr(i)); // possible packed second call, not framing
+            if (c == '"') {
+                string_is_key_ = json_ctx_.opening_string_is_key();
+                in_str_ = true;
+            } else {
+                json_ctx_.structural(c);
+                if (c == '{') depth_++;
+                else if (c == '}' && --depth_ == 0) {
+                    state = DONE;
+                    add_trail(in.substr(i)); // possible packed second call, not framing
+                }
             }
         }
     }
@@ -762,20 +828,9 @@ inline std::string infer_tool_name_unwrapped(const json& tools, json& args) {
 
 // Drift mode 10 (2026-07-17, pi live traffic, T2 tier): unescaped double
 // quotes inside a string value — shell quoting written verbatim into the
-// command string (`... || echo "empty dir"`). In valid JSON a closing quote
-// is always followed — past whitespace — by one of , } ] : or end-of-buffer,
-// so a quote followed by anything else cannot terminate the string: treat it
-// as literal content and re-escape it. Valid JSON is preserved exactly (its
-// closing quotes all satisfy the lookahead); EOF right after a quote stays a
-// terminator so the truncation-repair path sees the same framing as before.
-inline bool quote_terminates_string(const std::string& s, size_t j) {
-    for (size_t k = j + 1; k < s.size(); k++) {
-        char c = s[k];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
-        return c == ',' || c == '}' || c == ']' || c == ':';
-    }
-    return true;
-}
+// command string (`... || echo "empty dir"`). JsonQuoteContext distinguishes
+// key strings (only ':' may follow) from value strings (only , } ] may
+// follow), so punctuation inside shell content is not mistaken for framing.
 
 // Recover a name-dropped mode-6 BATCH: {"name":<ws>{ARGS}[ {"name":<ws>{ARGS}]... where
 // each outer {"name": never closes (net +1 depth per unit) so the main balanced scan
@@ -790,7 +845,9 @@ inline void scan_namedropped(const std::string& text, const json* tools,
         size_t q = p + 8;
         while (q < text.size() && (text[q]==' '||text[q]=='\t'||text[q]=='\r'||text[q]=='\n')) q++;
         if (q >= text.size() || text[q] != '{') { p += 8; continue; }
-        int depth = 0; bool in_str = false, esc = false; size_t e = std::string::npos;
+        int depth = 0; bool in_str = false, esc = false, string_is_key = false;
+        JsonQuoteContext json_ctx;
+        size_t e = std::string::npos;
         std::string san;
         for (size_t j = q; j < text.size(); j++) {
             char ch = text[j];
@@ -800,7 +857,7 @@ inline void scan_namedropped(const std::string& text, const json* tools,
                 if (ch == '"') {
                     // mode 10: a quote not followed by a JSON delimiter is
                     // literal content, not a terminator — re-escape it.
-                    if (quote_terminates_string(text, j)) { in_str = false; san += ch; }
+                    if (quote_terminates_string(text, j, string_is_key)) { in_str = false; san += ch; }
                     else san += "\\\"";
                     continue;
                 }
@@ -810,9 +867,14 @@ inline void scan_namedropped(const std::string& text, const json* tools,
                 san += ch; continue;
             }
             san += ch;
-            if (ch == '"') in_str = true;
-            else if (ch == '{') depth++;
-            else if (ch == '}' && --depth == 0) { e = j; break; }
+            if (ch == '"') {
+                string_is_key = json_ctx.opening_string_is_key();
+                in_str = true;
+            } else {
+                json_ctx.structural(ch);
+                if (ch == '{') depth++;
+                else if (ch == '}' && --depth == 0) { e = j; break; }
+            }
         }
         if (e == std::string::npos) break;   // truncated final unit
         try {
@@ -891,7 +953,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             san.clear();
             m5_here = m10_here = false;
             int depth = 0;
-            bool in_str = false, esc = false;
+            bool in_str = false, esc = false, string_is_key = false;
+            JsonQuoteContext json_ctx;
             for (size_t j = i; j < text.size(); j++) {
                 char ch = text[j];
                 if (esc) { esc = false; san += ch; continue; }
@@ -900,7 +963,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     if (ch == '"') {
                         // tenth drift mode: an in-string quote not followed by a
                         // JSON delimiter is literal content — re-escape it.
-                        if (!m10_look || quote_terminates_string(text, j)) { in_str = false; san += ch; }
+                        if (!m10_look || quote_terminates_string(text, j, string_is_key)) { in_str = false; san += ch; }
                         else { san += "\\\""; m10_here = true; }
                         continue;
                     }
@@ -912,9 +975,14 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     continue;
                 }
                 san += ch;
-                if (ch == '"') in_str = true;
-                else if (ch == '{') depth++;
-                else if (ch == '}' && --depth == 0) return j;
+                if (ch == '"') {
+                    string_is_key = json_ctx.opening_string_is_key();
+                    in_str = true;
+                } else {
+                    json_ctx.structural(ch);
+                    if (ch == '{') depth++;
+                    else if (ch == '}' && --depth == 0) return j;
+                }
             }
             return std::string::npos;
         };

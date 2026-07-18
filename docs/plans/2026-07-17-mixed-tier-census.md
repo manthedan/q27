@@ -1,6 +1,6 @@
-# Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, CENSUS + COMBO + SHIP GATES COMPLETE)
+# Mixed weight-tier census → mixed pack — pre-registration (2026-07-17, CENSUS + COMBO + ORIGINAL SHIP GATES COMPLETE; AMENDED GATES PENDING)
 
-k3 roadmap item #2, adopted 2026-07-17 (Daniel: "sounds good, do it" —
+k3 roadmap item #2, adopted 2026-07-17 (the operator: "sounds good, do it" —
 queued behind the funded kernel rounds and the fp8-KV control arm). The
 last artifact-level lever needing no kernel work: B1 (3.79 GB) carries
 ~1.05–1.16× PPL vs T2 (7.15 GB); if a small tensor set drives the gap, a
@@ -32,7 +32,7 @@ Zoom to per-tensor only inside the classes the first pass indicts.
   ≥ 15% of the B1→T2 NLL gap at ≤ 10% of the byte cost of full T2.
 - Mixed-pack ship bands (carried from the tier ladder discipline):
   NLL mixed/T2 ≤ 1.06 at ≤ 5.0 GB → ship as a tier; 1.06–1.12 →
-  conditional (report, Daniel decides); > 1.12 → the gap is diffuse,
+  conditional (report, the operator decides); > 1.12 → the gap is diffuse,
   record and close (that is itself the answer: B1's 16% is not
   concentrated, and the two-tier ladder stands).
 - Every shipped pack passes the suffix byte-identity battery and the
@@ -137,6 +137,10 @@ path, summary validated against all 25 arms before `COMPLETE`. Raw table:
 
 Same-box anchor: base B1 2.6610, base T2 2.6081, gap 0.0529 nats
 (ppl ratio 1.0543 — matches the recorded 24 GB M4 1.055 to 3 decimals).
+The original instrument retained scalar and two-bucket NLL summaries, not
+per-position losses; the later A1 paired-bootstrap requirement therefore
+needs a rerun/instrument extension. No confidence interval is invented from
+the aggregate logs, and no ship claim waits on the scalar table alone.
 
 ```
 gdn_qkv          NLL 2.6005  gap recovered 114.4%  bytes   +314.6 MB
@@ -267,9 +271,13 @@ parents re-run clean same-box (B1 8/8; T2 8/8 + the documented WARN).
 **Behavioral probes: `gdn_pair` passes only 3/4 — ship gate FAIL (4/4 required).** The
 constraints leg collapses at greedy into a thinking-mode repetition loop
 ("water bottle (2) -> " …) to the full 6144-token cap with empty final
-content. Same-box, same-server, same-protocol controls: B1 PASS, T2 PASS,
-alphabeta-only graft PASS, qkv-only graft PASS. The loop appears ONLY in
-the qkv+alphabeta composition — an emergent cross-checkpoint co-adaptation
+content. Same-box, same-server, same-protocol controls all avoid the loop:
+alphabeta-only is an exact constraints pass; B1, T2, and qkv-only are
+finite near-passes that satisfy the five list items but emit final `done`
+instead of the requested `done.`. The composition-only attribution here is
+to catastrophic repetition, not to perfect control compliance. The loop
+appears ONLY in the qkv+alphabeta composition — an emergent
+cross-checkpoint co-adaptation
 pathology of exactly the class the pre-readout amendment warned about, and
 one wikitext NLL cannot see (the same pack beats all-T2 on NLL while
 failing an agentic-collapse probe). json/codeedit/toolcall legs PASS.
@@ -278,26 +286,27 @@ vendor-B.1 sampling variant (temp 0.7/top-p 0.95/top-k 20 — NOT the
 registered greedy protocol, so it can inform but not substitute); per-layer
 loop localization.
 
-**`cheap_pair` passes the COMPLETE ship gate — first mixed pack to do so.**
-Rebuilt pack (md5 91db7fdd368ba3558e59bb5e111bbd07): 8K NLL identity anchor
+**`cheap_pair` passes the complete ORIGINAL ship gate — first mixed pack to
+do so; the post-run expert-review amendments below add gates before any ship
+claim.** Rebuilt pack (md5 91db7fdd368ba3558e59bb5e111bbd07): 8K NLL identity anchor
 2.6355 EXACT; suffix battery 8/8 PASS; probes 4/4 PASS (json exact
 keys/types; constraints all honored, `finish stop`; codeedit boundary fix
 exact; toolcall get_weather city=Taipei with schema-valid optional
-unit="c"). Ship band: 1.0105 vs T2 at 3.83 GB. Serving point: ~48% of the
-B1→T2 gap closed for +42.3 MB over B1 (+1.1% bytes).
+unit="c"). Original ship band: 1.0105 vs T2 at 3.83 GB. Candidate
+point: ~48% of the B1→T2 gap closed for +42.3 MB over B1 (+1.1% bytes).
 
-**Promotion decision (2026-07-17): `cheap_pair` is the M1 serving tier.**
-The gated bytes now live at
+**Provisional artifact decision (2026-07-17): `cheap_pair` is the M1
+candidate, not yet a serving tier.** The measured bytes now live at
 `models/bonsai-27b-m1/bonsai-27b-m1.q27`; the sibling `CHECKSUMS.md5`
-records md5 91db7fdd368ba3558e59bb5e111bbd07. M1 means the B1 base with T2
-`ssm_alpha`/`ssm_beta` and attention-Q in blocks 21–42. The NLL-stronger
-but probe-failing `gdn_pair` is retained explicitly as a non-serving
-experiment at
+records md5 91db7fdd368ba3558e59bb5e111bbd07. The provisional M1 name means
+the B1 base with T2 `ssm_alpha`/`ssm_beta` and attention-Q in blocks 21–42.
+The NLL-stronger but probe-failing `gdn_pair` is retained explicitly as a
+non-serving experiment at
 `models/bonsai-27b-gdn-pair-experimental/bonsai-27b-gdn-pair-experimental.q27`
 (md5 107647e9cba0f01a003934011644c2fe); its rescue investigation is parked
-until separately funded. This naming keeps the serving path fail-closed:
-only the artifact that passed every registered gate carries the M1 tier
-name.
+until separately funded. The post-run A5/A6 capability/KL gates, direct
+decode bench, two-slot serving, and 131K pressure gate must clear before the
+candidate becomes a serving tier.
 
 Ship bands are unchanged from the pre-registration: NLL mixed/T2 ≤ 1.06
 at ≤ 5.0 GB → ship candidate (then suffix byte-identity battery +
@@ -306,3 +315,69 @@ worse → record. All three candidates are inside the size band by
 construction; `gdn_pair` and `gate_trio` test whether the all-T2
 baseline can be beaten outright at ~57% of its bytes, `cheap_pair`
 whether ~half the gap closes for ~1% extra bytes.
+
+## Post-run expert-review amendments (adopted after the measurements above)
+
+These amendments supersede the original serving-claim boundary without
+invalidating the completed census, combo, suffix, or probe measurements.
+No mixed pack ships until the additional gates clear.
+
+### Expert-review amendments (2026-07-17; full dispositions:
+`2026-07-17-expert-review-triage.md`)
+
+- **Claim relabeled:** the census currently supports "quality difference
+  concentrated in the GDN subsystem," NOT "binary quantization error
+  concentrated in GDN." Decisive evidence: the alphabeta arm replaced F32
+  base values with LOWER-precision ternary donor values and still recovered
+  46.9% — encoding can explain none of it; donor training signal in the
+  recurrent pathway. (The reviewer's premise that both packs store
+  alpha/beta as F16 was wrong in detail — that's the official-tier policy;
+  B1=F32, T2=ternary — and the correction strengthens their conclusion.)
+- **Experiment design adopted:** Phase A independent holdout confirmation
+  (frozen units incl. code/chat/tool-JSON/continuous-state; absolute paired
+  ΔNLL primary; document/block bootstrap) BEFORE combinations; Phase B full
+  2^5 GDN factorial with pairwise interaction terms; Phase C reciprocal
+  grafts; Phase D source×encoding control (dequant/re-encode; common
+  pre-QAT master = vendor ask); Phase E gdn_qkv localization (q/k/v split
+  after vendor row-order validation, depth, retention-half-life head
+  ranking, state-drift experiment).
+- **Ship gate amended:** NLL bands stand as discovery; the ship candidate
+  additionally requires paired capability non-inferiority vs T2 on
+  ground-truth success with the tolerated deficit and sample size fixed
+  before running, plus a direct composed-pack decode bench (no pack-size
+  inference), two-slot serving, and 131K pressure.
+- **Low-rank delta probe adopted (CPU-only, high-value):** SVD of
+  W_T2 − dequant(W_B1) on gdn_qkv; a low-rank/head-structured delta turns
+  +315 MB into tens of MB of F16/Q8 correction.
+
+### Review-2 amendments (2026-07-18; full dispositions:
+`2026-07-18-expert-review-2-triage.md`)
+
+- **Combination-arm sequence ADOPTED (A0–A7, supersedes "combination arm"
+  as the next step; the 2^5 factorial is the escalation path if any
+  interaction signal appears):** A0 re-anchor · A1 qkv + per-position
+  paired bootstrap CI (CI must exclude 100%) · A2 alphabeta · A3 joint
+  with additivity classification ([0.8,1.2]×Σ lone Δ pre-registered;
+  sub-additive <0.8 → per-layer bisection A3a/A3b, mirroring the KV
+  census's honest Σ-means precedent) · A4 held-out code + multilingual
+  replication · **A5 KL(M1-candidate ‖ official 17 GiB) <
+  KL(T2 ‖ official) — the decisive quality gate.** Subject is frozen to
+  `cheap_pair`, md5 `91db7fdd368ba3558e59bb5e111bbd07`; `gdn_pair` and
+  `gate_trio` are ineligible. Use the same first 8,192 wikitext tokens and
+  route pins as the census, recording the 8,191 paired per-target values
+  d_i = KL(M1-candidate_i ‖ official_i) − KL(T2_i ‖ official_i). Gate
+  clears only if mean(d)<0 AND the one-sided 95% upper confidence bound
+  from 10,000 fixed-seed (1729) contiguous-256-token block-bootstrap
+  resamples is <0. Cross-model driver still to author: --kl-kv is a
+  same-model comparator; tokenizer is byte-identical; run all three packs
+  serially in one coordinated 24 GB session, not "one afternoon". ·
+  A6 ground-truth capability
+  non-inferiority (the landed cb099ee agreement spot-check is supporting
+  machinery only; the gold-graded paired-bootstrap verdict is still to be
+  authored, and A6 is conjunctive with A5 — neither adjudicates away a
+  failure in the other) · A7 shared_f32 as the ≈0 control
+  (already ran; publication carries it).
+- **Mechanism falsification pair adopted into Phase E:** graft qkv but
+  keep B1's β → recovery should collapse disproportionately; graft
+  alphabeta INTO T2 → near-zero effect. Both firing confirms the
+  delta-rule eigenvalue/addressing mechanism on this family.

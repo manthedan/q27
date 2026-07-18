@@ -244,6 +244,18 @@ static int anthropic_api_selftest() {
                "schema/description defaults");
         expect(q27::anthropic_tools_json(json::object()).is_array(), "no tools -> empty array");
     }
+    {
+        json body={{"max_tokens",nullptr},{"max_output_tokens",77}};
+        auto fallback=q27::json_i64_or(body,"max_output_tokens",256);
+        expect(fallback==77, "nullable integer fallback key");
+        expect(q27::json_i64_or(body,"max_tokens",fallback)==77,
+               "null max_tokens uses fallback");
+        body["max_tokens"]=123;
+        expect(q27::json_i64_or(body,"max_tokens",fallback)==123,
+               "explicit max_tokens wins");
+        expect(q27::json_i64_or(json::object(),"max_tokens",4096)==4096,
+               "missing max_tokens uses default");
+    }
     printf("anthropic api shapes: %s\n", fail ? "FAIL" : "PASS");
     return fail;
 }
@@ -459,8 +471,15 @@ int main(int argc, char** argv) {
             &pre, nullptr, true);
         bool ok16 = v16.empty();   // truncated call stays text — never a
                                    // "successful" parse of command+prose
+        // A colon only terminates an object KEY. Inside a command VALUE, raw
+        // shell quotes around a colon-bearing fragment remain literal.
+        auto v17 = q27::parse_bare_tool_calls(
+            "{\"name\":\"bash\",\"arguments\":{\"command\":\"echo \"key\": value\"}}",
+            &pre);
+        bool ok17 = v17.size()==1 && v17[0].name=="bash" &&
+                    v17[0].arguments.value("command","")=="echo \"key\": value";
         bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 &&
-                  ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16;
+                  ok10 && ok11 && ok12 && ok13 && ok14 && ok15 && ok16 && ok17;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }
@@ -510,6 +529,26 @@ int main(int argc, char** argv) {
         stream_cut(b3,1,f3,c3n,op3,cl3,nm3,raw3);
         bool s3=op3 && cl3 && nm3=="bash" &&
                 nlohmann::json::parse(f3).value("command","")=="echo \"hi\" ok";
+        std::string b3b="{\"name\":\"bash\",\"arguments\":{\"command\":\"echo \"key\": value\"}}";
+        std::string f3b,nm3b,raw3b; int c3bn=0; bool op3b=false,cl3b=false;
+        stream_cut(b3b,1,f3b,c3bn,op3b,cl3b,nm3b,raw3b);
+        bool s3b=op3b && cl3b && nm3b=="bash" &&
+                 nlohmann::json::parse(f3b).value("command","")=="echo \"key\": value";
+        // Structurally closed braces are not enough: an unclosed array makes
+        // the sanitized arguments invalid and must finalize unclean/fallback.
+        std::string b3c="{\"name\":\"bash\",\"arguments\":{\"a\":[1}}";
+        std::string f3c,nm3c,raw3c; int c3cn=0; bool op3c=false,cl3c=false;
+        stream_cut(b3c,1,f3c,c3cn,op3c,cl3c,nm3c,raw3c);
+        bool s3c=op3c && !cl3c && raw3c==b3c;
+        // Once invalidity is known, later token feeds still belong to the
+        // recovery trail (a packed second call must not disappear).
+        q27::ToolCallStreamer t3d; bool opened3d=false;
+        (void)t3d.feed(b3c,&opened3d);
+        (void)t3d.feed("{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}",nullptr);
+        std::string pre3d;
+        auto calls3d=q27::parse_bare_tool_calls(t3d.trail(),&pre3d,nullptr,false);
+        bool s3d=opened3d && t3d.invalid() && calls3d.size()==1 &&
+                 calls3d[0].name=="bash" && calls3d[0].arguments.value("command","")=="pwd";
         // s4: mode-6 head (name-dropped) must never stream — fallback with
         // the raw body preserved byte-exact for the recovery chain.
         std::string b4="{\"name\":\n{\"file_path\": \"/w/a.md\"}}";
@@ -574,11 +613,11 @@ int main(int argc, char** argv) {
             stream_cut(b9b,1,f9b,c9bn,op9b,cl9b,nm9b,raw9b);
             bool s9b=op9b && cl9b &&
                      nlohmann::json::parse(f9b).value("c","")=="a</content>b";
-            bool ok=s1&&s2&&s3&&s4&&s5&&s6&&s7&&s8&&s9&&s9b;
+            bool ok=s1&&s2&&s3&&s3b&&s3c&&s3d&&s4&&s5&&s6&&s7&&s8&&s9&&s9b;
             printf("incremental tool-call streamer: %s\n", ok?"PASS":"FAIL");
             if(!ok){
-                fprintf(stderr,"  s1=%d s2=%d s3=%d s4=%d s5=%d s6=%d s7=%d s8=%d s9=%d s9b=%d\n",
-                        s1,s2,s3,s4,s5,s6,s7,s8,s9,s9b);
+                fprintf(stderr,"  s1=%d s2=%d s3=%d s3b=%d s3c=%d s3d=%d s4=%d s5=%d s6=%d s7=%d s8=%d s9=%d s9b=%d\n",
+                        s1,s2,s3,s3b,s3c,s3d,s4,s5,s6,s7,s8,s9,s9b);
                 return 1;
             }
         }

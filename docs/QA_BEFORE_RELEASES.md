@@ -32,6 +32,9 @@ Box legend: **M4** = the 24 GB serving Mac (this repo's metal lane),
       kl, artifacts, depthctl).
 - [ ] `make test-metal` — matvec, ops (incl. turbo3 attention, fp16
       exception window, e4m3 store goldens), stream format + splitter.
+- [ ] `./build/test_tokenizer models/qwen36-27b-mtp/qwen36-27b-mtp.tok /dev/null`
+      — all artifact-backed tokenizer/API self-tests PASS (including bare-call
+      quote repair and incremental tool-call streaming).
 
 ## 2. Canonical correctness (box-marked)
 
@@ -60,15 +63,28 @@ Per COORDINATION.md: pgrep + `curl :8213/health` before launch; one
 - [ ] `tools/responses_parity_gate.sh` — /v1/responses function_call
       items, stream lifecycle, round-trip, custom tool, 400 class
       (G8a–G8d, G9).
-- [ ] `tools/trace_gate.sh <trace.jsonl>` — with the server started
-      `--trace`, the suites above leave a complete session stream:
-      boot, all 5 api families, outcomes, 400s, per-boot monotonic tms.
-- [ ] `tools/multislot_gates.py` — two-slot admission, fair lease, 503.
-- [ ] `tools/suffix_gate.sh` — suffix drafter byte-identity off-vs-on.
+- [ ] `tools/trace_gate.sh <trace.jsonl>` — start this release-trace server
+      with `Q27_METAL_TEST_FAILPOINTS=1` and `--trace`; the suites above plus
+      deterministic malformed-recovery, disconnect, and Responses engine-error
+      legs leave a complete correlated stream: boot, all 5 API families,
+      outcomes, 400/500s, recovery/cancel IDs, and per-boot monotonic tms.
 - [ ] Cancel smoke: kill a long prefill client-side; slot frees within
       one chunk; follow-up probe answers (the 2026-07-17 cancellation
       gates' standing form).
 - [ ] pi/Claude Code smoke: one real read-tool loop against the server.
+
+The next gates **self-launch or load the artifact themselves**. Stop the
+resident API server first, verify no `q27-metal-server`/`q27-metal` process
+remains, and run them strictly serially under the same coordinated slot:
+
+- [ ] Set `Q27_GATE_MODEL=<official-release-model.q27>` and
+      `Q27_GATE_TOK=models/qwen36-27b-mtp/qwen36-27b-mtp.tok`, then run both
+      `tools/multislot_gates.py` **and** `tools/multislot_gates.py mtp` —
+      self-launching Metal servers; greedy constraints/admission/503 plus MTP
+      scheduling, live speculation counters, fairness, and cancellation.
+- [ ] `tools/suffix_burst_gates_2026-07-16.sh` — Metal suffix-burst committed
+      byte identity and actual wide dispatch (not the legacy CUDA
+      `tools/suffix_gate.sh`).
 
 ## 4. Quality + perf spot checks (quiet M4 or as noted)
 

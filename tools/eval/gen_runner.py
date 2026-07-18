@@ -16,6 +16,15 @@ No third-party deps; stdlib urllib only.
 import argparse, json, sys, time, urllib.request, urllib.error
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code,
+                                    "redirect refused: " + newurl, headers, fp)
+
+
+DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+
 def build_request(api, base_url, prompt, max_tokens):
     if api == "anthropic":
         url = base_url.rstrip("/") + "/v1/messages"
@@ -42,7 +51,7 @@ def extract_text(api, payload):
 
 def run_one(api, base_url, prompt, max_tokens, timeout):
     req = build_request(api, base_url, prompt, max_tokens)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with DIRECT_OPENER.open(req, timeout=timeout) as resp:
         return extract_text(api, json.loads(resp.read().decode()))
 
 

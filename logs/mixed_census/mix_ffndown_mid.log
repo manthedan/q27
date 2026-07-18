@@ -1,0 +1,15 @@
+mix: 22 tensors from donor, 829 from base, byte delta +245.1 MB
+  take blk.21.ffn_down.weight
+  take blk.22.ffn_down.weight
+  take blk.23.ffn_down.weight
+  take blk.24.ffn_down.weight
+  take blk.25.ffn_down.weight
+  take blk.26.ffn_down.weight
+  take blk.27.ffn_down.weight
+  take blk.28.ffn_down.weight
+  take blk.29.ffn_down.weight
+  take blk.30.ffn_down.weight
+  ... and 12 more
+mix: wrote models/census_arm.61541.q27
+Metal model ready on Apple M4 in 1.31 s
+artifacts and Metal architecture: OK

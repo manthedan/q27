@@ -37,22 +37,35 @@ loads anywhere in this directory.
   spot-check set (120 items: 60 anchored MC, 40 numeric word problems,
   20 freeform short answers; fields prompt_id/prompt/gold/category).
   Authored for the mixed-pack ship gate
-  (docs/plans/2026-07-17-census-capability-spotcheck.md); golds are
-  recorded but the primary gate is agreement, not accuracy.
+  (docs/plans/2026-07-17-census-capability-spotcheck.md). Agreement is a
+  supporting read only; the amended A6 gate is ground-truth accuracy
+  non-inferiority and its verdict driver is not yet authored.
 - `promptlint.py` — structural lint for the prompt set: unique ids
   across all files, anchored-answer instruction present, options
   well-formed, and every gold ROUND-TRIPS through its real extractor
   (an item whose gold cannot extract would score as disagreement for
   every arm — a corpus bug, not a capability signal). Proves failure:
   duplicate id / missing anchor / bad gold each fail loudly.
-- `run_arm.sh` — one arm's serial generation pass over the three
-  prompt files (COORDINATION.md applies: model consumer, coordinated
-  GPU slot only; greedy via the server's missing-temperature default).
-- `spotcheck_verdict.py` — the spot-check decision tool: per-arm
-  agreement vs the reference arm (subprocesses agreement.py — one
-  source of truth), capability-gap-recovered metric, pre-registered
-  bands echoed from the plan doc. Mock-verified in both directions
-  (ship-supporting exit 0; worse-than-floor exit 1).
+- `arms.tsv` + `run_arm.sh` — frozen artifact filename/MD5/size for each
+  decision arm and one serial generation pass over the three prompt files.
+  The runner is localhost-only, verifies the local full-file MD5 plus the
+  server's opt-in `/health?identity=1` SHA1 over the resident mmap plus its
+  artifact filename (without exposing the absolute deployment path), then
+  writes a mandatory artifact + runtime provenance sidecar (server/shader/
+  tokenizer hashes, normalized protocol/numeric-path settings, hardware/OS,
+  an install-local private-file host identity, and server boot; verdict requires
+  exact runtime/machine equality across arms,
+  while the runner rechecks the same boot before publication). Generation
+  publishes from a temporary workspace with
+  provenance last; per-row IDs are bound to the sidecar run ID, so interrupted
+  reruns fail closed instead of mixing stale modes
+  (COORDINATION.md applies: coordinated GPU slot only; greedy).
+- `spotcheck_verdict.py` — supporting per-arm agreement report vs the
+  reference arm (subprocesses agreement.py — one source of truth), with
+  the capability-gap-recovered metric. It rejects incomplete/wrong prompt
+  ID sets and missing/mismatched artifact provenance. It cannot clear
+  amended A6; exit 0 means the report completed, while worse-than-floor
+  still exits 1.
 
 ## Run the self-tests
 

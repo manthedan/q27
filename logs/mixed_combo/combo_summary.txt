@@ -1,0 +1,4 @@
+base B1 2.6610  base T2 2.6081  gap 0.0529 nats  B1 pack 3.53 GB
+gdn_pair   NLL 2.5885  gap recovered  137.1%  vs T2 0.9925  bytes  +317.5 MB  pack 3.84 GB  SHIP-BAND
+gate_trio  NLL 2.5982  gap recovered  118.7%  vs T2 0.9962  bytes  +356.8 MB  pack 3.88 GB  SHIP-BAND
+cheap_pair NLL 2.6355  gap recovered   48.2%  vs T2 1.0105  bytes   +42.3 MB  pack 3.57 GB  SHIP-BAND

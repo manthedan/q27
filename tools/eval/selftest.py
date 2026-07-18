@@ -192,6 +192,12 @@ with tempfile.TemporaryDirectory() as td:
     rc, _ = run_agreement([dup, b, "--mode", "numeric"])
     check("agreement: duplicate prompt_id exits nonzero", rc != 0, True)
 
+    short = os.path.join(td, "short.jsonl")
+    write_jsonl(short, [{"prompt_id":"p1","text":"42"}])
+    rc, out = run_agreement([short, b, "--mode", "numeric", "--min-rate", "0.0"])
+    check("agreement: unpaired prompt set exits input-error", rc, 2)
+    check("agreement: unpaired prompt failure stated", "prompt_id sets differ" in out, True)
+
     # choice mode end-to-end with a label-shadow trap in one file
     ca = os.path.join(td, "ca.jsonl")
     cb = os.path.join(td, "cb.jsonl")
@@ -203,6 +209,142 @@ with tempfile.TemporaryDirectory() as td:
     check("agreement choice: shadow trap disagrees, not false-agrees",
           "pairs=2 agree=1" in out, True)
     check("agreement choice exits 0 without gate", rc, 0)
+
+# --- spotcheck_verdict.py: complete-corpus and truncation directions --------
+
+def run_spotcheck(args):
+    p = subprocess.run(
+        [sys.executable, os.path.join(HERE, "spotcheck_verdict.py")] + args,
+        capture_output=True, text=True)
+    return p.returncode, p.stdout + p.stderr
+
+
+with tempfile.TemporaryDirectory() as td:
+    texts = {"choice": "The answer is A.",
+             "numeric": "The answer is 1.",
+             "freeform": "The answer is paris."}
+    frozen_ids = {}
+    for mode in texts:
+        with open(os.path.join(HERE, "prompts", "%s.jsonl" % mode),
+                  encoding="utf-8") as f:
+            frozen_ids[mode] = [json.loads(line)["prompt_id"]
+                                for line in f if line.strip()]
+    manifests = {}
+    with open(os.path.join(HERE, "arms.tsv"), encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            arm, model, md5, sha1, nbytes = line.rstrip("\n").split("\t")
+            manifests[arm] = {"arm": arm, "model": model, "md5": md5,
+                              "resident_sha1": sha1, "bytes": int(nbytes)}
+    runtime = {"identity_schema": 2, "server_sha1": "a" * 40,
+               "shader_abi": "// Q27_SHADER_ABI 13", "shader_sha1": "b" * 40,
+               "eval_host_id": "h" * 64,
+               "platform": {"sysname": "Darwin", "release": "test",
+                            "machine": "arm64", "metal_device": "test-gpu"},
+               "protocol": {"context":131072,"kv":"turbo3","mtp":0,"suffix":0,
+                   "slots":1,"prefix_entries":1,"constrain_tools":False,
+                   "snapshots":False,"snapshot_auto_min":0,"snapshot_max_bytes":0,
+                   "max_tokens_default":0,"kv_fp16_except":False,
+                   "kv_fp16_cell_masks":"0"*32,"kv_side_codec":"none",
+                   "gemm_half":True,"gemm_half_q4":False,"gqa_tile":2,
+                   "gqa_block":1024,"gqa_threshold":2048,"gpu_sample":True,
+                   "resident":True,"bare_system":False,"tool_strict":False,
+                   "test_failpoints":False,"tokenizer":"test.tok",
+                   "tokenizer_sha1":"c"*40}}
+    run_ids = {arm: "run-" + arm for arm in ("t2-base", "b1-base", "m1-candidate")}
+    for arm in ("t2-base", "b1-base", "m1-candidate"):
+        with open(os.path.join(td, "%s.provenance.json" % arm), "w") as f:
+            row = dict(manifests[arm]); row["runtime"] = runtime; row["run_id"] = run_ids[arm]
+            row["server_boot"] = "boot-" + arm
+            json.dump(row, f, sort_keys=True)
+        for mode in texts:
+            write_jsonl(os.path.join(td, "%s.%s.jsonl" % (arm, mode)), [
+                {"id": "%s-%s-%s-%04d" % (arm, run_ids[arm], mode, i),
+                 "prompt_id": prompt_id, "text": texts[mode]}
+                for i, prompt_id in enumerate(frozen_ids[mode])
+            ])
+    spot_args = ["--dir", td, "--ref", "t2-base", "--floor", "b1-base",
+                 "--arms", "m1-candidate"]
+    rc, out = run_spotcheck(spot_args)
+    check("spotcheck complete corpus exits 0", rc, 0)
+    check("spotcheck states agreement-only boundary",
+          "cannot clear amended A6" in out, True)
+
+    # MUST-FAIL: machine binding is mandatory, not merely compared when present.
+    p = os.path.join(td, "m1-candidate.provenance.json")
+    with open(p) as f: missing_host = json.load(f)
+    missing_host["runtime"].pop("eval_host_id")
+    with open(p, "w") as f: json.dump(missing_host, f, sort_keys=True)
+    rc, out = run_spotcheck(spot_args)
+    check("spotcheck missing host identity exits nonzero", rc != 0, True)
+    check("spotcheck missing host identity names runtime provenance",
+          "missing/incomplete runtime provenance" in out, True)
+    missing_host["runtime"]["eval_host_id"] = runtime["eval_host_id"]
+    with open(p, "w") as f: json.dump(missing_host, f, sort_keys=True)
+
+    # MUST-FAIL: dropping one hard item cannot silently improve recovery.
+    write_jsonl(os.path.join(td, "m1-candidate.choice.jsonl"), [
+        {"id": "m1-candidate-%s-choice-%04d" % (run_ids["m1-candidate"], i),
+         "prompt_id": prompt_id, "text": texts["choice"]}
+        for i, prompt_id in enumerate(frozen_ids["choice"][:-1])
+    ])
+    rc, out = run_spotcheck(spot_args)
+    check("spotcheck truncated arm exits nonzero", rc != 0, True)
+    check("spotcheck truncated arm names incompleteness",
+          "incomplete choice arm" in out, True)
+
+    # Restore the missing row but prove a same-count, wrong-ID corpus fails.
+    wrong_ids = frozen_ids["choice"][:-1] + ["not-in-frozen-corpus"]
+    write_jsonl(os.path.join(td, "m1-candidate.choice.jsonl"), [
+        {"id": "m1-candidate-%s-choice-%04d" % (run_ids["m1-candidate"], i),
+         "prompt_id": prompt_id, "text": texts["choice"]}
+        for i, prompt_id in enumerate(wrong_ids)
+    ])
+    rc, out = run_spotcheck(spot_args)
+    check("spotcheck wrong same-count ids exit nonzero", rc != 0, True)
+    check("spotcheck wrong ids name frozen corpus",
+          "mismatch from frozen choice corpus" in out, True)
+
+    write_jsonl(os.path.join(td, "m1-candidate.choice.jsonl"), [
+        {"id": "m1-candidate-stale-run-choice-%04d" % i,
+         "prompt_id": prompt_id, "text": texts["choice"]}
+        for i, prompt_id in enumerate(frozen_ids["choice"])
+    ])
+    rc, out = run_spotcheck(spot_args)
+    check("spotcheck mixed-run rows exit nonzero", rc != 0, True)
+    check("spotcheck mixed-run rows name run prefix",
+          "not bound to run prefix" in out, True)
+
+    # Restore the corpus, then prove build/protocol drift cannot masquerade
+    # as an artifact capability difference.
+    write_jsonl(os.path.join(td, "m1-candidate.choice.jsonl"), [
+        {"id": "m1-candidate-%s-choice-%04d" % (run_ids["m1-candidate"], i),
+         "prompt_id": prompt_id, "text": texts["choice"]}
+        for i, prompt_id in enumerate(frozen_ids["choice"])
+    ])
+    with open(os.path.join(td, "m1-candidate.provenance.json"), "w") as f:
+        row = dict(manifests["m1-candidate"]); row["runtime"] = dict(runtime)
+        row["run_id"] = run_ids["m1-candidate"]
+        row["server_boot"] = "boot-m1-candidate"
+        row["runtime"]["server_sha1"] = "c" * 40
+        json.dump(row, f, sort_keys=True)
+    rc, out = run_spotcheck(spot_args)
+    check("spotcheck runtime mismatch exits nonzero", rc != 0, True)
+    check("spotcheck runtime mismatch names provenance",
+          "runtime provenance mismatch" in out, True)
+
+    # A caller also cannot relabel T2 output/artifact provenance as M1.
+    with open(os.path.join(td, "m1-candidate.provenance.json"), "w") as f:
+        row = dict(manifests["t2-base"]); row["runtime"] = runtime
+        row["run_id"] = run_ids["m1-candidate"]
+        row["server_boot"] = "boot-m1-candidate"
+        json.dump(row, f, sort_keys=True)
+    rc, out = run_spotcheck(spot_args)
+    check("spotcheck mislabeled artifact exits nonzero", rc != 0, True)
+    check("spotcheck mislabeled artifact names provenance",
+          "artifact provenance mismatch" in out, True)
+
 
 # --- report -----------------------------------------------------------------
 
