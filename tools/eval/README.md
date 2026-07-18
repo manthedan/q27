@@ -33,6 +33,26 @@ loads anywhere in this directory.
 - `selftest_gen.py` — mock-server self-test for gen_runner.py (stdlib
   HTTPServer; both API shapes, dead-server and duplicate-id must-fail
   directions, real exit codes).
+- `prompts/{choice,numeric,freeform}.jsonl` — the census capability
+  spot-check set (120 items: 60 anchored MC, 40 numeric word problems,
+  20 freeform short answers; fields prompt_id/prompt/gold/category).
+  Authored for the mixed-pack ship gate
+  (docs/plans/2026-07-17-census-capability-spotcheck.md); golds are
+  recorded but the primary gate is agreement, not accuracy.
+- `promptlint.py` — structural lint for the prompt set: unique ids
+  across all files, anchored-answer instruction present, options
+  well-formed, and every gold ROUND-TRIPS through its real extractor
+  (an item whose gold cannot extract would score as disagreement for
+  every arm — a corpus bug, not a capability signal). Proves failure:
+  duplicate id / missing anchor / bad gold each fail loudly.
+- `run_arm.sh` — one arm's serial generation pass over the three
+  prompt files (COORDINATION.md applies: model consumer, coordinated
+  GPU slot only; greedy via the server's missing-temperature default).
+- `spotcheck_verdict.py` — the spot-check decision tool: per-arm
+  agreement vs the reference arm (subprocesses agreement.py — one
+  source of truth), capability-gap-recovered metric, pre-registered
+  bands echoed from the plan doc. Mock-verified in both directions
+  (ship-supporting exit 0; worse-than-floor exit 1).
 
 ## Run the self-tests
 
@@ -65,11 +85,10 @@ rate < `--min-rate`, 2 on input errors, 0 otherwise.
 
 ## Not yet built (deliberate, keep scope creep visible)
 
-- Capability question sets (GPQA-class) — only if a decision ever
-  needs them, per the triage verdict.
 - The first real agreement RUN (gen_runner.py exists but has never
-  touched a live server) — a later GPU-slot task with its own
-  pre-registered prompt set and threshold.
+  touched a live server) — now concretely queued as the census
+  capability spot-check on the mini (plan doc above has the arms,
+  protocol, and pre-registered bands); still a GPU-slot task.
 - Continuation-fixture regression corpus (ds4 glm5.2 model) — after
   the first real agreement run exists.
 - Task-completion / agentic probes — separate from answer-grading.
