@@ -9,13 +9,15 @@ UNAME_S   := $(shell uname -s)
 .PHONY: all clean test-cpu test-metal
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
 
-test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl
+test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store
 	./build/test_artifacts
 	./build/test_depthctl
 	./build/test_toolconstrain
 	./build/test_suffixdraft
 	./build/test_sampling
 	./build/test_kl
+	./build/test_snapshot_evict
+	./build/test_snapshot_evict_store
 
 ifeq ($(UNAME_S),Darwin)
 test-metal: build/test_metal build/test_metal_ops build/test_metal_stream
@@ -127,6 +129,12 @@ build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 
 build/test_kl: src/test_kl.cpp src/kl.h | build
 	$(CXX) $(CXXFLAGS) -I src src/test_kl.cpp -o $@
+
+build/test_snapshot_evict: tools/test_snapshot_evict.cpp src/metal/snapshot_evict.h | build
+	$(CXX) $(CXXFLAGS) -I src/metal tools/test_snapshot_evict.cpp -o $@
+
+build/test_snapshot_evict_store: tools/test_snapshot_evict_store.cpp src/metal/disk_snapshot_store.h src/metal/snapshot_evict.h | build
+	$(CXX) $(CXXFLAGS) -I src/metal tools/test_snapshot_evict_store.cpp -o $@
 
 build/width_bench: tools/width_bench.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/width_bench.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@

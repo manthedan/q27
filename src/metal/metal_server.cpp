@@ -1,4 +1,6 @@
 #include "metal_engine.h"
+#include "snapshot_evict.h"
+#include "disk_snapshot_store.h"
 #include "stream_format.h"
 #include "../suffixdraft.h"
 #include "../tool_preamble.h"
@@ -192,93 +194,14 @@ class PrefixCache {
     size_t capacity_; std::list<Entry> entries_;
 };
 
-// Disk snapshot store (prefix snapshots Phase 2, docs/plans/2026-07-16-
-// prefix-snapshots.md): token-prefix keyed — the server tokenizes every
-// prompt itself, so "the snapshot's stored token ids are a prefix of this
-// request's tokens" is exact and has no BPE-boundary hazard (recorded
-// design deviation from ds4's byte-SHA1, which exists for stateless
-// clients that retokenize). Files are named by the SHA1 of the token
-// bytes, so an identical prefix overwrites rather than duplicates. LRU by
-// mtime; hits touch the file. All file I/O runs OUTSIDE the GPU lease;
-// only save_state/load_state (which read/write GPU buffers) go under it.
-class DiskSnapshotStore {
-  public:
-    // tag = artifact/KV identity prefix baked into every filename, so one
-    // directory shared by different artifacts or fp16/turbo3 servers never
-    // cross-matches or overwrites incompatible snapshots (codex P2 on
-    // 607160e); the deep header identity check at load stays underneath.
-    void init(std::string dir, uint64_t max_bytes, std::string tag) {
-        dir_=std::move(dir); max_bytes_=max_bytes; tag_=std::move(tag);
-    }
-    bool enabled() const { return !dir_.empty(); }
-
-    // Longest stored token prefix of `prompt`. Full-length matches whose
-    // logits are stale (mid-prefill saves) are skipped: state would be
-    // exact but no pending token could be derived.
-    bool best_match(const std::vector<uint32_t>& prompt,std::string& path_out,uint32_t& len_out) {
-        if(!enabled()) return false;
-        std::lock_guard<std::mutex> lk(m_);
-        std::string best; uint32_t best_len=0;
-        std::error_code ec;
-        for(const auto& e:std::filesystem::directory_iterator(dir_,ec)) {
-            if(!e.is_regular_file() || e.path().extension()!=".q27snap") continue;
-            if(e.path().filename().string().rfind(tag_,0)!=0) continue;
-            q27::MetalEngine::SnapshotInfo info;
-            try { info=q27::MetalEngine::peek_snapshot(e.path().string()); }
-            catch(...) { continue; }   // corrupt/foreign file: never a hit
-            // Saves record exactly the encoded prefix; anything else is not
-            // resumable by token matching.
-            if(info.position!=info.tokens.size()) continue;
-            if(info.tokens.empty() || info.tokens.size()>prompt.size()) continue;
-            if(info.tokens.size()==prompt.size() && !info.logits_resident) continue;
-            if(info.tokens.size()<=best_len) continue;
-            if(std::equal(info.tokens.begin(),info.tokens.end(),prompt.begin())) {
-                best=e.path().string(); best_len=(uint32_t)info.tokens.size();
-            }
-        }
-        if(best.empty()) return false;
-        std::filesystem::last_write_time(best,std::filesystem::file_time_type::clock::now(),ec);
-        path_out=std::move(best); len_out=best_len;
-        return true;
-    }
-
-    std::string path_for(const uint32_t* tokens,uint32_t count) const {
-        unsigned char sha[20];
-        CC_SHA1(tokens,(CC_LONG)(count*4),sha);
-        char hex[41];
-        for(int i=0;i<20;i++) snprintf(hex+2*i,3,"%02x",sha[i]);
-        return dir_+"/"+tag_+hex+".q27snap";
-    }
-
-    // Budget enforcement: oldest-first until the directory fits. The
-    // just-written file is deletable too — the budget is a hard cap, and
-    // the gate asserts the total never exceeds it. Returns {files, bytes}
-    // removed so the --trace stream can record the eviction decision.
-    std::pair<size_t,uint64_t> evict_past_budget() {
-        if(!enabled() || !max_bytes_) return {0,0};
-        std::lock_guard<std::mutex> lk(m_);
-        struct F { std::string path; uint64_t size; std::filesystem::file_time_type mtime; };
-        std::vector<F> files; uint64_t total=0;
-        std::error_code ec;
-        for(const auto& e:std::filesystem::directory_iterator(dir_,ec)) {
-            if(!e.is_regular_file() || e.path().extension()!=".q27snap") continue;
-            const uint64_t sz=(uint64_t)e.file_size(ec);
-            files.push_back({e.path().string(),sz,e.last_write_time(ec)});
-            total+=sz;
-        }
-        std::sort(files.begin(),files.end(),[](const F& a,const F& b){ return a.mtime<b.mtime; });
-        size_t n=0; uint64_t freed=0;
-        for(const auto& f:files) {
-            if(total<=max_bytes_) break;
-            if(std::filesystem::remove(f.path,ec)) { total-=f.size; n++; freed+=f.size; }
-        }
-        return {n,freed};
-    }
-
-    std::atomic<uint64_t> hits{0}, saves{0};
-  private:
-    std::string dir_; uint64_t max_bytes_=0; std::string tag_; std::mutex m_;
-};
+// Disk snapshot store now lives in disk_snapshot_store.h (extracted so the
+// T1 eviction gate drives the REAL store offline; the peek adapter below
+// bridges SnapPeekInfo to q27::MetalEngine::SnapshotInfo).
+static SnapPeekInfo snap_peek_adapter(const std::string& path) {
+    const q27::MetalEngine::SnapshotInfo i=q27::MetalEngine::peek_snapshot(path);
+    SnapPeekInfo o; o.position=i.position; o.logits_resident=i.logits_resident; o.tokens=i.tokens;
+    return o;
+}
 
 // Whole-session trace stream (triage I2, docs/plans/2026-07-17-ds4-product-
 // triage.md): one JSONL stream of the events the parity rounds kept having
@@ -438,7 +361,7 @@ struct Runtime {
     bool constrain_tools=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
-    DiskSnapshotStore snapstore;
+    DiskSnapshotStore snapstore{&snap_peek_adapter};
     TraceLog trace;
     std::string model_name;
     // Auto-snapshot threshold in prompt tokens (0 = hint-only); set with
@@ -453,7 +376,7 @@ struct Runtime {
     Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
             uint32_t width,uint32_t sfx_width,size_t cache_entries,bool constrain,
             uint32_t slot_count,uint32_t budget_mb,const std::string& snapshot_dir,
-            uint32_t snapshot_max_mb,long long snapshot_auto)
+            uint32_t snapshot_max_mb,long long snapshot_auto,int spine_pin)
         :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
          constrain_tools(constrain) {
         // Server identity (homebrew plan Q2): /health and the boot trace name
@@ -558,7 +481,19 @@ struct Runtime {
                 for(int i=0;i<16;i++) tag+="0123456789abcdef"[masks[i]&15];
             }
             tag+='-';
-            snapstore.init(sdir,snap_mb*1024ull*1024ull,tag.c_str());
+            // T1 spine-pin resolution (flag > env > default on):
+            // --snapshot-spine-pin 0/1 wins; else Q27_METAL_SNAPSHOT_SPINE_PIN
+            // (fail-loud like the other snapshot knobs); default 1.
+            bool spin=true;
+            if(spine_pin>=0) spin=(spine_pin!=0);
+            else if(const char* sp=getenv("Q27_METAL_SNAPSHOT_SPINE_PIN"); sp && *sp) {
+                char* end=nullptr; errno=0;
+                const unsigned long long v=strtoull(sp,&end,10);
+                if(errno || end==sp || *end || v>1)
+                    throw std::runtime_error("Q27_METAL_SNAPSHOT_SPINE_PIN must be 0 or 1");
+                spin=(v!=0);
+            }
+            snapstore.init(sdir,snap_mb*1024ull*1024ull,tag.c_str(),spin);
             // A restart over an oversized directory must come back under
             // budget without waiting for the next save (codex P2 on 607160e).
             snapstore.evict_past_budget();
@@ -584,8 +519,8 @@ struct Runtime {
                     throw std::runtime_error("Q27_METAL_SNAPSHOT_AUTO must be an integer 0..16777216");
                 snap_auto_min=(size_t)v;
             }
-            fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB, auto>=%zu tokens, tag %s\n",
-                    sdir.c_str(),(unsigned long long)snap_mb,snap_auto_min,tag.c_str());
+            fprintf(stderr,"prefix-snapshots: dir %s, budget %llu MB, auto>=%zu tokens, spine-pin %s, tag %s\n",
+                    sdir.c_str(),(unsigned long long)snap_mb,snap_auto_min,spin?"on":"off",tag.c_str());
         }
         if(constrain_tools) {
             vocab_bytes_v=tokenizer.vocab_bytes();
@@ -1203,8 +1138,8 @@ void json_response(httplib::Response& response,const json& value,int status=200)
 int main(int argc,char** argv) {
     if(argc<3) {
         fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n"
-                       "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
-                       "       (the snapshot/max-tokens/budget flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,MAX_TOKENS_DEFAULT,BUDGET_MB}; an explicit flag wins)\n",argv[0]);
+                       "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
+                       "       (the snapshot/max-tokens/budget flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,SNAPSHOT_SPINE_PIN,MAX_TOKENS_DEFAULT,BUDGET_MB}; an explicit flag wins)\n",argv[0]);
         return 1;
     }
     try {
@@ -1217,6 +1152,7 @@ int main(int argc,char** argv) {
         // (hint-only saves).
         uint32_t budget_mb=0,snapshot_max_mb=0,max_tokens_default=0;
         long long snapshot_auto=-1;
+        int spine_pin=-1;   // -1 = unset (env/default); 0/1 explicit flag
         bool turbo3=false; bool constrain_tools=false;
         for(int i=3;i<argc;i++) {
             std::string arg=argv[i];
@@ -1238,6 +1174,7 @@ int main(int argc,char** argv) {
             else if(arg=="--snapshot-auto" && i+1<argc) { snapshot_auto=parse_u32(argv[++i],"--snapshot-auto"); if(snapshot_auto>(1ll<<24)) throw std::runtime_error("--snapshot-auto must be an integer 0..16777216"); }
             else if(arg=="--max-tokens-default" && i+1<argc) { max_tokens_default=parse_u32(argv[++i],"--max-tokens-default"); if(!max_tokens_default) throw std::runtime_error("--max-tokens-default must be >= 1"); }
             else if(arg=="--budget-mb" && i+1<argc) { budget_mb=parse_u32(argv[++i],"--budget-mb"); if(!budget_mb||budget_mb>(1u<<24)) throw std::runtime_error("--budget-mb must be an integer 1..16777216"); }
+            else if(arg=="--snapshot-spine-pin" && i+1<argc) { spine_pin=(int)parse_u32(argv[++i],"--snapshot-spine-pin"); if(spine_pin>1) throw std::runtime_error("--snapshot-spine-pin must be 0 or 1"); }
             else throw std::runtime_error("unknown/incomplete argument: "+arg);
         }
         if(port>65535) throw std::runtime_error("port out of range");
@@ -1258,7 +1195,7 @@ int main(int argc,char** argv) {
         if(slot_count<1 || slot_count>2) throw std::runtime_error("--slots must be 1..2 in multislot Phase 1");
         max_tokens_default_flag=max_tokens_default;
         Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count,
-                        budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto);
+                        budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto,spine_pin);
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
             runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
@@ -1304,7 +1241,9 @@ int main(int argc,char** argv) {
                                              {"suffix_fallbacks",(uint64_t)runtime.suffix_fallback_rounds_total}}},
                              {"snapshots",{{"enabled",runtime.snapstore.enabled()},
                                            {"disk_hits",(uint64_t)runtime.snapstore.hits},
-                                           {"disk_saves",(uint64_t)runtime.snapstore.saves}}},
+                                           {"disk_saves",(uint64_t)runtime.snapstore.saves},
+                                           {"evicted_spine",(uint64_t)runtime.snapstore.evicted_spine},
+                                           {"evicted_leaf",(uint64_t)runtime.snapstore.evicted_leaf}}},
                              {"cancellations",{{"queued",(uint64_t)runtime.cancelled_queue},
                                                {"prefill",(uint64_t)runtime.cancelled_prefill}}}});
         });

@@ -84,20 +84,38 @@ restore path is untouched.
 
 ## Gates (pre-registered, both directions, exit codes)
 
-- **G1 — plumbing (class assignment + victim order):** synthetic directory
-  with a spine chain (A ⊂ AB ⊂ ABC) plus a large unrelated leaf D, total
-  over a small budget. Assert the classifier marks A, AB spine; ABC, D
-  leaves; assert eviction removes D (leaf) before any spine member even
-  when D is mtime-newer. Sabotage: `SPINE_PIN=0` must revert to flat
-  mtime order (D survives, oldest spine evicted). Gate must fail both ways.
-- **G2 — invariant:** with the pin active, run `tools/snapshot_gate.sh`:
-  64-token continuation byte-identical from a fresh process, both KV
-  dtypes, 5-case reject matrix fail-loud. Eviction policy must not alter
-  restore correctness.
-- **G3 — trace replay A/B (the decision number):** replay the recorded pi
-  session (8336-spine, then a ≥500 MB tool-output save, then a request
-  that lands back on the spine) with `SPINE_PIN=0` vs `=1`, same budget.
-  Ship line below lives on this.
+**Design amendment (2026-07-18, one-model constraint):** this box holds
+exactly ONE resident model — a second model server crashed the live T2
+server during the first G1 attempt. The original live-server G1/G3 (a
+throwaway server with a tiny budget driving real hinted requests) is
+therefore OFF this box. The eviction ordering was refactored into
+header-only `src/metal/snapshot_evict.h` precisely so the gates run
+**offline, no model, no GPU, no server.**
+
+- **G1 — plumbing (class assignment + victim order), OFFLINE.** DONE:
+  `tools/test_snapshot_evict.cpp` drives `q27::mark_spine` +
+  `q27::eviction_order` (the exact functions `evict_past_budget` calls) on
+  a synthetic A ⊂ AB ⊂ ABC spine chain plus a large mtime-newer leaf D.
+  Asserts: A,AB spine / ABC,D leaves; pin OFF → flat mtime (A oldest first
+  victim); pin ON → leaves (ABC,D) before spine (A,AB); pin changes the
+  first victim away from spine A; unreadable-token file stays a leaf. Gate
+  FAILED FIRST on an inverted fixture (proving the assertions can fail),
+  then PASS. In `test-cpu`.
+- **G2 — invariant.** DONE: `tools/snapshot_gate.sh` ALL PASS (fp16, turbo3,
+  l7full byte-identical fresh-process restore; full reject matrix;
+  crash-consistency legs). Eviction policy does not alter restore
+  correctness.
+- **G3 — decision number, OFFLINE replay.** The ship line (does the spine
+  survive a subsequent large tool-output save) is answered by driving the
+  REAL `DiskSnapshotStore::evict_past_budget` over a fabricated directory
+  that mirrors the recorded pi session: an 8336-token spine snapshot plus a
+  newer ≥500 MB tool-output leaf, total over budget. `SPINE_PIN=0` must
+  evict the spine; `=1` must evict the leaf and keep the spine. Runs
+  offline via fabricated Q27SNAP1 fixtures (header + token ids; the
+  eviction path only reads tokens through `peek_snapshot`). If the offline
+  store harness proves infeasible, G3 degrades to the G1 ordering result
+  plus a trace-observation period on the live server's `/stats`
+  `evicted_spine`/`evicted_leaf` counters.
 
 ## Ship / kill line
 
@@ -111,6 +129,49 @@ restore path is untouched.
   practice), or computing the prefix relation at eviction time is not
   cheap enough to matter. On KILL the flat-LRU store stands and T1 joins
   T5 in the not-worth-it list.
+
+## RESULTS (2026-07-18, M4, offline — one-model constraint)
+
+- **G1 (ordering, offline): PASS** — `test_snapshot_evict` asserts
+  classification (A,AB spine / ABC,D leaves), pin-OFF flat-mtime order, and
+  pin-ON leaves-before-spine order; pin changes the first victim away from
+  spine A; unreadable-token file stays a leaf. Failed-first on an inverted
+  fixture, then PASS. In `test-cpu`.
+- **G2 (restore correctness): ALL PASS** — `tools/snapshot_gate.sh` fp16 /
+  turbo3 / l7full byte-identical fresh-process restore, full reject matrix,
+  crash-consistency legs. Eviction policy does not touch the restore path.
+- **G3 (decision number, real store, offline): PASS** —
+  `test_snapshot_evict_store` drives `DiskSnapshotStore::evict_past_budget`
+  over fabricated Q27SNAP1 fixtures (reused spine s1 ⊂ s2 chain tip + a
+  large newer tool-output leaf, budget = total−1 byte to force exactly one
+  victim). **pin OFF evicts the reused spine s1; pin ON spares s1 and
+  evicts a leaf.** Failed-first twice (inverted mtime; then the
+  tip-is-a-leaf subtlety below), then PASS. In `test-cpu`.
+
+**VERDICT: SHIP.** The pre-registered ship line held on the real store:
+with the pin on, the reused conversation spine survives a large tool-output
+save that flat-LRU would sacrifice it to. Implementation shipped:
+`src/metal/snapshot_evict.h` (header-only ordering) +
+`src/metal/disk_snapshot_store.h` (store extracted from metal_server.cpp so
+the gate drives the real code offline), `--snapshot-spine-pin` /
+`Q27_METAL_SNAPSHOT_SPINE_PIN` (default 1), per-class `evicted_spine` /
+`evicted_leaf` counters in `/stats`, and a class note on the eviction
+trace event. `DiskSnapshotStore` now takes an injected peek functor so the
+offline gate links no GPU code.
+
+**Design caveat surfaced by G3 (operator-visible):** the pin protects only
+*non-tip* spine members. The chain tip (the most recent snapshot) is a leaf
+— nothing extends it — so a large newer tool-output can still evict the
+current tip under a tight budget. That is correct Mooncake semantics (the
+tip is the newest, least-reused position), and recency (touch-on-hit)
+already favors a re-hit tip, but it means the pin's protection is one turn
+behind the frontier. Recorded, not chased here.
+
+**One-model constraint (hard rule, reinforced this session):** this box
+holds exactly ONE resident model; a second model server (the original
+live-server G1) crashed the live T2 server. All T1 gates were therefore
+built offline (no model, no GPU, no server). The obsolete live-server gate
+script was removed.
 
 ## Honest scope note (operator, read before ship)
 
