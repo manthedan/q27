@@ -25,6 +25,7 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	./build/test_q27_agent_tools
 	./build/test_q27_agent_persistence
 	./build/test_q27_agent_worker
+	python3 tools/test_experimental_prefix_cache.py
 
 build/test_q27_agent_session: experiments/ds4-agent/test_q27_agent_session.cpp experiments/ds4-agent/q27_agent_session.h | build
 	$(CXX) $(CXXFLAGS) -I experiments/ds4-agent experiments/ds4-agent/test_q27_agent_session.cpp -o $@

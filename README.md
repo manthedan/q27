@@ -276,6 +276,67 @@ an explicit flag wins over the env):**
 | `--budget-mb N` | `Q27_METAL_BUDGET_MB` | half working set | multislot admission budget (test/override hook) |
 | `Q27_METAL_KV_FP16_CELLS` | env-only (engine ctor plumbing pending) | off | turbo3 KV fp16 exception cells (production: `8,9,10,11,12,13,14,15`) |
 
+### Experimental harness-prefix prewarming
+
+The Metal server can optionally pay Pi/Codex's large initial prompt prefill
+during explicit local setup rather than after the first interactive prompt.
+This remains experimental and completely dormant unless its separate flag is
+present:
+
+```bash
+export Q27_METAL_ADMIN_TOKEN="$(openssl rand -hex 16)"
+./build/q27-metal-server model.q27 model.tok --port 8080 \
+  --experimental-prefix-cache ~/.cache/q27/experimental-prefixes \
+  --snapshot-max-mb 8192
+```
+
+The flag enables an admin-authenticated, loopback-only prewarm endpoint and
+exact disk-prefix lookup. It defaults to explicit installs only
+(`--snapshot-auto 0` semantics); passing `--snapshot-auto` separately opts
+back into ordinary automatic saves. MTP is deliberately unsupported in this
+experiment.
+
+To install from a captured initial request body:
+
+```bash
+Q27_METAL_ADMIN_TOKEN="$Q27_METAL_ADMIN_TOKEN" \
+python3 tools/experimental_prefix_cache.py prewarm \
+  --target http://127.0.0.1:8080 --api chat_completions pi-request.json
+
+# For a Codex /v1/responses request, use: --api responses
+```
+
+Or capture the exact request from the real installed harness without knowing
+or copying its changing system prompt:
+
+```bash
+export Q27_PREFIX_CAPTURE_TOKEN="$(openssl rand -hex 16)"
+Q27_METAL_ADMIN_TOKEN="$Q27_METAL_ADMIN_TOKEN" \
+Q27_PREFIX_CAPTURE_TOKEN="$Q27_PREFIX_CAPTURE_TOKEN" \
+python3 tools/experimental_prefix_cache.py proxy \
+  --target http://127.0.0.1:8080 --port 8081
+```
+
+Configure that temporary harness provider's API key as
+`$Q27_PREFIX_CAPTURE_TOKEN` (or send it in
+`X-Q27-Prefix-Capture-Token`). The proxy will not exercise its stored admin
+capability for any unauthenticated local process. Temporarily point one fresh
+Pi or Codex setup run at port 8081. The proxy
+removes the final live user message, asks the real server to persist the exact
+remaining token prefix, then forwards the original request normally. Streaming
+setup requests receive SSE-comment keepalives while the cold prewarm runs. Both
+target and listener are forcibly loopback, and credential-bearing admin calls
+explicitly bypass configured HTTP proxies. Stop the proxy and point ordinary
+sessions back at port 8080. Only initial requests
+(system instructions plus one final user message) are accepted for prewarming;
+tool-loop histories fail closed. A changed harness prompt, tool schema,
+project instruction, model, or tokenizer simply misses and takes the normal
+prefill path. In the first real isolated Pi smoke, setup installed a
+1,318-token prefix in 28.28 s; a different first user message through a fresh
+server process then completed the whole Pi invocation in 1.64 s from disk.
+Snapshots are local private files and may encode sensitive system/project
+instructions; they are never bundled or uploaded.
+
 **The server has no auth and binds 127.0.0.1 by default.** Reaching it
 from other machines or containers requires an explicit `--host 0.0.0.0`.
 

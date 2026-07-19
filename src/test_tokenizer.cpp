@@ -244,6 +244,28 @@ static int anthropic_api_selftest() {
                "schema/description defaults");
         expect(q27::anthropic_tools_json(json::object()).is_array(), "no tools -> empty array");
     }
+    {   // Experimental prewarm strips only the live initial user turn.
+        const std::vector<q27::Msg> messages={{"system","stable"},{"user","variable"}};
+        std::string full;
+        const std::string prefix=q27::initial_harness_prefix(
+            messages,json::array(),true,&full);
+        expect(prefix=="<|im_start|>system\nstable<|im_end|>\n",
+               "initial harness closed prefix");
+        expect(full.rfind(prefix,0)==0 &&
+               full.find("variable")!=std::string::npos,
+               "initial harness prefix extends to full prompt");
+        bool rejected_history=false,rejected_terminal=false;
+        try {
+            (void)q27::initial_harness_prefix(
+                {{"system","s"},{"user","old"},{"assistant","a"},{"user","new"}},
+                json::array(),true);
+        } catch(const std::exception&) { rejected_history=true; }
+        try {
+            (void)q27::initial_harness_prefix({{"system","s"}},json::array(),true);
+        } catch(const std::exception&) { rejected_terminal=true; }
+        expect(rejected_history,"prewarm rejects conversation history");
+        expect(rejected_terminal,"prewarm requires live user terminal");
+    }
     {
         json body={{"max_tokens",nullptr},{"max_output_tokens",77}};
         auto fallback=q27::json_i64_or(body,"max_output_tokens",256);

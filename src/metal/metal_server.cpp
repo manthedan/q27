@@ -28,6 +28,7 @@
 #include <random>
 #include <set>
 #include <stdexcept>
+#include <sys/acl.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -63,6 +64,113 @@ std::string executable_sha1() {
     if(_NSGetExecutablePath(path.data(),&n)!=0)
         throw std::runtime_error("cannot resolve server executable");
     return file_sha1(path.data());
+}
+
+bool path_has_extended_acl(const std::string& path) {
+    errno=0;
+    acl_t acl=acl_get_file(path.c_str(),ACL_TYPE_EXTENDED);
+    if(!acl) {
+        if(errno==ENOENT) return false;
+        throw std::runtime_error("cannot inspect ACL on path: "+path);
+    }
+    acl_entry_t entry{};
+    errno=0;
+    const int result=acl_get_entry(acl,ACL_FIRST_ENTRY,&entry);
+    const int saved_errno=errno;
+    acl_free(acl);
+    if(result==0) return true;
+    // Darwin reports EINVAL when an allocated ACL has no first entry.
+    if(result<0 && saved_errno==EINVAL) return false;
+    throw std::runtime_error("cannot inspect ACL entries on path: "+path);
+}
+
+bool path_has_granting_acl(const std::string& path) {
+    errno=0;
+    acl_t acl=acl_get_file(path.c_str(),ACL_TYPE_EXTENDED);
+    if(!acl) {
+        if(errno==ENOENT) return false;
+        throw std::runtime_error("cannot inspect ancestor ACL: "+path);
+    }
+    acl_entry_t entry{};
+    int entry_id=ACL_FIRST_ENTRY;
+    for(;;) {
+        errno=0;
+        const int result=acl_get_entry(acl,entry_id,&entry);
+        if(result<0) {
+            const int saved_errno=errno;
+            acl_free(acl);
+            if(saved_errno==EINVAL) return false; // no entry / end of list
+            throw std::runtime_error("cannot inspect ancestor ACL entries: "+path);
+        }
+        acl_tag_t tag{};
+        if(acl_get_tag_type(entry,&tag)!=0) {
+            acl_free(acl);
+            throw std::runtime_error("cannot inspect ancestor ACL tag: "+path);
+        }
+        if(tag==ACL_EXTENDED_ALLOW) {
+            acl_free(acl);
+            return true;
+        }
+        if(tag!=ACL_EXTENDED_DENY) {
+            acl_free(acl);
+            throw std::runtime_error("unknown ancestor ACL tag: "+path);
+        }
+        entry_id=ACL_NEXT_ENTRY;
+    }
+}
+
+void make_owner_private_no_acl(const std::string& path,mode_t mode,bool directory) {
+    struct stat st{};
+    if(lstat(path.c_str(),&st)!=0 || st.st_uid!=geteuid() ||
+       (directory ? !S_ISDIR(st.st_mode) :
+                    (!S_ISREG(st.st_mode) || st.st_nlink!=1)))
+        throw std::runtime_error("experimental cache path has unsafe owner/type: "+path);
+    acl_t empty=acl_init(0);
+    if(!empty) throw std::runtime_error("cannot allocate empty ACL for: "+path);
+    const int set_result=acl_set_file(path.c_str(),ACL_TYPE_EXTENDED,empty);
+    acl_free(empty);
+    if(set_result!=0)
+        throw std::runtime_error("cannot remove extended ACL from experimental cache path: "+path);
+    if(chmod(path.c_str(),mode)!=0)
+        throw std::runtime_error("cannot set private mode on experimental cache path: "+path);
+    if(path_has_extended_acl(path))
+        throw std::runtime_error("experimental cache path retains an ACL: "+path);
+    if(lstat(path.c_str(),&st)!=0 || st.st_uid!=geteuid() ||
+       (st.st_mode&0777)!=mode ||
+       (directory ? !S_ISDIR(st.st_mode) :
+                    (!S_ISREG(st.st_mode) || st.st_nlink!=1)))
+        throw std::runtime_error("cannot verify private experimental cache path: "+path);
+}
+
+std::string verified_experimental_cache_path(const std::string& input) {
+    struct stat leaf{};
+    if(lstat(input.c_str(),&leaf)!=0 || !S_ISDIR(leaf.st_mode))
+        throw std::runtime_error(
+            "experimental cache leaf must be a real directory: "+input);
+    std::error_code ec;
+    const std::filesystem::path canonical=std::filesystem::canonical(input,ec);
+    if(ec) throw std::runtime_error(
+        "cannot canonicalize experimental cache path: "+input);
+    for(std::filesystem::path current=canonical.parent_path();;) {
+        struct stat st{};
+        const std::string path=current.string();
+        if(path.empty() || lstat(path.c_str(),&st)!=0 || !S_ISDIR(st.st_mode))
+            throw std::runtime_error("unsafe experimental cache ancestor: "+path);
+        if(st.st_uid!=0 && st.st_uid!=geteuid())
+            throw std::runtime_error(
+                "experimental cache ancestor has a foreign owner: "+path);
+        if(path_has_granting_acl(path))
+            throw std::runtime_error(
+                "experimental cache ancestor has a granting ACL: "+path);
+        if((st.st_mode&0022)!=0 &&
+           (!(st.st_mode&S_ISVTX) || (st.st_uid!=0 && st.st_uid!=geteuid())))
+            throw std::runtime_error(
+                "experimental cache ancestor is replaceable by another principal: "+path);
+        const std::filesystem::path parent=current.parent_path();
+        if(parent==current) break;
+        current=parent;
+    }
+    return canonical.string();
 }
 
 uint32_t parse_u32(const std::string& text, const char* option) {
@@ -144,6 +252,83 @@ std::vector<q27::Msg> openai_msgs(const json& body) {
     if(merged.empty()) throw std::runtime_error("messages are empty");
     if(merged[0].role=="system") q27::normalize_cc_billing_header(merged[0].content);
     return merged;
+}
+
+struct ResponsesPromptInput {
+    json tools = json::array();
+    std::set<std::string> custom_names;
+    std::vector<q27::Msg> messages;
+};
+
+// Normalize the Responses request once for both ordinary serving and the
+// opt-in experimental prefix prewarmer. Keeping one canonicalizer is the
+// central safety property: a prewarmed token prefix must be byte-for-byte
+// the same prompt the serving path would ingest.
+ResponsesPromptInput responses_prompt_input(const json& body) {
+    ResponsesPromptInput out;
+    if(body.contains("tools") && body["tools"].is_array())
+        for(const auto& t:body["tools"]) {
+            if(!t.is_object()) continue;
+            const std::string ty=t.value("type","");
+            if(t.contains("function") && t["function"].is_object()) out.tools.push_back(t);
+            else if(ty=="function" && t.contains("name"))
+                out.tools.push_back({{"type","function"},
+                    {"function",{{"name",t.value("name","")},
+                                 {"description",t.value("description","")},
+                                 {"parameters",t.contains("parameters")?t["parameters"]
+                                                                       :json::object()}}}});
+            else if(ty=="custom") {
+                const std::string name=t.value("name","");
+                out.custom_names.insert(name);
+                out.tools.push_back({{"type","function"},
+                    {"function",{{"name",name},
+                                 {"description",t.value("description","")},
+                                 {"parameters",{{"type","object"},
+                                     {"properties",{{"input",{{"type","string"},
+                                         {"description","The complete raw input text for this tool."}}}}},
+                                     {"required",json::array({"input"})}}}}}});
+            }
+        }
+    if(body.contains("instructions") && body["instructions"].is_string())
+        out.messages.push_back({"system",body["instructions"]});
+    if(body.contains("input")) {
+        if(body["input"].is_string()) out.messages.push_back({"user",body["input"]});
+        else if(body["input"].is_array())
+            for(const auto& item:body["input"]) {
+                if(!item.is_object()) continue;
+                const std::string type=item.value("type","message");
+                if(type=="message") {
+                    std::string role=item.value("role","user");
+                    if(role=="developer") role="system";
+                    out.messages.push_back({role,item.contains("content")?
+                        text_content(item["content"]):""});
+                } else if(type=="function_call" || type=="custom_tool_call") {
+                    json args;
+                    if(type=="function_call") {
+                        try { args=json::parse(item.value("arguments","{}")); }
+                        catch(...) { args=item.value("arguments",""); }
+                    } else args={{"input",item.value("input","")}};
+                    out.messages.push_back({"assistant",
+                        q27::tool_call_text(item.value("name",""),args)});
+                } else if(type=="function_call_output" || type=="custom_tool_call_output") {
+                    std::string value;
+                    if(item.contains("output"))
+                        value=item["output"].is_string()?item["output"].get<std::string>()
+                                                        :text_content(item["output"]);
+                    out.messages.push_back({"user",q27::tool_response_text(value)});
+                }
+                // Reasoning items in history are intentionally dropped.
+            }
+    }
+    if(out.messages.empty()) throw std::runtime_error("input is empty");
+    std::vector<q27::Msg> merged;
+    for(auto& message:out.messages) {
+        if(!merged.empty() && merged.back().role==message.role)
+            merged.back().content+="\n"+message.content;
+        else merged.push_back(std::move(message));
+    }
+    out.messages=std::move(merged);
+    return out;
 }
 
 // Unique-ish ids for tool_use/tool_calls blocks: agent clients key results
@@ -446,6 +631,7 @@ struct Runtime {
     std::string model_name,model_sha1_cache,boot_id,server_sha1,tokenizer_name,tokenizer_sha1;
     std::string admin_token;   // separate from boot_id: never served over HTTP (autoreview P2)
     bool snapshot_spine_pin_config=false;
+    bool experimental_prefix_cache=false;
     std::string os_sysname,os_release,os_machine;
     bool turbo3_kv=false, test_failpoints=false;
     size_t prefix_entries_config=0;
@@ -490,6 +676,7 @@ struct Runtime {
                     {"mtp",mtp_width},{"suffix",suffix_width},{"slots",slots.size()},
                     {"prefix_entries",prefix_entries_config},{"constrain_tools",constrain_tools},
                     {"snapshots",snapstore.enabled()},{"snapshot_auto_min",snap_auto_min},
+                    {"experimental_prefix_cache",experimental_prefix_cache},
                     {"snapshot_max_bytes",snapshot_max_bytes_config},
                     {"snapshot_spine_pin",snapshot_spine_pin_config},
                     {"max_tokens_default",max_tokens_default_config},
@@ -513,9 +700,11 @@ struct Runtime {
     Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
             uint32_t width,uint32_t sfx_width,size_t cache_entries,bool constrain,
             uint32_t slot_count,uint32_t budget_mb,const std::string& snapshot_dir,
-            uint32_t snapshot_max_mb,long long snapshot_auto,uint32_t max_tokens_default,int spine_pin)
+            uint32_t snapshot_max_mb,long long snapshot_auto,uint32_t max_tokens_default,
+            int spine_pin,bool experimental_prefix)
         :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
-         constrain_tools(constrain),turbo3_kv(turbo3),prefix_entries_config(cache_entries),
+         constrain_tools(constrain),experimental_prefix_cache(experimental_prefix),
+         turbo3_kv(turbo3),prefix_entries_config(cache_entries),
          max_tokens_default_config(max_tokens_default) {
         // Server identity (homebrew plan Q2): /health and the boot trace name
         // the resident artifact so wrapper/clients can tell what's loaded.
@@ -625,6 +814,19 @@ struct Runtime {
             std::filesystem::create_directories(sdir,ec);
             if(ec || !std::filesystem::is_directory(sdir))
                 throw std::runtime_error("snapshot dir (--snapshot-dir / Q27_METAL_SNAPSHOT_DIR) is not a usable directory: "+sdir);
+            if(experimental_prefix_cache) {
+                sdir=verified_experimental_cache_path(sdir);
+                // Captured harness prefixes can include private project
+                // instructions. Tighten a newly-created leaf and reject a
+                // symlink, foreign owner, or non-private existing leaf.
+                // (The ordinary shipped snapshot store keeps its historical
+                // deployment semantics; this stricter policy is scoped to
+                // the explicitly experimental prompt-capture surface.)
+                make_owner_private_no_acl(sdir,0700,true);
+                for(const auto& entry:std::filesystem::directory_iterator(sdir))
+                    if(entry.path().extension()==".q27snap")
+                        make_owner_private_no_acl(entry.path().string(),0600,false);
+            }
             const unsigned char* sha=slots[0]->engine.snapshot_identity();
             // Full 160-bit identity in the tag: a truncated prefix could
             // collide across artifacts sharing a directory and let one
@@ -678,7 +880,10 @@ struct Runtime {
             // covered-prefix skip and LRU budget bound the write traffic.
             // --snapshot-auto / Q27_METAL_SNAPSHOT_AUTO overrides (tokens;
             // 0 disables auto).
-            snap_auto_min=4096;
+            // The experimental install path only writes through its explicit
+            // authenticated prewarm endpoint unless the operator separately
+            // opts into production auto-snapshotting.
+            snap_auto_min=experimental_prefix_cache?0:4096;
             if(snapshot_auto>=0) snap_auto_min=(size_t)snapshot_auto; // --snapshot-auto, validated at parse
             else if(const char* sauto=getenv("Q27_METAL_SNAPSHOT_AUTO"); sauto && *sauto) {
                 char* end=nullptr; errno=0;
@@ -732,12 +937,31 @@ struct Runtime {
     struct Outcome {
         uint32_t prompt_tokens=0, output_tokens=0;
         size_t prefix_hit=0;
+        bool exact_disk_hit=false; // durable exact prefix existed before this run
+        bool exact_snapshot_written=false;
         Finish finish=Finish::Length;
         std::string stop_sequence; // set when finish==StopSequence
         double queue_wait_ms=0;    // arrival to slot admission
         double gate_wait_ms=0;     // slot admission to first GPU lease
         const char* arrival="idle"; // competing slot's phase at arrival
     };
+
+    // Invalidate path-keyed metadata on every save attempt. save_state can
+    // atomically rename the new inode and then throw on directory fsync; in
+    // that uncertain-publication case the path may already name new metadata.
+    // Erasing is safe before rename too: the next lookup simply re-peeks the
+    // still-current old file.
+    void save_disk_snapshot(q27::MetalEngine& engine,const std::string& path,
+                            const uint32_t* tokens,uint32_t count,
+                            bool logits_resident) {
+        try {
+            engine.save_state(path,tokens,count,logits_resident);
+        } catch(...) {
+            snapstore.published(path);
+            throw;
+        }
+        snapstore.published(path);
+    }
 
     // Single generation core shared by streaming and non-streaming paths.
     // `emit(piece)` receives UTF-8-safe, stop-sequence-trimmed text as it is
@@ -757,7 +981,8 @@ struct Runtime {
                 const std::vector<std::string>& tool_names={},
                 bool snapshot_hint=false,
                 const std::function<bool()>& live={},
-                const std::string& trace_id="") {
+                const std::string& trace_id="",
+                bool experimental_exact_prefix_save=false) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         q27::validate_sampling(sampling);
         const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
@@ -867,7 +1092,7 @@ struct Runtime {
 
         // ---- prompt ingestion, one quantum per chunk ----
         size_t hit=0; uint32_t pending=0;
-        bool restored=false, saved_snapshot=false;
+        bool restored=false, saved_snapshot=false, exact_snapshot_written=false;
         // Disk lookup runs before taking the lease (pure file I/O); only
         // the resulting load_state goes under it. MTP requests stay on the
         // cold path: lane warming state is not part of the snapshot
@@ -887,7 +1112,9 @@ struct Runtime {
             // 607160e). load_state validates fully before its first GPU
             // write, so a rejected file leaves a memory-restored state
             // intact; only a mid-restore I/O error falls all the way cold.
-            if(disk_ok && disk_len>hit) {
+            if(disk_ok && (disk_len>hit ||
+                           (experimental_exact_prefix_save &&
+                            disk_len==prompt.size()))) {
                 try {
                     engine.load_state(disk_path);
                     disk_loaded=true;
@@ -895,6 +1122,11 @@ struct Runtime {
                     if(hit==prompt.size()) { pending=engine.pending_from_logits(); restored=true; }
                     snapstore.hits++;
                 } catch(const std::exception&) {
+                    // A shallow-header candidate that fails the engine's full
+                    // load is unusable. Remove it so the same token key can
+                    // self-heal instead of failing every request or blocking
+                    // a later stale/exact publication.
+                    snapstore.reject(disk_path);
                     // A bad disk candidate must not cost more than it
                     // offered: fall back to the in-memory tier before going
                     // cold (codex P2 on f05ef2d).
@@ -924,8 +1156,9 @@ struct Runtime {
         // repeated agent prefixes, where the trade wins; churn-sensitive
         // deployments set Q27_METAL_SNAPSHOT_AUTO=0 (hint-only).
         size_t save_at=0;
-        const bool snap_wanted=snapshot_hint ||
-                               (snap_auto_min && prompt.size()>=snap_auto_min);
+        const bool snap_wanted=!experimental_exact_prefix_save &&
+                               (snapshot_hint ||
+                                (snap_auto_min && prompt.size()>=snap_auto_min));
         if(snap_wanted && !mtp && snapstore.enabled() && engine.chunked_prefill() &&
            prompt.size()>32+96) {
             const size_t target=(prompt.size()-32)/96*96;
@@ -956,16 +1189,25 @@ struct Runtime {
                         // client cancel into the generic error path
                         // (codex P3 on this round).
                         if(save_at && i>0) try {
+                            bool banked=false;
                             {
                                 auto gpu=lease_now();
-                                engine.save_state(snapstore.path_for(prompt.data(),(uint32_t)(hit+i)),
-                                                  prompt.data(),(uint32_t)(hit+i),false);
+                                const uint32_t bank_count=(uint32_t)(hit+i);
+                                if(!snapstore.exact_resident(prompt.data(),bank_count)) {
+                                    const std::string path=snapstore.path_for(
+                                        prompt.data(),bank_count);
+                                    save_disk_snapshot(engine,path,prompt.data(),
+                                                       bank_count,false);
+                                    banked=true;
+                                }
                             }
-                            snapstore.saves++;
-                            const auto ev=snapstore.evict_past_budget();
-                            trace.event({{"kind","snapshot_bank"},{"id",trace_id},
-                                         {"len",(uint64_t)(hit+i)},
-                                         {"evicted_files",ev.first},{"evicted_bytes",ev.second}});
+                            if(banked) {
+                                snapstore.saves++;
+                                const auto ev=snapstore.evict_past_budget();
+                                trace.event({{"kind","snapshot_bank"},{"id",trace_id},
+                                             {"len",(uint64_t)(hit+i)},
+                                             {"evicted_files",ev.first},{"evicted_bytes",ev.second}});
+                            }
                         } catch(const std::exception& e) {
                             fprintf(stderr,"[cancel-save] skipped: %s\n",e.what());
                         }
@@ -990,13 +1232,19 @@ struct Runtime {
                         // Mid-prefill state is exact but the logits row is
                         // stale — recorded in the file so a same-length
                         // request can never derive a pending token from it.
-                        engine.save_state(snapstore.path_for(prompt.data(),(uint32_t)save_at),
-                                          prompt.data(),(uint32_t)save_at,false);
-                        snapstore.saves++;
-                        trace.event({{"kind","snapshot_save"},{"id",trace_id},
-                                     {"len",(uint64_t)save_at},
-                                     {"mode",snapshot_hint?"hint":"auto"}});
-                        save_at=0; saved_snapshot=true;
+                        if(!snapstore.exact_resident(
+                                prompt.data(),(uint32_t)save_at)) {
+                            const std::string path=snapstore.path_for(
+                                prompt.data(),(uint32_t)save_at);
+                            save_disk_snapshot(engine,path,prompt.data(),
+                                               (uint32_t)save_at,false);
+                            snapstore.saves++;
+                            trace.event({{"kind","snapshot_save"},{"id",trace_id},
+                                         {"len",(uint64_t)save_at},
+                                         {"mode",snapshot_hint?"hint":"auto"}});
+                            saved_snapshot=true;
+                        }
+                        save_at=0;
                     }
                 }
                 // Serial tail: at most one leftover chunkable token plus the
@@ -1007,6 +1255,30 @@ struct Runtime {
                     pending=engine.step(suffix[i]);
                 }
             }
+        }
+        // Experimental harness prewarming saves the complete supplied token
+        // prefix, not the production hint heuristic's aligned len-32 prefix.
+        // The caller supplies a prompt with the live user message removed.
+        // An existing exact disk hit is already the requested result and is
+        // not rewritten. This flag is reachable only through the separately
+        // enabled, admin-authenticated experimental endpoint.
+        const bool exact_disk_hit=disk_loaded && disk_len==prompt.size();
+        if(experimental_exact_prefix_save && !exact_disk_hit) {
+            if(mtp) throw std::runtime_error("experimental prefix prewarm does not support MTP");
+            if(!snapstore.enabled())
+                throw std::runtime_error("experimental prefix cache store is disabled");
+            {
+                auto gpu=lease_now();
+                const std::string path=snapstore.path_for(
+                    prompt.data(),(uint32_t)prompt.size());
+                save_disk_snapshot(engine,path,prompt.data(),
+                                   (uint32_t)prompt.size(),true);
+            }
+            snapstore.saves++;
+            saved_snapshot=true;
+            exact_snapshot_written=true;
+            trace.event({{"kind","snapshot_save"},{"id",trace_id},
+                         {"len",(uint64_t)prompt.size()},{"mode","experimental_exact"}});
         }
         // LRU enforcement is pure file I/O — outside the lease.
         if(saved_snapshot) {
@@ -1228,6 +1500,8 @@ struct Runtime {
         out.prompt_tokens=(uint32_t)prompt.size();
         out.output_tokens=produced;
         out.prefix_hit=hit;
+        out.exact_disk_hit=exact_disk_hit;
+        out.exact_snapshot_written=exact_snapshot_written;
         out.queue_wait_ms=queue_wait_ms;
         out.gate_wait_ms=std::max(gate_wait_ms,0.0);
         out.arrival=arrival;
@@ -1311,12 +1585,13 @@ int main(int argc,char** argv) {
     if(argc<3) {
         fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n"
                        "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
+                       "       [--experimental-prefix-cache path]\n"
                        "       (the snapshot/max-tokens/budget flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,SNAPSHOT_SPINE_PIN,MAX_TOKENS_DEFAULT,BUDGET_MB}; an explicit flag wins)\n",argv[0]);
         return 1;
     }
     try {
         std::string model=argv[1],tok=argv[2],host="127.0.0.1";
-        std::string trace_path,snapshot_dir;
+        std::string trace_path,snapshot_dir,experimental_prefix_dir;
         uint32_t port=8080,context=8192,width=0,suffix_width=0,prefix_entries=1,slot_count=2;
         // Shipped-semantics knobs as flags (homebrew Phase-2 pre-tag);
         // sentinel = flag absent, Runtime falls back to the env twin.
@@ -1339,6 +1614,11 @@ int main(int argc,char** argv) {
             else if(arg=="--constrain-tools") constrain_tools=true;
             else if(arg=="--trace" && i+1<argc) trace_path=argv[++i];
             else if(arg=="--snapshot-dir" && i+1<argc) { snapshot_dir=argv[++i]; if(snapshot_dir.empty()) throw std::runtime_error("invalid --snapshot-dir"); }
+            else if(arg=="--experimental-prefix-cache" && i+1<argc) {
+                experimental_prefix_dir=argv[++i];
+                if(experimental_prefix_dir.empty())
+                    throw std::runtime_error("invalid --experimental-prefix-cache");
+            }
             // The env twins reject 0 as malformed, and 0 here would silently
             // collapse into the "flag absent" sentinel — so it fails loud
             // in-branch (post-loop checks can no longer tell 0 from unset).
@@ -1359,6 +1639,12 @@ int main(int argc,char** argv) {
         // 4415c53); 4096 entries is already far beyond any real deployment.
         if(prefix_entries>4096) throw std::runtime_error("--prefix-entries must be 0..4096");
         if(width && suffix_width) throw std::runtime_error("--mtp and --suffix are mutually exclusive (one speculation lever per server)");
+        if(!experimental_prefix_dir.empty()) {
+            if(width) throw std::runtime_error("--experimental-prefix-cache does not support --mtp");
+            if(!snapshot_dir.empty() && snapshot_dir!=experimental_prefix_dir)
+                throw std::runtime_error("--snapshot-dir and --experimental-prefix-cache must name the same directory");
+            snapshot_dir=experimental_prefix_dir;
+        }
         if(constrain_tools && width) throw std::runtime_error("--constrain-tools requires serial decode; drop --mtp (verify-lane masks are not wired on Metal)");
         if(constrain_tools && suffix_width) throw std::runtime_error("--constrain-tools requires serial decode; drop --suffix (burst rounds argmax unmasked logits)");
         // Phase 1's latency guarantee (wait <= one active quantum) only
@@ -1373,7 +1659,8 @@ int main(int argc,char** argv) {
             }
         max_tokens_default_flag=max_tokens_default;
         Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count,
-                        budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto,max_tokens_default,spine_pin);
+                        budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto,max_tokens_default,spine_pin,
+                        !experimental_prefix_dir.empty());
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
             runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
@@ -1445,6 +1732,7 @@ int main(int argc,char** argv) {
                                              {"suffix_bursts",(uint64_t)runtime.suffix_burst_rounds_total},
                                              {"suffix_fallbacks",(uint64_t)runtime.suffix_fallback_rounds_total}}},
                              {"snapshots",{{"enabled",runtime.snapstore.enabled()},
+                                           {"experimental_prefix_cache",runtime.experimental_prefix_cache},
                                            {"disk_hits",(uint64_t)runtime.snapstore.hits},
                                            {"disk_saves",(uint64_t)runtime.snapstore.saves},
                                            {"evicted_spine",(uint64_t)runtime.snapstore.evicted_spine},
@@ -1569,6 +1857,108 @@ int main(int argc,char** argv) {
             if(prompt_tokens+n>runtime.context) n=runtime.context-(uint32_t)prompt_tokens;
             return false;
         };
+
+        // Experimental, opt-in harness-prefix installer. It accepts one
+        // ordinary initial Chat Completions or Responses request, removes
+        // exactly its final live user message, verifies that the resulting
+        // token stream is an exact prefix of the ordinary serving prompt,
+        // and persists that prefix without decoding. No route is registered
+        // unless --experimental-prefix-cache was supplied; the separate
+        // admin credential and loopback check apply as for drain/resume.
+        if(runtime.experimental_prefix_cache)
+            server.Post("/experimental/prefix-cache/prewarm",
+                [&](const httplib::Request& req,httplib::Response& response) {
+                if(!admin_ok(req)) {
+                    json_response(response,{{"error","forbidden"}},403);
+                    return;
+                }
+                Runtime::RequestScope active(runtime);
+                if(!active.admitted) {
+                    json_response(response,{{"error","server draining"}},503);
+                    return;
+                }
+                try {
+                    const json envelope=json::parse(req.body);
+                    if(!envelope.contains("request") || !envelope["request"].is_object())
+                        throw std::runtime_error("request must be an object");
+                    const json& request=envelope["request"];
+                    const std::string api=envelope.value("api","");
+                    json tools=json::array();
+                    std::vector<q27::Msg> messages;
+                    bool think=true;
+                    if(api=="chat" || api=="chat_completions") {
+                        messages=openai_msgs(request);
+                        if(request.contains("tools") && request["tools"].is_array())
+                            tools=request["tools"];
+                        think=request.value("enable_thinking",true);
+                        if(request.contains("chat_template_kwargs") &&
+                           request["chat_template_kwargs"].is_object())
+                            think=request["chat_template_kwargs"].value(
+                                "enable_thinking",think);
+                    } else if(api=="responses") {
+                        ResponsesPromptInput normalized=responses_prompt_input(request);
+                        tools=std::move(normalized.tools);
+                        messages=std::move(normalized.messages);
+                    } else throw std::runtime_error(
+                        "api must be chat_completions or responses");
+
+                    std::string full_rendered;
+                    const std::string prefix_rendered=q27::initial_harness_prefix(
+                        messages,tools,think,&full_rendered);
+                    auto prefix_ids=to_u32(runtime.tokenizer.encode(prefix_rendered));
+                    const auto full_ids=to_u32(runtime.tokenizer.encode(full_rendered));
+                    if(prefix_ids.empty() || prefix_ids.size()>=full_ids.size() ||
+                       !std::equal(prefix_ids.begin(),prefix_ids.end(),full_ids.begin()))
+                        throw std::runtime_error(
+                            "derived static prompt is not an exact token prefix");
+                    const uint32_t maxp=max_prompt_tokens(
+                        runtime.context,runtime.mtp_width,runtime.suffix_width);
+                    if(prefix_ids.size()>maxp)
+                        throw std::runtime_error("derived prefix exceeds context");
+
+                    char cache_key[41];
+                    snap_hash_sha1(prefix_ids.data(),(uint32_t)prefix_ids.size(),cache_key);
+                    cache_key[40]='\0';
+                    const std::string id="prewarm-metal-"+runtime.boot_id+"-"+
+                        std::to_string((long)req_counter++);
+                    const Runtime::Outcome outcome=traced_engine("prefix_prewarm",id,[&]{
+                        return runtime.run(prefix_ids,0,q27::SamplingParams{},
+                            std::vector<std::string>{},
+                            [](const std::string&){ return true; },
+                            std::vector<std::string>{},false,{},id,true);
+                    });
+                    std::string retained_path;
+                    uint32_t retained_tokens=0;
+                    const bool retained=runtime.snapstore.best_match(
+                        prefix_ids,retained_path,retained_tokens) &&
+                        retained_tokens==prefix_ids.size();
+                    if(retained) make_owner_private_no_acl(
+                        retained_path,0600,false);
+                    runtime.trace.event({{"kind","prefix_prewarm"},{"id",id},
+                        {"api",api},{"prefix_tokens",(uint64_t)prefix_ids.size()},
+                        {"request_tokens",(uint64_t)full_ids.size()},
+                        {"existing_hit",outcome.exact_disk_hit},
+                        {"retained",retained}});
+                    if(!retained) {
+                        json_response(response,{{"error",
+                            "experimental prefix snapshot did not survive the configured budget"},
+                            {"cache_key",cache_key},{"prefix_tokens",prefix_ids.size()}},507);
+                        return;
+                    }
+                    json_response(response,{{"status","ok"},{"experimental",true},
+                        {"api",api},{"cache_key",cache_key},
+                        {"prefix_tokens",prefix_ids.size()},
+                        {"request_prompt_tokens",full_ids.size()},
+                        {"already_cached",outcome.exact_disk_hit},
+                        {"snapshot_written",outcome.exact_snapshot_written}});
+                } catch(const Runtime::ServerOverloaded& e) {
+                    json_response(response,{{"error",e.what()}},503);
+                } catch(const Runtime::EngineError& e) {
+                    json_response(response,{{"error",e.what()}},500);
+                } catch(const std::exception& e) {
+                    json_response(response,{{"error",e.what()}},400);
+                }
+            });
 
         // ---- OpenAI /v1/completions (raw continuation; no template, no
         // tool protocol) ----
@@ -2267,74 +2657,13 @@ int main(int argc,char** argv) {
             const long rn=req_counter++;
             const std::string resp_id="resp_metal_"+runtime.boot_id+"_"+std::to_string(rn);
             const std::string msg_id="msg_metal_"+runtime.boot_id+"_"+std::to_string(rn);
-            // Tools: flat function entries normalized to the nested shape
-            // chatml_prompt renders; `custom` freeform tools (apply_patch)
-            // bridged; hosted types (web_search etc.) skipped.
-            json tools=json::array();
-            std::set<std::string> custom_names;
-            if(body.contains("tools") && body["tools"].is_array())
-                for(const auto& t:body["tools"]) {
-                    if(!t.is_object()) continue;
-                    const std::string ty=t.value("type","");
-                    if(t.contains("function") && t["function"].is_object()) tools.push_back(t);
-                    else if(ty=="function" && t.contains("name"))
-                        tools.push_back({{"type","function"},
-                            {"function",{{"name",t.value("name","")},
-                                         {"description",t.value("description","")},
-                                         {"parameters",t.contains("parameters")?t["parameters"]
-                                                                               :json::object()}}}});
-                    else if(ty=="custom") {
-                        const std::string cn=t.value("name","");
-                        custom_names.insert(cn);
-                        tools.push_back({{"type","function"},
-                            {"function",{{"name",cn},
-                                         {"description",t.value("description","")},
-                                         {"parameters",{{"type","object"},
-                                             {"properties",{{"input",{{"type","string"},
-                                                 {"description","The complete raw input text for this tool."}}}}},
-                                             {"required",json::array({"input"})}}}}}});
-                    }
-                }
-            // input -> messages; instructions is the system prompt.
-            std::vector<q27::Msg> msgs;
-            if(body.contains("instructions") && body["instructions"].is_string())
-                msgs.push_back({"system",body["instructions"]});
-            if(body.contains("input")) {
-                if(body["input"].is_string()) msgs.push_back({"user",body["input"]});
-                else if(body["input"].is_array())
-                    for(const auto& it:body["input"]) {
-                        if(!it.is_object()) continue;
-                        const std::string ty=it.value("type","message");
-                        if(ty=="message") {
-                            std::string role=it.value("role","user");
-                            if(role=="developer") role="system";
-                            msgs.push_back({role,it.contains("content")?text_content(it["content"]):""});
-                        } else if(ty=="function_call" || ty=="custom_tool_call") {
-                            json args;
-                            if(ty=="function_call") {
-                                try { args=json::parse(it.value("arguments","{}")); }
-                                catch(...) { args=it.value("arguments",""); }
-                            } else args={{"input",it.value("input","")}};
-                            msgs.push_back({"assistant",q27::tool_call_text(it.value("name",""),args)});
-                        } else if(ty=="function_call_output" || ty=="custom_tool_call_output") {
-                            std::string out;
-                            if(it.contains("output"))
-                                out=it["output"].is_string()?it["output"].get<std::string>()
-                                                            :text_content(it["output"]);
-                            msgs.push_back({"user",q27::tool_response_text(out)});
-                        }
-                        // reasoning items in history are dropped (template behavior)
-                    }
-            }
-            // Fail-loud before the template renders (codex P1 on the old
-            // endpoint, preserved): tool declarations alone must not
-            // generate.
-            if(msgs.empty()) throw std::runtime_error("input is empty");
-            std::vector<q27::Msg> merged;
-            for(auto& m:msgs) {
-                if(!merged.empty() && merged.back().role==m.role) merged.back().content+="\n"+m.content;
-                else merged.push_back(m);
-            }
+            // Canonicalization is shared with the experimental prewarmer so
+            // a cache pack can never encode a different interpretation of a
+            // Responses request than the ordinary serving path.
+            ResponsesPromptInput normalized=responses_prompt_input(body);
+            json tools=std::move(normalized.tools);
+            std::set<std::string> custom_names=std::move(normalized.custom_names);
+            std::vector<q27::Msg> merged=std::move(normalized.messages);
             const std::string rendered=q27::chatml_prompt(merged,tools,true);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,4096);

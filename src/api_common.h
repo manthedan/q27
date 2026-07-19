@@ -203,6 +203,29 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     return p;
 }
 
+// Experimental harness-prefix prewarming accepts only an initial request:
+// zero or more merged system messages followed by exactly one live user
+// message. Return the closed static prompt and optionally the complete
+// ordinary generation prompt. Token-level callers still verify that encoding
+// the former is an exact prefix of encoding the latter before any side effect.
+inline std::string initial_harness_prefix(const std::vector<Msg>& messages,
+                                          const json& tools, bool think,
+                                          std::string* full_prompt = nullptr) {
+    if (messages.empty() || messages.back().role != "user")
+        throw std::runtime_error(
+            "prewarm requires an initial request ending in one user message");
+    std::vector<Msg> prefix_messages(messages.begin(), messages.end() - 1);
+    for (const auto& message : prefix_messages)
+        if (message.role != "system")
+            throw std::runtime_error(
+                "prewarm accepts initial requests only (system plus final user)");
+    if (full_prompt) *full_prompt = chatml_prompt(messages, tools, think);
+    size_t stable_bytes = 0;
+    std::string prefix = chatml_prompt(prefix_messages, tools, think, &stable_bytes);
+    prefix.resize(stable_bytes);
+    return prefix;
+}
+
 inline std::string tool_call_text(const std::string& name, const json& args) {
     return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + args.dump() +
            "}\n</tool_call>";

@@ -44,14 +44,15 @@ struct H {
 #pragma pack(pop)
 
 static void write_snap(const std::string& path, const std::vector<uint32_t>& tokens,
-                       uint64_t pad_bytes, int mtime_age_s) {
+                       uint64_t pad_bytes, int mtime_age_s,
+                       bool logits_resident=true) {
     H h{};
     std::memcpy(h.magic, "Q27SNAP1", 8);
     h.artifact_size = 0;  // unused by peek
     h.kv_dtype = 0;
     h.position = (uint32_t)tokens.size();
     h.token_count = (uint32_t)tokens.size();
-    h.reserved = 0;       // logits resident
+    h.reserved = logits_resident ? 0 : 1;
     std::ofstream o(path, std::ios::binary);
     o.write(reinterpret_cast<const char*>(&h), sizeof h);
     if (!tokens.empty())
@@ -152,6 +153,36 @@ int main() {
         }
         // The decisive contrast: the pin changes whether reused spine s1
         // survives a budget overflow.
+        fs::remove_all(dir,ec);
+    }
+
+    {   // A same-key exact prewarm can replace an older mid-prefill bank.
+        // Metadata cached from the displaced inode must be invalidated.
+        const std::string dir = std::string(::getenv("TMPDIR")?:"/tmp") +
+                                "/t1store.publish";
+        std::error_code ec; fs::remove_all(dir,ec); fs::create_directories(dir,ec);
+        DiskSnapshotStore store(&stub_peek,&stub_hash);
+        store.init(dir, 0, "t-", false);
+        std::vector<uint32_t> tokens={1,2,3,4};
+        const std::string path=store.path_for(tokens.data(),(uint32_t)tokens.size());
+        write_snap(path,tokens,0,10,false);
+        std::string found; uint32_t found_len=0;
+        CHECK(!store.best_match(tokens,found,found_len),
+              "stale-logits exact snapshot is rejected and metadata cached");
+        CHECK(!store.exact_resident(tokens.data(),(uint32_t)tokens.size()),
+              "stale-logits snapshot cannot block a later exact publication");
+        write_snap(path,tokens,0,0,true);
+        CHECK(!store.best_match(tokens,found,found_len),
+              "gate can fail: replacement is hidden by stale metadata before publish notice");
+        store.published(path);
+        CHECK(store.best_match(tokens,found,found_len) && found_len==tokens.size(),
+              "publish notice exposes replacement exact snapshot metadata");
+        CHECK(store.exact_resident(tokens.data(),(uint32_t)tokens.size()),
+              "resident exact snapshot blocks stale-logits downgrade");
+        store.reject(path);
+        CHECK(!exists(path) &&
+              !store.exact_resident(tokens.data(),(uint32_t)tokens.size()),
+              "deep-load rejection removes shallow candidate for repair");
         fs::remove_all(dir,ec);
     }
 
