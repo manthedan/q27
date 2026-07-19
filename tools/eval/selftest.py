@@ -347,6 +347,73 @@ with tempfile.TemporaryDirectory() as td:
           "artifact provenance mismatch" in out, True)
 
 
+# --- accuracy.py: gold-accuracy driver, must-fail directions ---------------
+
+def run_accuracy(args):
+    p = subprocess.run(
+        [sys.executable, os.path.join(HERE, "accuracy.py")] + args,
+        capture_output=True, text=True)
+    return p.returncode, p.stdout + p.stderr
+
+
+with tempfile.TemporaryDirectory() as td:
+    # Synthetic generation dir: a correct arm and an all-wrong arm over the
+    # real frozen prompt set. The all-wrong arm MUST score 0 everywhere and
+    # MUST trip the below-floor exit-1 (a gate that cannot fail is a trap).
+    golds = {}
+    for mode in ("choice", "numeric", "freeform"):
+        golds[mode] = []
+        with open(os.path.join(HERE, "prompts", "%s.jsonl" % mode),
+                  encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    r = json.loads(line)
+                    golds[mode].append((r["prompt_id"], str(r["gold"])))
+
+    def correct_text(mode, gold):
+        if mode == "choice":
+            return "The answer is %s." % gold
+        if mode == "numeric":
+            return "The answer is %s." % gold
+        return "The answer is %s." % gold
+
+    def wrong_text(mode):
+        if mode == "choice":
+            return "The answer is Z."      # invalid letter -> no extraction
+        if mode == "numeric":
+            return "The answer is -999999."  # far from any gold
+        return "The answer is xyzzy-nonexistent."
+
+    for arm, textfn in (("good-arm", None), ("bad-arm", None)):
+        for mode in ("choice", "numeric", "freeform"):
+            rows = []
+            for i, (pid, gold) in enumerate(golds[mode]):
+                txt = (correct_text(mode, gold) if arm == "good-arm"
+                       else wrong_text(mode))
+                rows.append({"id": "%s-%s-%04d" % (arm, mode, i),
+                             "prompt_id": pid, "text": txt})
+            write_jsonl(os.path.join(td, "%s.%s.jsonl" % (arm, mode)), rows)
+
+    # good=ref, bad=floor, and a third "mid" arm that is actually the good
+    # corpus again so it is NOT below floor: baseline should exit 0.
+    rc, out = run_accuracy(["--dir", td, "--ref", "good-arm",
+                            "--floor", "bad-arm", "--arms", "good-arm"])
+    check("accuracy baseline exits 0", rc == 0, True)
+    check("accuracy good-arm 100% overall", "120/120" in out, True)
+    check("accuracy bad-arm 0% overall", "  0/120 (0.0" in out or "0/120 (0." in out, True)
+
+    # A candidate strictly below floor MUST exit 1 (fail-closed).
+    rc, out = run_accuracy(["--dir", td, "--ref", "good-arm",
+                            "--floor", "good-arm", "--arms", "bad-arm"])
+    check("accuracy below-floor candidate exits 1", rc == 1, True)
+    check("accuracy below-floor stated", "BELOW-FLOOR" in out, True)
+
+    # Missing generation file MUST exit nonzero (incomplete run).
+    os.remove(os.path.join(td, "bad-arm.choice.jsonl"))
+    rc, out = run_accuracy(["--dir", td, "--ref", "good-arm",
+                            "--floor", "bad-arm", "--arms", "good-arm"])
+    check("accuracy missing file exits nonzero", rc != 0, True)
+
 # --- report -----------------------------------------------------------------
 
 if FAILURES:
