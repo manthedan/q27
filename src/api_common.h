@@ -391,8 +391,77 @@ inline bool quote_terminates_string(const std::string& s, size_t j, bool string_
     return true; // preserve the end-of-buffer truncation rule
 }
 
+// Shared JSON drift-sanitizer stepper (the "sanitizer state machine in 3
+// places / 2 idioms" registered residue, 2026-07-19). The buffered recovery
+// scan (parse_bare_tool_calls' scan_seg), the name-dropped batch scan
+// (scan_namedropped), and the incremental ToolCallStreamer all walk a JSON
+// byte stream with the SAME core loop: track in_str / escape / key-vs-value
+// (JsonQuoteContext), escape raw in-string control chars (mode 5), and
+// re-escape in-string quotes the lookahead proves literal (mode 10). A bug
+// fixed in one copy and not the others silently diverges the drift behavior
+// between the buffered and streaming paths (the exact class the strip_ctrl
+// extraction closed for injection). This struct holds the state and one
+// step(); per-call-site behavior is governed by flags.
+//
+// Usage: construct with the mode flags, then drive step() byte-by-byte with
+// the full source string and current index (the lookahead needs the whole
+// buffer, so index-based like quote_terminates_string). step() returns the
+// sanitized output for this byte ("" when the byte was consumed into
+// pending state) and advances depth_. Callers handle structure beyond
+// string repair (depth-0 = end of segment, tag capture, etc.) via the
+// exposed fields.
+struct JsonSanitizerStepper {
+    bool m10_lookahead = true;  // mode 10: re-escape literal in-string quotes
+    bool m5_control   = true;   // mode 5: escape raw \n \r \t inside strings
+
+    int  depth = 0;
+    bool in_str = false, esc = false, string_is_key = false;
+    bool m10_used = false;      // a quote was re-escaped this scan (gate flag)
+    bool m5_used  = false;      // a control char was escaped this scan
+    JsonQuoteContext json_ctx;
+
+    // Process source[i]; append the sanitized bytes to `out`. Returns nothing;
+    // depth/is_str/etc. are readable after each call. The caller advances i.
+    void step(const std::string& src, size_t i, std::string& out) {
+        const char c = src[i];
+        if (esc) { esc = false; out += c; return; }
+        if (in_str) {
+            if (c == '\\') { esc = true; out += c; return; }
+            if (c == '"') {
+                // mode 10: a quote not followed by a JSON delimiter is
+                // literal content, not a terminator -- re-escape it.
+                if (!m10_lookahead || quote_terminates_string(src, i, string_is_key)) {
+                    in_str = false; out += c;
+                } else { out += "\\\""; m10_used = true; }
+                return;
+            }
+            if (m5_control && c == '\n') { out += "\\n"; m5_used = true; return; }
+            if (m5_control && c == '\r') { out += "\\r"; m5_used = true; return; }
+            if (m5_control && c == '\t') { out += "\\t"; m5_used = true; return; }
+            out += c;
+            return;
+        }
+        out += c;
+        if (c == '"') {
+            string_is_key = json_ctx.opening_string_is_key();
+            in_str = true;
+        } else {
+            json_ctx.structural(c);
+            if (c == '{') depth++;
+            else if (c == '}') depth--;
+        }
+    }
+};
+
 // Incremental tool-call argument streamer (pre-registered:
-// docs/plans/2026-07-17-incremental-tool-call-streaming.md). Feeds the
+// docs/plans/2026-07-17-incremental-tool-call-streaming.md). Shares the
+// mode-5/10 drift semantics of JsonSanitizerStepper but deliberately keeps
+// its OWN loop: it is STREAMING (no full buffer for quote_terminates_string
+// lookahead — it holds a quote for a one-byte lookahead instead) and adds
+// mode-3 <content>-tag capture, neither of which fits the stepper's
+// buffer+index contract. Keep the escape/repair RULES in lockstep with the
+// stepper; the mechanics differ by necessity.
+// Feeds the
 // splitter's TOOL-channel bytes as they decode; once the call head parses
 // ({"name": "X", "arguments": {  — tolerating the mode-9 missing opening
 // quote on the arguments key), the arguments object streams out SANITIZED
@@ -845,36 +914,12 @@ inline void scan_namedropped(const std::string& text, const json* tools,
         size_t q = p + 8;
         while (q < text.size() && (text[q]==' '||text[q]=='\t'||text[q]=='\r'||text[q]=='\n')) q++;
         if (q >= text.size() || text[q] != '{') { p += 8; continue; }
-        int depth = 0; bool in_str = false, esc = false, string_is_key = false;
-        JsonQuoteContext json_ctx;
+        JsonSanitizerStepper st;
         size_t e = std::string::npos;
         std::string san;
         for (size_t j = q; j < text.size(); j++) {
-            char ch = text[j];
-            if (esc) { esc = false; san += ch; continue; }
-            if (in_str) {
-                if (ch == '\\') { esc = true; san += ch; continue; }
-                if (ch == '"') {
-                    // mode 10: a quote not followed by a JSON delimiter is
-                    // literal content, not a terminator — re-escape it.
-                    if (quote_terminates_string(text, j, string_is_key)) { in_str = false; san += ch; }
-                    else san += "\\\"";
-                    continue;
-                }
-                if (ch == '\n') { san += "\\n"; continue; }
-                if (ch == '\r') { san += "\\r"; continue; }
-                if (ch == '\t') { san += "\\t"; continue; }
-                san += ch; continue;
-            }
-            san += ch;
-            if (ch == '"') {
-                string_is_key = json_ctx.opening_string_is_key();
-                in_str = true;
-            } else {
-                json_ctx.structural(ch);
-                if (ch == '{') depth++;
-                else if (ch == '}' && --depth == 0) { e = j; break; }
-            }
+            st.step(text, j, san);
+            if (!st.in_str && st.depth == 0 && text[j] == '}') { e = j; break; }
         }
         if (e == std::string::npos) break;   // truncated final unit
         try {
@@ -952,37 +997,13 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         auto scan_seg = [&](bool m10_look, std::string& san) -> size_t {
             san.clear();
             m5_here = m10_here = false;
-            int depth = 0;
-            bool in_str = false, esc = false, string_is_key = false;
-            JsonQuoteContext json_ctx;
+            JsonSanitizerStepper st;
+            st.m10_lookahead = m10_look;
             for (size_t j = i; j < text.size(); j++) {
-                char ch = text[j];
-                if (esc) { esc = false; san += ch; continue; }
-                if (in_str) {
-                    if (ch == '\\') { esc = true; san += ch; continue; }
-                    if (ch == '"') {
-                        // tenth drift mode: an in-string quote not followed by a
-                        // JSON delimiter is literal content — re-escape it.
-                        if (!m10_look || quote_terminates_string(text, j, string_is_key)) { in_str = false; san += ch; }
-                        else { san += "\\\""; m10_here = true; }
-                        continue;
-                    }
-                    // fifth drift mode: literal newlines/tabs inside the string
-                    if (ch == '\n') { san += "\\n"; m5_here = true; continue; }
-                    if (ch == '\r') { san += "\\r"; m5_here = true; continue; }
-                    if (ch == '\t') { san += "\\t"; m5_here = true; continue; }
-                    san += ch;
-                    continue;
-                }
-                san += ch;
-                if (ch == '"') {
-                    string_is_key = json_ctx.opening_string_is_key();
-                    in_str = true;
-                } else {
-                    json_ctx.structural(ch);
-                    if (ch == '{') depth++;
-                    else if (ch == '}' && --depth == 0) return j;
-                }
+                st.step(text, j, san);
+                m5_here = m5_here || st.m5_used;
+                m10_here = m10_here || st.m10_used;
+                if (!st.in_str && st.depth == 0 && text[j] == '}') return j;
             }
             return std::string::npos;
         };
