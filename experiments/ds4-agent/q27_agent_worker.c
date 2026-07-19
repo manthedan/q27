@@ -37,7 +37,8 @@ typedef struct {
 typedef enum {
     REQUEST_NONE = 0,
     REQUEST_GENERATE,
-    REQUEST_TOOL
+    REQUEST_TOOL,
+    REQUEST_SESSION
 } request_kind;
 
 struct q27_agent_worker {
@@ -61,6 +62,9 @@ struct q27_agent_worker {
     request_kind request_type;
     owned_messages request;
     owned_tool_request tool_request;
+    q27_agent_session_action session_action;
+    char *session_path;
+    unsigned char expected_snapshot_sha256[32];
     int enable_thinking;
     int enable_tools;
     uint32_t max_tokens;
@@ -74,6 +78,7 @@ struct q27_agent_worker {
     event_node *event_tail;
     size_t event_count;
     size_t event_bytes;
+    unsigned char tokenizer_sha1[20];
     char error[512];
 #ifdef Q27_AGENT_WORKER_TESTING
     void (*stop_hook)(void *, int, int);
@@ -399,6 +404,12 @@ static void *worker_main(void *opaque) {
     q27_agent_engine *engine = q27_agent_engine_open(
         worker->model_path, worker->tokenizer_path, worker->context,
         error, sizeof(error));
+    if (engine && q27_agent_engine_tokenizer_sha1(
+                      engine, worker->tokenizer_sha1,
+                      error, sizeof(error)) != Q27_AGENT_OK) {
+        q27_agent_engine_close(engine);
+        engine = NULL;
+    }
 
     pthread_mutex_lock(&worker->mu);
     worker->init_done = 1;
@@ -426,6 +437,9 @@ static void *worker_main(void *opaque) {
         worker->request = (owned_messages){0};
         owned_tool_request tool = worker->tool_request;
         worker->tool_request = (owned_tool_request){0};
+        const q27_agent_session_action session_action = worker->session_action;
+        char *session_path = worker->session_path;
+        worker->session_path = NULL;
         const int enable_thinking = worker->enable_thinking;
         const int enable_tools = worker->enable_tools;
         const uint32_t max_tokens = worker->max_tokens;
@@ -436,7 +450,8 @@ static void *worker_main(void *opaque) {
         worker->generation_active = 1;
         const q27_agent_worker_state running_state =
             kind == REQUEST_TOOL ? Q27_WORKER_TOOL_RUNNING :
-                                   Q27_WORKER_GENERATING;
+            kind == REQUEST_SESSION ? Q27_WORKER_SESSION_IO :
+                                      Q27_WORKER_GENERATING;
         worker->state = worker->stop ? Q27_WORKER_STOPPING : running_state;
         pthread_mutex_unlock(&worker->mu);
 
@@ -483,6 +498,21 @@ static void *worker_main(void *opaque) {
             } else if (tool_result.message[0]) {
                 copy_error(error, sizeof(error), tool_result.message);
             }
+        } else if (kind == REQUEST_SESSION) {
+            if (session_action == Q27_SESSION_SAVE) {
+                status = q27_agent_engine_save_session(
+                    engine, session_path, messages.items, messages.len,
+                    enable_thinking, error, sizeof(error));
+            } else if (session_action == Q27_SESSION_LOAD) {
+                status = q27_agent_engine_load_session(
+                    engine, session_path, messages.items, messages.len,
+                    enable_thinking, worker->expected_snapshot_sha256,
+                    &prompt_tokens, error, sizeof(error));
+            } else {
+                status = q27_agent_engine_count_prompt(
+                    engine, messages.items, messages.len, enable_thinking,
+                    &prompt_tokens, error, sizeof(error));
+            }
         } else {
             status = q27_agent_generate(
                 engine, messages.items, messages.len, enable_thinking,
@@ -497,8 +527,10 @@ static void *worker_main(void *opaque) {
         const q27_agent_tool_kind completed_tool_kind = tool.request.kind;
         messages_free(&messages);
         tool_request_free(&tool);
+        free(session_path);
         q27_agent_event_type terminal_type = kind == REQUEST_TOOL ?
-            Q27_EVENT_TOOL_DONE :
+            Q27_EVENT_TOOL_DONE : kind == REQUEST_SESSION ?
+            Q27_EVENT_SESSION_DONE :
             status == Q27_AGENT_REJECTED ? Q27_EVENT_REJECTED :
             status == Q27_AGENT_ERROR ? Q27_EVENT_ERROR : Q27_EVENT_TURN_DONE;
         publish_terminal(worker, command_id, terminal_type, status, prompt_tokens,
@@ -671,6 +703,66 @@ q27_agent_status q27_agent_worker_submit_tool(
     return Q27_AGENT_OK;
 }
 
+q27_agent_status q27_agent_worker_submit_session(
+    q27_agent_worker *worker, q27_agent_session_action action,
+    const char *snapshot_path, const q27_agent_message *messages,
+    size_t message_count, int enable_thinking,
+    const unsigned char expected_snapshot_sha256[32],
+    uint64_t *command_id, char *error, size_t error_cap) {
+    if (command_id) *command_id = 0;
+    const int needs_path = action == Q27_SESSION_SAVE || action == Q27_SESSION_LOAD;
+    const int needs_messages = action == Q27_SESSION_SAVE ||
+                               action == Q27_SESSION_LOAD ||
+                               action == Q27_SESSION_COUNT;
+    if (!worker || action < Q27_SESSION_SAVE || action > Q27_SESSION_COUNT ||
+        (needs_path && (!snapshot_path || !*snapshot_path)) ||
+        (needs_messages && (!messages || !message_count)) ||
+        (action == Q27_SESSION_LOAD && !expected_snapshot_sha256)) {
+        copy_error(error, error_cap, "invalid worker session submission");
+        return Q27_AGENT_REJECTED;
+    }
+    owned_messages copied = {0};
+    if (needs_messages &&
+        !messages_clone(messages, message_count, &copied, error, error_cap))
+        return Q27_AGENT_REJECTED;
+    char *path = needs_path ? strdup(snapshot_path) : NULL;
+    if (needs_path && !path) {
+        messages_free(&copied);
+        copy_error(error, error_cap, "out of memory copying snapshot path");
+        return Q27_AGENT_REJECTED;
+    }
+
+    pthread_mutex_lock(&worker->mu);
+    if (worker->state != Q27_WORKER_IDLE || worker->stop ||
+        worker->command_active || worker->request_ready) {
+        pthread_mutex_unlock(&worker->mu);
+        messages_free(&copied); free(path);
+        copy_error(error, error_cap, "worker is not idle");
+        return Q27_AGENT_REJECTED;
+    }
+    worker->request_type = REQUEST_SESSION;
+    worker->request = copied;
+    worker->session_action = action;
+    worker->session_path = path;
+    memset(worker->expected_snapshot_sha256, 0,
+           sizeof(worker->expected_snapshot_sha256));
+    if (expected_snapshot_sha256)
+        memcpy(worker->expected_snapshot_sha256,
+               expected_snapshot_sha256,
+               sizeof(worker->expected_snapshot_sha256));
+    worker->enable_thinking = enable_thinking;
+    worker->alive = NULL;
+    worker->alive_opaque = NULL;
+    worker->command_id = ++worker->next_command_id;
+    worker->command_active = 1;
+    worker->request_ready = 1;
+    worker->state = Q27_WORKER_SESSION_IO;
+    if (command_id) *command_id = worker->command_id;
+    pthread_cond_broadcast(&worker->cv);
+    pthread_mutex_unlock(&worker->mu);
+    return Q27_AGENT_OK;
+}
+
 int q27_agent_worker_next_event(q27_agent_worker *worker,
                                 q27_agent_event *event,
                                 char *error, size_t error_cap) {
@@ -698,6 +790,7 @@ int q27_agent_worker_next_event(q27_agent_worker *worker,
     node->event.data = NULL;
     const int terminal = event->type == Q27_EVENT_TURN_DONE ||
                          event->type == Q27_EVENT_TOOL_DONE ||
+                         event->type == Q27_EVENT_SESSION_DONE ||
                          event->type == Q27_EVENT_REJECTED ||
                          event->type == Q27_EVENT_ERROR;
     if (terminal && event->command_id == worker->command_id) {
@@ -711,6 +804,42 @@ int q27_agent_worker_next_event(q27_agent_worker *worker,
     pthread_cond_broadcast(&worker->cv);
     pthread_mutex_unlock(&worker->mu);
     free(node);
+    return 1;
+}
+
+int q27_agent_worker_tokenizer_sha1(q27_agent_worker *worker,
+                                    unsigned char out_sha1[20]) {
+    if (!worker || !out_sha1) return 0;
+    pthread_mutex_lock(&worker->mu);
+    const int ok = worker->init_ok;
+    if (ok) memcpy(out_sha1, worker->tokenizer_sha1, 20);
+    pthread_mutex_unlock(&worker->mu);
+    return ok;
+}
+
+int q27_agent_worker_session_result_event(q27_agent_worker *worker,
+                                          int success,
+                                          const char *message,
+                                          q27_agent_event *event) {
+    if (!worker || !event) return 0;
+    *event = (q27_agent_event){0};
+    const char *text = message ? message : "";
+    const size_t len = strlen(text);
+    unsigned char *copy = NULL;
+    if (len) {
+        copy = malloc(len);
+        if (!copy) return 0;
+        memcpy(copy, text, len);
+    }
+    pthread_mutex_lock(&worker->mu);
+    event->sequence = ++worker->next_sequence;
+    event->command_id = ++worker->next_command_id;
+    event->type = Q27_EVENT_SESSION_DONE;
+    event->state = success ? Q27_WORKER_IDLE : Q27_WORKER_ERROR;
+    event->status = success ? Q27_AGENT_OK : Q27_AGENT_ERROR;
+    event->data = copy;
+    event->data_len = len;
+    pthread_mutex_unlock(&worker->mu);
     return 1;
 }
 
@@ -758,6 +887,7 @@ void q27_agent_worker_stop(q27_agent_worker *worker) {
 #endif
     messages_free(&worker->request);
     tool_request_free(&worker->tool_request);
+    free(worker->session_path);
     event_node *node = worker->event_head;
     while (node) {
         event_node *next = node->next;

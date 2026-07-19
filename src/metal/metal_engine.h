@@ -233,12 +233,17 @@ class MetalEngine {
     void save_state(const std::string& path, const uint32_t* tokens, uint32_t token_count,
                     bool logits_resident = true);
     uint32_t load_state(const std::string& path);   // returns restored position
+    // Descriptor forms keep metadata inspection and restore pinned to one
+    // inode. The caller retains source_fd; diagnostics use label only.
+    uint32_t load_state_fd(int source_fd, const std::string& label);
     // Header-only inspection for prefix keying (server): position, stored
     // token ids, and the logits-resident flag. Validates magic only — the
     // full structural validation happens on load_state.
     struct SnapshotInfo { uint32_t position = 0; bool logits_resident = true;
                           std::vector<uint32_t> tokens; };
     static SnapshotInfo peek_snapshot(const std::string& path);
+    static SnapshotInfo peek_snapshot_fd(int source_fd,
+                                         const std::string& label);
     // Re-run the resident-logits argmax (same GPU kernel as prompt
     // ingestion) so generation after load_state resumes byte-identically.
     uint32_t pending_from_logits();

@@ -33,6 +33,9 @@ q27_agent_engine *q27_agent_engine_open(const char *model_path,
                                          uint32_t context,
                                          char *error, size_t error_cap);
 void q27_agent_engine_close(q27_agent_engine *engine);
+q27_agent_status q27_agent_engine_tokenizer_sha1(
+    q27_agent_engine *engine, unsigned char out_sha1[20],
+    char *error, size_t error_cap);
 
 // Renders the complete transcript on every call, but reuses resident state
 // only when its exact generated-token ledger is a stable prefix of that render
@@ -55,6 +58,31 @@ q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      uint32_t *output_tokens,
                                      int *tool_call_complete,
                                      char *error, size_t error_cap);
+
+// Owner-thread-only persistence primitives. Save writes Q27SNAP1 with the
+// exact prompt-plus-generated token ledger. Load accepts it only when that
+// ledger is a stable prefix of the supplied transcript render and Metal
+// position/pending logits agree. A failed load invalidates and resets state.
+q27_agent_status q27_agent_engine_save_session(q27_agent_engine *engine,
+                                                const char *snapshot_path,
+                                                const q27_agent_message *messages,
+                                                size_t message_count,
+                                                int enable_thinking,
+                                                char *error, size_t error_cap);
+q27_agent_status q27_agent_engine_load_session(q27_agent_engine *engine,
+                                                const char *snapshot_path,
+                                                const q27_agent_message *messages,
+                                                size_t message_count,
+                                                int enable_thinking,
+                                                const unsigned char expected_sha256[32],
+                                                uint32_t *snapshot_tokens,
+                                                char *error, size_t error_cap);
+q27_agent_status q27_agent_engine_count_prompt(q27_agent_engine *engine,
+                                               const q27_agent_message *messages,
+                                               size_t message_count,
+                                               int enable_thinking,
+                                               uint32_t *prompt_tokens,
+                                               char *error, size_t error_cap);
 
 #ifdef __cplusplus
 }

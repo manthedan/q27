@@ -23,9 +23,9 @@ See `THIRD_PARTY_NOTICES.md` for attribution.
 - exact token-ledger validation, reset/append prefill, and serial greedy generation;
 - final emitted-token ingestion and all exception containment at the C ABI.
 
-The C process owns the transcript, terminal loop, streaming output, and
-interrupt decision. A dedicated pthread opens, owns, drives, and closes the
-engine. Submission deep-copies the complete message array; the UI thread then
+The C process owns the transcript, durable manifest, compaction policy,
+terminal loop, streaming output, and interrupt decision. A dedicated pthread
+opens, owns, drives, snapshots, restores, and closes the engine. Submission deep-copies the complete message array; the UI thread then
 drains a bounded owned event queue (`state`, binary `text_delta`, and exactly
 one terminal). There is no server, socket, HTTP, SSE, or API-shape translation.
 
@@ -46,6 +46,68 @@ Interactive mode omits `--prompt`; `:quit` exits. Machine-readable events use:
 
 Every JSONL row carries monotonic `seq`, `command_id`, event `type`, state,
 status, accounting, and exact `data_b64` bytes. Diagnostics remain on stderr.
+Tokenizer counts and Q27SNAP1 save/load use the same internal command/event
+boundary. JSONL exposes validated loads and emits a distinct `session_done`
+only after durable manifest publication (or a rejected `session_done` on
+publication failure); internal counts, compaction work, and the snapshot-only
+phase of save are suppressed so no terminal can falsely claim durable
+publication early. Successful process exit remains the outer noninteractive
+verdict.
+
+## Durable sessions and compaction
+
+`--session FILE` loads an existing session or creates and autosaves one after
+each completed top-level turn:
+
+```sh
+./build/q27-agent MODEL.q27 MODEL.tok --no-think --session work.q27agent
+```
+
+The mode is exact: context size, thinking mode, and automatic-tool mode must
+match on resume. A small binary `Q27AGT2` manifest stores the binary-safe
+transcript, owner-pinned tokenizer SHA-1 identity, full snapshot SHA-256
+digest, and
+the random basename of one immutable `Q27SNAP1` engine blob. Both files are
+owner-only regular files (`0600`). Snapshot content is fsynced
+and renamed first; the CRC-checked manifest is then published with its own
+fsync/rename/directory-fsync transaction. The old snapshot is removed only
+after the new manifest is durable, so a crash can leave an unreferenced blob
+but cannot publish a manifest pointing at a partial one. If the manifest rename
+succeeds but directory durability is uncertain, both old and new snapshots are
+retained and the command fails loudly. Snapshot basenames are namespaced to
+the manifest filename, so copying or renaming a manifest alone is rejected
+rather than creating an untracked shared reference. A stable owner-only lock
+file serializes publication, readers retain a shared lock until the engine has
+pinned and validated their referenced snapshot, and the manifest's previously
+loaded snapshot name is compared under the exclusive writer lock so a stale
+concurrent writer fails instead of overwriting a newer turn. The parent directory must be owned by the user and
+not group/other writable; symlink file opens are rejected.
+
+Resume pins one snapshot descriptor across SHA-256 verification, metadata
+inspection, and restore, then validates tokenizer identity, the model artifact,
+KV configuration, complete snapshot layout,
+exact token metadata prefix, Metal position, and—when present—the one pending
+token against resident logits before restoring the private token ledger. Any
+mismatch fails closed and resets uncertain engine state. Save also
+validates the resident generated-token ledger against a fresh transcript
+render; if decoded bytes retokenize differently, it re-prefills the canonical
+closed-message prefix before publication. Snapshot files contain the full
+active Metal state and can be large; persistence is
+therefore opt-in rather than the default. `:save` forces a save when
+`--session` is configured.
+
+Prompt size is counted on the owner thread before every generation. At 75% of
+the configured context by default, the harness summarizes older complete root
+turns and retains the four most recent root turns. Configure this with
+`--compact-at`, `--compact-keep`, and `--compact-tokens`; `:compact` requests it
+immediately. An assistant tool call and its following `<tool_response>` are an
+indivisible part of one root turn, so compaction never retains one side without
+the other. Summary generation cannot call tools. A hidden, bounded
+acknowledgement establishes a new exact generated-token prefix before the
+recent tail is appended, allowing the compacted transcript to be snapshotted
+immediately without pretending old KV state still matches. If no safe cut fits,
+the original transcript remains unchanged and generation fails rather than
+dropping history.
 
 ## Bounded native tools
 
@@ -150,8 +212,10 @@ events, request rejection, 4094-event queue backpressure (5000 deltas),
 cancellation terminals, and shutdown ordering without loading a model.
 `build/test_q27_agent_tools` gates binary read/search/edit/shell output, path
 and symlink rejection, exact-one edit publication/mode preservation, shell
-workspace, timeout, cancellation, and output bounds. Their ASan/UBSan legs are
-clean.
+workspace, timeout, cancellation, and output bounds.
+`build/test_q27_agent_persistence` gates binary transcript round trips, CRC
+rejection, mode-0600 publication, immutable snapshot replacement, and
+tool-boundary-preserving compaction cuts. Their ASan/UBSan legs are clean.
 
 A two-turn resident-session smoke returned exactly `one`, then `two`. The
 first turn reported `prompt=51 cached=0 prefill=51 output=1`; the second
@@ -161,8 +225,9 @@ gates pending-token finalization, append offsets, prefix and engine-position
 mismatch fallback, and cancellation/error invalidation.
 
 This establishes direct C → worker → C++ → resident Metal-session feasibility,
-including opt-in model-driven tools through a separate control-plane command.
-It does not establish snapshots, compaction, or broad parity.
+including opt-in model-driven tools through a separate control-plane command,
+private restart persistence, and bounded boundary-preserving compaction. It
+does not establish rich terminal/browser UX or broad DS4 parity.
 
 ## Graduation gates
 
@@ -185,10 +250,11 @@ After Phase 0, port from the pinned DS4 agent in this order:
 3. ~~q27 `AgentSession` append/finalize contract~~;
 4. ~~file read/search/edit tools and bounded asynchronous shell jobs~~;
 5. ~~q27 `<tool_call>` parsing and constrained generation (not DSML)~~;
-6. transcript/session persistence using `Q27SNAP1` (not DS4 payloads);
-7. compaction;
+6. ~~transcript/session persistence using `Q27SNAP1` (not DS4 payloads)~~;
+7. ~~compaction~~;
 8. optional terminal UI and browser tooling.
 
-The next slice is transcript/session persistence using `Q27SNAP1`, preserving
-the exact resident-token ledger and private-file publication contract. Tool
-calls remain opt-in and continue to use separate generation/tool terminals.
+The remaining product slice is optional terminal/browser UX. Persistence and
+compaction retain the exact resident-token ledger and private-file publication
+contract; tool calls remain opt-in and continue to use separate
+generation/tool terminals.

@@ -6,14 +6,43 @@
 #include "../../src/toolconstrain.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <exception>
+#include <fcntl.h>
 #include <memory>
 #include <optional>
 #include <string>
 #include <stdexcept>
 #include <utility>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
+
+#include <CommonCrypto/CommonDigest.h>
+
+static bool sha1_fd(int fd, unsigned char digest[20]) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0)
+        return false;
+    CC_SHA1_CTX sha;
+    CC_SHA1_Init(&sha);
+    std::vector<unsigned char> chunk(1024 * 1024);
+    off_t offset = 0;
+    while (offset < st.st_size) {
+        const size_t wanted = static_cast<size_t>(std::min<off_t>(
+            static_cast<off_t>(chunk.size()), st.st_size - offset));
+        ssize_t got;
+        do { got = pread(fd, chunk.data(), wanted, offset); }
+        while (got < 0 && errno == EINTR);
+        if (got <= 0 || static_cast<size_t>(got) != wanted) return false;
+        CC_SHA1_Update(&sha, chunk.data(), static_cast<CC_LONG>(got));
+        offset += got;
+    }
+    CC_SHA1_Final(digest, &sha);
+    return true;
+}
 
 struct q27_agent_engine {
     std::unique_ptr<q27::Tokenizer> tokenizer;
@@ -26,10 +55,29 @@ struct q27_agent_engine {
     bool tool_masks_ready = false;
     bool poisoned = false;
     char poison_error[256] = {0};
+    unsigned char tokenizer_sha1[20] = {0};
     uint32_t context;
 
     q27_agent_engine(const char *model_path, const char *tokenizer_path, uint32_t ctx)
-        : tokenizer(std::make_unique<q27::Tokenizer>(tokenizer_path)), context(ctx) {
+        : context(ctx) {
+        // Pin one tokenizer inode across identity hashing and parsing. The
+        // /dev/fd open gives Tokenizer its own stream over these exact bytes,
+        // so an atomic pathname replacement cannot split manifest identity
+        // from the tokenizer actually used by this engine.
+        const int tokenizer_fd = open(tokenizer_path, O_RDONLY | O_CLOEXEC);
+        if (tokenizer_fd < 0 || !sha1_fd(tokenizer_fd, tokenizer_sha1)) {
+            if (tokenizer_fd >= 0) close(tokenizer_fd);
+            throw std::runtime_error("cannot pin/hash tokenizer artifact");
+        }
+        char pinned_path[64];
+        std::snprintf(pinned_path, sizeof(pinned_path), "/dev/fd/%d", tokenizer_fd);
+        try {
+            tokenizer = std::make_unique<q27::Tokenizer>(pinned_path);
+            close(tokenizer_fd);
+        } catch (...) {
+            close(tokenizer_fd);
+            throw;
+        }
         // Match the CLI/server fail-fast ordering: validate the small tokenizer
         // before mapping or allocating the model.
         if (tokenizer->vocab_size() != q27::MetalEngine::vocabulary_size())
@@ -42,6 +90,12 @@ struct q27_agent_engine {
 static void set_error(char *out, size_t cap, const char *message) noexcept {
     if (!out || cap == 0) return;
     std::snprintf(out, cap, "%s", message ? message : "unknown error");
+}
+
+static void reset_agent_state(q27_agent_engine *engine) noexcept {
+    if (!engine) return;
+    engine->agent_session.invalidate();
+    try { engine->session->reset(); } catch (...) {}
 }
 
 extern "C" q27_agent_engine *q27_agent_engine_open(
@@ -73,6 +127,283 @@ extern "C" void q27_agent_engine_close(q27_agent_engine *engine) {
     }
 }
 
+extern "C" q27_agent_status q27_agent_engine_tokenizer_sha1(
+    q27_agent_engine *engine, unsigned char out_sha1[20],
+    char *error, size_t error_cap) {
+    if (!engine || !out_sha1) {
+        set_error(error, error_cap, "invalid tokenizer identity request");
+        return Q27_AGENT_REJECTED;
+    }
+    std::memcpy(out_sha1, engine->tokenizer_sha1, 20);
+    return Q27_AGENT_OK;
+}
+
+static bool render_messages(q27_agent_engine *engine,
+                            const q27_agent_message *messages,
+                            size_t message_count, int enable_thinking,
+                            std::vector<uint32_t>& ids,
+                            char *error, size_t error_cap) {
+    if (!engine || !messages || !message_count) {
+        set_error(error, error_cap, "invalid transcript arguments");
+        return false;
+    }
+    std::vector<std::pair<std::string,std::string>> chat;
+    chat.reserve(message_count);
+    for (size_t i = 0; i < message_count; ++i) {
+        if (!messages[i].role || !messages[i].content) {
+            set_error(error, error_cap, "message role/content must not be null");
+            return false;
+        }
+        const std::string role(messages[i].role);
+        if (role != "system" && role != "user" && role != "assistant" &&
+            role != "tool") {
+            set_error(error, error_cap, "unsupported message role");
+            return false;
+        }
+        chat.emplace_back(role, std::string(messages[i].content,
+                                            messages[i].content_len));
+    }
+    const std::vector<int> encoded =
+        engine->tokenizer->apply_chat_template(chat, enable_thinking != 0);
+    if (encoded.empty() || encoded.size() > UINT32_MAX) {
+        set_error(error, error_cap, "rendered prompt is empty or too large");
+        return false;
+    }
+    ids.clear();
+    ids.reserve(encoded.size());
+    for (int token : encoded) {
+        if (token < 0)
+            throw std::runtime_error("tokenizer returned a negative id");
+        ids.push_back(static_cast<uint32_t>(token));
+    }
+    return true;
+}
+
+static bool render_closed_messages(q27_agent_engine *engine,
+                                   const q27_agent_message *messages,
+                                   size_t message_count,
+                                   std::vector<uint32_t>& ids,
+                                   char *error, size_t error_cap) {
+    if (!engine || !messages || !message_count) {
+        set_error(error, error_cap, "invalid transcript arguments");
+        return false;
+    }
+    std::vector<std::pair<std::string,std::string>> chat;
+    chat.reserve(message_count);
+    for (size_t i = 0; i < message_count; ++i) {
+        if (!messages[i].role || !messages[i].content) {
+            set_error(error, error_cap, "message role/content must not be null");
+            return false;
+        }
+        const std::string role(messages[i].role);
+        if (role != "system" && role != "user" && role != "assistant" &&
+            role != "tool") {
+            set_error(error, error_cap, "unsupported message role");
+            return false;
+        }
+        chat.emplace_back(role, std::string(messages[i].content,
+                                            messages[i].content_len));
+    }
+    const std::vector<int> encoded = engine->tokenizer->apply_chat_prefix(chat);
+    if (encoded.empty() || encoded.size() > UINT32_MAX) {
+        set_error(error, error_cap, "closed transcript prefix is empty or too large");
+        return false;
+    }
+    ids.clear(); ids.reserve(encoded.size());
+    for (int token : encoded) {
+        if (token < 0)
+            throw std::runtime_error("tokenizer returned a negative id");
+        ids.push_back(static_cast<uint32_t>(token));
+    }
+    return true;
+}
+
+static void prefill_canonical(q27_agent_engine *engine,
+                              const std::vector<uint32_t>& ids) {
+    if (ids.empty() || ids.size() > engine->context)
+        throw std::runtime_error("closed transcript prefix exceeds context");
+    engine->agent_session.invalidate();
+    engine->session->reset();
+    size_t offset = 0;
+    const size_t chunkable = engine->session->chunked_prefill() ?
+                             ids.size() - 1 : 0;
+    while (offset < chunkable && chunkable - offset >= 2) {
+        const uint32_t count = static_cast<uint32_t>(std::min<size_t>(
+            q27::MetalEngine::prefill_chunk_max(), chunkable - offset));
+        engine->session->prefill_chunk(ids.data() + offset, count);
+        offset += count;
+    }
+    while (offset < ids.size())
+        (void)engine->session->step(ids[offset++]);
+    engine->agent_session.commit_prompt(ids);
+}
+
+extern "C" q27_agent_status q27_agent_engine_count_prompt(
+    q27_agent_engine *engine, const q27_agent_message *messages,
+    size_t message_count, int enable_thinking, uint32_t *prompt_tokens,
+    char *error, size_t error_cap) {
+    if (prompt_tokens) *prompt_tokens = 0;
+    if (!prompt_tokens) {
+        set_error(error, error_cap, "prompt token output is required");
+        return Q27_AGENT_REJECTED;
+    }
+    try {
+        std::vector<uint32_t> ids;
+        if (!render_messages(engine, messages, message_count, enable_thinking,
+                             ids, error, error_cap))
+            return Q27_AGENT_REJECTED;
+        *prompt_tokens = static_cast<uint32_t>(ids.size());
+        return Q27_AGENT_OK;
+    } catch (const std::exception& e) {
+        set_error(error, error_cap, e.what());
+    } catch (...) {
+        set_error(error, error_cap, "unknown prompt-count failure");
+    }
+    return Q27_AGENT_ERROR;
+}
+
+extern "C" q27_agent_status q27_agent_engine_save_session(
+    q27_agent_engine *engine, const char *snapshot_path,
+    const q27_agent_message *messages, size_t message_count,
+    int enable_thinking, char *error, size_t error_cap) {
+    if (!engine || !snapshot_path || !*snapshot_path || !messages ||
+        !message_count) {
+        set_error(error, error_cap, "invalid session-save arguments");
+        return Q27_AGENT_REJECTED;
+    }
+    if (engine->poisoned) {
+        set_error(error, error_cap, "poisoned engine cannot publish a session");
+        return Q27_AGENT_ERROR;
+    }
+    try {
+        std::vector<uint32_t> rendered;
+        if (!render_messages(engine, messages, message_count, enable_thinking,
+                             rendered, error, error_cap))
+            return Q27_AGENT_REJECTED;
+        const auto ledger_matches_render = [&]() {
+            const auto& ledger = engine->agent_session.tokens();
+            return engine->agent_session.valid() && !ledger.empty() &&
+                ledger.size() <= rendered.size() &&
+                engine->agent_session.encoded_count() ==
+                    engine->session->position() &&
+                std::equal(ledger.begin(), ledger.end(), rendered.begin());
+        };
+        if (!ledger_matches_render()) {
+            // Decoded generated bytes can retokenize differently. Never
+            // publish such a ledger: prefill the canonical closed-message
+            // boundary, which remains an exact prefix after any future turn.
+            std::vector<uint32_t> closed;
+            if (!render_closed_messages(engine, messages, message_count,
+                                        closed, error, error_cap))
+                return Q27_AGENT_REJECTED;
+            prefill_canonical(engine, closed);
+            if (!ledger_matches_render())
+                throw std::runtime_error(
+                    "canonical transcript prefix did not match full render");
+        }
+        const auto& ledger = engine->agent_session.tokens();
+        engine->session->save_state(snapshot_path, ledger.data(),
+                                    static_cast<uint32_t>(ledger.size()), true);
+        return Q27_AGENT_OK;
+    } catch (const std::exception& e) {
+        set_error(error, error_cap, e.what());
+    } catch (...) {
+        set_error(error, error_cap, "unknown session-save failure");
+    }
+    return Q27_AGENT_ERROR;
+}
+
+static bool snapshot_sha256(int fd, unsigned char digest[32]) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0)
+        return false;
+    CC_SHA256_CTX sha;
+    CC_SHA256_Init(&sha);
+    std::vector<unsigned char> chunk(1024 * 1024);
+    off_t offset = 0;
+    while (offset < st.st_size) {
+        const size_t wanted = static_cast<size_t>(std::min<off_t>(
+            static_cast<off_t>(chunk.size()), st.st_size - offset));
+        ssize_t got;
+        do { got = pread(fd, chunk.data(), wanted, offset); }
+        while (got < 0 && errno == EINTR);
+        if (got <= 0 || static_cast<size_t>(got) != wanted) return false;
+        CC_SHA256_Update(&sha, chunk.data(), static_cast<CC_LONG>(got));
+        offset += got;
+    }
+    CC_SHA256_Final(digest, &sha);
+    return true;
+}
+
+extern "C" q27_agent_status q27_agent_engine_load_session(
+    q27_agent_engine *engine, const char *snapshot_path,
+    const q27_agent_message *messages, size_t message_count,
+    int enable_thinking, const unsigned char expected_sha256[32],
+    uint32_t *snapshot_tokens,
+    char *error, size_t error_cap) {
+    if (snapshot_tokens) *snapshot_tokens = 0;
+    if (!engine || !snapshot_path || !*snapshot_path || !expected_sha256 ||
+        !snapshot_tokens) {
+        reset_agent_state(engine);
+        set_error(error, error_cap, "invalid session-load arguments");
+        return Q27_AGENT_REJECTED;
+    }
+    try {
+        std::vector<uint32_t> rendered;
+        if (!render_messages(engine, messages, message_count, enable_thinking,
+                             rendered, error, error_cap)) {
+            reset_agent_state(engine);
+            return Q27_AGENT_REJECTED;
+        }
+        const int snapshot_fd = open(snapshot_path,
+                                     O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (snapshot_fd < 0)
+            throw std::runtime_error("cannot pin session snapshot");
+        struct SnapshotFd {
+            int value;
+            ~SnapshotFd() { if (value >= 0) close(value); }
+        } pinned{snapshot_fd};
+        unsigned char actual_sha256[32];
+        if (!snapshot_sha256(pinned.value, actual_sha256) ||
+            memcmp(actual_sha256, expected_sha256, sizeof(actual_sha256)))
+            throw std::runtime_error(
+                "snapshot payload digest does not match durable manifest");
+        const q27::MetalEngine::SnapshotInfo info =
+            q27::MetalEngine::peek_snapshot_fd(pinned.value, snapshot_path);
+        if (!info.logits_resident || info.tokens.empty() ||
+            info.tokens.size() > rendered.size() ||
+            (info.tokens.size() != info.position &&
+             info.tokens.size() != static_cast<size_t>(info.position) + 1) ||
+            !std::equal(info.tokens.begin(), info.tokens.end(), rendered.begin())) {
+            reset_agent_state(engine);
+            set_error(error, error_cap,
+                      "snapshot token ledger is not an exact transcript prefix");
+            return Q27_AGENT_REJECTED;
+        }
+        const bool pending = info.tokens.size() ==
+                             static_cast<size_t>(info.position) + 1;
+        const uint32_t restored =
+            engine->session->load_state_fd(pinned.value, snapshot_path);
+        if (restored != info.position || restored > engine->context)
+            throw std::runtime_error("snapshot restored an unexpected Metal position");
+        if (pending && engine->session->pending_from_logits() != info.tokens.back())
+            throw std::runtime_error("snapshot pending logits do not match token ledger");
+        if (!engine->agent_session.restore(info.tokens, pending))
+            throw std::runtime_error("snapshot token ledger could not be restored");
+        engine->poisoned = false;
+        engine->poison_error[0] = '\0';
+        *snapshot_tokens = static_cast<uint32_t>(info.tokens.size());
+        return Q27_AGENT_OK;
+    } catch (const std::exception& e) {
+        reset_agent_state(engine);
+        set_error(error, error_cap, e.what());
+    } catch (...) {
+        reset_agent_state(engine);
+        set_error(error, error_cap, "unknown session-load failure");
+    }
+    return Q27_AGENT_ERROR;
+}
+
 extern "C" q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
     size_t message_count, int enable_thinking, int enable_tools,
@@ -98,43 +429,15 @@ extern "C" q27_agent_status q27_agent_generate(
     }
 
     try {
-        std::vector<std::pair<std::string,std::string>> chat;
-        chat.reserve(message_count);
-        for (size_t i = 0; i < message_count; ++i) {
-            if (!messages[i].role || !messages[i].content) {
-                set_error(error, error_cap, "message role/content must not be null");
-                return Q27_AGENT_REJECTED;
-            }
-            const std::string role(messages[i].role);
-            if (role != "system" && role != "user" && role != "assistant" &&
-                role != "tool") {
-                set_error(error, error_cap, "unsupported message role");
-                return Q27_AGENT_REJECTED;
-            }
-            chat.emplace_back(role,
-                              std::string(messages[i].content,
-                                          messages[i].content_len));
-        }
-
-        const std::vector<int> encoded =
-            engine->tokenizer->apply_chat_template(chat, enable_thinking != 0);
-        if (encoded.empty()) {
-            set_error(error, error_cap, "rendered prompt is empty");
+        std::vector<uint32_t> ids;
+        if (!render_messages(engine, messages, message_count, enable_thinking,
+                             ids, error, error_cap))
             return Q27_AGENT_REJECTED;
-        }
-        if (encoded.size() > engine->context ||
-            static_cast<uint64_t>(encoded.size()) + max_tokens >
+        if (ids.size() > engine->context ||
+            static_cast<uint64_t>(ids.size()) + max_tokens >
                 static_cast<uint64_t>(engine->context) + 1) {
             set_error(error, error_cap, "prompt plus max_tokens exceeds context");
             return Q27_AGENT_REJECTED;
-        }
-
-        std::vector<uint32_t> ids;
-        ids.reserve(encoded.size());
-        for (int token : encoded) {
-            if (token < 0)
-                throw std::runtime_error("tokenizer returned a negative id");
-            ids.push_back(static_cast<uint32_t>(token));
         }
         if (prompt_tokens) *prompt_tokens = static_cast<uint32_t>(ids.size());
 

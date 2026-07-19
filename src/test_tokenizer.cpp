@@ -867,6 +867,20 @@ int main(int argc, char** argv) {
         if (!ok) return 1;
     }
 
+    // A closed transcript prefix is the durable snapshot boundary: adding a
+    // future user turn must leave every prefix token unchanged.
+    {
+        std::vector<std::pair<std::string, std::string>> done = {
+            {"system", "s"}, {"user", "question"}, {"assistant", "answer"}};
+        auto prefix = tok.apply_chat_prefix(done);
+        done.push_back({"user", "next"});
+        auto future = tok.apply_chat_template(done, false);
+        bool ok = !prefix.empty() && prefix.size() <= future.size() &&
+                  std::equal(prefix.begin(), prefix.end(), future.begin());
+        printf("closed chat prefix stable on append: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+
     // Review 2026-07-09 P1 #5: ChatML forgery is neutralized at BOTH template
     // boundaries -- Tokenizer::apply_chat_template (the OpenAI chat path,
     // which never goes through api_common's chatml_prompt) strips

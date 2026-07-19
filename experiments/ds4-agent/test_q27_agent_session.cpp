@@ -50,6 +50,15 @@ int main() {
     CHECK(session.plan(first, 0).reset, "invalidated session resets");
 
     session.commit_prompt(first);
+    CHECK(session.encoded_count() == 3 && session.tokens() == first,
+          "persistence view exposes the exact encoded ledger");
+    CHECK(session.restore({7, 8, 9}, true) && session.valid() &&
+          session.pending() && session.token_count() == 3 &&
+          session.encoded_count() == 2,
+          "validated snapshot ledger restores one pending token");
+    CHECK(!session.restore({}, false) && !session.valid(),
+          "empty snapshot ledger fails closed");
+    session.commit_prompt(first);
     session.invalidate();
     CHECK(!session.valid() && !session.pending() && session.token_count() == 0,
           "explicit cancellation/error invalidation clears ledger");

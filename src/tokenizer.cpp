@@ -363,6 +363,14 @@ static std::string strip_chatml(std::string s) {
     return s;
 }
 
+std::vector<int> Tokenizer::apply_chat_prefix(
+    const std::vector<std::pair<std::string, std::string>>& messages) const {
+    std::string p;
+    for (auto& [role, content] : messages)
+        p += "<|im_start|>" + strip_chatml(role) + "\n" + strip_chatml(content) + "<|im_end|>\n";
+    return encode(p);
+}
+
 std::vector<int> Tokenizer::apply_chat_template(
     const std::vector<std::pair<std::string, std::string>>& messages, bool think) const {
     std::string p;

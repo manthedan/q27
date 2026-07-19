@@ -33,6 +33,17 @@ void q27_agent_engine_close(q27_agent_engine *engine) {
     free(engine);
 }
 
+q27_agent_status q27_agent_engine_tokenizer_sha1(
+    q27_agent_engine *engine, unsigned char out_sha1[20],
+    char *error, size_t error_cap) {
+    if (!engine || !out_sha1) {
+        snprintf(error, error_cap, "bad identity request");
+        return Q27_AGENT_REJECTED;
+    }
+    memset(out_sha1, 42, 20);
+    return Q27_AGENT_OK;
+}
+
 q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
     size_t message_count, int enable_thinking, int enable_tools,
@@ -88,6 +99,50 @@ q27_agent_status q27_agent_generate(
     *cached_tokens = 5;
     *prefill_tokens = 6;
     *output_tokens = 1;
+    return Q27_AGENT_OK;
+}
+
+q27_agent_status q27_agent_engine_save_session(
+    q27_agent_engine *engine, const char *path,
+    const q27_agent_message *messages, size_t count, int thinking,
+    char *error, size_t error_cap) {
+    (void)thinking;
+    if (!engine || engine->marker != 27 || !path || strcmp(path, "snap") ||
+        count != 1 || messages[0].content_len != 3 ||
+        memcmp(messages[0].content, "x\0y", 3)) {
+        snprintf(error, error_cap, "bad snapshot save");
+        return Q27_AGENT_REJECTED;
+    }
+    return Q27_AGENT_OK;
+}
+
+q27_agent_status q27_agent_engine_load_session(
+    q27_agent_engine *engine, const char *path,
+    const q27_agent_message *messages, size_t count, int thinking,
+    const unsigned char expected_sha256[32], uint32_t *snapshot_tokens,
+    char *error, size_t error_cap) {
+    (void)thinking;
+    if (!engine || engine->marker != 27 || !path || strcmp(path, "snap") ||
+        !expected_sha256 || expected_sha256[0] != 27 || count != 1 ||
+        messages[0].content_len != 3 ||
+        memcmp(messages[0].content, "x\0y", 3)) {
+        snprintf(error, error_cap, "bad snapshot load");
+        return Q27_AGENT_REJECTED;
+    }
+    *snapshot_tokens = 17;
+    return Q27_AGENT_OK;
+}
+
+q27_agent_status q27_agent_engine_count_prompt(
+    q27_agent_engine *engine, const q27_agent_message *messages, size_t count,
+    int thinking, uint32_t *prompt_tokens, char *error, size_t error_cap) {
+    (void)thinking;
+    if (!engine || engine->marker != 27 || count != 1 ||
+        messages[0].content_len != 3 || memcmp(messages[0].content, "x\0y", 3)) {
+        snprintf(error, error_cap, "bad prompt count");
+        return Q27_AGENT_REJECTED;
+    }
+    *prompt_tokens = 23;
     return Q27_AGENT_OK;
 }
 
@@ -182,6 +237,7 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
         }
         int terminal = event.type == Q27_EVENT_TURN_DONE ||
                        event.type == Q27_EVENT_TOOL_DONE ||
+                       event.type == Q27_EVENT_SESSION_DONE ||
                        event.type == Q27_EVENT_REJECTED ||
                        event.type == Q27_EVENT_ERROR;
         if (terminal) {
@@ -250,6 +306,10 @@ int main(void) {
         q27_agent_worker_start("model", "tok", 128, error, sizeof(error));
     CHECK(worker && q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "worker starts idle");
+    unsigned char tokenizer_sha1[20] = {0};
+    CHECK(q27_agent_worker_tokenizer_sha1(worker, tokenizer_sha1) &&
+          tokenizer_sha1[0] == 42 && tokenizer_sha1[19] == 42,
+          "worker exports owner-pinned tokenizer identity");
 
     // submit owns a deep binary copy: mutate the source immediately afterward.
     char binary[] = {'x', '\0', 'y'};
@@ -305,6 +365,50 @@ int main(void) {
           result.tool_flags == 0 && result.tool_output_bytes == 3 &&
           q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "tool terminal accounting reopens shared admission");
+
+    message = (q27_agent_message){
+        .role = "user", .content = "x\0y", .content_len = 3};
+    CHECK(q27_agent_worker_submit_session(worker, Q27_SESSION_COUNT, NULL,
+                                           &message, 1, 0, NULL, &command,
+                                           error, sizeof(error)) == Q27_AGENT_OK,
+          "session prompt-count command submits");
+    CHECK(drain_command(worker, command, &result) && result.terminals == 1 &&
+          result.terminal_status == Q27_AGENT_OK && result.prompt_tokens == 23 &&
+          q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
+          "session prompt count uses owner event boundary");
+    CHECK(q27_agent_worker_submit_session(worker, Q27_SESSION_SAVE, "snap",
+                                           &message, 1, 0, NULL, &command,
+                                           error, sizeof(error)) == Q27_AGENT_OK,
+          "session snapshot save submits");
+    CHECK(drain_command(worker, command, &result) &&
+          result.terminal_status == Q27_AGENT_OK,
+          "session snapshot save completes");
+    unsigned char expected_sha256[32] = {27};
+    CHECK(q27_agent_worker_submit_session(worker, Q27_SESSION_LOAD, "snap",
+                                           &message, 1, 0, expected_sha256,
+                                           &command, error, sizeof(error)) == Q27_AGENT_OK,
+          "session snapshot load submits with deep transcript copy");
+    CHECK(drain_command(worker, command, &result) &&
+          result.terminal_status == Q27_AGENT_OK && result.prompt_tokens == 17,
+          "session snapshot load reports restored ledger");
+    q27_agent_event persistence_event;
+    CHECK(q27_agent_worker_session_result_event(
+              worker, 1, NULL, &persistence_event) &&
+          persistence_event.type == Q27_EVENT_SESSION_DONE &&
+          persistence_event.status == Q27_AGENT_OK,
+          "durable publication success terminal is machine-readable");
+    uint64_t persistence_sequence = persistence_event.sequence;
+    q27_agent_event_free(&persistence_event);
+    CHECK(q27_agent_worker_session_result_event(
+              worker, 0, "publish failed", &persistence_event) &&
+          persistence_event.type == Q27_EVENT_SESSION_DONE &&
+          persistence_event.status == Q27_AGENT_ERROR &&
+          persistence_event.sequence > persistence_sequence &&
+          persistence_event.data_len == strlen("publish failed") &&
+          !memcmp(persistence_event.data, "publish failed",
+                  persistence_event.data_len),
+          "durable publication failure terminal bypasses poisoned admission");
+    q27_agent_event_free(&persistence_event);
 
     q27_agent_message bad = {.role = "user", .content = "bad", .content_len = 3};
     CHECK(q27_agent_worker_submit(worker, &bad, 1, 0, 0, 8, alive, NULL,

@@ -63,6 +63,20 @@ class AgentSession {
         return true;
     }
 
+    // Restore is used only after Q27SNAP1 has validated artifact/config/layout,
+    // its token metadata is an exact prefix of the re-rendered transcript, and
+    // Metal position (plus pending logits when present) agrees with the ledger.
+    bool restore(const std::vector<uint32_t>& tokens, bool pending) {
+        if (tokens.empty() || (pending && tokens.size() < 1)) {
+            invalidate();
+            return false;
+        }
+        tokens_ = tokens;
+        valid_ = true;
+        pending_ = pending;
+        return true;
+    }
+
     void invalidate() noexcept {
         tokens_.clear();
         valid_ = false;
@@ -72,6 +86,10 @@ class AgentSession {
     bool valid() const noexcept { return valid_; }
     bool pending() const noexcept { return pending_; }
     size_t token_count() const noexcept { return tokens_.size(); }
+    size_t encoded_count() const noexcept {
+        return valid_ ? tokens_.size() - (pending_ ? 1u : 0u) : 0u;
+    }
+    const std::vector<uint32_t>& tokens() const noexcept { return tokens_; }
 
   private:
     std::vector<uint32_t> tokens_;

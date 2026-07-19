@@ -19,6 +19,7 @@ typedef enum {
     Q27_WORKER_IDLE,
     Q27_WORKER_GENERATING,
     Q27_WORKER_TOOL_RUNNING,
+    Q27_WORKER_SESSION_IO,
     Q27_WORKER_STOPPING,
     Q27_WORKER_ERROR,
     Q27_WORKER_STOPPED
@@ -30,9 +31,16 @@ typedef enum {
     Q27_EVENT_TOOL_OUTPUT,
     Q27_EVENT_TURN_DONE,
     Q27_EVENT_TOOL_DONE,
+    Q27_EVENT_SESSION_DONE,
     Q27_EVENT_REJECTED,
     Q27_EVENT_ERROR
 } q27_agent_event_type;
+
+typedef enum {
+    Q27_SESSION_SAVE = 1,
+    Q27_SESSION_LOAD,
+    Q27_SESSION_COUNT
+} q27_agent_session_action;
 
 typedef struct {
     q27_agent_event_type type;
@@ -91,6 +99,23 @@ q27_agent_status q27_agent_worker_submit_tool(
     uint64_t *command_id,
     char *error, size_t error_cap);
 
+// Serializes Q27SNAP1 save/load and tokenizer-only prompt counts on the engine
+// owner. SAVE and LOAD require snapshot_path plus a transcript; COUNT requires
+// a transcript and ignores snapshot_path. All three deep-copy every message;
+// LOAD also requires the manifest's expected snapshot SHA-256. SESSION_DONE
+// reports the loaded ledger or rendered
+// prompt count in prompt_tokens.
+q27_agent_status q27_agent_worker_submit_session(
+    q27_agent_worker *worker,
+    q27_agent_session_action action,
+    const char *snapshot_path,
+    const q27_agent_message *messages,
+    size_t message_count,
+    int enable_thinking,
+    const unsigned char expected_snapshot_sha256[32],
+    uint64_t *command_id,
+    char *error, size_t error_cap);
+
 // Blocks until an event is available. Returns 1 with an owned event, 0 when a
 // stopped worker has no events left, and -1 on invalid arguments. Consuming a
 // terminal event acknowledges the command and reopens admission when safe.
@@ -100,6 +125,16 @@ int q27_agent_worker_next_event(q27_agent_worker *worker,
 void q27_agent_event_free(q27_agent_event *event);
 
 q27_agent_worker_state q27_agent_worker_get_state(q27_agent_worker *worker);
+// Identity copied by the owner thread from the exact pinned tokenizer bytes
+// used to construct the engine.
+int q27_agent_worker_tokenizer_sha1(q27_agent_worker *worker,
+                                    unsigned char out_sha1[20]);
+// Creates one owned, monotonic post-publication terminal without requiring
+// engine admission; usable even when snapshot I/O put the worker in ERROR.
+int q27_agent_worker_session_result_event(q27_agent_worker *worker,
+                                          int success,
+                                          const char *message,
+                                          q27_agent_event *event);
 
 // Non-destructive: closes admission and asks the worker to stop after its
 // current bounded engine quantum. Callback-safe.
