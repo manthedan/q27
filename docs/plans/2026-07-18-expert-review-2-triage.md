@@ -78,6 +78,24 @@ then what survived verification, then amendments.**
    footprint sweep (same kernel, 3.6 vs 6.3 GB) and scale-walk arms.
    Consequence recorded: B1's next 15% lives in the fixed ~14 ms, not
    the GEMV — the kernel rounds on B1's GEMV are done.
+
+   **Probe-ladder rung 1 RAN (2026-07-19, quiet 24 GB M4, `Q27_METAL_PROFILE=1`
+   B1 decode bench, 64 tokens ctx 128, `logs/bench-smoke-20260719/b1-profile.err`):**
+   GPU busy 96% of wall (decode kernel-bound, as ledger records). Per-token
+   decomposition of the 68.4 ms wall: **GEMV 47.4 ms (72% of GPU time) at
+   76.1 GB/s counted-bytes effective**; non-GEMV kernels 6.5 ms
+   (delta_step 3.9%, rmsnorm_quantized 3.1%, attention_f16 1.9%, all else
+   <1% each); command-buffer/sync overhead ~3.1 ms (4%). The prediction
+   (GEMV ≈73% at 93–97 GB/s) is CONFIRMED on the share and REFUTED on the
+   absolute bandwidth: the B1 GEMV streams at 76.1 GB/s, not 93–97 — so
+   the fixed ~14 ms the dilution model wants is NOT all non-GEMV; the
+   GEMV itself runs ~20% below the bandwidth the model assumed. Next
+   rungs (N-sweep slope fit, footprint sweep 3.6 vs 6.3 GB, scale-walk)
+   decide whether that 76.1 GB/s is the small-working-set DRAM/page
+   effect or the kernel. The non-GEMV fixed cost is only ~9.6 ms/token
+   (14% of wall), so even zeroing it caps the gain at ~1.16× — the
+   review's "~22 tok/s if F halves" needs the GEMV bandwidth question
+   answered first.
 4. **Residency — toolbox MERGED:** R1's full-footprint 4-arm bench
    stands; R2 adds: setPurgeableState(NonVolatile) check (cheap audit
    item), the anonymous+mlock route as arm E, **chunked-staging private
