@@ -8,6 +8,7 @@
 // Memory-safe: synthetic buffers only (~1.6 GiB peak), no 17 GiB mmap.
 
 #include "metal_backend.h"
+#include "bench_env.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1045,6 +1046,7 @@ int main(int argc, char** argv) {
     if (official) return run_official_probe(backend, reps, q4_candidate);
     if (b1_candidate) return run_b1_round2(backend, reps, b1_candidate);
 
+    const bool sampling = q27bench::bench_thermal_start();
     double total_seconds = 0.0, total_bytes = 0.0;
     for (size_t si = 0; si < n_shapes; si++) {
         const Shape& shape = shapes[si];
@@ -1097,5 +1099,7 @@ int main(int argc, char** argv) {
         total_bytes += bytes;
     }
     printf("%-34s %-3s %8s    %11.2f GB/s\n", "aggregate", "", "", total_bytes / total_seconds / 1e9);
+    q27bench::bench_thermal_stop();
+    q27bench::bench_power_line(sampling);
     return 0;
 }

@@ -13,6 +13,7 @@
 // Memory-safe: synthetic buffers only (~1.6 GiB peak), no model artifact.
 
 #include "metal_backend.h"
+#include "bench_env.h"
 
 #include <algorithm>
 #include <chrono>
@@ -337,6 +338,7 @@ int main(int argc, char** argv) {
     backend.profile_reset();
     position = 0;
 
+    const bool sampling = q27bench::bench_thermal_start();
     const auto start = std::chrono::steady_clock::now();
     uint32_t chunks = 0;
     for (uint32_t begin = 0; begin < prompt; begin += chunk_size, chunks++) {
@@ -346,9 +348,11 @@ int main(int argc, char** argv) {
     backend.synchronize();
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    q27bench::bench_thermal_stop();
 
     printf("prefill: %.1f ms/chunk, %.2f tok/s, effective weight stream %.1f GB/s\n",
            seconds / chunks * 1e3, prompt / seconds,
            chunk_weight_bytes * chunks / seconds / 1e9);
+    q27bench::bench_power_line(sampling);
     return 0;
 }

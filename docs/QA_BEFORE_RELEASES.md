@@ -127,7 +127,11 @@ remains, and run them strictly serially under the same coordinated slot:
 - [ ] **Thermal governance:** every bench artifact carries a powermetrics
       thermal-pressure log line; benches that gate ship decisions record
       power state (twice-burned: gate-3 wall anomaly, the 12.66→10.57
-      ceiling drift).
+      ceiling drift). **Instrumentation landed (2026-07-19):**
+      `tools/bench_env.h` — set `Q27_BENCH_POWER_LOG=<path>` per leg and the
+      decode/prefill/gemv benches sample powermetrics and append a
+      `power-state:` line; unset, they append `power-state: NOT SAMPLED`,
+      which reads as a recorded decision, not a masked skip.
 - [ ] **Temperature coverage statement:** release notes state that
       suffix bursts / MTP / tool-constraint engage at temperature 0 only
       (metal_server.cpp:660-661,952) until the sampled-path acceptance
