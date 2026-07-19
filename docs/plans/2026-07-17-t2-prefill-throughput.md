@@ -144,3 +144,24 @@ remains default-off. The hardened watcher publishes
 all six finite legs, baseline sanity, one-model residency, and a verified
 restart of the intended T2 server. ≥1.7× ships default-ON; a valid <1.7×
 parks it.
+
+**Ship-line bench RESOLVED — PARK (2026-07-19 early, quiet 24 GB M4,
+serverless variant).** The operator freed the box and no live traffic
+exists (house rule, 2026-07-18), so the measurement ran as the exact
+pre-registered float/half protocol minus the moot server stop/restore
+(script `logs/q4port-20260717/run_quiet_ship_bench.sh`, waits for ≥600 s
+input idle per leg, fingerprinted bench+shader). Legs (tok/s): float 8352
+24.27 / 20.04 (max 24.27 — reproduces the 23.2 quiet baseline inside the
+18–30 sanity band), half 8352 22.92 / 21.94 (min 21.94), float 960 23.74,
+half 960 27.32. **Ratio min(half)/max(float) = 0.904 < 1.7 — PARK.**
+The Q4 chunk-GEMM half port does NOT ship default-ON; Q4 stays on the
+float-staged kernel. The half kernels remain in-tree correctness-gated
+behind the probe knob `Q27_METAL_GEMM_HALF_Q4` per the pre-registration.
+Mechanism read (not pre-registered): the T2 donor schedule's win does not
+transfer to Q4 at this schedule — at 8352 the half route is slightly
+SLOWER than float-staged (0.90×), and only the shallow 960 arm shows a
+gain (27.32 vs 23.74) that never approaches 1.7×; the 91.8%-
+`q27_matmul_q4_mm` wall is not a staging-cadence problem on this device.
+Evidence: `logs/q4port-20260717/quiet_{float,half}{8352,960}*.log`
+(fresh 2026-07-19 mtimes), verdict text in
+`logs/q4port-20260717/quiet_ship_bench.out`.
