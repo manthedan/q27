@@ -2313,6 +2313,14 @@ int main(int argc,char** argv) {
                         ev("message_stop",{{"type","message_stop"}});
                     } catch(const std::exception& e) {
                         runtime.trace.event({{"kind","error"},{"api","messages"},{"id",mid},{"status",500},{"type","api_error"},{"message",e.what()}});
+                        // codex P2 2026-07-19: an engine failure mid-stream must
+                        // not leave an opened tool_use or text/thinking block
+                        // unterminated before message_stop. close_tool() closes a
+                        // streamed tool block (all streamer cases) and
+                        // close_block() closes any open text/thinking block;
+                        // both are no-ops when nothing is open.
+                        try { close_tool(); } catch(...) {}
+                        try { close_block(); } catch(...) {}
                         // First-class error event; message_stop still follows so
                         // naive clients get a well-formed stream (server.cu's
                         // batch-error convention).
@@ -2755,6 +2763,7 @@ int main(int argc,char** argv) {
                         q27::ToolCallStreamer ts;
                         int st_idx=-1;             // output_index of in-flight streamed call
                         std::string st_iid, st_cid, st_acc;  // item/call ids + accumulated args
+                        bool st_custom=false;      // in-flight stream is a custom tool: route buffered
                         auto st_arg_delta=[&](const std::string& frag){
                             if(frag.empty() || st_idx<0) return;
                             st_acc+=frag;
@@ -2780,6 +2789,17 @@ int main(int argc,char** argv) {
                         };
                         auto close_stream_tool=[&](bool incomplete_item){
                             if(!ts.active()) return;
+                            // Custom tool: never streamed incremental; hand the
+                            // verbatim raw to the buffered flush_tool -> push_call
+                            // path so it emits a whole custom_tool_call item with
+                            // bare-string input (codex P1 2026-07-19).
+                            if(st_custom) {
+                                st_custom=false;
+                                tool_buf=ts.raw;
+                                ts.reset();
+                                flush_tool(false,incomplete_item);
+                                return;
+                            }
                             std::string tail;
                             const bool clean=ts.finalize(&tail);
                             if(ts.invalid()) {
@@ -2826,15 +2846,26 @@ int main(int argc,char** argv) {
                                 bool opened=false;
                                 const std::string frag=ts.feed(t,&opened);
                                 if(opened) {
-                                    const int call_index=tool_counter++;
-                                    st_idx=out_index;
-                                    st_cid="call_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
-                                    st_iid="fc_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
-                                    ev({{"type","response.output_item.added"},{"output_index",st_idx},
-                                        {"item",{{"type","function_call"},{"id",st_iid},{"call_id",st_cid},
-                                                 {"status","in_progress"},{"name",ts.name},{"arguments",""}}}});
+                                    // Custom tools (custom_tool_call) must NOT
+                                    // stream incremental function_call args:
+                                    // their wire shape is a whole item with a
+                                    // bare-string input, so bypass the streamer
+                                    // and route the accumulated raw through the
+                                    // buffered flush_tool -> push_call path
+                                    // (codex P1 2026-07-19).
+                                    if(custom_names.count(ts.name)) {
+                                        st_custom=true;
+                                    } else {
+                                        const int call_index=tool_counter++;
+                                        st_idx=out_index;
+                                        st_cid="call_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
+                                        st_iid="fc_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
+                                        ev({{"type","response.output_item.added"},{"output_index",st_idx},
+                                            {"item",{{"type","function_call"},{"id",st_iid},{"call_id",st_cid},
+                                                     {"status","in_progress"},{"name",ts.name},{"arguments",""}}}});
+                                    }
                                 }
-                                if(!frag.empty()) st_arg_delta(frag);
+                                if(!frag.empty() && !st_custom) st_arg_delta(frag);
                                 // FALLBACK: not yet open and head deviated — hand
                                 // the verbatim raw to the buffered path.
                                 if(!ts.opened && ts.active() && frag.empty() && !opened) {
@@ -2967,6 +2998,10 @@ int main(int argc,char** argv) {
                         // forces this path under Q27_METAL_TEST_FAILPOINTS.
                         try {
                             for(auto& [ch,t]:sp.flush()) route(ch,t);
+                            close_stream_tool(true);   // codex P2 2026-07-19:
+                                // close any in-flight streamed function_call so
+                                // the added item gets a matching done (and lands
+                                // in response.output) instead of dangling open.
                             if(!tool_buf.empty()) flush_tool(false,true);
                             if(!think.empty()) flush_think(true);
                             if(!bare_pending.empty()) {

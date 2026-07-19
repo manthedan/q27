@@ -1041,12 +1041,23 @@ int main(int argc, char** argv) {
         backend.end_commands();
     }
 
-    if (slot2) return run_slot2_probe(backend, reps);
-    if (b1) return run_b1_probe(backend, reps);
-    if (official) return run_official_probe(backend, reps, q4_candidate);
-    if (b1_candidate) return run_b1_round2(backend, reps, b1_candidate);
-
+    // Specialized probe/ship-decision modes early-return below, but they are
+    // exactly the runs whose thermal/power anchor the QA contract relies on.
+    // Start thermal sampling BEFORE the dispatch and emit the power-state
+    // line after, so no benchmark mode runs uninstrumented (codex P2
+    // 2026-07-19).
     const bool sampling = q27bench::bench_thermal_start();
+    if (slot2 || b1 || official || b1_candidate) {
+        int rc;
+        if (slot2)        rc = run_slot2_probe(backend, reps);
+        else if (b1)      rc = run_b1_probe(backend, reps);
+        else if (official)     rc = run_official_probe(backend, reps, q4_candidate);
+        else              rc = run_b1_round2(backend, reps, b1_candidate);
+        q27bench::bench_thermal_stop();
+        q27bench::bench_power_line(sampling);
+        return rc;
+    }
+
     double total_seconds = 0.0, total_bytes = 0.0;
     for (size_t si = 0; si < n_shapes; si++) {
         const Shape& shape = shapes[si];

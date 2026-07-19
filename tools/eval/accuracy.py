@@ -18,6 +18,14 @@ Fail-closed: a missing/truncated generation row, an unknown prompt_id, or
 an arm whose overall accuracy is strictly below the floor arm exits 1
 (exit codes are the contract — never grep for PASS).
 
+Provenance (codex P2 2026-07-19): before scoring, each arm's
+<arm>.provenance.json sidecar is validated against the frozen arms.tsv
+manifest (arm/model/md5/resident_sha1/bytes) and its run_id extracted;
+every generation row's "id" must then carry the exact
+"<arm>-<run_id>-<mode>-" prefix written by run_arm.sh. This refuses to
+silently mix modes from an interrupted/partial run or rows relabeled
+between arms — the same run-binding spotcheck_verdict.py enforces.
+
     accuracy.py --dir logs/eval-census --ref t2-base --floor b1-base \
         --arms gdn-pair m1-candidate
 """
@@ -30,8 +38,9 @@ import sys
 sys.dont_write_bytecode = True
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
-import extract  # noqa: E402
-import grade    # noqa: E402
+import extract              # noqa: E402
+import grade                # noqa: E402
+import spotcheck_verdict    # noqa: E402  (arm_manifest + validate_provenance)
 
 MODES = ("choice", "numeric", "freeform")
 EXPECTED_COUNTS = {"choice": 60, "numeric": 40, "freeform": 20}
@@ -66,16 +75,27 @@ def load_prompts(mode):
     return gold
 
 
-def load_generations(path, arm, mode):
+def load_generations(path, arm, mode, run_id):
     rows = {}
     if not os.path.exists(path):
         sys.exit(f"missing generation file for arm {arm!r}: {path}")
+    # run-binding (codex P2 2026-07-19): run_arm.sh writes each row id as
+    # f"{tag}-{i:04d}" with tag = f"{arm}-{run_id}-{mode}", so every id must
+    # carry this exact prefix. A row relabeled between arms, or left over
+    # from a prior partial run (stale run_id), fails here instead of being
+    # silently scored.
+    prefix = f"{arm}-{run_id}-{mode}-"
     with open(path, "r", encoding="utf-8") as f:
         for ln, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             r = json.loads(line)
+            row_id = r.get("id")
+            if not isinstance(row_id, str) or not row_id.startswith(prefix):
+                sys.exit(f"{path} line {ln}: row id {row_id!r} is not bound to "
+                         f"run prefix {prefix!r} (stale/mixed/relabeled run, "
+                         f"refusing to score)")
             pid = r.get("prompt_id")
             if pid is None:
                 sys.exit(f"{path} line {ln}: missing prompt_id")
@@ -87,13 +107,19 @@ def load_generations(path, arm, mode):
 
 def score_arm(arm, gen_dir, golds):
     """Return (per_mode {mode:(correct,total)}, overall (correct,total)).
-    Fail-closed on any missing/unknown prompt_id."""
+    Fail-closed on any missing/unknown prompt_id. Validates the arm's
+    provenance sidecar against arms.tsv and binds every row id to the
+    sidecar's run_id before scoring (codex P2 2026-07-19)."""
+    # validate_provenance exits non-zero on: arm not frozen in arms.tsv,
+    # missing/malformed sidecar, artifact (model/md5/sha1/bytes) mismatch,
+    # incomplete runtime/protocol/platform identity, missing run_id.
+    _runtime, run_id = spotcheck_verdict.validate_provenance(gen_dir, arm)
     per_mode = {}
     tot_c = tot_n = 0
     for mode in MODES:
         gold = golds[mode]
         rows = load_generations(os.path.join(gen_dir, f"{arm}.{mode}.jsonl"),
-                                arm, mode)
+                                arm, mode, run_id)
         if set(rows) != set(gold):
             missing = sorted(set(gold) - set(rows))[:5]
             extra = sorted(set(rows) - set(gold))[:5]

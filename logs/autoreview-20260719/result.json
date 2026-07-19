@@ -1,0 +1,19 @@
+autoreview findings: 4
+[P1] [P1] Preserve custom-tool items on the streaming Responses path
+src/metal/metal_server.cpp:2833
+Every successfully parsed wrapped call is unconditionally opened as a `function_call`, even when `ts.name` is present in `custom_names`. Consequently a streaming request using a custom tool such as `apply_patch` receives `function_call` events with JSON `arguments` instead of the required whole `custom_tool_call` item with string `input`; clients will not dispatch the registered custom tool. Bypass incremental argument streaming for custom names and route them through `push_call`, as the comment and non-streaming path require.
+
+[P2] [P2] Close streamed tool items when generation throws
+src/metal/metal_server.cpp:2924
+`close_stream_tool` is invoked only on the normal completion path. If `runtime.run` throws after a `response.output_item.added` and one or more argument deltas have been emitted, the exception handler flushes the splitter but never calls this closer. It then emits `response.failed` with no matching `response.output_item.done`, leaving the client with an unterminated item and omitting the partial call from `response.output`. The Messages handler has the analogous issue: an opened tool block is followed directly by `error`/`message_stop` without `content_block_stop`. Both error paths need to finalize their newly introduced streaming lifecycle state.
+
+[P2] [P2] Validate generation provenance before scoring accuracy
+tools/eval/accuracy.py:84
+The new driver discards each row's `id` and never reads the `<arm>.provenance.json` sidecar. This defeats `run_arm.sh`'s publication protocol: an interrupted run can leave fresh files for some modes alongside stale files for another mode, all with complete prompt-ID sets, and this driver will silently combine and score them. Files can also be relabeled between arms without detection. Reuse the manifest/runtime/run-id checks from `spotcheck_verdict.py` and require every row ID to match the sidecar's arm and run ID before producing accuracy conclusions.
+
+[P2] [P2] Instrument the specialized GEMV benchmark modes
+tools/metal_gemv_bench.cpp:1049
+Thermal sampling starts after the early returns for `--slot2`, `--b1`, `--official`/`--q4-candidate`, and `--b1-candidate`. Those are precisely the probe and ship-decision modes documented elsewhere, so they emit neither a power-state line nor a thermal anchor even when `Q27_BENCH_POWER_LOG` is set. Move the instrumentation around these dispatches or add it inside each specialized runner so all benchmark modes satisfy the new QA contract.
+
+overall: patch is incorrect (0.99)
+The change introduces a major streaming regression for custom Responses tools and leaves newly opened streaming tool lifecycles unterminated on exceptions. The new evaluation and thermal-instrumentation tooling also fails its stated integrity guarantees in common execution paths.

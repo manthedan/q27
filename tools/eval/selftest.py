@@ -360,6 +360,9 @@ with tempfile.TemporaryDirectory() as td:
     # Synthetic generation dir: a correct arm and an all-wrong arm over the
     # real frozen prompt set. The all-wrong arm MUST score 0 everywhere and
     # MUST trip the below-floor exit-1 (a gate that cannot fail is a trap).
+    # accuracy.py now validates provenance (codex P2 2026-07-19): each arm
+    # needs a <arm>.provenance.json sidecar against arms.tsv and run-bound
+    # row ids "<arm>-<run_id>-<mode>-NNNN", exactly as run_arm.sh writes.
     golds = {}
     for mode in ("choice", "numeric", "freeform"):
         golds[mode] = []
@@ -371,10 +374,6 @@ with tempfile.TemporaryDirectory() as td:
                     golds[mode].append((r["prompt_id"], str(r["gold"])))
 
     def correct_text(mode, gold):
-        if mode == "choice":
-            return "The answer is %s." % gold
-        if mode == "numeric":
-            return "The answer is %s." % gold
         return "The answer is %s." % gold
 
     def wrong_text(mode):
@@ -384,34 +383,97 @@ with tempfile.TemporaryDirectory() as td:
             return "The answer is -999999."  # far from any gold
         return "The answer is xyzzy-nonexistent."
 
-    for arm, textfn in (("good-arm", None), ("bad-arm", None)):
+    # Reuse the real t2-base manifest row as the "good" arm and b1-base as
+    # the "bad"/floor arm (both are frozen in arms.tsv) so provenance
+    # validates; runtime/platform identity mirrors the spotcheck block.
+    acc_manifests = {}
+    with open(os.path.join(HERE, "arms.tsv"), encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            a, mo, md, sh, nb = line.rstrip("\n").split("\t")
+            acc_manifests[a] = {"arm": a, "model": mo, "md5": md,
+                                "resident_sha1": sh, "bytes": int(nb)}
+    acc_runtime = {"identity_schema": 3, "server_sha1": "a" * 40,
+                   "shader_abi": "// Q27_SHADER_ABI 13", "shader_sha1": "b" * 40,
+                   "eval_host_id": "h" * 64,
+                   "platform": {"sysname": "Darwin", "release": "test",
+                                "machine": "arm64", "metal_device": "test-gpu"},
+                   "protocol": {"context":131072,"kv":"turbo3","mtp":0,"suffix":0,
+                       "slots":1,"prefix_entries":1,"constrain_tools":False,
+                       "snapshots":False,"snapshot_auto_min":0,"snapshot_max_bytes":0,
+                       "snapshot_spine_pin":True,
+                       "max_tokens_default":0,"kv_fp16_except":False,
+                       "kv_fp16_cell_masks":"0"*32,"kv_side_codec":"none",
+                       "gemm_half":True,"gemm_half_q4":False,"gqa_tile":2,
+                       "gqa_block":1024,"gqa_threshold":2048,"gpu_sample":True,
+                       "resident":True,"bare_system":False,"tool_strict":False,
+                       "test_failpoints":False,"tokenizer":"test.tok",
+                       "tokenizer_sha1":"c"*40}}
+    acc_run_ids = {"t2-base": "run-t2", "b1-base": "run-b1"}
+    good_arm, bad_arm = "t2-base", "b1-base"
+    for arm in (good_arm, bad_arm):
+        with open(os.path.join(td, "%s.provenance.json" % arm), "w") as f:
+            row = dict(acc_manifests[arm]); row["runtime"] = acc_runtime
+            row["run_id"] = acc_run_ids[arm]; row["server_boot"] = "boot-" + arm
+            json.dump(row, f, sort_keys=True)
         for mode in ("choice", "numeric", "freeform"):
             rows = []
             for i, (pid, gold) in enumerate(golds[mode]):
-                txt = (correct_text(mode, gold) if arm == "good-arm"
+                txt = (correct_text(mode, gold) if arm == good_arm
                        else wrong_text(mode))
-                rows.append({"id": "%s-%s-%04d" % (arm, mode, i),
+                rows.append({"id": "%s-%s-%s-%04d" % (arm, acc_run_ids[arm], mode, i),
                              "prompt_id": pid, "text": txt})
             write_jsonl(os.path.join(td, "%s.%s.jsonl" % (arm, mode)), rows)
 
-    # good=ref, bad=floor, and a third "mid" arm that is actually the good
-    # corpus again so it is NOT below floor: baseline should exit 0.
-    rc, out = run_accuracy(["--dir", td, "--ref", "good-arm",
-                            "--floor", "bad-arm", "--arms", "good-arm"])
+    # good=ref, bad=floor, and a third arm that is the good corpus again so
+    # it is NOT below floor: baseline should exit 0.
+    rc, out = run_accuracy(["--dir", td, "--ref", good_arm,
+                            "--floor", bad_arm, "--arms", good_arm])
     check("accuracy baseline exits 0", rc == 0, True)
     check("accuracy good-arm 100% overall", "120/120" in out, True)
     check("accuracy bad-arm 0% overall", "  0/120 (0.0" in out or "0/120 (0." in out, True)
 
     # A candidate strictly below floor MUST exit 1 (fail-closed).
-    rc, out = run_accuracy(["--dir", td, "--ref", "good-arm",
-                            "--floor", "good-arm", "--arms", "bad-arm"])
+    rc, out = run_accuracy(["--dir", td, "--ref", good_arm,
+                            "--floor", good_arm, "--arms", bad_arm])
     check("accuracy below-floor candidate exits 1", rc == 1, True)
     check("accuracy below-floor stated", "BELOW-FLOOR" in out, True)
 
+    # MUST-FAIL: a row id NOT bound to the sidecar's run_id is refused
+    # (stale/mixed/relabeled run) — the codex P2 provenance binding.
+    stale = os.path.join(td, "%s.choice.jsonl" % bad_arm)
+    rows = []
+    for i, (pid, gold) in enumerate(golds["choice"]):
+        rows.append({"id": "%s-stale-run-choice-%04d" % (bad_arm, i),
+                     "prompt_id": pid, "text": wrong_text("choice")})
+    write_jsonl(stale, rows)
+    rc, out = run_accuracy(["--dir", td, "--ref", good_arm,
+                            "--floor", bad_arm, "--arms", good_arm])
+    check("accuracy mixed-run rows exit nonzero", rc != 0, True)
+    check("accuracy mixed-run names run prefix", "not bound to run prefix" in out, True)
+
+    # MUST-FAIL: a missing provenance sidecar is refused outright.
+    prov = os.path.join(td, "%s.provenance.json" % bad_arm)
+    saved = open(prov, encoding="utf-8").read()
+    os.remove(prov)
+    # restore a valid corpus so only the sidecar is missing
+    rows = []
+    for i, (pid, gold) in enumerate(golds["choice"]):
+        rows.append({"id": "%s-%s-choice-%04d" % (bad_arm, acc_run_ids[bad_arm], i),
+                     "prompt_id": pid, "text": wrong_text("choice")})
+    write_jsonl(stale, rows)
+    rc, out = run_accuracy(["--dir", td, "--ref", good_arm,
+                            "--floor", bad_arm, "--arms", good_arm])
+    check("accuracy missing sidecar exits nonzero", rc != 0, True)
+    check("accuracy missing sidecar named", "provenance" in out, True)
+    with open(prov, "w", encoding="utf-8") as f:
+        f.write(saved)
+
     # Missing generation file MUST exit nonzero (incomplete run).
-    os.remove(os.path.join(td, "bad-arm.choice.jsonl"))
-    rc, out = run_accuracy(["--dir", td, "--ref", "good-arm",
-                            "--floor", "bad-arm", "--arms", "good-arm"])
+    os.remove(os.path.join(td, "%s.choice.jsonl" % bad_arm))
+    rc, out = run_accuracy(["--dir", td, "--ref", good_arm,
+                            "--floor", bad_arm, "--arms", good_arm])
     check("accuracy missing file exits nonzero", rc != 0, True)
 
 # --- report -----------------------------------------------------------------
