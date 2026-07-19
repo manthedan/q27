@@ -1,0 +1,4 @@
+logits-dump ready on Apple M4 in 0.13 s (models/qwen36-27b-mtp/qwen36-27b-mtp.q27)
+logits-dump: 4095 positions x 248320 f32 -> logs/kl-pair-20260719/official-wikitext-4k.logits (3.79 GiB, token_hash 3299446ad250d4f8)
+  dump pos 384/4095  dump pos 768/4095  dump pos 1152/4095  dump pos 1536/4095  dump pos 1920/4095  dump pos 2304/4095  dump pos 2688/4095  dump pos 3072/4095  dump pos 3456/4095  dump pos 3840/4095
+logits-dump wall: 271.90 s (15.06 pos/s), wrote 4095 positions

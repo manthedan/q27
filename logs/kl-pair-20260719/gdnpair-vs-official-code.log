@@ -1,0 +1,12 @@
+kl-vs-dump ready on Apple M4 in 0.96 s (/tmp/gdnpair-a5.q27 vs logs/kl-pair-20260719/official-code-4k.logits)
+kl-vs-dump: 4095 positions, single pass, no resets
+  kl pos 384/4095  kl pos 768/4095  kl pos 1152/4095  kl pos 1536/4095  kl pos 1920/4095  kl pos 2052: running mean 0.717065 nats
+  kl pos 2304/4095  kl pos 2688/4095  kl pos 3072/4095  kl pos 3456/4095  kl pos 3840/4095
+kl-vs-dump tail: p50 0.09839  p90 2.01  p99 6.314  p99.5 7.901  max 12.12 @pos 1788
+kl-vs-dump runs >0.1: 2043 positions, 814 runs, longest 20 @pos 3988
+kl-vs-dump runs >0.5: 1146 positions, 617 runs, longest 20 @pos 3988
+kl-vs-dump wall: 225.60 s (18.15 pos/s), overall mean KL 0.651109 nats, max 12.1183
+kl-vs-dump: wrote 4095 per-position KLs to logs/kl-pair-20260719/gdnpair-vs-official-code.kl
+paired-logit forward-KL dump→model by target position (4096 tokens, no resets):
+  0-2k    : mean KL 0.716713 nats  max 12.1183  (n=2047)
+  2k-8k   : mean KL 0.585537 nats  max 11.1984  (n=2048)
