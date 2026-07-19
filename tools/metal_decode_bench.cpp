@@ -13,6 +13,7 @@
 // Memory-safe: synthetic buffers only (~1.6 GiB peak), no model artifact.
 
 #include "metal_backend.h"
+#include "bench_env.h"
 
 #include <algorithm>
 #include <chrono>
@@ -322,13 +323,20 @@ int main(int argc, char** argv) {
 
     token_step(1); token_step(2); // warmup: clock ramp + first-touch paging
     backend.profile_reset();      // keep the cold dispatches out of the attribution
+    const bool sampling = q27bench::bench_thermal_start();
     const auto start = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < tokens; i++) token_step(i + 3);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    q27bench::bench_thermal_stop();
 
     printf("decode step: %.1f ms/token, %.2f tok/s, effective weight stream %.1f GB/s\n",
            seconds / tokens * 1e3, tokens / seconds,
            token_weight_bytes * tokens / seconds / 1e9);
+    // counted per-token bytes (review-2 §3.2: derive the dilution fit from
+    // counted bytes, not byte/unit fits) + the thermal-governance line.
+    printf("per-token bytes: %.0f (%.3f GiB)\n", token_weight_bytes,
+           token_weight_bytes / (1024.0 * 1024.0 * 1024.0));
+    q27bench::bench_power_line(sampling);
     return 0;
 }
