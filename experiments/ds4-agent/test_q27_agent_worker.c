@@ -35,11 +35,12 @@ void q27_agent_engine_close(q27_agent_engine *engine) {
 
 q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
-    size_t message_count, int enable_thinking, uint32_t max_tokens,
-    q27_agent_text_sink sink, q27_agent_alive_check alive, void *opaque,
+    size_t message_count, int enable_thinking, int enable_tools,
+    uint32_t max_tokens, q27_agent_text_sink sink,
+    q27_agent_alive_check alive, void *opaque,
     uint32_t *prompt_tokens, uint32_t *cached_tokens,
     uint32_t *prefill_tokens, uint32_t *output_tokens,
-    char *error, size_t error_cap) {
+    int *tool_call_complete, char *error, size_t error_cap) {
     (void)enable_thinking;
     (void)max_tokens;
     if (!engine || engine->marker != 27 || message_count != 1) {
@@ -52,6 +53,19 @@ q27_agent_status q27_agent_generate(
         return Q27_AGENT_REJECTED;
     }
     if (!alive(opaque)) return Q27_AGENT_CANCELLED;
+    if (messages[0].content_len == 4 &&
+        memcmp(messages[0].content, "call", 4) == 0) {
+        static const char body[] =
+            "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}"
+            "</tool_call>";
+        if (!enable_tools || !sink(body, sizeof(body) - 1, opaque))
+            return Q27_AGENT_CANCELLED;
+        *prompt_tokens = 9;
+        *prefill_tokens = 9;
+        *output_tokens = 12;
+        *tool_call_complete = 1;
+        return Q27_AGENT_OK;
+    }
     if (messages[0].content_len == 5 &&
         memcmp(messages[0].content, "burst", 5) == 0) {
         for (uint32_t i = 0; i < 5000; ++i) {
@@ -133,6 +147,7 @@ typedef struct {
     uint32_t cached_tokens;
     uint32_t prefill_tokens;
     uint32_t output_tokens;
+    int tool_call_complete;
     int states;
     int tool_outputs;
     int terminals;
@@ -177,6 +192,7 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
             out->cached_tokens = event.cached_tokens;
             out->prefill_tokens = event.prefill_tokens;
             out->output_tokens = event.output_tokens;
+            out->tool_call_complete = event.tool_call_complete;
             out->tool_kind = event.tool_kind;
             out->tool_exit_code = event.tool_exit_code;
             out->tool_flags = event.tool_flags;
@@ -240,7 +256,7 @@ int main(void) {
     q27_agent_message message = {
         .role = "user", .content = binary, .content_len = sizeof(binary)};
     uint64_t command = 0;
-    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 8, alive, NULL,
+    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 0, 8, alive, NULL,
                                   &command, error, sizeof(error)) == Q27_AGENT_OK,
           "binary command submits");
     memset(binary, '!', sizeof(binary));
@@ -256,6 +272,16 @@ int main(void) {
           "terminal session accounting survives event queue");
     CHECK(q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "terminal consumption reopens admission");
+
+    q27_agent_message call = {
+        .role = "user", .content = "call", .content_len = 4};
+    CHECK(q27_agent_worker_submit(worker, &call, 1, 0, 1, 64, alive, NULL,
+                                  &command, error, sizeof(error)) == Q27_AGENT_OK,
+          "constrained generation command submits");
+    CHECK(drain_command(worker, command, &result) &&
+          result.terminal_status == Q27_AGENT_OK &&
+          result.tool_call_complete == 1 && result.output_tokens == 12,
+          "closed model tool call reaches terminal metadata");
 
     char shell_command[] = "printf 't\\000l'";
     q27_agent_tool_request tool_request = {
@@ -281,7 +307,7 @@ int main(void) {
           "tool terminal accounting reopens shared admission");
 
     q27_agent_message bad = {.role = "user", .content = "bad", .content_len = 3};
-    CHECK(q27_agent_worker_submit(worker, &bad, 1, 0, 8, alive, NULL,
+    CHECK(q27_agent_worker_submit(worker, &bad, 1, 0, 0, 8, alive, NULL,
                                   &command, error, sizeof(error)) == Q27_AGENT_OK,
           "rejected request is accepted as a command");
     CHECK(drain_command(worker, command, &result) &&
@@ -293,7 +319,7 @@ int main(void) {
     // draining proves backpressure resumes without loss or duplicate sequence.
     q27_agent_message burst = {
         .role = "user", .content = "burst", .content_len = 5};
-    CHECK(q27_agent_worker_submit(worker, &burst, 1, 0, 6000, alive, NULL,
+    CHECK(q27_agent_worker_submit(worker, &burst, 1, 0, 0, 6000, alive, NULL,
                                   &command, error, sizeof(error)) == Q27_AGENT_OK,
           "burst command submits");
     CHECK(drain_command(worker, command, &result) &&
@@ -305,12 +331,12 @@ int main(void) {
     gate_init(&gate, 1);
     message = (q27_agent_message){
         .role = "user", .content = "x\0y", .content_len = 3};
-    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 8, gated_alive, &gate,
+    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 0, 8, gated_alive, &gate,
                                   &command, error, sizeof(error)) == Q27_AGENT_OK,
           "blocked command submits");
     gate_wait_entered(&gate);
     uint64_t rejected_id = 99;
-    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 8, alive, NULL,
+    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 0, 8, alive, NULL,
                                   &rejected_id, error, sizeof(error)) ==
                                       Q27_AGENT_REJECTED && rejected_id == 0,
           "concurrent submission is rejected");
@@ -326,7 +352,7 @@ int main(void) {
     worker = q27_agent_worker_start("model", "tok", 128, error, sizeof(error));
     CHECK(worker, "worker for cancellation starts");
     gate_init(&gate, 1);
-    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 8, gated_alive, &gate,
+    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 0, 8, gated_alive, &gate,
                                   &command, error, sizeof(error)) == Q27_AGENT_OK,
           "command before request_stop submits");
     gate_wait_entered(&gate);
@@ -345,7 +371,7 @@ int main(void) {
     worker = q27_agent_worker_start("model", "tok", 128, error, sizeof(error));
     CHECK(worker, "worker for destructive stop starts");
     gate_init(&gate, 1);
-    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 8, gated_alive, &gate,
+    CHECK(q27_agent_worker_submit(worker, &message, 1, 0, 0, 8, gated_alive, &gate,
                                   &command, error, sizeof(error)) == Q27_AGENT_OK,
           "command before destructive stop submits");
     gate_wait_entered(&gate);

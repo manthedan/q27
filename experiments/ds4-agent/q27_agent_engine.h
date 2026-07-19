@@ -37,11 +37,14 @@ void q27_agent_engine_close(q27_agent_engine *engine);
 // Renders the complete transcript on every call, but reuses resident state
 // only when its exact generated-token ledger is a stable prefix of that render
 // and the Metal position agrees. Any mismatch resets and re-prefills. Any
-// cancellation/runtime error invalidates reuse for the next call.
+// cancellation/runtime error invalidates reuse for the next call. When
+// enable_tools is set, greedy decode grammar-locks registered <tool_call>
+// bodies and stops exactly after a valid closer.
 q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      const q27_agent_message *messages,
                                      size_t message_count,
                                      int enable_thinking,
+                                     int enable_tools,
                                      uint32_t max_tokens,
                                      q27_agent_text_sink sink,
                                      q27_agent_alive_check alive,
@@ -50,6 +53,7 @@ q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      uint32_t *cached_tokens,
                                      uint32_t *prefill_tokens,
                                      uint32_t *output_tokens,
+                                     int *tool_call_complete,
                                      char *error, size_t error_cap);
 
 #ifdef __cplusplus

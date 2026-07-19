@@ -62,6 +62,7 @@ struct q27_agent_worker {
     owned_messages request;
     owned_tool_request tool_request;
     int enable_thinking;
+    int enable_tools;
     uint32_t max_tokens;
     q27_agent_alive_check alive;
     void *alive_opaque;
@@ -350,6 +351,7 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
                              q27_agent_status status, uint32_t prompt_tokens,
                              uint32_t cached_tokens, uint32_t prefill_tokens,
                              uint32_t output_tokens,
+                             int tool_call_complete,
                              const q27_agent_tool_result *tool_result,
                              q27_agent_tool_kind tool_kind,
                              const char *error) {
@@ -362,6 +364,7 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
         .cached_tokens = cached_tokens,
         .prefill_tokens = prefill_tokens,
         .output_tokens = output_tokens,
+        .tool_call_complete = tool_call_complete,
         .tool_kind = tool_kind,
         .tool_exit_code = tool_result ? tool_result->exit_code : 0,
         .tool_flags = tool_result ? tool_result->flags : 0,
@@ -424,6 +427,7 @@ static void *worker_main(void *opaque) {
         owned_tool_request tool = worker->tool_request;
         worker->tool_request = (owned_tool_request){0};
         const int enable_thinking = worker->enable_thinking;
+        const int enable_tools = worker->enable_tools;
         const uint32_t max_tokens = worker->max_tokens;
         q27_agent_alive_check alive = worker->alive;
         void *alive_opaque = worker->alive_opaque;
@@ -452,6 +456,7 @@ static void *worker_main(void *opaque) {
                            worker_monotonic_ms() + tool.request.timeout_ms : 0};
         uint32_t prompt_tokens = 0, cached_tokens = 0;
         uint32_t prefill_tokens = 0, output_tokens = 0;
+        int tool_call_complete = 0;
         q27_agent_tool_result tool_result = {0};
         error[0] = '\0';
         q27_agent_status status;
@@ -480,10 +485,10 @@ static void *worker_main(void *opaque) {
             }
         } else {
             status = q27_agent_generate(
-                engine, messages.items, messages.len, enable_thinking, max_tokens,
-                event_text_sink, combined_alive, &context,
-                &prompt_tokens, &cached_tokens, &prefill_tokens,
-                &output_tokens, error, sizeof(error));
+                engine, messages.items, messages.len, enable_thinking,
+                enable_tools, max_tokens, event_text_sink, combined_alive,
+                &context, &prompt_tokens, &cached_tokens, &prefill_tokens,
+                &output_tokens, &tool_call_complete, error, sizeof(error));
             if (context.queue_error && status == Q27_AGENT_CANCELLED) {
                 status = Q27_AGENT_ERROR;
                 copy_error(error, sizeof(error), "text event publication failed");
@@ -498,6 +503,7 @@ static void *worker_main(void *opaque) {
             status == Q27_AGENT_ERROR ? Q27_EVENT_ERROR : Q27_EVENT_TURN_DONE;
         publish_terminal(worker, command_id, terminal_type, status, prompt_tokens,
                          cached_tokens, prefill_tokens, output_tokens,
+                         tool_call_complete,
                          kind == REQUEST_TOOL ? &tool_result : NULL,
                          completed_tool_kind, error);
     }
@@ -592,8 +598,9 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
 
 q27_agent_status q27_agent_worker_submit(
     q27_agent_worker *worker, const q27_agent_message *messages,
-    size_t message_count, int enable_thinking, uint32_t max_tokens,
-    q27_agent_alive_check alive, void *opaque, uint64_t *command_id,
+    size_t message_count, int enable_thinking, int enable_tools,
+    uint32_t max_tokens, q27_agent_alive_check alive, void *opaque,
+    uint64_t *command_id,
     char *error, size_t error_cap) {
     if (command_id) *command_id = 0;
     if (!worker || !messages || !message_count || !max_tokens || !alive) {
@@ -615,6 +622,7 @@ q27_agent_status q27_agent_worker_submit(
     worker->request_type = REQUEST_GENERATE;
     worker->request = copied;
     worker->enable_thinking = enable_thinking;
+    worker->enable_tools = enable_tools;
     worker->max_tokens = max_tokens;
     worker->alive = alive;
     worker->alive_opaque = opaque;

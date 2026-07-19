@@ -46,6 +46,7 @@ typedef struct {
     uint32_t cached_tokens;
     uint32_t prefill_tokens;
     uint32_t output_tokens;
+    int tool_call_complete;
     q27_agent_tool_kind tool_kind;
     int32_t tool_exit_code;
     uint32_t tool_flags;
@@ -62,7 +63,9 @@ q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
                                              const char *workspace_root,
                                              char *error, size_t error_cap);
 
-// Deep-copies every message before returning. alive/opaque remain borrowed
+// Deep-copies every message before returning. enable_tools opts into the fixed
+// native-tool grammar; a closed call ends generation and is reported on the
+// terminal event. alive/opaque remain borrowed
 // until the command's terminal event is consumed; the owner must keep them
 // valid and close submission admission before destructive stop.
 q27_agent_status q27_agent_worker_submit(
@@ -70,6 +73,7 @@ q27_agent_status q27_agent_worker_submit(
     const q27_agent_message *messages,
     size_t message_count,
     int enable_thinking,
+    int enable_tools,
     uint32_t max_tokens,
     q27_agent_alive_check alive,
     void *opaque,

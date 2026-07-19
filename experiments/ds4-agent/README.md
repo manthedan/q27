@@ -57,11 +57,10 @@ Interactive users can exercise the control plane directly:
 :shell command
 ```
 
-The C API additionally exposes exact binary atomic edit requests. This slice
-intentionally does **not** parse model output or let an engine callback launch
-a tool; model-driven `<tool_call>` parsing remains the next protocol slice.
-Generation and tools share one-command admission and the same bounded owned
-event queue (`tool_running → tool_output* → tool_done`).
+The C API additionally exposes exact binary atomic edit requests. Generation
+and tools share one-command admission and the same bounded owned event queue
+(`tool_running → tool_output* → tool_done`). No engine callback launches a
+tool.
 
 File tools are rooted at a directory descriptor pinned when `--workspace`
 (default `.`) opens; later pathname replacement cannot retarget it. They reject
@@ -78,6 +77,43 @@ job denies process creation (Darwin sandbox policy / Linux seccomp): builtins
 and a final external `exec` work, while pipelines, background jobs, and
 forking commands fail. The sole process group is killed/reaped on timeout,
 cancellation, or output overflow.
+
+## Opt-in model tool calls
+
+Automatic tools are disabled unless `--auto-tools` is present. **This flag
+grants model output local side effects.** File helpers remain workspace-bounded,
+but shell uses the workspace only as its current directory and can access any
+path allowed to the local account; the no-fork policy is process containment,
+not a filesystem or prompt-injection sandbox.
+
+```sh
+./build/q27-agent MODEL.q27 MODEL.tok --auto-tools --workspace ./project \
+  --prompt 'Read README.md and summarize it'
+```
+
+Opt-in mode inserts the fixed read/search/edit/shell JSON schemas into the
+system message and enables greedy grammar masks after the model emits
+`<tool_call>`. The grammar allows only a registered name, a strict JSON object,
+and a complete `</tool_call>` closer. Generation stops at that closer, so
+post-call prose is never produced. Mask exhaustion, illegal grammar state,
+truncation, malformed JSON, unknown arguments, multiple calls in one turn, or
+non-whitespace after the closer all fail closed without executing a tool.
+
+The engine callback only publishes binary text deltas. After the generation
+terminal, the C control thread strictly parses the completed call and submits a
+new owned tool command through `q27_agent_worker_submit_tool`. It captures the
+exact output and verifies terminal byte accounting. Before execution it lowers
+the tool's output cap to a conservative one-byte-per-token budget derived from
+the terminal prompt accounting plus the full generated assistant byte length
+(never trusting emitted-token segmentation across re-render), remaining
+context, next `max_tokens`,
+and fixed response-framing reserve; if even the framing cannot fit, it refuses
+before a mutating tool runs. It then appends an explicit `<tool_response>` user
+turn with exit/flag metadata and starts the next resident generation. `--max-tool-rounds` bounds this loop (default 8, maximum
+64). JSONL shows separate monotonic command IDs for generation, tool execution,
+and follow-up generation; `turn_done.tool_call_complete` identifies the
+semantic call terminal. Automatic shell execution remains subject to the
+single-process sandbox described above.
 
 ### Resident session contract
 
@@ -124,9 +160,9 @@ rather than another full reset. The CPU `AgentSession` selftest separately
 gates pending-token finalization, append offsets, prefix and engine-position
 mismatch fallback, and cancellation/error invalidation.
 
-This establishes direct C → worker → C++ → resident Metal-session feasibility.
-It establishes explicit control-plane tool execution, but not model-driven
-tool calls, snapshots, compaction, or broad parity.
+This establishes direct C → worker → C++ → resident Metal-session feasibility,
+including opt-in model-driven tools through a separate control-plane command.
+It does not establish snapshots, compaction, or broad parity.
 
 ## Graduation gates
 
@@ -148,12 +184,11 @@ After Phase 0, port from the pinned DS4 agent in this order:
 2. ~~queued UI events and a noninteractive JSONL event stream~~;
 3. ~~q27 `AgentSession` append/finalize contract~~;
 4. ~~file read/search/edit tools and bounded asynchronous shell jobs~~;
-5. q27 `<tool_call>` parsing and constrained generation (not DSML);
+5. ~~q27 `<tool_call>` parsing and constrained generation (not DSML)~~;
 6. transcript/session persistence using `Q27SNAP1` (not DS4 payloads);
 7. compaction;
 8. optional terminal UI and browser tooling.
 
-The next slice is q27 `<tool_call>` parsing and constrained generation (not
-DSML), followed by tool-result transcript append through the proven resident
-session boundary. Automatic execution must remain opt-in and preserve the
-explicit event/terminal contract.
+The next slice is transcript/session persistence using `Q27SNAP1`, preserving
+the exact resident-token ledger and private-file publication contract. Tool
+calls remain opt-in and continue to use separate generation/tool terminals.

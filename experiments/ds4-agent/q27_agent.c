@@ -6,10 +6,13 @@
  * The worker-owned direct-engine architecture is based on antirez/ds4's
  * ds4_agent.c. This Phase-0 file is intentionally small: it proves that a C
  * control loop can drive q27's C++/Metal engine without HTTP. Narrow bounded
- * tools now share its owned event boundary; model-driven tool-call parsing,
- * persistence, and terminal UI remain later slices. See THIRD_PARTY_NOTICES.md.
+ * tools and opt-in model tool calls share its owned event boundary. Parsing
+ * happens only after the generation terminal; the control thread then submits
+ * a separate tool command. Persistence and terminal UI remain later slices.
+ * See THIRD_PARTY_NOTICES.md.
  */
 
+#include "q27_agent_protocol.h"
 #include "q27_agent_worker.h"
 
 #include <errno.h>
@@ -56,6 +59,10 @@ typedef struct {
 } output_buffer;
 
 typedef struct {
+    uint32_t prompt_tokens;
+} turn_accounting;
+
+typedef struct {
     unsigned char pending[4096];
     size_t pos;
     size_t len;
@@ -76,6 +83,8 @@ static void usage(FILE *out, const char *argv0) {
         "      --no-think          append the Qwen no-thinking prefix\n"
         "      --output-format F   text (default) or jsonl events\n"
         "      --workspace DIR     root for relative tools (default .)\n"
+        "      --auto-tools        opt into model-driven local side effects\n"
+        "      --max-tool-rounds N automatic tool-call bound (default 8)\n"
         "  -h, --help              show this help\n"
         "\n"
         "interactive tools: :read PATH, :search PATH NEEDLE, :shell COMMAND\n",
@@ -278,6 +287,7 @@ static int print_json_event(const q27_agent_event *event) {
         "\"state\":\"%s\",\"status\":\"%s\",\"data_b64\":\"%s\","
         "\"prompt_tokens\":%u,\"cached_tokens\":%u,"
         "\"prefill_tokens\":%u,\"output_tokens\":%u,"
+        "\"tool_call_complete\":%s,"
         "\"tool_kind\":\"%s\",\"tool_exit_code\":%d,"
         "\"tool_flags\":%u,\"tool_output_bytes\":%u}\n",
         (unsigned long long)event->sequence,
@@ -285,7 +295,9 @@ static int print_json_event(const q27_agent_event *event) {
         event_type_name(event->type), worker_state_name(event->state),
         status_name(event->status), data,
         event->prompt_tokens, event->cached_tokens, event->prefill_tokens,
-        event->output_tokens, tool_kind_name(event->tool_kind),
+        event->output_tokens,
+        event->tool_call_complete ? "true" : "false",
+        tool_kind_name(event->tool_kind),
         event->tool_exit_code, event->tool_flags, event->tool_output_bytes) >= 0 &&
         fflush(stdout) != EOF;
     free(data);
@@ -351,7 +363,11 @@ static int read_line_interruptible(input_reader *reader, char **line,
 }
 
 static int run_tool(q27_agent_worker *worker,
-                    const q27_agent_tool_request *request, int jsonl) {
+                    const q27_agent_tool_request *request, int jsonl,
+                    int display_text, output_buffer *captured,
+                    q27_agent_tool_result *completed) {
+    if (captured) *captured = (output_buffer){0};
+    if (completed) *completed = (q27_agent_tool_result){0};
     char error[512] = {0};
     uint64_t command_id = 0;
     q27_agent_status submitted = q27_agent_worker_submit_tool(
@@ -374,20 +390,24 @@ static int run_tool(q27_agent_worker *worker,
         if (got <= 0) {
             fprintf(stderr, "q27-agent: tool event stream ended: %s\n",
                     got < 0 && error[0] ? error : "worker stopped");
+            if (captured) { free(captured->bytes); *captured = (output_buffer){0}; }
             return 0;
         }
         if (event.command_id != command_id) {
             fprintf(stderr, "q27-agent: tool event command mismatch\n");
             q27_agent_event_free(&event);
             q27_agent_worker_request_stop(worker);
+            if (captured) { free(captured->bytes); *captured = (output_buffer){0}; }
             return 0;
         }
         int output_failed = 0;
-        if (event.type == Q27_EVENT_TOOL_OUTPUT && !jsonl && event.data_len) {
-            if (fwrite(event.data, 1, event.data_len, stdout) != event.data_len ||
-                fflush(stdout) == EOF)
+        if (event.type == Q27_EVENT_TOOL_OUTPUT && event.data_len) {
+            if (captured && !output_append(captured, event.data, event.data_len))
                 output_failed = 1;
-
+            if (!jsonl && display_text &&
+                (fwrite(event.data, 1, event.data_len, stdout) != event.data_len ||
+                 fflush(stdout) == EOF))
+                output_failed = 1;
         }
         if (jsonl && !print_json_event(&event)) output_failed = 1;
         terminal = event.type == Q27_EVENT_TOOL_DONE ||
@@ -398,25 +418,42 @@ static int run_tool(q27_agent_worker *worker,
             exit_code = event.tool_exit_code;
             flags = event.tool_flags;
             output_bytes = event.tool_output_bytes;
+            if (completed) {
+                completed->exit_code = event.tool_exit_code;
+                completed->flags = event.tool_flags;
+                completed->output_bytes = event.tool_output_bytes;
+            }
             size_t n = event.data_len < sizeof(error) - 1 ?
                        event.data_len : sizeof(error) - 1;
             if (n) memcpy(error, event.data, n);
             error[n] = '\0';
+            if (completed)
+                snprintf(completed->message, sizeof(completed->message),
+                         "%s", error);
         }
         q27_agent_event_free(&event);
         if (output_failed) {
             q27_agent_worker_request_stop(worker);
             fprintf(stderr, "q27-agent: tool output failure\n");
+            if (captured) { free(captured->bytes); *captured = (output_buffer){0}; }
             return 0;
         }
     }
     if (status == Q27_AGENT_CANCELLED) {
         fprintf(stderr, "q27-agent: tool interrupted\n");
+        if (captured) { free(captured->bytes); *captured = (output_buffer){0}; }
         return 0;
     }
     if (status != Q27_AGENT_OK) {
         fprintf(stderr, "q27-agent: tool infrastructure failure: %s\n",
                 error[0] ? error : "unknown error");
+        if (captured) { free(captured->bytes); *captured = (output_buffer){0}; }
+        return 0;
+    }
+    if (captured && captured->len != output_bytes) {
+        fprintf(stderr, "q27-agent: tool output accounting mismatch\n");
+        free(captured->bytes);
+        *captured = (output_buffer){0};
         return 0;
     }
     fprintf(stderr, "[q27-tool exit=%d flags=%u output=%u%s%s]\n",
@@ -426,7 +463,13 @@ static int run_tool(q27_agent_worker *worker,
 }
 
 static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
-                    uint32_t max_tokens, int jsonl) {
+                    int enable_tools, uint32_t max_tokens, int jsonl,
+                    output_buffer *completed_output,
+                    int *completed_tool_call,
+                    turn_accounting *completed_accounting) {
+    if (completed_output) *completed_output = (output_buffer){0};
+    if (completed_tool_call) *completed_tool_call = 0;
+    if (completed_accounting) *completed_accounting = (turn_accounting){0};
     if (interrupted) {
         fprintf(stderr, "q27-agent: pending interrupt; generation not started\n");
         return 0;
@@ -445,7 +488,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
     char error[512] = {0};
     uint64_t command_id = 0;
     q27_agent_status submitted = q27_agent_worker_submit(
-        worker, view, chat->len, think, max_tokens,
+        worker, view, chat->len, think, enable_tools, max_tokens,
         continue_running, NULL, &command_id, error, sizeof(error));
     // submit deep-copies every message; the UI transcript is no longer pinned
     // for the duration of generation.
@@ -460,7 +503,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
     q27_agent_status status = Q27_AGENT_ERROR;
     uint32_t prompt_tokens = 0, cached_tokens = 0;
     uint32_t prefill_tokens = 0, output_tokens = 0;
-    int terminal = 0;
+    int tool_call_complete = 0, terminal = 0;
     while (!terminal) {
         q27_agent_event event;
         int got = q27_agent_worker_next_event(worker, &event,
@@ -498,6 +541,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
             cached_tokens = event.cached_tokens;
             prefill_tokens = event.prefill_tokens;
             output_tokens = event.output_tokens;
+            tool_call_complete = event.tool_call_complete;
             size_t n = event.data_len < sizeof(error) - 1 ?
                        event.data_len : sizeof(error) - 1;
             if (n) memcpy(error, event.data, n);
@@ -536,12 +580,136 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
         free(output.bytes);
         return 0;
     }
-    free(output.bytes);
+    if (completed_output) {
+        *completed_output = output;
+    } else {
+        free(output.bytes);
+    }
+    if (completed_tool_call) *completed_tool_call = tool_call_complete;
+    if (completed_accounting) {
+        completed_accounting->prompt_tokens = prompt_tokens;
+    }
     fprintf(stderr,
-            "[q27-agent prompt=%u cached=%u prefill=%u output=%u; %s]\n",
+            "[q27-agent prompt=%u cached=%u prefill=%u output=%u; %s%s]\n",
             prompt_tokens, cached_tokens, prefill_tokens, output_tokens,
-            cached_tokens ? "exact-prefix session reuse" : "reset/re-prefill");
+            cached_tokens ? "exact-prefix session reuse" : "reset/re-prefill",
+            tool_call_complete ? "; closed tool call" : "");
     return 1;
+}
+
+static int append_tool_response(transcript *chat,
+                                const output_buffer *output,
+                                const q27_agent_tool_result *result) {
+    output_buffer wrapped = {0};
+    static const char open[] = "<tool_response>\n";
+    static const char close[] = "\n</tool_response>";
+    char status[512];
+    int n = snprintf(status, sizeof(status),
+                     "\n[q27-tool exit=%d flags=%u output=%u%s%s]",
+                     result->exit_code, result->flags, result->output_bytes,
+                     result->message[0] ? "; " : "",
+                     result->message[0] ? result->message : "");
+    int ok = n >= 0 && (size_t)n < sizeof(status) &&
+             output_append(&wrapped, (const unsigned char *)open,
+                           sizeof(open) - 1) &&
+             output_append(&wrapped,
+                           (const unsigned char *)(output->bytes ?
+                                                   output->bytes : ""),
+                           output->len) &&
+             output_append(&wrapped, (const unsigned char *)status, (size_t)n) &&
+             output_append(&wrapped, (const unsigned char *)close,
+                           sizeof(close) - 1) &&
+             transcript_append_len(chat, "user", wrapped.bytes, wrapped.len);
+    free(wrapped.bytes);
+    return ok;
+}
+
+static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
+                           int think, uint32_t context_tokens,
+                           uint32_t max_tokens, int jsonl,
+                           uint32_t max_tool_rounds) {
+    uint32_t tool_rounds = 0;
+    for (;;) {
+        output_buffer generated = {0};
+        int engine_closed_call = 0;
+        turn_accounting accounting = {0};
+        if (!run_turn(worker, chat, think, 1, max_tokens, jsonl,
+                      &generated, &engine_closed_call, &accounting)) {
+            free(generated.bytes);
+            return 0;
+        }
+
+        q27_agent_tool_call call = {0};
+        char error[512] = {0};
+        const size_t generated_bytes = generated.len;
+        q27_agent_tool_call_status parsed = q27_agent_parse_tool_call(
+            (const unsigned char *)(generated.bytes ? generated.bytes : ""),
+            generated.len, &call, error, sizeof(error));
+        if (parsed == Q27_TOOL_CALL_NONE) {
+            free(generated.bytes);
+            if (engine_closed_call) {
+                fprintf(stderr,
+                        "q27-agent: engine/parser tool-call mismatch\n");
+                return 0;
+            }
+            return 1;
+        }
+        free(generated.bytes);
+        if (parsed != Q27_TOOL_CALL_VALID || !engine_closed_call) {
+            fprintf(stderr, "q27-agent: invalid model tool call: %s\n",
+                    error[0] ? error : "constraint/parser mismatch");
+            q27_agent_tool_call_free(&call);
+            return 0;
+        }
+        if (tool_rounds >= max_tool_rounds) {
+            fprintf(stderr, "q27-agent: automatic tool-round limit reached\n");
+            q27_agent_tool_call_free(&call);
+            return 0;
+        }
+
+        // Reserve enough worst-case one-byte tokens for the tool-response
+        // tags, status metadata, ChatML role framing, and next assistant
+        // prefix. The remaining byte cap is conservative because byte-BPE
+        // cannot encode one input byte as more than one token.
+        static const uint32_t response_reserve_tokens = 512;
+        // Re-rendering assistant bytes can segment differently from the
+        // emitted token IDs. Charge every generated byte as one token rather
+        // than trusting output_tokens; byte-BPE cannot exceed that bound.
+        const uint64_t committed = (uint64_t)accounting.prompt_tokens +
+                                   generated_bytes;
+        const uint64_t required = committed + max_tokens +
+                                  response_reserve_tokens;
+        if ((uint64_t)context_tokens + 1 <= required) {
+            fprintf(stderr,
+                    "q27-agent: insufficient context for bounded tool response\n");
+            q27_agent_tool_call_free(&call);
+            return 0;
+        }
+        const uint64_t room = (uint64_t)context_tokens + 1 - required;
+        if (call.request.max_output_bytes > room)
+            call.request.max_output_bytes = (uint32_t)room;
+
+        fprintf(stderr,
+                "[q27-agent automatic tool=%s round=%u/%u output-cap=%u]\n",
+                tool_kind_name(call.request.kind), tool_rounds + 1,
+                max_tool_rounds, call.request.max_output_bytes);
+        output_buffer tool_output = {0};
+        q27_agent_tool_result tool_result = {0};
+        int ran = run_tool(worker, &call.request, jsonl, 0,
+                           &tool_output, &tool_result);
+        q27_agent_tool_call_free(&call);
+        if (!ran) {
+            free(tool_output.bytes);
+            return 0;
+        }
+        if (!append_tool_response(chat, &tool_output, &tool_result)) {
+            free(tool_output.bytes);
+            fprintf(stderr, "q27-agent: could not retain tool response\n");
+            return 0;
+        }
+        free(tool_output.bytes);
+        ++tool_rounds;
+    }
 }
 
 int main(int argc, char **argv) {
@@ -549,9 +717,9 @@ int main(int argc, char **argv) {
     const char *workspace = ".";
     const char *system =
         "You are q27-agent, an experimental local coding assistant. "
-        "Answer concisely. Model-driven tool execution is not enabled in this build.";
-    uint32_t context = 8192, max_tokens = 512;
-    int think = 1, jsonl = 0;
+        "Answer concisely.";
+    uint32_t context = 8192, max_tokens = 512, max_tool_rounds = 8;
+    int think = 1, jsonl = 0, auto_tools = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -576,6 +744,14 @@ int main(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--no-think")) {
             think = 0;
+        } else if (!strcmp(arg, "--auto-tools")) {
+            auto_tools = 1;
+        } else if (!strcmp(arg, "--max-tool-rounds")) {
+            if (++i == argc || !parse_u32(argv[i], &max_tool_rounds) ||
+                max_tool_rounds > 64) {
+                fprintf(stderr, "q27-agent: max tool rounds must be 1..64\n");
+                return 2;
+            }
         } else if (!strcmp(arg, "--workspace")) {
             if (++i == argc || !argv[i][0]) {
                 fprintf(stderr, "q27-agent: workspace path is required\n");
@@ -635,12 +811,31 @@ int main(int argc, char **argv) {
     }
 
     transcript chat = {0};
-    int ok = transcript_append(&chat, "system", system);
+    int ok;
+    if (auto_tools) {
+        const char *preamble = q27_agent_tool_preamble();
+        output_buffer combined = {0};
+        ok = preamble &&
+             output_append(&combined, (const unsigned char *)preamble,
+                           strlen(preamble)) &&
+             output_append(&combined, (const unsigned char *)"\n\n", 2) &&
+             output_append(&combined, (const unsigned char *)system,
+                           strlen(system)) &&
+             transcript_append_len(&chat, "system", combined.bytes,
+                                   combined.len);
+        free(combined.bytes);
+    } else {
+        ok = transcript_append(&chat, "system", system);
+    }
     if (!ok) fprintf(stderr, "q27-agent: out of memory\n");
 
     if (ok && prompt) {
         ok = transcript_append(&chat, "user", prompt) &&
-             run_turn(worker, &chat, think, max_tokens, jsonl);
+             (auto_tools ?
+                  run_agent_cycle(worker, &chat, think, context, max_tokens,
+                                  jsonl, max_tool_rounds) :
+                  run_turn(worker, &chat, think, 0, max_tokens, jsonl,
+                           NULL, NULL, NULL));
     } else if (ok) {
         char *line = NULL;
         size_t len = 0, cap = 0;
@@ -699,12 +894,16 @@ int main(int argc, char **argv) {
                 if (request.kind == Q27_TOOL_NONE)
                     fprintf(stderr, "q27-agent: invalid tool command\n");
                 else
-                    ok = run_tool(worker, &request, jsonl);
+                    ok = run_tool(worker, &request, jsonl, 1, NULL, NULL);
                 free(tool_line);
                 continue;
             }
             ok = transcript_append_len(&chat, "user", line, len) &&
-                 run_turn(worker, &chat, think, max_tokens, jsonl);
+                 (auto_tools ?
+                      run_agent_cycle(worker, &chat, think, context, max_tokens,
+                                      jsonl, max_tool_rounds) :
+                      run_turn(worker, &chat, think, 0, max_tokens, jsonl,
+                               NULL, NULL, NULL));
         }
         free(line);
     }

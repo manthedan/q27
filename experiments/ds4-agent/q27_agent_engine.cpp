@@ -3,11 +3,13 @@
 
 #include "../../src/metal/metal_engine.h"
 #include "../../src/tokenizer.h"
+#include "../../src/toolconstrain.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -18,6 +20,10 @@ struct q27_agent_engine {
     std::shared_ptr<q27::MetalEngine::Shared> shared;
     std::unique_ptr<q27::MetalEngine> session;
     q27::agent::AgentSession agent_session;
+    std::vector<std::string> tool_vocab;
+    q27::ToolMaskCache tool_masks;
+    std::vector<int> tool_host2dev;
+    bool tool_masks_ready = false;
     bool poisoned = false;
     char poison_error[256] = {0};
     uint32_t context;
@@ -69,15 +75,17 @@ extern "C" void q27_agent_engine_close(q27_agent_engine *engine) {
 
 extern "C" q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
-    size_t message_count, int enable_thinking, uint32_t max_tokens,
-    q27_agent_text_sink sink, q27_agent_alive_check alive, void *opaque,
+    size_t message_count, int enable_thinking, int enable_tools,
+    uint32_t max_tokens, q27_agent_text_sink sink,
+    q27_agent_alive_check alive, void *opaque,
     uint32_t *prompt_tokens, uint32_t *cached_tokens,
     uint32_t *prefill_tokens, uint32_t *output_tokens,
-    char *error, size_t error_cap) {
+    int *tool_call_complete, char *error, size_t error_cap) {
     if (prompt_tokens) *prompt_tokens = 0;
     if (cached_tokens) *cached_tokens = 0;
     if (prefill_tokens) *prefill_tokens = 0;
     if (output_tokens) *output_tokens = 0;
+    if (tool_call_complete) *tool_call_complete = 0;
     if (!engine || !messages || message_count == 0 || !sink || !alive ||
         max_tokens == 0) {
         set_error(error, error_cap, "invalid generation arguments");
@@ -183,6 +191,37 @@ extern "C" q27_agent_status q27_agent_generate(
         // The GPU and ledger now agree at the complete rendered prompt.
         engine->agent_session.commit_prompt(ids);
 
+        using ToolConstrainer =
+            q27::BasicToolConstrainer<q27::MetalEngine, q27::Tokenizer>;
+        std::optional<ToolConstrainer> constrainer;
+        if (enable_tools) {
+            if (!engine->tool_masks_ready) {
+                const int closer = engine->tokenizer->token_id("</tool_call>");
+                if (closer < 0)
+                    throw std::runtime_error("tokenizer lacks </tool_call>");
+                engine->tool_vocab = engine->tokenizer->vocab_bytes();
+                engine->tool_masks.init(&engine->tool_vocab, closer);
+                engine->tool_masks_ready = true;
+            }
+            constrainer.emplace();
+            constrainer->eng = engine->session.get();
+            constrainer->tok = engine->tokenizer.get();
+            constrainer->cache = &engine->tool_masks;
+            constrainer->host2dev = &engine->tool_host2dev;
+            constrainer->enabled = true;
+            constrainer->begin({"read", "search", "edit", "shell"});
+        }
+        struct ConstraintCleanup {
+            q27_agent_engine *engine;
+            std::optional<ToolConstrainer> *constrainer;
+            ~ConstraintCleanup() {
+                try {
+                    if (constrainer->has_value()) (*constrainer)->end();
+                    engine->session->set_tool_constraint(-1);
+                } catch (...) {}
+            }
+        } constraint_cleanup{engine, &constrainer};
+
         const uint32_t eos = static_cast<uint32_t>(engine->tokenizer->eos());
         uint32_t produced = 0;
         while (produced < max_tokens && current != eos) {
@@ -190,6 +229,32 @@ extern "C" q27_agent_status q27_agent_generate(
                 if (output_tokens) *output_tokens = produced;
                 return cancelled();
             }
+
+            bool call_closed = false;
+            if (constrainer) {
+                const long engaged_before = constrainer->engaged;
+                const bool active_before = constrainer->active;
+                const int token = static_cast<int>(current);
+                (void)constrainer->scan_round(&token, 1);
+                constrainer->on_id(token);
+                const bool newly_engaged =
+                    constrainer->engaged != engaged_before;
+                if (constrainer->pool_dead ||
+                    (newly_engaged && !constrainer->active &&
+                     !constrainer->tg.closed()))
+                    throw std::runtime_error(
+                        "tool grammar could not remain fail-closed");
+                if (constrainer->active) {
+                    constrainer->apply(constrainer->tg);
+                    if (constrainer->pool_dead || !constrainer->active)
+                        throw std::runtime_error(
+                            "tool grammar mask pool exhausted");
+                }
+                call_closed = !constrainer->active &&
+                              constrainer->tg.closed() &&
+                              (active_before || newly_engaged);
+            }
+
             const std::string bytes =
                 engine->tokenizer->decode_one(static_cast<int>(current));
             if (!bytes.empty() && !sink(bytes.data(), bytes.size(), opaque)) {
@@ -200,10 +265,12 @@ extern "C" q27_agent_status q27_agent_generate(
             // The callback is irreversible: publish accounting before any
             // allocation, Metal step, or other bookkeeping can fail.
             if (output_tokens) *output_tokens = produced;
+            if (call_closed && tool_call_complete) *tool_call_complete = 1;
 
-            // Once max_tokens is visible, generation succeeded. Even ledger
-            // allocation is now best-effort and may only disable reuse.
-            if (produced == max_tokens) {
+            // A closed tool call is a semantic terminal: never generate prose
+            // after </tool_call>. Like max_tokens, the visible final token is
+            // irreversible; resident finalization is best-effort bookkeeping.
+            if (produced == max_tokens || call_closed) {
                 try {
                     if (!engine->agent_session.record_emitted(current))
                         throw std::runtime_error(
