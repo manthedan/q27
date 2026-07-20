@@ -19,6 +19,15 @@ ELIGIBLE = {
     "/v1/responses": "responses",
     "/v1/messages": "messages",
 }
+# APIs the proxy may capture-and-prewarm inline. /v1/messages is deliberately
+# NOT here: the server-side extractor (initial_harness_prefix) still requires a
+# canonical message list ending in a user message, and Claude Code 2.1.x sends a
+# trailing system block, so an inline prewarm would 400 and the proxy would then
+# fail the LIVE turn instead of forwarding it. Messages requests are therefore
+# dump-only (harvest for out-of-band prewarm) until the extractor is generalized
+# for the trailing-system shape. See
+# docs/plans/2026-07-17-experimental-harness-prefix-cache.md.
+PREWARM_APIS = {"chat_completions", "responses"}
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
@@ -233,7 +242,18 @@ class PrefixProxy(http.server.BaseHTTPRequestHandler):
             with self.state.lock:
                 if not self.state.warmed:
                     self.state.maybe_dump(api, request)
-                    if request.get("stream") is True:
+                    prewarmed = False
+                    result = None
+                    if api not in PREWARM_APIS:
+                        # Dump-only route (e.g. /v1/messages): harvest for
+                        # out-of-band prewarm, never inline-prewarm (would 400
+                        # and fail the live turn). Mark warmed so later requests
+                        # forward without re-dumping, then forward normally.
+                        self.state.warmed = True
+                        print(f"q27 experimental prefix: {api} is dump-only "
+                              "(extractor not yet generalized); forwarded without prewarm",
+                              file=sys.stderr, flush=True)
+                    elif request.get("stream") is True:
                         downstream_started = True
                         self.send_response(200)
                         self.send_header("Content-Type", "text/event-stream")
@@ -277,11 +297,13 @@ class PrefixProxy(http.server.BaseHTTPRequestHandler):
                     else:
                         try:
                             result = prewarm(self.state.target, self.state.admin_token, api, request)
+                            prewarmed = True
                         except Exception as exc:
                             self._error(502, str(exc))
                             return
                     self.state.warmed = True
-                    self._report_installed(result)
+                    if prewarmed:
+                        self._report_installed(result)
         self._forward(body, downstream_started=downstream_started, api=api)
 
     def _report_installed(self, result: object) -> None:

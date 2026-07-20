@@ -272,12 +272,15 @@ def run() -> None:
     )
     with urllib.request.urlopen(messages_req, timeout=5) as response:
         assert response.status == 200
-    assert FakeTarget.prewarms[-1] == {"api": "messages", "request": claude_request}
-    assert len(FakeTarget.prewarms) == prewarm_count_before + 1
-    # A second /v1/messages request is forwarded without re-prewarming.
+    # /v1/messages is DUMP-ONLY (the server extractor rejects Claude Code's
+    # trailing-system shape, so inline prewarm would 400 and fail the live
+    # turn): the request is forwarded WITHOUT any prewarm call.
+    assert len(FakeTarget.prewarms) == prewarm_count_before
+    assert FakeTarget.forwarded[-1][0] == "/v1/messages"
+    # A second /v1/messages request is also forwarded without prewarming.
     with urllib.request.urlopen(messages_req, timeout=5) as response:
         assert response.status == 200
-    assert len(FakeTarget.prewarms) == prewarm_count_before + 1
+    assert len(FakeTarget.prewarms) == prewarm_count_before
     # Anthropic clients authenticate with x-api-key (not Authorization: Bearer);
     # it is accepted as a capture credential and stripped before forwarding.
     state3 = cache.ProxyState(target, "test-token", "capture-token")
@@ -292,7 +295,9 @@ def run() -> None:
     )
     with urllib.request.urlopen(apikey_req, timeout=5) as response:
         assert response.status == 200
-    assert FakeTarget.prewarms[-1] == {"api": "messages", "request": claude_request}
+    # x-api-key is accepted as the capture credential and the dump-only
+    # /v1/messages request is forwarded without prewarming.
+    assert FakeTarget.forwarded[-1][0] == "/v1/messages"
     proxy3.shutdown(); proxy3.server_close(); proxy3_thread.join()
     proxy2.shutdown(); proxy2.server_close(); proxy2_thread.join()
 
