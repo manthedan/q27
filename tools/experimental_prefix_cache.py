@@ -97,8 +97,19 @@ def load_request(path: str) -> dict:
 
 
 def command_prewarm(args: argparse.Namespace) -> int:
-    result = prewarm(args.target, secret_from_env("Q27_METAL_ADMIN_TOKEN"), args.api,
-                     load_request(args.request))
+    payload = load_request(args.request)
+    # A --dump-request file is an envelope {"api": ..., "request": ...}; consume
+    # it directly instead of re-wrapping it as a bare request body. --api may be
+    # omitted when the envelope supplies the api; an explicit --api overrides it.
+    api = args.api
+    if "request" in payload and isinstance(payload.get("request"), dict) and "api" in payload:
+        if api is None:
+            api = payload["api"]
+        payload = payload["request"]
+    if api is None:
+        raise SystemExit("--api is required when the request file is a bare request body "
+                         "(not a --dump-request envelope)")
+    result = prewarm(args.target, secret_from_env("Q27_METAL_ADMIN_TOKEN"), api, payload)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -144,7 +155,12 @@ class ProxyState:
         if not self.dump_request:
             return
         try:
-            with open(self.dump_request, "w", encoding="utf-8") as stream:
+            # Owner-only: the dump holds the full harness prompt, tool schemas,
+            # and project/user content. Create 0600 BEFORE writing so a partial
+            # write never leaves world-readable prompt material, matching the
+            # snapshot store's 0600/0700 privacy model.
+            fd = os.open(self.dump_request, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump({"api": api, "request": request}, stream, indent=2, sort_keys=True)
             print(f"q27 experimental prefix: captured request dumped to {self.dump_request}",
                   file=sys.stderr, flush=True)
@@ -351,7 +367,9 @@ def parser() -> argparse.ArgumentParser:
     direct = sub.add_parser("prewarm", help="prewarm from a captured request JSON object")
     direct.add_argument("--target", type=target_url, default=target_url("http://127.0.0.1:8080"))
     direct.add_argument("--api", choices=("chat_completions", "responses", "messages", "anthropic"),
-                        required=True)
+                        default=None,
+                        help="api of the request; optional when the file is a "
+                             "--dump-request envelope that carries its own api")
     direct.add_argument("request", help="request JSON file, or - for stdin")
     direct.set_defaults(func=command_prewarm)
 

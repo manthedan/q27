@@ -206,9 +206,30 @@ def run() -> None:
     with open(dump_path, encoding="utf-8") as stream:
         dumped = json.load(stream)
     assert dumped == {"api": "responses", "request": {"input": "hi", "model": "q27"}}
+    # Dump files hold the full private prompt: they must be owner-only (0600).
+    assert (os.stat(dump_path).st_mode & 0o777) == 0o600, oct(os.stat(dump_path).st_mode & 0o777)
     # A state without dump_request is a no-op (no file written).
     state_nodump = cache.ProxyState(target, "test-token", "capture-token")
     state_nodump.maybe_dump("responses", {"input": "x"})  # must not raise
+
+    # command_prewarm consumes a --dump-request envelope WITHOUT double-wrapping
+    # and without requiring --api (the envelope carries it). Bare bodies still
+    # need --api.
+    import argparse as _argparse
+    envelope_path = os.path.join(tempfile.mkdtemp(), "env.json")
+    with open(envelope_path, "w", encoding="utf-8") as stream:
+        json.dump({"api": "responses", "request": {"input": "replay me", "model": "q27"}}, stream)
+    ns = _argparse.Namespace(target=target, api=None, request=envelope_path)
+    before = len(FakeTarget.prewarms)
+    os.environ["Q27_METAL_ADMIN_TOKEN"] = "test-token"
+    cache.command_prewarm(ns)
+    assert FakeTarget.prewarms[-1] == {"api": "responses",
+                                       "request": {"input": "replay me", "model": "q27"}}
+    assert len(FakeTarget.prewarms) == before + 1
+    # An explicit --api overrides the envelope's api.
+    ns2 = _argparse.Namespace(target=target, api="messages", request=envelope_path)
+    cache.command_prewarm(ns2)
+    assert FakeTarget.prewarms[-1]["api"] == "messages"
     state2 = cache.ProxyState(target, "test-token", "capture-token")
     proxy2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cache.PrefixProxy)
     proxy2.state = state2
