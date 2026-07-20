@@ -58,9 +58,15 @@ artifact_sha_for() {
 }
 
 hf_download() { # $1=remote-file $2=dest  (resumable)
-    local file="$1" dest="$2"
+    local file="$1" dest="$2" rev="main"
+    # The pinned source revision only applies to the repack path's source
+    # GGUF (it pins the prism-ml repo so an upstream re-upload cannot drift
+    # in). Direct tiers download the pre-repacked artifact from their own
+    # repo, whose integrity is already md5-pinned via the registry; that repo
+    # has no source-GGUF commit, so resolving the pinned rev would 404.
+    [ "$KIND" = "repack" ] && rev="$(source_rev_for)"
     curl -L --fail --continue-at - \
-        "https://huggingface.co/$REPO/resolve/$(source_rev_for)/$file" -o "$dest"
+        "https://huggingface.co/$REPO/resolve/$rev/$file" -o "$dest"
 }
 
 case "$KIND" in
