@@ -1,6 +1,6 @@
 # Metal implementation progress
 
-**Updated:** 2026-07-17
+**Updated:** 2026-07-20
 **Test devices:** Apple M4 24 GiB (official + T2/B1 tiers) and mac-mini M4 16 GiB (T2/B1 + provisional M1 candidate)
 
 This file is two things: a **current-state summary** (this section — kept
@@ -10,7 +10,18 @@ the behavioral reference. The old checkpoint ledger and "mature-decode
 critical path" sections further down are HISTORICAL (2026-07-14 vintage) —
 do not read them as current.
 
-## Current state (2026-07-17 night)
+## Current state (2026-07-20)
+
+**Release lines.** Two independent lines now exist. (1) **Upstream CUDA**
+(signalnine/q27): v0.3.5 tagged 2026-07-19 (`a2cc8b8`) — tool-call parser
+hardening, no kernel changes; merged into `metal` on 2026-07-20. (2) **Metal
+/ Homebrew** (manthedan/q27): the installable `brew install manthedan/tap/q27`
+line, formula pinned at **v0.3.0** (2026-07-19) with the supervisor wrapper,
+`q27 pull/report` bench suite, model registry, and `q27-agent`. These are two
+separate tag namespaces on the same history: `v0.3.5` is upstream's CUDA tag,
+`v0.3.0` is the Metal/Homebrew tag. HEAD is `v0.3.0-100-g…` — 100 Metal
+commits past the Homebrew tag (the v0.3.5 CUDA merge is folded into those).
+Bump the Homebrew pin when a Metal milestone is worth shipping.
 
 ### Shipped and gated (base M4, T2 tier unless noted)
 
@@ -25,7 +36,7 @@ do not read them as current.
 | Multislot | 2 slots, FIFO ticket lease, 96/48/12 quanta, full admission accounting, cancellation-safe queue, gates G1–G7 | busy-arrival wait ≤ 84 ms |
 | Snapshots | Durable disk resume + auto-save for long prompts + bank-on-cancel | cold 4:54 → 8.1 s on changed-message prefix hit |
 | Quality | 32K turbo3 NLL depth-flat; needles 6/6; funded L7-full fp16 exceptions remove the KV tail event | max KL 2.94→0.755, mean −11%, KV bytes +25.8% |
-| Tiers | Official 17 GiB (MTP), T2 7.15 GB, and B1 3.79 GB serve; **M1 mixed 3.83 GB is provisional** pending the amended product gates | Candidate/T2 NLL 1.0105; suffix 8/8; probes 4/4 |
+| Tiers | Official 17 GiB (MTP), T2 7.15 GB, and B1 3.79 GB serve; the M1 mixed graft is **CLOSED, no ship** (mixed thesis killed, see Recently closed) | historical M1-candidate evidence: NLL/T2 1.0105, suffix 8/8, probes 4/4 (kept for provenance; not a live gate) |
 
 ### Parked by measurement (mechanism recorded in the chronicle entry)
 
@@ -73,14 +84,59 @@ fixtures + one-command re-gate banked for M5/M6)** · slim verifiers
   pending.~~ **CLOSED with the mixed thesis** — no ship claim; see the
   gdn_pair exoneration + A5 KILL above.
 
+### Recently closed (since the 2026-07-17 snapshot)
+
+- **Mixed-tier / graft thesis: permanently CLOSED.** The gdn_pair rescue
+  exonerated the PACK (the repetition loop was a serving-binary artifact,
+  `6abf45f`), then A5-on-gdn_pair KILLED the strongest arm on both corpora
+  (`55ac29d`). A B1→T2 bridge requires training/distillation, not byte-level
+  grafting (measured, not conjectured). The whole census/A5/A6/provisional-M1
+  "active work" line from 2026-07-17 is dead with it.
+- **B1 serial-decode fusion: CLOSED, no ship.** Pre-registered experiment
+  (`2026-07-19-b1-serial-decode-fusion.md`). G0 route audit PASS; Candidate A
+  measured +0.093 ms/token (11× below the ≥1.0 ship line) → reverted;
+  Candidate B killed unfunded. Route audit + Candidate B CPU reference banked.
+- **ds4-agent harness: SHIPPED (experimental).** Native C/C++ agent
+  (engine/protocol/session/tools/worker/persistence) with tests, in the
+  formula; `experiments/ds4-agent/`. CLI-only so far.
+- **Harness-prefix cache: Phase 0 SHIPPED (experimental, opt-in).**
+  `/experimental/prefix-cache/prewarm` + `tools/experimental_prefix_cache.py`.
+  Codex captured + warm-verified (10,802-token prefix, 826 MB snapshot);
+  Claude Code harvested but shape-blocked (canonical request ends in a system
+  block). `/v1/messages` is dump-only in the proxy. Plan:
+  `2026-07-17-experimental-harness-prefix-cache.md`.
+- **Repo hygiene:** upstream/master merged (2026-07-20); `logs/` gitignored;
+  stale branches/worktrees pruned.
+
 ### Active work
 
-Publish the census bootstrap readout · author the A5 cross-model KL driver ·
-author the amended A6 ground-truth verdict, then run the three provenance-
-checked capability arms · direct candidate decode/two-slot/131K gates ·
-envelope ensemble +
-cross-tier oracle sweep · watch live tool
-traffic for the unreproduced post-streaming parse report.
+**Operator's roadmap (2026-07-20), in priority order:**
+1. **UAT on larger machines** — real-world q6/q6k/q8 + agent validation on
+   friends' 36–48 GB rigs via the `q27 pull/report` flow. Unblocks remote
+   quant-tier development.
+2. **Overnight benching/testing** — long-horizon correctness/perf batteries
+   (eval census, capability suites) run unattended.
+3. **Agent product improvement** — a TUI front-end over the agent
+   engine/protocol (sessions, compaction, tool-call display, streaming).
+4. **Docs + logs cleanup** — de-stale this file + HANDOFF; prune the 708
+   tracked logs (39 MB) and the 27 docs citing ~50 of them.
+5. **Pre-merge back to upstream** — stage focused PRs of genuinely
+   shared/upstream-worthy changes (kernel fixes, parity/tie-rule corrections,
+   format hardening); most of `metal` is our product, not upstream material.
+
+**Open engineering items (independent of the roadmap):**
+- **Official-tier two-slot MTP evidence gap:** 813 committed / 281 rounds is
+  reported in the chronicle but the harness output is not committed; run and
+  commit an evidence rerun before treating it as a release gate.
+- **Envelope ensemble:** envelope constants are PROVISIONAL (one nonzero pair
+  per class); the two-variant + holdout ensemble is queued.
+- **Prefix-cache promotion gates:** async-prewarm fix (gate-2 blocker) and
+  Claude Code extractor generalization (find the last user message anywhere,
+  not just trailing).
+- **Server streaming residue:** `/v1/messages` input-json and `/v1/responses`
+  argument-delta streaming.
+- **Standing watch:** live tool traffic for the unreproduced post-streaming
+  parse report.
 
 ---
 
