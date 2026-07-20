@@ -1,4 +1,5 @@
 #include "q27_agent_engine.h"
+#include "q27_agent_protocol.h"
 #include "q27_agent_session.h"
 
 #include "../../src/metal/metal_engine.h"
@@ -512,7 +513,16 @@ extern "C" q27_agent_status q27_agent_generate(
             constrainer->cache = &engine->tool_masks;
             constrainer->host2dev = &engine->tool_host2dev;
             constrainer->enabled = true;
-            constrainer->begin({"read", "search", "edit", "shell"});
+            const char *const *registered_names = nullptr;
+            const size_t registered_count =
+                q27_agent_tool_names(&registered_names);
+            if (!registered_names || !registered_count)
+                throw std::runtime_error("native tool registry is unavailable");
+            std::vector<std::string> names;
+            names.reserve(registered_count);
+            for (size_t i = 0; i < registered_count; ++i)
+                names.emplace_back(registered_names[i]);
+            constrainer->begin(names);
         }
         struct ConstraintCleanup {
             q27_agent_engine *engine;

@@ -31,6 +31,21 @@ int main() {
           "strict read call parses with prefix prose");
     q27_agent_tool_call_free(&call);
 
+    std::string write = "<tool_call>{\"name\":\"write\",\"arguments\":{"
+        "\"path\":\"new.bin\",\"content\":\"x\\u0000y\"}}</tool_call>";
+    CHECK(parse(write, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.request.kind == Q27_TOOL_WRITE && call.request.input_len == 3 &&
+          !std::memcmp(call.request.input, "x\0y", 3),
+          "write preserves JSON NUL content");
+    q27_agent_tool_call_free(&call);
+
+    std::string empty_write = "<tool_call>{\"name\":\"write\",\"arguments\":{"
+        "\"path\":\"empty\",\"content\":\"\"}}</tool_call>";
+    CHECK(parse(empty_write, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.request.kind == Q27_TOOL_WRITE && call.request.input_len == 0,
+          "write accepts an empty new file");
+    q27_agent_tool_call_free(&call);
+
     std::string binary = "<tool_call>{\"name\":\"edit\",\"arguments\":{"
         "\"path\":\"a.bin\",\"old\":\"a\\u0000b\","
         "\"replacement\":\"x\\u0000y\"}}</tool_call>";
@@ -68,9 +83,17 @@ int main() {
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
           "multiple calls fail closed");
 
+    const char *const *names = nullptr;
+    CHECK(q27_agent_tool_names(&names) == 5 && names &&
+          !std::strcmp(names[0], "read") && !std::strcmp(names[1], "search") &&
+          !std::strcmp(names[2], "write") && !std::strcmp(names[3], "edit") &&
+          !std::strcmp(names[4], "shell"),
+          "prompt and constrained decoder share one ordered registry");
+
     const char *preamble = q27_agent_tool_preamble();
     CHECK(preamble && std::strstr(preamble, "<tools>") &&
           std::strstr(preamble, "\"name\":\"read\"") &&
+          std::strstr(preamble, "\"name\":\"write\"") &&
           std::strstr(preamble, "\"name\":\"shell\"") &&
           std::strstr(preamble, "additionalProperties"),
           "fixed strict registry is present in preamble");

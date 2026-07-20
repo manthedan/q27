@@ -119,21 +119,27 @@ Interactive users can exercise the control plane directly:
 :shell command
 ```
 
-The C API additionally exposes exact binary atomic edit requests. Generation
-and tools share one-command admission and the same bounded owned event queue
+The C API additionally exposes exact binary atomic write/edit requests.
+Generation and tools share one-command admission and the same bounded owned
+event queue
 (`tool_running → tool_output* → tool_done`). No engine callback launches a
 tool.
 
 File tools are rooted at a directory descriptor pinned when `--workspace`
 (default `.`) opens; later pathname replacement cannot retarget it. They reject
 absolute paths, `..`, empty components, and every symlink component, accept
-regular files up to 8 MiB, and cap output at 256 KiB. Search/edit use
+regular files up to 8 MiB, and cap output at 256 KiB. Write creates only a
+nonexistent path, stages content beneath a pinned ACL-free `0700` directory,
+and atomically publishes a fixed owner-only, ACL-free, non-executable `0600`
+file; it requires an owner-owned destination parent that is not group/other
+writable, rejects granting parent ACLs, and never overwrites. Search/edit use
 cancellation-aware linear matching. Edit requires exactly one old-byte match,
 uses bounded nonblocking lock acquisition, preserves mode, and atomically
 exchanges the new file with the destination (Darwin/Linux), validating the
 displaced inode and complete bytes before deleting it or atomically rolling
-back. Shell is explicitly user-issued and not model-triggered. It starts in the
-workspace, combines exact stdout/stderr bytes, caps output at 256 KiB, and caps
+back. Shell is manual by default and becomes model-triggerable only under the
+explicit global `--auto-tools` opt-in. It starts in the workspace, combines
+exact stdout/stderr bytes, caps output at 256 KiB, and caps
 runtime at 60 seconds. To make that bound cover the complete process tree, the
 job denies process creation (Darwin sandbox policy / Linux seccomp): builtins
 and a final external `exec` work, while pipelines, background jobs, and
@@ -153,7 +159,7 @@ not a filesystem or prompt-injection sandbox.
   --prompt 'Read README.md and summarize it'
 ```
 
-Opt-in mode inserts the fixed read/search/edit/shell JSON schemas into the
+Opt-in mode inserts the fixed read/search/write/edit/shell JSON schemas into the
 system message and enables greedy grammar masks after the model emits
 `<tool_call>`. The grammar allows only a registered name, a strict JSON object,
 and a complete `</tool_call>` closer. Generation stops at that closer, so
@@ -168,14 +174,20 @@ exact output and verifies terminal byte accounting. Before execution it lowers
 the tool's output cap to a conservative one-byte-per-token budget derived from
 the terminal prompt accounting plus the full generated assistant byte length
 (never trusting emitted-token segmentation across re-render), remaining
-context, next `max_tokens`,
-and fixed response-framing reserve; if even the framing cannot fit, it refuses
+context, next `max_tokens`, and fixed response-framing reserve; if even the
+framing cannot fit, it refuses
 before a mutating tool runs. It then appends an explicit `<tool_response>` user
-turn with exit/flag metadata and starts the next resident generation. `--max-tool-rounds` bounds this loop (default 8, maximum
-64). JSONL shows separate monotonic command IDs for generation, tool execution,
+turn with exit/flag metadata and starts the next resident generation.
+`--max-tool-rounds` bounds this loop (default 8, maximum 64). JSONL shows
+separate monotonic command IDs for generation, tool execution,
 and follow-up generation; `turn_done.tool_call_complete` identifies the
-semantic call terminal. Automatic shell execution remains subject to the
-single-process sandbox described above.
+semantic call terminal. Unless `--max-tokens` is supplied explicitly,
+`--auto-tools` raises the per-generation bound from 512 to 4096 when context
+is at least 8192 tokens, so a complete new-file payload can close its
+constrained call. Smaller contexts retain 512 because tool execution also
+reserves framing and the next generation; an explicit `--max-tokens` always
+wins. Automatic shell execution
+remains subject to the single-process sandbox described above.
 
 ### Resident session contract
 
@@ -210,9 +222,10 @@ the dedicated engine-owner thread. The JSONL smoke produced exactly
 deep binary message/tool ownership, monotonic generation and tool lifecycle
 events, request rejection, 4094-event queue backpressure (5000 deltas),
 cancellation terminals, and shutdown ordering without loading a model.
-`build/test_q27_agent_tools` gates binary read/search/edit/shell output, path
-and symlink rejection, exact-one edit publication/mode preservation, shell
-workspace, timeout, cancellation, and output bounds.
+`build/test_q27_agent_tools` gates binary read/search/write/edit/shell output,
+path and symlink rejection, create-only atomic write publication, exact-one
+edit publication/mode preservation, shell workspace, timeout, cancellation,
+and output bounds.
 `build/test_q27_agent_persistence` gates binary transcript round trips, CRC
 rejection, mode-0600 publication, immutable snapshot replacement, and
 tool-boundary-preserving compaction cuts. Their ASan/UBSan legs are clean.

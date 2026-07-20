@@ -163,7 +163,7 @@ static int tool_request_clone(const q27_agent_tool_request *source,
                               char *error, size_t error_cap) {
     *out = (owned_tool_request){0};
     if (!source || source->kind < Q27_TOOL_READ ||
-        source->kind > Q27_TOOL_SHELL || !source->max_output_bytes ||
+        source->kind > Q27_TOOL_WRITE || !source->max_output_bytes ||
         source->max_output_bytes > 256u * 1024u ||
         source->input_len > 8u * 1024u * 1024u ||
         source->replacement_len > 8u * 1024u * 1024u ||

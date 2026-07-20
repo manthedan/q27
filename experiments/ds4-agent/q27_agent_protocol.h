@@ -23,9 +23,13 @@ typedef struct {
     unsigned char *replacement;
 } q27_agent_tool_call;
 
-// Returns the fixed read/search/edit/shell registry and instructions inserted
+// Returns the fixed read/search/write/edit/shell registry and instructions inserted
 // into the system message when automatic tools are explicitly enabled.
 const char *q27_agent_tool_preamble(void);
+
+// Returns the same ordered fixed registry used by the prompt and constrained
+// decoder. The returned array and strings have static lifetime.
+size_t q27_agent_tool_names(const char *const **names_out);
 
 // Parses exactly one closed wrapped call. Prefix prose is allowed; bytes after
 // the closer must be whitespace. JSON and each fixed tool schema are strict.

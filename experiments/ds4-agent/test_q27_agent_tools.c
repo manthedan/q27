@@ -22,11 +22,25 @@ typedef struct {
     int alive;
     unsigned alive_calls;
     unsigned cancel_after;
+    const char *replace_staging_path;
+    int replaced_staging;
 } capture;
 
 static int alive(void *opaque) {
     capture *state = opaque;
     ++state->alive_calls;
+    if (state->replace_staging_path && !state->replaced_staging &&
+        access(state->replace_staging_path, F_OK) == 0) {
+        if (unlink(state->replace_staging_path) == 0) {
+            int fd = open(state->replace_staging_path,
+                          O_WRONLY | O_CREAT | O_EXCL, 0600);
+            if (fd >= 0) {
+                ssize_t written = write(fd, "attacker", 8);
+                int closed = close(fd);
+                state->replaced_staging = written == 8 && closed == 0;
+            }
+        }
+    }
     if (state->cancel_after && state->alive_calls >= state->cancel_after)
         state->alive = 0;
     return state->alive;
@@ -75,11 +89,24 @@ int main(void) {
     int workspace_fd = open(root, O_RDONLY | O_DIRECTORY);
     CHECK(workspace_fd >= 0, "workspace fd pinned");
     char sub[512], file[512], duplicate[512], linkpath[512], root_file[512];
+    char created[512], cancelled_write[512], empty_file[512];
+    char raced_write[512], raced_stage_dir[512], raced_staging[512];
+    char acl_parent[512], shared_parent[512];
     snprintf(sub, sizeof(sub), "%s/sub", root);
     snprintf(file, sizeof(file), "%s/sub/data.bin", root);
     snprintf(duplicate, sizeof(duplicate), "%s/sub/duplicate.txt", root);
     snprintf(linkpath, sizeof(linkpath), "%s/sub/link", root);
     snprintf(root_file, sizeof(root_file), "%s/root.txt", root);
+    snprintf(created, sizeof(created), "%s/sub/created.bin", root);
+    snprintf(cancelled_write, sizeof(cancelled_write), "%s/sub/cancelled.bin", root);
+    snprintf(empty_file, sizeof(empty_file), "%s/sub/empty.bin", root);
+    snprintf(raced_write, sizeof(raced_write), "%s/sub/raced.bin", root);
+    snprintf(raced_stage_dir, sizeof(raced_stage_dir),
+             "%s/sub/.q27-write-stage-%ld-0", root, (long)getpid());
+    snprintf(raced_staging, sizeof(raced_staging), "%s/payload",
+             raced_stage_dir);
+    snprintf(acl_parent, sizeof(acl_parent), "%s/acl-parent", root);
+    snprintf(shared_parent, sizeof(shared_parent), "%s/shared-parent", root);
     CHECK(mkdir(sub, 0700) == 0, "workspace subdirectory created");
     const unsigned char original[] = {'a','l','p','h','a','\n','x','\0','n','e','e','d','l','e','\n'};
     CHECK(write_file(file, original, sizeof(original), 0640), "binary fixture written");
@@ -127,6 +154,78 @@ int main(void) {
           out.len == sizeof(expected_search) &&
           !memcmp(out.data, expected_search, sizeof(expected_search)),
           "search returns numbered binary-safe matching line");
+
+    const unsigned char new_content[] = {'n','e','w','\0','f','i','l','e'};
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_WRITE, .path = "sub/created.bin",
+        .input = new_content, .input_len = sizeof(new_content),
+        .max_output_bytes = 1024};
+    mode_t saved_umask = umask(0777);
+    q27_agent_status write_status = q27_agent_tool_execute(
+        workspace_fd, &request, sink, alive, &out, &result);
+    umask(saved_umask);
+    CHECK(write_status == Q27_AGENT_OK &&
+          result.exit_code == 0 && result.output_bytes == 0,
+          "write atomically creates a binary file under restrictive umask");
+    struct stat created_st;
+    unsigned char created_bytes[sizeof(new_content)];
+    int created_fd = open(created, O_RDONLY);
+    CHECK(created_fd >= 0 && fstat(created_fd, &created_st) == 0 &&
+          (created_st.st_mode & 0777) == 0600 &&
+          read(created_fd, created_bytes, sizeof(created_bytes)) ==
+              (ssize_t)sizeof(created_bytes) &&
+          !memcmp(created_bytes, new_content, sizeof(new_content)),
+          "write publishes exact bytes with fixed owner-only mode");
+    close(created_fd);
+    const unsigned char overwrite[] = "overwrite";
+    request.input = overwrite;
+    request.input_len = sizeof(overwrite) - 1;
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == -1 && strstr(result.message, "already exists"),
+          "write refuses to overwrite an existing file");
+    created_fd = open(created, O_RDONLY);
+    CHECK(created_fd >= 0 &&
+          read(created_fd, created_bytes, sizeof(created_bytes)) ==
+              (ssize_t)sizeof(created_bytes) &&
+          !memcmp(created_bytes, new_content, sizeof(new_content)),
+          "failed overwrite leaves existing bytes intact");
+    close(created_fd);
+
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_WRITE, .path = "sub/empty.bin",
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == 0 && stat(empty_file, &created_st) == 0 &&
+          created_st.st_size == 0,
+          "write creates an empty file");
+
+    out.cancel_after = 2;
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_WRITE, .path = "sub/cancelled.bin",
+        .input = new_content, .input_len = sizeof(new_content),
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_CANCELLED &&
+          access(cancelled_write, F_OK) != 0,
+          "cancelled write never publishes a partial destination");
+    out.alive = 1;
+    out.alive_calls = out.cancel_after = 0;
+
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_WRITE, .path = "sub/raced.bin",
+        .input = new_content, .input_len = sizeof(new_content),
+        .max_output_bytes = 1024};
+    out.replace_staging_path = raced_staging;
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          out.replaced_staging && result.exit_code == -1 &&
+          access(raced_write, F_OK) != 0 &&
+          access(raced_staging, F_OK) == 0,
+          "replaced staging pathname is rejected without deleting foreign content");
+    CHECK(unlink(raced_staging) == 0 && rmdir(raced_stage_dir) == 0,
+          "foreign staging fixture removed by its creator");
 
     capture_reset(&out);
     const unsigned char old[] = {'x','\0','n','e','e','d','l','e'};
@@ -205,6 +304,38 @@ int main(void) {
               Q27_AGENT_OK && result.exit_code == -1,
           "parent traversal is rejected");
 
+    CHECK(mkdir(shared_parent, 0700) == 0 && chmod(shared_parent, 0770) == 0,
+          "principal-writable parent fixture created");
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_WRITE, .path = "shared-parent/private.txt",
+        .input = (const unsigned char *)"private", .input_len = 7,
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == -1 && strstr(result.message, "group/other"),
+          "write rejects a parent replaceable by another principal");
+    CHECK(rmdir(shared_parent) == 0, "principal-writable fixture removed");
+
+#if defined(__APPLE__)
+    CHECK(mkdir(acl_parent, 0700) == 0, "ACL parent fixture created");
+    char acl_command[1024];
+    snprintf(acl_command, sizeof(acl_command),
+             "chmod +a '_www allow list,search,add_file,add_subdirectory,"
+             "file_inherit,directory_inherit' %s", acl_parent);
+    CHECK(system(acl_command) == 0, "granting inherited ACL fixture installed");
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_WRITE, .path = "acl-parent/private.txt",
+        .input = (const unsigned char *)"private", .input_len = 7,
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == -1 && strstr(result.message, "granting"),
+          "write rejects a parent with a granting inherited ACL");
+    snprintf(acl_command, sizeof(acl_command), "chmod -N %s", acl_parent);
+    CHECK(system(acl_command) == 0 && rmdir(acl_parent) == 0,
+          "ACL parent fixture removed");
+#endif
+
     capture_reset(&out);
     request = (q27_agent_tool_request){
         .kind = Q27_TOOL_SHELL,
@@ -275,6 +406,8 @@ int main(void) {
     close(workspace_fd);
     unlink(linkpath);
     unlink(root_file);
+    unlink(empty_file);
+    unlink(created);
     unlink(duplicate);
     unlink(file);
     rmdir(sub);

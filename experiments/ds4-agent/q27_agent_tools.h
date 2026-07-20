@@ -15,13 +15,14 @@ typedef enum {
     Q27_TOOL_READ,
     Q27_TOOL_SEARCH,
     Q27_TOOL_EDIT,
-    Q27_TOOL_SHELL
+    Q27_TOOL_SHELL,
+    Q27_TOOL_WRITE
 } q27_agent_tool_kind;
 
 typedef struct {
     q27_agent_tool_kind kind;
     const char *path;             // relative to the configured workspace
-    const unsigned char *input;   // search needle, edit old bytes, shell command
+    const unsigned char *input;   // search needle, edit old bytes, shell command, write content
     size_t input_len;
     const unsigned char *replacement; // edit replacement bytes
     size_t replacement_len;
@@ -49,8 +50,9 @@ typedef int (*q27_agent_tool_sink)(const unsigned char *bytes, size_t len,
 // Executes one bounded request beneath a caller-owned, pinned workspace fd.
 // File paths must be
 // relative and every component is opened with O_NOFOLLOW. File tools accept
-// regular files up to 8 MiB. Edit requires exactly one old-byte match and
-// publishes atomically. Shell runs in its own process group, captures combined
+// regular files up to 8 MiB. Write atomically creates only a nonexistent file;
+// edit requires exactly one old-byte match and publishes atomically. Shell runs
+// in its own process group, captures combined
 // stdout/stderr, denies process creation so the complete job stays in one
 // bounded process group, and is killed/reaped on timeout, cancellation, or
 // output cap.

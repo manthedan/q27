@@ -12,6 +12,10 @@ using nlohmann::json;
 
 namespace {
 
+constexpr const char *kToolNames[] = {
+    "read", "search", "write", "edit", "shell"};
+constexpr size_t kToolNameCount = sizeof(kToolNames) / sizeof(kToolNames[0]);
+
 void set_error(char *out, size_t cap, const char *message) noexcept {
     if (out && cap) std::snprintf(out, cap, "%s", message ? message : "invalid tool call");
 }
@@ -54,14 +58,14 @@ const std::string& preamble() {
     static const std::string value = [] {
         json tools = json::array({
             {{"type", "function"}, {"function", {
-                {"name", "read"},
+                {"name", kToolNames[0]},
                 {"description", "Read one workspace-relative regular file as exact bytes."},
                 {"parameters", {{"type", "object"},
                     {"properties", {{"path", {{"type", "string"}}}}},
                     {"required", json::array({"path"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
-                {"name", "search"},
+                {"name", kToolNames[1]},
                 {"description", "Find literal byte-string occurrences in one workspace-relative regular file."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
@@ -70,8 +74,17 @@ const std::string& preamble() {
                     {"required", json::array({"path", "needle"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
-                {"name", "edit"},
-                {"description", "Atomically replace exactly one literal byte-string match in a workspace-relative regular file."},
+                {"name", kToolNames[2]},
+                {"description", "Atomically create one new workspace-relative regular file. Fails if the path already exists; use edit for existing files."},
+                {"parameters", {{"type", "object"},
+                    {"properties", {
+                        {"path", {{"type", "string"}}},
+                        {"content", {{"type", "string"}}}}},
+                    {"required", json::array({"path", "content"})},
+                    {"additionalProperties", false}}}}}},
+            {{"type", "function"}, {"function", {
+                {"name", kToolNames[3]},
+                {"description", "Atomically replace exactly one nonempty literal byte-string match in an existing workspace-relative regular file."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
                         {"path", {{"type", "string"}}},
@@ -80,7 +93,7 @@ const std::string& preamble() {
                     {"required", json::array({"path", "old", "replacement"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
-                {"name", "shell"},
+                {"name", kToolNames[4]},
                 {"description", "Run one bounded no-fork shell job in the workspace. Pipelines and background jobs are unavailable."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
@@ -100,6 +113,12 @@ const std::string& preamble() {
 extern "C" const char *q27_agent_tool_preamble(void) {
     try { return preamble().c_str(); }
     catch (...) { return nullptr; }
+}
+
+extern "C" size_t q27_agent_tool_names(const char *const **names_out) {
+    if (!names_out) return 0;
+    *names_out = kToolNames;
+    return kToolNameCount;
 }
 
 extern "C" void q27_agent_tool_call_free(q27_agent_tool_call *call) {
@@ -164,17 +183,23 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         size_t path_len = 0;
 
         bool valid = false;
-        if (name == "read" && only_keys(args, {"path"})) {
+        if (name == kToolNames[0] && only_keys(args, {"path"})) {
             request.kind = Q27_TOOL_READ;
             valid = copy_string(args, "path", &path, &path_len, true) &&
                     path_len > 0;
-        } else if (name == "search" && only_keys(args, {"path", "needle"})) {
+        } else if (name == kToolNames[1] && only_keys(args, {"path", "needle"})) {
             request.kind = Q27_TOOL_SEARCH;
             valid = copy_string(args, "path", &path, &path_len, true) &&
                     path_len > 0 &&
                     copy_string(args, "needle", &input, &request.input_len, false) &&
                     request.input_len > 0;
-        } else if (name == "edit" && only_keys(args, {"path", "old", "replacement"})) {
+        } else if (name == kToolNames[2] && only_keys(args, {"path", "content"})) {
+            request.kind = Q27_TOOL_WRITE;
+            valid = copy_string(args, "path", &path, &path_len, true) &&
+                    path_len > 0 &&
+                    copy_string(args, "content", &input,
+                                &request.input_len, false);
+        } else if (name == kToolNames[3] && only_keys(args, {"path", "old", "replacement"})) {
             request.kind = Q27_TOOL_EDIT;
             valid = copy_string(args, "path", &path, &path_len, true) &&
                     path_len > 0 &&
@@ -182,7 +207,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                     copy_string(args, "replacement", &replacement,
                                 &request.replacement_len, false) &&
                     request.input_len > 0;
-        } else if (name == "shell" && args.is_object() &&
+        } else if (name == kToolNames[4] && args.is_object() &&
                    args.size() >= 1 && args.size() <= 3 && args.contains("command")) {
             for (auto it = args.begin(); it != args.end(); ++it)
                 if (it.key() != "command" && it.key() != "timeout_ms" &&

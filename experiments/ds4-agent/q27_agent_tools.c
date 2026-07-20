@@ -13,6 +13,9 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <sys/acl.h>
+#endif
 #include <sys/types.h>
 #include <sys/wait.h>
 #if defined(__linux__)
@@ -21,6 +24,10 @@
 #include <linux/seccomp.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/xattr.h>
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1u << 0)
+#endif
 #ifndef RENAME_EXCHANGE
 #define RENAME_EXCHANGE (1u << 1)
 #endif
@@ -38,6 +45,94 @@
 #define FILE_MAX_BYTES (8u * 1024u * 1024u)
 #define OUTPUT_MAX_BYTES (256u * 1024u)
 
+// Darwin extended allow ACLs can grant access independently of restrictive
+// BSD mode bits. Reject a granting ACL on the destination parent before
+// staging, then strip and verify ACLs on both private staging inodes.
+static int fd_has_granting_acl(int fd) {
+#if defined(__APPLE__)
+    errno = 0;
+    acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+    if (!acl) return errno == ENOENT ? 0 : -1;
+    acl_entry_t entry;
+    int entry_id = ACL_FIRST_ENTRY;
+    for (;;) {
+        errno = 0;
+        int got = acl_get_entry(acl, entry_id, &entry);
+        if (got < 0) {
+            int saved = errno;
+            acl_free(acl);
+            return saved == EINVAL ? 0 : -1;
+        }
+        acl_tag_t tag;
+        if (acl_get_tag_type(entry, &tag) != 0) {
+            acl_free(acl);
+            return -1;
+        }
+        if (tag == ACL_EXTENDED_ALLOW) {
+            acl_free(acl);
+            return 1;
+        }
+        if (tag != ACL_EXTENDED_DENY) {
+            acl_free(acl);
+            errno = EINVAL;
+            return -1;
+        }
+        entry_id = ACL_NEXT_ENTRY;
+    }
+#elif defined(__linux__)
+    static const char *names[] = {
+        "system.posix_acl_access", "system.posix_acl_default"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        errno = 0;
+        ssize_t size = fgetxattr(fd, names[i], NULL, 0);
+        if (size >= 0) return 1; // reject any inherited POSIX ACL
+        if (errno != ENODATA && errno != ENOTSUP && errno != ENOTDIR)
+            return -1;
+    }
+    return 0;
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
+static int clear_extended_acl_fd(int fd) {
+#if defined(__APPLE__)
+    acl_t empty = acl_init(0);
+    if (!empty) return 0;
+    int ok = acl_set_fd_np(fd, empty, ACL_TYPE_EXTENDED) == 0;
+    acl_free(empty);
+    if (!ok) return 0;
+    errno = 0;
+    acl_t verify = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+    if (!verify) return errno == ENOENT;
+    acl_entry_t entry;
+    errno = 0;
+    int got = acl_get_entry(verify, ACL_FIRST_ENTRY, &entry);
+    int saved = errno;
+    acl_free(verify);
+    return got < 0 && saved == EINVAL;
+#elif defined(__linux__)
+    static const char *names[] = {
+        "system.posix_acl_access", "system.posix_acl_default"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        if (fremovexattr(fd, names[i]) != 0 && errno != ENODATA &&
+            errno != ENOTSUP && errno != ENOTDIR)
+            return 0;
+    }
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        errno = 0;
+        if (fgetxattr(fd, names[i], NULL, 0) >= 0 ||
+            (errno != ENODATA && errno != ENOTSUP && errno != ENOTDIR))
+            return 0;
+    }
+    return 1;
+#else
+    (void)fd;
+    return 1;
+#endif
+}
+
 static void result_error(q27_agent_tool_result *result, const char *message) {
     result->exit_code = -1;
     snprintf(result->message, sizeof(result->message), "%s",
@@ -53,7 +148,7 @@ static void result_errno(q27_agent_tool_result *result, const char *prefix) {
 static int request_valid(const q27_agent_tool_request *request,
                          q27_agent_tool_result *result) {
     if (!request || request->kind < Q27_TOOL_READ ||
-        request->kind > Q27_TOOL_SHELL || !request->max_output_bytes ||
+        request->kind > Q27_TOOL_WRITE || !request->max_output_bytes ||
         request->max_output_bytes > OUTPUT_MAX_BYTES ||
         request->input_len > FILE_MAX_BYTES ||
         request->replacement_len > FILE_MAX_BYTES) {
@@ -76,6 +171,12 @@ static int request_valid(const q27_agent_tool_request *request,
     if (request->kind == Q27_TOOL_SEARCH &&
         (!request->input || !request->input_len)) {
         result_error(result, "search needle must not be empty");
+        return 0;
+    }
+    if (request->kind == Q27_TOOL_WRITE &&
+        ((request->input_len && !request->input) ||
+         request->replacement_len)) {
+        result_error(result, "invalid write content");
         return 0;
     }
     if (request->kind == Q27_TOOL_EDIT &&
@@ -419,6 +520,262 @@ static int atomic_swap_at(int parent, const char *a, const char *b) {
     errno = ENOTSUP;
     return -1;
 #endif
+}
+
+static int atomic_create_between(int source_parent, const char *source,
+                                 int target_parent, const char *target) {
+#if defined(__APPLE__)
+    return renameatx_np(source_parent, source, target_parent, target,
+                        RENAME_EXCL);
+#elif defined(__linux__) && defined(SYS_renameat2)
+    return (int)syscall(SYS_renameat2, source_parent, source,
+                        target_parent, target, RENAME_NOREPLACE);
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static int remove_pinned_regular_file(int parent, const char *name,
+                                      int file_fd) {
+    struct stat pinned, named;
+    if (fstat(file_fd, &pinned) != 0 ||
+        fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        pinned.st_dev != named.st_dev || pinned.st_ino != named.st_ino)
+        return 0;
+    return unlinkat(parent, name, 0) == 0;
+}
+
+static int remove_pinned_empty_directory(int parent, const char *name,
+                                         int directory_fd) {
+    struct stat pinned, named;
+    if (fstat(directory_fd, &pinned) != 0 ||
+        fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        pinned.st_dev != named.st_dev || pinned.st_ino != named.st_ino)
+        return 0;
+    return unlinkat(parent, name, AT_REMOVEDIR) == 0;
+}
+
+static q27_agent_status run_write(int rootfd,
+                                  const q27_agent_tool_request *request,
+                                  q27_agent_alive_check alive, void *opaque,
+                                  q27_agent_tool_result *result) {
+    int parent = -1;
+    char *leaf = NULL;
+    if (!open_parent(rootfd, request->path, &parent, &leaf, result))
+        return Q27_AGENT_OK;
+    struct stat existing;
+    if (fstatat(parent, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0) {
+        result_error(result, "write target already exists; use edit");
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_OK;
+    }
+    if (errno != ENOENT) {
+        result_errno(result, "cannot inspect write target");
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_OK;
+    }
+    if (!alive(opaque)) {
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_CANCELLED;
+    }
+    // Atomic create cannot safely clean up pathname races in a directory
+    // writable by another principal. Require the pinned destination parent to
+    // be owned by this account and non-writable by group/other. Same-account
+    // processes are already inside the harness's authority boundary.
+    struct stat parent_stat;
+    if (fstat(parent, &parent_stat) != 0 || !S_ISDIR(parent_stat.st_mode) ||
+        parent_stat.st_uid != geteuid() || (parent_stat.st_mode & 0022)) {
+        result_error(result,
+                     "write parent must be owner-owned and not group/other writable");
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_OK;
+    }
+    int parent_acl = fd_has_granting_acl(parent);
+    if (parent_acl != 0) {
+        result_error(result, parent_acl > 0 ?
+                     "write parent has a granting extended ACL" :
+                     "cannot inspect write parent ACL");
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_OK;
+    }
+
+    // Keep the payload beneath a pinned owner-only directory. A principal
+    // that can rename entries in the destination parent still cannot replace
+    // the source entry used by renameatx_np/renameat2.
+    char stage_name[96];
+    int stage_fd = -1;
+    struct stat created_stage;
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        snprintf(stage_name, sizeof(stage_name), ".q27-write-stage-%ld-%u",
+                 (long)getpid(), attempt);
+        if (mkdirat(parent, stage_name, 0700) == 0) {
+            // mkdir mode is umask-filtered. Inspect before chmod and later
+            // require the opened fd to retain this exact identity.
+            if (fstatat(parent, stage_name, &created_stage,
+                        AT_SYMLINK_NOFOLLOW) == 0 &&
+                S_ISDIR(created_stage.st_mode) &&
+                created_stage.st_uid == geteuid() &&
+                fchmodat(parent, stage_name, 0700,
+                         AT_SYMLINK_NOFOLLOW) == 0)
+                stage_fd = openat(parent, stage_name,
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC);
+            // Without a pinned fd, pathname cleanup could delete a
+            // concurrently substituted directory. Preserve the empty residue
+            // on failure rather than acting on an unverified name.
+            break;
+        }
+        if (errno != EEXIST) break;
+    }
+    if (stage_fd < 0) {
+        result_errno(result, "cannot create private write staging directory");
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_OK;
+    }
+    struct stat stage = {0}, named_stage = {0};
+    int stage_path_owned =
+        fchmod(stage_fd, 0700) == 0 && clear_extended_acl_fd(stage_fd) &&
+        fstat(stage_fd, &stage) == 0 &&
+        stage.st_uid == geteuid() && S_ISDIR(stage.st_mode) &&
+        stage.st_dev == created_stage.st_dev &&
+        stage.st_ino == created_stage.st_ino &&
+        (stage.st_mode & 07777) == 0700 &&
+        fstatat(parent, stage_name, &named_stage, AT_SYMLINK_NOFOLLOW) == 0 &&
+        named_stage.st_dev == stage.st_dev && named_stage.st_ino == stage.st_ino;
+    if (!stage_path_owned) {
+        result_error(result, "write staging directory identity changed");
+        // ACL/mode verification can fail while the pathname still names our
+        // pinned, empty directory. Remove only that exact inode; on mismatch
+        // preserve the foreign entry rather than deleting by name.
+        struct stat cleanup_fd, cleanup_name;
+        int cleanup_owned =
+            fstat(stage_fd, &cleanup_fd) == 0 &&
+            fstatat(parent, stage_name, &cleanup_name,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            cleanup_fd.st_dev == cleanup_name.st_dev &&
+            cleanup_fd.st_ino == cleanup_name.st_ino &&
+            cleanup_fd.st_dev == created_stage.st_dev &&
+            cleanup_fd.st_ino == created_stage.st_ino;
+        close(stage_fd);
+        if (cleanup_owned) unlinkat(parent, stage_name, AT_REMOVEDIR);
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_OK;
+    }
+
+    static const char payload_name[] = "payload";
+    int temp_fd = openat(stage_fd, payload_name,
+                         O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                         0600);
+    if (temp_fd < 0) {
+        result_errno(result, "cannot create private write payload");
+        remove_pinned_empty_directory(parent, stage_name, stage_fd);
+        close(stage_fd);
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_OK;
+    }
+
+    int cancelled = 0, prepared = 1, renamed = 0, published = 0;
+    struct stat staged;
+    size_t offset = 0;
+    while (offset < request->input_len) {
+        if (!alive(opaque)) { cancelled = 1; prepared = 0; break; }
+        ssize_t n = write(temp_fd, request->input + offset,
+                          request->input_len - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { prepared = 0; break; }
+        offset += (size_t)n;
+    }
+    if (prepared && !alive(opaque)) {
+        cancelled = 1;
+        prepared = 0;
+    }
+    // Creation mode is filtered through umask; force the exact private mode.
+    if (prepared && (fchmod(temp_fd, 0600) != 0 ||
+                     !clear_extended_acl_fd(temp_fd) || fsync(temp_fd) != 0 ||
+                     fstat(temp_fd, &staged) != 0))
+        prepared = 0;
+    if (prepared) {
+        unsigned char *verified = read_all(temp_fd, request->input_len, result);
+        const int content_ok = verified &&
+            (!request->input_len ||
+             !memcmp(verified, request->input, request->input_len));
+        free(verified);
+        if (!content_ok) { errno = EIO; prepared = 0; }
+    }
+    if (prepared && !alive(opaque)) {
+        cancelled = 1;
+        prepared = 0;
+    }
+    if (prepared) {
+        struct stat named;
+        if (fstatat(stage_fd, payload_name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(named.st_mode) || named.st_dev != staged.st_dev ||
+            named.st_ino != staged.st_ino || named.st_nlink != 1 ||
+            named.st_size != (off_t)request->input_len) {
+            errno = EBUSY;
+            prepared = 0;
+        }
+    }
+    if (prepared) {
+        if (atomic_create_between(stage_fd, payload_name, parent, leaf) == 0) {
+            renamed = 1;
+            const int dirsync_result = fsync(parent);
+            const int dirsync_errno = errno;
+            struct stat installed;
+            const int identity_ok =
+                fstatat(parent, leaf, &installed, AT_SYMLINK_NOFOLLOW) == 0 &&
+                S_ISREG(installed.st_mode) && installed.st_dev == staged.st_dev &&
+                installed.st_ino == staged.st_ino && installed.st_nlink == 1 &&
+                installed.st_size == (off_t)request->input_len &&
+                (installed.st_mode & 07777) == 0600;
+            if (identity_ok) {
+                published = 1;
+                result->exit_code = 0;
+                if (dirsync_result != 0) {
+                    result->flags |= Q27_TOOL_FLAG_DURABILITY_UNCERTAIN;
+                    snprintf(result->message, sizeof(result->message),
+                             "write committed; directory fsync failed: %s",
+                             strerror(dirsync_errno));
+                }
+            } else {
+                // Do not unlink or quarantine by pathname here: after an
+                // identity mismatch the visible entry may belong to a
+                // concurrent creator. The failed transaction reports the
+                // uncertain side effect without deleting foreign content.
+                result->flags |= Q27_TOOL_FLAG_DURABILITY_UNCERTAIN;
+                result_error(result,
+                             "atomic write publication failed validation");
+            }
+        } else if (errno == EEXIST) {
+            result_error(result, "write target already exists; use edit");
+        }
+    }
+    if (!published && result->exit_code == -1 && !result->message[0] &&
+        !cancelled)
+        result_errno(result, "cannot publish atomic write");
+
+    const int saved = errno;
+    if (!renamed)
+        remove_pinned_regular_file(stage_fd, payload_name, temp_fd);
+    close(temp_fd);
+    // Only remove the parent entry when it still names our pinned directory;
+    // a concurrent rename may leave an empty private residue but cannot expose
+    // payload bytes or redirect publication.
+    remove_pinned_empty_directory(parent, stage_name, stage_fd);
+    close(stage_fd);
+    close(parent);
+    free(leaf);
+    errno = saved;
+    return cancelled ? Q27_AGENT_CANCELLED : Q27_AGENT_OK;
 }
 
 static q27_agent_status run_edit(int rootfd,
@@ -865,6 +1222,8 @@ q27_agent_status q27_agent_tool_execute(
         status = run_read(rootfd, request, sink, alive, opaque, result);
     else if (request->kind == Q27_TOOL_SEARCH)
         status = run_search(rootfd, request, sink, alive, opaque, result);
+    else if (request->kind == Q27_TOOL_WRITE)
+        status = run_write(rootfd, request, alive, opaque, result);
     else
         status = run_edit(rootfd, request, alive, opaque, result);
     close(rootfd);

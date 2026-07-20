@@ -85,7 +85,7 @@ static void usage(FILE *out, const char *argv0) {
         "options:\n"
         "  -p, --prompt TEXT       run one non-interactive turn\n"
         "  -s, --system TEXT       replace the default system prompt\n"
-        "  -n, --max-tokens N      maximum generated tokens (default 512)\n"
+        "  -n, --max-tokens N      maximum generated tokens (default 512; 4096 with --auto-tools at context >=8192)\n"
         "  -c, --context N         engine context (default 8192)\n"
         "      --no-think          append the Qwen no-thinking prefix\n"
         "      --output-format F   text (default) or jsonl events\n"
@@ -332,6 +332,7 @@ static const char *tool_kind_name(q27_agent_tool_kind kind) {
     case Q27_TOOL_SEARCH: return "search";
     case Q27_TOOL_EDIT: return "edit";
     case Q27_TOOL_SHELL: return "shell";
+    case Q27_TOOL_WRITE: return "write";
     }
     return "unknown";
 }
@@ -1110,7 +1111,7 @@ int main(int argc, char **argv) {
         "Answer concisely.";
     uint32_t context = 8192, max_tokens = 512, max_tool_rounds = 8;
     uint32_t compact_at = 0, compact_keep = 4, compact_tokens = 1024;
-    int think = 1, jsonl = 0, auto_tools = 0;
+    int think = 1, jsonl = 0, auto_tools = 0, max_tokens_explicit = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -1128,6 +1129,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "q27-agent: invalid max token count\n");
                 return 2;
             }
+            max_tokens_explicit = 1;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--context")) {
             if (++i == argc || !parse_u32(argv[i], &context)) {
                 fprintf(stderr, "q27-agent: invalid context\n");
@@ -1196,6 +1198,8 @@ int main(int argc, char **argv) {
         usage(stderr, argv[0]);
         return 2;
     }
+    if (auto_tools && !max_tokens_explicit && context >= 8192)
+        max_tokens = 4096;
     if (!compact_at) compact_at = context - context / 4;
     if (compact_at > context) {
         fprintf(stderr, "q27-agent: compaction threshold exceeds context\n");
