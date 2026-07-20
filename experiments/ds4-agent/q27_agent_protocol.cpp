@@ -14,7 +14,7 @@ using nlohmann::json;
 namespace {
 
 constexpr const char *kToolNames[] = {
-    "read", "search", "write", "edit", "shell"};
+    "read", "search", "write", "edit", "edit_selection", "shell"};
 constexpr size_t kToolNameCount = sizeof(kToolNames) / sizeof(kToolNames[0]);
 
 void set_error(char *out, size_t cap, const char *message) noexcept {
@@ -127,14 +127,14 @@ const std::string& preamble() {
         json tools = json::array({
             {{"type", "function"}, {"function", {
                 {"name", kToolNames[0]},
-                {"description", "Read one workspace-relative regular file as exact bytes."},
+                {"description", "Read one workspace-relative regular file as exact bytes. Successful output includes short edit-selection handles for line content."},
                 {"parameters", {{"type", "object"},
                     {"properties", {{"path", {{"type", "string"}}}}},
                     {"required", json::array({"path"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
                 {"name", kToolNames[1]},
-                {"description", "Find literal byte-string occurrences in one workspace-relative regular file."},
+                {"description", "Find literal byte-string occurrences in one workspace-relative regular file. Matching lines include short edit-selection handles."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
                         {"path", {{"type", "string"}}},
@@ -160,6 +160,15 @@ const std::string& preamble() {
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
                 {"name", kToolNames[4]},
+                {"description", "Begin replacing the exact bytes identified by a recent read/search selection handle. Supply path and selection only. Stale, unknown, or path-mismatched handles fail without mutation. After validation, a separate raw-payload turn requests the replacement."},
+                {"parameters", {{"type", "object"},
+                    {"properties", {
+                        {"path", {{"type", "string"}}},
+                        {"selection", {{"type", "string"}}}}},
+                    {"required", json::array({"path", "selection"})},
+                    {"additionalProperties", false}}}}}},
+            {{"type", "function"}, {"function", {
+                {"name", kToolNames[5]},
                 {"description", "Run one bounded no-fork shell job in the workspace. Pipelines and background jobs are unavailable."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
@@ -192,6 +201,7 @@ extern "C" void q27_agent_tool_call_free(q27_agent_tool_call *call) {
     std::free(call->path);
     std::free(call->input);
     std::free(call->replacement);
+    std::free(call->selection);
     *call = q27_agent_tool_call{};
 }
 
@@ -323,14 +333,17 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         request.timeout_ms = 30000;
         request.max_output_bytes = 256u * 1024u;
         unsigned char *path = nullptr, *input = nullptr, *replacement = nullptr;
+        unsigned char *selection = nullptr;
         struct LocalCleanup {
             unsigned char *&path;
             unsigned char *&input;
             unsigned char *&replacement;
+            unsigned char *&selection;
             ~LocalCleanup() {
                 std::free(path); std::free(input); std::free(replacement);
+                std::free(selection);
             }
-        } cleanup{path, input, replacement};
+        } cleanup{path, input, replacement, selection};
         size_t path_len = 0;
 
         bool valid = false;
@@ -354,7 +367,16 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                     path_len > 0 &&
                     copy_string(args, "old", &input, &request.input_len, false) &&
                     request.input_len > 0;
-        } else if (name == kToolNames[4] && args.is_object() &&
+        } else if (name == kToolNames[4] &&
+                   only_keys(args, {"path", "selection"})) {
+            request.kind = Q27_TOOL_EDIT;
+            size_t selection_len = 0;
+            valid = copy_string(args, "path", &path, &path_len, true) &&
+                    path_len > 0 &&
+                    copy_string(args, "selection", &selection,
+                                &selection_len, true) &&
+                    selection_len > 0 && selection_len <= 64;
+        } else if (name == kToolNames[5] && args.is_object() &&
                    args.size() >= 1 && args.size() <= 3 && args.contains("command")) {
             for (auto it = args.begin(); it != args.end(); ++it)
                 if (it.key() != "command" && it.key() != "timeout_ms" &&
@@ -383,7 +405,8 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         call->path = reinterpret_cast<char *>(path);
         call->input = input;
         call->replacement = replacement;
-        path = input = replacement = nullptr;
+        call->selection = reinterpret_cast<char *>(selection);
+        path = input = replacement = selection = nullptr;
         return Q27_TOOL_CALL_VALID;
     } catch (const std::bad_alloc&) {
         q27_agent_tool_call_free(call);

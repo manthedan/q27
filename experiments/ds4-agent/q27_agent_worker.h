@@ -29,6 +29,10 @@ typedef enum {
     Q27_EVENT_STATE = 0,
     Q27_EVENT_TEXT_DELTA,
     Q27_EVENT_TOOL_OUTPUT,
+    // Control-plane metadata appended to the model-visible tool response after
+    // the worker terminal. Carries a monotonic worker sequence and the parent
+    // tool command id so JSONL remains a faithful transcript.
+    Q27_EVENT_SELECTIONS,
     Q27_EVENT_TURN_DONE,
     Q27_EVENT_TOOL_DONE,
     Q27_EVENT_SESSION_DONE,
@@ -60,6 +64,11 @@ typedef struct {
     int32_t tool_exit_code;
     uint32_t tool_flags;
     uint32_t tool_output_bytes;
+    int tool_has_file_sha256;
+    uint64_t tool_file_size;
+    unsigned char tool_file_sha256[32];
+    uint32_t tool_selection_count;
+    q27_agent_tool_selection tool_selections[Q27_TOOL_MAX_SELECTIONS];
 } q27_agent_event;
 
 q27_agent_worker *q27_agent_worker_start(const char *model_path,
@@ -132,6 +141,12 @@ int q27_agent_worker_tokenizer_sha1(q27_agent_worker *worker,
                                     unsigned char out_sha1[20]);
 // Creates one owned, monotonic post-publication terminal without requiring
 // engine admission; usable even when snapshot I/O put the worker in ERROR.
+int q27_agent_worker_selection_event(q27_agent_worker *worker,
+                                     uint64_t parent_command_id,
+                                     q27_agent_tool_kind tool_kind,
+                                     const unsigned char *data, size_t data_len,
+                                     q27_agent_event *event);
+
 int q27_agent_worker_session_result_event(q27_agent_worker *worker,
                                           int success,
                                           const char *message,

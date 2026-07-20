@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "q27_agent_tools.h"
+#include "q27_agent_sha256.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -155,6 +156,11 @@ static int request_valid(const q27_agent_tool_request *request,
         result_error(result, "invalid tool request/output bound");
         return 0;
     }
+    if (request->has_selection && request->kind != Q27_TOOL_EDIT &&
+        request->kind != Q27_TOOL_EDIT_PREFLIGHT) {
+        result_error(result, "selection authority is valid only for edit");
+        return 0;
+    }
     if (request->kind == Q27_TOOL_SHELL) {
         if (!request->input || !request->input_len || !request->timeout_ms ||
             request->timeout_ms > 60000 ||
@@ -188,8 +194,12 @@ static int request_valid(const q27_agent_tool_request *request,
     if ((request->kind == Q27_TOOL_EDIT ||
          request->kind == Q27_TOOL_EDIT_PREFLIGHT) &&
         (!request->input || !request->input_len ||
-         (request->replacement_len && !request->replacement))) {
-        result_error(result, "edit old bytes must not be empty");
+         (request->replacement_len && !request->replacement) ||
+         (request->has_selection &&
+          request->selection_length != request->input_len))) {
+        result_error(result, request->has_selection ?
+                     "invalid edit selection authority" :
+                     "edit old bytes must not be empty");
         return 0;
     }
     if (request->kind == Q27_TOOL_EDIT_PREFLIGHT &&
@@ -381,6 +391,53 @@ static int kmp_matches(const unsigned char *haystack, size_t hlen,
     return 1;
 }
 
+static void describe_read_selections(const unsigned char *data, size_t size,
+                                     q27_agent_tool_result *result) {
+    if (!size) return;
+    uint64_t lines = 0;
+    for (size_t i = 0; i < size; ++i) if (data[i] == '\n') ++lines;
+    if (data[size - 1] != '\n') ++lines;
+    if (!lines) return;
+    const uint64_t groups = lines < Q27_TOOL_MAX_SELECTIONS ?
+        lines : Q27_TOOL_MAX_SELECTIONS;
+    const uint64_t lines_per_group = (lines + groups - 1) / groups;
+    size_t start = 0;
+    uint64_t first_line = 1;
+    while (start < size && first_line <= lines &&
+           result->selection_count < groups) {
+        uint64_t take_lines = lines - first_line + 1;
+        if (take_lines > lines_per_group) take_lines = lines_per_group;
+        const uint64_t last_line = first_line + take_lines - 1;
+        size_t end = start;
+        uint64_t seen = 0;
+        while (end < size && seen < take_lines) {
+            if (data[end++] == '\n') ++seen;
+        }
+        if (seen < take_lines) end = size;
+        // Keep the line terminator outside the selection. Weak models can
+        // replace visible line content without having to regenerate LF/CRLF.
+        size_t selected_end = end;
+        const int stripped_lf =
+            selected_end > start && data[selected_end - 1] == '\n';
+        if (stripped_lf) --selected_end;
+        if (stripped_lf && selected_end > start &&
+            data[selected_end - 1] == '\r')
+            --selected_end;
+        if (selected_end > start) {
+            q27_agent_tool_selection *selection =
+                &result->selections[result->selection_count++];
+            selection->file_offset = start;
+            selection->length = selected_end - start;
+            selection->output_offset = start;
+            selection->output_length = selected_end - start;
+            selection->first_line = first_line;
+            selection->last_line = last_line;
+        }
+        start = end;
+        first_line = last_line + 1;
+    }
+}
+
 static q27_agent_status run_read(int rootfd,
                                  const q27_agent_tool_request *request,
                                  q27_agent_tool_sink sink,
@@ -399,27 +456,20 @@ static q27_agent_status run_read(int rootfd,
         close(fd);
         return Q27_AGENT_OK;
     }
-    unsigned char buffer[16384];
-    size_t remaining = (size_t)st.st_size;
-    while (remaining) {
-        if (!alive(opaque)) { close(fd); return Q27_AGENT_CANCELLED; }
-        size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-        ssize_t n = read(fd, buffer, want);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            if (n == 0) errno = EIO;
-            result_errno(result, "cannot read tool file");
-            close(fd);
-            return Q27_AGENT_OK;
-        }
-        if (!sink(buffer, (size_t)n, opaque)) {
-            close(fd);
-            return Q27_AGENT_CANCELLED;
-        }
-        result->output_bytes += (uint32_t)n;
-        remaining -= (size_t)n;
-    }
+    unsigned char *data = read_all(fd, (size_t)st.st_size, result);
     close(fd);
+    if (!data) return Q27_AGENT_OK;
+    if (!alive(opaque)) { free(data); return Q27_AGENT_CANCELLED; }
+    q27_agent_sha256(data, (size_t)st.st_size, result->file_sha256);
+    result->has_file_sha256 = 1;
+    result->file_size = (uint64_t)st.st_size;
+    describe_read_selections(data, (size_t)st.st_size, result);
+    if (st.st_size && !sink(data, (size_t)st.st_size, opaque)) {
+        free(data);
+        return Q27_AGENT_CANCELLED;
+    }
+    result->output_bytes = (uint32_t)st.st_size;
+    free(data);
     result->exit_code = 0;
     return Q27_AGENT_OK;
 }
@@ -440,6 +490,10 @@ static q27_agent_status run_search(int rootfd,
     unsigned char *data = read_all(fd, (size_t)st.st_size, result);
     close(fd);
     if (!data) return Q27_AGENT_OK;
+    if (!alive(opaque)) { free(data); return Q27_AGENT_CANCELLED; }
+    q27_agent_sha256(data, (size_t)st.st_size, result->file_sha256);
+    result->has_file_sha256 = 1;
+    result->file_size = (uint64_t)st.st_size;
     int cancelled = 0;
     size_t *table = kmp_table(request->input, request->input_len,
                               alive, opaque, &cancelled);
@@ -486,6 +540,21 @@ static q27_agent_status run_search(int rootfd,
             }
             memcpy(out + used, prefix, (size_t)prefix_len);
             used += (size_t)prefix_len;
+            size_t selected_len = line_len;
+            if (newline && selected_len &&
+                data[line_start + selected_len - 1] == '\r')
+                --selected_len;
+            if (selected_len &&
+                result->selection_count < Q27_TOOL_MAX_SELECTIONS) {
+                q27_agent_tool_selection *selection =
+                    &result->selections[result->selection_count++];
+                selection->file_offset = line_start;
+                selection->length = selected_len;
+                selection->output_offset = used;
+                selection->output_length = selected_len;
+                selection->first_line = line_number;
+                selection->last_line = line_number;
+            }
             memcpy(out + used, data + line_start, line_len + newline);
             used += line_len + newline;
         }
@@ -824,6 +893,51 @@ static q27_agent_status run_write(int rootfd,
     return cancelled ? Q27_AGENT_CANCELLED : Q27_AGENT_OK;
 }
 
+static int locate_edit_target(const unsigned char *data, size_t size,
+                              const q27_agent_tool_request *request,
+                              q27_agent_alive_check alive, void *opaque,
+                              q27_agent_tool_result *result,
+                              size_t *match_at) {
+    if (!alive(opaque)) return -1;
+    if (request->has_selection) {
+        unsigned char digest[32];
+        q27_agent_sha256(data, size, digest);
+        if (memcmp(digest, request->selection_file_sha256, sizeof(digest)) ||
+            request->selection_offset > size ||
+            request->selection_length > size - request->selection_offset ||
+            request->selection_length != request->input_len ||
+            memcmp(data + request->selection_offset,
+                   request->input, request->input_len)) {
+            result_error(result,
+                         "edit selection is stale; read or search the file again");
+            return 0;
+        }
+        *match_at = (size_t)request->selection_offset;
+        return 1;
+    }
+
+    int cancelled = 0;
+    size_t *table = kmp_table(request->input, request->input_len,
+                              alive, opaque, &cancelled);
+    if (!table) {
+        if (cancelled) return -1;
+        result_error(result, "out of memory building edit matcher");
+        return 0;
+    }
+    size_t matches = 0;
+    int matched = kmp_matches(data, size, request->input, request->input_len,
+                              table, alive, opaque, &matches, match_at,
+                              &cancelled);
+    free(table);
+    if (!matched) return -1;
+    if (matches != 1) {
+        result_error(result, matches ? "edit old bytes are not unique" :
+                                       "edit old bytes were not found");
+        return 0;
+    }
+    return 1;
+}
+
 static q27_agent_status run_edit_preflight(
     int rootfd, const q27_agent_tool_request *request,
     q27_agent_alive_check alive, void *opaque,
@@ -839,27 +953,12 @@ static q27_agent_status run_edit_preflight(
     unsigned char *data = read_all(fd, (size_t)st.st_size, result);
     close(fd);
     if (!data) return Q27_AGENT_OK;
-    int cancelled = 0;
-    size_t *table = kmp_table(request->input, request->input_len,
-                              alive, opaque, &cancelled);
-    if (!table) {
-        free(data);
-        if (cancelled) return Q27_AGENT_CANCELLED;
-        result_error(result, "out of memory building edit matcher");
-        return Q27_AGENT_OK;
-    }
-    size_t matches = 0, match_at = 0;
-    int matched = kmp_matches(data, (size_t)st.st_size,
-                              request->input, request->input_len, table,
-                              alive, opaque, &matches, &match_at, &cancelled);
-    free(table);
+    size_t match_at = 0;
+    int located = locate_edit_target(data, (size_t)st.st_size, request,
+                                     alive, opaque, result, &match_at);
     free(data);
-    if (!matched) return Q27_AGENT_CANCELLED;
-    if (matches != 1) {
-        result_error(result, matches ? "edit old bytes are not unique" :
-                                       "edit old bytes were not found");
-        return Q27_AGENT_OK;
-    }
+    if (located < 0) return Q27_AGENT_CANCELLED;
+    if (!located) return Q27_AGENT_OK;
     result->exit_code = 0;
     snprintf(result->message, sizeof(result->message),
              "edit target is ready for a raw replacement");
@@ -918,28 +1017,12 @@ static q27_agent_status run_edit(int rootfd,
     }
     unsigned char *data = read_all(fd, (size_t)before.st_size, result);
     if (!data) { close(fd); close(parent); free(leaf); return Q27_AGENT_OK; }
-    int cancelled = 0;
-    size_t *table = kmp_table(request->input, request->input_len,
-                              alive, opaque, &cancelled);
-    if (!table) {
+    size_t match_at = 0;
+    int located = locate_edit_target(data, (size_t)before.st_size, request,
+                                     alive, opaque, result, &match_at);
+    if (located <= 0) {
         free(data); close(fd); close(parent); free(leaf);
-        if (cancelled) return Q27_AGENT_CANCELLED;
-        result_error(result, "out of memory building edit matcher");
-        return Q27_AGENT_OK;
-    }
-    size_t matches = 0, match_at = 0;
-    if (!kmp_matches(data, (size_t)before.st_size,
-                     request->input, request->input_len, table,
-                     alive, opaque, &matches, &match_at, &cancelled)) {
-        free(table); free(data); close(fd); close(parent); free(leaf);
-        return Q27_AGENT_CANCELLED;
-    }
-    free(table);
-    if (matches != 1) {
-        result_error(result, matches ? "edit old bytes are not unique" :
-                                       "edit old bytes were not found");
-        free(data); close(fd); close(parent); free(leaf);
-        return Q27_AGENT_OK;
+        return located < 0 ? Q27_AGENT_CANCELLED : Q27_AGENT_OK;
     }
     size_t old_size = (size_t)before.st_size;
     if (request->replacement_len > SIZE_MAX - (old_size - request->input_len) ||

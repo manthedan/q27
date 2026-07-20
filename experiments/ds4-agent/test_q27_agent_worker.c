@@ -1,9 +1,11 @@
 #include "q27_agent_worker.h"
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 struct q27_agent_engine { int marker; };
 
@@ -214,6 +216,11 @@ typedef struct {
     int32_t tool_exit_code;
     uint32_t tool_flags;
     uint32_t tool_output_bytes;
+    int tool_has_file_sha256;
+    uint64_t tool_file_size;
+    unsigned char tool_file_sha256[32];
+    uint32_t tool_selection_count;
+    q27_agent_tool_selection tool_selections[Q27_TOOL_MAX_SELECTIONS];
 } drained;
 
 static int drain_command(q27_agent_worker *worker, uint64_t command_id,
@@ -258,6 +265,12 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
             out->tool_exit_code = event.tool_exit_code;
             out->tool_flags = event.tool_flags;
             out->tool_output_bytes = event.tool_output_bytes;
+            out->tool_has_file_sha256 = event.tool_has_file_sha256;
+            out->tool_file_size = event.tool_file_size;
+            memcpy(out->tool_file_sha256, event.tool_file_sha256, 32);
+            out->tool_selection_count = event.tool_selection_count;
+            memcpy(out->tool_selections, event.tool_selections,
+                   sizeof(out->tool_selections));
         }
         q27_agent_event_free(&event);
         if (terminal) return 1;
@@ -372,6 +385,45 @@ int main(void) {
           result.tool_flags == 0 && result.tool_output_bytes == 3 &&
           q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "tool terminal accounting reopens shared admission");
+
+    static const char selection_fixture[] = "first\nsecond\n";
+    const char *selection_path = "build/q27-worker-selection.tmp";
+    int selection_fd = open(selection_path,
+                            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    CHECK(selection_fd >= 0 &&
+          write(selection_fd, selection_fixture,
+                sizeof(selection_fixture) - 1) ==
+              (ssize_t)(sizeof(selection_fixture) - 1) &&
+          close(selection_fd) == 0,
+          "worker selection fixture created");
+    tool_request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_READ, .path = selection_path,
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_worker_submit_tool(worker, &tool_request, alive, NULL,
+                                       &command, error, sizeof(error)) ==
+              Q27_AGENT_OK &&
+          drain_command(worker, command, &result) &&
+          result.terminal_status == Q27_AGENT_OK &&
+          result.tool_exit_code == 0 && result.tool_has_file_sha256 &&
+          result.tool_file_size == sizeof(selection_fixture) - 1 &&
+          result.tool_selection_count == 2 &&
+          result.tool_selections[1].file_offset == 6 &&
+          result.tool_selections[1].length == 6,
+          "read selection metadata survives the owned event boundary");
+    static const unsigned char annotation[] = "[s1] lines 1-1\n";
+    q27_agent_event selection_event = {0};
+    CHECK(q27_agent_worker_selection_event(
+              worker, command, Q27_TOOL_READ, annotation,
+              sizeof(annotation) - 1, &selection_event) &&
+          selection_event.sequence > result.last_sequence &&
+          selection_event.command_id == command &&
+          selection_event.type == Q27_EVENT_SELECTIONS &&
+          selection_event.tool_kind == Q27_TOOL_READ &&
+          selection_event.data_len == sizeof(annotation) - 1 &&
+          !memcmp(selection_event.data, annotation, sizeof(annotation) - 1),
+          "post-terminal selection event preserves JSONL sequence and parent command");
+    q27_agent_event_free(&selection_event);
+    CHECK(unlink(selection_path) == 0, "worker selection fixture removed");
 
     message = (q27_agent_message){
         .role = "user", .content = "x\0y", .content_len = 3};

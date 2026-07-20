@@ -270,9 +270,11 @@ Friends testing it now should use a source checkout and `make agent`.
 script-friendly defaults. The wrapper holds a private kernel lifetime lock
 shared with `q27 serve`, preventing concurrent multi-GB model launches. The
 lock is inherited across `exec` and released automatically on every process
-exit, including signals and crashes. File helpers stay workspace-bounded, but automatic
-shell retains the local account's filesystem access; use a disposable checkout
-when testing an untrusted prompt.
+exit, including signals and crashes. Read/search results expose short,
+digest-bound line-selection handles so B1 can edit one exact occurrence without
+regenerating a unique `old` string; stale selections fail before mutation. File
+helpers stay workspace-bounded, but automatic shell retains the local account's
+filesystem access; use a disposable checkout when testing an untrusted prompt.
 
 ## Server
 

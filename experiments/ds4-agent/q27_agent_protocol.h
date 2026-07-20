@@ -21,9 +21,10 @@ typedef struct {
     char *path;
     unsigned char *input;
     unsigned char *replacement;
+    char *selection;
 } q27_agent_tool_call;
 
-// Returns the fixed read/search/write/edit/shell registry and instructions inserted
+// Returns the fixed read/search/write/edit/edit_selection/shell registry and instructions inserted
 // into the system message when automatic tools are explicitly enabled.
 const char *q27_agent_tool_preamble(void);
 
@@ -33,8 +34,9 @@ size_t q27_agent_tool_names(const char *const **names_out);
 
 // Parses exactly one closed wrapped call. Prefix prose is allowed; bytes after
 // the closer must be whitespace. JSON and each fixed tool schema are strict.
-// Write carries only path and edit carries path+old; their generated content is
-// attached later by the control plane's separate EOS-bounded raw turn. VALID
+// Write carries only path; edit carries path+old, while edit_selection carries
+// path plus a short opaque handle resolved by the control plane. Generated
+// content is attached later by the separate EOS-bounded raw turn. VALID
 // owns all request bytes in `call`; release with tool_call_free.
 q27_agent_tool_call_status q27_agent_parse_tool_call(
     const unsigned char *bytes, size_t len,

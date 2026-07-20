@@ -73,7 +73,9 @@ each completed top-level turn:
 ```
 
 The mode is exact: context size, thinking mode, automatic-tool mode, tokenizer,
-and the complete tool preamble/protocol must match on resume. A small binary
+and the complete tool preamble/protocol must match on resume. Selection handles
+use the `selection-handles-v1` protocol boundary, so older tool-enabled durable
+sessions fail closed and must be recreated. A small binary
 `Q27AGT2` manifest stores the binary-safe
 transcript, owner-pinned tokenizer SHA-1 identity, full snapshot SHA-256
 digest, and
@@ -171,7 +173,7 @@ not a filesystem or prompt-injection sandbox.
   --prompt 'Read README.md and summarize it'
 ```
 
-Opt-in mode inserts the fixed read/search/write/edit/shell JSON schemas into the
+Opt-in mode inserts the fixed read/search/write/edit/edit_selection/shell JSON schemas into the
 system message and enables greedy grammar masks after the model emits
 `<tool_call>`. The grammar allows only a registered name, a strict JSON object,
 and a complete `</tool_call>` closer. Generation stops at that closer, so
@@ -180,8 +182,21 @@ truncation, malformed JSON, unknown arguments, multiple calls in one turn, or
 non-whitespace after the closer all fail closed without executing a tool.
 
 Generated file and replacement bytes are deliberately excluded from JSON.
-`write` takes only `path`; `edit` takes `path` plus the unique nonempty `old`
-text. After a control call,
+`write` takes only `path`; literal `edit` takes `path` plus the unique nonempty
+`old` text. When the response budget permits, successful automatic `read` and
+`search` responses also append up
+to 32 short selection handles for exact line-aligned content ranges; the final
+LF or CRLF terminator stays outside each range so ordinary line replacement
+preserves it automatically. The bounded process-local ledger behind each
+handle owns the workspace-relative path,
+selected bytes, byte offset, and SHA-256 of the complete file. `edit_selection`
+takes only the same path and one handle, allowing one duplicate occurrence to
+be selected without regenerating its contents. Unknown, expired, path-mismatched,
+or stale handles fail before payload generation; preflight and final publication
+both revalidate the full-file digest, exact range, and selected bytes. Handles
+expire when their 256-entry ledger slot is reused or the process restarts, so a
+resumed model must read/search again rather than trusting transcript-only IDs.
+After a write or edit control call,
 the worker first runs a mutation-free path/match preflight. On success the
 harness appends an internal raw-payload request and starts a dedicated
 no-thinking, no-tools generation. Every emitted byte is buffered as the
@@ -219,7 +234,9 @@ before a mutating tool runs. It then appends an explicit `<tool_response>` user
 turn with exit/flag metadata and starts the next resident generation.
 `--max-tool-rounds` bounds this loop (default 8, maximum 64). JSONL shows
 separate monotonic command IDs for generation, tool execution,
-and follow-up generation; `turn_done.tool_call_complete` identifies the
+and follow-up generation; a post-terminal `selection_handles` event carries
+the exact model-visible annotation with the parent tool command ID and its own
+monotonic event sequence. `turn_done.tool_call_complete` identifies the
 semantic call terminal. The worker's `eos_reached` field distinguishes natural
 completion from a generation stopped at its bound and is used internally for
 raw payload authority, although internal raw terminals are not emitted to
@@ -279,7 +296,9 @@ the dedicated engine-owner thread. The JSONL smoke produced exactly
 deep binary message/tool ownership, monotonic generation and tool lifecycle
 events, request rejection, 4094-event queue backpressure (5000 deltas),
 cancellation terminals, and shutdown ordering without loading a model.
-`build/test_q27_agent_tools` gates binary read/search/write/edit/shell output,
+`build/test_q27_agent_tools` gates binary read/search/write/edit-selection/shell output,
+`build/test_q27_agent_selections` gates annotation budgets, exact handle
+resolution, path mismatch, unknown IDs, and 256-slot expiry,
 path and symlink rejection, create-only atomic write publication, exact-one
 edit publication/mode preservation, shell workspace, timeout, cancellation,
 and output bounds.

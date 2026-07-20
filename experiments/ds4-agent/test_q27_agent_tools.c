@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "q27_agent_tools.h"
+#include "q27_agent_sha256.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -84,12 +85,23 @@ static int write_file(const char *path, const void *data, size_t len, mode_t mod
 } while (0)
 
 int main(void) {
+    static const unsigned char abc_sha256[32] = {
+        0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,
+        0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+        0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,
+        0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};
+    unsigned char digest[32];
+    q27_agent_sha256((const unsigned char *)"abc", 3, digest);
+    CHECK(!memcmp(digest, abc_sha256, sizeof(digest)),
+          "portable SHA-256 matches the standard vector");
+
     char root[] = "/tmp/q27-agent-tools-XXXXXX";
     CHECK(mkdtemp(root), "temporary workspace created");
     int workspace_fd = open(root, O_RDONLY | O_DIRECTORY);
     CHECK(workspace_fd >= 0, "workspace fd pinned");
     char sub[512], file[512], duplicate[512], linkpath[512], root_file[512];
-    char created[512], cancelled_write[512], empty_file[512];
+    char created[512], cancelled_write[512], empty_file[512], crlf_file[512];
+    char many_lines_file[512], bare_cr_file[512];
     char raced_write[512], raced_stage_dir[512], raced_staging[512];
     char acl_parent[512], shared_parent[512];
     snprintf(sub, sizeof(sub), "%s/sub", root);
@@ -100,6 +112,9 @@ int main(void) {
     snprintf(created, sizeof(created), "%s/sub/created.bin", root);
     snprintf(cancelled_write, sizeof(cancelled_write), "%s/sub/cancelled.bin", root);
     snprintf(empty_file, sizeof(empty_file), "%s/sub/empty.bin", root);
+    snprintf(crlf_file, sizeof(crlf_file), "%s/sub/crlf.txt", root);
+    snprintf(many_lines_file, sizeof(many_lines_file), "%s/sub/many.txt", root);
+    snprintf(bare_cr_file, sizeof(bare_cr_file), "%s/sub/bare-cr.txt", root);
     snprintf(raced_write, sizeof(raced_write), "%s/sub/raced.bin", root);
     snprintf(raced_stage_dir, sizeof(raced_stage_dir),
              "%s/sub/.q27-write-stage-%ld-0", root, (long)getpid());
@@ -112,6 +127,16 @@ int main(void) {
     CHECK(write_file(file, original, sizeof(original), 0640), "binary fixture written");
     CHECK(write_file(duplicate, "old old", 7, 0600), "duplicate fixture written");
     CHECK(write_file(root_file, "first", 5, 0600), "root edit fixture written");
+    CHECK(write_file(crlf_file, "one\r\ntwo\r\n", 10, 0600),
+          "CRLF selection fixture written");
+    unsigned char many_lines[66];
+    for (size_t i = 0; i < sizeof(many_lines); i += 2) {
+        many_lines[i] = 'x'; many_lines[i + 1] = '\n';
+    }
+    CHECK(write_file(many_lines_file, many_lines, sizeof(many_lines), 0600),
+          "many-line selection fixture written");
+    CHECK(write_file(bare_cr_file, "abc\r", 4, 0600),
+          "unterminated bare-CR fixture written");
     CHECK(symlink("data.bin", linkpath) == 0, "symlink fixture created");
 
     capture out = {.alive = 1};
@@ -119,11 +144,58 @@ int main(void) {
     q27_agent_tool_request request = {
         .kind = Q27_TOOL_READ, .path = "sub/data.bin",
         .timeout_ms = 1000, .max_output_bytes = 1024};
+    q27_agent_sha256(original, sizeof(original), digest);
     CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out, &result) ==
               Q27_AGENT_OK && result.exit_code == 0 &&
-          out.len == sizeof(original) && !memcmp(out.data, original, sizeof(original)),
-          "read preserves exact binary bytes");
+          out.len == sizeof(original) && !memcmp(out.data, original, sizeof(original)) &&
+          result.has_file_sha256 && result.file_size == sizeof(original) &&
+          !memcmp(result.file_sha256, digest, sizeof(digest)) &&
+          result.selection_count == 2 &&
+          result.selections[0].file_offset == 0 &&
+          result.selections[0].length == 5 &&
+          result.selections[0].first_line == 1 &&
+          result.selections[1].file_offset == 6 &&
+          result.selections[1].length == 8 &&
+          result.selections[1].first_line == 2,
+          "read preserves exact bytes and describes digest-bound line selections");
 
+    capture_reset(&out);
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_READ, .path = "sub/crlf.txt",
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == 0 && result.selection_count == 2 &&
+          result.selections[0].file_offset == 0 &&
+          result.selections[0].length == 3 &&
+          result.selections[1].file_offset == 5 &&
+          result.selections[1].length == 3,
+          "read selections leave complete CRLF terminators outside ranges");
+
+    capture_reset(&out);
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_READ, .path = "sub/bare-cr.txt",
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == 0 && result.selection_count == 1 &&
+          result.selections[0].length == 4,
+          "unterminated bare CR remains selected line content");
+
+    capture_reset(&out);
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_READ, .path = "sub/many.txt",
+        .max_output_bytes = 1024};
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == 0 && result.selection_count == 17 &&
+          result.selections[16].first_line == 33 &&
+          result.selections[16].last_line == 33,
+          "grouped selections clamp the final LF-terminated line range");
+
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_READ, .path = "sub/data.bin",
+        .timeout_ms = 1000, .max_output_bytes = 1024};
     char moved[512], replacement_sub[512], replacement_file[512];
     snprintf(moved, sizeof(moved), "%s.moved", root);
     snprintf(replacement_sub, sizeof(replacement_sub), "%s/sub", root);
@@ -152,8 +224,14 @@ int main(void) {
     CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out, &result) ==
               Q27_AGENT_OK && result.exit_code == 0 &&
           out.len == sizeof(expected_search) &&
-          !memcmp(out.data, expected_search, sizeof(expected_search)),
-          "search returns numbered binary-safe matching line");
+          !memcmp(out.data, expected_search, sizeof(expected_search)) &&
+          result.has_file_sha256 && result.selection_count == 1 &&
+          result.selections[0].file_offset == 6 &&
+          result.selections[0].length == 8 &&
+          result.selections[0].output_offset == 2 &&
+          result.selections[0].output_length == 8 &&
+          result.selections[0].first_line == 2,
+          "search returns a numbered binary-safe line plus selection metadata");
 
     const unsigned char new_content[] = {'n','e','w','\0','f','i','l','e'};
     request = (q27_agent_tool_request){
@@ -312,7 +390,41 @@ int main(void) {
     CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out, &result) ==
               Q27_AGENT_OK && result.exit_code == -1 &&
           strstr(result.message, "not unique"),
-          "ambiguous edit fails closed");
+          "ambiguous literal edit fails closed");
+
+    q27_agent_sha256((const unsigned char *)"old old", 7, digest);
+    request = (q27_agent_tool_request){
+        .kind = Q27_TOOL_EDIT_PREFLIGHT, .path = "sub/duplicate.txt",
+        .input = (const unsigned char *)"old", .input_len = 3,
+        .has_selection = 1, .selection_offset = 4, .selection_length = 3,
+        .max_output_bytes = 1024};
+    memcpy(request.selection_file_sha256, digest, sizeof(digest));
+    request.input = (const unsigned char *)"OLD";
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == -1 && strstr(result.message, "stale"),
+          "selection preflight validates the exact selected bytes");
+    request.input = (const unsigned char *)"old";
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == 0,
+          "digest-bound selection preflight accepts one duplicate occurrence");
+    request.kind = Q27_TOOL_EDIT;
+    request.replacement = (const unsigned char *)"new";
+    request.replacement_len = 3;
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == 0,
+          "selection edit replaces the chosen duplicate occurrence");
+    unsigned char selected_edit[7];
+    fd = open(duplicate, O_RDONLY);
+    CHECK(fd >= 0 && read(fd, selected_edit, sizeof(selected_edit)) == 7 &&
+          close(fd) == 0 && !memcmp(selected_edit, "old new", 7),
+          "selection edit publishes only the selected byte range");
+    CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out,
+                                 &result) == Q27_AGENT_OK &&
+          result.exit_code == -1 && strstr(result.message, "stale"),
+          "file-digest mismatch rejects reuse of a stale selection");
 
     request = (q27_agent_tool_request){
         .kind = Q27_TOOL_READ, .path = "sub/link", .max_output_bytes = 1024};
@@ -427,6 +539,9 @@ int main(void) {
     unlink(linkpath);
     unlink(root_file);
     unlink(empty_file);
+    unlink(crlf_file);
+    unlink(many_lines_file);
+    unlink(bare_cr_file);
     unlink(created);
     unlink(duplicate);
     unlink(file);

@@ -17,6 +17,7 @@
 
 #include "q27_agent_persistence.h"
 #include "q27_agent_protocol.h"
+#include "q27_agent_selections.h"
 #include "q27_agent_worker.h"
 
 #include <errno.h>
@@ -37,7 +38,7 @@ static int signal_pipe[2] = {-1, -1};
 // An exact boundary after the generated schema makes durable tool-protocol
 // identity unambiguous even when the caller's custom system text is arbitrary.
 static const char tool_protocol_boundary[] =
-    "\n<q27_tool_protocol version=\"raw-payload-v2\"/>\n\n";
+    "\n<q27_tool_protocol version=\"selection-handles-v1\"/>\n\n";
 
 static void on_signal(int sig) {
     (void)sig;
@@ -303,6 +304,7 @@ static const char *event_type_name(q27_agent_event_type type) {
     case Q27_EVENT_STATE: return "state";
     case Q27_EVENT_TEXT_DELTA: return "text_delta";
     case Q27_EVENT_TOOL_OUTPUT: return "tool_output";
+    case Q27_EVENT_SELECTIONS: return "selection_handles";
     case Q27_EVENT_TURN_DONE: return "turn_done";
     case Q27_EVENT_TOOL_DONE: return "tool_done";
     case Q27_EVENT_SESSION_DONE: return "session_done";
@@ -463,9 +465,11 @@ static int read_line_interruptible(input_reader *reader, char **line,
 static int run_tool(q27_agent_worker *worker,
                     const q27_agent_tool_request *request, int jsonl,
                     int display_text, output_buffer *captured,
-                    q27_agent_tool_result *completed) {
+                    q27_agent_tool_result *completed,
+                    uint64_t *completed_command_id) {
     if (captured) *captured = (output_buffer){0};
     if (completed) *completed = (q27_agent_tool_result){0};
+    if (completed_command_id) *completed_command_id = 0;
     char error[512] = {0};
     uint64_t command_id = 0;
     q27_agent_status submitted = q27_agent_worker_submit_tool(
@@ -476,6 +480,7 @@ static int run_tool(q27_agent_worker *worker,
                 error[0] ? error : "unknown error");
         return 0;
     }
+    if (completed_command_id) *completed_command_id = command_id;
 
     int terminal = 0;
     q27_agent_status status = Q27_AGENT_ERROR;
@@ -520,6 +525,13 @@ static int run_tool(q27_agent_worker *worker,
                 completed->exit_code = event.tool_exit_code;
                 completed->flags = event.tool_flags;
                 completed->output_bytes = event.tool_output_bytes;
+                completed->has_file_sha256 = event.tool_has_file_sha256;
+                completed->file_size = event.tool_file_size;
+                memcpy(completed->file_sha256, event.tool_file_sha256,
+                       sizeof(completed->file_sha256));
+                completed->selection_count = event.tool_selection_count;
+                memcpy(completed->selections, event.tool_selections,
+                       sizeof(completed->selections));
             }
             size_t n = event.data_len < sizeof(error) - 1 ?
                        event.data_len : sizeof(error) - 1;
@@ -1159,6 +1171,7 @@ static int append_failed_tool_response(transcript *chat, const char *message) {
 }
 
 static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
+                           q27_agent_selection_ledger *selections,
                            int think, uint32_t context_tokens,
                            uint32_t max_tokens, int adaptive_tokens, int jsonl,
                            uint32_t max_tool_rounds, uint32_t compact_at,
@@ -1206,6 +1219,18 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
             q27_agent_tool_call_free(&call);
             return 0;
         }
+        if (call.selection &&
+            !q27_agent_selection_resolve(
+                selections, call.selection, call.request.path, &call.request,
+                &call.input, error, sizeof(error))) {
+            if (!append_failed_tool_response(chat, error)) {
+                q27_agent_tool_call_free(&call);
+                return 0;
+            }
+            q27_agent_tool_call_free(&call);
+            ++tool_rounds;
+            continue;
+        }
 
         size_t latest_generated_bytes = generated_bytes;
         turn_accounting latest_accounting = accounting;
@@ -1221,7 +1246,7 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                 Q27_TOOL_WRITE_PREFLIGHT : Q27_TOOL_EDIT_PREFLIGHT;
             q27_agent_tool_result preflight_result = {0};
             if (!run_tool(worker, &preflight, 0, 0, NULL,
-                          &preflight_result)) {
+                          &preflight_result, NULL)) {
                 q27_agent_tool_call_free(&call);
                 return 0;
             }
@@ -1321,6 +1346,10 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         const uint64_t room = (uint64_t)context_tokens + 1 - required;
         if (call.request.max_output_bytes > room)
             call.request.max_output_bytes = (uint32_t)room;
+        const uint32_t total_output_cap = call.request.max_output_bytes;
+        const int annotate_selections =
+            call.request.kind == Q27_TOOL_READ ||
+            call.request.kind == Q27_TOOL_SEARCH;
 
         fprintf(stderr,
                 "[q27-agent automatic tool=%s round=%u/%u output-cap=%u]\n",
@@ -1328,8 +1357,50 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                 max_tool_rounds, call.request.max_output_bytes);
         output_buffer tool_output = {0};
         q27_agent_tool_result tool_result = {0};
+        uint64_t tool_command_id = 0;
         int ran = run_tool(worker, &call.request, jsonl, 0,
-                           &tool_output, &tool_result);
+                           &tool_output, &tool_result, &tool_command_id);
+        if (ran && annotate_selections && tool_result.exit_code == 0) {
+            unsigned char *annotation = NULL;
+            size_t annotation_len = 0;
+            if (!q27_agent_selection_annotate(
+                    selections, &call.request, &tool_result,
+                    (const unsigned char *)tool_output.bytes, tool_output.len,
+                    total_output_cap, &annotation, &annotation_len,
+                    error, sizeof(error))) {
+                fprintf(stderr, "q27-agent: selection metadata failed: %s\n",
+                        error[0] ? error : "unknown error");
+                ran = 0;
+            } else if (annotation_len) {
+                if (!output_append(&tool_output, annotation, annotation_len)) {
+                    fprintf(stderr,
+                            "q27-agent: could not retain selection metadata\n");
+                    ran = 0;
+                }
+                tool_result.output_bytes = (uint32_t)tool_output.len;
+                if (ran) {
+                    if (jsonl) {
+                        q27_agent_event selection_event = {0};
+                        if (!q27_agent_worker_selection_event(
+                                worker, tool_command_id, call.request.kind,
+                                annotation, annotation_len, &selection_event) ||
+                            !print_json_event(&selection_event)) {
+                            fprintf(stderr,
+                                    "q27-agent: selection JSONL output failure\n");
+                            ran = 0;
+                        }
+                        q27_agent_event_free(&selection_event);
+                    } else if (fwrite(annotation, 1, annotation_len, stdout) !=
+                                   annotation_len ||
+                               fflush(stdout) == EOF) {
+                        fprintf(stderr,
+                                "q27-agent: selection annotation output failure\n");
+                        ran = 0;
+                    }
+                }
+            }
+            free(annotation);
+        }
         if (ran && payload_unwrapped) {
             const char *notice = "outer Markdown fence removed before publication";
             if (!tool_result.message[0]) {
@@ -1391,6 +1462,7 @@ int main(int argc, char **argv) {
     uint32_t compact_at = 0, compact_keep = 4, compact_tokens = 1024;
     int think = 1, jsonl = 0, auto_tools = 0, max_tokens_explicit = 0;
     int adaptive_tokens = 0;
+    q27_agent_selection_ledger *selections = NULL;
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -1526,6 +1598,13 @@ int main(int argc, char **argv) {
         close_signal_pipe();
         return 1;
     }
+    selections = q27_agent_selection_ledger_create(arc4random());
+    if (!selections) {
+        fprintf(stderr, "q27-agent: could not allocate selection ledger\n");
+        q27_agent_worker_stop(worker);
+        close_signal_pipe();
+        return 1;
+    }
 
     transcript chat = {0};
     char *current_snapshot_name = NULL;
@@ -1615,7 +1694,8 @@ int main(int argc, char **argv) {
     if (ok && prompt) {
         ok = transcript_append(&chat, "user", prompt);
         if (ok && auto_tools)
-            ok = run_agent_cycle(worker, &chat, think, context, max_tokens,
+            ok = run_agent_cycle(worker, &chat, selections,
+                                 think, context, max_tokens,
                                  adaptive_tokens, jsonl, max_tool_rounds, compact_at,
                                  compact_tokens, compact_keep);
         else if (ok) {
@@ -1718,13 +1798,15 @@ int main(int argc, char **argv) {
                 if (request.kind == Q27_TOOL_NONE)
                     fprintf(stderr, "q27-agent: invalid tool command\n");
                 else
-                    ok = run_tool(worker, &request, jsonl, 1, NULL, NULL);
+                    ok = run_tool(worker, &request, jsonl, 1, NULL, NULL,
+                                  NULL);
                 free(tool_line);
                 continue;
             }
             ok = transcript_append_len(&chat, "user", line, len);
             if (ok && auto_tools)
-                ok = run_agent_cycle(worker, &chat, think, context, max_tokens,
+                ok = run_agent_cycle(worker, &chat, selections,
+                                     think, context, max_tokens,
                                      adaptive_tokens, jsonl, max_tool_rounds, compact_at,
                                      compact_tokens, compact_keep);
             else if (ok) {
@@ -1744,6 +1826,7 @@ int main(int argc, char **argv) {
         free(line);
     }
 
+    q27_agent_selection_ledger_free(selections);
     transcript_free(&chat);
     free(current_snapshot_name);
     q27_agent_worker_stop(worker);

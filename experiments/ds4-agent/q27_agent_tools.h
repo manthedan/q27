@@ -23,6 +23,17 @@ typedef enum {
     Q27_TOOL_EDIT_PREFLIGHT
 } q27_agent_tool_kind;
 
+enum { Q27_TOOL_MAX_SELECTIONS = 32 };
+
+typedef struct {
+    uint64_t file_offset;
+    uint64_t length;
+    uint64_t output_offset;
+    uint64_t output_length;
+    uint64_t first_line;
+    uint64_t last_line;
+} q27_agent_tool_selection;
+
 typedef struct {
     q27_agent_tool_kind kind;
     const char *path;             // relative to the configured workspace
@@ -30,6 +41,13 @@ typedef struct {
     size_t input_len;
     const unsigned char *replacement; // edit replacement bytes
     size_t replacement_len;
+    // Resolved edit-selection authority. The model sees only a short opaque
+    // handle; the control plane supplies the exact selected bytes, range, and
+    // full-file digest copied from a prior successful read/search.
+    int has_selection;
+    uint64_t selection_offset;
+    uint64_t selection_length;
+    unsigned char selection_file_sha256[32];
     uint32_t timeout_ms;          // shell only; 1..60000
     uint32_t max_output_bytes;    // 1..262144
 } q27_agent_tool_request;
@@ -45,6 +63,11 @@ typedef struct {
     int32_t exit_code; // 0 file-tool success; shell exit/128+signal; -1 tool failure
     uint32_t flags;
     uint32_t output_bytes;
+    int has_file_sha256;
+    uint64_t file_size;
+    unsigned char file_sha256[32];
+    uint32_t selection_count;
+    q27_agent_tool_selection selections[Q27_TOOL_MAX_SELECTIONS];
     char message[256];
 } q27_agent_tool_result;
 

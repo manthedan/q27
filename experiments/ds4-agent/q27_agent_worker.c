@@ -176,6 +176,11 @@ static int tool_request_clone(const q27_agent_tool_request *source,
         copy_error(error, error_cap, "tool path is required");
         return 0;
     }
+    if (source->has_selection && source->kind != Q27_TOOL_EDIT &&
+        source->kind != Q27_TOOL_EDIT_PREFLIGHT) {
+        copy_error(error, error_cap, "selection authority is valid only for edit");
+        return 0;
+    }
     if (source->kind == Q27_TOOL_SHELL &&
         (!source->input_len || !source->timeout_ms || source->timeout_ms > 60000 ||
          memchr(source->input, '\0', source->input_len))) {
@@ -187,8 +192,11 @@ static int tool_request_clone(const q27_agent_tool_request *source,
         return 0;
     }
     if ((source->kind == Q27_TOOL_EDIT ||
-         source->kind == Q27_TOOL_EDIT_PREFLIGHT) && !source->input_len) {
-        copy_error(error, error_cap, "edit old bytes are required");
+         source->kind == Q27_TOOL_EDIT_PREFLIGHT) &&
+        (!source->input_len ||
+         (source->has_selection &&
+          source->selection_length != source->input_len))) {
+        copy_error(error, error_cap, "edit bytes or selection are invalid");
         return 0;
     }
     if (source->path) {
@@ -376,9 +384,18 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
         .tool_exit_code = tool_result ? tool_result->exit_code : 0,
         .tool_flags = tool_result ? tool_result->flags : 0,
         .tool_output_bytes = tool_result ? tool_result->output_bytes : 0,
+        .tool_has_file_sha256 = tool_result ? tool_result->has_file_sha256 : 0,
+        .tool_file_size = tool_result ? tool_result->file_size : 0,
+        .tool_selection_count = tool_result ? tool_result->selection_count : 0,
         .data = (unsigned char *)(error ? error : ""),
         .data_len = error ? strlen(error) : 0
     };
+    if (tool_result) {
+        memcpy(event.tool_file_sha256, tool_result->file_sha256,
+               sizeof(event.tool_file_sha256));
+        memcpy(event.tool_selections, tool_result->selections,
+               sizeof(event.tool_selections));
+    }
     // Mark completion before publication so a fast consumer cannot acknowledge
     // the terminal and submit the next command before this generation retires.
     pthread_mutex_lock(&worker->mu);
@@ -818,6 +835,36 @@ int q27_agent_worker_tokenizer_sha1(q27_agent_worker *worker,
     if (ok) memcpy(out_sha1, worker->tokenizer_sha1, 20);
     pthread_mutex_unlock(&worker->mu);
     return ok;
+}
+
+int q27_agent_worker_selection_event(q27_agent_worker *worker,
+                                     uint64_t parent_command_id,
+                                     q27_agent_tool_kind tool_kind,
+                                     const unsigned char *data, size_t data_len,
+                                     q27_agent_event *event) {
+    if (!worker || !parent_command_id || !event ||
+        (tool_kind != Q27_TOOL_READ && tool_kind != Q27_TOOL_SEARCH) ||
+        (data_len && !data) || data_len > 256u * 1024u)
+        return 0;
+    *event = (q27_agent_event){0};
+    unsigned char *copy = NULL;
+    if (data_len) {
+        copy = malloc(data_len);
+        if (!copy) return 0;
+        memcpy(copy, data, data_len);
+    }
+    pthread_mutex_lock(&worker->mu);
+    event->sequence = ++worker->next_sequence;
+    event->command_id = parent_command_id;
+    event->type = Q27_EVENT_SELECTIONS;
+    event->state = Q27_WORKER_IDLE;
+    event->status = Q27_AGENT_OK;
+    event->tool_kind = tool_kind;
+    event->tool_output_bytes = (uint32_t)data_len;
+    event->data = copy;
+    event->data_len = data_len;
+    pthread_mutex_unlock(&worker->mu);
+    return 1;
 }
 
 int q27_agent_worker_session_result_event(q27_agent_worker *worker,

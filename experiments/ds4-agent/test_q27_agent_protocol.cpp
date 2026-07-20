@@ -59,6 +59,20 @@ int main() {
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
           "edit rejects JSON-embedded replacement");
 
+    std::string selected = "<tool_call>{\"name\":\"edit_selection\",\"arguments\":{"
+        "\"path\":\"a.bin\",\"selection\":\"s12345678-9\"}}</tool_call>";
+    CHECK(parse(selected, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.request.kind == Q27_TOOL_EDIT && !call.request.input &&
+          call.request.input_len == 0 && call.selection &&
+          !std::strcmp(call.selection, "s12345678-9"),
+          "edit_selection carries only its short opaque handle");
+    q27_agent_tool_call_free(&call);
+    CHECK(parse("<tool_call>{\"name\":\"edit_selection\",\"arguments\":{"
+                "\"path\":\"a\",\"selection\":\"s1\",\"old\":\"x\"}}"
+                "</tool_call>", call, error, sizeof(error)) ==
+              Q27_TOOL_CALL_INVALID,
+          "edit_selection rejects mixed literal authority");
+
     std::string shell = "<tool_call>{\"name\":\"shell\",\"arguments\":{"
         "\"command\":\"pwd\",\"timeout_ms\":123,"
         "\"max_output_bytes\":99}}</tool_call>";
@@ -151,16 +165,18 @@ int main() {
           "earlier closing fence makes the wrapper ambiguous");
 
     const char *const *names = nullptr;
-    CHECK(q27_agent_tool_names(&names) == 5 && names &&
+    CHECK(q27_agent_tool_names(&names) == 6 && names &&
           !std::strcmp(names[0], "read") && !std::strcmp(names[1], "search") &&
           !std::strcmp(names[2], "write") && !std::strcmp(names[3], "edit") &&
-          !std::strcmp(names[4], "shell"),
+          !std::strcmp(names[4], "edit_selection") &&
+          !std::strcmp(names[5], "shell"),
           "prompt and constrained decoder share one ordered registry");
 
     const char *preamble = q27_agent_tool_preamble();
     CHECK(preamble && std::strstr(preamble, "<tools>") &&
           std::strstr(preamble, "\"name\":\"read\"") &&
           std::strstr(preamble, "\"name\":\"write\"") &&
+          std::strstr(preamble, "\"name\":\"edit_selection\"") &&
           std::strstr(preamble, "\"name\":\"shell\"") &&
           std::strstr(preamble, "additionalProperties"),
           "fixed strict registry is present in preamble");
