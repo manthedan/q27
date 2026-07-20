@@ -100,3 +100,38 @@ is stream-rate at the full-decode dispatch mix, now known NOT to be GEMV
 issue-rate; unfunded. Legs ran with the server stopped but the machine not
 input-idle; the decision metrics are same-run A/B ratios (contention-
 robust) and the absolute ≥ 18 legs can only improve on a quiet machine.
+
+## CORRECTION (2026-07-19, expert review 4): route attribution
+
+The causal claim above — "the engine's decode stream already overlaps
+kernels enough to hide the 2.36×" — is **not established by this
+experiment.** The promoted kernel is `q27_matvec_b1_quantized` (the
+int8-activation entry point). The pure-B1 serial-decode path does not call
+it:
+
+    B1 tensor
+      → MetalEngine::project()        (metal_engine.cpp:1146-1149)
+      → is_bonsai_dtype → backend_.matvec(float activation)
+      → q27_matvec_b1_g128            (metal_backend.mm:1032)
+
+`project()` routes both B1 and T2 to `backend_.matvec`, not
+`matvec_quantized`; the backend then selects `q27_matvec_b1_g128` for B1.
+The float-activation kernel was already four rows per simdgroup. The
+round-2 change modified the **int8** entry point, which the B1 artifact
+serial path never invokes (the int8 copy is written 129×/token and read
+0×/token — see `2026-07-19-b1-serial-decode-fusion.md`).
+
+Therefore:
+
+1. The artifact wall failing to move is **expected**; the changed kernel
+   was not on that critical path.
+2. "Engine overlap hides the 2.36× kernel gain" is **not** a supported
+   conclusion of this round.
+3. The promoted kernel may still be correct and useful to direct callers
+   (chunked prefill / official-tier), but it was not a production B1
+   serial-decode optimization. The measured B1 speed and the memory-wall
+   observation stand; only the causal attribution does not.
+4. **New gate — route liveness:** before timing any candidate artifact,
+   the profiler must show a nonzero call count for the candidate kernel in
+   that exact artifact run (P0 route audit). This round would have failed
+   that gate.

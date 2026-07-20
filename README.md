@@ -56,26 +56,33 @@ against the serial path, experiments are pre-registered with kill lines
 before they run, and negative results are recorded with their mechanisms.
 The parked list is as load-bearing as the shipped list.
 
-- **CUDA** is the production backend. On a 5090 it is the fastest engine
-  we have measured on this model by a wide margin (see Speed). On the 24 GB
-  3090, the merged width-8 server is validated at 16K context: it boots at
-  23,230–23,232 MiB and passes the canonical gate. The older pre-merge w8
-  build served 131K with turbo3 KV; the merged 131K fit leg remains to run.
-  Width 12 exceeds the card because its prebuilt graph families add
-  ~980 MiB, a build-width limit rather than a server regression.
-- **Metal** is mature for single-request use on base M4 and serves two
-  slots. It has layer-major prefill to width 96, decode at 98–99% of its
-  own resident-weight ceiling, factor-2 tiled GQA attention, batched MTP
-  and suffix-burst speculation, batched verification to width 48, disk
-  prefix snapshots, and a fair two-slot scheduler with full memory
-  admission accounting. The ledger records an official-tier two-slot MTP
-  pass (813 committed tokens over 281 rounds), but its raw multislot harness
-  output is not committed, so release status remains provisional pending an
-  evidence-publishing rerun. The numerical-envelope constants are also
-  provisional. The mixed M1 candidate owes its own amended two-slot and
-  product gates.
-- **Continuous batching** (CUDA) passed its bars (1.31–1.35× two-slot
-  aggregate) but ships default-off pending live validation.
+- **Metal** is the serving stack and the active development backend. It is
+  mature for single-request use on base M4 and serves two slots: layer-major
+  prefill to width 96, decode at 98–99% of its own resident-weight ceiling,
+  factor-2 tiled GQA attention, batched MTP and suffix-burst speculation,
+  batched verification to width 48, disk prefix snapshots, and a fair
+  two-slot scheduler with full memory admission accounting. The ledger
+  records an official-tier two-slot MTP pass (813 committed tokens over 281
+  rounds), but its raw multislot harness output is not committed, so release
+  status remains provisional pending an evidence-publishing rerun. The
+  numerical-envelope constants are also provisional.
+- **CUDA** remains in-tree and is the fastest engine we have measured on
+  this model (5090; see Speed), but **CUDA serving adoption is dropped
+  (2026-07-18), not deferred — do not touch the CUDA code.** Yukon (the
+  RTX 3090) stays as-is and is now a behavioral/numeric oracle only: the
+  16-token canonical gate is byte-exact across CUDA and Metal. On the
+  24 GB 3090 the merged width-8 server is validated at 16K context (boots
+  at 23,230–23,232 MiB, passes the canonical gate); width 12 exceeds the
+  card by ~980 MiB of prebuilt graph families, a build-width limit.
+- **The mixed-tier (M1) thesis is permanently closed.** The gdn_pair rescue
+  exonerated the pack itself (the repetition loop was a serving-binary
+  artifact), and A5-on-gdn_pair then KILLED the strongest arm on both
+  corpora. A B1→T2 bridge requires training/distillation, not byte-level
+  grafting — now a measured result, not a conjecture.
+- **No live traffic yet.** The native-agent direction (opt-in model-driven
+  tools, durable sessions, compaction) has exact restart persistence and
+  boundary-preserving compaction, but broad product validation is open and
+  is gated behind the task-suite/native-agent graduation work.
 
 ## More documentation
 
@@ -111,7 +118,7 @@ and the ternary tier is repacked from PrismML's QAT pack:
 | q6 (6.0 bpw) | `qwen36-27b-mtp-q6.q27` | larger | 32 GB | +0.35% PPL margin over Q5_K_M |
 | q6k (6.8 bpw) | `qwen36-27b-mtp-q6k.q27` | larger | 32 GB | GGUF-matching quality, ~10% slower |
 | **T2 ternary** (2.25 bpw) | repack of `Ternary-Bonsai-27B-Q2_0.gguf` | 7.15 GB | 16 GB Mac | fully-resident 27B on small machines; ~2.1–2.3× PPL vs official, task quality holds |
-| **M1 candidate** (mixed; not shipped) | `bonsai-27b-m1.q27` | 3.83 GB | 16 GB Mac | closes 48% of the B1→T2 NLL gap and passes suffix/probes; capability, KL, direct-decode, multislot, and 131K gates remain |
+| ~~M1 candidate~~ (mixed; thesis CLOSED) | `bonsai-27b-m1.q27` | 3.83 GB | 16 GB Mac | mixed-graft thesis permanently closed: gdn_pair pack exonerated, A5-on-gdn_pair KILLED on both corpora; a B1→T2 bridge needs training, not grafting |
 | B1 binary (1.125 bpw) | `bonsai-27b-b1.q27` | 3.79 GB | 16 GB Mac | smallest fully-resident tier; full quality/probe battery passed |
 
 ```bash
@@ -128,10 +135,12 @@ losslessly (bit-exact round-trip gated) with:
 python3 tools/repack.py Ternary-Bonsai-27B-Q2_0.gguf ternary-bonsai-27b-t2.q27
 ```
 
-The provisional M1 candidate is a byte-level graft of the companion B1/T2
-checkpoints: B1 bulk plus T2 GDN alpha/beta and attention-Q in blocks 21–42.
-Its 8K NLL, suffix byte-identity battery, 4/4 behavioral probes, and the
-later gates that still block a ship claim are recorded in
+The M1 candidate was a byte-level graft of the companion B1/T2 checkpoints
+(B1 bulk plus T2 GDN alpha/beta and attention-Q in blocks 21–42). The
+mixed-graft thesis is now **permanently closed**: the gdn_pair rescue
+exonerated the pack (the repetition loop was a serving-binary artifact),
+and A5-on-gdn_pair KILLED the strongest arm on both corpora. History and
+the negative result are recorded in
 [`docs/plans/2026-07-17-mixed-tier-census.md`](docs/plans/2026-07-17-mixed-tier-census.md).
 
 Verify every download against its `CHECKSUMS.md5`. The fine-tune variant
@@ -192,7 +201,8 @@ a first-class subsystem.
 262,144-token native window practical. On CUDA it is validated flat to
 361K tokens (needle 6/6 at depths beyond native, NLL buckets flat to
 256K). The pre-merge w8 server used it to promote a 24 GB 3090 from a
-32K box to a 131K box; the merged w8 server's 131K fit leg is pending. On
+32K box to a 131K box; the merged w8 server's 131K fit leg was not run
+before CUDA serving adoption was dropped, and is no longer planned. On
 Metal, 32K NLL is depth-flat (PPL 5.318 single-pass) with 6/6 needle
 retrieval, and tail-focused codec allocation is the active KV-quality
 frontier. Disk prefix snapshots restore a 2,346-token prefix byte-exactly
@@ -275,67 +285,6 @@ an explicit flag wins over the env):**
 | `--max-tokens-default N` | `Q27_METAL_MAX_TOKENS_DEFAULT` | per-endpoint | generation cap when the client sends none/null (pi sends null; 16384 recommended for agents) |
 | `--budget-mb N` | `Q27_METAL_BUDGET_MB` | half working set | multislot admission budget (test/override hook) |
 | `Q27_METAL_KV_FP16_CELLS` | env-only (engine ctor plumbing pending) | off | turbo3 KV fp16 exception cells (production: `8,9,10,11,12,13,14,15`) |
-
-### Experimental harness-prefix prewarming
-
-The Metal server can optionally pay Pi/Codex's large initial prompt prefill
-during explicit local setup rather than after the first interactive prompt.
-This remains experimental and completely dormant unless its separate flag is
-present:
-
-```bash
-export Q27_METAL_ADMIN_TOKEN="$(openssl rand -hex 16)"
-./build/q27-metal-server model.q27 model.tok --port 8080 \
-  --experimental-prefix-cache ~/.cache/q27/experimental-prefixes \
-  --snapshot-max-mb 8192
-```
-
-The flag enables an admin-authenticated, loopback-only prewarm endpoint and
-exact disk-prefix lookup. It defaults to explicit installs only
-(`--snapshot-auto 0` semantics); passing `--snapshot-auto` separately opts
-back into ordinary automatic saves. MTP is deliberately unsupported in this
-experiment.
-
-To install from a captured initial request body:
-
-```bash
-Q27_METAL_ADMIN_TOKEN="$Q27_METAL_ADMIN_TOKEN" \
-python3 tools/experimental_prefix_cache.py prewarm \
-  --target http://127.0.0.1:8080 --api chat_completions pi-request.json
-
-# For a Codex /v1/responses request, use: --api responses
-```
-
-Or capture the exact request from the real installed harness without knowing
-or copying its changing system prompt:
-
-```bash
-export Q27_PREFIX_CAPTURE_TOKEN="$(openssl rand -hex 16)"
-Q27_METAL_ADMIN_TOKEN="$Q27_METAL_ADMIN_TOKEN" \
-Q27_PREFIX_CAPTURE_TOKEN="$Q27_PREFIX_CAPTURE_TOKEN" \
-python3 tools/experimental_prefix_cache.py proxy \
-  --target http://127.0.0.1:8080 --port 8081
-```
-
-Configure that temporary harness provider's API key as
-`$Q27_PREFIX_CAPTURE_TOKEN` (or send it in
-`X-Q27-Prefix-Capture-Token`). The proxy will not exercise its stored admin
-capability for any unauthenticated local process. Temporarily point one fresh
-Pi or Codex setup run at port 8081. The proxy
-removes the final live user message, asks the real server to persist the exact
-remaining token prefix, then forwards the original request normally. Streaming
-setup requests receive SSE-comment keepalives while the cold prewarm runs. Both
-target and listener are forcibly loopback, and credential-bearing admin calls
-explicitly bypass configured HTTP proxies. Stop the proxy and point ordinary
-sessions back at port 8080. Only initial requests
-(system instructions plus one final user message) are accepted for prewarming;
-tool-loop histories fail closed. A changed harness prompt, tool schema,
-project instruction, model, or tokenizer simply misses and takes the normal
-prefill path. In the first real isolated Pi smoke, setup installed a
-1,318-token prefix in 28.28 s; a different first user message through a fresh
-server process then completed the whole Pi invocation in 1.64 s from disk.
-Snapshots are local private files and may encode sensitive system/project
-instructions; they are never bundled or uploaded.
 
 **The server has no auth and binds 127.0.0.1 by default.** Reaching it
 from other machines or containers requires an explicit `--host 0.0.0.0`.
