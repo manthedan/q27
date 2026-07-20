@@ -83,3 +83,66 @@ GPU on this M4. No new model downloads, no CUDA, no EvalScope/lm-eval —
 the scope is deliberately our own 120-prompt probe, NOT the whitepaper's
 15-benchmark H100 suite. gdn_pair pack is transient (/tmp), deleted after
 its generation pass.
+
+## RESULTS (2026-07-19, 24 GB M4, one GPU queue) — CONFOUNDED, do not read as capability
+
+All four arms generated and published with provenance (`logs/eval-census/`).
+`t2-base` first attempt FAILED closed: its server received SIGTERM mid-run
+(prompts c43–c49 connection-refused; run_arm.sh's boot_id check correctly
+refused the partial). Re-run clean (0 failures). Scored with
+`tools/eval/accuracy.py` (selftest green, provenance + run-binding enforced):
+
+| arm | choice | numeric | freeform | overall |
+|---|---|---|---|---|
+| t2-base      | 44/60 (0.73) | 34/40 (0.85) | 14/20 (0.70) | 92/120 (0.767) |
+| b1-base      | 49/60 (0.82) | 37/40 (0.93) | 18/20 (0.90) | 104/120 (0.867) |
+| gdn-pair     | 54/60 (0.90) | 37/40 (0.93) | 19/20 (0.95) | 110/120 (0.917) |
+| m1-candidate | 56/60 (0.93) | 40/40 (1.00) | 20/20 (1.00) | 116/120 (0.967) |
+
+**The ranking is a generation-completeness artifact, not capability.** The
+empty-response count (<5 chars) anti-correlates almost perfectly with the
+accuracy order: t2-base 22 empty (choice 13, freeform 7, numeric 2), b1-base
+13, gdn-pair 10, m1-candidate 2. Whichever server returned fewer empty
+responses "scored" higher. T2 — the quality tier — produced the MOST empty
+outputs (e.g. c11/c15/c26/c27/c31 returned `""` with no error field; c20
+truncated mid-sentence). An empty generation scores 0 regardless of the
+model's actual capability, so the accuracy ordering tracks **serving
+robustness under this 120-prompt serial greedy workload**, not task
+capability. `gap-recovered` is undefined (acc(t2) < acc(b1)) for the same
+reason.
+
+**What this run actually measured:** a per-arm server-empty-response rate
+under 1024-max-token thinking-mode greedy generation. m1-candidate's server
+was the most robust (2 empty); t2-base's the least (22 empty). This is a
+REAL signal worth its own investigation (why does the T2 server return
+empty/truncated at ~18% on this prompt set — thinking-mode budget
+exhaustion? an early-EOS / finish-reason bug? suffix/constraint
+interaction?) but it is NOT the task-accuracy axis the pre-registration
+sought, and it does NOT speak to the A5-closed serving thesis.
+
+**Completed-only re-score (empty rows excluded from numerator AND denominator):**
+t2 91/98 (0.929), b1 103/107 (0.963), gdn 108/110 (0.982), m1 116/118
+(0.983). The gap narrows but the order holds — and the residual is a SECOND
+generation artifact, not capability: T2's remaining failures are
+**truncations** of verbose reasoning at the 1024 max_tokens cap (n09/n26 cut
+mid-sentence; n10 cut at "The answer is 1" dropping the final digit of "12";
+c20/c55 cut mid-sentence), while m1/gdn emit terser reasoning that completes
+in budget. T2 ALSO has the most empty responses (the dominant term) — two
+distinct generation/serving artifacts (empty-response rate + verbose-reasoning
+truncation), both orthogonal to task capability.
+
+**Verdict: this run measured generation/serving robustness, not task
+capability.** Two confounds, both on the serving axis: (1) per-arm
+empty-response rate under 1024-token thinking greedy (t2 22 > b1 13 > gdn 10
+> m1 2); (2) T2's verbose chain-of-thought truncating at the token cap.
+Neither says anything about what the models know. The capability question
+this suite was built for remains OPEN.
+
+**To get the real capability axis, control both confounds:** regenerate all
+four arms at a max_tokens high enough that NO completion truncates (e.g.
+2048, or until finish_reason==stop for all) AND with the empty-response
+cause fixed or retried; then score only finish_reason==stop rows. The
+empty-response cause is itself worth a bug: the T2 server returned `""` with
+no error on 13/60 choice prompts — check thinking-mode budget interaction
+and the finish_reason on those rows. Generation corpus + provenance retained
+in `logs/eval-census/` for re-scoring.

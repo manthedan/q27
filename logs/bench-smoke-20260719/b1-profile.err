@@ -1,0 +1,22 @@
+q27 Metal: per-dispatch profiling enabled
+[bench_env] powermetrics sampling -> logs/bench-smoke-20260719/b1-profile.power.log (pid 97303)
+q27 Metal profile (per-op encoders; overlap suppressed, shares are the signal)
+kernel                                    calls     total ms     avg us  share
+q27_matvec_b1_g128                        31808      3031.12       95.3  87.9%
+q27_delta_step                             3072       135.12       44.0   3.9%
+q27_rmsnorm_quantized                      8256       108.00       13.1   3.1%
+q27_attention_f16                          1024        64.10       62.6   1.9%
+q27_add_inplace                            8192        26.13        3.2   0.8%
+q27_conv_step                              3072        16.17        5.3   0.5%
+q27_silu_mul                               4096        15.39        3.8   0.4%
+q27_gated_norm_gdn                         3072        10.10        3.3   0.3%
+q27_argmax                                   64         8.35      130.5   0.2%
+q27_gdn_gates                              3072         7.93        2.6   0.2%
+q27_rmsnorm_heads                          2048         7.63        3.7   0.2%
+q27_l2norm_heads                           3072         7.03        2.3   0.2%
+q27_rope_neox                              2048         4.65        2.3   0.1%
+q27_sigmoid_gate_mul                       1024         2.90        2.8   0.1%
+q27_kv_store_f16                           1024         2.09        2.0   0.1%
+q27_embedding_b1                             64         0.21        3.3   0.0%
+total sampled                             75008      3446.91
+command buffers 64, GPU busy 4.182 s, CPU wait 4.221 s

@@ -1,3 +1,5 @@
 backend: Apple M4, 960-token synthetic prompt in chunks of 96, fp16 KV
 weight stream per chunk: 12.08 GiB
-prefill: 3131.8 ms/chunk, 30.65 tok/s, effective weight stream 4.1 GB/s
+prefill: 3513.4 ms/chunk, 27.32 tok/s, effective weight stream 3.7 GB/s
+power-state: NOT SAMPLED (set Q27_BENCH_POWER_LOG to record)
+thermal: start[] end[No thermal warning level has been recorded No performance warning level has been recorded No CPU power status has been recorded ]

@@ -1,0 +1,6 @@
+gdn qkv           [10240x5120]     q4     0.302 ms/op    92.25 GB/s
+ssm_out           [5120x6144]      q4     0.193 ms/op    86.48 GB/s
+output head       [151936x5120]    q8     8.994 ms/op    87.85 GB/s
+aggregate                                                88.59 GB/s
+power-state: pmset thermal anchor only (powermetrics needs root), log logs/bench-smoke-20260719/gemv.power.log
+thermal: start[No thermal warning level has been recorded No performance warning level has been recorded No CPU power status has been recorded ] end[No thermal warning level has been recorded No performance warning level has been recorded No CPU power status has been recorded ]

@@ -1,0 +1,9 @@
+quiet ship bench: waiting for idle>=600s (serverless; no live traffic)
+idle reached 00:34:51; fingerprinting
+quiet ship-line bench (8352/96, dtype q4q8, idle>=10min, serverless)
+  bench sha1 5792d6db2c3d00d6146d5172e4a6f7f3e1ce58c5  shader sha1 28840d4831c3dbb22ec1bff0edea2d80ecfd4fb1
+  float 8352: 24.27 20.04 (max 24.27; quiet baseline 23.2)
+  half  8352: 22.92 21.94 (min 21.94)
+  float 960: 23.74   half 960: 27.32
+  ratio min(half)/max(float) = 0.904 (ship >=1.7 i.e. >=39 tok/s)
+VERDICT: PARK -- <1.7x; keep Q4 on float-staged kernel + honest table

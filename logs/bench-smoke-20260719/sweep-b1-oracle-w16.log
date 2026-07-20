@@ -1,0 +1,13 @@
+Metal model ready on Apple M4 in 0.60 s
+oracle round: live 16 | verify 394.42 ms read 0.06 ms commit 11.03 ms
+oracle round: live 16 | verify 390.86 ms read 0.06 ms commit 11.52 ms
+oracle round: live 16 | verify 394.01 ms read 0.03 ms commit 12.33 ms
+oracle round: live 16 | verify 394.15 ms read 0.05 ms commit 11.93 ms
+oracle round: live 16 | verify 394.12 ms read 0.04 ms commit 11.63 ms
+oracle round: live 16 | verify 390.40 ms read 0.04 ms commit 11.13 ms
+oracle round: live 16 | verify 389.67 ms read 0.09 ms commit 11.99 ms
+oracle round: live 16 | verify 390.68 ms read 0.04 ms commit 11.34 ms
+oracle w=16: G 51.08/53.30 ms/tok (serial 19.58/18.76 tok/s), 8 rounds, 15.88 tok/round
+oracle w=16: round 403.99 ms mean, 403.77 ms warm (first 405.55), oracle wall 39.30 tok/s
+oracle w=16: S(w) = 2.051x mean, 2.052x warm | agreement 126/127 (99.2%)
+oracle w=16: state gate PASS (probe 51595 vs 51595, position 143 vs 143, logits max|d| 0.05193)

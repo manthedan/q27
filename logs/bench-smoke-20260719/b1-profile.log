@@ -1,0 +1,6 @@
+backend: Apple M4, 64 simulated tokens at context 128, fp16 KV, binary weights
+weight stream per token: 3.36 GiB
+decode step: 68.4 ms/token, 14.62 tok/s, effective weight stream 52.7 GB/s
+per-token bytes: 3603087360 (3.356 GiB)
+power-state: pmset thermal anchor only (powermetrics needs root), log logs/bench-smoke-20260719/b1-profile.power.log
+thermal: start[No thermal warning level has been recorded No performance warning level has been recorded No CPU power status has been recorded ] end[No thermal warning level has been recorded No performance warning level has been recorded No CPU power status has been recorded ]

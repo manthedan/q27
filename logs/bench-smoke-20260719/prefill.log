@@ -1,0 +1,5 @@
+backend: Apple M4, 120-token synthetic prompt in chunks of 96, fp16 KV
+weight stream per chunk: 12.08 GiB
+prefill: 1825.6 ms/chunk, 32.87 tok/s, effective weight stream 7.1 GB/s
+power-state: pmset thermal anchor only (powermetrics needs root), log logs/bench-smoke-20260719/prefill.power.log
+thermal: start[No thermal warning level has been recorded No performance warning level has been recorded No CPU power status has been recorded ] end[No thermal warning level has been recorded No performance warning level has been recorded No CPU power status has been recorded ]

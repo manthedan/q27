@@ -1,0 +1,470 @@
+GPU queue start 10:09:39
+=== sweep b1 10:11:39 ===
+sweep b1 done
+=== sweep official 10:13:20 ===
+sweep official done
+=== arm t2-base 10:18:33 ===
+[1/60] c01
+[2/60] c02
+[3/60] c03
+[4/60] c04
+[5/60] c05
+[6/60] c06
+[7/60] c07
+[8/60] c08
+[9/60] c09
+[10/60] c10
+[11/60] c11
+[12/60] c12
+[13/60] c13
+[14/60] c14
+[15/60] c15
+[16/60] c16
+[17/60] c17
+[18/60] c18
+[19/60] c19
+[20/60] c20
+[21/60] c21
+[22/60] c22
+[23/60] c23
+[24/60] c24
+[25/60] c25
+[26/60] c26
+[27/60] c27
+[28/60] c28
+[29/60] c29
+[30/60] c30
+[31/60] c31
+[32/60] c32
+[33/60] c33
+[34/60] c34
+[35/60] c35
+[36/60] c36
+[37/60] c37
+[38/60] c38
+[39/60] c39
+[40/60] c40
+[41/60] c41
+[42/60] c42
+FAIL c43: attempt 2: <urlopen error [Errno 61] Connection refused>
+[43/60] c43 (failed)
+FAIL c44: attempt 2: <urlopen error [Errno 61] Connection refused>
+[44/60] c44 (failed)
+FAIL c45: attempt 2: <urlopen error [Errno 61] Connection refused>
+[45/60] c45 (failed)
+FAIL c46: attempt 2: <urlopen error [Errno 61] Connection refused>
+[46/60] c46 (failed)
+FAIL c47: attempt 2: <urlopen error [Errno 61] Connection refused>
+[47/60] c47 (failed)
+FAIL c48: attempt 2: <urlopen error [Errno 61] Connection refused>
+[48/60] c48 (failed)
+FAIL c49: attempt 2: <urlopen error [Errno 61] Connection refused>
+[49/60] c49 (failed)
+[50/60] c50
+[51/60] c51
+[52/60] c52
+[53/60] c53
+[54/60] c54
+[55/60] c55
+[56/60] c56
+[57/60] c57
+[58/60] c58
+[59/60] c59
+[60/60] c60
+wrote 60 rows to logs/eval-census/.t2-base.run.0pEOOY/t2-base.choice.jsonl, 7 failed
+logs/bench-smoke-20260719/run_gpu_queue.sh: line 58: 10192 Terminated: 15          nohup caffeinate -i nice ./build/q27-metal-server "$model" "$TOK" --ctx 8192 --port 8213 --max-tokens-default 8192 > "$LOG/eval-server.log" 2>&1
+arm t2-base FAILED
+=== arm b1-base 11:50:55 ===
+[1/60] c01
+[2/60] c02
+[3/60] c03
+[4/60] c04
+[5/60] c05
+[6/60] c06
+[7/60] c07
+[8/60] c08
+[9/60] c09
+[10/60] c10
+[11/60] c11
+[12/60] c12
+[13/60] c13
+[14/60] c14
+[15/60] c15
+[16/60] c16
+[17/60] c17
+[18/60] c18
+[19/60] c19
+[20/60] c20
+[21/60] c21
+[22/60] c22
+[23/60] c23
+[24/60] c24
+[25/60] c25
+[26/60] c26
+[27/60] c27
+[28/60] c28
+[29/60] c29
+[30/60] c30
+[31/60] c31
+[32/60] c32
+[33/60] c33
+[34/60] c34
+[35/60] c35
+[36/60] c36
+[37/60] c37
+[38/60] c38
+[39/60] c39
+[40/60] c40
+[41/60] c41
+[42/60] c42
+[43/60] c43
+[44/60] c44
+[45/60] c45
+[46/60] c46
+[47/60] c47
+[48/60] c48
+[49/60] c49
+[50/60] c50
+[51/60] c51
+[52/60] c52
+[53/60] c53
+[54/60] c54
+[55/60] c55
+[56/60] c56
+[57/60] c57
+[58/60] c58
+[59/60] c59
+[60/60] c60
+wrote 60 rows to logs/eval-census/.b1-base.run.FLNxoT/b1-base.choice.jsonl, 0 failed
+[1/40] n01
+[2/40] n02
+[3/40] n03
+[4/40] n04
+[5/40] n05
+[6/40] n06
+[7/40] n07
+[8/40] n08
+[9/40] n09
+[10/40] n10
+[11/40] n11
+[12/40] n12
+[13/40] n13
+[14/40] n14
+[15/40] n15
+[16/40] n16
+[17/40] n17
+[18/40] n18
+[19/40] n19
+[20/40] n20
+[21/40] n21
+[22/40] n22
+[23/40] n23
+[24/40] n24
+[25/40] n25
+[26/40] n26
+[27/40] n27
+[28/40] n28
+[29/40] n29
+[30/40] n30
+[31/40] n31
+[32/40] n32
+[33/40] n33
+[34/40] n34
+[35/40] n35
+[36/40] n36
+[37/40] n37
+[38/40] n38
+[39/40] n39
+[40/40] n40
+wrote 40 rows to logs/eval-census/.b1-base.run.FLNxoT/b1-base.numeric.jsonl, 0 failed
+[1/20] f01
+[2/20] f02
+[3/20] f03
+[4/20] f04
+[5/20] f05
+[6/20] f06
+[7/20] f07
+[8/20] f08
+[9/20] f09
+[10/20] f10
+[11/20] f11
+[12/20] f12
+[13/20] f13
+[14/20] f14
+[15/20] f15
+[16/20] f16
+[17/20] f17
+[18/20] f18
+[19/20] f19
+[20/20] f20
+wrote 20 rows to logs/eval-census/.b1-base.run.FLNxoT/b1-base.freeform.jsonl, 0 failed
+run_arm: b1-base complete run=90f8b9c7924e44c2a0eb1b81b12f8632 (bonsai-27b-b1.q27 md5=3b9545dc8b723342c98ee148ca1c8e72 resident_sha1=3aceaf75a77ca06a09fa0e44745a00344a3fefec) -> logs/eval-census/b1-base.{choice,numeric,freeform}.jsonl
+logs/bench-smoke-20260719/run_gpu_queue.sh: line 55: 79100 Terminated: 15          nohup caffeinate -i nice ./build/q27-metal-server "$model" "$TOK" --ctx 8192 --port 8213 --max-tokens-default 8192 > "$LOG/eval-server.log" 2>&1
+arm b1-base done
+=== arm gdn-pair 13:31:35 ===
+[1/60] c01
+[2/60] c02
+[3/60] c03
+[4/60] c04
+[5/60] c05
+[6/60] c06
+[7/60] c07
+[8/60] c08
+[9/60] c09
+[10/60] c10
+[11/60] c11
+[12/60] c12
+[13/60] c13
+[14/60] c14
+[15/60] c15
+[16/60] c16
+[17/60] c17
+[18/60] c18
+[19/60] c19
+[20/60] c20
+[21/60] c21
+[22/60] c22
+[23/60] c23
+[24/60] c24
+[25/60] c25
+[26/60] c26
+[27/60] c27
+[28/60] c28
+[29/60] c29
+[30/60] c30
+[31/60] c31
+[32/60] c32
+[33/60] c33
+[34/60] c34
+[35/60] c35
+[36/60] c36
+[37/60] c37
+[38/60] c38
+[39/60] c39
+[40/60] c40
+[41/60] c41
+[42/60] c42
+[43/60] c43
+[44/60] c44
+[45/60] c45
+[46/60] c46
+[47/60] c47
+[48/60] c48
+[49/60] c49
+[50/60] c50
+[51/60] c51
+[52/60] c52
+[53/60] c53
+[54/60] c54
+[55/60] c55
+[56/60] c56
+[57/60] c57
+[58/60] c58
+[59/60] c59
+[60/60] c60
+wrote 60 rows to logs/eval-census/.gdn-pair.run.tlDix8/gdn-pair.choice.jsonl, 0 failed
+[1/40] n01
+[2/40] n02
+[3/40] n03
+[4/40] n04
+[5/40] n05
+[6/40] n06
+[7/40] n07
+[8/40] n08
+[9/40] n09
+[10/40] n10
+[11/40] n11
+[12/40] n12
+[13/40] n13
+[14/40] n14
+[15/40] n15
+[16/40] n16
+[17/40] n17
+[18/40] n18
+[19/40] n19
+[20/40] n20
+[21/40] n21
+[22/40] n22
+[23/40] n23
+[24/40] n24
+[25/40] n25
+[26/40] n26
+[27/40] n27
+[28/40] n28
+[29/40] n29
+[30/40] n30
+[31/40] n31
+[32/40] n32
+[33/40] n33
+[34/40] n34
+[35/40] n35
+[36/40] n36
+[37/40] n37
+[38/40] n38
+[39/40] n39
+[40/40] n40
+wrote 40 rows to logs/eval-census/.gdn-pair.run.tlDix8/gdn-pair.numeric.jsonl, 0 failed
+[1/20] f01
+[2/20] f02
+[3/20] f03
+[4/20] f04
+[5/20] f05
+[6/20] f06
+[7/20] f07
+[8/20] f08
+[9/20] f09
+[10/20] f10
+[11/20] f11
+[12/20] f12
+[13/20] f13
+[14/20] f14
+[15/20] f15
+[16/20] f16
+[17/20] f17
+[18/20] f18
+[19/20] f19
+[20/20] f20
+wrote 20 rows to logs/eval-census/.gdn-pair.run.tlDix8/gdn-pair.freeform.jsonl, 0 failed
+run_arm: gdn-pair complete run=70dc6adcc2014c72b8da1242a840a915 (gdn-pair-arm.q27 md5=107647e9cba0f01a003934011644c2fe resident_sha1=fc263de5f69d321085c416029b2b74e749e4a4db) -> logs/eval-census/gdn-pair.{choice,numeric,freeform}.jsonl
+logs/bench-smoke-20260719/run_gpu_queue.sh: line 55: 54048 Terminated: 15          nohup caffeinate -i nice ./build/q27-metal-server "$model" "$TOK" --ctx 8192 --port 8213 --max-tokens-default 8192 > "$LOG/eval-server.log" 2>&1
+arm gdn-pair done
+=== arm m1-candidate 14:41:31 ===
+[1/60] c01
+[2/60] c02
+[3/60] c03
+[4/60] c04
+[5/60] c05
+[6/60] c06
+[7/60] c07
+[8/60] c08
+[9/60] c09
+[10/60] c10
+[11/60] c11
+[12/60] c12
+[13/60] c13
+[14/60] c14
+[15/60] c15
+[16/60] c16
+[17/60] c17
+[18/60] c18
+[19/60] c19
+[20/60] c20
+[21/60] c21
+[22/60] c22
+[23/60] c23
+[24/60] c24
+[25/60] c25
+[26/60] c26
+[27/60] c27
+[28/60] c28
+[29/60] c29
+[30/60] c30
+[31/60] c31
+[32/60] c32
+[33/60] c33
+[34/60] c34
+[35/60] c35
+[36/60] c36
+[37/60] c37
+[38/60] c38
+[39/60] c39
+[40/60] c40
+[41/60] c41
+[42/60] c42
+[43/60] c43
+[44/60] c44
+[45/60] c45
+[46/60] c46
+[47/60] c47
+[48/60] c48
+[49/60] c49
+[50/60] c50
+[51/60] c51
+[52/60] c52
+[53/60] c53
+[54/60] c54
+[55/60] c55
+[56/60] c56
+[57/60] c57
+[58/60] c58
+[59/60] c59
+[60/60] c60
+wrote 60 rows to logs/eval-census/.m1-candidate.run.e2Tt3R/m1-candidate.choice.jsonl, 0 failed
+[1/40] n01
+[2/40] n02
+[3/40] n03
+[4/40] n04
+[5/40] n05
+[6/40] n06
+[7/40] n07
+[8/40] n08
+[9/40] n09
+[10/40] n10
+[11/40] n11
+[12/40] n12
+[13/40] n13
+[14/40] n14
+[15/40] n15
+[16/40] n16
+[17/40] n17
+[18/40] n18
+[19/40] n19
+[20/40] n20
+[21/40] n21
+[22/40] n22
+[23/40] n23
+[24/40] n24
+[25/40] n25
+[26/40] n26
+[27/40] n27
+[28/40] n28
+[29/40] n29
+[30/40] n30
+[31/40] n31
+[32/40] n32
+[33/40] n33
+[34/40] n34
+[35/40] n35
+[36/40] n36
+[37/40] n37
+[38/40] n38
+[39/40] n39
+[40/40] n40
+wrote 40 rows to logs/eval-census/.m1-candidate.run.e2Tt3R/m1-candidate.numeric.jsonl, 0 failed
+[1/20] f01
+[2/20] f02
+[3/20] f03
+[4/20] f04
+[5/20] f05
+[6/20] f06
+[7/20] f07
+[8/20] f08
+[9/20] f09
+[10/20] f10
+[11/20] f11
+[12/20] f12
+[13/20] f13
+[14/20] f14
+[15/20] f15
+[16/20] f16
+[17/20] f17
+[18/20] f18
+[19/20] f19
+[20/20] f20
+wrote 20 rows to logs/eval-census/.m1-candidate.run.e2Tt3R/m1-candidate.freeform.jsonl, 0 failed
+run_arm: m1-candidate complete run=2a22372287404c4f87027b3b9c04564b (bonsai-27b-m1.q27 md5=91db7fdd368ba3558e59bb5e111bbd07 resident_sha1=9eaf2dd1b72847c53d0a9b911311dc689fbb0e05) -> logs/eval-census/m1-candidate.{choice,numeric,freeform}.jsonl
+logs/bench-smoke-20260719/run_gpu_queue.sh: line 55:  7606 Terminated: 15          nohup caffeinate -i nice ./build/q27-metal-server "$model" "$TOK" --ctx 8192 --port 8213 --max-tokens-default 8192 > "$LOG/eval-server.log" 2>&1
+arm m1-candidate done
+GPU queue done 15:39:15
+b1-base.choice.jsonl
+b1-base.freeform.jsonl
+b1-base.numeric.jsonl
+b1-base.provenance.json
+gdn-pair.choice.jsonl
+gdn-pair.freeform.jsonl
+gdn-pair.numeric.jsonl
+gdn-pair.provenance.json
+m1-candidate.choice.jsonl
+m1-candidate.freeform.jsonl
+m1-candidate.numeric.jsonl
+m1-candidate.provenance.json
