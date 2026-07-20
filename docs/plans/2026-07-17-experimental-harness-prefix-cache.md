@@ -214,3 +214,13 @@ identical-prefix turns hit) — zero new code; (b) defer Claude Code until the
 extractor is generalized properly. Decision recorded 2026-07-20: write up
 and stop; Codex ships as the working capture, Claude Code awaits the
 extractor design pass.
+
+**Proxy safety note (autoreview, landed):** because the extractor rejects the
+trailing-system shape, the proxy must NOT inline-prewarm `/v1/messages` —
+doing so on a first streaming Claude Code request would 400 and fail the live
+turn. `/v1/messages` is therefore **dump-only**: the proxy harvests the
+request via `--dump-request` for out-of-band `prewarm`, marks itself warmed,
+and forwards normally, so live Claude Code turns are never broken by the
+capture path. `chat_completions`/`responses` (Pi/Codex, which end in a user
+turn) still inline-prewarm. Once the extractor is generalized, `/v1/messages`
+can move from dump-only to inline-prewarm.
