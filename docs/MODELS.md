@@ -155,3 +155,68 @@ contains **no model weights and no private prompts** — just machine specs,
 thermal anchors, per-tier tok/s, artifact md5s, and one fixed-prompt
 generation sample. Email it back and we can diagnose and fix the tiers we
 cannot run locally.
+
+## 6. Try the native agent (experimental)
+
+The formula also installs **`q27-agent`**, a native C/C++ agent that links the
+engine directly — no server, no HTTP, no Anthropic/OpenAI shim. It owns the
+transcript, durable sessions, auto-compaction, and a set of local tools
+(read / search / write / edit / shell). **It is a Phase-0 experiment, not a
+finished product**: the terminal UX is a plain read-eval loop (a real TUI is on
+the roadmap), and it is the thing we most want feedback on.
+
+It uses whatever pack you already pulled — the `q27 agent` wrapper resolves
+the model and tokenizer for you (default pack **b1**, or pass another):
+
+```bash
+q27 agent          # b1
+q27 agent t2       # or default / any installed pack
+```
+
+**Read this before you run it.** `q27 agent` turns the model's local tools on
+automatically and uses your **current directory** as the agent's workspace.
+The file tools stay inside that directory, but the shell tool runs with your
+local account's normal filesystem access — so **`cd` into a scratch directory
+first, not a real project:**
+
+```bash
+mkdir -p /tmp/q27-play && cd /tmp/q27-play
+q27 agent
+```
+
+Type a prompt, Enter; `:quit` exits. Try `Create hello.py that prints hello,
+then run it`.
+
+Sessions are opt-in and durable (autosave + resume). Point the wrapper at a
+session file and it reuses it across runs:
+
+```bash
+cd /tmp/q27-play
+Q27_AGENT_SESSION=work.q27agent q27 agent b1
+```
+
+A one-shot answer with no tools and no session (bypass the wrapper, straight
+to the binary):
+
+```bash
+q27-agent ~/.q27/models/b1/*.q27 ~/.q27/models/b1/*.tok \
+  --prompt 'Reply with exactly: ready' --no-think
+```
+
+Useful env knobs for the wrapper: `Q27_AGENT_PACK` (default pack, instead of
+the `[name]` argument), `Q27_AGENT_WORKSPACE` (override the workspace without
+`cd`), `Q27_AGENT_CONTEXT` (default 32768), `Q27_AGENT_MAX_TOKENS` (default
+`auto`). Inside the agent,
+`--max-tool-rounds N` (default 8) bounds how many tool calls one turn can
+chain, and `--compact-at`/`--compact-keep` tune auto-compaction.
+
+Recommended tiers: **b1** or **t2** on 16 GB (fast, and the raw-payload file
+path is most exercised there); any official tier on bigger machines.
+
+**What to report:** crashes or hangs, a session that fails to resume, the
+model writing outside the workspace (the current dir, or `Q27_AGENT_WORKSPACE`),
+a tool call looping past
+`--max-tool-rounds`, or anything where the agent's answer diverges from the
+same prompt through `q27 serve`. The exact command line and the session file
+are usually enough to reproduce it. Note the agent is CLI-only and not part of
+`q27 report` yet — for now just describe what you saw and include the command.
