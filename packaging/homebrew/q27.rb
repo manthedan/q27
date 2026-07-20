@@ -11,11 +11,7 @@ class Q27 < Formula
   desc "Ternary-quantized 27B LLM inference engine for Apple silicon (Metal)"
   homepage "https://github.com/manthedan/q27"
   url "https://github.com/manthedan/q27/archive/refs/tags/v0.3.0.tar.gz"
-  # IMPORTANT: this sha256 is the LOCAL git-archive hash of v0.3.0 and is a
-  # PLACEHOLDER. GitHub's auto-generated tarball has different bytes. After
-  # `git push origin v0.3.0`, regenerate and replace:
-  #   curl -sL https://github.com/manthedan/q27/archive/refs/tags/v0.3.0.tar.gz | shasum -a 256
-  sha256 "69b086ce026664f807f8f47ee365e5ea2eb89eff7f8c170fc3e2834546734a68"
+  sha256 "1f8dd130c33d4f6517ce6c268db170df38f35b60a40851628f4ebcadbaca56ca"
   license "MIT"
 
   depends_on :macos
