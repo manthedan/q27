@@ -72,12 +72,29 @@ case "$KIND" in
         exit 0
         ;;
     direct)
-        # Fast path needs BOTH the artifact verified AND the tokenizer
-        # present; a verified artifact with a missing/empty .tok (a prior run
-        # that died mid-tokenizer-download) must fall through and repair, not
-        # exit "already present" and dead-end the user (codex P2).
+        # A tokenizer is only trusted if it parses (Q27T magic), not merely
+        # present — a partial curl -C - remnant must not be accepted (codex P1).
+        tok_valid() {
+            local t; for t in "$DEST"/*.tok; do
+                [ -f "$t" ] || continue
+                [ "$(head -c 4 "$t" 2>/dev/null)" = "Q27T" ] && return 0
+            done; return 1
+        }
+        # Validate a freshly downloaded staged tokenizer, then publish it
+        # atomically. Returns nonzero (leaving nothing behind) on a bad magic.
+        tok_valid_mv() {
+            local part="$1" final="$2"
+            if [ -f "$part" ] && [ "$(head -c 4 "$part" 2>/dev/null)" = "Q27T" ]; then
+                mv -f "$part" "$final"; return 0
+            fi
+            rm -f "$part"; return 1
+        }
+        # Fast path needs BOTH the artifact verified AND a valid tokenizer; a
+        # verified artifact with a missing/invalid .tok (a prior run that died
+        # mid-tokenizer-download) must fall through and repair, not exit
+        # "already present" and dead-end the user (codex P2).
         if [ -f "$ART" ] && [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" = "$EXPECT_MD5" ] \
-           && ls "$DEST"/*.tok >/dev/null 2>&1; then
+           && tok_valid; then
             echo "q27-fetch: $ART_FILE already present and verified"; exit 0
         fi
         # Only re-download the artifact if it is missing or fails verification;
@@ -90,10 +107,23 @@ case "$KIND" in
                 echo "q27-fetch: md5 MISMATCH on $ART_FILE — aborting"; exit 1
             fi
         fi
-        if [ "$TOK_KIND" = "direct" ] && ! ls "$DEST"/*.tok >/dev/null 2>&1; then
+        if [ "$TOK_KIND" = "direct" ] && ! tok_valid; then
             echo "q27-fetch: downloading tokenizer"
-            hf_download "qwen36-27b-mtp.tok" "$DEST/qwen36-27b-mtp.tok" ||
-                { echo "q27-fetch: tokenizer download failed — re-run \`q27 pull $NAME\` to resume"; exit 1; }
+            # The tokenizer shares the artifact's basename (<name>.tok). The
+            # official tiers predate this and ship qwen36-27b-mtp.tok. Download
+            # to a temp name and mv into place only on success, so a failed or
+            # partial attempt never masquerades as installed; and remove the
+            # derived-name attempt before falling back so it cannot shadow the
+            # official tokenizer in q27_tokenizer_path's first-glob pick.
+            tok_base="${ART_FILE%.q27}.tok"
+            if hf_download "$tok_base" "$DEST/$tok_base.part" && tok_valid_mv "$DEST/$tok_base.part" "$DEST/$tok_base"; then
+                :
+            else
+                rm -f "$DEST/$tok_base.part" "$DEST/$tok_base"
+                hf_download "qwen36-27b-mtp.tok" "$DEST/qwen36-27b-mtp.tok.part" \
+                    && tok_valid_mv "$DEST/qwen36-27b-mtp.tok.part" "$DEST/qwen36-27b-mtp.tok" \
+                    || { rm -f "$DEST/qwen36-27b-mtp.tok.part"; echo "q27-fetch: tokenizer download failed — re-run \`q27 pull $NAME\` to resume"; exit 1; }
+            fi
         fi
         echo "q27-fetch: $NAME installed at $DEST"
         ;;

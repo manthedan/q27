@@ -12,7 +12,29 @@ Format (little-endian):
 import struct
 import sys
 
+import gguf.constants as _ggc
 from gguf import GGUFReader
+
+
+# The PrismML fork's quant types are absent from mainline gguf-py; forge the
+# enum members so GGUFReader can parse their packs (GGUFReader eagerly builds
+# every tensor even though we only read tokenizer metadata). Mirrors
+# tools/repack.py's _forge_fork_type; (block_size, type_size) per
+# ggml/src/ggml-common.h at tag prism-b9591-62061f9.
+def _forge_fork_type(name, value, blck, tsize):
+    if value in _ggc.GGMLQuantizationType._value2member_map_:
+        return _ggc.GGMLQuantizationType(value)
+    m = int.__new__(_ggc.GGMLQuantizationType, value)
+    m._name_, m._value_ = name, value
+    _ggc.GGMLQuantizationType._member_map_[name] = m
+    _ggc.GGMLQuantizationType._value2member_map_[value] = m
+    _ggc.GGML_QUANT_SIZES[m] = (blck, tsize)
+    return m
+
+
+_forge_fork_type("Q2_0", 42, 128, 34)
+_forge_fork_type("Q1_0", 41, 128, 18)
+
 
 def main():
     src, dst = sys.argv[1], sys.argv[2]

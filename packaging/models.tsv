@@ -20,12 +20,17 @@
 #
 # Official Qwen3.6-27B-MTP tiers live in signalnine/Qwen3.6-27B-MTP-q27 and
 # are direct .q27 downloads verified against that repo's CHECKSUMS.md5.
-# Bonsai ternary/binary tiers are lossless local repacks of prism-ml GGUFs
-# (q27 never redistributes weights), verified by repacked-artifact sha256.
+# Bonsai ternary/binary tiers are lossless repacks of prism-ml GGUFs. They are
+# pre-repacked once and hosted at manthedan/q27-bonsai-packs as direct .q27
+# (+ .tok) downloads verified by md5, so testers need no Python/numpy/gguf.
+# The repack is deterministic and reproducible from the prism-ml GGUF via
+# tools/repack.py (pinned source + artifact sha256 in q27-fetch); the hosted
+# artifacts are byte-identical to that repack. q27 never redistributes the
+# official checkpoint weights.
 #
 name	display	quant_policy	artifact_file	artifact_md5	weights_gb	min_ram_gb	hf_repo	source_kind	tokenizer	experimental	notes
-b1	Bonsai-27B binary (1.125 bpw)	bonsai-b1-v1	bonsai-27b-b1.q27		3.53	8	prism-ml/Bonsai-27B-gguf	repack	gguf	no	Smallest fully-resident 27B; fastest decode on 16 GB; passed the full quality/probe battery.
-t2	Bonsai-27B ternary (2.25 bpw)	bonsai-t2-v1	ternary-bonsai-27b-t2.q27		6.66	16	prism-ml/Ternary-Bonsai-27B-gguf	repack	gguf	no	The 16 GB answer; task quality holds, ~2.1-2.3x official PPL.
+b1	Bonsai-27B binary (1.125 bpw)	bonsai-b1-v1	bonsai-27b-b1.q27	3b9545dc8b723342c98ee148ca1c8e72	3.53	8	manthedan/q27-bonsai-packs	direct	direct	no	Smallest fully-resident 27B; fastest decode on 16 GB; passed the full quality/probe battery.
+t2	Bonsai-27B ternary (2.25 bpw)	bonsai-t2-v1	ternary-bonsai-27b-t2.q27	8babb56d67b63f2308f883912a272bb3	6.66	16	manthedan/q27-bonsai-packs	direct	direct	no	The 16 GB answer; task quality holds, ~2.1-2.3x official PPL.
 m1	Bonsai-27B mixed B1/T2 graft (EXPERIMENTAL)	bonsai-mixed-v1	bonsai-27b-m1.q27		3.57	8	local-only	local	direct	yes	EXPERIMENTAL: mixed-graft thesis is closed (A5 KILL on both corpora) but the pack is kept for users who want to try it; not a supported tier. Built locally via tools/q27_mix.py.
 default	Qwen3.6-27B-MTP official (5.25 bpw)	v1.4	qwen36-27b-mtp.q27	39fd724426088abaef6e0bad66d6dac6	16.51	24	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	Max speed + trained MTP head; the only official tier that fits 24 GB (borderline, needs an idle machine).
 q4s	Qwen3.6-27B-MTP q4s (15.5 GB)	v1.4	qwen36-27b-mtp-q4s.q27	7e5454e0c0ded717136ad3e42634ba25	14.44	20	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	Official 15.5 GB tier; fits 20 GB+ with headroom the 17 GB default lacks.
