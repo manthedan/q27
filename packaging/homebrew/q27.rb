@@ -22,12 +22,30 @@ class Q27 < Formula
     ENV["CXXFLAGS"] =
       %Q{-O2 -std=c++17 -Wall -Wextra -DQ27_SHADER_PATH='"#{shader}"'}
     system "make", "build/q27-metal", "build/q27-metal-server",
-           "build/tokenize_to_bin"
+           "build/tokenize_to_bin",
+           "build/metal_decode_bench", "build/metal_prefill_bench"
     bin.install "build/q27-metal"
     bin.install "build/q27-metal-server"
-    bin.install "build/tokenize_to_bin" => "q27-tokenize"
+    bin.install "build/tokenize_to_bin" => "************"
+    bin.install "build/metal_decode_bench"
+    bin.install "build/metal_prefill_bench"
     pkgshare.install "src/metal/q27_kernels.metal"
-    doc.install "README.md", "docs/METAL_PROGRESS.md"
+
+    # The supervisor wrapper, bench/report tools, model registry, and the
+    # python repack/tokenizer tools. These scripts resolve their dependencies
+    # RELATIVE to their own location (bin/../lib, bin/../models.tsv,
+    # ../share/q27-tools, and a dev build/ dir). To keep that resolution
+    # intact under Homebrew, install the whole tree under libexec/q27 in the
+    # same shape as packaging/, then symlink the entry points into bin/.
+    (libexec/"q27/bin").install Dir["packaging/bin/*"]
+    (libexec/"q27/lib").install "packaging/lib/q27_bench_lib.sh"
+    (libexec/"q27").install "packaging/models.tsv"
+    (libexec/"q27/share/q27-tools").install "tools/repack.py",
+                                           "tools/export_tokenizer.py"
+    %w[q27 q27-bench q27-report q27-fetch].each do |t|
+      bin.install_symlink libexec/"q27/bin"/t
+    end
+    doc.install "README.md", "docs/METAL_PROGRESS.md", "docs/MODELS.md"
   end
 
   def caveats

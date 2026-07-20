@@ -89,6 +89,10 @@ The parked list is as load-bearing as the shipped list.
 The lab records are the real documentation of *why* things are the way
 they are.
 
+- [docs/MODELS.md](docs/MODELS.md): **which pack (quant) and context window
+  for your Mac** — the M-chip speed table, the quant×context memory-fit
+  table, and the recommendation guide behind `q27 recommend`. Start here as
+  a user.
 - [docs/METAL_PROGRESS.md](docs/METAL_PROGRESS.md): the Metal ledger,
   with a maintained **Current state** table on top of an append-only
   dated chronicle. Start here for the Apple Silicon side.
@@ -107,6 +111,12 @@ they are.
   register, and progress logs verbatim. No longer maintained.
 
 ## Model weights
+
+**Easy way (Homebrew):** `brew install manthedan/tap/q27`, then `q27 pull`
+auto-picks the right pack for your RAM and `q27 serve` boots it. See
+[docs/MODELS.md](docs/MODELS.md) for the pack/context/speed tables and the
+experimental packs. The manual flow below is what `q27 pull` runs under the
+hood.
 
 Everything is Apache-2.0. The three official-model tiers live in one repo
 ([signalnine/Qwen3.6-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.6-27B-MTP-q27)),
