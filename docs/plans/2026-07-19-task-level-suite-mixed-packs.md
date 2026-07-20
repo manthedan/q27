@@ -170,3 +170,54 @@ truncates. Both confounds collapse to one: budget too small for
 thinking-mode. Re-score after a 2048+ re-run; the capability axis stays
 OPEN until then. Generation corpus + provenance retained in
 `logs/eval-census/`.
+
+## RESULTS 2 — confound-controlled re-run at max_tokens 4096 (2026-07-20, 24 GB M4)
+
+Harness fixed (commit c16dae0): gen_runner records `stop_reason` + `thinking`
+per row; accuracy.py scores only `end_turn`/`stop` rows (truncated rows
+dropped from numerator AND denominator, counted in a new `excl` column;
+pre-fix corpora fail closed). run_arm.sh max_tokens now
+`Q27_EVAL_MAX_TOKENS` (default 4096). Re-ran all four arms into
+`logs/eval-census-4k/` with full provenance; every arm's servers stayed up
+(0 connection-refused across the whole run — the 4096 budget also removed
+the mid-run crash class from the first attempt).
+
+Empty-response artifact CONFIRMED dead at 4096: t2-base choice went from 13
+empty (1024) to **0 empty**, all `end_turn`. The 1024 "capability ranking"
+was the thinking-budget artifact, as diagnosed.
+
+**4096 scores (end_turn rows only):**
+
+| arm | choice | numeric | freeform | overall | excl |
+|---|---|---|---|---|---|
+| t2-base      | 60/60 (1.00) | 40/40 (1.00) | 19/19 (1.00) | 119/119 (1.000) | 1 |
+| b1-base      | 59/59 (1.00) | 40/40 (1.00) | 19/19 (1.00) | 118/118 (1.000) | 2 |
+| gdn-pair     | 59/59 (1.00) | 37/37 (1.00) | 19/19 (1.00) | 115/115 (1.000) | 5 |
+| m1-candidate | 59/60 (0.98) | 40/40 (1.00) | 20/20 (1.00) | 119/120 (0.992) | 0 |
+
+**Verdict: the probe SATURATES — no discriminative power.** Once generation
+completes, all four tiers ace this 120-prompt set (choice/numeric/freeform
+are short-form knowledge + simple reasoning that a 27B ternary, a 27B
+binary, and both mixed packs all answer correctly under thinking-mode
+greedy). The only non-100% row anywhere is m1-candidate c16 (binary→decimal
+1011, a single arithmetic slip). There is no measurable B1→T2 task gap on
+this set, so `gap-recovered` is undefined and the "does the KL rotation
+cost task accuracy" question **cannot be answered by this probe** — it is
+below the floor of every tier here.
+
+**What this run DID establish (the useful residue):**
+1. The empty-response bug is fully explained and fixed (harness budget, not
+   server/model). The 1024 numbers are retired as artifact.
+2. The harness is now sound: stop_reason-aware scoring, provenance-bound,
+   fail-closed. It is reusable.
+3. **This 120-prompt probe is too easy to discriminate 27B tiers.** A
+   capability gate that can actually separate B1 from T2 (and test whether
+   the A5 KL rotation is task-silent) needs harder items — multi-step
+   reasoning, long-chain math, or a held-out set where T2 demonstrably
+   beats B1. Until such a set exists, task-level capability comparison of
+   the tiers is UNMEASURED (not "no difference" — "no instrument"). The
+   whitepaper's long-chain-reasoning benchmarks are the right shape; our
+   own short-form probe is not.
+
+The serving thesis stays closed (A5). Corpus + provenance retained in
+`logs/eval-census-4k/` for any future harder-set reuse of the harness.

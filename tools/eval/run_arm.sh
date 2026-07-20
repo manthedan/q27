@@ -79,10 +79,15 @@ with open(path,"w") as f:
                "server_boot":server_boot,"run_id":run_id},f,sort_keys=True)
     f.write("\n")
 PY
+# max_tokens must budget thinking + answer, not answer alone (the 2026-07-19
+# thinking-budget artifact: at 1024 the think block exhausts the budget and
+# no text block is emitted). 4096 covers the observed T2 thinking; override
+# with Q27_EVAL_MAX_TOKENS. The scorer drops any row that still truncates.
+MAX_TOKENS=${Q27_EVAL_MAX_TOKENS:-4096}
 for mode in choice numeric freeform; do
     python3 tools/eval/gen_runner.py "tools/eval/prompts/$mode.jsonl" \
         --out "$TMP/$ARM.$mode.jsonl" --base-url "$URL" \
-        --api anthropic --max-tokens 1024 --tag "$ARM-$RUN_ID-$mode"
+        --api anthropic --max-tokens "$MAX_TOKENS" --tag "$ARM-$RUN_ID-$mode"
 done
 FINAL_HEALTH=$(curl --noproxy '*' -fsS "$URL/health?identity=1") || { echo "run_arm: final server health failed" >&2; exit 2; }
 FINAL_ROW=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("model","")+"\t"+d.get("artifact_sha1","")+"\t"+d.get("boot_id","")+"\t"+json.dumps(d.get("runtime"),sort_keys=True,separators=(",",":")))' "$FINAL_HEALTH")
