@@ -23,12 +23,17 @@ class Q27 < Formula
       %Q{-O2 -std=c++17 -Wall -Wextra -DQ27_SHADER_PATH='"#{shader}"'}
     system "make", "build/q27-metal", "build/q27-metal-server",
            "build/tokenize_to_bin",
-           "build/metal_decode_bench", "build/metal_prefill_bench"
+           "build/metal_decode_bench", "build/metal_prefill_bench",
+           "build/q27-agent"
     bin.install "build/q27-metal"
     bin.install "build/q27-metal-server"
     bin.install "build/tokenize_to_bin" => "************"
     bin.install "build/metal_decode_bench"
     bin.install "build/metal_prefill_bench"
+    # The experimental native agent (durable sessions + compaction). It links
+    # the engine directly and inherits the baked Q27_SHADER_PATH, so it runs
+    # from any directory like the other binaries. See caveats.
+    bin.install "build/q27-agent"
     pkgshare.install "src/metal/q27_kernels.metal"
 
     # The supervisor wrapper, bench/report tools, model registry, and the
@@ -60,6 +65,12 @@ class Q27 < Formula
       Chunked prefill and speculative decoding need an Apple7+ GPU family
       device (M1 or newer). 16 GB unified memory is a practical minimum for
       the 27B ternary artifact.
+
+      EXPERIMENTAL: q27-agent is the native agent (durable sessions +
+      compaction, no server). It is a Phase-0 experiment, not a finished
+      product:
+
+        q27-agent MODEL.q27 MODEL.tok --session work.q27agent
     EOS
   end
 
@@ -68,5 +79,7 @@ class Q27 < Formula
     # which also proves the binary links and launches.
     assert_match "usage:", shell_output("#{bin}/q27-metal 2>&1", 1)
     assert_match "usage:", shell_output("#{bin}/q27-metal-server 2>&1", 1)
+    # q27-agent prints usage to stderr and exits 2 with no model/tokenizer.
+    assert_match "usage:", shell_output("#{bin}/q27-agent 2>&1", 2)
   end
 end
