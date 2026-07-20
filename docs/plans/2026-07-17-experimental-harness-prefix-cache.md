@@ -173,8 +173,44 @@ immediately + lets the first request ride ordinary prefill while the
 snapshot builds, or a longer-heartbeat SSE path) is required before the
 blocking proxy is usable interactively for large-prompt harnesses.
 
-**Claude Code 2.1.214: NOT yet captured.** Messages-API support now exists
-(endpoint + proxy + direct prewarm), but Claude Code is closed-source, so
-its exact initial request cannot be reconstructed from a repo — it must be
-harvested live via `--dump-request` the same way Codex was. Pending the same
-async-prewarm caveat for its (larger) system prompt.
+**Claude Code 2.1.215: harvested, but its request shape does NOT fit the
+prewarm contract — capture blocked on an extractor generalization.**
+
+Capture plumbing (all landed): the proxy accepts Anthropic `x-api-key` as a
+capture credential and strips it before forwarding (it is a secret); Claude
+Code's `Authorization: Bearer` is driven by `ANTHROPIC_AUTH_TOKEN` (NOT
+`ANTHROPIC_API_KEY` — Claude Code prefers its stored OAuth and only honors
+`ANTHROPIC_AUTH_TOKEN` for the Bearer header on a custom base URL). Its
+request path is `/v1/messages?beta=true` (the proxy's query-stripping path
+match already handles the `?beta=true`). With `ANTHROPIC_BASE_URL=:8081` +
+`ANTHROPIC_AUTH_TOKEN=<capture>`, one `claude -p` run dumped the exact
+request via `--dump-request`: 99.6 KB body, `api=messages`, 3 system blocks
+(6,203 chars) + 27 tools + 2 raw messages.
+
+**The blocker (structural, not config).** After the server's OWN
+`anthropic_msgs` canonicalizer runs, Claude Code's message list is:
+
+    [system(6203 chars), user(331 chars), system(7672 chars)]
+
+i.e. it ENDS in a system block — the large trailing injected
+system-reminder / tool-context — not in a final user message.
+`initial_harness_prefix` hard-requires "zero or more system messages
+followed by exactly one final user message" and throws `400: prewarm
+requires an initial request ending in one user message`. Pi and Codex both
+end in a clean user turn, so the assumption held for them; Claude Code
+2.1.215 injects its context as a trailing system block, breaking it. The
+static prefix is still well-defined (everything before the live user turn,
+plus arguably the trailing system block which is itself largely stable), but
+the current extractor cannot carve it because the live user message is not
+last.
+
+**Fix required (NOT done — deserves its own pre-reg + tests):** generalize
+`initial_harness_prefix` to locate the LAST user message anywhere in the
+canonical list and treat the tail after it as non-static (or, better, as a
+second cacheable-static segment if it is byte-stable across runs). This is a
+safety-critical exact-prefix path; do not hack it ad hoc. Interim options:
+(a) leave Claude Code on ordinary `--snapshot-auto` (first turn cold, later
+identical-prefix turns hit) — zero new code; (b) defer Claude Code until the
+extractor is generalized properly. Decision recorded 2026-07-20: write up
+and stop; Codex ships as the working capture, Claude Code awaits the
+extractor design pass.
