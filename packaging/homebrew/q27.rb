@@ -11,7 +11,7 @@ class Q27 < Formula
   desc "Ternary-quantized 27B LLM inference engine for Apple silicon (Metal)"
   homepage "https://github.com/manthedan/q27"
   url "https://github.com/manthedan/q27/archive/refs/tags/metal-v0.4.0.tar.gz"
-  sha256 "0cdce4ef8b299dd7e100a7f6aaa63a1db5a25d7a0f3c432baf786559c62c74b5"
+  sha256 "73ee46b3c084b013a0049f1febddf22d5720959c1215bafbb353e14a042ce71c"
   # The metal-v* tag line is independent of upstream's v0.3.x CUDA tags; set
   # the version explicitly since the "metal-v" prefix doesn't parse to one.
   version "0.4.0"
