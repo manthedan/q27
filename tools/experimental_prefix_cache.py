@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import sys
+import tempfile
 import threading
 import urllib.parse
 import urllib.request
@@ -154,25 +155,34 @@ class ProxyState:
         # HTTP timeout. Local-only file; it is the harness's own request.
         if not self.dump_request:
             return
+        tmp_path = None
         try:
-            # Owner-only: the dump holds the full harness prompt, tool schemas,
-            # and project/user content. Match the snapshot store's privacy model:
-            # O_NOFOLLOW rejects a symlinked path, and fchmod(0600) forces the
-            # mode even when the file already exists with broader permissions
-            # (the 0600 arg to open() only applies to a freshly created file).
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            fd = os.open(self.dump_request, flags, 0o600)
-            # fchmod BEFORE fdopen takes ownership; fdopen closes fd on exit.
+            # The dump holds the full harness prompt, tool schemas, and
+            # project/user content, so it must never be readable by another
+            # local user. Write a FRESHLY created 0600 temp file in the target's
+            # directory and atomically rename it over the destination: this
+            # refuses to write through a pre-existing symlink and, crucially,
+            # means no other process can hold an already-open readable fd to the
+            # destination while new private content lands (the failure mode of
+            # open(O_TRUNC)+chmod on an existing permissive file).
+            directory = os.path.dirname(os.path.abspath(self.dump_request)) or "."
+            fd, tmp_path = tempfile.mkstemp(prefix=".q27-dump-", dir=directory)
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump({"api": api, "request": request}, stream, indent=2, sort_keys=True)
+            os.replace(tmp_path, self.dump_request)
+            tmp_path = None
             print(f"q27 experimental prefix: captured request dumped to {self.dump_request}",
                   file=sys.stderr, flush=True)
         except OSError as exc:
             print(f"q27 experimental prefix: dump-request write failed: {exc}",
                   file=sys.stderr, flush=True)
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
 
 class PrefixProxy(http.server.BaseHTTPRequestHandler):
