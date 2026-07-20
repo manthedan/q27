@@ -72,18 +72,28 @@ case "$KIND" in
         exit 0
         ;;
     direct)
-        # Artifact + tokenizer straight from HF, md5-verified.
-        if [ -f "$ART" ] && [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" = "$EXPECT_MD5" ]; then
+        # Fast path needs BOTH the artifact verified AND the tokenizer
+        # present; a verified artifact with a missing/empty .tok (a prior run
+        # that died mid-tokenizer-download) must fall through and repair, not
+        # exit "already present" and dead-end the user (codex P2).
+        if [ -f "$ART" ] && [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" = "$EXPECT_MD5" ] \
+           && ls "$DEST"/*.tok >/dev/null 2>&1; then
             echo "q27-fetch: $ART_FILE already present and verified"; exit 0
         fi
-        echo "q27-fetch: downloading $ART_FILE from $REPO ($(FIELD 6) GiB)"
-        hf_download "$ART_FILE" "$ART"
-        if [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" != "$EXPECT_MD5" ]; then
-            echo "q27-fetch: md5 MISMATCH on $ART_FILE — aborting"; exit 1
+        # Only re-download the artifact if it is missing or fails verification;
+        # a healthy artifact is left alone even when we fell through to repair
+        # the tokenizer.
+        if [ ! -f "$ART" ] || { [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" != "$EXPECT_MD5" ]; }; then
+            echo "q27-fetch: downloading $ART_FILE from $REPO ($(FIELD 6) GiB)"
+            hf_download "$ART_FILE" "$ART"
+            if [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" != "$EXPECT_MD5" ]; then
+                echo "q27-fetch: md5 MISMATCH on $ART_FILE — aborting"; exit 1
+            fi
         fi
         if [ "$TOK_KIND" = "direct" ] && ! ls "$DEST"/*.tok >/dev/null 2>&1; then
             echo "q27-fetch: downloading tokenizer"
-            hf_download "qwen36-27b-mtp.tok" "$DEST/qwen36-27b-mtp.tok"
+            hf_download "qwen36-27b-mtp.tok" "$DEST/qwen36-27b-mtp.tok" ||
+                { echo "q27-fetch: tokenizer download failed — re-run \`q27 pull $NAME\` to resume"; exit 1; }
         fi
         echo "q27-fetch: $NAME installed at $DEST"
         ;;

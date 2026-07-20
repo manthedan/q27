@@ -10,6 +10,12 @@
 class Q27 < Formula
   desc "Ternary-quantized 27B LLM inference engine for Apple silicon (Metal)"
   homepage "https://github.com/manthedan/q27"
+  # TODO(release): the url/sha256 below pin the OLD v0.1.0 tag, which does NOT
+  # contain the q27 wrapper (packaging/bin, packaging/lib), models.tsv, the
+  # bench/agent Makefile targets, or docs/MODELS.md that this install block
+  # references. Installing from that tarball FAILS. Before publishing: tag a
+  # new release that includes this bundle, then update url + sha256:
+  #   curl -sL https://github.com/manthedan/q27/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
   url "https://github.com/manthedan/q27/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "42877ca9042daacfa5d580339da1444b61ee4923c41c17735a68b986ba5e1d07"
   license "MIT"
