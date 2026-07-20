@@ -138,11 +138,35 @@ empty-response rate under 1024-token thinking greedy (t2 22 > b1 13 > gdn 10
 Neither says anything about what the models know. The capability question
 this suite was built for remains OPEN.
 
-**To get the real capability axis, control both confounds:** regenerate all
-four arms at a max_tokens high enough that NO completion truncates (e.g.
-2048, or until finish_reason==stop for all) AND with the empty-response
-cause fixed or retried; then score only finish_reason==stop rows. The
-empty-response cause is itself worth a bug: the T2 server returned `""` with
-no error on 13/60 choice prompts — check thinking-mode budget interaction
-and the finish_reason on those rows. Generation corpus + provenance retained
-in `logs/eval-census/` for re-scoring.
+**ROOT CAUSE FOUND (2026-07-19, diagnostic replay, T2 server on :8213):**
+the empty responses are **thinking-mode budget exhaustion**, NOT a server
+bug and NOT capability. `gen_runner.py` sends `--max-tokens 1024` with
+thinking mode ON (server default) and extracts only `type=="text"` blocks
+from the Anthropic response. Replaying c11 at max_tokens=1024 against a
+live T2 server: `stop_reason=max_tokens`, `usage.output_tokens=1024`,
+`content` = **one `thinking` block and NO `text` block** — the model's
+2722-char `<think>` consumed the entire 1024-token budget before any
+visible answer was emitted, so `extract_text` returns `""`. Replaying the
+same prompt at max_tokens=2048: `stop_reason=end_turn`, `content` =
+`[thinking, text]`, correct answer ("The answer is C"). The per-arm empty
+ordering (t2 22 > b1 13 > gdn 10 > m1 2) is exactly the per-arm
+thinking-verbosity ordering: the more verbose the model's reasoning, the
+more often its 1024 budget is exhausted inside the think block. This is a
+**harness configuration bug**, not a model or server defect — the eval set
+max_tokens too low for thinking-mode generation.
+
+**Fix (harness, one line):** the capability suite must budget thinking +
+answer, not answer alone. Either (a) raise gen_runner's `--max-tokens` so
+NO completion truncates (verify `stop_reason=="end_turn"` for every row —
+a `max_tokens` stop is a truncated think, unscoreable), or (b) disable
+thinking for the eval if the intent is short-form answers. Scoring must
+then use only `end_turn` rows. The 1024 cap was sized for the ANSWER, not
+the reasoning the server prepends.
+
+**Note the second artifact is the same root cause in miniature:** T2's
+"completed-but-truncated" rows (n10 cut at "The answer is 1", c20
+mid-sentence) are think+answer overrunning 1024 so the answer itself
+truncates. Both confounds collapse to one: budget too small for
+thinking-mode. Re-score after a 2048+ re-run; the capability axis stays
+OPEN until then. Generation corpus + provenance retained in
+`logs/eval-census/`.
