@@ -15,3 +15,7 @@ bonsai-27b-whitepaper.pdf
 
 # swebench per-run engine journals (transient artifacts)
 bench/swebench/*.journal
+
+# run/bench/eval logs — transient measurement output, not source. Tracked
+# history stays; new changes are ignored.
+logs/
