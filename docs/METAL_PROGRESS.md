@@ -55,12 +55,23 @@ fixtures + one-command re-gate banked for M5/M6)** · slim verifiers
 - Server: slot selection is first-idle with no prefix-match probe;
   `/v1/messages` input-json and `/v1/responses` argument-delta streaming
   remain residue.
-- CUDA server still lacks Metal's ToolCallStreamer, keepalives, and
-  non-streaming disconnect cancellation; port them at the next merge.
-- The NLL-winning `gdn_pair` graft is not a serving candidate (3/4 probes);
-  rescue work is parked until separately funded.
-- The provisional M1 candidate clears the original NLL/suffix/probe gate,
-  but the later A5/A6, direct-decode, two-slot, and 131K gates are pending.
+- ~~CUDA server still lacks Metal's ToolCallStreamer, keepalives, and
+  non-streaming disconnect cancellation; port them at the next merge.~~
+  **SUPERSEDED (2026-07-18, HANDOFF-2026-07-17): CUDA serving adoption is
+  DROPPED, not deferred — do not touch the CUDA code.** Metal is the
+  serving stack; yukon stays as-is and remains a behavioral/numeric oracle
+  only.
+- ~~The NLL-winning `gdn_pair` graft is not a serving candidate (3/4
+  probes); rescue work is parked until separately funded.~~ **CLOSED
+  (2026-07-18):** the gdn_pair rescue exonerated the PACK (the repetition
+  loop was a serving-binary artifact, 6abf45f), then A5-on-gdn_pair KILLED
+  the strongest arm on both corpora (55ac29d). The mixed-graft thesis is
+  permanently closed — a B1→T2 bridge requires training/distillation, not
+  byte-level grafting (measured, not conjectured).
+- ~~The provisional M1 candidate clears the original NLL/suffix/probe
+  gate, but the later A5/A6, direct-decode, two-slot, and 131K gates are
+  pending.~~ **CLOSED with the mixed thesis** — no ship claim; see the
+  gdn_pair exoneration + A5 KILL above.
 
 ### Active work
 

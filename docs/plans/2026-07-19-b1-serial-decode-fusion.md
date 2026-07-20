@@ -56,39 +56,65 @@ compose (B's fused kernel emits float x1 for Bonsai).
 
 ## Gates (both directions, exit codes)
 
-- **G1 byte-identity (hard).** B1 committed output tokens byte-identical
-  pre/post change over a fixed greedy continuation (≥256 tokens) at a
-  fixed prompt; hidden rows byte-identical, OR a tightly registered
-  numeric envelope if Candidate B's reduction order necessarily changes
-  (envelope must be pre-registered, not fit after). Sabotage arm: a change
-  that alters the float normalization must FAIL byte-identity.
+- **G0 route liveness (hard, run first).** On a real B1 decode with
+  profiling enabled, prove: `q27_matvec_b1_g128` calls > 0,
+  `q27_matvec_b1_quantized` calls = 0, `q27_rmsnorm_quantized` calls =
+  129/token. This validates the diagnosis and closes the round-2
+  attribution error (see the CORRECTION in
+  `2026-07-17-b1-select-round2.md`). No candidate is timed until G0
+  passes.
+- **G1 byte-identity (hard, byte-exact only — no envelope).** B1 committed
+  output tokens byte-identical pre/post change over a fixed greedy
+  continuation (≥256 tokens) at a fixed prompt; hidden rows byte-identical.
+  Candidate B's fused kernel preserves the exact rounding order (explicit
+  store + device barrier + reread of `h`, the same `reduce_sum` tree), so
+  there is no mathematical reason the fusion must change rounding; if G1
+  fails, fix or kill Candidate B rather than widen to an envelope. A later
+  single-pass variant that drops the storage boundary is a separate
+  experiment needing a margin-certified envelope, and must not rescue this
+  exact-order candidate. Sabotage arm: a change that alters the float
+  normalization or omits the store/reload barrier must FAIL byte-identity.
 - **G2 no T2 regression.** T2 serial decode wall unchanged within noise
   (±1%) and T2 committed output byte-identical (T2 is also Bonsai-routed,
   so it must benefit or be neutral, never regress).
 - **G3 official-tier untouched.** Official Q4/Q8 pack serial decode
-  byte-identical (proves the swap is correctly scoped to Bonsai).
-- **G4 wall measurement.** B1 resident decode tok/s, same machine, warm
-  pack, back-to-back at matched thermal state (house rule). Baseline is
-  the current ~19 tok/s (52 ms/token, 3.36 GiB/token @ ~69 GB/s — the
-  memory-wall regime from `2026-07-17-b1-select-round2.md`).
+  byte-identical; chunked prefill and verification untouched (they require
+  quantized activations).
+- **G4 wall measurement.** B1 resident decode ms/token, same machine, warm
+  pack, ≥5 interleaved baseline/candidate pairs, same process where
+  possible, matched thermal state (house rule); report GPU and wall time
+  separately. Baseline is the current ~19 tok/s (52 ms/token, 3.36
+  GiB/token @ ~69 GB/s — the memory-wall regime from
+  `2026-07-17-b1-select-round2.md`).
 
-## Ship / kill line (verbatim from the review, adopted)
+## Ship / kill line
 
-- **SHIP Candidate A/B only at ≥5% end-to-end B1 resident-decode
-  improvement** with G1/G2/G3 all PASS (byte-identity holds).
-- **STOP after these two candidates** if the combined wall gain is < 5%.
-  Do not escalate into a broader survey — the parked ledger already holds
-  the negative verdicts for the surrounding levers.
+- **SHIP Candidate A/B only at ≥1.0 ms/token end-to-end B1
+  resident-decode improvement** (~2% at the 52 ms/token wall) with
+  G0/G1/G2/G3 all PASS (byte-identity holds) and the paired result
+  consistently positive. Below that the gain is too vulnerable to
+  machine-state noise and not worth splitting the execution path.
+- **STOP after these two candidates** if the combined wall gain is under
+  the line. Do not escalate into a broader survey — the parked ledger
+  already holds the negative verdicts for the surrounding levers.
 
 ## Expected magnitude (honest, pre-registered)
 
-**2–8%, not 20%.** B1 decode is at the memory wall: 3.36 GiB/token at ~69
-GB/s ≈ 19 tok/s, and the funded 2.36× GEMV isolation win moved the full
-token only ~3% (dilution is the primary model). Removing 129 unused
-quantizations + up to 128 dispatches attacks the fixed ~14 ms non-GEMV
-residue, not the bandwidth — so the ceiling is a few percent, and the 5%
-ship line is deliberately at the optimistic end. If it misses, that is a
-clean negative and the B1 serial-decode question closes.
+**0–3%; more than 3% would be surprising.** The dead work is real (129
+unused int8 quantizations/token) but it is not a memory-bandwidth lever:
+at width 5120 the extra traffic per invocation is ≈ 5120×4 B read +
+5120×1 B write + 160×4 B scale write = 26,240 B, so 129 calls ≈ **3.23
+MiB/token, only ~0.09% of the 3.36 GiB/token projection stream.** The only
+mechanism is latency removal on the dependency chain (the barrier, serial
+per-simdgroup block iterations, and maxima reductions sit between the
+RMSNorm float output and the next dependent GEMV). Decode can be
+bandwidth-dominated while still containing additive serial latency before
+and between weight streams. Candidate B's dispatch removal (up to 128
+add_inplace dispatches) is a distinct lever; before funding it measure
+`total q27_add_inplace GPU time/token + the pure-RMSNorm saving` — that
+sum is the hard upper bound, and if it is under ~1 ms/token, kill the
+fusion without writing the kernel. (Prior 2–8% estimate revised down per
+expert review 4; it was too optimistic given the actual kernel.)
 
 ## Cost / risk / house rules
 

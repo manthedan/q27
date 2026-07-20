@@ -2,7 +2,43 @@
 
 ## Homebrew (macOS, Apple silicon)
 
-Direct install from a checkout or raw file:
+The one-command install:
+
+    brew install manthedan/tap/q27
+
+This installs the engine binaries (`q27-metal`, `q27-metal-server`, the
+synthetic benches) **and** the `q27` supervisor wrapper, which owns the
+multi-GB weight lifecycle:
+
+    q27 recommend      # table of packs that fit THIS machine + the pick
+    q27 pull           # download + verify the recommended pack (~/.q27/models)
+    q27 serve          # boot the server (refuses if one is already running)
+    q27 ls             # what's installed
+    q27 bench --fast   # quick synthetic ceiling + a real decode
+    q27 report --full  # build a send-back diagnostic bundle (see below)
+
+Point a coding agent at it:
+
+    export ANTHROPIC_BASE_URL=http://localhost:8080 && claude
+
+Model artifacts (`.q27`) and tokenizers (`.tok`) are NOT in the formula —
+they are multi-GB and carry their own licenses. `q27 pull` fetches and
+checksum-verifies them per `packaging/models.tsv`. See
+[docs/MODELS.md](../docs/MODELS.md) for the pack/context/speed tables.
+
+### Developing the big tiers remotely
+
+The maintainer's laptop tops out at 24 GB, so **q6 / q6k / q8 and the
+long-context legs are built against user reports.** On a 28 GB+ machine:
+
+    q27 pull q8
+    q27 report --full     # writes q27-report-<ts>.tgz; email it back
+
+The bundle has no weights and no private prompts — machine specs, thermal
+anchors, per-tier tok/s, artifact md5s, and one fixed-prompt generation
+sample. That is enough to diagnose and fix tiers we cannot run locally.
+
+### Direct install (no tap)
 
     brew install --formula ./packaging/homebrew/q27.rb
 

@@ -31,6 +31,10 @@ class Tokenizer {
     std::vector<int> apply_chat_template(
         const std::vector<std::pair<std::string, std::string>>& messages,
         bool think = true) const;
+    // Canonical encoding of complete closed messages without a new assistant
+    // generation suffix. Used to establish a persistence-safe boundary.
+    std::vector<int> apply_chat_prefix(
+        const std::vector<std::pair<std::string, std::string>>& messages) const;
 
     // Exact-string vocab lookup (-1 if absent). Needed for added tokens like
     // <think> that BPE merges cannot form and the special-matcher (type-3

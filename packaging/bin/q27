@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# q27 — supervisor for the q27 Metal engine: model install, switching,
+# serving, and benchmarking. The engine binaries (q27-metal*) stay narrow
+# and dependency-free; this wrapper owns the multi-GB weight lifecycle and
+# the one-model-at-a-time discipline so users don't have to.
+#
+#   q27 pull [name]     recommend by RAM, or fetch a specific pack (resumable,
+#                       checksum-verified) into ~/.q27/models/<name>/
+#   q27 serve [name]    start the server on a pack (refuses if one is running)
+#   q27 ls              list installed packs + sizes + which is servable
+#   q27 rm <name>       delete a pack's cache
+#   q27 bench [--fast|--full] [packs..]   run the benchmark suite
+#   q27 report [...]    build a send-back diagnostic bundle
+#   q27 recommend       print the pack + context table for THIS machine
+#   q27 help
+set -u
+# Resolve symlinks (Homebrew links bin/q27 -> libexec/q27/bin/q27) so the
+# relative lib/models/tools lookups land beside the REAL script, not the link.
+SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+HERE="$(cd "$(dirname "$SRC")" && pwd)"
+. "$HERE/../lib/q27_bench_lib.sh"
+
+CMD="${1:-help}"; [ $# -gt 0 ] && shift
+
+ram_gb() { echo $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )); }
+
+# ---- recommendation logic: largest pack that fits with ctx headroom ----
+# macOS caps GPU-usable memory ~65-75% of RAM; weights are mmap'd/pageable,
+# but we recommend against the working-set budget with headroom for the OS
+# and the user's browser. ctx budget scales with what is left after weights.
+recommend_pack() {
+    local ram; ram="$(ram_gb)"
+    # Walk registry from largest min_ram to smallest; pick the first that fits
+    # comfortably (ram >= min_ram) and is not experimental.
+    local best="" bestmin=0 n min exp
+    for n in $(q27_registry_names); do
+        exp="$(q27_registry_field "$n" 11)"
+        [ "$exp" = "yes" ] && continue
+        min="$(q27_registry_field "$n" 7)"
+        if [ "$ram" -ge "$min" ] && [ "$min" -gt "$bestmin" ]; then best="$n"; bestmin="$min"; fi
+    done
+    printf '%s' "$best"
+}
+
+cmd_recommend() {
+    local ram; ram="$(ram_gb)"
+    echo "This machine: ${ram} GB unified memory"
+    echo
+    printf '%-9s %-8s %-10s %-6s %s\n' "pack" "weights" "min_ram" "fits?" "note"
+    local n wg min exp fits
+    for n in $(q27_registry_names); do
+        wg="$(q27_registry_field "$n" 6)"; min="$(q27_registry_field "$n" 7)"; exp="$(q27_registry_field "$n" 11)"
+        if [ "$ram" -ge "$min" ]; then fits="yes"; else fits="NO"; fi
+        [ "$exp" = "yes" ] && fits="$fits(exp)"
+        printf '%-9s %-8s %-10s %-6s %s\n' "$n" "${wg}G" "${min}G" "$fits" "$(q27_registry_field "$n" 12 | cut -c1-60)"
+    done
+    echo
+    local rec; rec="$(recommend_pack)"
+    echo "Recommended pack for this machine: ${rec:-none (too little RAM)}"
+    echo "Context window: the wrapper sizes ctx to the memory left after weights"
+    echo "(see docs/MODELS.md for the full quant x context fit table)."
+}
+
+cmd_ls() {
+    local n art
+    printf '%-9s %-10s %-8s %s\n' "pack" "installed" "size" "path"
+    for n in $(q27_registry_names); do
+        if art="$(q27_artifact_path "$n" 2>/dev/null)"; then
+            printf '%-9s %-10s %-8s %s\n' "$n" "yes" "$(du -h "$art" 2>/dev/null | cut -f1)" "$art"
+        else
+            printf '%-9s %-10s\n' "$n" "-"
+        fi
+    done
+}
+
+cmd_rm() {
+    local n="${1:?usage: q27 rm <name>}"
+    q27_registry_field "$n" 1 >/dev/null 2>&1 || { echo "q27 rm: unknown pack $n" >&2; exit 1; }
+    local d; d="$(q27_home)/$n"
+    [ -d "$d" ] || { echo "q27 rm: $n not installed"; exit 0; }
+    echo "q27 rm: deleting $d ($(du -sh "$d" 2>/dev/null | cut -f1))"
+    rm -rf "$d"
+}
+
+cmd_serve() {
+    local n="${1:-$(recommend_pack)}"
+    [ -n "$n" ] || { echo "q27 serve: no pack fits this machine; see \`q27 recommend\`" >&2; exit 1; }
+    local art tok server
+    art="$(q27_artifact_path "$n")" || { echo "q27 serve: $n not installed — run \`q27 pull $n\`" >&2; exit 1; }
+    tok="$(q27_tokenizer_path "$n")" || { echo "q27 serve: $n tokenizer missing — re-run \`q27 pull $n\`" >&2; exit 1; }
+    server="$(q27_bin q27-metal-server)" || { echo "q27 serve: q27-metal-server not found" >&2; exit 1; }
+    if pgrep -f "q27-metal-server" >/dev/null 2>&1; then
+        echo "q27 serve: a q27-metal-server is already running (one model at a time)." >&2
+        echo "  stop it first: pkill -f q27-metal-server" >&2; exit 1
+    fi
+    echo "q27 serve: $n ($(basename "$art")) on 127.0.0.1:8080"
+    echo "  export ANTHROPIC_BASE_URL=http://localhost:8080"
+    exec "$server" "$art" "$tok" --port 8080 \
+        --snapshot-dir "${Q27_SNAPSHOT_DIR:-$HOME/.q27/snapshots}" \
+        --max-tokens-default "${Q27_MAX_TOKENS:-16384}"
+}
+
+cmd_bench()  { exec "$HERE/q27-bench" "$@"; }
+cmd_report() { exec "$HERE/q27-report" "$@"; }
+
+cmd_pull() {
+    local n="${1:-}"
+    if [ -z "$n" ]; then n="$(recommend_pack)"; echo "q27 pull: no pack given, recommending by RAM -> $n"; fi
+    [ -n "$n" ] || { echo "q27 pull: no pack fits this machine" >&2; exit 1; }
+    q27_registry_field "$n" 1 >/dev/null 2>&1 || { echo "q27 pull: unknown pack $n (see \`q27 recommend\`)" >&2; exit 1; }
+    local fetch; fetch="$HERE/q27-fetch"
+    [ -x "$fetch" ] || { echo "q27 pull: q27-fetch helper missing" >&2; exit 1; }
+    exec "$fetch" "$n"
+}
+
+case "$CMD" in
+    pull) cmd_pull "$@" ;;
+    serve) cmd_serve "$@" ;;
+    ls|list) cmd_ls "$@" ;;
+    rm|remove) cmd_rm "$@" ;;
+    bench) cmd_bench "$@" ;;
+    report) cmd_report "$@" ;;
+    recommend) cmd_recommend "$@" ;;
+    help|--help|-h)
+        sed -n '2,20p' "$0" ;;
+    *) echo "q27: unknown command $CMD (try \`q27 help\`)" >&2; exit 2 ;;
+esac

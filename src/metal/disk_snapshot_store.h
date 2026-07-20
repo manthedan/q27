@@ -116,6 +116,51 @@ class DiskSnapshotStore {
         return p;
     }
 
+    // True only when the exact token-key pathname currently contains a
+    // logits-resident snapshot with matching position/tokens. Callers use
+    // this immediately before a lease-serialized stale-logits save so an
+    // older save decision cannot downgrade a newly installed exact prefix.
+    bool exact_resident(const uint32_t* tokens,uint32_t count) {
+        if(!enabled() || !tokens || !count) return false;
+        char hex[41]; hash_(tokens,count,hex); hex[40]='\0';
+        const std::string path=dir_+"/"+tag_+hex+".q27snap";
+        std::lock_guard<std::mutex> lk(m_);
+        std::error_code ec;
+        if(!std::filesystem::is_regular_file(path,ec)) return false;
+        SnapPeekInfo info;
+        auto cached=meta_.find(path);
+        if(cached!=meta_.end()) info=cached->second;
+        else {
+            try { info=peek_(path); }
+            catch(...) { return false; }
+            meta_[path]=info;
+        }
+        return info.logits_resident && info.position==count &&
+               info.tokens.size()==count &&
+               std::equal(info.tokens.begin(),info.tokens.end(),tokens);
+    }
+
+    // A candidate that passed the shallow header peek but failed the engine's
+    // full structural/configuration load is not usable. Remove it so future
+    // requests do not repeatedly pay the failure and so a later save can
+    // repair the same token key.
+    void reject(const std::string& path) {
+        std::lock_guard<std::mutex> lk(m_);
+        std::error_code ec;
+        std::filesystem::remove(path,ec);
+        meta_.erase(path);
+        tokens_.erase(path);
+    }
+
+    // Call after save_state atomically publishes/replaces a path. A prior
+    // best_match may have cached metadata for the displaced inode (notably a
+    // stale-logits mid-prefill bank); force the next lookup to inspect the
+    // newly published file rather than retaining that verdict indefinitely.
+    void published(const std::string& path) {
+        std::lock_guard<std::mutex> lk(m_);
+        meta_.erase(path);
+    }
+
     // Budget enforcement until the directory fits. The just-written file is
     // deletable too — the budget is a hard cap, and the gate asserts the
     // total never exceeds it. Returns {files, bytes} removed so the --trace

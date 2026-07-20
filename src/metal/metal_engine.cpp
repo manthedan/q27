@@ -13,6 +13,7 @@
 #include <stdexcept>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <CommonCrypto/CommonDigest.h>
@@ -825,8 +826,23 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
     const uint64_t active_cache = (uint64_t)position_ * cache_row;
     const std::string tmp = path + ".tmp";
-    FILE* f = fopen(tmp.c_str(), "wb");
-    if (!f) throw std::runtime_error("q27 Metal: cannot create snapshot: " + tmp);
+    // Snapshot payloads contain private conversation state. Remove a stale
+    // crash temporary, then use O_EXCL|O_NOFOLLOW so a hostile symlink can
+    // only cause a loud denial, never redirect or expose the write.
+    (void)unlink(tmp.c_str());
+    const int tmp_fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL |
+                            O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (tmp_fd < 0 || fchmod(tmp_fd, 0600) != 0) {
+        if (tmp_fd >= 0) close(tmp_fd);
+        (void)unlink(tmp.c_str());
+        throw std::runtime_error("q27 Metal: cannot create private snapshot: " + tmp);
+    }
+    FILE* f = fdopen(tmp_fd, "wb");
+    if (!f) {
+        close(tmp_fd);
+        (void)unlink(tmp.c_str());
+        throw std::runtime_error("q27 Metal: cannot create snapshot: " + tmp);
+    }
     std::vector<unsigned char> stage(16u << 20);
     try {
         SnapshotHeader h{};
@@ -947,8 +963,30 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
 }
 
 uint32_t MetalEngine::load_state(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) throw std::runtime_error("q27 Metal: cannot open snapshot: " + path);
+    const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        throw std::runtime_error("q27 Metal: cannot open snapshot: " + path);
+    try {
+        const uint32_t position = load_state_fd(fd, path);
+        close(fd);
+        return position;
+    } catch (...) {
+        close(fd);
+        throw;
+    }
+}
+
+uint32_t MetalEngine::load_state_fd(int source_fd, const std::string& path) {
+    const int snap_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
+    if (snap_fd < 0 || lseek(snap_fd, 0, SEEK_SET) < 0) {
+        if (snap_fd >= 0) close(snap_fd);
+        throw std::runtime_error("q27 Metal: cannot pin snapshot: " + path);
+    }
+    FILE* f = fdopen(snap_fd, "rb");
+    if (!f) {
+        close(snap_fd);
+        throw std::runtime_error("q27 Metal: cannot read snapshot: " + path);
+    }
     try {
         SnapshotHeader h{};
         snap_read(f, &h, sizeof h, path);
@@ -1097,8 +1135,31 @@ uint32_t MetalEngine::load_state(const std::string& path) {
 }
 
 MetalEngine::SnapshotInfo MetalEngine::peek_snapshot(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) throw std::runtime_error("q27 Metal: cannot open snapshot: " + path);
+    const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        throw std::runtime_error("q27 Metal: cannot open snapshot: " + path);
+    try {
+        SnapshotInfo info = peek_snapshot_fd(fd, path);
+        close(fd);
+        return info;
+    } catch (...) {
+        close(fd);
+        throw;
+    }
+}
+
+MetalEngine::SnapshotInfo MetalEngine::peek_snapshot_fd(
+    int source_fd, const std::string& path) {
+    const int snap_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
+    if (snap_fd < 0 || lseek(snap_fd, 0, SEEK_SET) < 0) {
+        if (snap_fd >= 0) close(snap_fd);
+        throw std::runtime_error("q27 Metal: cannot pin snapshot: " + path);
+    }
+    FILE* f = fdopen(snap_fd, "rb");
+    if (!f) {
+        close(snap_fd);
+        throw std::runtime_error("q27 Metal: cannot read snapshot: " + path);
+    }
     try {
         SnapshotHeader h{};
         snap_read(f, &h, sizeof h, path);
@@ -1108,10 +1169,11 @@ MetalEngine::SnapshotInfo MetalEngine::peek_snapshot(const std::string& path) {
         info.position = h.position;
         // Bit test, not equality: bit 1 is the v2 exception extension.
         info.logits_resident = (h.reserved & 1) == 0;
-        // Bound the metadata before allocating: a corrupt header must not
-        // drive a multi-GB resize on the scan path (codex P2 on 607160e).
-        if (h.token_count > 262144)
-            throw std::runtime_error("q27 Metal: snapshot token count exceeds any context: " + path);
+        // Bound the metadata before allocating: max context plus the one
+        // legal pending emitted token used by resident agent sessions. A
+        // corrupt header must not drive a multi-GB scan-path allocation.
+        if (h.token_count > 262145)
+            throw std::runtime_error("q27 Metal: snapshot token count exceeds context plus pending token: " + path);
         if (fseeko(f, 0, SEEK_END) != 0)
             throw std::runtime_error("q27 Metal: cannot read snapshot: " + path);
         if ((uint64_t)ftello(f) < sizeof h + (uint64_t)h.token_count * 4)

@@ -1,0 +1,34 @@
+# q27 model registry — drives `q27 pull`, `q27 bench`, `q27 serve`.
+# One line per installable pack. TAB-separated. # lines are comments.
+# The wrapper reads this file (installed next to it by the formula).
+#
+# Columns (TAB-separated, no leading/trailing spaces):
+#   1 name          short handle the user types (`q27 pull <name>`)
+#   2 display       human label
+#   3 quant_policy  artifact's quant_policy metadata value (route selector)
+#   4 artifact_file the .q27 filename inside the model dir
+#   5 artifact_md5  expected md5 of the artifact (empty if unverified/unknown)
+#   6 weights_gb    artifact size in GiB (bytes/2^30), for fit checks
+#   7 min_ram_gb    practical minimum unified memory (GiB) to run + starter ctx
+#   8 hf_repo       Hugging Face repo hosting the artifact/source
+#   9 source_kind   direct = download .q27 (md5-checked);
+#                   repack = download GGUF, repack locally (sha256-checked);
+#                   local  = produced on this machine, not downloadable
+#  10 tokenizer     direct = download the .tok; gguf = export from source GGUF
+#  11 experimental  yes = opt-in research pack; no = supported
+#  12 notes         one-line guidance shown by `q27 pull <name>`
+#
+# Official Qwen3.6-27B-MTP tiers live in signalnine/Qwen3.6-27B-MTP-q27 and
+# are direct .q27 downloads verified against that repo's CHECKSUMS.md5.
+# Bonsai ternary/binary tiers are lossless local repacks of prism-ml GGUFs
+# (q27 never redistributes weights), verified by repacked-artifact sha256.
+#
+name	display	quant_policy	artifact_file	artifact_md5	weights_gb	min_ram_gb	hf_repo	source_kind	tokenizer	experimental	notes
+b1	Bonsai-27B binary (1.125 bpw)	bonsai-b1-v1	bonsai-27b-b1.q27		3.53	8	prism-ml/Bonsai-27B-gguf	repack	gguf	no	Smallest fully-resident 27B; fastest decode on 16 GB; passed the full quality/probe battery.
+t2	Bonsai-27B ternary (2.25 bpw)	bonsai-t2-v1	ternary-bonsai-27b-t2.q27		6.66	16	prism-ml/Ternary-Bonsai-27B-gguf	repack	gguf	no	The 16 GB answer; task quality holds, ~2.1-2.3x official PPL.
+m1	Bonsai-27B mixed B1/T2 graft (EXPERIMENTAL)	bonsai-mixed-v1	bonsai-27b-m1.q27		3.57	8	local-only	local	direct	yes	EXPERIMENTAL: mixed-graft thesis is closed (A5 KILL on both corpora) but the pack is kept for users who want to try it; not a supported tier. Built locally via tools/q27_mix.py.
+default	Qwen3.6-27B-MTP official (5.25 bpw)	v1.4	qwen36-27b-mtp.q27	39fd724426088abaef6e0bad66d6dac6	16.51	24	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	Max speed + trained MTP head; the only official tier that fits 24 GB (borderline, needs an idle machine).
+q4s	Qwen3.6-27B-MTP q4s (15.5 GB)	v1.4	qwen36-27b-mtp-q4s.q27	7e5454e0c0ded717136ad3e42634ba25	14.44	20	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	Official 15.5 GB tier; fits 20 GB+ with headroom the 17 GB default lacks.
+q6	Qwen3.6-27B-MTP q6 (6.0 bpw)	q6-v1	qwen36-27b-mtp-q6.q27	7a0d21b4e44254e1820ca4fd75ea8fee	19.09	28	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	+0.35% PPL over Q5_K_M; 28 GB+ machines.
+q6k	Qwen3.6-27B-MTP q6k (6.8 bpw)	q6k-v1	qwen36-27b-mtp-q6k.q27	30d5657d47cf20fb0c6ee8d27c351fe6	21.70	32	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	GGUF-matching quality, ~10% slower; 32 GB+ machines.
+q8	Qwen3.6-27B-MTP q8 (8.1 bpw, UNVALIDATED)	q8-v1	qwen36-27b-mtp-q8.q27	d799948795fdc9151d2bdc23a3100181	26.49	36	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	yes	UNVALIDATED upstream pending 48GB-class hardware. Our remote-dev/diagnosis target: run `q27 report` on a 36-48GB+ machine and send the bundle back.

@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# q27-fetch — download + verify one pack from the registry. Called by
+# `q27 pull <name>`; rarely invoked directly. Three source kinds:
+#   direct  download the .q27 (and .tok) from HF, verify md5
+#   repack  download the source GGUF, repack locally (lossless), verify the
+#           artifact against the published digest, export the tokenizer
+#   local   produced on this machine (e.g. the M1 graft) — point the user at
+#           the build tool instead of downloading
+# Downloads are resumable (curl -C -) and every artifact is checksum-gated
+# before it is considered installed. Mirrors tools/fetch_weights.sh's
+# verified pattern, generalized over the registry.
+set -u
+SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+HERE="$(cd "$(dirname "$SRC")" && pwd)"
+. "$HERE/../lib/q27_bench_lib.sh"
+
+NAME="${1:?usage: q27-fetch <name> (see \`q27 recommend\`)}"
+FIELD() { q27_registry_field "$NAME" "$1" || { echo "q27-fetch: unknown pack $NAME" >&2; exit 1; }; }
+
+ART_FILE="$(FIELD 4)"; EXPECT_MD5="$(FIELD 5)"; REPO="$(FIELD 8)"
+KIND="$(FIELD 9)"; TOK_KIND="$(FIELD 10)"; EXP="$(FIELD 11)"
+DEST="$(q27_home)/$NAME"
+ART="$DEST/$ART_FILE"
+
+[ "$EXP" = "yes" ] && echo "q27-fetch: NOTE — $NAME is EXPERIMENTAL: $(FIELD 12)"
+mkdir -p "$DEST"
+
+# Map a registry name to its source GGUF filename / repo revision / digests.
+# These are pinned so an upstream re-upload cannot drift in (the fetch_weights
+# pattern). direct tiers need no source GGUF.
+source_gguf_for() {
+    case "$NAME" in
+        t2) echo "Ternary-Bonsai-27B-Q2_0.gguf" ;;
+        b1) echo "Bonsai-27B-Q1_0.gguf" ;;
+        *)  echo "" ;;
+    esac
+}
+source_rev_for() {
+    case "$NAME" in
+        t2) echo "20e435f518bd5b882795954aba81e80a91894321" ;;
+        b1) echo "main" ;;  # TODO: pin once upstream tags a stable revision
+        *)  echo "main" ;;
+    esac
+}
+source_sha_for() {
+    case "$NAME" in
+        t2) echo "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757" ;;
+        b1) echo "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0" ;;
+        *)  echo "" ;;
+    esac
+}
+artifact_sha_for() {
+    case "$NAME" in
+        t2) echo "25392b471d2e5c55798c2ea77d8b53fbbd1f720318e5ff23bd8c49e5d378e549" ;;
+        b1) echo "84cf2400fafb27e9ce35b72d478299d2a855c902e2e495fb9564e13f06f9da52" ;;
+        *)  echo "" ;;
+    esac
+}
+
+hf_download() { # $1=remote-file $2=dest  (resumable)
+    local file="$1" dest="$2"
+    curl -L --fail --continue-at - \
+        "https://huggingface.co/$REPO/resolve/$(source_rev_for)/$file" -o "$dest"
+}
+
+case "$KIND" in
+    local)
+        echo "q27-fetch: $NAME is a LOCAL build, not downloadable."
+        echo "  Build it on this machine with the mixed-tier tool:"
+        echo "    python3 tools/q27_mix.py   (see docs/plans/2026-07-17-mixed-tier-census.md)"
+        echo "  Then place the artifact at $ART"
+        exit 0
+        ;;
+    direct)
+        # Fast path needs BOTH the artifact verified AND the tokenizer
+        # present; a verified artifact with a missing/empty .tok (a prior run
+        # that died mid-tokenizer-download) must fall through and repair, not
+        # exit "already present" and dead-end the user (codex P2).
+        if [ -f "$ART" ] && [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" = "$EXPECT_MD5" ] \
+           && ls "$DEST"/*.tok >/dev/null 2>&1; then
+            echo "q27-fetch: $ART_FILE already present and verified"; exit 0
+        fi
+        # Only re-download the artifact if it is missing or fails verification;
+        # a healthy artifact is left alone even when we fell through to repair
+        # the tokenizer.
+        if [ ! -f "$ART" ] || { [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" != "$EXPECT_MD5" ]; }; then
+            echo "q27-fetch: downloading $ART_FILE from $REPO ($(FIELD 6) GiB)"
+            hf_download "$ART_FILE" "$ART"
+            if [ -n "$EXPECT_MD5" ] && [ "$(md5 -q "$ART")" != "$EXPECT_MD5" ]; then
+                echo "q27-fetch: md5 MISMATCH on $ART_FILE — aborting"; exit 1
+            fi
+        fi
+        if [ "$TOK_KIND" = "direct" ] && ! ls "$DEST"/*.tok >/dev/null 2>&1; then
+            echo "q27-fetch: downloading tokenizer"
+            hf_download "qwen36-27b-mtp.tok" "$DEST/qwen36-27b-mtp.tok" ||
+                { echo "q27-fetch: tokenizer download failed — re-run \`q27 pull $NAME\` to resume"; exit 1; }
+        fi
+        echo "q27-fetch: $NAME installed at $DEST"
+        ;;
+    repack)
+        python3 -c "import numpy, gguf" 2>/dev/null || {
+            echo "q27-fetch: the repack needs python3 with numpy and gguf:"
+            echo "  python3 -m pip install numpy gguf"; exit 1; }
+        GGUF_NAME="$(source_gguf_for)"; SRC_SHA="$(source_sha_for)"
+        OUT_SHA="$(artifact_sha_for)"; GGUF="$DEST/$GGUF_NAME"
+        if [ -f "$ART" ] && [ "$(shasum -a 256 "$ART" | cut -d' ' -f1)" = "$OUT_SHA" ] \
+           && ls "$DEST"/*.tok >/dev/null 2>&1; then
+            echo "q27-fetch: $ART_FILE already present and verified"; exit 0
+        fi
+        if [ ! -f "$GGUF" ] || [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" != "$SRC_SHA" ]; then
+            echo "q27-fetch: downloading source $GGUF_NAME from $REPO"
+            hf_download "$GGUF_NAME" "$GGUF"
+            [ "$(shasum -a 256 "$GGUF" | cut -d' ' -f1)" = "$SRC_SHA" ] || {
+                echo "q27-fetch: source GGUF sha256 MISMATCH — aborting"; exit 1; }
+        fi
+        echo "q27-fetch: source verified; repacking (lossless)"
+        REPACK="$(q27_bin_repack)"
+        python3 "$REPACK" "$GGUF" "$ART" || { echo "q27-fetch: repack failed"; exit 1; }
+        [ "$(shasum -a 256 "$ART" | cut -d' ' -f1)" = "$OUT_SHA" ] || {
+            echo "q27-fetch: repacked artifact sha256 MISMATCH (deterministic repack;" \
+                 "this means a code/source change) — do not use it"; exit 1; }
+        python3 "$(q27_bin_export_tok)" "$GGUF" "$DEST/$NAME.tok" || {
+            echo "q27-fetch: tokenizer export failed"; exit 1; }
+        echo "q27-fetch: $NAME installed at $DEST (source GGUF kept; delete to save disk)"
+        ;;
+    *) echo "q27-fetch: unknown source_kind $KIND for $NAME" >&2; exit 1 ;;
+esac
