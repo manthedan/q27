@@ -423,7 +423,8 @@ with tempfile.TemporaryDirectory() as td:
                 txt = (correct_text(mode, gold) if arm == good_arm
                        else wrong_text(mode))
                 rows.append({"id": "%s-%s-%s-%04d" % (arm, acc_run_ids[arm], mode, i),
-                             "prompt_id": pid, "text": txt})
+                             "prompt_id": pid, "text": txt,
+                             "stop_reason": "end_turn"})
             write_jsonl(os.path.join(td, "%s.%s.jsonl" % (arm, mode)), rows)
 
     # good=ref, bad=floor, and a third arm that is the good corpus again so
@@ -475,6 +476,43 @@ with tempfile.TemporaryDirectory() as td:
     rc, out = run_accuracy(["--dir", td, "--ref", good_arm,
                             "--floor", bad_arm, "--arms", good_arm])
     check("accuracy missing file exits nonzero", rc != 0, True)
+
+    # --- stop_reason end_turn-only filter (2026-07-19 thinking-budget fix) ---
+    # Restore bad_arm's full corpus with stop_reason on every row.
+    for mode in ("choice", "numeric", "freeform"):
+        rows = []
+        for i, (pid, gold) in enumerate(golds[mode]):
+            rows.append({"id": "%s-%s-%s-%04d" % (bad_arm, acc_run_ids[bad_arm], mode, i),
+                         "prompt_id": pid, "text": wrong_text(mode),
+                         "stop_reason": "end_turn"})
+        write_jsonl(os.path.join(td, "%s.%s.jsonl" % (bad_arm, mode)), rows)
+
+    # MUST-FAIL: a row without stop_reason (pre-fix corpus) is refused.
+    rows = []
+    for i, (pid, gold) in enumerate(golds["choice"]):
+        rows.append({"id": "%s-%s-choice-%04d" % (bad_arm, acc_run_ids[bad_arm], i),
+                     "prompt_id": pid, "text": wrong_text("choice")})  # no stop_reason
+    write_jsonl(os.path.join(td, "%s.choice.jsonl" % bad_arm), rows)
+    rc, out = run_accuracy(["--dir", td, "--ref", good_arm,
+                            "--floor", bad_arm, "--arms", good_arm])
+    check("accuracy no-stop_reason exits nonzero", rc != 0, True)
+    check("accuracy no-stop_reason names the fix", "stop_reason" in out, True)
+
+    # Truncated rows (max_tokens) are EXCLUDED from numerator+denominator and
+    # counted in the excl column; a half-truncated arm still scores on the rest.
+    for mode in ("choice", "numeric", "freeform"):
+        rows = []
+        for i, (pid, gold) in enumerate(golds[mode]):
+            trunc = (i % 2 == 0)  # half the rows truncated
+            rows.append({"id": "%s-%s-%s-%04d" % (bad_arm, acc_run_ids[bad_arm], mode, i),
+                         "prompt_id": pid, "text": wrong_text(mode),
+                         "stop_reason": "max_tokens" if trunc else "end_turn"})
+        write_jsonl(os.path.join(td, "%s.%s.jsonl" % (bad_arm, mode)), rows)
+    rc, out = run_accuracy(["--dir", td, "--ref", good_arm,
+                            "--floor", bad_arm, "--arms", bad_arm])
+    # bad_arm scores 0 on its completed half; excl = 60 (half of 120)
+    check("accuracy truncated-arm still scored", "0/60" in out, True)
+    check("accuracy truncated-arm excl counted", " 60 " in out, True)
 
 # --- report -----------------------------------------------------------------
 

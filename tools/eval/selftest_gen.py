@@ -15,9 +15,13 @@ class Mock(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         prompt = body["messages"][0]["content"]
         if self.path == "/v1/messages":
-            payload = {"content": [{"type": "text", "text": f"echo:{prompt}"}]}
+            payload = {"stop_reason": "end_turn",
+                       "content": [{"type": "thinking", "thinking": "ponder"},
+                                   {"type": "text", "text": f"echo:{prompt}"}]}
         elif self.path == "/v1/chat/completions":
-            payload = {"choices": [{"message": {"content": f"echo:{prompt}"}}]}
+            payload = {"choices": [{"finish_reason": "stop",
+                                    "message": {"content": f"echo:{prompt}",
+                                                "reasoning_content": "ponder"}}]}
         else:
             self.send_error(404)
             return
@@ -62,6 +66,12 @@ def main():
                 fails.append(f"{api}: wrong texts {rows}")
             if [x["prompt_id"] for x in rows] != ["p0", "p1"]:
                 fails.append(f"{api}: wrong prompt_ids")
+            # stop_reason + thinking ride every row (2026-07-19 harness fix)
+            want_stop = "end_turn" if api == "anthropic" else "stop"
+            if [x.get("stop_reason") for x in rows] != [want_stop, want_stop]:
+                fails.append(f"{api}: wrong stop_reasons {rows}")
+            if [x.get("thinking") for x in rows] != ["ponder", "ponder"]:
+                fails.append(f"{api}: wrong thinking {rows}")
 
         # must-fail: dead server -> exit 1, rows carry error + empty text
         out = os.path.join(td, "out_dead.jsonl")

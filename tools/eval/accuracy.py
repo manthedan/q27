@@ -101,12 +101,21 @@ def load_generations(path, arm, mode, run_id):
                 sys.exit(f"{path} line {ln}: missing prompt_id")
             if pid in rows:
                 sys.exit(f"{path} line {ln}: duplicate prompt_id {pid!r}")
-            rows[pid] = r.get("text", "")
+            rows[pid] = r
     return rows
 
 
+COMPLETE_REASONS = {"end_turn", "stop"}
+
+
 def score_arm(arm, gen_dir, golds):
-    """Return (per_mode {mode:(correct,total)}, overall (correct,total)).
+    """Return (per_mode, overall, n_excluded). Scores only rows whose
+    stop_reason marks a COMPLETE generation (end_turn/stop); a max_tokens /
+    length stop means the reasoning or answer truncated and the row is
+    unscoreable (the 2026-07-19 thinking-budget artifact). Excluded rows are
+    dropped from numerator AND denominator and counted in n_excluded so the
+    report shows how much each arm truncated. Rows without stop_reason are
+    legacy (pre-fix corpus) and fail closed with a clear message.
     Fail-closed on any missing/unknown prompt_id. Validates the arm's
     provenance sidecar against arms.tsv and binds every row id to the
     sidecar's run_id before scoring (codex P2 2026-07-19)."""
@@ -116,6 +125,7 @@ def score_arm(arm, gen_dir, golds):
     _runtime, run_id = spotcheck_verdict.validate_provenance(gen_dir, arm)
     per_mode = {}
     tot_c = tot_n = 0
+    n_excluded = 0
     for mode in MODES:
         gold = golds[mode]
         rows = load_generations(os.path.join(gen_dir, f"{arm}.{mode}.jsonl"),
@@ -127,16 +137,26 @@ def score_arm(arm, gen_dir, golds):
                      f"(missing {missing}, extra {extra}) — incomplete run, "
                      f"refusing to score")
         extractor, grader = _PIPE[mode]
-        correct = 0
+        correct = total = 0
         for pid, g in gold.items():
-            pred = extractor(rows[pid])
-            ok, _reason = grader(pred, g)
+            row = rows[pid]
+            sr = row.get("stop_reason")
+            if sr is None:
+                sys.exit(f"{arm}.{mode}: row {pid} has no stop_reason — this "
+                         f"corpus predates the stop_reason harness fix; "
+                         f"regenerate with the patched gen_runner before "
+                         f"scoring (refusing to guess completeness)")
+            if sr not in COMPLETE_REASONS:
+                n_excluded += 1
+                continue  # truncated (max_tokens/length): unscoreable
+            total += 1
+            ok, _reason = grader(extractor(row.get("text", "")), g)
             if ok:
                 correct += 1
-        per_mode[mode] = (correct, len(gold))
+        per_mode[mode] = (correct, total)
         tot_c += correct
-        tot_n += len(gold)
-    return per_mode, (tot_c, tot_n)
+        tot_n += total
+    return per_mode, (tot_c, tot_n), n_excluded
 
 
 def acc(ct):
@@ -158,26 +178,26 @@ def main():
                                          if a not in (args.ref, args.floor)]
     results = {}
     for arm in all_arms:
-        per_mode, overall = score_arm(arm, args.dir, golds)
-        results[arm] = (per_mode, overall)
+        per_mode, overall, n_excl = score_arm(arm, args.dir, golds)
+        results[arm] = (per_mode, overall, n_excl)
 
     ref_acc = acc(results[args.ref][1])
     floor_acc = acc(results[args.floor][1])
 
     hdr = f"{'arm':16s} " + " ".join(f"{m:>16s}" for m in MODES) + \
-          f" {'overall':>10s} {'gap-to-ref':>11s} {'gap-rec':>8s}"
+          f" {'overall':>10s} {'excl':>5s} {'gap-to-ref':>11s} {'gap-rec':>8s}"
     print(hdr)
     print("-" * len(hdr))
     for arm in all_arms:
-        per_mode, overall = results[arm]
-        cells = " ".join(f"{c}/{n} ({c/n:.2f})".rjust(16) for m in MODES
+        per_mode, overall, n_excl = results[arm]
+        cells = " ".join(f"{c}/{n} ({c/n if n else 0:.2f})".rjust(16) for m in MODES
                          for c, n in [per_mode[m]])
         a = acc(overall)
         gap = a - ref_acc
         rec = (a - floor_acc) / (ref_acc - floor_acc) \
             if ref_acc > floor_acc else math.nan
         print(f"{arm:16s} {cells} {overall[0]}/{overall[1]} ({a:.3f}) "
-              f"{gap:+.3f}".ljust(len(hdr) - 9) + (f"{rec:7.2f}" if not math.isnan(rec) else "    nan"))
+              f"{n_excl:>5d} {gap:+.3f}".ljust(len(hdr) - 9) + (f"{rec:7.2f}" if not math.isnan(rec) else "    nan"))
 
     # fail-closed: any candidate strictly below the floor arm exits 1.
     rc = 0

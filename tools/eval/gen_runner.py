@@ -49,10 +49,37 @@ def extract_text(api, payload):
     return choices[0].get("message", {}).get("content", "") or ""
 
 
+def extract_thinking(api, payload):
+    """Concatenate thinking-block content (Anthropic) / reasoning_content
+    (OpenAI). Returns "" when the response has none."""
+    if api == "anthropic":
+        return "".join(b.get("thinking", "") for b in payload.get("content", [])
+                       if b.get("type") == "thinking")
+    choices = payload.get("choices", [])
+    if not choices:
+        return ""
+    return choices[0].get("message", {}).get("reasoning_content", "") or ""
+
+
+def extract_stop_reason(api, payload):
+    """The generation stop reason ('end_turn'/'stop' = complete,
+    'max_tokens'/'length' = truncated). Drives the scorer's
+    end_turn-only filter (the thinking-budget artifact of 2026-07-19)."""
+    if api == "anthropic":
+        return payload.get("stop_reason") or ""
+    choices = payload.get("choices", [])
+    if not choices:
+        return ""
+    return choices[0].get("finish_reason") or ""
+
+
 def run_one(api, base_url, prompt, max_tokens, timeout):
+    """Returns (text, thinking, stop_reason)."""
     req = build_request(api, base_url, prompt, max_tokens)
     with DIRECT_OPENER.open(req, timeout=timeout) as resp:
-        return extract_text(api, json.loads(resp.read().decode()))
+        payload = json.loads(resp.read().decode())
+    return (extract_text(api, payload), extract_thinking(api, payload),
+            extract_stop_reason(api, payload))
 
 
 def main():
@@ -88,8 +115,13 @@ def main():
             err = None
             for attempt in (1, 2):
                 try:
-                    rec["text"] = run_one(args.api, args.base_url, r["prompt"],
-                                          args.max_tokens, args.timeout)
+                    text, thinking, stop_reason = run_one(
+                        args.api, args.base_url, r["prompt"],
+                        args.max_tokens, args.timeout)
+                    rec["text"] = text
+                    rec["stop_reason"] = stop_reason
+                    if thinking:
+                        rec["thinking"] = thinking
                     err = None
                     break
                 except (urllib.error.URLError, OSError, json.JSONDecodeError,
