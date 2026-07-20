@@ -115,6 +115,12 @@ def sse_error_payload(message: str, api: str | None) -> bytes:
                                "output": []}}
         return (f"data: {json.dumps(error, separators=(',', ':'))}\n\n"
                 f"data: {json.dumps(failed, separators=(',', ':'))}\n\n").encode()
+    if api in ("messages", "anthropic"):
+        # Anthropic /v1/messages streams named events: the error rides an
+        # "event: error" frame whose body is the real API's error envelope.
+        body = {"type": "error",
+                "error": {"type": "api_error", "message": message}}
+        return (f"event: error\ndata: {json.dumps(body, separators=(',', ':'))}\n\n").encode()
     error = {"error": {"message": message, "type": "api_error"}}
     return (f"data: {json.dumps(error, separators=(',', ':'))}\n\n"
             "data: [DONE]\n\n").encode()
@@ -321,7 +327,8 @@ def parser() -> argparse.ArgumentParser:
 
     direct = sub.add_parser("prewarm", help="prewarm from a captured request JSON object")
     direct.add_argument("--target", type=target_url, default=target_url("http://127.0.0.1:8080"))
-    direct.add_argument("--api", choices=("chat_completions", "responses"), required=True)
+    direct.add_argument("--api", choices=("chat_completions", "responses", "messages", "anthropic"),
+                        required=True)
     direct.add_argument("request", help="request JSON file, or - for stdin")
     direct.set_defaults(func=command_prewarm)
 

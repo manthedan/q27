@@ -86,12 +86,20 @@ def run() -> None:
     result = cache.prewarm(target, "test-token", "chat_completions", request)
     assert result["status"] == "ok"
     assert FakeTarget.prewarms[-1] == {"api": "chat_completions", "request": request}
+    # The direct path also accepts the Anthropic Messages API (Claude Code).
+    claude_direct = {"system": "You are Claude Code.",
+                     "messages": [{"role": "user", "content": "hi"}]}
+    result = cache.prewarm(target, "test-token", "messages", claude_direct)
+    assert result["status"] == "ok"
+    assert FakeTarget.prewarms[-1] == {"api": "messages", "request": claude_direct}
     try:
         cache.prewarm(target, "test-token", "chat_completions", {"redirect": True})
         raise AssertionError("credential-bearing redirect was followed")
     except RuntimeError:
         pass
     assert not FakeTarget.redirect_followed
+    # Count after the two direct prewarms (chat + messages) above.
+    direct_prewarms = len(FakeTarget.prewarms)
 
     state = cache.ProxyState(target, "test-token", "capture-token")
     proxy_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cache.PrefixProxy)
@@ -109,7 +117,7 @@ def run() -> None:
         raise AssertionError("unauthenticated capture request accepted")
     except urllib.error.HTTPError as exc:
         assert exc.code == 403
-    assert len(FakeTarget.prewarms) == 2
+    assert len(FakeTarget.prewarms) == direct_prewarms
 
     # The first streaming harness request receives an SSE comment while its
     # cold prewarm is still running, then the actual upstream SSE response.
@@ -138,9 +146,9 @@ def run() -> None:
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             assert json.load(response)["object"] == "chat.completion"
-    # One direct prewarm above plus exactly one proxy prewarm; subsequent
+    # The direct prewarms above plus exactly one proxy prewarm; subsequent
     # harness requests are forwarded without repeated multi-hundred-MiB saves.
-    assert len(FakeTarget.prewarms) == 3
+    assert len(FakeTarget.prewarms) == direct_prewarms + 1
     assert len(FakeTarget.forwarded) == 3
     assert FakeTarget.forwarded[1][1]["messages"][0]["content"] == "first"
     assert FakeTarget.forwarded[2][1]["messages"][0]["content"] == "second"
@@ -167,6 +175,16 @@ def run() -> None:
     assert "[DONE]" not in responses_error
     chat_error = cache.sse_error_payload("boom", "chat_completions").decode()
     assert '\"error\"' in chat_error and "data: [DONE]" in chat_error
+    # Anthropic /v1/messages streaming prewarm failures ride a named
+    # "event: error" frame with the real API's error envelope, NOT the
+    # OpenAI chat data-frame + [DONE] shape.
+    anthropic_error = cache.sse_error_payload("boom", "messages").decode()
+    assert anthropic_error.startswith("event: error\n"), anthropic_error
+    anthropic_rows = [json.loads(line[6:]) for line in anthropic_error.splitlines()
+                      if line.startswith("data: ")]
+    assert anthropic_rows[0]["type"] == "error"
+    assert anthropic_rows[0]["error"]["message"] == "boom"
+    assert "[DONE]" not in anthropic_error
 
     rejected_listener = False
     try:
