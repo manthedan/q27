@@ -208,6 +208,30 @@ def run() -> None:
     assert dumped == {"api": "responses", "request": {"input": "hi", "model": "q27"}}
     # Dump files hold the full private prompt: they must be owner-only (0600).
     assert (os.stat(dump_path).st_mode & 0o777) == 0o600, oct(os.stat(dump_path).st_mode & 0o777)
+    # Dumping over an EXISTING world-readable file must still force 0600 (the
+    # open mode arg only applies to newly created files; fchmod fixes existing).
+    existing_path = os.path.join(tempfile.mkdtemp(), "existing.json")
+    with open(existing_path, "w", encoding="utf-8") as stream:
+        stream.write("{}")
+    os.chmod(existing_path, 0o644)
+    state_existing = cache.ProxyState(target, "test-token", "capture-token",
+                                      dump_request=existing_path)
+    state_existing.maybe_dump("responses", {"input": "over"})
+    assert (os.stat(existing_path).st_mode & 0o777) == 0o600, \
+        oct(os.stat(existing_path).st_mode & 0o777)
+    # A symlinked dump path is rejected (O_NOFOLLOW), not written through.
+    if hasattr(os, "O_NOFOLLOW"):
+        link_path = os.path.join(tempfile.mkdtemp(), "link.json")
+        victim = os.path.join(tempfile.mkdtemp(), "victim.json")
+        with open(victim, "w", encoding="utf-8") as stream:
+            stream.write('{"sentinel": true}')
+        os.chmod(victim, 0o644)
+        os.symlink(victim, link_path)
+        state_link = cache.ProxyState(target, "test-token", "capture-token",
+                                      dump_request=link_path)
+        state_link.maybe_dump("responses", {"input": "nope"})
+        with open(victim, encoding="utf-8") as stream:
+            assert json.load(stream) == {"sentinel": True}  # untouched
     # A state without dump_request is a no-op (no file written).
     state_nodump = cache.ProxyState(target, "test-token", "capture-token")
     state_nodump.maybe_dump("responses", {"input": "x"})  # must not raise

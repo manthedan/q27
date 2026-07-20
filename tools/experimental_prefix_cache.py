@@ -156,10 +156,16 @@ class ProxyState:
             return
         try:
             # Owner-only: the dump holds the full harness prompt, tool schemas,
-            # and project/user content. Create 0600 BEFORE writing so a partial
-            # write never leaves world-readable prompt material, matching the
-            # snapshot store's 0600/0700 privacy model.
-            fd = os.open(self.dump_request, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # and project/user content. Match the snapshot store's privacy model:
+            # O_NOFOLLOW rejects a symlinked path, and fchmod(0600) forces the
+            # mode even when the file already exists with broader permissions
+            # (the 0600 arg to open() only applies to a freshly created file).
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(self.dump_request, flags, 0o600)
+            # fchmod BEFORE fdopen takes ownership; fdopen closes fd on exit.
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump({"api": api, "request": request}, stream, indent=2, sort_keys=True)
             print(f"q27 experimental prefix: captured request dumped to {self.dump_request}",
