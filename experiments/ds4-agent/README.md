@@ -185,8 +185,13 @@ semantic call terminal. Unless `--max-tokens` is supplied explicitly,
 `--auto-tools` raises the per-generation bound from 512 to 4096 when context
 is at least 8192 tokens, so a complete new-file payload can close its
 constrained call. Smaller contexts retain 512 because tool execution also
-reserves framing and the next generation; an explicit `--max-tokens` always
-wins. Automatic shell execution
+reserves framing and the next generation. An explicit numeric `--max-tokens`
+always wins. `--max-tokens auto` instead derives each generation from the
+fresh canonical prompt count, retaining 512 tokens in automatic-tool mode
+(256 without tools), and caps any one generation at 16384 tokens. Before a
+side effect, tool-response framing and another 512-token continuation margin
+are reserved separately. The limit is recomputed after every tool response and any
+compaction rewrite. Automatic shell execution
 remains subject to the single-process sandbox described above.
 
 ### Resident session contract

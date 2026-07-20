@@ -85,7 +85,7 @@ static void usage(FILE *out, const char *argv0) {
         "options:\n"
         "  -p, --prompt TEXT       run one non-interactive turn\n"
         "  -s, --system TEXT       replace the default system prompt\n"
-        "  -n, --max-tokens N      maximum generated tokens (default 512; 4096 with --auto-tools at context >=8192)\n"
+        "  -n, --max-tokens N|auto maximum generated tokens (default 512; 4096 with --auto-tools at context >=8192)\n"
         "  -c, --context N         engine context (default 8192)\n"
         "      --no-think          append the Qwen no-thinking prefix\n"
         "      --output-format F   text (default) or jsonl events\n"
@@ -1011,20 +1011,70 @@ static int append_tool_response(transcript *chat,
     return ok;
 }
 
+static int adaptive_turn_limit(q27_agent_worker *worker,
+                               const transcript *chat, int think,
+                               uint32_t context_tokens, int enable_tools,
+                               uint32_t *limit) {
+    uint32_t prompt_tokens = 0;
+    if (!transcript_prompt_tokens(worker, chat, think, &prompt_tokens))
+        return 0;
+    // Tool turns retain a continuation margin; before any side effect the
+    // separate tool preflight also reserves worst-case response framing.
+    // Plain turns retain a smaller margin. Both remain context-bounded and
+    // subject to a 16K runaway ceiling.
+    const uint32_t reserve = enable_tools ? 512 : 256;
+    const uint64_t capacity = (uint64_t)context_tokens + 1;
+    if ((uint64_t)prompt_tokens + reserve >= capacity) {
+        fprintf(stderr,
+                "q27-agent: insufficient context for adaptive generation\n");
+        return 0;
+    }
+    uint64_t available = capacity - prompt_tokens - reserve;
+    if (available > 16384) available = 16384;
+    *limit = (uint32_t)available;
+    fprintf(stderr,
+            "[q27-agent adaptive max-tokens=%u prompt=%u reserve=%u]\n",
+            *limit, prompt_tokens, reserve);
+    return 1;
+}
+
+static int prepare_turn(q27_agent_worker *worker, transcript *chat, int think,
+                        uint32_t context_tokens, uint32_t configured_max_tokens,
+                        int adaptive_tokens, int enable_tools,
+                        uint32_t compact_at, uint32_t compact_tokens,
+                        uint32_t compact_keep, uint32_t *turn_max_tokens) {
+    // In adaptive mode compaction reserves a viable minimum instead of the
+    // potential 16K ceiling; the actual turn limit is derived after any
+    // compaction rewrites the transcript.
+    const uint32_t compaction_reserve = adaptive_tokens ?
+        (enable_tools ? 513 : 257) : configured_max_tokens;
+    if (!maybe_compact(worker, chat, think, context_tokens,
+                       compaction_reserve, compact_at, compact_tokens,
+                       compact_keep))
+        return 0;
+    if (adaptive_tokens)
+        return adaptive_turn_limit(worker, chat, think, context_tokens,
+                                   enable_tools, turn_max_tokens);
+    *turn_max_tokens = configured_max_tokens;
+    return 1;
+}
+
 static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                            int think, uint32_t context_tokens,
-                           uint32_t max_tokens, int jsonl,
+                           uint32_t max_tokens, int adaptive_tokens, int jsonl,
                            uint32_t max_tool_rounds, uint32_t compact_at,
                            uint32_t compact_tokens, uint32_t compact_keep) {
     uint32_t tool_rounds = 0;
     for (;;) {
-        if (!maybe_compact(worker, chat, think, context_tokens, max_tokens,
-                           compact_at, compact_tokens, compact_keep))
+        uint32_t turn_max_tokens = 0;
+        if (!prepare_turn(worker, chat, think, context_tokens, max_tokens,
+                          adaptive_tokens, 1, compact_at, compact_tokens,
+                          compact_keep, &turn_max_tokens))
             return 0;
         output_buffer generated = {0};
         int engine_closed_call = 0;
         turn_accounting accounting = {0};
-        if (!run_turn(worker, chat, think, 1, max_tokens, jsonl, 1,
+        if (!run_turn(worker, chat, think, 1, turn_max_tokens, jsonl, 1,
                       &generated, &engine_closed_call, &accounting)) {
             free(generated.bytes);
             return 0;
@@ -1068,7 +1118,9 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         // than trusting output_tokens; byte-BPE cannot exceed that bound.
         const uint64_t committed = (uint64_t)accounting.prompt_tokens +
                                    generated_bytes;
-        const uint64_t required = committed + max_tokens +
+        const uint32_t continuation_reserve =
+            adaptive_tokens ? 512 : max_tokens;
+        const uint64_t required = committed + continuation_reserve +
                                   response_reserve_tokens;
         if ((uint64_t)context_tokens + 1 <= required) {
             fprintf(stderr,
@@ -1112,6 +1164,7 @@ int main(int argc, char **argv) {
     uint32_t context = 8192, max_tokens = 512, max_tool_rounds = 8;
     uint32_t compact_at = 0, compact_keep = 4, compact_tokens = 1024;
     int think = 1, jsonl = 0, auto_tools = 0, max_tokens_explicit = 0;
+    int adaptive_tokens = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -1125,9 +1178,17 @@ int main(int argc, char **argv) {
             if (++i == argc) { usage(stderr, argv[0]); return 2; }
             system = argv[i];
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--max-tokens")) {
-            if (++i == argc || !parse_u32(argv[i], &max_tokens)) {
+            if (++i == argc) {
+                fprintf(stderr, "q27-agent: max token count is required\n");
+                return 2;
+            }
+            if (!strcmp(argv[i], "auto")) {
+                adaptive_tokens = 1;
+            } else if (!parse_u32(argv[i], &max_tokens)) {
                 fprintf(stderr, "q27-agent: invalid max token count\n");
                 return 2;
+            } else {
+                adaptive_tokens = 0;
             }
             max_tokens_explicit = 1;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--context")) {
@@ -1308,13 +1369,16 @@ int main(int argc, char **argv) {
         ok = transcript_append(&chat, "user", prompt);
         if (ok && auto_tools)
             ok = run_agent_cycle(worker, &chat, think, context, max_tokens,
-                                 jsonl, max_tool_rounds, compact_at,
+                                 adaptive_tokens, jsonl, max_tool_rounds, compact_at,
                                  compact_tokens, compact_keep);
-        else if (ok)
-            ok = maybe_compact(worker, &chat, think, context, max_tokens,
-                               compact_at, compact_tokens, compact_keep) &&
-                 run_turn(worker, &chat, think, 0, max_tokens, jsonl, 1,
+        else if (ok) {
+            uint32_t turn_max_tokens = 0;
+            ok = prepare_turn(worker, &chat, think, context, max_tokens,
+                              adaptive_tokens, 0, compact_at, compact_tokens,
+                              compact_keep, &turn_max_tokens) &&
+                 run_turn(worker, &chat, think, 0, turn_max_tokens, jsonl, 1,
                           NULL, NULL, NULL);
+        }
         if (ok) ok = save_session(worker, session_path,
                                   &current_snapshot_name, &chat, think,
                                   auto_tools, context, tokenizer_sha1, jsonl);
@@ -1369,7 +1433,9 @@ int main(int argc, char **argv) {
                         fprintf(stderr,
                                 "q27-agent: cannot compact an incomplete turn\n");
                     } else if (!compact_transcript(
-                                   worker, &chat, think, context, max_tokens,
+                                   worker, &chat, think, context,
+                                   adaptive_tokens ?
+                                       (auto_tools ? 513 : 257) : max_tokens,
                                    compact_tokens, compact_keep)) {
                         fprintf(stderr,
                                 "q27-agent: no eligible turns to compact\n");
@@ -1412,13 +1478,17 @@ int main(int argc, char **argv) {
             ok = transcript_append_len(&chat, "user", line, len);
             if (ok && auto_tools)
                 ok = run_agent_cycle(worker, &chat, think, context, max_tokens,
-                                     jsonl, max_tool_rounds, compact_at,
+                                     adaptive_tokens, jsonl, max_tool_rounds, compact_at,
                                      compact_tokens, compact_keep);
-            else if (ok)
-                ok = maybe_compact(worker, &chat, think, context, max_tokens,
-                                   compact_at, compact_tokens, compact_keep) &&
-                     run_turn(worker, &chat, think, 0, max_tokens, jsonl, 1,
-                              NULL, NULL, NULL);
+            else if (ok) {
+                uint32_t turn_max_tokens = 0;
+                ok = prepare_turn(worker, &chat, think, context, max_tokens,
+                                  adaptive_tokens, 0, compact_at,
+                                  compact_tokens, compact_keep,
+                                  &turn_max_tokens) &&
+                     run_turn(worker, &chat, think, 0, turn_max_tokens,
+                              jsonl, 1, NULL, NULL, NULL);
+            }
             if (ok) ok = save_session(worker, session_path,
                                       &current_snapshot_name, &chat, think,
                                       auto_tools, context, tokenizer_sha1,
