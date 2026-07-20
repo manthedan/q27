@@ -128,12 +128,29 @@ def sse_error_payload(message: str, api: str | None) -> bytes:
 
 class ProxyState:
     def __init__(self, target: urllib.parse.ParseResult, admin_token: str,
-                 capture_token: str):
+                 capture_token: str, dump_request: str | None = None):
         self.target = target
         self.admin_token = admin_token
         self.capture_token = capture_token
+        self.dump_request = dump_request
         self.lock = threading.Lock()
         self.warmed = False
+
+    def maybe_dump(self, api: str, request: dict) -> None:
+        # Write the exact captured request (with its api tag) so it can be
+        # re-installed out-of-band via the direct `prewarm` subcommand — the
+        # robust path for large prompts whose cold prewarm outlives a harness
+        # HTTP timeout. Local-only file; it is the harness's own request.
+        if not self.dump_request:
+            return
+        try:
+            with open(self.dump_request, "w", encoding="utf-8") as stream:
+                json.dump({"api": api, "request": request}, stream, indent=2, sort_keys=True)
+            print(f"q27 experimental prefix: captured request dumped to {self.dump_request}",
+                  file=sys.stderr, flush=True)
+        except OSError as exc:
+            print(f"q27 experimental prefix: dump-request write failed: {exc}",
+                  file=sys.stderr, flush=True)
 
 
 class PrefixProxy(http.server.BaseHTTPRequestHandler):
@@ -179,6 +196,7 @@ class PrefixProxy(http.server.BaseHTTPRequestHandler):
                 return
             with self.state.lock:
                 if not self.state.warmed:
+                    self.state.maybe_dump(api, request)
                     if request.get("stream") is True:
                         downstream_started = True
                         self.send_response(200)
@@ -306,7 +324,8 @@ class PrefixProxy(http.server.BaseHTTPRequestHandler):
 
 def command_proxy(args: argparse.Namespace) -> int:
     state = ProxyState(args.target, secret_from_env("Q27_METAL_ADMIN_TOKEN"),
-                       secret_from_env("Q27_PREFIX_CAPTURE_TOKEN"))
+                       secret_from_env("Q27_PREFIX_CAPTURE_TOKEN"),
+                       dump_request=args.dump_request)
     server = http.server.ThreadingHTTPServer((args.listen, args.port), PrefixProxy)
     server.state = state  # type: ignore[attr-defined]
     print(f"q27 experimental prefix proxy: http://{args.listen}:{args.port}", file=sys.stderr)
@@ -336,6 +355,9 @@ def parser() -> argparse.ArgumentParser:
     proxy.add_argument("--target", type=target_url, default=target_url("http://127.0.0.1:8080"))
     proxy.add_argument("--listen", type=listen_address, default="127.0.0.1")
     proxy.add_argument("--port", type=int, default=8081)
+    proxy.add_argument("--dump-request", metavar="PATH",
+                       help="also write the first captured request JSON to PATH "
+                            "(for out-of-band `prewarm` re-install)")
     proxy.set_defaults(func=command_proxy)
     return result
 

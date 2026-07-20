@@ -196,6 +196,19 @@ def run() -> None:
     # /v1/messages (Claude Code, Anthropic API) is an eligible capture path and
     # maps to api="messages" on the prewarm envelope.
     assert cache.ELIGIBLE["/v1/messages"] == "messages"
+    # --dump-request writes the exact captured request (api + request) to a file
+    # for out-of-band direct prewarm.
+    import tempfile, os
+    dump_path = os.path.join(tempfile.mkdtemp(), "captured.json")
+    state_dump = cache.ProxyState(target, "test-token", "capture-token",
+                                  dump_request=dump_path)
+    state_dump.maybe_dump("responses", {"input": "hi", "model": "q27"})
+    with open(dump_path, encoding="utf-8") as stream:
+        dumped = json.load(stream)
+    assert dumped == {"api": "responses", "request": {"input": "hi", "model": "q27"}}
+    # A state without dump_request is a no-op (no file written).
+    state_nodump = cache.ProxyState(target, "test-token", "capture-token")
+    state_nodump.maybe_dump("responses", {"input": "x"})  # must not raise
     state2 = cache.ProxyState(target, "test-token", "capture-token")
     proxy2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cache.PrefixProxy)
     proxy2.state = state2
