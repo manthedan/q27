@@ -119,3 +119,62 @@ Before this can become supported behavior:
    cold and filesystem-warm snapshot load times.
 6. Complete adversarial review of prompt privacy and directory replacement
    assumptions before enabling non-loopback administration.
+
+---
+
+## Codex + Claude Code capture (2026-07-20, promotion gate 1 partial)
+
+**Messages API support added (this change).** The prewarm endpoint previously
+accepted only `chat_completions` and `responses`, so Claude Code (Anthropic
+`/v1/messages`) could not be captured at all. Added a `messages`/`anthropic`
+arm that reuses the SAME canonicalizer as ordinary `/v1/messages` serving
+(`q27::anthropic_msgs` + `anthropic_tools_json`, `think=true` to match the
+serving render), so the prewarmed prefix is byte-for-byte what the live
+request prefills. Proxy `ELIGIBLE` gains `/v1/messages -> messages`; direct
+`prewarm --api` accepts `messages`/`anthropic`; streaming prewarm failures on
+`/v1/messages` now emit the real API's named `event: error` frame instead of
+the OpenAI `[DONE]` shape.
+
+**Codex 0.144.6 captured and warm-verified (pinned).** Method: the proxy's
+blocking cold-prewarm outlives Codex's HTTP timeout on a large prompt, so a
+`--dump-request PATH` proxy mode was added to harvest the exact request JSON
+for out-of-band install. One `codex exec -p q27` run dumped
+`/tmp/q27-codex-captured.json` (177 KB body, `api=responses`, 20,751-char
+`instructions` + 19 tools + 3 input items, `stream=true`). The background
+install thread (which keeps running after client disconnect, by design)
+completed the snapshot anyway; a direct `prewarm` of the harvested file
+confirmed `already_cached: true`.
+
+- Codex initial request: 11,219 prompt tokens; exact static prefix: **10,802
+  tokens** (96.3% of the prompt is stable across runs).
+- Snapshot: **826 MiB**, mode `0600`, dir `0700`.
+- `/stats` after a fresh warm run: `disk_saves: 1`, `disk_hits: 2` — the
+  10.8K-token prefix is restored from disk, not re-prefilled.
+- Cold first turn (blocking proxy, Codex timeout) never completed
+  interactively; warm turn (`codex exec -p q27`, prefix hit) completed
+  end-to-end in **29.6 s wall** including Codex startup + model refresh +
+  generation. This is the gate-1 Codex number; a clean cold-vs-warm TTFT
+  split needs the async-prewarm fix below.
+
+**Persistent Codex config installed:** `~/.codex/q27.config.toml` (named
+`q27` profile: provider `q27` -> `http://127.0.0.1:8081/v1`,
+`wire_api=responses`, bearer from `Q27_CAPTURE_TOKEN` in `~/.codex/q27.env`,
+mode 600). Toggle with `codex -p q27`. Stack launcher `/tmp/q27-stack.sh`
+(server ctx 32768 + proxy) with proper PID/port handling.
+
+**Known limitation surfaced (gate 2 blocker):** the proxy's streaming
+cold-prewarm blocks the first live request for the full tokenize +
+zero-token-gen duration. On a >10K-token Codex/Claude prompt at 32K ctx on
+the M1 pack this exceeds the harness HTTP timeout, so the interactive
+capture path stalls (the snapshot still lands via the background install
+thread, but the first turn is lost). Mitigation used here: `--dump-request`
++ out-of-band direct `prewarm`. Proper fix (async prewarm that returns
+immediately + lets the first request ride ordinary prefill while the
+snapshot builds, or a longer-heartbeat SSE path) is required before the
+blocking proxy is usable interactively for large-prompt harnesses.
+
+**Claude Code 2.1.214: NOT yet captured.** Messages-API support now exists
+(endpoint + proxy + direct prewarm), but Claude Code is closed-source, so
+its exact initial request cannot be reconstructed from a repo — it must be
+harvested live via `--dump-request` the same way Codex was. Pending the same
+async-prewarm caveat for its (larger) system prompt.
