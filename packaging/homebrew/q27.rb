@@ -50,7 +50,19 @@ class Q27 < Formula
     (libexec/"q27").install "packaging/models.tsv"
     (libexec/"q27/share/q27-tools").install "tools/repack.py",
                                            "tools/export_tokenizer.py"
-    %w[q27 q27-bench q27-report q27-fetch].each do |t|
+    # The wrapper resolves its lib/models/tools relative to its own real
+    # path, but its symlink-chase uses `dirname "$0"` rather than `dirname
+    # "$SRC"`, so it breaks on Homebrew's nested symlink chain
+    # (/opt/homebrew/bin/q27 -> Cellar/bin/q27 -> ../libexec/q27/bin/q27).
+    # Install bin/q27 as a tiny shim that execs the libexec wrapper directly,
+    # sidestepping the resolution. The leaf tools are simple enough to keep as
+    # symlinks.
+    (bin/"q27").write <<~SH
+      #!/bin/sh
+      exec "#{libexec}/q27/bin/q27" "$@"
+    SH
+    (bin/"q27").chmod 0555
+    %w[q27-bench q27-report q27-fetch].each do |t|
       bin.install_symlink libexec/"q27/bin"/t
     end
     doc.install "README.md", "docs/METAL_PROGRESS.md", "docs/MODELS.md"
