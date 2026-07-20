@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Hold q27's one-consumer flock across an exec without changing its PID."""
+
+import fcntl
+import os
+import stat
+import sys
+
+
+def die(message: str, code: int = 75) -> "None":
+    print(f"q27: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        die("usage: q27-lock-exec LOCK COMMAND [ARGS...]", 2)
+
+    lock_path = os.path.abspath(sys.argv[1])
+    command = sys.argv[2:]
+    parent, leaf = os.path.split(lock_path)
+    if not leaf or leaf in (".", ".."):
+        die("invalid consumer lock path")
+
+    old_umask = os.umask(0o077)
+    try:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    finally:
+        os.umask(old_umask)
+
+    try:
+        parent_lstat = os.lstat(parent)
+        if not stat.S_ISDIR(parent_lstat.st_mode):
+            die(f"consumer run path is not a directory: {parent}")
+
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        dir_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        dir_fd = os.open(parent, dir_flags)
+        parent_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            die(f"consumer run path is not a directory: {parent}")
+        if parent_stat.st_uid != os.geteuid():
+            die(f"consumer run directory is not owned by this user: {parent}")
+        os.fchmod(dir_fd, 0o700)
+        if stat.S_IMODE(os.fstat(dir_fd).st_mode) != 0o700:
+            die(f"consumer run directory is not private: {parent}")
+    except OSError as exc:
+        die(f"cannot protect consumer run directory {parent}: {exc}")
+
+    try:
+        flags = os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(leaf, flags, 0o600, dir_fd=dir_fd)
+        os.fchmod(fd, 0o600)
+        opened = os.fstat(fd)
+        named = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_dev != named.st_dev
+            or opened.st_ino != named.st_ino
+        ):
+            die("consumer lock is not one private regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            die("a q27 server or native agent is already running (one model at a time)")
+
+        # Revalidate after acquisition. The private owner-only parent excludes
+        # other principals; this catches accidental same-account replacement.
+        named = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
+        if opened.st_dev != named.st_dev or opened.st_ino != named.st_ino:
+            die("consumer lock identity changed during acquisition")
+
+        os.set_inheritable(fd, True)
+        child_env = os.environ.copy()
+        child_env["Q27_SUPERVISOR_LOCK_FD"] = str(fd)
+        os.close(dir_fd)
+        dir_fd = -1
+        os.execvpe(command[0], command, child_env)
+    except OSError as exc:
+        die(f"cannot launch locked consumer: {exc}")
+    finally:
+        if dir_fd >= 0:
+            os.close(dir_fd)
+
+
+if __name__ == "__main__":
+    main()

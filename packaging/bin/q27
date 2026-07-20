@@ -7,6 +7,7 @@
 #   q27 pull [name]     recommend by RAM, or fetch a specific pack (resumable,
 #                       checksum-verified) into ~/.q27/models/<name>/
 #   q27 serve [name]    start the server on a pack (refuses if one is running)
+#   q27 agent [name]    start the native coding agent (default: b1)
 #   q27 ls              list installed packs + sizes + which is servable
 #   q27 rm <name>       delete a pack's cache
 #   q27 bench [--fast|--full] [packs..]   run the benchmark suite
@@ -82,6 +83,59 @@ cmd_rm() {
     rm -rf "$d"
 }
 
+q27_source_model() {
+    local filename="$1" root p
+    if [ -n "${Q27_SOURCE_ROOT:-}" ]; then
+        root="$Q27_SOURCE_ROOT"
+    else
+        root="$(cd "$HERE/../.." 2>/dev/null && pwd)" || return 1
+    fi
+    for p in "$root/models/$filename" "$root"/models/*/"$filename"; do
+        [ -f "$p" ] && { printf '%s' "$p"; return 0; }
+    done
+    return 1
+}
+
+q27_source_tokenizer() {
+    local root p
+    if [ -n "${Q27_SOURCE_ROOT:-}" ]; then
+        root="$Q27_SOURCE_ROOT"
+    else
+        root="$(cd "$HERE/../.." 2>/dev/null && pwd)" || return 1
+    fi
+    for p in "$root/models/qwen36-27b-mtp/qwen36-27b-mtp.tok" \
+             "$root"/models/*/*.tok; do
+        [ -f "$p" ] && { printf '%s' "$p"; return 0; }
+    done
+    return 1
+}
+
+q27_resident_consumer() {
+    pgrep -x q27-metal-server >/dev/null 2>&1 ||
+        pgrep -f '^([^[:space:]]*/)?q27-metal-server([[:space:]]|$)' \
+            >/dev/null 2>&1 ||
+        pgrep -x q27-agent >/dev/null 2>&1 ||
+        pgrep -f '^([^[:space:]]*/)?q27-agent([[:space:]]|$)' \
+            >/dev/null 2>&1
+}
+
+q27_run_consumer() {
+    local run lock_exec
+    if q27_resident_consumer; then
+        echo "q27: a low-level q27 server or native agent is already running." >&2
+        return 1
+    fi
+    lock_exec="$HERE/q27-lock-exec"
+    [ -x "$lock_exec" ] || {
+        echo "q27: q27-lock-exec helper not found" >&2; return 1; }
+    run="${Q27_RUN_DIR:-${TMPDIR:-/tmp}/q27-$UID}"
+
+    # The helper takes a nonblocking kernel flock and then execs the consumer.
+    # Both exec steps preserve the wrapper PID, while the inherited lock fd is
+    # released by the kernel on every normal, error, signal, and crash exit.
+    exec "$lock_exec" "$run/consumer.lock" "$@"
+}
+
 cmd_serve() {
     local n="${1:-$(recommend_pack)}"
     [ -n "$n" ] || { echo "q27 serve: no pack fits this machine; see \`q27 recommend\`" >&2; exit 1; }
@@ -89,15 +143,67 @@ cmd_serve() {
     art="$(q27_artifact_path "$n")" || { echo "q27 serve: $n not installed — run \`q27 pull $n\`" >&2; exit 1; }
     tok="$(q27_tokenizer_path "$n")" || { echo "q27 serve: $n tokenizer missing — re-run \`q27 pull $n\`" >&2; exit 1; }
     server="$(q27_bin q27-metal-server)" || { echo "q27 serve: q27-metal-server not found" >&2; exit 1; }
-    if pgrep -f "q27-metal-server" >/dev/null 2>&1; then
-        echo "q27 serve: a q27-metal-server is already running (one model at a time)." >&2
-        echo "  stop it first: pkill -f q27-metal-server" >&2; exit 1
-    fi
     echo "q27 serve: $n ($(basename "$art")) on 127.0.0.1:8080"
     echo "  export ANTHROPIC_BASE_URL=http://localhost:8080"
-    exec "$server" "$art" "$tok" --port 8080 \
+    q27_run_consumer "$server" "$art" "$tok" --port 8080 \
         --snapshot-dir "${Q27_SNAPSHOT_DIR:-$HOME/.q27/snapshots}" \
         --max-tokens-default "${Q27_MAX_TOKENS:-16384}"
+}
+
+cmd_agent() {
+    local n="${Q27_AGENT_PACK:-b1}" agent
+    case "${1:-}" in
+        --help|-h)
+            agent="$(q27_bin q27-agent)" || {
+                echo "q27 agent: q27-agent binary not found" >&2; exit 1; }
+            exec "$agent" --help ;;
+    esac
+    case "${1:-}" in
+        ""|-*) ;;
+        *) n="$1"; shift ;;
+    esac
+    case "${1:-}" in
+        --help|-h)
+            agent="$(q27_bin q27-agent)" || {
+                echo "q27 agent: q27-agent binary not found" >&2; exit 1; }
+            exec "$agent" --help ;;
+    esac
+    q27_registry_field "$n" 1 >/dev/null 2>&1 || {
+        echo "q27 agent: unknown pack $n (see \`q27 recommend\`)" >&2; exit 1; }
+
+    local art tok artifact_file context workspace max_tokens
+    artifact_file="$(q27_registry_field "$n" 4)"
+    art="$(q27_artifact_path "$n" 2>/dev/null ||
+           q27_source_model "$artifact_file" 2>/dev/null)" || {
+        echo "q27 agent: $n is not installed — run \`q27 pull $n\`" >&2
+        echo "  source checkouts may also place $artifact_file beneath models/" >&2
+        exit 1
+    }
+    tok="$(q27_tokenizer_path "$n" 2>/dev/null ||
+           q27_source_tokenizer 2>/dev/null)" || {
+        echo "q27 agent: tokenizer missing — re-run \`q27 pull $n\`" >&2; exit 1; }
+    agent="$(q27_bin q27-agent)" || {
+        echo "q27 agent: q27-agent binary not found" >&2; exit 1; }
+    context="${Q27_AGENT_CONTEXT:-32768}"
+    if [ -n "${Q27_AGENT_WORKSPACE:-}" ]; then
+        workspace="$Q27_AGENT_WORKSPACE"
+    else
+        workspace="$(pwd -P)" || {
+            echo "q27 agent: cannot resolve the current workspace" >&2; exit 1; }
+    fi
+    max_tokens="${Q27_AGENT_MAX_TOKENS:-auto}"
+    echo "q27 agent: pack=$n context=$context workspace=$workspace" >&2
+    echo "  automatic tools enabled; shell retains your local account's filesystem access" >&2
+    if [ -n "${Q27_AGENT_SESSION:-}" ]; then
+        q27_run_consumer "$agent" "$art" "$tok" \
+            --context "$context" --max-tokens "$max_tokens" \
+            --auto-tools --workspace "$workspace" \
+            --session "$Q27_AGENT_SESSION" "$@"
+        return $?
+    fi
+    q27_run_consumer "$agent" "$art" "$tok" \
+        --context "$context" --max-tokens "$max_tokens" \
+        --auto-tools --workspace "$workspace" "$@"
 }
 
 cmd_bench()  { exec "$HERE/q27-bench" "$@"; }
@@ -116,12 +222,13 @@ cmd_pull() {
 case "$CMD" in
     pull) cmd_pull "$@" ;;
     serve) cmd_serve "$@" ;;
+    agent|chat) cmd_agent "$@" ;;
     ls|list) cmd_ls "$@" ;;
     rm|remove) cmd_rm "$@" ;;
     bench) cmd_bench "$@" ;;
     report) cmd_report "$@" ;;
     recommend) cmd_recommend "$@" ;;
     help|--help|-h)
-        sed -n '2,20p' "$0" ;;
+        awk 'NR == 1 { next } /^set -u$/ { exit } { sub(/^# ?/, ""); print }' "$0" ;;
     *) echo "q27: unknown command $CMD (try \`q27 help\`)" >&2; exit 2 ;;
 esac

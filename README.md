@@ -240,6 +240,40 @@ Quality and correctness instruments ride the same binary: `--nll`,
 `--nll-long`, `--kl-kv`, `--envelope`, `--chunk-parity`, `--oracle`,
 `--eos-gate`, `--save-state`/`--load-state`.
 
+## Native coding agent
+
+The friendly source-checkout command builds and starts the B1 agent in the
+current directory:
+
+```bash
+make agent
+```
+
+The equivalent current-source supervisor command is
+`./packaging/bin/q27 agent`. It defaults to B1, context 32768,
+`--max-tokens auto`, automatic tools, and the physical path of the current
+workspace. Packs and ordinary native-agent flags remain available:
+
+```bash
+make agent                                      # B1 in the current project
+Q27_AGENT_PACK=t2 make agent                    # choose another local pack
+Q27_AGENT_SESSION=work.q27agent make agent
+Q27_AGENT_CONTEXT=16384 make agent
+Q27_AGENT_WORKSPACE=/path/to/project make agent
+```
+
+The published v0.3 Homebrew archive predates this supervisor subcommand;
+`q27 agent` will become the installed spelling in the next tagged release.
+Friends testing it now should use a source checkout and `make agent`.
+
+`Q27_AGENT_PACK`, `Q27_AGENT_MAX_TOKENS`, and `Q27_AGENT_SESSION` provide
+script-friendly defaults. The wrapper holds a private kernel lifetime lock
+shared with `q27 serve`, preventing concurrent multi-GB model launches. The
+lock is inherited across `exec` and released automatically on every process
+exit, including signals and crashes. File helpers stay workspace-bounded, but automatic
+shell retains the local account's filesystem access; use a disposable checkout
+when testing an untrusted prompt.
+
 ## Server
 
 Both backends serve the native Anthropic Messages API plus OpenAI

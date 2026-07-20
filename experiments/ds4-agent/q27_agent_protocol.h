@@ -42,6 +42,16 @@ q27_agent_tool_call_status q27_agent_parse_tool_call(
     char *error, size_t error_cap);
 void q27_agent_tool_call_free(q27_agent_tool_call *call);
 
+// Removes one unambiguous outer Markdown fence from a known whole-file
+// source-code payload. Callers must not apply this to edit fragments. This is
+// a weak-model transport repair, not general Markdown parsing: a three-backtick
+// opening language must match the file extension (or be empty), the closing
+// fence must be the final line, and prose/Markdown files remain untouched.
+// Returns 1 when bytes were normalized, 0 when unchanged, and -1 on invalid
+// arguments. The buffer is modified in place and remains NUL-terminated.
+int q27_agent_unwrap_whole_file_source_fence(
+    const char *path, unsigned char *bytes, size_t *len);
+
 #ifdef __cplusplus
 }
 #endif

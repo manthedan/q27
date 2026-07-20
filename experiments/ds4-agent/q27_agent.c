@@ -37,7 +37,7 @@ static int signal_pipe[2] = {-1, -1};
 // An exact boundary after the generated schema makes durable tool-protocol
 // identity unambiguous even when the caller's custom system text is arbitrary.
 static const char tool_protocol_boundary[] =
-    "\n<q27_tool_protocol version=\"raw-payload-v1\"/>\n\n";
+    "\n<q27_tool_protocol version=\"raw-payload-v2\"/>\n\n";
 
 static void on_signal(int sig) {
     (void)sig;
@@ -1091,17 +1091,17 @@ static int generate_raw_payload(q27_agent_worker *worker, transcript *chat,
                                 q27_agent_tool_kind kind,
                                 uint32_t context_tokens,
                                 uint32_t configured_max_tokens,
-                                int adaptive_tokens,
+                                int adaptive_tokens, int stream_text,
                                 output_buffer *payload,
                                 turn_accounting *accounting) {
     static const char write_request[] =
-        "<q27_raw_payload_request version=\"1\" kind=\"write\">\n"
+        "<q27_raw_payload_request version=\"2\" kind=\"write\">\n"
         "Emit the exact complete file content only. Do not emit JSON, a tool "
         "call, markdown fences, commentary, or thinking. End the response "
         "immediately after the final file byte.\n"
         "</q27_raw_payload_request>";
     static const char edit_request[] =
-        "<q27_raw_payload_request version=\"1\" kind=\"edit\">\n"
+        "<q27_raw_payload_request version=\"2\" kind=\"edit\">\n"
         "Emit the exact replacement bytes only. Do not emit JSON, a tool "
         "call, markdown fences, commentary, or thinking. End the response "
         "immediately after the final replacement byte. Emit an empty response "
@@ -1127,8 +1127,11 @@ static int generate_raw_payload(q27_agent_worker *worker, transcript *chat,
         transcript_truncate(chat, checkpoint);
         return 0;
     }
+    if (stream_text)
+        fprintf(stderr, "[q27-agent streaming raw %s payload]\n",
+                tool_kind_name(kind));
     int eos_reached = 0;
-    if (!run_turn(worker, chat, 0, 0, payload_max_tokens, 0, 0,
+    if (!run_turn(worker, chat, 0, 0, payload_max_tokens, 0, stream_text,
                   payload, NULL, &eos_reached, accounting)) {
         transcript_truncate(chat, checkpoint);
         free(payload->bytes);
@@ -1206,6 +1209,7 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
 
         size_t latest_generated_bytes = generated_bytes;
         turn_accounting latest_accounting = accounting;
+        int payload_unwrapped = 0;
         if (call.request.kind == Q27_TOOL_WRITE ||
             call.request.kind == Q27_TOOL_EDIT) {
             // Reject impossible destinations/matches before spending a second
@@ -1236,7 +1240,7 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
             turn_accounting payload_accounting = {0};
             int payload_status = generate_raw_payload(
                 worker, chat, call.request.kind, context_tokens, max_tokens,
-                adaptive_tokens, &payload, &payload_accounting);
+                adaptive_tokens, !jsonl, &payload, &payload_accounting);
             if (payload_status < 0) {
                 free(payload.bytes);
                 q27_agent_tool_call_free(&call);
@@ -1254,6 +1258,26 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                 ++tool_rounds;
                 continue;
             }
+            const size_t transcript_payload_bytes = payload.len;
+            // Only whole-file writes have enough semantic authority to treat
+            // an outer source fence as transport decoration. An edit payload
+            // may intentionally insert a fenced block inside a source string
+            // or comment, so fragment replacements always remain exact.
+            if (payload.bytes && call.request.kind == Q27_TOOL_WRITE) {
+                int unwrapped = q27_agent_unwrap_whole_file_source_fence(
+                    call.request.path, (unsigned char *)payload.bytes,
+                    &payload.len);
+                if (unwrapped < 0) {
+                    free(payload.bytes);
+                    q27_agent_tool_call_free(&call);
+                    return 0;
+                }
+                payload_unwrapped = unwrapped == 1;
+                if (payload_unwrapped)
+                    fprintf(stderr,
+                            "[q27-agent removed outer Markdown fence from raw %s payload]\n",
+                            tool_kind_name(call.request.kind));
+            }
             if (call.request.kind == Q27_TOOL_WRITE) {
                 call.input = (unsigned char *)payload.bytes;
                 call.request.input = (const unsigned char *)payload.bytes;
@@ -1264,7 +1288,9 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                 call.request.replacement_len = payload.len;
             }
             payload.bytes = NULL;
-            latest_generated_bytes = payload.len;
+            // Context accounting follows the exact assistant transcript,
+            // including a transport fence even when publication removes it.
+            latest_generated_bytes = transcript_payload_bytes;
             latest_accounting = payload_accounting;
         }
 
@@ -1304,6 +1330,19 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         q27_agent_tool_result tool_result = {0};
         int ran = run_tool(worker, &call.request, jsonl, 0,
                            &tool_output, &tool_result);
+        if (ran && payload_unwrapped) {
+            const char *notice = "outer Markdown fence removed before publication";
+            if (!tool_result.message[0]) {
+                snprintf(tool_result.message, sizeof(tool_result.message),
+                         "%s", notice);
+            } else {
+                const size_t used = strlen(tool_result.message);
+                if (used + 2 < sizeof(tool_result.message))
+                    snprintf(tool_result.message + used,
+                             sizeof(tool_result.message) - used,
+                             "; %s", notice);
+            }
+        }
         q27_agent_tool_call_free(&call);
         if (!ran) {
             free(tool_output.bytes);
@@ -1319,7 +1358,30 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
     }
 }
 
+static int mark_supervisor_lock_close_on_exec(void) {
+    const char *value = getenv("Q27_SUPERVISOR_LOCK_FD");
+    char *end = NULL;
+    long parsed;
+    int flags;
+    if (!value || !*value) return 0;
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno || !end || *end || parsed < 0 || parsed > 0x7fffffffL) {
+        fprintf(stderr, "q27-agent: invalid supervisor lock descriptor\n");
+        return -1;
+    }
+    flags = fcntl((int)parsed, F_GETFD);
+    if (flags < 0 || fcntl((int)parsed, F_SETFD, flags | FD_CLOEXEC) != 0) {
+        fprintf(stderr, "q27-agent: cannot protect supervisor lock descriptor: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    (void)unsetenv("Q27_SUPERVISOR_LOCK_FD");
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (mark_supervisor_lock_close_on_exec() != 0) return 2;
     const char *model = NULL, *tokenizer = NULL, *prompt = NULL;
     const char *workspace = ".", *session_path = NULL;
     const char *system =

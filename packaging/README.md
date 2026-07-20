@@ -17,7 +17,23 @@ multi-GB weight lifecycle:
     q27 bench --fast   # quick synthetic ceiling + a real decode
     q27 report --full  # build a send-back diagnostic bundle (see below)
 
-Point a coding agent at it:
+The current source checkout adds the native-agent supervisor planned for the
+next tagged release. Friends testing it before that release should build from
+source, place the B1 artifact/tokenizer under `models/`, and run:
+
+    make agent
+
+The underlying `./packaging/bin/q27 agent [pack]` defaults to context 32768,
+adaptive generation limits, automatic tools, and the physical current
+workspace. Override with `Q27_AGENT_PACK`, `Q27_AGENT_CONTEXT`,
+`Q27_AGENT_WORKSPACE`, `Q27_AGENT_MAX_TOKENS`, or `Q27_AGENT_SESSION`.
+The supervisor holds one private lifetime lock across `agent` and `serve` so
+concurrent launches cannot double-load multi-GB weights. Automatic file tools
+are workspace-bounded, but shell retains the local account's filesystem
+authority.
+
+To use the currently published package, point another coding-agent harness at
+the server:
 
     export ANTHROPIC_BASE_URL=http://localhost:8080 && claude
 

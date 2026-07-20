@@ -10,8 +10,13 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 UNAME_S   := $(shell uname -s)
 
-.PHONY: all clean test-cpu test-metal
+.PHONY: all clean test-cpu test-metal agent
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
+
+# Friendly source-checkout entry point. The supervisor resolves the local B1
+# artifact/tokenizer, enables bounded tools, and roots them at the caller's cwd.
+agent: build/q27-agent
+	Q27_BIN_DIR="$(CURDIR)/build" ./packaging/bin/q27 agent
 
 test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_persistence build/test_q27_agent_worker
 	./build/test_artifacts
@@ -38,6 +43,7 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	./build/test_q27_agent_tools
 	./build/test_q27_agent_persistence
 	./build/test_q27_agent_worker
+	./packaging/test_q27_wrapper.sh
 	python3 tools/test_experimental_prefix_cache.py
 
 build/test_q27_agent_session: experiments/ds4-agent/test_q27_agent_session.cpp experiments/ds4-agent/q27_agent_session.h | build

@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <functional>
@@ -1581,7 +1582,32 @@ void json_response(httplib::Response& response,const json& value,int status=200)
 
 } // namespace
 
+static int mark_supervisor_lock_close_on_exec() {
+    const char* value = std::getenv("Q27_SUPERVISOR_LOCK_FD");
+    char* end = nullptr;
+    long parsed;
+    int flags;
+    if (!value || !*value) return 0;
+    errno = 0;
+    parsed = std::strtol(value, &end, 10);
+    if (errno || !end || *end || parsed < 0 || parsed > 0x7fffffffL) {
+        std::fprintf(stderr, "q27-metal-server: invalid supervisor lock descriptor\n");
+        return -1;
+    }
+    flags = fcntl(static_cast<int>(parsed), F_GETFD);
+    if (flags < 0 ||
+        fcntl(static_cast<int>(parsed), F_SETFD, flags | FD_CLOEXEC) != 0) {
+        std::fprintf(stderr,
+                     "q27-metal-server: cannot protect supervisor lock descriptor: %s\n",
+                     std::strerror(errno));
+        return -1;
+    }
+    (void)unsetenv("Q27_SUPERVISOR_LOCK_FD");
+    return 0;
+}
+
 int main(int argc,char** argv) {
+    if (mark_supervisor_lock_close_on_exec() != 0) return 2;
     if(argc<3) {
         fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n"
                        "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"

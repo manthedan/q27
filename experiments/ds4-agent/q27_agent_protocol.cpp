@@ -7,6 +7,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <string_view>
 
 using nlohmann::json;
 
@@ -52,6 +53,73 @@ bool copy_string(const json& args, const char *key, unsigned char **out,
     *out = copy;
     *out_len = value.size();
     return true;
+}
+
+bool ascii_equal_ci(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        unsigned char ac = static_cast<unsigned char>(a[i]);
+        unsigned char bc = static_cast<unsigned char>(b[i]);
+        if (ac >= 'A' && ac <= 'Z') ac = static_cast<unsigned char>(ac + 'a' - 'A');
+        if (bc >= 'A' && bc <= 'Z') bc = static_cast<unsigned char>(bc + 'a' - 'A');
+        if (ac != bc) return false;
+    }
+    return true;
+}
+
+bool source_fence_label_allowed(const char *path, std::string_view label) {
+    if (!path) return false;
+    const char *base = std::strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char *dot = std::strrchr(base, '.');
+    if (!dot || !dot[1]) return false;
+    const std::string_view ext(dot + 1);
+    struct Mapping { const char *ext; const char *labels[4]; };
+    static constexpr Mapping mappings[] = {
+        {"py", {"python", "py", nullptr, nullptr}},
+        {"c", {"c", nullptr, nullptr, nullptr}},
+        {"h", {"c", "cpp", "c++", nullptr}},
+        {"cc", {"cpp", "c++", "cc", nullptr}},
+        {"cpp", {"cpp", "c++", nullptr, nullptr}},
+        {"cxx", {"cpp", "c++", nullptr, nullptr}},
+        {"hh", {"cpp", "c++", nullptr, nullptr}},
+        {"hpp", {"cpp", "c++", nullptr, nullptr}},
+        {"hxx", {"cpp", "c++", nullptr, nullptr}},
+        {"m", {"objective-c", "objc", nullptr, nullptr}},
+        {"mm", {"objective-cpp", "objcpp", "cpp", nullptr}},
+        {"js", {"javascript", "js", nullptr, nullptr}},
+        {"jsx", {"jsx", "javascript", "js", nullptr}},
+        {"ts", {"typescript", "ts", nullptr, nullptr}},
+        {"tsx", {"tsx", "typescript", "ts", nullptr}},
+        {"rs", {"rust", "rs", nullptr, nullptr}},
+        {"go", {"go", nullptr, nullptr, nullptr}},
+        {"java", {"java", nullptr, nullptr, nullptr}},
+        {"swift", {"swift", nullptr, nullptr, nullptr}},
+        {"kt", {"kotlin", "kt", nullptr, nullptr}},
+        {"kts", {"kotlin", "kts", nullptr, nullptr}},
+        {"rb", {"ruby", "rb", nullptr, nullptr}},
+        {"php", {"php", nullptr, nullptr, nullptr}},
+        {"sh", {"bash", "sh", "shell", nullptr}},
+        {"zsh", {"zsh", "shell", nullptr, nullptr}},
+        {"fish", {"fish", "shell", nullptr, nullptr}},
+        {"lua", {"lua", nullptr, nullptr, nullptr}},
+        {"sql", {"sql", nullptr, nullptr, nullptr}},
+        {"html", {"html", nullptr, nullptr, nullptr}},
+        {"css", {"css", nullptr, nullptr, nullptr}},
+        {"json", {"json", nullptr, nullptr, nullptr}},
+        {"yaml", {"yaml", "yml", nullptr, nullptr}},
+        {"yml", {"yaml", "yml", nullptr, nullptr}},
+        {"toml", {"toml", nullptr, nullptr, nullptr}},
+        {"xml", {"xml", nullptr, nullptr, nullptr}},
+    };
+    for (const Mapping& mapping : mappings) {
+        if (!ascii_equal_ci(ext, mapping.ext)) continue;
+        if (label.empty()) return true;
+        for (const char *candidate : mapping.labels)
+            if (candidate && ascii_equal_ci(label, candidate)) return true;
+        return false;
+    }
+    return false;
 }
 
 const std::string& preamble() {
@@ -125,6 +193,91 @@ extern "C" void q27_agent_tool_call_free(q27_agent_tool_call *call) {
     std::free(call->input);
     std::free(call->replacement);
     *call = q27_agent_tool_call{};
+}
+
+extern "C" int q27_agent_unwrap_whole_file_source_fence(
+    const char *path, unsigned char *bytes, size_t *len) {
+    if (!path || !bytes || !len) return -1;
+    const size_t size = *len;
+    if (size < 7 || std::memcmp(bytes, "```", 3)) return 0;
+
+    size_t opening_end = 3;
+    while (opening_end < size && bytes[opening_end] != '\n' &&
+           bytes[opening_end] != '\r') {
+        // Fence labels are intentionally narrow. Spaces, attributes, and long
+        // lines are ambiguous and remain exact rather than being guessed at.
+        const unsigned char c = bytes[opening_end];
+        if (opening_end - 3 >= 31 ||
+            !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '_'))
+            return 0;
+        ++opening_end;
+    }
+    if (opening_end >= size) return 0;
+    size_t content_start = opening_end + 1;
+    if (bytes[opening_end] == '\r') {
+        if (content_start >= size || bytes[content_start] != '\n') return 0;
+        ++content_start;
+    }
+    const std::string_view label(
+        reinterpret_cast<const char *>(bytes + 3), opening_end - 3);
+    if (!source_fence_label_allowed(path, label)) return 0;
+
+    size_t non_newline_end = size;
+    while (non_newline_end &&
+           (bytes[non_newline_end - 1] == '\n' ||
+            bytes[non_newline_end - 1] == '\r'))
+        --non_newline_end;
+    if (non_newline_end <= content_start) return 0;
+    size_t closing_start = non_newline_end;
+    while (closing_start > content_start && bytes[closing_start - 1] != '\n')
+        --closing_start;
+    size_t closing_ticks_start = closing_start;
+    while (closing_ticks_start < non_newline_end &&
+           closing_ticks_start - closing_start < 3 &&
+           bytes[closing_ticks_start] == ' ')
+        ++closing_ticks_start;
+    size_t closing_ticks_end = closing_ticks_start;
+    while (closing_ticks_end < non_newline_end &&
+           bytes[closing_ticks_end] == '`')
+        ++closing_ticks_end;
+    if (closing_ticks_end - closing_ticks_start < 3) return 0;
+    size_t closing_tail = closing_ticks_end;
+    while (closing_tail < non_newline_end &&
+           (bytes[closing_tail] == ' ' || bytes[closing_tail] == '\t'))
+        ++closing_tail;
+    if (closing_tail != non_newline_end) return 0;
+    // The final fence is authoritative only when no earlier exact fence line
+    // already closes the block. Otherwise the intervening bytes are prose or
+    // another block, and silently flattening the wrapper would corrupt them.
+    for (size_t line_start = content_start; line_start < closing_start;) {
+        size_t line_end = line_start;
+        while (line_end < closing_start && bytes[line_end] != '\n') ++line_end;
+        size_t logical_end = line_end;
+        if (logical_end > line_start && bytes[logical_end - 1] == '\r')
+            --logical_end;
+        size_t candidate = line_start;
+        while (candidate < logical_end && candidate - line_start < 3 &&
+               bytes[candidate] == ' ')
+            ++candidate;
+        size_t ticks_end = candidate;
+        while (ticks_end < logical_end && bytes[ticks_end] == '`') ++ticks_end;
+        if (ticks_end - candidate >= 3) {
+            size_t tail = ticks_end;
+            while (tail < logical_end &&
+                   (bytes[tail] == ' ' || bytes[tail] == '\t'))
+                ++tail;
+            if (tail == logical_end) return 0;
+        }
+        line_start = line_end < closing_start ? line_end + 1 : closing_start;
+    }
+
+    const size_t content_len = closing_start - content_start;
+    if (content_len)
+        std::memmove(bytes, bytes + content_start, content_len);
+    bytes[content_len] = 0;
+    *len = content_len;
+    return 1;
 }
 
 extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(

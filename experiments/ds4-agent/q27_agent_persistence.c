@@ -497,9 +497,9 @@ static int message_contains(const q27_agent_message *message,
 
 static int is_raw_payload_request(const q27_agent_message *message) {
     static const char write_prefix[] =
-        "<q27_raw_payload_request version=\"1\" kind=\"write\">\n";
+        "<q27_raw_payload_request version=\"2\" kind=\"write\">\n";
     static const char edit_prefix[] =
-        "<q27_raw_payload_request version=\"1\" kind=\"edit\">\n";
+        "<q27_raw_payload_request version=\"2\" kind=\"edit\">\n";
     static const char suffix[] = "\n</q27_raw_payload_request>";
     if (!message || !message->role || strcmp(message->role, "user") ||
         !message->content) return 0;

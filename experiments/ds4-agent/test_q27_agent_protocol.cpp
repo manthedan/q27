@@ -85,6 +85,71 @@ int main() {
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
           "multiple calls fail closed");
 
+    unsigned char fenced_python[] =
+        "```python\nprint(f\"hello {name}\")\n```\n";
+    size_t fenced_python_len = sizeof(fenced_python) - 1;
+    static const char expected_python[] = "print(f\"hello {name}\")\n";
+    CHECK(q27_agent_unwrap_whole_file_source_fence(
+              "src/primes.py", fenced_python, &fenced_python_len) == 1 &&
+          fenced_python_len == sizeof(expected_python) - 1 &&
+          !std::memcmp(fenced_python, expected_python, fenced_python_len) &&
+          fenced_python[fenced_python_len] == 0,
+          "matching outer source fence is removed in place");
+
+    unsigned char fenced_crlf[] =
+        "```python\r\nprint(27)\r\n```\r\n";
+    size_t fenced_crlf_len = sizeof(fenced_crlf) - 1;
+    static const char expected_crlf[] = "print(27)\r\n";
+    CHECK(q27_agent_unwrap_whole_file_source_fence(
+              "windows.py", fenced_crlf, &fenced_crlf_len) == 1 &&
+          fenced_crlf_len == sizeof(expected_crlf) - 1 &&
+          !std::memcmp(fenced_crlf, expected_crlf, fenced_crlf_len),
+          "matching CRLF source fence preserves CRLF body bytes");
+
+    unsigned char long_closer[] =
+        "```python\nprint(27)\n   ````  \n";
+    size_t long_closer_len = sizeof(long_closer) - 1;
+    static const char expected_long_closer[] = "print(27)\n";
+    CHECK(q27_agent_unwrap_whole_file_source_fence(
+              "long.py", long_closer, &long_closer_len) == 1 &&
+          long_closer_len == sizeof(expected_long_closer) - 1 &&
+          !std::memcmp(long_closer, expected_long_closer, long_closer_len),
+          "longer whitespace-suffixed final closer is accepted");
+
+    unsigned char empty_fence[] = "```py\n```";
+    size_t empty_fence_len = sizeof(empty_fence) - 1;
+    CHECK(q27_agent_unwrap_whole_file_source_fence(
+              "empty.py", empty_fence, &empty_fence_len) == 1 &&
+          empty_fence_len == 0 && empty_fence[0] == 0,
+          "empty matching source fence becomes an empty payload");
+
+    unsigned char markdown_fence[] = "```python\nprint(1)\n```\n";
+    size_t markdown_fence_len = sizeof(markdown_fence) - 1;
+    CHECK(q27_agent_unwrap_whole_file_source_fence(
+              "README.md", markdown_fence, &markdown_fence_len) == 0 &&
+          markdown_fence_len == sizeof(markdown_fence) - 1,
+          "Markdown files retain intentional fences");
+
+    unsigned char wrong_label[] = "```javascript\nprint(1)\n```\n";
+    size_t wrong_label_len = sizeof(wrong_label) - 1;
+    CHECK(q27_agent_unwrap_whole_file_source_fence(
+              "script.py", wrong_label, &wrong_label_len) == 0,
+          "mismatched source language remains exact");
+
+    unsigned char trailing_prose[] = "```python\nprint(1)\n```\nDone.";
+    size_t trailing_prose_len = sizeof(trailing_prose) - 1;
+    CHECK(q27_agent_unwrap_whole_file_source_fence(
+              "script.py", trailing_prose, &trailing_prose_len) == 0,
+          "fence with trailing prose is ambiguous and remains exact");
+
+    unsigned char multiple_fences[] =
+        "```python\nprint(1)\n  ````  \nexplanation\n```\n";
+    size_t multiple_fences_len = sizeof(multiple_fences) - 1;
+    CHECK(q27_agent_unwrap_whole_file_source_fence(
+              "script.py", multiple_fences, &multiple_fences_len) == 0 &&
+          multiple_fences_len == sizeof(multiple_fences) - 1,
+          "earlier closing fence makes the wrapper ambiguous");
+
     const char *const *names = nullptr;
     CHECK(q27_agent_tool_names(&names) == 5 && names &&
           !std::strcmp(names[0], "read") && !std::strcmp(names[1], "search") &&
