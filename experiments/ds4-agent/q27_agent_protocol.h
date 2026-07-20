@@ -33,7 +33,9 @@ size_t q27_agent_tool_names(const char *const **names_out);
 
 // Parses exactly one closed wrapped call. Prefix prose is allowed; bytes after
 // the closer must be whitespace. JSON and each fixed tool schema are strict.
-// VALID owns all request bytes in `call`; release with tool_call_free.
+// Write carries only path and edit carries path+old; their generated content is
+// attached later by the control plane's separate EOS-bounded raw turn. VALID
+// owns all request bytes in `call`; release with tool_call_free.
 q27_agent_tool_call_status q27_agent_parse_tool_call(
     const unsigned char *bytes, size_t len,
     q27_agent_tool_call *call,

@@ -160,6 +160,14 @@ int main(void) {
         .kind = Q27_TOOL_WRITE, .path = "sub/created.bin",
         .input = new_content, .input_len = sizeof(new_content),
         .max_output_bytes = 1024};
+    q27_agent_tool_request write_preflight = request;
+    write_preflight.kind = Q27_TOOL_WRITE_PREFLIGHT;
+    write_preflight.input = NULL;
+    write_preflight.input_len = 0;
+    CHECK(q27_agent_tool_execute(workspace_fd, &write_preflight, sink, alive,
+                                 &out, &result) == Q27_AGENT_OK &&
+          result.exit_code == 0 && access(created, F_OK) != 0,
+          "write preflight validates without creating the destination");
     mode_t saved_umask = umask(0777);
     q27_agent_status write_status = q27_agent_tool_execute(
         workspace_fd, &request, sink, alive, &out, &result);
@@ -167,6 +175,10 @@ int main(void) {
     CHECK(write_status == Q27_AGENT_OK &&
           result.exit_code == 0 && result.output_bytes == 0,
           "write atomically creates a binary file under restrictive umask");
+    CHECK(q27_agent_tool_execute(workspace_fd, &write_preflight, sink, alive,
+                                 &out, &result) == Q27_AGENT_OK &&
+          result.exit_code == -1 && strstr(result.message, "already exists"),
+          "write preflight rejects an existing destination");
     struct stat created_st;
     unsigned char created_bytes[sizeof(new_content)];
     int created_fd = open(created, O_RDONLY);
@@ -235,6 +247,14 @@ int main(void) {
         .input = old, .input_len = sizeof(old),
         .replacement = replacement, .replacement_len = sizeof(replacement),
         .max_output_bytes = 1024};
+    q27_agent_tool_request edit_preflight = request;
+    edit_preflight.kind = Q27_TOOL_EDIT_PREFLIGHT;
+    edit_preflight.replacement = NULL;
+    edit_preflight.replacement_len = 0;
+    CHECK(q27_agent_tool_execute(workspace_fd, &edit_preflight, sink, alive,
+                                 &out, &result) == Q27_AGENT_OK &&
+          result.exit_code == 0,
+          "edit preflight validates a unique old-byte match without mutation");
     CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out, &result) ==
               Q27_AGENT_OK && result.exit_code == 0,
           "unique binary edit publishes");

@@ -412,12 +412,14 @@ extern "C" q27_agent_status q27_agent_generate(
     q27_agent_alive_check alive, void *opaque,
     uint32_t *prompt_tokens, uint32_t *cached_tokens,
     uint32_t *prefill_tokens, uint32_t *output_tokens,
-    int *tool_call_complete, char *error, size_t error_cap) {
+    int *tool_call_complete, int *eos_reached,
+    char *error, size_t error_cap) {
     if (prompt_tokens) *prompt_tokens = 0;
     if (cached_tokens) *cached_tokens = 0;
     if (prefill_tokens) *prefill_tokens = 0;
     if (output_tokens) *output_tokens = 0;
     if (tool_call_complete) *tool_call_complete = 0;
+    if (eos_reached) *eos_reached = 0;
     if (!engine || !messages || message_count == 0 || !sink || !alive ||
         max_tokens == 0) {
         set_error(error, error_cap, "invalid generation arguments");
@@ -537,6 +539,7 @@ extern "C" q27_agent_status q27_agent_generate(
 
         const uint32_t eos = static_cast<uint32_t>(engine->tokenizer->eos());
         uint32_t produced = 0;
+        bool stopped_for_tool_call = false;
         while (produced < max_tokens && current != eos) {
             if (!alive(opaque)) {
                 if (output_tokens) *output_tokens = produced;
@@ -584,6 +587,7 @@ extern "C" q27_agent_status q27_agent_generate(
             // after </tool_call>. Like max_tokens, the visible final token is
             // irreversible; resident finalization is best-effort bookkeeping.
             if (produced == max_tokens || call_closed) {
+                if (call_closed) stopped_for_tool_call = true;
                 try {
                     if (!engine->agent_session.record_emitted(current))
                         throw std::runtime_error(
@@ -638,6 +642,8 @@ extern "C" q27_agent_status q27_agent_generate(
             }
         }
         if (output_tokens) *output_tokens = produced;
+        if (eos_reached)
+            *eos_reached = current == eos && !stopped_for_tool_call;
         return Q27_AGENT_OK;
     } catch (const std::exception& e) {
         engine->agent_session.invalidate();

@@ -148,7 +148,7 @@ static void result_errno(q27_agent_tool_result *result, const char *prefix) {
 static int request_valid(const q27_agent_tool_request *request,
                          q27_agent_tool_result *result) {
     if (!request || request->kind < Q27_TOOL_READ ||
-        request->kind > Q27_TOOL_WRITE || !request->max_output_bytes ||
+        request->kind > Q27_TOOL_EDIT_PREFLIGHT || !request->max_output_bytes ||
         request->max_output_bytes > OUTPUT_MAX_BYTES ||
         request->input_len > FILE_MAX_BYTES ||
         request->replacement_len > FILE_MAX_BYTES) {
@@ -179,10 +179,22 @@ static int request_valid(const q27_agent_tool_request *request,
         result_error(result, "invalid write content");
         return 0;
     }
-    if (request->kind == Q27_TOOL_EDIT &&
+    if (request->kind == Q27_TOOL_WRITE_PREFLIGHT &&
+        (request->input || request->input_len || request->replacement ||
+         request->replacement_len)) {
+        result_error(result, "write preflight accepts only a path");
+        return 0;
+    }
+    if ((request->kind == Q27_TOOL_EDIT ||
+         request->kind == Q27_TOOL_EDIT_PREFLIGHT) &&
         (!request->input || !request->input_len ||
          (request->replacement_len && !request->replacement))) {
         result_error(result, "edit old bytes must not be empty");
+        return 0;
+    }
+    if (request->kind == Q27_TOOL_EDIT_PREFLIGHT &&
+        (request->replacement || request->replacement_len)) {
+        result_error(result, "edit preflight accepts no replacement");
         return 0;
     }
     return 1;
@@ -556,31 +568,24 @@ static int remove_pinned_empty_directory(int parent, const char *name,
     return unlinkat(parent, name, AT_REMOVEDIR) == 0;
 }
 
-static q27_agent_status run_write(int rootfd,
-                                  const q27_agent_tool_request *request,
-                                  q27_agent_alive_check alive, void *opaque,
-                                  q27_agent_tool_result *result) {
+static int open_validated_write_target(int rootfd, const char *path,
+                                       int *parent_out, char **leaf_out,
+                                       q27_agent_tool_result *result) {
     int parent = -1;
     char *leaf = NULL;
-    if (!open_parent(rootfd, request->path, &parent, &leaf, result))
-        return Q27_AGENT_OK;
+    if (!open_parent(rootfd, path, &parent, &leaf, result)) return 0;
     struct stat existing;
     if (fstatat(parent, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0) {
         result_error(result, "write target already exists; use edit");
         close(parent);
         free(leaf);
-        return Q27_AGENT_OK;
+        return 0;
     }
     if (errno != ENOENT) {
         result_errno(result, "cannot inspect write target");
         close(parent);
         free(leaf);
-        return Q27_AGENT_OK;
-    }
-    if (!alive(opaque)) {
-        close(parent);
-        free(leaf);
-        return Q27_AGENT_CANCELLED;
+        return 0;
     }
     // Atomic create cannot safely clean up pathname races in a directory
     // writable by another principal. Require the pinned destination parent to
@@ -593,7 +598,7 @@ static q27_agent_status run_write(int rootfd,
                      "write parent must be owner-owned and not group/other writable");
         close(parent);
         free(leaf);
-        return Q27_AGENT_OK;
+        return 0;
     }
     int parent_acl = fd_has_granting_acl(parent);
     if (parent_acl != 0) {
@@ -602,7 +607,48 @@ static q27_agent_status run_write(int rootfd,
                      "cannot inspect write parent ACL");
         close(parent);
         free(leaf);
+        return 0;
+    }
+    *parent_out = parent;
+    *leaf_out = leaf;
+    return 1;
+}
+
+static q27_agent_status run_write_preflight(
+    int rootfd, const q27_agent_tool_request *request,
+    q27_agent_alive_check alive, void *opaque,
+    q27_agent_tool_result *result) {
+    int parent = -1;
+    char *leaf = NULL;
+    if (!open_validated_write_target(rootfd, request->path, &parent, &leaf,
+                                     result))
         return Q27_AGENT_OK;
+    if (!alive(opaque)) {
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_CANCELLED;
+    }
+    close(parent);
+    free(leaf);
+    result->exit_code = 0;
+    snprintf(result->message, sizeof(result->message),
+             "write target is ready for a raw payload");
+    return Q27_AGENT_OK;
+}
+
+static q27_agent_status run_write(int rootfd,
+                                  const q27_agent_tool_request *request,
+                                  q27_agent_alive_check alive, void *opaque,
+                                  q27_agent_tool_result *result) {
+    int parent = -1;
+    char *leaf = NULL;
+    if (!open_validated_write_target(rootfd, request->path, &parent, &leaf,
+                                     result))
+        return Q27_AGENT_OK;
+    if (!alive(opaque)) {
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_CANCELLED;
     }
 
     // Keep the payload beneath a pinned owner-only directory. A principal
@@ -776,6 +822,48 @@ static q27_agent_status run_write(int rootfd,
     free(leaf);
     errno = saved;
     return cancelled ? Q27_AGENT_CANCELLED : Q27_AGENT_OK;
+}
+
+static q27_agent_status run_edit_preflight(
+    int rootfd, const q27_agent_tool_request *request,
+    q27_agent_alive_check alive, void *opaque,
+    q27_agent_tool_result *result) {
+    int parent = -1;
+    char *leaf = NULL;
+    struct stat st;
+    int fd = open_regular(rootfd, request->path, O_RDONLY,
+                          &parent, &leaf, &st, result);
+    if (fd < 0) return Q27_AGENT_OK;
+    close(parent);
+    free(leaf);
+    unsigned char *data = read_all(fd, (size_t)st.st_size, result);
+    close(fd);
+    if (!data) return Q27_AGENT_OK;
+    int cancelled = 0;
+    size_t *table = kmp_table(request->input, request->input_len,
+                              alive, opaque, &cancelled);
+    if (!table) {
+        free(data);
+        if (cancelled) return Q27_AGENT_CANCELLED;
+        result_error(result, "out of memory building edit matcher");
+        return Q27_AGENT_OK;
+    }
+    size_t matches = 0, match_at = 0;
+    int matched = kmp_matches(data, (size_t)st.st_size,
+                              request->input, request->input_len, table,
+                              alive, opaque, &matches, &match_at, &cancelled);
+    free(table);
+    free(data);
+    if (!matched) return Q27_AGENT_CANCELLED;
+    if (matches != 1) {
+        result_error(result, matches ? "edit old bytes are not unique" :
+                                       "edit old bytes were not found");
+        return Q27_AGENT_OK;
+    }
+    result->exit_code = 0;
+    snprintf(result->message, sizeof(result->message),
+             "edit target is ready for a raw replacement");
+    return Q27_AGENT_OK;
 }
 
 static q27_agent_status run_edit(int rootfd,
@@ -1224,8 +1312,12 @@ q27_agent_status q27_agent_tool_execute(
         status = run_search(rootfd, request, sink, alive, opaque, result);
     else if (request->kind == Q27_TOOL_WRITE)
         status = run_write(rootfd, request, alive, opaque, result);
-    else
+    else if (request->kind == Q27_TOOL_EDIT)
         status = run_edit(rootfd, request, alive, opaque, result);
+    else if (request->kind == Q27_TOOL_WRITE_PREFLIGHT)
+        status = run_write_preflight(rootfd, request, alive, opaque, result);
+    else
+        status = run_edit_preflight(rootfd, request, alive, opaque, result);
     close(rootfd);
     return status;
 }

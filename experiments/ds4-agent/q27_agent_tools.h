@@ -16,7 +16,11 @@ typedef enum {
     Q27_TOOL_SEARCH,
     Q27_TOOL_EDIT,
     Q27_TOOL_SHELL,
-    Q27_TOOL_WRITE
+    Q27_TOOL_WRITE,
+    // Internal validation-only commands. They are never model-visible and
+    // perform no filesystem mutation.
+    Q27_TOOL_WRITE_PREFLIGHT,
+    Q27_TOOL_EDIT_PREFLIGHT
 } q27_agent_tool_kind;
 
 typedef struct {

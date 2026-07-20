@@ -42,7 +42,9 @@ q27_agent_status q27_agent_engine_tokenizer_sha1(
 // and the Metal position agrees. Any mismatch resets and re-prefills. Any
 // cancellation/runtime error invalidates reuse for the next call. When
 // enable_tools is set, greedy decode grammar-locks registered <tool_call>
-// bodies and stops exactly after a valid closer.
+// bodies and stops exactly after a valid closer. eos_reached distinguishes a
+// natural complete response (including EOS as the next token at the exact
+// bound) from max-token/tool-call termination.
 q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      const q27_agent_message *messages,
                                      size_t message_count,
@@ -57,6 +59,7 @@ q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      uint32_t *prefill_tokens,
                                      uint32_t *output_tokens,
                                      int *tool_call_complete,
+                                     int *eos_reached,
                                      char *error, size_t error_cap);
 
 // Owner-thread-only persistence primitives. Save writes Q27SNAP1 with the

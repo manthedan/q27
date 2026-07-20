@@ -75,22 +75,20 @@ const std::string& preamble() {
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
                 {"name", kToolNames[2]},
-                {"description", "Atomically create one new workspace-relative regular file. Fails if the path already exists; use edit for existing files."},
+                {"description", "Begin creating one new workspace-relative regular file. Supply only the path. After validation, a separate raw-payload turn requests the exact file content without JSON escaping. Fails if the path already exists; use edit for existing files."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
-                        {"path", {{"type", "string"}}},
-                        {"content", {{"type", "string"}}}}},
-                    {"required", json::array({"path", "content"})},
+                        {"path", {{"type", "string"}}}}},
+                    {"required", json::array({"path"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
                 {"name", kToolNames[3]},
-                {"description", "Atomically replace exactly one nonempty literal byte-string match in an existing workspace-relative regular file."},
+                {"description", "Begin replacing exactly one nonempty literal byte-string match in an existing workspace-relative regular file. Supply path and old only. After validation, a separate raw-payload turn requests the replacement without JSON escaping."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
                         {"path", {{"type", "string"}}},
-                        {"old", {{"type", "string"}}},
-                        {"replacement", {{"type", "string"}}}}},
-                    {"required", json::array({"path", "old", "replacement"})},
+                        {"old", {{"type", "string"}}}}},
+                    {"required", json::array({"path", "old"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
                 {"name", kToolNames[4]},
@@ -193,19 +191,15 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                     path_len > 0 &&
                     copy_string(args, "needle", &input, &request.input_len, false) &&
                     request.input_len > 0;
-        } else if (name == kToolNames[2] && only_keys(args, {"path", "content"})) {
+        } else if (name == kToolNames[2] && only_keys(args, {"path"})) {
             request.kind = Q27_TOOL_WRITE;
             valid = copy_string(args, "path", &path, &path_len, true) &&
-                    path_len > 0 &&
-                    copy_string(args, "content", &input,
-                                &request.input_len, false);
-        } else if (name == kToolNames[3] && only_keys(args, {"path", "old", "replacement"})) {
+                    path_len > 0;
+        } else if (name == kToolNames[3] && only_keys(args, {"path", "old"})) {
             request.kind = Q27_TOOL_EDIT;
             valid = copy_string(args, "path", &path, &path_len, true) &&
                     path_len > 0 &&
                     copy_string(args, "old", &input, &request.input_len, false) &&
-                    copy_string(args, "replacement", &replacement,
-                                &request.replacement_len, false) &&
                     request.input_len > 0;
         } else if (name == kToolNames[4] && args.is_object() &&
                    args.size() >= 1 && args.size() <= 3 && args.contains("command")) {

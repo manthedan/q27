@@ -100,6 +100,23 @@ int main(void) {
     CHECK(!q27_agent_compaction_cut(tool_history, 8, 3, &cut),
           "compaction defers when no complete old root turn is available");
 
+    q27_agent_message raw_history[] = {
+        {.role="system",.content="s",.content_len=1},
+        {.role="user",.content="create it",.content_len=9},
+        {.role="assistant",.content="<tool_call>x</tool_call>",.content_len=24},
+        {.role="user",.content="<q27_raw_payload_request version=\"1\" kind=\"write\">\nx\n</q27_raw_payload_request>",
+         .content_len=sizeof("<q27_raw_payload_request version=\"1\" kind=\"write\">\nx\n</q27_raw_payload_request>")-1},
+        {.role="assistant",.content="print(27)\n",.content_len=10},
+        {.role="user",.content="<tool_response>\nok\n</tool_response>",
+         .content_len=sizeof("<tool_response>\nok\n</tool_response>")-1},
+        {.role="assistant",.content="created",.content_len=7},
+        {.role="user",.content="task two",.content_len=8},
+        {.role="assistant",.content="answer two",.content_len=10},
+        {.role="user",.content="task three",.content_len=10},
+    };
+    CHECK(q27_agent_compaction_cut(raw_history, 10, 2, &cut) && cut == 7,
+          "compaction keeps raw payload requests inside their tool root turn");
+
     char *snap2_path=NULL,*snap2_name=NULL;
     CHECK(q27_agent_session_new_snapshot_path(manifest,&snap2_path,&snap2_name,error,sizeof(error)) &&
           write_private(snap2_path,"Q27SNAP1-new",12),"replacement snapshot created");

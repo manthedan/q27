@@ -34,6 +34,10 @@
 
 static volatile sig_atomic_t interrupted = 0;
 static int signal_pipe[2] = {-1, -1};
+// An exact boundary after the generated schema makes durable tool-protocol
+// identity unambiguous even when the caller's custom system text is arbitrary.
+static const char tool_protocol_boundary[] =
+    "\n<q27_tool_protocol version=\"raw-payload-v1\"/>\n\n";
 
 static void on_signal(int sig) {
     (void)sig;
@@ -220,11 +224,18 @@ static int transcript_append_assistant(transcript *t, const char *content,
     return ok;
 }
 
-static void transcript_free(transcript *t) {
-    for (size_t i = 0; i < t->len; ++i) {
+static void transcript_truncate(transcript *t, size_t keep) {
+    if (!t || keep > t->len) return;
+    for (size_t i = keep; i < t->len; ++i) {
         free(t->items[i].role);
         free(t->items[i].content);
     }
+    t->len = keep;
+}
+
+static void transcript_free(transcript *t) {
+    if (!t) return;
+    transcript_truncate(t, 0);
     free(t->items);
     *t = (transcript){0};
 }
@@ -333,6 +344,8 @@ static const char *tool_kind_name(q27_agent_tool_kind kind) {
     case Q27_TOOL_EDIT: return "edit";
     case Q27_TOOL_SHELL: return "shell";
     case Q27_TOOL_WRITE: return "write";
+    case Q27_TOOL_WRITE_PREFLIGHT: return "write_preflight";
+    case Q27_TOOL_EDIT_PREFLIGHT: return "edit_preflight";
     }
     return "unknown";
 }
@@ -371,7 +384,7 @@ static int print_json_event(const q27_agent_event *event) {
         "\"state\":\"%s\",\"status\":\"%s\",\"data_b64\":\"%s\","
         "\"prompt_tokens\":%u,\"cached_tokens\":%u,"
         "\"prefill_tokens\":%u,\"output_tokens\":%u,"
-        "\"tool_call_complete\":%s,"
+        "\"tool_call_complete\":%s,\"eos_reached\":%s,"
         "\"tool_kind\":\"%s\",\"tool_exit_code\":%d,"
         "\"tool_flags\":%u,\"tool_output_bytes\":%u}\n",
         (unsigned long long)event->sequence,
@@ -381,6 +394,7 @@ static int print_json_event(const q27_agent_event *event) {
         event->prompt_tokens, event->cached_tokens, event->prefill_tokens,
         event->output_tokens,
         event->tool_call_complete ? "true" : "false",
+        event->eos_reached ? "true" : "false",
         tool_kind_name(event->tool_kind),
         event->tool_exit_code, event->tool_flags, event->tool_output_bytes) >= 0 &&
         fflush(stdout) != EOF;
@@ -616,10 +630,11 @@ static int run_session_command(q27_agent_worker *worker,
 static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
                     int enable_tools, uint32_t max_tokens, int jsonl,
                     int display_text, output_buffer *completed_output,
-                    int *completed_tool_call,
+                    int *completed_tool_call, int *completed_eos,
                     turn_accounting *completed_accounting) {
     if (completed_output) *completed_output = (output_buffer){0};
     if (completed_tool_call) *completed_tool_call = 0;
+    if (completed_eos) *completed_eos = 0;
     if (completed_accounting) *completed_accounting = (turn_accounting){0};
     if (interrupted) {
         fprintf(stderr, "q27-agent: pending interrupt; generation not started\n");
@@ -649,7 +664,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
     q27_agent_status status = Q27_AGENT_ERROR;
     uint32_t prompt_tokens = 0, cached_tokens = 0;
     uint32_t prefill_tokens = 0, output_tokens = 0;
-    int tool_call_complete = 0, terminal = 0;
+    int tool_call_complete = 0, eos_reached = 0, terminal = 0;
     while (!terminal) {
         q27_agent_event event;
         int got = q27_agent_worker_next_event(worker, &event,
@@ -688,6 +703,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
             prefill_tokens = event.prefill_tokens;
             output_tokens = event.output_tokens;
             tool_call_complete = event.tool_call_complete;
+            eos_reached = event.eos_reached;
             size_t n = event.data_len < sizeof(error) - 1 ?
                        event.data_len : sizeof(error) - 1;
             if (n) memcpy(error, event.data, n);
@@ -733,6 +749,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
         free(output.bytes);
     }
     if (completed_tool_call) *completed_tool_call = tool_call_complete;
+    if (completed_eos) *completed_eos = eos_reached;
     if (completed_accounting) {
         completed_accounting->prompt_tokens = prompt_tokens;
     }
@@ -820,7 +837,7 @@ static int compact_transcript(q27_agent_worker *worker, transcript *chat,
     }
     output_buffer summary = {0};
     if (!run_turn(worker, &summary_chat, 0, 0, summary_limit, 0, 0,
-                  &summary, NULL, NULL)) {
+                  &summary, NULL, NULL, NULL)) {
         transcript_free(&summary_chat); free(summary.bytes); return 0;
     }
     transcript_free(&summary_chat);
@@ -863,7 +880,7 @@ static int compact_transcript(q27_agent_worker *worker, transcript *chat,
     // is appended, making immediate Q27SNAP1 publication/resume sound.
     output_buffer acknowledgement = {0};
     if (!run_turn(worker, &compacted, 0, 0, 32, 0, 0,
-                  &acknowledgement, NULL, NULL)) {
+                  &acknowledgement, NULL, NULL, NULL)) {
         free(acknowledgement.bytes); transcript_free(&compacted); return 0;
     }
     free(acknowledgement.bytes);
@@ -1011,18 +1028,12 @@ static int append_tool_response(transcript *chat,
     return ok;
 }
 
-static int adaptive_turn_limit(q27_agent_worker *worker,
-                               const transcript *chat, int think,
-                               uint32_t context_tokens, int enable_tools,
-                               uint32_t *limit) {
+static int adaptive_turn_limit_with_reserve(
+    q27_agent_worker *worker, const transcript *chat, int think,
+    uint32_t context_tokens, uint32_t reserve, uint32_t *limit) {
     uint32_t prompt_tokens = 0;
     if (!transcript_prompt_tokens(worker, chat, think, &prompt_tokens))
         return 0;
-    // Tool turns retain a continuation margin; before any side effect the
-    // separate tool preflight also reserves worst-case response framing.
-    // Plain turns retain a smaller margin. Both remain context-bounded and
-    // subject to a 16K runaway ceiling.
-    const uint32_t reserve = enable_tools ? 512 : 256;
     const uint64_t capacity = (uint64_t)context_tokens + 1;
     if ((uint64_t)prompt_tokens + reserve >= capacity) {
         fprintf(stderr,
@@ -1036,6 +1047,17 @@ static int adaptive_turn_limit(q27_agent_worker *worker,
             "[q27-agent adaptive max-tokens=%u prompt=%u reserve=%u]\n",
             *limit, prompt_tokens, reserve);
     return 1;
+}
+
+static int adaptive_turn_limit(q27_agent_worker *worker,
+                               const transcript *chat, int think,
+                               uint32_t context_tokens, int enable_tools,
+                               uint32_t *limit) {
+    // Tool turns retain a continuation margin. Plain terminal turns retain a
+    // smaller margin. Bulk payload turns use the reserve-aware helper directly
+    // because they must also leave room for response framing before mutation.
+    return adaptive_turn_limit_with_reserve(
+        worker, chat, think, context_tokens, enable_tools ? 512 : 256, limit);
 }
 
 static int prepare_turn(q27_agent_worker *worker, transcript *chat, int think,
@@ -1059,6 +1081,80 @@ static int prepare_turn(q27_agent_worker *worker, transcript *chat, int think,
     return 1;
 }
 
+// Generates bulk file bytes in a dedicated no-thinking, no-tools turn. The
+// model emits only payload bytes; EOS is the sole completion boundary, so file
+// syntax never has to be escaped for JSON or a textual delimiter. Returns 1
+// with an owned payload, 0 for an incomplete bounded generation, and -1 for an
+// infrastructure/cancellation failure. Incomplete payloads are removed from
+// the transcript and must never reach a filesystem tool.
+static int generate_raw_payload(q27_agent_worker *worker, transcript *chat,
+                                q27_agent_tool_kind kind,
+                                uint32_t context_tokens,
+                                uint32_t configured_max_tokens,
+                                int adaptive_tokens,
+                                output_buffer *payload,
+                                turn_accounting *accounting) {
+    static const char write_request[] =
+        "<q27_raw_payload_request version=\"1\" kind=\"write\">\n"
+        "Emit the exact complete file content only. Do not emit JSON, a tool "
+        "call, markdown fences, commentary, or thinking. End the response "
+        "immediately after the final file byte.\n"
+        "</q27_raw_payload_request>";
+    static const char edit_request[] =
+        "<q27_raw_payload_request version=\"1\" kind=\"edit\">\n"
+        "Emit the exact replacement bytes only. Do not emit JSON, a tool "
+        "call, markdown fences, commentary, or thinking. End the response "
+        "immediately after the final replacement byte. Emit an empty response "
+        "to delete the selected old bytes.\n"
+        "</q27_raw_payload_request>";
+    if (payload) *payload = (output_buffer){0};
+    if (accounting) *accounting = (turn_accounting){0};
+    if (!payload || !accounting ||
+        (kind != Q27_TOOL_WRITE && kind != Q27_TOOL_EDIT))
+        return -1;
+
+    const size_t checkpoint = chat->len;
+    const char *request = kind == Q27_TOOL_WRITE ? write_request : edit_request;
+    if (!transcript_append(chat, "user", request)) return -1;
+
+    uint32_t payload_max_tokens = configured_max_tokens;
+    // A successful raw generation is still inside a tool transaction. Retain
+    // both the 512-token tool-response/framing reserve and the 512-token next
+    // continuation reserve now, rather than generating bytes that the
+    // pre-side-effect accounting must inevitably reject later.
+    if (adaptive_tokens && !adaptive_turn_limit_with_reserve(
+            worker, chat, 0, context_tokens, 1024, &payload_max_tokens)) {
+        transcript_truncate(chat, checkpoint);
+        return 0;
+    }
+    int eos_reached = 0;
+    if (!run_turn(worker, chat, 0, 0, payload_max_tokens, 0, 0,
+                  payload, NULL, &eos_reached, accounting)) {
+        transcript_truncate(chat, checkpoint);
+        free(payload->bytes);
+        *payload = (output_buffer){0};
+        return -1;
+    }
+    if (!eos_reached) {
+        transcript_truncate(chat, checkpoint);
+        free(payload->bytes);
+        *payload = (output_buffer){0};
+        *accounting = (turn_accounting){0};
+        return 0;
+    }
+    fprintf(stderr, "[q27-agent raw-payload kind=%s bytes=%zu]\n",
+            tool_kind_name(kind), payload->len);
+    return 1;
+}
+
+static int append_failed_tool_response(transcript *chat, const char *message) {
+    output_buffer empty = {0};
+    q27_agent_tool_result result = {.exit_code = -1};
+    snprintf(result.message, sizeof(result.message), "%s",
+             message ? message : "tool preparation failed");
+    return append_tool_response(chat, &empty, &result);
+}
+
 static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                            int think, uint32_t context_tokens,
                            uint32_t max_tokens, int adaptive_tokens, int jsonl,
@@ -1075,7 +1171,7 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         int engine_closed_call = 0;
         turn_accounting accounting = {0};
         if (!run_turn(worker, chat, think, 1, turn_max_tokens, jsonl, 1,
-                      &generated, &engine_closed_call, &accounting)) {
+                      &generated, &engine_closed_call, NULL, &accounting)) {
             free(generated.bytes);
             return 0;
         }
@@ -1108,6 +1204,70 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
             return 0;
         }
 
+        size_t latest_generated_bytes = generated_bytes;
+        turn_accounting latest_accounting = accounting;
+        if (call.request.kind == Q27_TOOL_WRITE ||
+            call.request.kind == Q27_TOOL_EDIT) {
+            // Reject impossible destinations/matches before spending a second
+            // generation on bulk content. This is advisory only: the final
+            // mutating tool repeats every check under its stronger atomic race
+            // defenses.
+            q27_agent_tool_request preflight = call.request;
+            preflight.kind = call.request.kind == Q27_TOOL_WRITE ?
+                Q27_TOOL_WRITE_PREFLIGHT : Q27_TOOL_EDIT_PREFLIGHT;
+            q27_agent_tool_result preflight_result = {0};
+            if (!run_tool(worker, &preflight, 0, 0, NULL,
+                          &preflight_result)) {
+                q27_agent_tool_call_free(&call);
+                return 0;
+            }
+            if (preflight_result.exit_code != 0) {
+                if (!append_tool_response(chat, &(output_buffer){0},
+                                          &preflight_result)) {
+                    q27_agent_tool_call_free(&call);
+                    return 0;
+                }
+                q27_agent_tool_call_free(&call);
+                ++tool_rounds;
+                continue;
+            }
+
+            output_buffer payload = {0};
+            turn_accounting payload_accounting = {0};
+            int payload_status = generate_raw_payload(
+                worker, chat, call.request.kind, context_tokens, max_tokens,
+                adaptive_tokens, &payload, &payload_accounting);
+            if (payload_status < 0) {
+                free(payload.bytes);
+                q27_agent_tool_call_free(&call);
+                return 0;
+            }
+            if (payload_status == 0) {
+                fprintf(stderr,
+                        "[q27-agent raw payload incomplete; discarded; no side effect]\n");
+                if (!append_failed_tool_response(
+                        chat, "raw payload did not reach EOS; no side effect")) {
+                    q27_agent_tool_call_free(&call);
+                    return 0;
+                }
+                q27_agent_tool_call_free(&call);
+                ++tool_rounds;
+                continue;
+            }
+            if (call.request.kind == Q27_TOOL_WRITE) {
+                call.input = (unsigned char *)payload.bytes;
+                call.request.input = (const unsigned char *)payload.bytes;
+                call.request.input_len = payload.len;
+            } else {
+                call.replacement = (unsigned char *)payload.bytes;
+                call.request.replacement = (const unsigned char *)payload.bytes;
+                call.request.replacement_len = payload.len;
+            }
+            payload.bytes = NULL;
+            latest_generated_bytes = payload.len;
+            latest_accounting = payload_accounting;
+        }
+
         // Reserve enough worst-case one-byte tokens for the tool-response
         // tags, status metadata, ChatML role framing, and next assistant
         // prefix. The remaining byte cap is conservative because byte-BPE
@@ -1116,17 +1276,21 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         // Re-rendering assistant bytes can segment differently from the
         // emitted token IDs. Charge every generated byte as one token rather
         // than trusting output_tokens; byte-BPE cannot exceed that bound.
-        const uint64_t committed = (uint64_t)accounting.prompt_tokens +
-                                   generated_bytes;
+        const uint64_t committed =
+            (uint64_t)latest_accounting.prompt_tokens + latest_generated_bytes;
         const uint32_t continuation_reserve =
             adaptive_tokens ? 512 : max_tokens;
         const uint64_t required = committed + continuation_reserve +
                                   response_reserve_tokens;
         if ((uint64_t)context_tokens + 1 <= required) {
-            fprintf(stderr,
-                    "q27-agent: insufficient context for bounded tool response\n");
+            if (!append_failed_tool_response(
+                    chat, "insufficient context for bounded tool response; no side effect")) {
+                q27_agent_tool_call_free(&call);
+                return 0;
+            }
             q27_agent_tool_call_free(&call);
-            return 0;
+            ++tool_rounds;
+            continue;
         }
         const uint64_t room = (uint64_t)context_tokens + 1 - required;
         if (call.request.max_output_bytes > room)
@@ -1313,14 +1477,33 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "q27-agent: session load failed: %s\n",
                         error[0] ? error : strerror(errno));
                 ok = 0;
-            } else if (saved.context != context ||
-                       saved.enable_thinking != think ||
-                       saved.enable_tools != auto_tools ||
-                       memcmp(saved.tokenizer_sha1, tokenizer_sha1, 20)) {
-                fprintf(stderr,
-                        "q27-agent: saved session context/thinking/tool/tokenizer mismatch\n");
-                ok = 0;
             } else {
+                const char *current_preamble = auto_tools ?
+                    q27_agent_tool_preamble() : NULL;
+                const size_t preamble_len = current_preamble ?
+                    strlen(current_preamble) : 0;
+                const int preamble_matches = !auto_tools ||
+                    (saved.message_count > 0 && current_preamble &&
+                     saved.messages[0].role &&
+                     !strcmp(saved.messages[0].role, "system") &&
+                     saved.messages[0].content_len >= preamble_len +
+                         sizeof(tool_protocol_boundary) - 1 &&
+                     !memcmp(saved.messages[0].content, current_preamble,
+                             preamble_len) &&
+                     !memcmp(saved.messages[0].content + preamble_len,
+                             tool_protocol_boundary,
+                             sizeof(tool_protocol_boundary) - 1));
+                if (saved.context != context ||
+                    saved.enable_thinking != think ||
+                    saved.enable_tools != auto_tools ||
+                    memcmp(saved.tokenizer_sha1, tokenizer_sha1, 20) ||
+                    !preamble_matches) {
+                    fprintf(stderr,
+                            "q27-agent: saved session context/thinking/tool/tokenizer/protocol mismatch\n");
+                    ok = 0;
+                }
+            }
+            if (ok && saved.message_count) {
                 for (size_t i = 0; ok && i < saved.message_count; ++i)
                     ok = transcript_append_len(&chat, saved.messages[i].role,
                                                saved.messages[i].content,
@@ -1353,7 +1536,9 @@ int main(int argc, char **argv) {
             ok = preamble &&
                  output_append(&combined, (const unsigned char *)preamble,
                                strlen(preamble)) &&
-                 output_append(&combined, (const unsigned char *)"\n\n", 2) &&
+                 output_append(&combined,
+                               (const unsigned char *)tool_protocol_boundary,
+                               sizeof(tool_protocol_boundary) - 1) &&
                  output_append(&combined, (const unsigned char *)system,
                                strlen(system)) &&
                  transcript_append_len(&chat, "system", combined.bytes,
@@ -1377,7 +1562,7 @@ int main(int argc, char **argv) {
                               adaptive_tokens, 0, compact_at, compact_tokens,
                               compact_keep, &turn_max_tokens) &&
                  run_turn(worker, &chat, think, 0, turn_max_tokens, jsonl, 1,
-                          NULL, NULL, NULL);
+                          NULL, NULL, NULL, NULL);
         }
         if (ok) ok = save_session(worker, session_path,
                                   &current_snapshot_name, &chat, think,
@@ -1487,7 +1672,7 @@ int main(int argc, char **argv) {
                                   compact_tokens, compact_keep,
                                   &turn_max_tokens) &&
                      run_turn(worker, &chat, think, 0, turn_max_tokens,
-                              jsonl, 1, NULL, NULL, NULL);
+                              jsonl, 1, NULL, NULL, NULL, NULL);
             }
             if (ok) ok = save_session(worker, session_path,
                                       &current_snapshot_name, &chat, think,

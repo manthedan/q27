@@ -32,30 +32,32 @@ int main() {
     q27_agent_tool_call_free(&call);
 
     std::string write = "<tool_call>{\"name\":\"write\",\"arguments\":{"
-        "\"path\":\"new.bin\",\"content\":\"x\\u0000y\"}}</tool_call>";
+        "\"path\":\"new.bin\"}}</tool_call>";
     CHECK(parse(write, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
-          call.request.kind == Q27_TOOL_WRITE && call.request.input_len == 3 &&
-          !std::memcmp(call.request.input, "x\0y", 3),
-          "write preserves JSON NUL content");
+          call.request.kind == Q27_TOOL_WRITE && !call.request.input &&
+          call.request.input_len == 0,
+          "write control call carries only a path");
     q27_agent_tool_call_free(&call);
 
-    std::string empty_write = "<tool_call>{\"name\":\"write\",\"arguments\":{"
-        "\"path\":\"empty\",\"content\":\"\"}}</tool_call>";
-    CHECK(parse(empty_write, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
-          call.request.kind == Q27_TOOL_WRITE && call.request.input_len == 0,
-          "write accepts an empty new file");
-    q27_agent_tool_call_free(&call);
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"bad\",\"content\":\"embedded\"}}</tool_call>",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
+          "write rejects JSON-embedded content");
 
-    std::string binary = "<tool_call>{\"name\":\"edit\",\"arguments\":{"
-        "\"path\":\"a.bin\",\"old\":\"a\\u0000b\","
-        "\"replacement\":\"x\\u0000y\"}}</tool_call>";
-    CHECK(parse(binary, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+    std::string edit = "<tool_call>{\"name\":\"edit\",\"arguments\":{"
+        "\"path\":\"a.bin\",\"old\":\"a\\u0000b\"}}</tool_call>";
+    CHECK(parse(edit, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
           call.request.kind == Q27_TOOL_EDIT && call.request.input_len == 3 &&
           !std::memcmp(call.request.input, "a\0b", 3) &&
-          call.request.replacement_len == 3 &&
-          !std::memcmp(call.request.replacement, "x\0y", 3),
-          "edit preserves JSON NUL bytes");
+          !call.request.replacement && call.request.replacement_len == 0,
+          "edit control call carries old bytes but no replacement");
     q27_agent_tool_call_free(&call);
+
+    CHECK(parse("<tool_call>{\"name\":\"edit\",\"arguments\":{"
+                "\"path\":\"a\",\"old\":\"b\","
+                "\"replacement\":\"embedded\"}}</tool_call>",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
+          "edit rejects JSON-embedded replacement");
 
     std::string shell = "<tool_call>{\"name\":\"shell\",\"arguments\":{"
         "\"command\":\"pwd\",\"timeout_ms\":123,"

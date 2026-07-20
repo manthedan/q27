@@ -55,6 +55,7 @@ typedef struct {
     uint32_t prefill_tokens;
     uint32_t output_tokens;
     int tool_call_complete;
+    int eos_reached;
     q27_agent_tool_kind tool_kind;
     int32_t tool_exit_code;
     uint32_t tool_flags;

@@ -495,16 +495,55 @@ static int message_contains(const q27_agent_message *message,
     return 0;
 }
 
-static int is_paired_tool_response(const q27_agent_message *messages, size_t i) {
+static int is_raw_payload_request(const q27_agent_message *message) {
+    static const char write_prefix[] =
+        "<q27_raw_payload_request version=\"1\" kind=\"write\">\n";
+    static const char edit_prefix[] =
+        "<q27_raw_payload_request version=\"1\" kind=\"edit\">\n";
+    static const char suffix[] = "\n</q27_raw_payload_request>";
+    if (!message || !message->role || strcmp(message->role, "user") ||
+        !message->content) return 0;
+    const size_t prefix_len =
+        message->content_len >= sizeof(write_prefix) - 1 &&
+        !memcmp(message->content, write_prefix, sizeof(write_prefix) - 1) ?
+        sizeof(write_prefix) - 1 :
+        message->content_len >= sizeof(edit_prefix) - 1 &&
+        !memcmp(message->content, edit_prefix, sizeof(edit_prefix) - 1) ?
+        sizeof(edit_prefix) - 1 : 0;
+    return prefix_len && message->content_len >= prefix_len + sizeof(suffix) - 1 &&
+        !memcmp(message->content + message->content_len - (sizeof(suffix) - 1),
+                suffix, sizeof(suffix) - 1);
+}
+
+// Automatic tool traffic is indivisible for compaction. Ordinary calls are
+// assistant-call/user-response pairs. Bulk write/edit calls additionally have
+// a harness-authored user request and assistant raw payload between them.
+static int is_automatic_tool_user(const q27_agent_message *messages, size_t i) {
     static const char response[] = "<tool_response>\n";
     static const char call_open[] = "<tool_call>";
     static const char call_close[] = "</tool_call>";
-    return i > 1 && messages[i].role && !strcmp(messages[i].role, "user") &&
-        messages[i].content && messages[i].content_len >= sizeof(response) - 1 &&
-        !memcmp(messages[i].content, response, sizeof(response) - 1) &&
-        messages[i-1].role && !strcmp(messages[i-1].role, "assistant") &&
+    if (!messages || i < 2 || !messages[i].role ||
+        strcmp(messages[i].role, "user"))
+        return 0;
+    if (is_raw_payload_request(&messages[i]))
+        return messages[i-1].role &&
+            !strcmp(messages[i-1].role, "assistant") &&
+            message_contains(&messages[i-1], call_open, sizeof(call_open) - 1) &&
+            message_contains(&messages[i-1], call_close, sizeof(call_close) - 1);
+    if (!messages[i].content ||
+        messages[i].content_len < sizeof(response) - 1 ||
+        memcmp(messages[i].content, response, sizeof(response) - 1))
+        return 0;
+    if (messages[i-1].role && !strcmp(messages[i-1].role, "assistant") &&
         message_contains(&messages[i-1], call_open, sizeof(call_open) - 1) &&
-        message_contains(&messages[i-1], call_close, sizeof(call_close) - 1);
+        message_contains(&messages[i-1], call_close, sizeof(call_close) - 1))
+        return 1;
+    return i >= 4 && messages[i-1].role &&
+        !strcmp(messages[i-1].role, "assistant") &&
+        is_raw_payload_request(&messages[i-2]) &&
+        messages[i-3].role && !strcmp(messages[i-3].role, "assistant") &&
+        message_contains(&messages[i-3], call_open, sizeof(call_open) - 1) &&
+        message_contains(&messages[i-3], call_close, sizeof(call_close) - 1);
 }
 
 int q27_agent_compaction_cut(const q27_agent_message *messages,
@@ -518,14 +557,14 @@ int q27_agent_compaction_cut(const q27_agent_message *messages,
     size_t roots = 0;
     for (size_t i = 1; i < message_count; ++i)
         if (messages[i].role && !strcmp(messages[i].role, "user") &&
-            !is_paired_tool_response(messages, i))
+            !is_automatic_tool_user(messages, i))
             ++roots;
     if (roots <= keep_root_turns) return 0;
     const size_t wanted = roots - keep_root_turns;
     roots = 0;
     for (size_t i = 1; i < message_count; ++i) {
         if (messages[i].role && !strcmp(messages[i].role, "user") &&
-            !is_paired_tool_response(messages, i) && roots++ == wanted) {
+            !is_automatic_tool_user(messages, i) && roots++ == wanted) {
             *cut_index = i;
             return i > 1;
         }

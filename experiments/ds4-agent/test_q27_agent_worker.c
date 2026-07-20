@@ -51,9 +51,11 @@ q27_agent_status q27_agent_generate(
     q27_agent_alive_check alive, void *opaque,
     uint32_t *prompt_tokens, uint32_t *cached_tokens,
     uint32_t *prefill_tokens, uint32_t *output_tokens,
-    int *tool_call_complete, char *error, size_t error_cap) {
+    int *tool_call_complete, int *eos_reached,
+    char *error, size_t error_cap) {
     (void)enable_thinking;
     (void)max_tokens;
+    *eos_reached = 0;
     if (!engine || engine->marker != 27 || message_count != 1) {
         snprintf(error, error_cap, "bad forwarded request");
         return Q27_AGENT_ERROR;
@@ -99,6 +101,7 @@ q27_agent_status q27_agent_generate(
     *cached_tokens = 5;
     *prefill_tokens = 6;
     *output_tokens = 1;
+    *eos_reached = 1;
     return Q27_AGENT_OK;
 }
 
@@ -203,6 +206,7 @@ typedef struct {
     uint32_t prefill_tokens;
     uint32_t output_tokens;
     int tool_call_complete;
+    int eos_reached;
     int states;
     int tool_outputs;
     int terminals;
@@ -249,6 +253,7 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
             out->prefill_tokens = event.prefill_tokens;
             out->output_tokens = event.output_tokens;
             out->tool_call_complete = event.tool_call_complete;
+            out->eos_reached = event.eos_reached;
             out->tool_kind = event.tool_kind;
             out->tool_exit_code = event.tool_exit_code;
             out->tool_flags = event.tool_flags;
@@ -328,8 +333,9 @@ int main(void) {
           "binary delta survives event queue");
     CHECK(result.terminal_status == Q27_AGENT_OK &&
           result.prompt_tokens == 11 && result.cached_tokens == 5 &&
-          result.prefill_tokens == 6 && result.output_tokens == 1,
-          "terminal session accounting survives event queue");
+          result.prefill_tokens == 6 && result.output_tokens == 1 &&
+          result.eos_reached == 1,
+          "terminal session accounting and EOS completion survive event queue");
     CHECK(q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "terminal consumption reopens admission");
 
@@ -340,8 +346,9 @@ int main(void) {
           "constrained generation command submits");
     CHECK(drain_command(worker, command, &result) &&
           result.terminal_status == Q27_AGENT_OK &&
-          result.tool_call_complete == 1 && result.output_tokens == 12,
-          "closed model tool call reaches terminal metadata");
+          result.tool_call_complete == 1 && result.eos_reached == 0 &&
+          result.output_tokens == 12,
+          "closed model tool call is distinct from EOS completion metadata");
 
     char shell_command[] = "printf 't\\000l'";
     q27_agent_tool_request tool_request = {
@@ -427,8 +434,9 @@ int main(void) {
                                   &command, error, sizeof(error)) == Q27_AGENT_OK,
           "burst command submits");
     CHECK(drain_command(worker, command, &result) &&
-          result.deltas == 5000 && result.output_tokens == 5000,
-          "bounded queue drains all burst events exactly");
+          result.deltas == 5000 && result.output_tokens == 5000 &&
+          result.eos_reached == 0,
+          "bounded queue drains all burst events and reports no EOS exactly");
 
     // A command stays active until its terminal event is consumed.
     alive_gate gate;

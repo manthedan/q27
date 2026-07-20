@@ -163,7 +163,7 @@ static int tool_request_clone(const q27_agent_tool_request *source,
                               char *error, size_t error_cap) {
     *out = (owned_tool_request){0};
     if (!source || source->kind < Q27_TOOL_READ ||
-        source->kind > Q27_TOOL_WRITE || !source->max_output_bytes ||
+        source->kind > Q27_TOOL_EDIT_PREFLIGHT || !source->max_output_bytes ||
         source->max_output_bytes > 256u * 1024u ||
         source->input_len > 8u * 1024u * 1024u ||
         source->replacement_len > 8u * 1024u * 1024u ||
@@ -186,7 +186,8 @@ static int tool_request_clone(const q27_agent_tool_request *source,
         copy_error(error, error_cap, "search needle is required");
         return 0;
     }
-    if (source->kind == Q27_TOOL_EDIT && !source->input_len) {
+    if ((source->kind == Q27_TOOL_EDIT ||
+         source->kind == Q27_TOOL_EDIT_PREFLIGHT) && !source->input_len) {
         copy_error(error, error_cap, "edit old bytes are required");
         return 0;
     }
@@ -356,7 +357,7 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
                              q27_agent_status status, uint32_t prompt_tokens,
                              uint32_t cached_tokens, uint32_t prefill_tokens,
                              uint32_t output_tokens,
-                             int tool_call_complete,
+                             int tool_call_complete, int eos_reached,
                              const q27_agent_tool_result *tool_result,
                              q27_agent_tool_kind tool_kind,
                              const char *error) {
@@ -370,6 +371,7 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
         .prefill_tokens = prefill_tokens,
         .output_tokens = output_tokens,
         .tool_call_complete = tool_call_complete,
+        .eos_reached = eos_reached,
         .tool_kind = tool_kind,
         .tool_exit_code = tool_result ? tool_result->exit_code : 0,
         .tool_flags = tool_result ? tool_result->flags : 0,
@@ -471,7 +473,7 @@ static void *worker_main(void *opaque) {
                            worker_monotonic_ms() + tool.request.timeout_ms : 0};
         uint32_t prompt_tokens = 0, cached_tokens = 0;
         uint32_t prefill_tokens = 0, output_tokens = 0;
-        int tool_call_complete = 0;
+        int tool_call_complete = 0, eos_reached = 0;
         q27_agent_tool_result tool_result = {0};
         error[0] = '\0';
         q27_agent_status status;
@@ -518,7 +520,8 @@ static void *worker_main(void *opaque) {
                 engine, messages.items, messages.len, enable_thinking,
                 enable_tools, max_tokens, event_text_sink, combined_alive,
                 &context, &prompt_tokens, &cached_tokens, &prefill_tokens,
-                &output_tokens, &tool_call_complete, error, sizeof(error));
+                &output_tokens, &tool_call_complete, &eos_reached,
+                error, sizeof(error));
             if (context.queue_error && status == Q27_AGENT_CANCELLED) {
                 status = Q27_AGENT_ERROR;
                 copy_error(error, sizeof(error), "text event publication failed");
@@ -535,7 +538,7 @@ static void *worker_main(void *opaque) {
             status == Q27_AGENT_ERROR ? Q27_EVENT_ERROR : Q27_EVENT_TURN_DONE;
         publish_terminal(worker, command_id, terminal_type, status, prompt_tokens,
                          cached_tokens, prefill_tokens, output_tokens,
-                         tool_call_complete,
+                         tool_call_complete, eos_reached,
                          kind == REQUEST_TOOL ? &tool_result : NULL,
                          completed_tool_kind, error);
     }
