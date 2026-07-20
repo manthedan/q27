@@ -233,6 +233,22 @@ def run() -> None:
     with urllib.request.urlopen(messages_req, timeout=5) as response:
         assert response.status == 200
     assert len(FakeTarget.prewarms) == prewarm_count_before + 1
+    # Anthropic clients authenticate with x-api-key (not Authorization: Bearer);
+    # it is accepted as a capture credential and stripped before forwarding.
+    state3 = cache.ProxyState(target, "test-token", "capture-token")
+    proxy3 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cache.PrefixProxy)
+    proxy3.state = state3
+    proxy3_thread = threading.Thread(target=proxy3.serve_forever, daemon=True)
+    proxy3_thread.start()
+    apikey_url = f"http://127.0.0.1:{proxy3.server_port}/v1/messages"
+    apikey_req = urllib.request.Request(
+        apikey_url, data=json.dumps(claude_request).encode(), method="POST",
+        headers={"Content-Type": "application/json", "x-api-key": "capture-token"},
+    )
+    with urllib.request.urlopen(apikey_req, timeout=5) as response:
+        assert response.status == 200
+    assert FakeTarget.prewarms[-1] == {"api": "messages", "request": claude_request}
+    proxy3.shutdown(); proxy3.server_close(); proxy3_thread.join()
     proxy2.shutdown(); proxy2.server_close(); proxy2_thread.join()
 
     proxy_server.shutdown(); proxy_server.server_close(); proxy_thread.join()

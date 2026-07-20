@@ -183,8 +183,12 @@ class PrefixProxy(http.server.BaseHTTPRequestHandler):
         if api:
             bearer = self.headers.get("Authorization", "")
             capture = self.headers.get("X-Q27-Prefix-Capture-Token", "")
+            # Anthropic clients (Claude Code) authenticate with x-api-key, not
+            # Authorization: Bearer. Accept it as an equivalent capture credential.
+            api_key = self.headers.get("x-api-key", "")
             if capture != self.state.capture_token and \
-               bearer != "Bearer " + self.state.capture_token:
+               bearer != "Bearer " + self.state.capture_token and \
+               api_key != self.state.capture_token:
                 self._error(403, "invalid experimental prefix capture credential")
                 return
             try:
@@ -266,7 +270,7 @@ class PrefixProxy(http.server.BaseHTTPRequestHandler):
             key: value for key, value in self.headers.items()
             if key.lower() not in HOP_HEADERS | {
                 "host", "content-length", "authorization", "x-q27-admin-token",
-                "x-q27-prefix-capture-token",
+                "x-q27-prefix-capture-token", "x-api-key",
             }
         }
         headers["Host"] = target.netloc
