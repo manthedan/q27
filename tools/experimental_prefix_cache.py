@@ -16,6 +16,7 @@ import urllib.request
 ELIGIBLE = {
     "/v1/chat/completions": "chat_completions",
     "/v1/responses": "responses",
+    "/v1/messages": "messages",
 }
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",

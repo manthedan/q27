@@ -1899,8 +1899,17 @@ int main(int argc,char** argv) {
                         ResponsesPromptInput normalized=responses_prompt_input(request);
                         tools=std::move(normalized.tools);
                         messages=std::move(normalized.messages);
+                    } else if(api=="messages" || api=="anthropic") {
+                        // Claude Code speaks Anthropic /v1/messages. Reuse the
+                        // SAME canonicalizer as ordinary serving (line ~2388:
+                        // chatml_prompt(anthropic_msgs(body), tools, true)) so
+                        // the prewarmed prefix is byte-for-byte the prefix the
+                        // live request will prefill. think=true matches serving.
+                        messages=q27::anthropic_msgs(request);
+                        tools=q27::anthropic_tools_json(request);
+                        think=true;
                     } else throw std::runtime_error(
-                        "api must be chat_completions or responses");
+                        "api must be chat_completions, responses, or messages");
 
                     std::string full_rendered;
                     const std::string prefix_rendered=q27::initial_harness_prefix(

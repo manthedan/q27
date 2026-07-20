@@ -175,6 +175,35 @@ def run() -> None:
         rejected_listener = True
     assert rejected_listener, "non-loopback listener accepted"
 
+    # /v1/messages (Claude Code, Anthropic API) is an eligible capture path and
+    # maps to api="messages" on the prewarm envelope.
+    assert cache.ELIGIBLE["/v1/messages"] == "messages"
+    state2 = cache.ProxyState(target, "test-token", "capture-token")
+    proxy2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cache.PrefixProxy)
+    proxy2.state = state2
+    proxy2_thread = threading.Thread(target=proxy2.serve_forever, daemon=True)
+    proxy2_thread.start()
+    prewarm_count_before = len(FakeTarget.prewarms)
+    messages_url = f"http://127.0.0.1:{proxy2.server_port}/v1/messages"
+    claude_request = {
+        "system": "You are Claude Code.",
+        "messages": [{"role": "user", "content": "fix the bug"}],
+    }
+    messages_req = urllib.request.Request(
+        messages_url, data=json.dumps(claude_request).encode(), method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer capture-token"},
+    )
+    with urllib.request.urlopen(messages_req, timeout=5) as response:
+        assert response.status == 200
+    assert FakeTarget.prewarms[-1] == {"api": "messages", "request": claude_request}
+    assert len(FakeTarget.prewarms) == prewarm_count_before + 1
+    # A second /v1/messages request is forwarded without re-prewarming.
+    with urllib.request.urlopen(messages_req, timeout=5) as response:
+        assert response.status == 200
+    assert len(FakeTarget.prewarms) == prewarm_count_before + 1
+    proxy2.shutdown(); proxy2.server_close(); proxy2_thread.join()
+
     proxy_server.shutdown(); proxy_server.server_close(); proxy_thread.join()
     target_server.shutdown(); target_server.server_close(); target_thread.join()
     print("experimental prefix cache selftest: PASS")
