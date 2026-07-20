@@ -6184,3 +6184,1760 @@ default + a "pass --ctx" warning), so a ~26K prompt serializes onto
 slot 1 and nothing fuses -- documented in README Serving. Docs refreshed
 with these numbers: README reference/State/Serving lines +
 docs/BENCHMARKING.md 2-slot aggregate table.
+
+**2026-07-16 -- TURBO3 AGENTIC QUALITY GATE (master eccc641 / v0.2.0).**
+The open question from the 07-15 turbo3 x batching validation: turbo3 CC
+scores pooled below the fp8-131K-era bands in SHAPE-CONFOUNDED runs (fp8
+ran 131K windows, turbo3 ran 2x96K/2x48K squeezes). Already measured, NOT
+redone here: generic-corpus (wikitext-2) position-bucket NLL turbo3 vs fp8
++0.65-1.2%/bucket flat to 297K (07-11); needle 6/6 @361K (07-11);
+acceptance TIES fp8 on basin-matched CC replay (07-11 accept_kv_ab). What
+was never measured: NLL on AGENTIC-shaped text (ChatML + tools + code +
+tool_response blocks) and a shape-MATCHED CC score comparison.
+
+PRE-DECLARED DECISION RULE (written before any result was collected):
+turbo3 PASSES as agentic-quality-safe unless
+  (a) agentic-corpus NLL delta (turbo3 vs fp8) at CC depths (16-100K
+      buckets) substantially exceeds the +0.87% generic figure -- i.e.
+      >+2% in any CC-depth bucket, sustained across buckets; OR
+  (b) the shape-matched CC study (n=3/leg) shows a gross consistent
+      deficit: BOTH tasks' medians lower by >0.15 with matched
+      ctx-squeeze.
+Per the standing statistical register, n=3/leg cannot separate small
+effects -- anything short of (a)/(b) reads "no detectable tax; the 07-15
+band gap attributed to shape confound", reported descriptively.
+
+LEG 1 -- agentic-corpus position-bucket NLL A/B (deterministic). Corpus:
+the LARGEST captured real CC conversation (scratchpad/ccreplay
+req_0031.json, 2026-07-14 capture_proxy traffic) rendered to its full
+ChatML token sequence by the server's OWN code path (anthropic_msgs ->
+anthropic_tools_json -> chatml_prompt think=false, then
+Tokenizer::encode; renderer = scratchpad/t3_quality/render_req.cpp
+including src/api_common.h verbatim): 15 messages, 615,147 chars ->
+**154,160 tokens**, one contiguous stream, no concatenation (provenance +
+sha256 in scratchpad/t3_quality/corpus/). Run: `--nll <corpus> --nll-long
+154160 --ctx 163840`, CUDA_VISIBLE_DEVICES=0, one pass, no resets,
+Q27_KV=fp8 vs turbo3 (the two serving formats), vanilla qwen:
+
+  bucket      n      fp8 NLL  turbo3   dNLL     dPPL%
+  0-2k        2047   2.8235   2.8810   +0.0575  +5.92
+  2k-8k       6144   1.9144   1.9022   -0.0122  -1.21
+  8k-16k      8192   2.1390   2.1461   +0.0071  +0.71
+  16k-32k    16384   2.1347   2.1386   +0.0039  +0.39   << CC range
+  32k-48k    16384   0.0248   0.0280   +0.0032  +0.32   << CC range
+  48k-64k    16384   0.0016   0.0020   +0.0004  +0.04   << CC range
+  64k-96k    32768   0.0016   0.0022   +0.0006  +0.06   << CC range
+  96k-128k   32768   0.0002   0.0002   +0.0000  +0.00
+  128k-160k  23088   0.0113   0.0120   +0.0007  +0.07
+
+Rule (a): NOT triggered -- every CC-depth bucket is far under +2%; the
+worst CC-depth bucket (16k-32k, the only content-diverse one, n=16384)
+is +0.39%, UNDER even the +0.87% generic short-context figure. Shape
+notes, reported descriptively: buckets >=32k are echo-dominated (NLL
+0.0002-0.028 -- the transcript's depth is one ~252K-char assistant turn,
+i.e. model-generated text that teacher-forcing re-predicts near-argmax;
+0% duplicate 2K-char chunks, so this is own-output echo, not copy-paste
+repetition). That IS the agentic serving regime at depth, and turbo3
+does not disturb it (absolute dNLL <= +0.0032 everywhere past 32k). The
+0-2k +5.92% and 2k-8k -1.21% wiggle (n=2047/6144, system-preamble +
+task-statement content) is outside the rule's CC-depth scope and
+sign-flips, i.e. content noise, consistent with the known ~+1% short-ctx
+class. Novel-content-at-depth coverage stays with the 07-11 generic
+corpus (+0.65-1.2%/bucket flat to 297K) -- the two corpora are
+complementary and BOTH clear their bars.
+
+LEG 2 -- shape-matched CC study (n=3/leg, alternating fp8,t3,...). Config:
+v0.2.0 serving defaults (batching+graphs ON), W12 build/q27-server, fresh
+server per rep as unit q27-eval on :8081, --ctx 49152 --slots 2
+--slot1-ctx 49152 BOTH legs (the fp8-max 2x48K shape -- turbo3 takes the
+SAME squeeze, removing the 07-15 confound), CUDA_VISIBLE_DEVICES=0,
+vanilla qwen. Per rep: thunderdome T2 (bench-collab-server), sleep 15
+(latest-symlink stagger), T5 (bench-task-queue) CONCURRENT; scores from
+trials meta.json composite_score (harness exit codes ignored per the
+standing note). Runner: scratchpad/t3_quality/leg2_run.sh; raw per-rep
+logs + meta in scratchpad/t3_quality/leg2/.
+
+  rep          T2-collab           T5-taskq            ctx400  med tps
+  1 fp8        0.303 crashed 271s  0.200 completed 10s   10     215.2
+  2 turbo3     0.631 completed     0.653 completed 411s  17     204.9
+  3 fp8        0.303 crashed 205s  0.200 completed 11s    7     216.8
+  4 turbo3     0.303 completed     0.200 crashed 164s    25     179.7
+  5 fp8        0.277 crashed 381s  0.200 completed 10s   19     240.8
+  6 turbo3     0.272 completed     0.293 crashed 305s     4     150.5
+
+  leg     T2 median (spread)        T5 median (spread)
+  fp8     0.303 (0.277-0.303)       0.200 (0.200-0.200)
+  turbo3  0.303 (0.272-0.631)       0.293 (0.200-0.653)
+
+Rule (b): NOT triggered -- T2 medians TIE (0.303 both), T5 turbo3 is
+HIGHER (+0.093). No deficit on either task, let alone >0.15 on both.
+Confound counters comparable: ctx-limit 400s fp8 36 vs turbo3 46 total
+(overlapping per-rep ranges; turbo3's 25 came from its longest full
+session, 804s/5.04M tok) -- the squeeze bound BOTH legs as designed.
+Stability: 549 requests across 6 reps, ZERO end=error / [req-error] /
+5xx, zero server crashes. Decode context: per-rep med tps fp8
+215-241 vs turbo3 151-205 (the known t3 decode tax; turbo3 reps also ran
+the longer, deeper sessions). Eval artifacts hit BOTH legs and are
+score-dominant: fp8's T5 leg is a DETERMINISTIC one-shot-quit (3/3 reps
+byte-identical 24,109 tokens, 10-11s -- the [drift] UN-RESCUED
+first-tool-call class, greedy determinism re-drawing the same
+trajectory), fp8's T2 crashed 3/3 (CC-agent crash class), turbo3's T5
+crashed 2/3; turbo3 drew the only two high basins (rep 2). Per the
+standing register these are basin/artifact modes, NOT KV-quality signal
+-- which is exactly why the rule demanded a GROSS consistent deficit,
+and there is none. Both legs pool well under the fp8-131K-era bands
+(0.78-0.85), confirming the band gap tracks the 2x48K squeeze, not the
+KV format.
+
+VERDICT: **PASS -- turbo3 is agentic-quality-safe.** Neither trigger
+fired: (a) agentic-corpus NLL at CC depths max +0.39% (bar >+2%
+sustained); (b) shape-matched medians tie/favor turbo3 (bar: both
+tasks -0.15). Finding of record: NO detectable turbo3 quality tax on
+agentic serving; the 07-15 "turbo3 pools below fp8-era bands"
+observation is attributed to the SHAPE CONFOUND (131K windows vs
+2x96K/2x48K squeezes), as suspected. With quality now settled on top of
+the 07-11 gates (generic NLL flat to 297K, needle 6/6 @361K, acceptance
+ties) and the capacity picture already established (turbo3 2x96K vs fp8
+2x48K on 32GB, W12), the serving guidance becomes: fp8 stays the CC
+default on SPEED (turbo3 costs ~5-30% median decode depending on depth
+mix); choose turbo3 whenever capacity matters -- >48K/slot, more slots,
+or the 3090 -- with no quality asterisk. The turbo3-vs-fp8 quality gate
+(open since the 07-11 port) is CLOSED.
+
+**2026-07-16 -- CLUB-3090 HARNESS ON OUR SILICON (their bench.sh verbatim,
+endpoint-only; 5090 + 3090, two passes each).** Prerequisite shipped
+first: the OpenAI streaming paths now emit the spec
+`stream_options.include_usage` final usage chunk (`aa991de`; both
+/v1/chat/completions and /v1/completions, one shared handler; absent
+option = framing byte-identical). Gates on that change: make + w16 + w8
+rebuilds; canonical a2982c5197c627551b27d76a0a94b220 + sampled-seed
+8b6aacf912d8e4c7a50a021623c6c276 EXACT (CLI untouched); bare-server W12
+codegen replay text == p0_baseline r1 EXACT; live curl A/B -- no usage
+chunk without the option, spec-shape chunk with it, both API shapes.
+Then their harness unmodified from their repo (read end-to-end first;
+endpoint-only mode): `URL=http://localhost:8020 CONTAINER=none PP=1 bash
+scripts/bench.sh` -- 3 warm + 5 measured per prompt (narrative 1000 tok /
+code 800 tok), temp 0.6 top_p 0.95, streamed usage counts, salted prefill
+probes at 10K/90K. q27 = vanilla qwen, single slot, bare defaults,
+systemd-run, GPU-exclusive.
+  5090 (W12, fp8+fdmma, auto-ctx 262144), two passes: narr 144.15/143.97
+wall (151.81/151.62 decode), code 193.04/192.82 (210.92/210.65), TTFT
+350 ms, prefill 3372/3350 t/s @10K, 2559/2560 @90K (client-observed);
+in-run CV <=0.2%, pass delta <=0.15%. [req] cross-check: 151.4 / 209.8
+t/s engine at 2.64 / 3.86 tok/round.
+  3090 (w8, fp16 KV + h16, banner fd=mma, `--ctx 24576`), two passes:
+narr 84.06/83.41 (88.59/87.88), code 105.76/105.67 (115.08/114.97), TTFT
+~610 ms, prefill 1124/1123 @10K; the 90K depth SKIPped by their harness
+on q27's context-limit 400 -- their documented over-ctx path, not a
+failure. Engine cross-check 88.2 / 114.5 t/s.
+  vs their published rows (decode-to-decode, all spec-on): 5090 +19%
+narr / +3% code over their best single-5090 (vLLM DFlash 127.98/204.80
+decode), within 2-6% of their DUAL-5090 row on wall; 3090 +47% narr /
++14% code over the best published single-3090 decode (ik MTP 60.39 narr,
+beellama DFlash 101.3 code), ~91% of their 2x3090 vLLM dual decode row
+(96/127) on one card -- honest asterisks: their 3090 rows are mostly
+370W-capped (ours drew ~417 W; they document -29..-42% at 230 W) and
+serve 102-200K ctx vs our 24576 on this config. ANOMALY logged: bare
+auto-ctx (36864) and explicit `--ctx 32768` both OOM at
+verify_sample_graph instantiation on the 24 GB card under the 07-16
+defaults; 24576 boots -- the auto-ctx anchor is 5090-calibrated, exactly
+the miss the README warns about; turbo3 remains the 131K lever on that
+card. Full method, tables, and caveats: docs/BENCHMARKING.md "vs
+club-3090 community recipes (their harness, our silicon)".
+
+## 2026-07-16 -- q4s tier SHIPPED: 4.55 bpw for VRAM-starved cards -- 2.27 GB smaller, +5.2% suite, AND PPL beats default (-0.26%)
+
+Ask came from GitHub issue #1 (A10 cloud card: 24 DECIMAL GB minus ECC
+= 22.6 GiB usable): default weights + w8 + turbo3 measured a 28672 ctx
+ceiling -- the fixed stack eats 95% of that card, and the graph-zoo
+env knobs cap out at +280 MiB (Q27_MAXD=4, his measured sweep; DEXIT
+is not a capture knob, the per-step graphs capture unconditionally).
+The real lever is weight bytes. Design: strip the v1.4 above-Q4 mass
+that doesn't pay. repack.py grew --q4-head: emit output.weight ITSELF
+at Q4_G64 and drop the output_q4.weight dupe (one lm_head serves
+draft/verify/plain; all four name-keyed call sites fall back
+correctly -- engine change ZERO), plus no --q8, so the v1.4
+residual-writer promotion (ssm_out+attn_output) reverts to Q4.
+KEPT Q8: token_embd (phase-2 candidate, unmeasured), blk.64 MTP
+(FORMAT.md: draft/verify agreement craters), attn_k/v (~0.17 GB,
+errors persist in KV).
+
+Artifact: qwen36-27b-mtp-q4s.q27, 15.46 GB = 4.55 bpw (repack 678s,
+866 tensors, md5 7e5454e0c0ded717136ad3e42634ba25, tag q4s-v1; worst
+RMSE 0.1226 = same class as v1.4's residual Q4 worst 0.115, and the
+Q4 head is NOT in the worst-15). Bytes that moved: lm_head mass
+1.966 GB (Q8 head + Q4 dupe) -> 0.675 (one Q4 head); promotions
+2.045 -> 1.070. Total -2.27 GB = ~167K tokens of turbo3 KV budget.
+
+MEASURED (same-day, master e58c063 fresh build, 5090):
+- canonical: v1.4 a2982c51 EXACT first (build sanity); q4s canonical
+  f64e7c02252ca4c40cea62db662205e0, deterministic x2, 2.84 t/round.
+- PPL (--nll, 148335 preds, c2048, paired): v1.4 8.0409 reproduced
+  EXACT; q4s **8.0197 = -0.26% BETTER than default**. Third measured
+  error-cancellation structure (after ffn_up and GDN in-proj) -- the
+  v1.4 promotion was tuned on qwopus; on vanilla wikitext it was
+  hurting, not helping. Ladder: Q5_K_M 7.9179 / q6k 7.9127 / q6
+  7.9460 / q4s 8.0197 / v1.4 8.0409.
+- suite: 186.2 vs 177.0 t/s same-day (+5.2%) -- decode goes as weight
+  bytes; the 12.8% byte cut beats the acceptance mix shift.
+- serving: turbo3 boots, auto-ctx picks the 262144 cap on the 5090
+  (24.0 GB used), coherent completions through /v1/messages.
+- NOT run: task dome (tier-dome precedent says no score separation;
+  run before quality-critical recommendations); phase-2 token_embd
+  demotion (-0.6 GB more) unmeasured.
+
+Small-card math (A10 fixed 21907 MiB measured at maxd4): q4s fixed
+~19.7 GB -> ceiling ~215K by arithmetic, up from 49152 tuned / 28672
+stock. A 24 GiB 3090 reaches the 262144 cap by the same arithmetic
+(not boot-verified; vox resident). Tier map now: q4s 4.55 (max ctx,
+fastest) / default 5.25 (reference, canonical a2982c51) / q6 6.0 /
+q6k 6.8. Shipped: README tier row + small-cards rewrite, CHECKSUMS,
+HF upload alongside the existing tiers.
+
+FIELD CONFIRMATION (07-17, issue #1, same A10, commit 666b7d9): the
+reporter downloaded q4s off HF before the announcement even posted
+and ran his own ladder. Measured: v1.4+maxd4 49,152 re-confirmed
+(30 MiB spare); **q4s+maxd4 212,992** (22,567 MiB used, 22 MiB
+spare; 217,088 OOMs at the sampled-verify instantiate) = 7.4x his
+stock 28,672. Predicted 219K vs measured 213K -- the delta is the
+new gcache exec reserve, whose headroom guard his logs show working
+as designed at the brim (cap 64 -> 2 with LRU recapture). Boot also
+dropped 18.1s -> 6.0s on the smaller weight stream. Scored tasks
+(07-17, 5090): HOLD at default-tier level, tier-dome precedent
+repeats. q4s A10 row promoted to the README.
+
+## 2026-07-16 -- q4s-v1 REPACK VALIDATION: full ladder GREEN, anchors minted, club-3090 matched-bpw rerun (both GPUs)
+
+Independent validation ladder on the q4s artifact above (master
+e58c063 binaries; file md5 7e5454e0c0ded717136ad3e42634ba25 verified
+against CHECKSUMS.md5). Where this ladder re-measured the SHIPPED
+entry's numbers it CONVERGED exactly (canonical md5, paired PPL) --
+two sessions, same answers. v1.4 stays the reference tier; nothing
+here changes a serving default; adoption is a product call.
+
+**q4s-v1 CANONICAL ANCHORS (new-artifact anchors -- v1.4's a2982c51 /
+8b6aacf9 are NOT replaced and still gate the default tier):**
+- canonical (`--tokens "760,6511,314,9338,369" -n 128 --ctx 2048
+  --spec`, grep '^generated:' | md5sum):
+  **f64e7c02252ca4c40cea62db662205e0**, x2 runs EXACT.
+- sampled-seed (same prompt, `-n 64 --temp 0.7 --top-p 0.95
+  --seed 42`): **900031e9b86df8f52493e6c1f4040c2e**, x2 runs EXACT.
+
+Ladder (all GPU work under systemd-run, GPU idle-checked per rung):
+
+1. SMOKE + test_kernels(q4s): generation sane both recipes, anchors
+   above. test_kernels: **83/83 executed checks PASS** -- including
+   dequant/gemv/gemv_n/gemm-MMA/g64 on the Q4 head via dtype dispatch
+   -- then the suite ABORTS (illegal memory access,
+   test_kernels.cu:498) inside `test_gemv10_scaling`: the P10-A0 perf
+   probe HARDCODES `gemv_q8_n` on `output.weight` and reads 2x past a
+   Q4 head allocation. Harness fixture assumption (default-tier Q8
+   verify head), NOT a q4s weight fault -- same-day v1.4 control on
+   the same binary: 315 checks ALL PASS (which also covers the
+   model-independent synthetics the crash skipped). LOOSE END: teach
+   test_gemv10_scaling to skip or dispatch on `q4_head` files.
+2. PPL, exact v1.4 protocol (wiki.test.qwopus.i32, `--nll --nll-chunk
+   2048 --ctx 2048`, 145 chunks, 148335 preds, fp16 KV, paired legs):
+   q4s **8.0197** / v1.4 re-run **8.0409** (recorded value reproduced
+   EXACT). q4s = **-0.26% vs v1.4 (better)**, **+1.29% vs the Q5_K_M
+   bar 7.9179** (v1.4 +1.55%). Matches the SHIPPED entry's paired run.
+3. AGENTIC NLL (t3_quality leg-1 method: 154,160-tok real-CC corpus,
+   `--nll-long 154160 --ctx 163840`, BOTH legs fp8 KV; the v1.4 leg
+   reproduces the turbo3-gate fp8 column to the 4th decimal):
+
+     bucket      n      v1.4     q4s      dNLL     dPPL%
+     0-2k        2047   2.8235   2.7857   -0.0378  -3.71
+     2k-8k       6144   1.9144   1.8949   -0.0195  -1.93
+     8k-16k      8192   2.1390   2.1823   +0.0433  +4.43
+     16k-32k    16384   2.1347   2.1607   +0.0260  +2.63  << CC range
+     32k-48k    16384   0.0248   0.0277   +0.0029  +0.29  << CC range
+     48k-64k    16384   0.0016   0.0014   -0.0002  -0.02  << CC range
+     64k-96k    32768   0.0016   0.0017   +0.0001  +0.01  << CC range
+     96k-128k   32768   0.0002   0.0002   +0.0000  +0.00
+     128k-160k  23088   0.0113   0.0123   +0.0010  +0.10
+
+   FLAG + disposition: 16k-32k (the one content-diverse CC bucket)
+   reads **+2.63%**, over the 2% red-flag bar in that single bucket;
+   every other CC bucket <= +0.29%, pooled 16k-96k +0.58%, and the
+   echo-dominated depth that IS the CC serving regime is untouched.
+   "Sustained across buckets" is structurally untestable on this
+   corpus (deeper CC buckets are all own-output echo), so the
+   established disambiguator was run: the 07-11 generic-corpus
+   position-bucket NLL (wikitext-2, one pass, both legs fp8 at the
+   262144 window -- content-diverse at EVERY depth). Result, q4s vs
+   v1.4: 0-16k **-3.6/-6.8/-7.2% (q4s better)**; 16k-96k
+   -1.29/-0.31/+0.96/+1.21% (pooled +0.35%); then FLAT
+   +1.16..+1.35% out to 256k, non-compounding. VERDICT: the agentic
+   +2.63% is content noise on an n=1 transcript (same sign-flipping
+   class as the turbo3 gate's excluded shallow wiggles), not a
+   systematic CC-depth defect. Ladder proceeded; flag on the record.
+4. NEEDLE spot (needle_deep method, haystack trimmed to the fp8
+   262144 native window -- the full 355K haystack is turbo3-only;
+   prompt 248,726 tok, deepest-first): depth 60% (~149K) and 10%
+   (~24K) both PASS EXACT -- **2/2**.
+5. SERVING SANITY (bare W12 2-slot, `--ctx 32768 --slots 2
+   --slot1-ctx 32768`, zero env): warm pass + 2 measured concurrent
+   codegen+docs reps. Composition determinism: rep1 == rep2
+   completion text BYTE-IDENTICAL both payloads (raw JSON differs
+   only in `created`). bat=2.0/1.8 fused, gcache ON cap 64, warm reps
+   pf=1 off prefix snapshots, ZERO errors. codegen solo-warm vs
+   fused-rep fork = the documented A1 suffix-trim class (docs payload
+   solo==fused) -- v1.4-identical behavior.
+6. CLUB-3090 matched-bpw rerun (their bench.sh verbatim,
+   endpoint-only, x2 passes per GPU; full table in
+   docs/BENCHMARKING.md "Matched-bpw rerun"):
+   - 5090 (bare W12, auto-ctx 262144): narr 146.8/146.6 wall
+     (154.2/153.9 decode), code 181.6/181.5 (196.2/196.0), TTFT
+     326ms, prefill 3442/3420 @10K, 2608/2562 @90K. In-run CV <=0.3%,
+     pass delta <=0.2%, [req] agrees within 0.5%.
+   - 3090 (vox-transcriber stopped for the window, restarted +
+     verified active after; w8, fp16 KV + h16, stock ~417 W,
+     `--ctx 61440`): narr 88.5/87.8 (93.2/92.4), code 99.4/99.2
+     (106.9/106.7), TTFT ~565ms, prefill 1131/1122 @10K, 90K SKIP
+     (>ctx, their documented path).
+   - **3090 ctx FINDING (boot-verified)**: q4s + fp16 KV boots
+     **61440** (49152/57344 also boot; **65536 OOMs** at
+     spec_sample_graph instantiation; auto-ctx picks 69632 and OOMs
+     -- the 5090-calibrated anchor miss again) = **2.5x** v1.4's
+     24576 on the same club-config defaults. The 2.27 GB of freed
+     weights went straight to KV, arithmetic-clean (68 KB/token).
+     The SHIPPED entry's "262144 cap by arithmetic" claim is the
+     TURBO3 ceiling; this is the fp16-KV bench config's.
+   - READ vs v1.4 (decode): narrative **+1.6% (5090) / +5.2%
+     (3090)**; code **-7% on BOTH GPUs** -- the single-Q4-head tier
+     re-rolls the code acceptance basin (5090 code 3.86 -> 3.45
+     tok/round; narrative 2.64 -> 2.58 barely moves), so the
+     shipped-entry suite gain (+5.2%, 5-prompt mean) and a code-basin
+     loss coexist: q4s wins low-acceptance traffic on bytes and gives
+     ground where acceptance was carrying v1.4. vs THEIR rows at
+     matched bpw: 3090 narr +54% over ik MTP (93.2 vs 60.39), code
+     +5.5% over beellama DFlash (106.9 vs 101.3); 5090 narr +20% over
+     their best single-5090, code -4.2% vs DFlash 204.80 (v1.4 was
+     +3%). KV-bits asymmetry stated in the doc: our 3090 leg spends
+     fp16 KV vs their q4_0/q5_0.
+   - Ops lesson RE-paid (cost: three phantom OOM readings): a failed
+     systemd-run unit needs `systemctl reset-failed` before the name
+     is reused, and journal greps must scope to
+     _SYSTEMD_INVOCATION_ID -- the ctx ladder's first three rungs
+     read ONE stale crash as three "OOMs" (24576-40960!) until the
+     identical CPU-time lines gave it away. Same trap as the 07-12
+     journalctl note, new costume.
+
+VERDICT: **q4s-v1 VALIDATED** at 0.66 bpw under the default tier.
+Quality GREEN (PPL better, agentic NLL flat at depth with one
+disambiguated content-noise flag, needle exact, serving deterministic,
+zero errors across every server boot). Speed trade legible: narrative
++2-5%, code -7% (acceptance basin), +2.27 GB KV budget, 3090 club
+config 2.5x ctx. Open items: test_gemv10_scaling q4-head skip; task
+dome before quality-critical recommendations (per the SHIPPED entry);
+phase-2 token_embd demotion unmeasured.
+
+## 2026-07-16 -- q4s-v1 CONSISTENCY STUDY: do real agentic task scores hold on the repack? (thunderdome, single-slot 131K fp8)
+
+The validation ladder above left one open item ("task dome before
+quality-critical recommendations") and one legible trade: the
+single-Q4-head tier re-rolls the code acceptance basin (5090 code 3.86
+-> 3.45 tok/round, -7% code decode). Question: does that acceptance
+re-roll (or anything else in the tier) move REAL agentic task scores?
+Master 4d0a3c2, build/q27-server (W12, mtime after last src commit
+aa991de), q4s md5 re-verified against CHECKSUMS.md5.
+
+DESIGN (pre-declared, written before any result was collected):
+- Tasks: the CONSISTENT SCORERS at this shape -- T2 collab-server
+  (historical band 0.83-0.85; draws 0.851/0.851/0.839-0.844), T11
+  debug-nightmare (0.850 x2), T5 task-queue (0.78-0.81; draws
+  0.789/0.776-0.797). NOT the documented lottery modes (T8's
+  auth-chain basin; the T2/T5 crash classes seen only at the 2x48K
+  squeeze shape in the turbo3 gate -- the bands here were measured at
+  single-slot 131K, which is what this study reproduces).
+- Shape: single-slot --ctx 131072, Q27_KV=fp8, bare v0.2.0 defaults
+  (fast-head + no-think + fp8 are the defaults; env pins fp8
+  explicitly), port 8081, unit q27-eval, CUDA_VISIBLE_DEVICES=0,
+  vanilla model files. One task at a time, sequential -- no
+  concurrency anywhere in this study.
+- Legs: q4s-v1 (qwen36-27b-mtp-q4s.q27) vs v1.4 (qwen36-27b-mtp.q27),
+  n=3 per task per leg, alternating leg-blocks with a fresh server per
+  block: q4s[T2,T11,T5], v14[T2,T11,T5], x3 = 18 runs. GPU-free check
+  + reset-failed before each block; "slot 0 ready: ctx=131072"
+  verified from the CURRENT invocation's journal (invocation-ID
+  scoped, per the 07-16 phantom-OOM lesson).
+- Thunderdome: `./thunderdome run --orchestrator claude-code-q27-haight
+  --task TN --trials 1`; scores from trials meta.json composite_score
+  + exit_reason (harness exit codes ignored per the standing note).
+- PASS RULE: q4s passes if per-task medians land within +-0.03 of the
+  same-day v1.4 leg medians AND within/above the historical bands;
+  single outlier draws reported descriptively (standing register:
+  n=3 cannot separate small effects). A consistent multi-task deficit
+  >0.05 = flag for the owner, no rationalizing.
+- Also collected per run: decode tps + tok/round from [req] telemetry
+  (the code-acceptance question: do T2/T5 turn walls/tps shift on
+  q4s?), errors (must be zero), wall times (descriptive only).
+
+RESULTS (18/18 runs completed, ZERO [req-error]/end=error across all
+runs and 6 server boots; every boot's "slot 0 ready: ctx=131072"
+verified invocation-scoped; study wall ~53 min):
+
+  block  leg  T2 collab          T11 debug        T5 task-queue
+  b1     q4s  0.553 @175s        1.000 @38s       0.619 @141s
+  b2     v14  0.535 @212s        1.000 @39s       0.200 @9s
+  b3     q4s  0.553 @307s        1.000 @38s       0.620 @145s
+  b4     v14  0.547 @533s        1.000 @50s       0.200 @10s
+  b5     q4s  0.545 @146s        1.000 @37s       0.625 @153s
+  b6     v14  0.272 @67s         1.000 @48s       0.200 @9s
+
+  task  q4s med (spread)      v14 med (spread)      delta    hist band
+  T2    0.553 (0.545-0.553)   0.535 (0.272-0.547)   +0.018   0.83-0.85
+  T11   1.000 (1.000-1.000)   1.000 (1.000-1.000)    0.000   0.850
+  T5    0.620 (0.619-0.625)   0.200 (0.200-0.200)   +0.420   0.78-0.81
+
+Basin anatomy (sub-scores): T2 draws the SAME basin on BOTH legs all
+6 runs -- hidden_tests 0.07 / tests 0 / agent 1.00; composite spread
+is coverage/code_metrics wiggle (v14 b6 0.272 = outlier draw that
+also lost agent_tests, 67s). T11: tests+static 1.00 flat, both legs,
+all 6. T5: v14 lands the DOCUMENTED deterministic one-shot-quit 3/3
+(the [drift] UN-RESCUED first-tool-call class -- 2 reqs, 151 decode
+tokens, 9-10s, identical every rep; same class the turbo3 gate logged
+for fp8 T5 at 2x48K, now on the reference tier at single-slot 131K);
+q4s escapes it 3/3 into full 141-153s sessions (hidden 0.18, coverage
+0.88-0.91). Per the standing register that is a basin-lottery re-roll
+at the first tool call (different tier bytes, different trajectory),
+not KV/weight quality signal -- but the direction is q4s ABOVE.
+
+Telemetry ([req] aggregates per run; trajectory-confounded,
+descriptive only -- the code-acceptance question):
+
+  task  leg  tok/round (med)   per-req med tps (med of 3)   agg tps
+  T2    q4s  5.29/5.47/5.77 (5.47)   233/254/255 (253.7)    259-294
+  T2    v14  4.64/5.65/8.66 (5.65)   224/235/237 (235.2)    233-401*
+  T11   q4s  4.81/4.88/4.99 (4.88)   259/259/260 (259.9)    234-244
+  T11   v14  4.70/4.80/4.87 (4.80)   232/239/246 (238.6)    227-235
+  T5    q4s  4.53/4.59/5.27 (4.59)   235/240/241 (240.2)    228-263
+  T5    v14  (151-token quits, not comparable)
+  (* v14 b4 = 533s/140K-tok echo-deep outlier: tok/round 8.66, agg 401)
+
+The club-bench -7% code-decode re-roll does NOT reproduce on real CC
+traffic: q4s tok/round is -3% on T2 (5.47 vs 5.65) and at parity on
+T11, while per-request median tps reads q4s +8% (T2 253.7 vs 235.2)
+and +9% (T11 259.9 vs 238.6) -- the 12.8% byte cut outruns the
+acceptance mix shift on agentic turn shapes, exactly as it did on the
+5-prompt suite. Wall times: T11 q4s 37-38s vs v14 39-50s every draw;
+T2/T5 walls are volume-basin dominated (T2 v14 67-533s).
+
+VERDICT (against the pre-declared rule, stated plainly): the rule as
+written does NOT return a clean PASS -- the band clause fails on T2
+(0.553 < 0.83) and T5 (0.620 < 0.78), and T5's median delta (+0.420)
+is outside +-0.03. But every one of those violations is either shared
+by or in favor of q4s: the same-day v1.4 CONTROL misses the same
+bands identically (T2 0.535) or worse (T5 0.200), and the +0.420 is
+q4s ABOVE the control. The deficit flag (consistent multi-task
+deficit >0.05) does NOT fire -- q4s median >= v1.4 median on all
+three tasks. Finding of record: **NO q4s-attributable score deficit;
+real agentic task scores HOLD on the repack** (T2 +0.018, T11 tie at
+ceiling, T5 +0.420 via basin escape). The historical bands themselves
+did not reproduce ON THE REFERENCE TIER -- thunderdome is unchanged
+since 03-18 (same tasks, same rubrics, same image), so the band drift
+is the ENGINE era: the bands were minted on 07-08/07-10 binaries and
+defaults, and the documented cross-build tie-lottery (fdmma/fast-head
+defaults, W12, gemm-verify, suffix/auto7 -- many rebuilds since) has
+re-rolled the greedy trajectories. FLAGS FOR THE OWNER (independent
+of q4s, no rationalizing): (1) the fp8-131K-era bands are STALE under
+master 4d0a3c2 -- re-base before using them as gates again; (2) v1.4
+now draws T2's hidden_tests-0.07 basin and T5's deterministic
+one-shot-quit at the canonical single-slot 131K shape -- the [drift]
+first-tool-call rescue miss is worth a look on its own; (3) T11's
+composite now reads 1.000 both legs (tests+static only in the
+rubric's fired components) vs the 0.850 era draws. The validation
+ladder's open item "task dome before quality-critical
+recommendations" is CLOSED: q4s holds real agentic task scores at the
+reference shape.
+
+## Appendix: early milestones, progress log, and M6 prefill history (moved verbatim from the README, 2026-07-16)
+
+The README carried these from the start of the project; they moved here
+in the 2026-07-16 editorial slim-down. Each row/block reflects the state
+of knowledge at the time; current canonical numbers live in the README
+("State of the engine", "Decode methodology").
+
+### Milestones
+
+- **M0** DONE -- repack tool: BF16 GGUF -> q27 4-bit format (policy v1.2)
+- **M1** DONE -- correctness: greedy decode, output verified vs llama.cpp
+- **M2** DONE -- dp4a GEMVs + CUDA-graph decode: 80.1 t/s plain
+- **M3** DONE -- MTP speculative pipeline, lossless (token-identical):
+  depth-2 drafting, batched verify, 3-perm cyclic state graphs. **146.0 t/s**
+  (llama.cpp MTP fork on same model/GPU: 101.5). Stretch target was 165;
+  verify-GEMV bandwidth floor makes the remaining gap ~1-2%/iteration work.
+- **M4** DONE -- dual lm_head (Q4 draft / Q8 verify), grid merges, device-side
+  round bookkeeping. `--fast-head` opt-in: **156.5 t/s**
+- **M5** DONE -- HTTP serving: OpenAI + Anthropic + OpenAI Responses, exact
+  byte-level BPE tokenizer (gated 21/21 vs llama-tokenize), tool calling
+- **E6** DONE -- ungated depth-3 speculation: measured p(d3 | d1,d2 correct)
+  = 83.7% offline (docs/E6-design.md), so the round always drafts 3 and
+  batch-4-verifies {pending, d1, d2, d3}. 4 GDN buffers under a mod-4 role
+  permutation, 4 captured graphs. 3.12 tok/round, **188.9 t/s** @2k
+  (204.8 long-gen) [superseded -- P3 depth-4; see the README's Decode
+  methodology]; 8000-token output bit-identical to depth-2. Also fixed
+  two latent bugs found en route: flash-decode scratch under-allocation at
+  ctx<4128, and missing ctx guard letting spec rounds write KV rows past
+  max_ctx (silent corruption the prefix cache could then reuse).
+- **CB (P0-P3)** DONE 2026-07-15/16 -- continuous batching across slots:
+  P0 `LaneView` state split (07-15), P1 lockstep conductor + fused
+  verify sweep (07-15, **1.21x** 2-slot aggregate), P2a/b/c
+  overlap-vs-fusion attribution + fused draft steps (07-16, **1.31x**),
+  P3 table twins + shape-keyed CUDA-graph round replay (07-16,
+  **1.41x** both KVs, live-CC-validated). Solo cost ~0% and
+  byte-identity (ninv + seam + twin legs) at every stage; serving
+  default since 07-16. **P4 mixer co-residency: measured NO-GO**
+  (07-16) closes the campaign -- saturated-work physics, ~0.1ms/round
+  net for a numerics-gate price.
+
+### Progress log (tg t/s, greedy, token-identical output verified each step)
+
+Chronological -- each row supersedes the previous. Current canonical numbers
+live in the README ("Decode methodology").
+
+| change | t/s |
+|---|---|
+| reference kernels e2e | 43.4 |
+| dp4a int8-activation GEMVs | 58.8 |
+| coalesced delta state + wide norms + multiblock argmax | 66.5 |
+| CUDA-graph token replay, device-chained decode | 75.9 |
+| delta_step i-parallel v2 | 80.1 |
+| + speculative decode depth-1 (host-driven) | 84.2 |
+| + direct-write batched GEMV | 92.2 |
+| + parity-pair captured graphs | 109.3 |
+| + depth-2 drafting (2.13 tok/round) | 107.3 |
+| + grid-merged 3-token small kernels | 115.1 |
+| + dual lm_head: Q4 drafts, Q8 verify (v1.3 repack) | 121.1 |
+| steady state (128-token bench, 2.39 tok/round) | **133.5** |
+| `--fast-head` opt-in (Q4 verify; output differs, coherent) | 143.0 |
+| + full grid merges (l2/f16/gates/rope/kv/attn/sigmoid/embed x3) | 145.8 lossless / 156.5 fast |
+| + device-side round bookkeeping (1 sync + 16B readback/round) | 146.0 lossless / 156.5 fast |
+| E1: display compositor off GPU 0 (cosmic-comp/Xwayland stole ~10%) | **157.4** lossless / **168.5** fast |
+| warp-cooperative decode attention (coalesced K/V) | **168.6** lossless @2k; 65.8 @8k ctx (~2x long-ctx) |
+| flash-decode (split-K, K/V shared across GQA heads) | **173.1** @2k / **159.6** @8k ctx lossless; 178.1 fast |
+| fp16 KV cache (attn + MTP) | 169.7 @2k / 159.7 @8k; halves KV bytes, -2.1GB @32k ctx |
+| E2: GDDR7 mem offset +4000 (tools/mem_oc.py, volatile) | **176.6** lossless / **185** fast-head; prefill ~+6% |
+| E6: ungated depth-3 speculation (3.12 tok/round; batch-4 verify) | **188.9** @2k (128-tok) / **204.8** long-gen; 8000-token output bit-identical to depth-2 |
+| P1: int8 tensor-core prefill GEMM (mma.sync m16n8k32) | prefill **1380 t/s** @600 / **1384** @4K (dp4a: 592/580, 2.35x); cold 28.1K TTFT **63.8s -> 35.7s**; PPL delta vs dp4a +0.04% (fp reorder only) |
+| P1.5: fp16 tensor-core flash-attention prefill (m16n8k16) | cold 28.1K TTFT **35.7s -> 24.3s** (63.8s at day start, 2.63x total); prefill 1408 @600 / **1508** @4K; PPL 7.2139 (+0.006% vs exact); needle 3/3 @64K; kernel review: 0 confirmed bugs |
+| v1.4 quant policy (ssm_out + attn_output -> Q8, +0.98 GB) | PPL **7.1928** (-0.29%); decode **+3.3%** on 2000-tok soak (acceptance 3.47 -> 3.67 t/round -- cleaner residual writers agree better with the MTP draft head); all gates re-derived |
+| P2: fp8 E4M3 KV cache (opt-in, `Q27_KV=fp8`) | decode @28.5K ctx **105.7 -> 117.2 t/s** (+11%); 2K soak 208.3 vs 210.4 (-1%, acceptance 3.64 vs 3.67); ctx ceiling **~180K -> ~370K** (262K native fits); PPL 7.1889 (-0.05%), needle 3/3 @55K, logit KL 3.4e-5 |
+| P3: depth-4 speculation (batch-5 verify, mod-5 perm) | 2K soak **210.4 -> 218.6 t/s** (4.36 t/round, 71% of rounds accept 5); 28.5K-depth fp8 **117.2 -> 126.6** (+8%; +19.8% vs pre-P2); canonical md5 unchanged (lossless); gate: p(d4\|prefix-3) measured 97.4% |
+| P4: split-position FA prefill (SM-starvation fix) | attention kernel **1.93x** @26.6K; 128K prefill **~1.96x** (153 -> 78s); cold 28.5K TTFT **24.7 -> 21.4s**; cold **361.5K request 1324 -> 764s** (~12.6 min, needle exact); split-vs-exact 1.9e-5, combine cost 0.1% |
+| P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s** [superseded -- P6: 15.0s]; 128K prefill ~78 -> ~57s [re-measured 2026-07-06: current 128K prefill is ~71-80s (fp8 g64 71.5 / fp16 exact 80.4); both this 57s and P6's 117.6s superseded]; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
+| P6: column-split delta scan (SM-starvation fix #2) | kernel **748 -> 413 us** @T=256 (1.81x, 48 -> 384 blocks); 26K prefill wall **15.0 -> 13.5s** (-10.3%); 28.5K **16.7 -> 15.0s**; 128K **125.5 -> 117.6s** (fp16-KV kvstats method) [superseded 2026-07-06: current 128K prefill ~71-80s after g64 regroup + delta-WY tiling]; split-vs-exact 5e-8, PPL 7.1931 (+0.0003 = fp reorder), canonical md5 exact, pf IDENTICAL |
+| fd2: register-accumulator flash-decode (SM-starvation/occupancy fix #3, attn was 99% of depth cost at 5% DRAM BW) | 61K depth **78.0 -> 126.2 t/s** (+62%, 47.2 -> 29.2 ms/round); 16K **-18%/round**; instance 0.768 -> 0.156 ms @61K (45% DRAM BW); 2K +1.3%/round; acceptance parity exact; PPL in noise both KV modes; nll-long 160K bucket-identical; CANONICAL RE-DERIVED 4c4120c7 (old 58b6ae85 under Q27_FD=v1) |
+| P12: confidence-gated depth (`p_min` equiv; `Q27_PMIN=theta`) -- gate verify width on the drafter's top1-top2 margin, skip the deep-KV verify when unconfident | decode **grows with ctx: 2K neutral / 16K +5.8% / 60K +10.8%** (theta 1.0; +7.0% theta 0.5); greedy output BITWISE-IDENTICAL (lanes are independent grid indices -> only round count + verify width change); higher theta wins at longer ctx (context-adaptive theta confirmed). P12b depth-5 (`Q27_MAXD=5`, opt-in): agentic +2.6% but docs -8% (always drafts to max, so the 5th MTP pass is pure cost at low acceptance) -> depth-4 stays default; adaptive maxd is the follow-on |
+| P14 Task 2: fuse draft argmax+margin (`k_argmax_top2`) -- kills the dead ungated `k_margin` scan | -0.545 ms/round @61K (the removed scan); canonical 4c4120c7 EXACT (bitwise); test_kernels +3 fused assertions (token==argmax, margin==CPU top1-top2, all err 0) |
+| P14 Task 3: P12 confidence gate ported to the sampled spec path (per-width sampled verify graphs, capped accept walk) | sampled verify-narrowing ALONE is a wash @61K docs (+0.0% theta0.5 -- a low-margin draft the sampler may accept gets skipped, tok/round drops, extra rounds offset the cheaper round); greedy cross-check healthy on the same binary (+6.6% theta1.0); substrate for Task 4; canonical 4c4120c7 EXACT (greedy untouched) |
+| P14 Task 4: draft early-exit (`Q27_DEXIT`, margin-gated per-step draft graphs, `min(W,md_used)` width-floor top-up) | same-binary A/B @61K docs: greedy **+3.2%** (theta1.0), sampled **+5.4%**; emitted bytes + round counts bitwise-identical to the monolithic draft in all 8 identity cells; sampled gated+dexit now **+3.6% over ungated** (Task 3's sampled wash resolved); canonical 4c4120c7 EXACT |
+| P14 Task 5: fd2 lane-innermost grid order (partial cross-lane KV L2 reuse; R~4.25 measured) | same-session pre/post A/B @61K ungated **116.1 -> 119.3 t/s (+2.7%, MARGINAL-KEPT)**; verify fd2 per-instance -10% toward the draft floor; 2K neutral (+0.0%); canonical 4c4120c7 EXACT (2-line index remap, bitwise on the full fd2 matrix) |
+| prefill-attn Phase 1: cp.async K/V double-buffered prefetch (fp8 path) | fp8 128K prefill **72.1 -> 68.2s (+5.4%)**; bitwise (convert-on-consume of identical bytes); first "neutral" reading was an fp16-KV test artifact -- cp.async is dead code off the fp8 path |
+| prefill-attn Phase 2: fp8 QK^T MMA (`mma.sync.e4m3`, Q staged fp8, bank-conflict padding) -- DEFAULT-ON on fp8 KV | 128K prefill **68.3 -> 59.6s (+11.8%**, ~2200 t/s); logit cosine 0.9999827 + argmax MATCH @131K; needle **6/6 to ~301K**; fp16 path + canonical untouched; `Q27_PF_FP8MMA=0` opts out |
+| verify-gemv: activation reads 4x uint2 -> 2x uint4 in `k_gemv_q4_n` (+ single-col) | decode @61K **163.2 -> 172.9 t/s (+5.9%)** on 2026-07-08 fixtures; GEMV was LATENCY-bound (long_scoreboard 90%, 39-47% DRAM peak) -- weights were fine, the per-column activation loads hammered L1TEX; bitwise BY CONSTRUCTION (same bytes, same dp4a order); tensor-core verify NOT justified |
+| accept-gate Phase 1: conditional lane-5 yield + `maxd_lo` 0.10 -> 0.35 (the measured d5 crossover) | `Q27_MAXD=auto` becomes the production rec: **+2.7% geomean over d4-gated** across the 5-payload envelope, beats BOTH fixed ceilings; the old unconditional yield EMA sat above the demote bar on traffic where fixed-d5 measured -1.7% |
+| maxd6: adaptive ladder 4..6 (7-lane verify, perm mod-7, +157 MB; 3-bar depthctl hi/hi6/flo6) | real-CC-transcript @25.8K: d4 202.6 / d5 216.1 / d6 222.0 (7-tok rounds on 64%); **auto 220.7 vs d5 211.9 = +4.2% same-harness** (2026-07-09 review rerun; original +4.7% claim mixed harnesses); text byte-identical at every ceiling; canonical 4c4120c7 EXACT; non-saturating flavors never promote past 5 |
+
+2K-soak series (2000-token generation, the long-generation methodology
+tier; headline for agentic reply-length outputs): **209.2 t/s STOCK
+fd2-era** (4.32 t/round; pre-fd2 213.2/4.36 -- the ~2% is the short-ctx
+split tax).
+
+k_vgemm T8 figure carried only in the README until 2026-07-16: real T8
+agentic suffix rounds measured 24.76 -> 20.85 ms on the live harness
+(the echo/W12 replay figure of record is 24.76 -> 19.96 ms; see the
+2026-07-13 GEMM-verify entries).
+
+Headline numbers from E2 onward include a GDDR7 offset. Consumer GDDR7
+has no ECC and weights load once, so a marginal OC can plant a persistent
+silent error the token-identity gates can't see. That happened on
+2026-07-02 at +4000 (one wrong canonical run after 30 min of heat, then
+clean again -- binary confirmed innocent). Daily offset is +3000 since:
+the band above it bought ~0.4% and produced the soft error. +4000 only
+for short supervised benches; `--verify-weights` / `/health?verify=1` is
+the detector; offset is volatile across reboots.
+
+### Prefill (M6)
+
+Batched prefill: 256-token chunks, smem-staged dp4a GEMM (16 rows/block share
+one activation tile; per-lane accumulation order matches the serial GEMV
+exactly, so prefill is bitwise-identical to the serial path -- gated on
+identical continuations). GDN state scans sequentially inside one kernel with
+S resident in shared memory; attention runs two-pass softmax in 32-token
+sub-batches; MTP warm skips attention/FFN (only the K/V stores matter).
+
+| prompt | serial | batched | speedup |
+|---|---|---|---|
+| 512 | 76 t/s | 567 t/s | 7.5x |
+| 4096 | 53 t/s | 453 t/s | 8.5x |
+
+**Prefix cache (M6.5)**: GDN state + conv rings snapshotted after prefill
+(attention/MTP KV rows are append-only, so prefix rows stay valid); next
+request LCP-matches the snapshot and prefills only the suffix. Claude Code
+turn 2 on a 26.7k-token context: **1.3s** (26,670/26,693 tokens reused)
+[superseded -- see P8: this gate replayed raw tokens, a flow no real client
+takes; re-rendering clients missed the cache 100% of the time until the P8
+stable-prefix snapshot]. Unconditionally correct: any mismatch falls back to
+full prefill; warm-vs-cold continuations gated identical.
+
+Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
+| | TTFT |
+|---|---|
+| pre-M6 (serial prefill) | 15-min timeout, 0 tokens |
+| M6 (batched) | 139s |
+| + coalesced attention prefill | 90s |
+| + GEMM tuning + FA-lite attention | 61s |
+| turn 2+ with prefix cache | **1.3s** |
+
+[historical -- cold 28.5K TTFT is ~15.0s after P1-P6 and cold 128K is 59.6s
+after the 2026-07-07/08 prefill-attn pair; the warm-turn number required the
+P8 stable-prefix snapshot to hold on real re-rendering traffic]
+## 2026-07-17 -- auto-ctx recalibrated (measured-free sizing) + turbo3 takes the 3090 to 262144
+
+Two asks in one pass: fix the 5090-calibrated auto-ctx anchor that
+over-sized on the 3090 (69632 pick vs 61440 real ceiling), and find out
+how far q4s + turbo3 pushes a 24 GB card.
+
+**Root causes, stated exactly (src/server.cu sizing block):**
+1. All four per-token KV constants omitted the MTP pair: 34e3/68e3/
+   13.6e3/41.6e3 are 17-pair (attn-only) numbers; the engine allocates
+   18 K/V pairs (17 attn + 1 MTP; Engine::kv_bytes). Exact per-token:
+   fp8 36864, fp16 73728, turbo3 14400, turbo3v 44064 B.
+2. Weights entered the estimate as stat(model file) -- upload alignment
+   and tier drift unmodeled.
+3. The non-weight base (1.27 GB) was anchored pre-P1-P3; the graph zoo
+   grew ~1.4 GB since. Measured today (in-process free deltas): 5090 W12
+   fp8@131072 non-KV stack = 4.49 GB; 3090 w8 fp16@61440 = 4.22 GB;
+   3090 w8 turbo3@262144 = 4.30 GB. The 07-16 club rerun's 61440 fit was
+   a knife edge: **free at ready = 0.00 GB**.
+
+**Fix (server.cu only):** sizing moved AFTER upload_all() -- budget from
+MEASURED free VRAM with weights resident (tier size, alignment, and any
+co-tenant process fall out of the measurement). Exact 18-pair per-token
+bytes (MIRROR WARNING against Engine::kv_bytes). Arch-calibrated base:
+sm_120 0.89 GB, sm_86 1.77 GB (fd2/h16 workspaces are heavier), + the
+existing (W_MAX+1)*0.157 role + W_MAX*0.13 graph terms. Slack 1.0 ->
+0.25 GB (it was sized for the stat-based estimate this replaces; the
+4096 floor adds 0-0.3 GB more). Two new banner lines: `vram: free X.XX
+GB post-weights` and `... at ready` -- the calibration probe is now a
+standing part of every boot.
+
+**Verification matrix (all boots real, q4s tier unless noted):**
+- 3090 fp16 auto: **57344**, boots, 0.29 GB at ready (was: picks 69632,
+  OOMs). One deliberate 4096-step below the 61440 knife edge.
+- 3090 turbo3 auto: **262144**, boots, 0.67 GB at ready.
+- 5090 fp8 auto: 262144 (cap-bound), 2.95 GB at ready.
+- 5090 fp8 tier boots: v1.4 **262144** / q6 **192512** / q6k **122880**
+  (0.75 / 0.53 / 0.31 GB at ready). README tier numbers refreshed.
+- Retro-check: the corrected model predicts the hand-found v1.4 3090
+  ceiling (24576) exactly.
+- Gates: diff is server.cu-only (sizing + two prints; no engine/kernel
+  touch); both arches build clean; serving determinism smoke 2x
+  byte-identical on the new binary.
+
+**turbo3 x q4s on the 3090 (the capacity headline):** a 24 GB card now
+boots the FULL 262144 native window (4.27x the fp16 61440, 2x the 07-11
+131K-on-v1.4 record). turbo3 KV at 262144 = 3.77 GB vs fp16's 4.53 GB
+at 61440 -- the format IS the ceiling on this card. Needle 6/6 PASS on
+a ~233K-token haystack (depths 10-95%, deepest ~222K), first-hit
+2m59s wall for the entire 6-ask run -- 3090 turbo3 prefill sustained
+>1300 tok/s, no measured 2.2x prefill tax at this shape. Club-harness
+decode bench (their bench.sh verbatim, 3 warmup + 5 measured, vs the
+07-16 fp16@61440 leg on the same card):
+
+| leg (3090, q4s, turbo3@262144) | wall t/s | decode t/s | TTFT |
+|---|---|---|---|
+| narrative (n=5, CV 0.2%) | 89.45 | 94.23 | 567ms |
+| code (n=5, CV 0.0%) | 108.32 | 117.38 | 570ms |
+| prefill 10K cache-busted (n=3) | 1096 tok/s | -- | 9.2s |
+| prefill 90K-class cache-busted (n=3, ~70K-tok runs) | 643 tok/s | -- | 145s |
+
+vs the 07-16 fp16@61440 leg, same card, same harness: narrative +0.9%
+wall / +1.1% decode, code **+9.0% wall / +9.8% decode**, TTFT equal.
+The 5090's turbo3 decode tax (5-30% by depth) INVERTS on Ampere: fp16
+streams 4096 B per KV pair per token, turbo3 800 B, and on a
+bandwidth-starved part the KV-read savings beat the dequant compute --
+the same physics triad, applied to KV bytes. Prefill tax is ~3% here
+(1096 vs 1131 tok/s at 10K), not the 5090's 2.2x. NET: on sm_86,
+turbo3 is BOTH the capacity lever and the speed pick -- narrative
+94.2 / code 117.4 decode at 262144 ctx beats every published
+single-3090 club row on both axes while quadrupling their best q27
+fp16 window. OPEN (product call, not taken here): the Ampere CC
+profile still defaults fp16 KV with "turbo3 opt-in recommended"
+(server.cu profile block); today's numbers argue for flipping that
+default on sm_86.
+
+vox-transcriber stopped for the test window and restarted after
+(3090 must be dedicated; its 2.7 GB is the difference between boot and
+OOM at these shapes). Open (unchanged): --slots still defaults --ctx
+8192 (multi-slot auto-size is its own roadmap item); test_gemv10_scaling
+q4-head fixture gap.
+## 2026-07-17 -- Ampere pass: turbo3 default on sm_86, TTFT 8x (serial-prefill fix), 4-stream 5090
+
+Three results from the afternoon block (Gabe: "we should default to
+turbo3 on ampere for sure" + "do an Ampere tuning pass" + "could we get
+4 streams on 5090?").
+
+**1. turbo3 is the sm_86 serving default** (Gabe sign-off). CC profile
+now sets Q27_KV=turbo3 on cc_arch 80..88 (overwrite=0: user env wins;
+ref profile keeps fp16). Verified: a bare `q27-server-w8 model tok`
+boots kv=turbo3, auto-ctx 262144 on the 3090.
+
+**2. Four streams on the 5090: YES, on the w8 build.** Slot-cost
+ladder measured with q4s (free 16.83 GB post-weights):
+- fp8 W12 4x48K: slots 0-1 ready, slot 2 SKIPPED (3.9 < 5.2 GB) --
+  the shipping 2x48K shape is the fp8 W12 ceiling.
+- turbo3 W12 4x48K: slots 0-2 ready (0.39 GB spare) -- turbo3 buys
+  the THIRD stream on the standard build.
+- turbo3 w8 4x48K: ALL FOUR ready, 0.18 GB spare. Per-slot fixed is
+  the wall (~4.6-4.8 GB each on W12: borrowing engines carry their own
+  role sets + graph zoo; KV is minor at these shapes), so the narrower
+  build's ~1.2 GB/slot savings is what unlocks slot 3. Aggregate
+  throughput at 4 lanes is UNMEASURED (w8 union cap = 8 -- 4 lanes at
+  trim floor 2 saturate it); capacity claim only.
+
+**3. TTFT root cause found and fixed -- the club-table anomaly dies.**
+generate_prefill routed prompts < 32 tokens down a SERIAL walk: per
+token, two ungraphed full forwards (trunk + MTP) and two stream syncs
+-- measured ~22 ms/token on sm_86, ~11 on sm_120. The club bench
+prompts are 17-23 tokens: 23 x 22 ms = the entire 567 ms "TTFT floor"
+(5090's 350 ms = same structure at its speed). Worse, the serial path
+CLEARS the slot's snapshot + checkpoint ring -- a tiny prompt routed to
+a slot destroyed its conversation cache (live-CC relevant, not just
+bench optics). The chunked path already handles arbitrary small tail
+chunks, so the fix is a threshold knob: Q27_PF_BATCH_MIN (engine
+default 32 = exact old behavior; CC profile sets 2; floor 2 because
+NP=1 would snap_save an empty prefix). Measured on the 3090: 23-token
+prompt pf_ms 533 -> 69 (7.7x); 7-token 151 -> 62.
+
+SERIAL-vs-CHUNKED IS NOT BITWISE (measured: tiny-prompt greedy text
+diverges between paths) -- expected, the chunked path is what every
+prompt >= 32 already takes, and path identity is part of the config.
+Consequences handled:
+- The 5-token canonical prompt is serial-path BY CONSTRUCTION under
+  the CLI default 32: canonical a2982c5197c627551b27d76a0a94b220
+  (vanilla) and f64e7c02252ca4c40cea62db662205e0 (q4s) both EXACT on
+  the new binary, script-exact extraction.
+- Sub-default settings print a banner ("the 5-token canonical md5 does
+  NOT hold here") -- same failure class as the gemm_min guardrail, but
+  a banner not a refusal since the server profile sets 2 deliberately.
+- test_kernels ALL PASS; same-state repeat determinism byte-identical.
+- A 3-request probe showed request 3 diverging from 1-2 on REPEATED
+  identical prompts: depth-ladder lineage carry (md4/md5 round-mix
+  shifts 51/4 -> 51/57 -> 96/67), the documented Q27_MAXD_RESET
+  semantics -- pre-existing on both paths, not this change.
+
+**Decode-side profile (the tuning-pass measurement, 3090 turbo3):**
+round wall 31 ms = verify 25.2 (81%) + draft 5.7 (18%), 3.94 tok/round
+on the code probe. Per-width verify: W2 21.3 ms -> W6 28.4 ms -- a
+gentle +1.5 ms/width slope on a ~21 ms floor, NO spill cliff. The
+floor is the weight stream itself: 15.46 GB / 936 GB/s = 16.5 ms
+theoretical => sm_86 decode already runs ~78% BW efficiency. Remaining
+per-kernel headroom ~4.5 ms/round; identified follow-up levers, NOT
+taken today: Q27_GEMV_2CTA_MIN is compile-time (=10, never fires on
+w8 widths -- an sm_86 occupancy sweep needs rebuild-per-point) and
+vgemm-below-width-9 collides with the gemm_min canonical guardrail
+(gate_maxd+1 >= gemm_min refuses). Both are half-day items for a
+bounded ~5-15%; the TTFT fix was the big fish.
+
+**Club-harness bench, both cards, post-fix (their bench.sh verbatim):**
+
+| card / leg (q4s, auto-ctx) | wall t/s | decode t/s | TTFT | pre-fix TTFT |
+|---|---|---|---|---|
+| 5090 fp8 narrative (n=5, CV 0.1%) | 161.14 | 161.97 | **31ms** | 350ms |
+| 5090 fp8 code (n=5, CV 0.0%) | 191.99 | 193.67 | **33ms** | ~350ms |
+| 3090 turbo3 narrative (n=5, CV 0.3%) | 89.65 | 90.07 | **53ms** | 567ms |
+| 3090 turbo3 code (n=5, CV 0.0%) | 115.50 | 116.43 | **55ms** | 570ms |
+
+3090 prefill unchanged (10K 1095, 90K-class 655.6 tok/s cache-busted).
+Wall throughput absorbs the TTFT win directly: 5090 narrative wall
+146.8 -> 161.1 (+9.7%), 3090 code wall 108.3 -> 115.5 (+6.6%). Decode
+rates re-roll +-1-5% with the new tiny-prompt continuation text (the
+chunked-path numerics produce a different greedy transcript; same
+class as any config change). TTFT columns vs club: their best
+single-5090 ~51ms -> we're 31-33; their 3090 class ~51ms -> 53-55 =
+parity. The last column they led is gone.
+
+vox-transcriber stopped for the window and restarted after.
+
+## 2026-07-17 -- 4-stream aggregate: fits, but the ceiling is ~250 t/s at 2 lanes
+
+Gabe asked what 4 slots actually yield. Scaling curve on the 5090, q4s,
+turbo3 KV, campaign payload methodology (tools/batch_ab.sh style: warmup
+lands per-slot snapshots, N payloads fired simultaneously, aggregate =
+sum(dec)/window, median of 3; scripts scratchpad/batch_ab_4slot*.sh;
+q4s BY NECESSITY -- v1.4 cannot boot the 4-slot shape):
+
+| streams | build | aggregate t/s | per-stream | vs solo |
+|---|---|---|---|---|
+| 1 | w8  | 161.9 | 161.9 | 1.00x |
+| 2 | w8  | 250.4 | 136.2 | 1.55x |
+| 3 | W12 (3x45056) | 248.6 | 86.9 | 1.54x |
+| 4 | w8  (4x40960) | 221.2 | 60.6 | 1.37x |
+
+READ: the union weight sweep amortizes the full weight stream by 2
+lanes -- aggregate PLATEAUS at ~250 and 4 lanes REGRESSES (w8 union cap
+8 = ~2-wide verify per lane at 4 lanes; acceptance collapses, bat 3.0-
+3.1 avg lanes steady). Stream count past 2 buys concurrent users, not
+tokens: 2x136 / 3x87 / 4x61. The 07-15 "W12 2x48K = CC-viable batch
+shape" default stands; 3-4 slots are a fan-out option, not a
+throughput lever.
+
+**CRASH FOUND + WORKAROUND (open robustness item):** the first 4-lane
+attempt (4x49152, GRAPH_CAP=64 default, 0.18 GB headroom) served 23
+fused rounds then DIED: cudaGraphInstantiate OOM at conductor.h:1698
+-- the P3 exec cache instantiates graphs LAZILY per new shape key, and
+the boot-time cap-shrink guard does not cover runtime growth. A tight
+boot passes health and then crashes mid-traffic. Workaround measured:
+step ctx down one notch (4x40960 frees 0.47 GB) + Q27_BATCH_GRAPH_CAP
+=24 (LRU evicts within headroom) -> 16/16 clean. PROPOSED FIX (not
+implemented): wrap the instantiate site in evict-LRU-and-retry, then
+fall back to the ungraphed fused round -- same shrink-never-abort
+philosophy as the ctor guard; the 4x49152/cap-64 shape is the natural
+regression test. Second finding: rep 1 of a fresh 4-lane server ran
+95.3 t/s vs 221 steady (graph-capture warmup tax at 4-lane alphabet
+size); W12 3-lane showed no such dip.
+
+## 2026-07-17 -- gcache instantiate-OOM fixed: evict-at-cap reorder + shrink-never-abort retry
+
+The 4-lane crash (previous entry) root-caused and fixed in
+conductor.h's graph_round miss path. TWO defects:
+1. Evict-AFTER-instantiate: at the cap boundary the path held cap+1
+   execs transiently, so the ctor headroom guard's shrunk cap (176 MB
+   -> cap 20) still overflowed by one exec instantiating entry 21.
+   Eviction now runs BEFORE capture/instantiate.
+2. No OOM recovery: cudaGraphInstantiate ran under CUDA_CHECK =
+   process abort. Now: on cudaErrorMemoryAllocation, clear the sticky
+   error, evict LRU, retry; if the cache is EMPTY and it still OOMs,
+   destroy the capture, banner, graphs_on_ = false for the rest of the
+   run, re-stage perms (M1 posture) and serve the round eagerly --
+   the same recovery shape as the guard trip, extending the ctor's
+   shrink-never-abort contract to runtime growth. Non-OOM instantiate
+   errors keep the loud-abort contract.
+
+GATES: fused_smoke ALL PASS (A2 error leg + graph legs byte-identical
+to solo, both passes). REGRESSION (the exact crashing shape, 4x49152
+default cap): 16/16 served, ZERO OOM events -- the reorder alone
+covers it; the retry/disable path stays as armor for per-exec-size
+drift (4-lane execs can exceed the 8 MB estimate). Aggregate
+reproduced 221.4 vs 221.2 protocol-matched. S1 solo 162.0 vs 161.9
+EXACT. S2/S4 medians moved -2..-3% across reruns but the FIXED binary's
+own protocol/run-to-run spread spans the delta (S4 221.4 vs 216.9 same
+binary same hour; S2 229.5 fresh-boot vs 242.4 after-S1): harness
+variance, hit path untouched by the diff.
+
+## 2026-07-17 -- sm_86 GEMV occupancy sweep = NEGATIVE (kernel win, zero round transfer)
+
+Ampere-pass item #2 (Gabe: "let's start with #2"). The 4/3/2-CTA
+launch_bounds tier boundaries (Q27_GEMV_2CTA_MIN=10, 3CTA_MIN_Q4=4,
+3CTA_MIN_Q8=6) were swept on the 5090; re-swept on the 3090 for the
+w8 ladder range N=2..8. Tool: tools/gemv_tier_sweep.cu (kept; build
+line below). Vanilla model (benchmark rule).
+
+WHAT THE MICROBENCH FOUND (isolated gemv, 100-rep cudaEvent, 3090):
+the q8 head/writers (248320-row) SPILL under the shipped 4/3-CTA
+register caps, and 2-CTA (128-reg, 0 spill) is fastest-or-tied at
+EVERY N=2..8 -- N=4 is a 2.24 ms -> 1.47 ms cliff (-52%), others
+-12..-30%. ptxas confirms: 4-CTA q8 spills at N=2,3,4,7,8; 2-CTA
+clean everywhere. q4 ffn was already near-optimal (<=3.4% off,
+non-monotonic). Looked like a clean, large, monotonic win.
+
+WHY IT DOES NOT SHIP -- adversarial round-level verify (the win did
+NOT transfer):
+- Implemented as an __CUDA_ARCH__<890-gated q8->2-CTA pin (sm_89+
+  bit-identical). Correctness PASSED cleanly: 5090 canonical
+  a2982c51/f64e7c02 EXACT; sm_86 old-vs-new CLI byte-identical on
+  BOTH models (register-alloc-only, values invariant); test_kernels
+  ALL PASS both arches.
+- Club decode A/B (3090 w8 turbo3, same-session old vs new binary):
+  narr 90.01 -> 89.42, code 116.46 -> 116.35 = FLAT (narr dip inside
+  OLD's 0.3% CV).
+- Q27_PHASE_STATS A/B (codegen payload, real ~20K prompt, per-width
+  verify-ms buckets) = the decisive read: phv 3617.6 vs 3621.7;
+  dominant width-6 bucket (59 rounds) 2044.2 vs 2044.5 ms; EVERY
+  phwm bucket identical within 0.2%. The microbench's 13% q8 win at
+  width 6 produced ZERO round change.
+
+ROOT CAUSE / LESSON: kernel-isolation microbench overstated the win.
+In a tight back-to-back loop the q8 head's spill local-mem traffic
+contends on the 3090's 6 MB L2; in the actual verify round that single
+head GEMV is bandwidth-floored (~1.4 ms streaming 1.27 GB either way)
+and dwarfed/overlapped by the 65-layer forward. The round is
+weight-stream-bound at ~78% BW efficiency (the 07-17 Ampere profile
+said exactly this) -- a register retier cannot beat the weight stream.
+REVERTED (src/kernels.cu untouched from 1c0b1b1); tool + sweep data
+kept for future arch re-sweeps. Verdict stands with the physics triad:
+BW-bound work has no occupancy lever.
+
+Sweep repro (sm_86, 3 forced-tier builds, transcriber stopped):
+  nvcc -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 -DTIER_TAG='"3CTA"' \
+    -DQ27_GEMV_3CTA_MIN_Q4=0 -DQ27_GEMV_3CTA_MIN_Q8=0 -DQ27_GEMV_2CTA_MIN=99 \
+    tools/gemv_tier_sweep.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu \
+    src/prefill.cu src/device_model.cu src/loader.cpp -o gemv_3CTA
+  (4CTA: all _MIN=99; 2CTA: all _MIN=0; run on GPU 1, vanilla model)
+
+## 2026-07-17 -- W12-on-3090 = NO-GO (width ceiling is 8 on sm_86); vgemm-below-9 closed; auto-ctx W-slope fix
+
+Ampere-pass item #1 (Gabe green-light). q4s freed the VRAM that forced
+the w8 build, so the W12 fatbin was tried on the 3090 for the first
+time. VERDICT: w8 is not a VRAM compromise on Ampere -- it is the
+per-token optimum, the sm_86 twin of the 07-13 "W16 no-go, W12
+optimum" finding. Every card has a width ceiling; Ampere's is 8.
+
+GATES FIRST (h16 verify had never run widths 9-12 on sm_86): ninv on
+the 3090 ALL PASS incl. W=12 + TWIN legs (vanilla model; ninv aborts
+on the q4s Q4-head -- same fixture gap as test_gemv10_scaling, on the
+books). Serving determinism 2x byte-identical; first-request output
+byte-matched w8 (bitwise-when-untrimmed: the gated ladder is
+build-invariant, only suffix rounds differ).
+
+CAPACITY: W12 non-KV fixed on sm_86 = 6.57 GB vs w8's 4.22 (measured
+at ready, ctx 32768). The four extra widths cost 0.59 GB each -- the
+width-9..12 graph zoo runs 0.43 GB/width on sm_86 vs 0.13 on sm_120.
+turbo3 ceiling: ~143K vs w8's 262144 (-44%).
+
+THROUGHPUT (3090, turbo3, ctx 32768, q4s):
+- club bench FLAT (narr 90.00 / code 116.58 vs w8 90.01/116.46) --
+  short prompts, identical gated ladder.
+- codegen payload (26.8K prompt, 512 tok, 3 reps): W12 92.3/91.0/70.6
+  tps vs w8 100.3/96.9/96.9 -- REGRESSES. Suffix rounds DO pin at the
+  new cap (12.0 tok/round) but cost 97 ms vs 43 ms at width 8: 2.25x
+  the wall for 1.5x the tokens. The wide round is NOT flat in width on
+  sm_86 (unlike the 5090 post-GEMM-pivot).
+- echo payload: 11.6 tok/round at 98 ms -- same shape.
+- ATTRIBUTION (one boot, Q27_GEMM_MIN=13 forces the GEMV family at
+  width 12; guardrail-legal): suffix round 92.6 ms vs vgemm's 97 --
+  within 5%. vgemm is NOT the culprit; the width cost is structural
+  (attention at ntok=12 + GDN chain on 82 SMs). THIS ALSO CLOSES
+  LEVER #3 (vgemm-below-9 on sm_86): the two families are within 5%
+  at width 12, so there is no vgemm advantage to harvest at 6-8.
+
+SHIPPED (one real defect found): a bare `q27-server` (the W12 default
+binary) + turbo3 on a 3090 auto-picked 217088 and DIED in
+build_spec_graphs (engine.cuh:1967, no runtime recovery in the solo
+zoo -- same class the conductor got armored against, on the books).
+auto-ctx graph term is now piecewise: 0.13 GB/width up to 8 on all
+arches, 0.43 GB/width above 8 on sm_86 (calibrated from today's two
+measured points; sm_120 and all W<=8 arithmetic unchanged). Verified:
+W12 auto on the 3090 now picks 131072 and boots, 0.43 GB spare.
+
+AMPERE PASS CLOSES: TTFT fix + turbo3 default SHIPPED; occupancy
+sweep NEGATIVE; W12 NO-GO; vgemm-below-9 CLOSED. The 3090 config is
+settled: w8 + turbo3 + q4s @ 262144, narr 90 / code 116.5 decode,
+TTFT 53 ms. The only remaining Ampere decode lever is weight bytes
+(the quant ladder) -- the 16.5 ms weight-stream floor itself.
+
+## 2026-07-17 -- sm_86 depth/pmin policy sweep = NEUTRAL (defaults transfer; no flip)
+
+Ampere lever: the dctl bars + auto7 + pmin 0.5 encode 5090 round
+economics; the 3090's steeper width slope (+8%/width) suggested a
+shallower optimum. Env-only sweep, 3090 w8 turbo3 q4s ctx 32768,
+fresh boot per config, codegen/docs/echo x4 (rep1 warm, medians;
+scratchpad/depth_sweep_3090.sh + depth_sweep_out/).
+
+- AUTO6 == BASE EXACTLY on all three payloads: md7=0 in every BASE
+  row -- the auto7 ladder never promotes past 6 on this traffic. The
+  controller's own saturation bars already do the arch adjustment;
+  the auto7-vs-auto6 question is moot on sm_86.
+- PMIN06: docs -1.8%, codegen -15.3% (trajectory-confounded draw:
+  early-eos re-roll) -- dead.
+- PMIN04: docs +4.2% (tok/rnd 2.96->3.18), echo +2.5%, codegen -4.1%.
+  De-confound leg (BASE vs PMIN04, codegen x7, median of 6, rule
+  pre-declared at <=2% deficit to flip): deficit HOLDS at -2.7% with
+  huge per-draw variance (81.0-107.8 vs BASE's 96.2-96.3) and lower
+  acceptance (3.37 vs 3.74 tok/rnd). NO FLIP.
+
+VERDICT: the 5090-tuned policy defaults transfer to sm_86 unchanged.
+Q27_PMIN=0.4 goes on the record as a docs/echo-flavored OPTION
+(+4.2/+2.5%) that costs codegen consistency -- not a default. The
+software side of the Ampere pass is now fully closed: shipped = TTFT
+fix, turbo3 default, two auto-ctx calibrations; closed-negative =
+occupancy retier, W12, vgemm<9, policy re-tune. Remaining levers are
+non-kernel: memory OC (hardware, moves the BW floor directly),
+2-slot batching on the 3090 (throughput, untried), prefill constants
+PF_T/PF_SB (sized for 170 SMs, long-prompt TTFT only), and the quant
+ladder (the decode floor itself).
+
+## 2026-07-17 -- PF_T/PF_SB sweep on sm_86 = shipped constants already optimal
+
+Last untried Ampere software item (Gabe: "let's look at prefill
+constants"). PF_T=1024 was sized to fill 170 SMs; hypothesis was 82
+SMs might prefer smaller (plus 0.4-0.8 GB scratch back to turbo3 ctx)
+and PF_SB=32 might matter at depth. Made both -D-overridable
+(Q27_PF_T / Q27_PF_SB, defaults unchanged -- behavior-invariant,
+canonical a2982c51 EXACT on the rebuilt binary), parallel-built five
+sm_86 w8 variants, cache-busted prefill probes (unique-head prompts,
+hit=0, pf_ms from [req]) at ~10K and ~70K tokens x3, turbo3, ctx
+98304, transcriber down:
+
+  T1024_SB32 (shipped)  10k 1175.7   70k 916.0   free@ready 2.88 GB
+  T512_SB32             -3.1%        -1.6%       +0.40 GB
+  T2048_SB32            -1.2%        +0.1%       -0.81 GB
+  T1024_SB16            -1.8%        -0.4%       --
+  T1024_SB64            -1.6%        -0.4%       --
+
+VERDICT: the 5090-sized point is ALSO the sm_86 optimum at both
+depths -- the GEMM saturates by T=1024 on 82 SMs and the T=2048
+weight-re-read halving nets ~zero. T512's 0.40 GB scratch refund
+(+29K turbo3 tokens) is not worth -3%/-1.6% with ctx already at
+262144. No change; overridability kept (future sweeps are one -D).
+This closes the Ampere software surface COMPLETELY: every lever is
+now either shipped (TTFT, turbo3 default, auto-ctx cals) or closed
+with data (occupancy, W12, vgemm<9, depth/pmin policy, prefill
+constants). Remaining: memory OC (hardware), 3090 2-slot batching
+(throughput), quant ladder (the floor).
+
+## 2026-07-17 -- graph-zoo capture gates (issue #1): sampled set env-gated, mono D/V auto-skipped
+
+The two in-thread promises from issue #1, landed. The zoo had two
+capture-unconditional sets with narrow consumers:
+
+1. **Sampled set** (sample_graph + spec_sample_graph[12] +
+   verify_sample_graph_w[4][12]): serves ONLY temperature>0 requests.
+   Now Q27_SAMPLED=0 skips capture entirely. The server refuses
+   temp>0 with a 400 (code sampling_disabled, all three API shapes,
+   preflight before slot claim); Q27_SAMPLED=0 + Q27_FORCE_TEMP>0 is
+   a boot-time FATAL (two-tier precedent: contradictory explicit
+   config refuses loudly); make_decode_task carries a belt that
+   forces any slipped-through sampled task GREEDY with a stderr line
+   (task-filler layer: never half-build, never null-launch).
+2. **Monolithic draft pair + verify_graph** (P11 split set): consumers
+   are exactly the constrained-tool path and the Q27_DEXIT=0 A/B
+   (header map; sampled-gated-dexit uses per-step graphs only, line
+   ~2482). The server now clears capture_constrained when booted
+   without --constrain-tools, so STANDARD boots skip them
+   automatically -- no new knob. CLI leaves both gates default-true:
+   the canonical zoo is byte-identical.
+
+MEASURED (same binary, full-zoo --constrain-tools control, ctx 8192):
+  sm_120: mono 80 MB, sampled 340 MB (combined 420 MB)
+  sm_86:  mono 150 MB, sampled 600 MB (combined 750 MB = ~55K turbo3
+          tokens -- the sm_86 sampled graphs are fatter, consistent
+          with the W12 zoo finding)
+auto-ctx now deducts the measured savings per arch (constrain_tools /
+sampled_on aware). Verified on the 3090: bare boot auto 262144 with
+0.81 GB at ready (was 0.67); Q27_SAMPLED=0 boot 262144 with 1.42 GB.
+For the A10 in issue #1 the arithmetic says a greedy-only boot now
+reaches the full 262144 native window (his 212,992 + ~55K, capped).
+
+GATES -- ALL PASS: canonical a2982c51 + f64e7c02 EXACT; sampled-seed
+anchor 900031e9 EXACT (the sampled zoo is untouched when on);
+test_kernels + fused_smoke (graph legs byte-identical); serving
+matrix: DEFAULT boot serves greedy+sampled with mono skipped;
+SAMPLED=0 400s temp>0, greedy byte-deterministic 2x; FORCE_TEMP
+contradiction FATALs; DEXIT=0 boot captures mono D and serves (the
+banner's three-state marker covers D/V independently). One false
+alarm en route: a "determinism DIVERGE" that was md5-of-full-JSON
+(created timestamp) -- text-only extraction passes; harness lesson
+re-learned same-day.
+
+## 2026-07-17 -- v0.3.0 RELEASED (tag @ e8a6e46)
+
+github.com/signalnine/q27/releases/tag/v0.3.0 -- "small cards get the
+whole window". 23 commits since v0.2.0, one day: turbo3 = Ampere
+serving default (262144 on a 24GB 3090, decode faster than fp16 was),
+TTFT 8-11x (Q27_PF_BATCH_MIN), q4s tier validated end-to-end with its
+own anchors, auto-ctx rebuilt on measured free VRAM + exact 18-pair
+KV bytes + capture-gate awareness, Q27_SAMPLED=0 + mono auto-skip
+(~750MB back on sm_86), gcache OOM fix, 4-stream measured (~250 t/s
+ceiling at 2 lanes), four negative results on the record (occupancy,
+W12-on-3090, vgemm<9, depth/pmin), tools needle_check.py +
+gemv_tier_sweep.cu. Pre-tag doc-staleness sweep: 4-reader parallel
+audit vs ground truth found 19 stale claims (5 blocking: front-page
+131K headline, fp16-default claim, serial-threshold listed as open,
+multislot 2-cap rationale, notes fp8-opt-in) -- all fixed in e8a6e46.
+Assets: q27-v0.3.0-linux-x86_64.tar.gz (4 binaries + MIT LICENSE,
+sha256 af7118e4...) + SHA256SUMS-0.3.0. Release-binary canonical
+a2982c51 EXACT re-verified at package time.
+
+## 2026-07-17 -- issue #1 receipts: A10 confirms 262144; brim-serving verified; the "identical VRAM" anomaly is malloc granularity
+
+Field results at a31108a (chaudhryfaisal): **q4s + Q27_SAMPLED=0 +
+maxd4 boots the FULL 262144 on the 22.6 GiB A10** (prediction held);
+v1.4 doubled to 102400 (was 49152). His v1.4 106496 OOM died at the
+suffix verify instantiate (engine.cuh:1968) -- the solo-zoo
+no-runtime-recovery edge, already on the books.
+
+He also reported a runtime OOM under live Claude Code at ctx 212992
+on the OLDER build (666b7d9 era, 22-31 MiB boot spare). Reproduction
+attempt on the 3090, CURRENT build, his exact recipe at 262144 with a
+1.2 GB balloon pinning free to 154 MiB: 200K-token cache-busted
+prefill (2m28s) AND 1024-token generation at 200K depth both served
+cleanly -- free VRAM byte-identical before/after (zero runtime
+allocation; boots = serves holds on this build). His old build
+predates the gcache evict-order fix and the capture gates and ran at
+5-7x less headroom; ask for the crash's "at src/..." line if it
+recurs on a31108a.
+
+His "used_after identical at 258048 vs 262144" observation SOLVED,
+exactly: turbo3 KV per buffer = ctx x 400 B; at 262144 that is
+EXACTLY 100 MiB, at 258048 it is 98.44 MiB -- and cudaMalloc's 2 MiB
+granularity rounds both to the same 100 MiB granule across all 36
+buffers (delta = 0). His 253952 row confirms: 96.88 -> 98 MiB granule,
+a 72 MiB step (he measured 68). Reproduced on the 3090: both ctx
+values read 1.70 GB at ready. The window's last 4096 tokens are
+allocation-free. Benign; physics, not engine.
+
+## 2026-07-17 (late) -- first 4090 (sm_89): field test on a RunPod pod; tri-arch fatbin ships
+
+Gabe spun up a RunPod 4090 for q27's first Ada run. Everything below
+was executed remotely over SSH on the pod.
+
+TOOLCHAIN FINDING: **CUDA 12.4+ is a hard floor for sm_89** -- the
+pod's stock CUDA 12.0 ptxas rejects the e4m3 MMA forms ("Unexpected
+instruction types specified for 'mma'", prefill.ptx). Installed the
+12.6 toolkit alongside (driver untouched); tri-arch (86/89/120)
+compiles clean there and on our 13.2.
+
+GATES on sm_89 -- ALL PASS, with a cross-arch determinism result:
+- CLI canonical (q4s) = **8196e65e... = the sm_86 anchor, byte-exact.**
+  One canonical anchor per SASS family (8.x vs 12.x), not per chip.
+- Serving greedy probe = byte-identical to the 5090's output for the
+  same prompt (fp8 path agreeing across sm_89/sm_120).
+- Serving determinism 2x byte-identical. Model md5 verified.
+
+NUMBERS (q4s, w8 build, their bench.sh verbatim on-pod, CVs <=0.1%):
+fp8 (arch default): narr 102.06/102.58, code 135.48/136.64, TTFT 49ms
+@ auto-ctx 110592. turbo3: code 130.95/132.03, TTFT 50ms @ the FULL
+262144 (0.27 GB spare). vs their best published single-4090 (ik
+two-stage 82.5/120.9 @160K): +24% narr / +13% code at 1.6x context.
+turbo3 tax ladder across arches complete: 5090 fp8-wins-big, 4090
+fp8-wins-small (-3.4% code on turbo3), 3090 turbo3-wins-outright.
+Prefill on Ada near-5090-class (~3.1K tok/s @10K on turbo3).
+
+SHIPPED:
+- Makefile (Gabe-approved): sm_89 gencode added -- the fatbin now
+  covers 3090/4090/5090. v0.3.0 release binaries predate this; README
+  notes the workaround (build from source with 12.4+, or Q27_KV=turbo3
+  explicit) until the next release.
+- auto-ctx sm_89 base = 2.13 GB (two pod boots agreeing within 75 MB;
+  Ada's fixed stack runs ~1 GB over the sm_120 constants -- the
+  pre-calibration pick survived on a 40 MB margin). The >8-width graph
+  slope on sm_89 is unmeasured and deliberately shares sm_86's fat
+  slope (under-pick beats a dead boot).
+- README: CUDA 12.4 floor, tri-arch build, 4090 guidance; BENCHMARKING
+  4090 addendum.
+- Post-change gates on the tri-arch binaries: canonical a2982c51 +
+  f64e7c02 + sampled-seed 900031e9 EXACT, test_kernels ALL PASS.
+
+ODDITY on the record: the tokenizer file vanished from the pod's
+overlay disk between download (listed, 7.2 MB) and first use
+("cannot open"). Re-downloaded + checksummed, did not recur. Cloud
+overlay-fs distrust noted; CHECKSUMS verification is now part of the
+pod recipe.
+
+## 2026-07-17 (late) -- external review of BENCHMARKING.md: label + claim fixes; q8-v1 repacked
+
+Review feedback (via Gabe) on the five-engine doc, all points taken:
+1. "NVFP4" mislabel FIXED everywhere it described q27's own tiers --
+   v1.4/q4s/q6/q6k are q27's Q4_G64/Q8_G128 integer group quant, NOT
+   NVIDIA's e2m1+fp8-scale NVFP4; only vLLM's unsloth checkpoint is
+   literally NVFP4. Now labeled "q27 4-bit, 5.25 bpw effective".
+2. "Quality is engine-independent" softened to "quality converged to
+   the model once both tool protocols were validated" -- the
+   strict-parser episode (T8 0.00) proved engines DO move quality
+   through tool-protocol failures.
+3. 4090 addendum re-dated 07-17-late (UTC slip).
+4. "vLLM has no /v1/messages" annotated: current vLLM Python frontend
+   serves it natively (Anthropic->OpenAI double adapter, ~04/2026);
+   our 07-14 run used the litellm shim; native-endpoint rerun flagged.
+5. Method B n=1 disclosure -> n=3 seal RUNNING tonight (q27 +
+   llama+MTP ceiling legs).
+
+Also tonight: q8-v1 tier repacked (--q8 '.*', 28.45 GB / ~8.1 bpw,
+867 tensors, worst Q8 rel-RMSE 0.0153; keeps the v1.3-style Q4
+draft-head copy -- a --q8-head acceptance variant is the obvious
+follow-up). UNVALIDATED: no card in the house fits it (weights +
+fixed stack > 32 GB); upload to HF in progress; the ladder runs on
+rented 48 GB+ hardware (PRO 6000 / RTX 6000 Ada -- doubles as those
+cards' field test).
+
+## 2026-07-17 (late) -- Method B n=3 seal: 1.59x sealed; an early-quit reproducer surfaces
+
+Review item #3 executed: 12 pinned SWE-bench instances x3 reps, q27
+(bare-boot reproduce recipe, vanilla, HEAD de5564c) then mainline
+llama+MTP (13e67386, doc launch line verbatim). Throughput SEALED:
+q27 192.4 t/s (678 reqs / 143.7K tok) vs llama 120.9 (703 / 213.6K)
+= 1.59x decode, 1.58x wall (n=1 claim was 1.74x; both engines moved
+a few percent with n and engine evolution). llama's 12/12 nonempty
+reproduced exactly; q27 drew 10-11/12: pallets__flask-5014 is a
+DETERMINISTIC early-eos (45 tok, end=eos, byte-identical x3, the
+dome's one-shot-quit class, was 12/12 on the 07-14 build) and
+pydata__xarray-4094 a 2-of-3 no-edit lottery (one 63-turn spin =
+the drift-loop shape). Doc updated with the sealed table + honest
+quality columns. flask-5014 = the standing reproducer for the
+early-quit class; the [drift] first-tool-call rescue item now has a
+deterministic test case. Results archived scratchpad/results.*.rep*.
+
+## 2026-07-18 -- q8 ladder on an RTX PRO 6000 (96GB): anchors minted, quad-262K boots; TWO bugs surfaced
+
+Gabe rented an RTX PRO 6000 Blackwell Server (96GB, sm_120, driver
+570/CUDA 12.8, 224 cores) for the q8-v1 ladder. Results and the two
+bugs the trip surfaced, in order:
+
+**BUG 1 -- v0.3.0 release binaries have an undocumented driver floor.**
+The tarball's statically-linked CUDA 13.2 runtime refuses drivers
+older than r580: "driver version is insufficient" at first CUDA call
+on this pod's 570.195 (CUDA 12.8) stack. Every ladder rung silently
+produced empty output on the release binaries (and the ladder's
+2>/dev/null ate the diagnostic -- harness lesson re-learned AGAIN;
+ladder v2 keeps stderr and fail-fasts on build-sanity). Workaround:
+source-build with the driver's toolkit (CUDA 12.8 = first sm_120
+support; builds clean, canonical EXACT). TODO: state the driver floor
+in the release notes + README; consider a 12.8-runtime build for the
+next release's binaries.
+
+**LADDER (source-built sm_120 @ HEAD, all on-pod):**
+- Build sanity: vanilla canonical a2982c51 EXACT (fourth silicon).
+- q8-v1 canonical MINTED: a5eddc71c12a1f3a43ebec479cb1458b x2 EXACT.
+- q8-v1 sampled-seed MINTED: e85bded3f5e2b99481b812bbe263cd62 x2.
+- Serving: bare boot = fp8 @ auto 262144, 56 GB spare at ready;
+  determinism 2x byte-identical; needle 6/6 at ~233K.
+- Club bench (their bench.sh): narr 97.45/97.99, code 131.11/132.42,
+  TTFT 56ms. Code decode 132 vs the pure byte-scaling prediction
+  ~105 from q4s's 192: the Q8 ACCEPTANCE RECOVERY IS REAL (+26%
+  over bytes -- the q4s Q4-head acceptance loss un-happens at Q8).
+- **Quad-slot: 4 x 262144 turbo3 ALL READY with 28.89 GB still
+  free** -- 1,048,576 tokens of resident context on one card, W12
+  build, stock binary. The --slots clamp (4) is now the binding
+  limit on this hardware, not VRAM.
+- PPL: paired serial-path run IN PROGRESS (see bug 2); absolute
+  serial numbers are not comparable to the batched-path anchors
+  (g64 regroup, notes.md #6), but the paired delta is valid.
+
+**BUG 2 -- batched --nll path has a latent OOB read, sanitizer-
+deterministic, lottery in the wild.** First seen as sm_0 + "illegal
+memory access" at prefill.cu:2085 on the pod (both tiers), then
+reproduced at HEAD on the 5090. Bisect misdirection: four suspect
+commits all tested clean; a tri-vs-dual-arch build split also
+evaporated on 3x reruns (n=1 observations -- the harness-variance
+lesson applied to crashes). Ground truth via compute-sanitizer
+memcheck: k_embed_rows_q8_T reads emb + tok*cols with a GARBAGE
+token -- Invalid __global__ read, block (1,17,0), IDENTICAL address
+across runs and across dual/tri builds, 3426 errors. So: not a
+race in the upload (same-stream ordered), not codegen, not arch --
+a deterministic-under-instrumentation bad token index in the
+batched nll flow, timing-lottery without instrumentation. The
+serving prefill path shows no such fault (needle at 233K, live CC,
+club prefill legs all clean + sanitizer-clean runs elsewhere).
+REPRODUCER: compute-sanitizer --tool memcheck build/q27 <model>
+--nll wiki.test.raw --ctx 2048 (fires in <60s). Scope: quality
+measurement only; serving unaffected. OPEN, top of tomorrow's list.
+
+## 2026-07-18 -- nll "bug 2" RETRACTED: wrong input file; one real fix shipped (step_with) + input guards
+
+Resolution of yesterday's "batched --nll latent OOB": there was no
+batched-path bug. The --nll flag reads RAW INT32 TOKEN IDS; the house
+corpus is wiki.test.qwopus.i32 (tokenizer byte-identical across
+vanilla/qwopus). I fed wiki.test.raw -- raw TEXT -- on both machines:
+ASCII reinterpreted as int32 yields ~540M "token ids" (the guard now
+names it: id 540876810 at offset 0), embed reads emb + id*cols
+terabytes out of bounds. Same bytes = same addresses everywhere
+(the "deterministic OOB"); usually lands on mapped memory (the six
+"clean" runs read silent garbage); occasionally unmapped (the
+natural crashes, incl. both pod tiers). The 07-16 PPL anchors used
+the correct .i32 and are untouched.
+
+What the chase surfaced anyway, both kept:
+1. **step_with stack-lifetime fix (REAL bug, independent):**
+   cudaMemcpyAsync(d_token, &token) from the parameter's stack slot
+   with no sync -- a driver that defers pageable staging reads a dead
+   frame. Now a synchronous 4-byte copy (cold paths only; ordering
+   note documented: relies on stm being a BLOCKING stream). step_taps
+   same fix. Canonical a2982c51 + f64e7c02 + sampled-seed 900031e9
+   all EXACT after.
+2. **--nll input guards:** both int32 loaders now scan ids against
+   VOCAB and refuse with a diagnostic naming the first bad id --
+   raw text can never masquerade as a corpus again. (First guard
+   attempt landed twice in the wrong loader -- regex patching; the
+   verify caught it because the text file still "worked".)
+
+Method lesson for the ledger: the bisect chased two phantom
+correlations (commit suspects, tri-vs-dual fatbin) that n=1 crash
+observations manufactured. The sanitizer's DETERMINISTIC address was
+the only honest witness, and its "nearest allocation 512 B" line was
+pointing at input data, not engine state, from the first report.
+
+## 2026-07-18 -- q8-v1 ladder CLOSED on the RTX PRO 6000; default-tier PPL anchor reproduced cross-machine
+
+Final rungs, correct corpus (wiki.test.qwopus.i32 -- the tokenizer is
+byte-identical across vanilla/qwopus), exact anchor protocol
+(--nll-chunk 2048, 148,335 predictions):
+- **default tier: PPL 8.0409 -- the 07-16 anchor to FOUR DECIMALS**,
+  on different silicon (PRO 6000 vs 5090), different toolchain (12.8
+  vs 13.2), different machine. The measurement stack reproduces.
+- **q8-v1: PPL 7.9942** (-0.58% vs default). Better than default and
+  q4s (8.0197); NOT the family floor -- q6 7.9460 / q6k 7.9127 still
+  lead on wikitext. Third data point on error cancellation: the
+  tuned mixed promotions beat blanket-Q8; PPL is non-monotonic in
+  bits in this family. q8's distinct value is elsewhere: the
+  acceptance recovery (code decode 132 on this card vs ~105 pure
+  byte-scaling -- the q4s Q4-head acceptance loss un-happens) and
+  near-lossless verify-side weights as the reference point.
+
+q8-v1 LADDER SUMMARY (all on the PRO 6000, v0.3.0-era HEAD):
+canonical a5eddc71 x2 + sampled-seed e85bded3 x2 MINTED; build-sanity
+a2982c51 EXACT; needle 6/6 @233K; serving deterministic; club narr
+97.99 / code 132.42 @ fp8 auto-262144; 2-slot aggregate ~181 t/s
+(bat 2.0, the 1.55x multiplier holds on Blackwell-Pro); quad-slot
+4x262144 turbo3 ALL READY with 28.89 GB spare. Not run: the task
+dome (Gabe's call whether q8 needs one; q4s precedent says the
+score-lottery dominates PPL-class deltas anyway). README tier table
+gains the q8 row + the release-binary driver floor (r580+) is now
+stated in the Quickstart.
+
+## 2026-07-18 -- PRO 6000 q4s club leg completes the four-card table
+
+Same tier, same harness, apples-to-apples at last: PRO 6000 Server
+Edition q4s fp8 @ auto-262144 = narr 138.55/139.32, code
+169.35/170.81, TTFT 40ms (CV <=0.5%). ~12% UNDER the 5090 despite
+the bigger die: the Server Edition's inline GDDR7 ECC + passive-SKU
+clocks tax exactly the bandwidth decode lives on. Fleet reading:
+5090 = single-stream king (162/194); PRO 6000 = the capacity card
+(85.1 GB post-weights free, quad-262K, 181 t/s 2-slot, q8 host);
+4090 = the fp8 midpoint; 3090 = the 262K value card. Same-card tier
+read: q8 costs 22% decode vs q4s for 84% more weight bytes --
+acceptance recovery holds it sublinear. Pod work complete.
+
+## 2026-07-18 -- fix program (4 of 7 code defects): fixtures, spec-graph OOM guidance, multi-slot auto-ctx, slot clamp
+
+Batch of the bounded fixes from the 7-defect list (early-eos
+investigation, sm_89 slope, v0.3.1 release are separate):
+
+- **#5 tier fixtures.** test_kernels' gemv10 leg and ninv_test's
+  head rows hardcoded the Q8 head / output_q4 -- they aborted on
+  q4s/q8 single-head tiers. Both now dtype-dispatch: gemv10 times
+  whichever head kernel the tier uses (Q4 or Q8) and bitwise-checks
+  it; ninv picks output_q4 -> output.weight@Q4 -> skip (pure-Q8) and
+  keeps Q4 kernel coverage via ffn_down. VERIFIED on q4s: test_kernels
+  ALL PASS, NINV ALL PASS (were: abort).
+- **#2 spec-graph OOM guidance.** build_spec_graphs' 9 instantiate
+  sites hard-aborted with a raw "CUDA error at engine.cuh:NNNN" (the
+  A10 issue-#1 boot-death). New inst_or_advise() turns an OOM into an
+  ACTIONABLE refusal naming the levers (--ctx, Q27_MAXD=4,
+  Q27_SAMPLED=0, w8 build, free co-resident VRAM); non-OOM keeps the
+  loud abort. VERIFIED: a forced 655360 turbo3 boot prints the
+  guidance instead of the bare error.
+- **#3 multi-slot auto-ctx.** --slots >1 without --ctx used to pin
+  8192 + a warning. Now it sizes per-slot from measured free VRAM:
+  N==1 is BITWISE-unchanged (single_fixed formula; 5090 q4s still
+  262144); N>1 splits the budget with a per-slot reserve calibrated
+  to the shipped 2x48K fp8 anchor (~6.6 GB/slot W12), reduces the
+  effective slot count to what fits (HONEST log, not a silent
+  build-loop skip), and sets every slot's window. Skip-loop reserve
+  aligned to the same constant (ENG_FIXED_BYTES) so a slot can't pass
+  admission then OOM its own zoo. VERIFIED 5090: 2xfp8 40960/slot,
+  2xturbo3 106496/slot -- both ready=2 skipped=0, ~4.5 GB spare;
+  4xturbo3 on 32GB honestly sizes to 2.
+- **#4 slot clamp 4 -> 8.** The conductor's hard fusion ceiling is
+  MAX_K/2 = 8 (W_PLUMB=16 lane slots, fixed on every build). The old
+  --slots clamp of 4 was a 32GB VRAM guess; the PRO 6000 fit 4x262144
+  with 28.9 GB idle. Raised to 8, the real plumbing limit; VRAM is
+  handled by the per-slot fit reduction + skip.
+
+Gates: canonical a2982c51 EXACT, fused_smoke byte-identical, single-
+slot picks unchanged on the 5090.
+
+## 2026-07-18 -- fix #1: flask-5014 early-eos ROOT-CAUSED = tool-parser drift mode 10 (dropped opener)
+
+The n=3 seal's deterministic early-quit was NOT a basin -- it's a tool-
+call parser miss, the [drift] first-tool-call rescue the dome flagged.
+Raw capture (temp Q27_RAWDUMP, since removed): on flask-5014 the model
+emits its FIRST call as
+    I'll investigate... implementation.\n\nRead", "file_path": "..."}
+-- it dropped the ENTIRE `{"name": "` opener. No `{`, so the bare-call
+scanner found no candidate, the JSON tail leaked into text, and the
+agent ended at turn 1 with a text-only "response" (num_turns=1,
+nonempty-diff 0). Byte-identical x3 because greedy.
+
+Fix (api_common.h, two parts):
+1. DRIFT MODE 10: when nothing else rescued and a REGISTERED tool name
+   is followed by the `", "` arg-separator with no opening brace,
+   splice `{"name": "` back and re-parse once (allow_o10=false in the
+   recursion -- no loop). 
+2. FLAT name+args: the spliced (and wrapper-less) object {"name":"X",
+   <sibling arg keys>} matched no mode (shaped needs "arguments",
+   mode-6 needs name-as-object, mode-8 needs alias keys). Added: a
+   string "name" validated against the registry, siblings become the
+   arguments. Registry validation keeps prose JSON with a "name" field
+   out.
+
+VERIFIED: unit test (flask string -> Read{file_path}, prose-unknown ->
+0, wrapped call -> 1 unchanged); END-TO-END flask-5014 now 13 turns
+(was 1), nonempty-diff 1/1, edited-gold-file 1/1. Canonical a2982c51
+EXACT (parser is host-side, CLI path untouched). This is the serving-
+quality half of the n=3 seal's 10-11/12; a full re-seal is the
+measurement to confirm the fleet number moves.
+
+## 2026-07-18 -- fix program COMPLETE (7/7); v0.3.1 RELEASED
+
+#6 (sm_89 W12 auto-ctx slope): RESOLVED BY ANALYSIS, no calibration
+needed. The >8-width graph slope only applies to a W12 build; the only
+sm_89 card class in reach (4090, 24GB) runs the w8 build where W_MAX=8
+zeroes that term. It would matter only on a 48GB sm_89 card (RTX 6000
+Ada) running W12 -- none in hand; the defensive sm_86-slope default
+under-picks safely there. Both pods were down at close, so no live
+recheck; noted for the next 48GB-Ada trip.
+
+#7: v0.3.1 RELEASED (tag @ HEAD,
+github.com/signalnine/q27/releases/tag/v0.3.1). Tri-arch fatbin
+(sm_86/89/120 confirmed via cuobjdump) -- 4090 users get native SASS.
+Ships the q8 tier reference, drift-mode-10 fix, multi-slot auto-ctx,
+slots-8 clamp, spec-graph OOM guidance, dtype-dispatch fixtures.
+KNOWN LIMITATION documented: 13.2-static runtime needs driver r580+
+(no local 12.8 toolkit to lower the floor; future item). Clean
+tri-arch build + full gate battery green at tag (canonical x2 EXACT,
+test_kernels/ninv/fused_smoke PASS). Assets: tarball (4 binaries +
+MIT LICENSE, sha256 c38985c0) + SHA256SUMS-0.3.1.
+
+7-DEFECT SCORECARD: #1 drift-mode-10 (biggest -- serving quality,
+flask 1->13 turns) DONE; #2 spec-graph OOM guidance DONE; #3 multi-
+slot auto-ctx DONE; #4 slots 4->8 DONE; #5 tier fixtures DONE; #6
+sm_89 slope N/A-by-analysis; #7 v0.3.1 RELEASED. Follow-on worth
+running: a fresh n=3 SWE-bench seal to measure how much drift-mode-10
+moves the fleet number (was 10-11/12 nonempty, partly this bug).
+
+## 2026-07-18 -- n=3 re-seal on the drift-mode-10 fix: quality 12/12, 1.66x decode
+
+Re-ran the Method B seal, q27 leg only (llama+MTP 120.9/12-12 is a
+fixed anchor, unchanged binary/commit). Vanilla, bare boot, current
+build (601d7c3+, drift mode 10 fixed). ALL THREE reps: 12/12 nonempty
+(was 10-11/12), 11/12 gold (was 9-10/12), still-empty NONE. Both
+pre-fix failures gone -- flask-5014 (the deterministic drift-mode-10
+quit) and xarray-4094 (was a lottery) now complete every rep. Decode
+201.2 t/s over 780 reqs (was 192.4; higher because the two instances
+that used to short-circuit now run full sessions cleanly). Wall rose
+1734->1876s for the same reason -- more real work done, not slower.
+SEALED CLAIM NOW: q27 matches llama+MTP's 12/12 task-solve quality at
+1.66x its decode (201.2 vs 120.9). The 07-17 seal's quality asterisk
+is retired. BENCHMARKING seal table + Reddit draft updated.
+
+## 2026-07-19 -- fix: tool-parser drift mode 11 (raw code-body string value), issue #4
+
+chaudhryfaisal reported CC sessions dying on a Write call whose `content`
+is a large source file: `{"name":"Write","arguments":{"content":"// go\n
+package main\nimport "context"\n...`. UN-RESCUED, tool call leaks to text,
+agent stops. Reproduced in a unit test: the parser's string sanitizer
+escapes literal newlines (mode 5) but treats every `"` as a terminator,
+so the first unescaped inner quote (`"context"`) closes the JSON string
+early and the rest is garbage. No local escape heuristic is safe -- code
+carries `",` `"}` `[]string{"a","b"}` `map["k"]` everywhere.
+
+Fix (recover_raw_value_call, api_common.h): forward-scan the value's
+candidate terminators. For each `"` after the opener, escape the span,
+keep the tail literal, reconstruct the object, and parse. The FIRST
+candidate that yields a valid object (registered tool name) is the real
+terminator -- inner quotes leave the tail as un-parseable raw code, and a
+scalar arg AFTER the value forces the correct earlier terminator (making
+that arg a valid sibling). Ordering-independent (handles content-last,
+scalar-before, scalar-after, inner-braces). Gated on out.empty() +
+registered tool, so well-formed calls and prose never hit it. Requires
+the call at the end of the model output, which is the UN-RESCUED reality.
+
+Committed test tools/test_tool_drift.cpp (6 cases, mode 10 + 11 +
+negatives; standalone g++, no Makefile target). Gates: canonical
+a2982c51 EXACT (host-side change), mode-10 test + PR-#3 tests unchanged.
+
+## 2026-07-19 -- proactive tool-drift testing (answering "we should've caught this")
+
+Why mode 11 hid until production: every prior drift test used TRIVIAL arg
+values ("hello", short paths). The bug lived in the value CONTENT (raw
+code with inner quotes), an axis we never tested. Two additions close it:
+
+1. tools/test_tool_drift_corpus.cpp -- a mutation harness: realistic value
+   fixtures (go/python/json/markdown/braces/unicode/empty + a JSON-tail
+   lookalike) CROSSED with the drift transforms (well-formed, raw-unescaped
+   content-last, scalar-after, prose-preamble). Proven to catch the class:
+   RED on the pre-mode-11 parser (18 FAIL, every quote-bearing fixture) and
+   GREEN on current. The lookalike fixture asserts graceful under-capture
+   (prefix), not exact. Standalone g++, no Makefile target.
+
+2. Q27_DRIFT_CORPUS=<file> (api_common.h) -- appends the FULL untruncated
+   UN-RESCUED text (NUL-separated) on every real miss. The stderr line caps
+   at 400 chars, which is exactly why issue #4's payload wasn't visible.
+   Point a serving box at a corpus file; any new drift mode becomes a
+   replayable fixture the next time it recurs. Proactive harness for known
+   transforms + capture for unknown ones.
+
+Gates: canonical a2982c51 EXACT, both drift tests + PR-3 tests pass.
+
+## 2026-07-19 -- v0.3.2 RELEASED (tag @ ca2d2bb)
+
+github.com/signalnine/q27/releases/tag/v0.3.2. 8 commits since v0.3.1,
+led by two serving-robustness items: OpenAI /v1/chat/completions
+tool-calling (PR #3, @chaudhryfaisal -- messages-gated, /v1/completions
+byte-identical) and tool-parser drift mode 11 (raw code-body content
+values, issue #4 -- forward-scan terminator recovery). Plus proactive
+drift tests (test_tool_drift_corpus.cpp, red on pre-fix parser) +
+Q27_DRIFT_CORPUS capture, the RunPod serverless example, and the n=3
+re-seal (12/12 quality, 1.66x). Clean tri-arch build (sm_86/89/120
+cuobjdump-confirmed) + full gate battery green at tag: canonical
+a2982c51 + f64e7c02 + sampled 900031e9 EXACT, test_kernels/ninv/
+fused_smoke/drift-corpus pass, OpenAI tool-calling smoke on the
+release binary (proper tool_calls). Assets: tarball (4 binaries + MIT
+LICENSE, sha256 889b9f32) + SHA256SUMS-0.3.2. Driver floor r580+
+unchanged (documented).
+
+## 2026-07-19 -- independent-tool benchmark: llama-benchy on the 5090
+
+Ran eugr/llama-benchy (community llama-bench-style, MTP-aware, OpenAI
+endpoint) against q27 5090 q4s fp8, tokenizer Qwen/Qwen3.6-27B. Cold
+sweep: prefill 2.8-3.5K t/s, decode 159->102 t/s over depth 0->65K,
+cold TTFT 193ms->23.8s. tg@d0=159 cross-checks the club narrative 162.
+KEY: cached-context mode (--enable-prefix-caching) at d65536: a
+512-token follow-up over already-cached 65K = TTFT 2.13s vs cold 23.8s
+= 11x. The GDN checkpoint ENGAGES on /v1/chat/completions (not just
+/v1/messages) -- first third-party quantification of the no-re-prefill
+win, the mechanism behind the 4.7x vLLM wall gap. Honest: cold 65K
+prefill is genuinely 24s (no sm_86 fp8-MMA leg; even 5090 pays it once);
+win is not paying it every turn. BENCHMARKING.md addendum added. Tool
+read before running (network = endpoint + HF tokenizer + Gutenberg only,
+no exec); uvx install, deps mainstream.
+
+**Prefill split-K (short-prompt underfill): DONE + OPT-IN 2026-07-19.**
+Motivation: the llama.cpp-MMQ / vLLM-Marlin prefill study concluded q27's
+k_gemm_mma_T already converged with SOTA hand-rolled int8-MMA on every
+major axis (int8 m16n8k32 + quantized-weights-end-to-end + one-scale-per-32
++ single-buffer-no-cp.async + padding-not-swizzle + ldmatrix-the-unamortized-
+operand). The ONE in-regime lever both digs flagged and q27 lacked on the
+weight GEMM: Stream-K/split-K to fill idle SMs on the short-prompt / suffix-
+round prefill where the (T/NT)x(rows/MR) grid underfills.
+- SPIKE (tools/gemm_splitk_spike.cu, ffn_down 5120x17408, 5090/170 SMs):
+  split fills the idle SMs exactly at underfill. nsp=4 T<=32 = 2.23-2.29x;
+  nsp=2 T=64-128 = 1.80-1.82x; T>=256 (>=160 blocks) REGRESSES 0.80-0.96x
+  (reduce overhead > fill gain). Non-bitwise vs nsp==1 (rel 3e-7, ~90% of
+  outputs differ in low bits) -- the group-scaled float K-sum is regrouped;
+  tolerance-gated, same class as the attention P4 split + delta-scan split.
+- INTEGRATION (k_gemm_mma_T gains gridDim.z split + tmp partials + ordered
+  k_gemm_splitk_reduce; SplitKScratch per-engine, fal-reserved, no mid-serving
+  regrow; threaded through gemm_q4_T/q8_T as a nullptr-default arg). nsp==1 is
+  byte-identical to the pre-split path. Auto-gate (gemm_splitk_nsp): split only
+  when blocks*2<=nsm, nsp=ceil(nsm/blocks) (x2 at T<=32), cap 4; XG64=false
+  (canonical --pf leg) hard-excluded via `if constexpr`. Verified in-engine at
+  T=65: fires nsp=3 on rows=5120 (down/o, 80 blocks) + nsp=4 on rows=1024,
+  correctly nsp=1 on rows=17408/12288/10240/6144 (gate/up/qkv, saturated).
+- DEFAULT OFF (Q27_GEMM_SPLITK: unset/0=off, auto=occupancy-gate, N=force).
+  Split output is non-bitwise, so defaulting on would move the greedy canonical
+  -- a product call + quality seal, same posture as batching/sampling. NOTE:
+  the shortbench canonical (a2982c51, 5-token prompt) is eager-forwarded, never
+  hits batched prefill, so it's bitwise-safe regardless; a2982c51 reproduced
+  both off and (vacuously) under auto. Gates green: test_kernels ALL PASS, ninv
+  twin-bitwise ALL PASS (no-sk default path untouched).
+- HONEST payoff: down_proj is the big split-eligible chunk (~1/3 of FFN GEMM),
+  o_proj + small qkv the rest; gate/up (the other 2/3) never underfill. FLOP-
+  weighted aggregate ~1.1-1.2x prefill-GEMM at T~65, higher at T<=32, zero
+  above T~130. First-turn / stateless-short-prompt (RunPod single-shot) only;
+  warm agentic turns already skip prefill via the GDN checkpoint.
+- END-TO-END SEAL (q27-server, 5090, cold ~70-tok prompts, server-logged
+  pf_ms; PF_T=1024 so <=128-tok prompts are one underfilling pass): OFF mean
+  62.35ms (62-63, n=20) -> auto 57.4ms (57-58, n=20) = ~8% faster prefill,
+  non-overlapping variance. On the FULL prefill (attention/GDN/norms don't
+  split) so GEMM-only is higher. HTTP wall ~155ms both (too noisy; pf_ms is
+  the clean signal). QUALITY: greedy byte-identical 20/20 @16 tok AND 5/5
+  @128 tok (split-perturbed prefill + KV, 3e-7, flips zero argmaxes downstream).
+  Default stays OFF pending Gabe's flip call; the seal says the flip is
+  quality-safe on this corpus (n small vs a full agentic-NLL gate).
+
+**SPLIT-K AGENTIC QUALITY GATE -- RULE PRE-REGISTERED 2026-07-19 (verdict below).**
+Greedy-identical (the end-to-end seal) is necessary but NOT sufficient: it only
+checks the argmax, while split perturbs the whole distribution (the 3e-7 per-GEMM
+float regrouping compounds through 65 layers of residual + GDN recurrence). So
+the default-on decision needs the agentic-corpus NLL A/B, mirroring the turbo3
+leg-1 gate (a74fca9).
+- Corpus: scratchpad/t3_quality/corpus/agentic_req0031.i32 -- the SAME real
+  154,160-token CC transcript as the turbo3 gate (sha256 c0a623b1...8394096047464).
+- Config: `--nll <corpus> --nll-chunk 128` (batched). C=128 is the underfill
+  window where split fires (verified: fires nsp=3/4 on rows<=5120, nsp=1 on the
+  big GEMMs). NOTE why NOT --nll-long/position-buckets like turbo3: split is a
+  prefill-time perturbation that only fires at underfilling T, and is depth-
+  INDEPENDENT; a single long saturated pass would never fire it (false PASS).
+- Legs: baseline OFF vs candidate Q27_GEMM_SPLITK=auto. Deterministic (greedy
+  teacher-forced NLL, run-to-run identical per leg).
+- Metric: aggregate mean NLL over the full corpus, plus per-corpus-segment
+  buckets (localized-regression check).
+- TRIGGER (pre-registered, turbo3 precedent): FAIL if auto mean NLL exceeds OFF
+  by >+2% sustained, aggregate OR in any segment bucket. Reference: turbo3
+  passed at +0.39%; smoke @10 chunks (unrepresentative corpus start) showed
+  +0.77%, so the full-corpus number is required before any verdict.
+- VERDICT: **PASS -- split-K is agentic-quality-safe.** Full corpus (75,852
+  predictions, 1204 chunks of 128): OFF mean NLL 0.855073 -> auto 0.855231 =
+  +0.018% aggregate. Six 200-chunk content buckets: worst +0.063% (seg5), and
+  seg3/seg4 go NEGATIVE (-0.031%/-0.040%, split marginally better) -- the
+  perturbation sits at the noise floor, not a systematic tax. Every bucket is
+  30x+ under the +2% trigger and tighter than turbo3's +0.39%. (The pre-reg
+  smoke's +0.77% was the tiny first-10-chunk start; over seg0's 200 chunks it
+  washes to +0.014%.) Neither trigger fired. Artifacts + runner in
+  scratchpad/splitk_quality/ (off_full.txt, auto_full.txt, buckets.txt, seg*.i32;
+  uncommitted per scratchpad policy). Corpus sha256 c0a623b1...096047464.
+  CONCLUSION: the default-on flip is quality-cleared (no asterisk). It stays a
+  product call only because the WIN is narrow (~8% prefill, short cold prompts
+  <=128 tok only); with quality clean + auto-disable on saturated shapes +
+  canonical unaffected, the downside of flipping is ~nil. FLIPPED default ON
+  2026-07-19 (v0.3.3): battery re-verified under the flip -- all 3 canonicals
+  EXACT (CLI eager-forwards, only server splits), test_kernels/ninv/fused_smoke
+  PASS. Q27_GEMM_SPLITK=0 opts out.
+
+## 2026-07-19 -- v0.3.3 RELEASED (tag @ bd8964f)
+
+github.com/signalnine/q27/releases/tag/v0.3.3. Prefill split-K DEFAULT ON
+(Q27_GEMM_SPLITK unset/auto): short cold prompts (<=128 tok, stateless single-
+shot / first turn) prefill in one underfilling pass where down_proj/o_proj tile
+5120 rows into 80 blocks on a 170-SM 5090; split-K fills the idle half. Server-
+measured ~8% faster prefill (62.4->57.4ms @70 tok); auto-disables the moment the
+grid saturates (blocks*2>SMs), so the common case is untouched. Non-bitwise
+(~3e-7 float regrouping) -> the flip cleared the agentic NLL gate (full 154K CC
+corpus +0.018% aggregate / +0.063% worst segment vs pre-registered >+2%; rule
+committed before results) + end-to-end greedy seal (20/20 @16 tok, 5/5 @128).
+Only the SERVER path fires it -- the CLI eager-forwards prompts, so all three
+canonicals stay bitwise. Shipped with the llama.cpp-MMQ / vLLM-Marlin prefill
+study (q27's GEMM already converged with SOTA hand-rolled int8-MMA; split-K was
+the one open in-regime lever) + the llama-benchy independent benchmark. GATES
+green at tag: canonical a2982c51 + f64e7c02 + sampled 900031e9 EXACT,
+test_kernels/ninv/fused_smoke PASS, split-K NLL gate +0.018%. Tri-arch build
+(sm_86/89/120 cuobjdump-confirmed on all 4 binaries). Assets: tarball (4
+binaries + MIT LICENSE, sha256 bfa0f366) + SHA256SUMS-0.3.3. Driver floor r580+
+unchanged. Q27_GEMM_SPLITK=0 opts out.
+
+## 2026-07-19 -- prefill GEMM ntx M-minitile (+3.4%, bitwise, sm_120)
+
+The int8 59%->SoL tuning pass. ncu on the shipped B-ldm k_gemm_mma_T (5090):
+49% Compute SoL, but the bound is NOT occupancy (register-cap to force 2/3
+blocks/SM = 0.619ms flat -- the register-pipeline hides latency, more warps
+just queue on the same pipes) and NOT dequant (ALU 17%, FMA 11%). It's LSU:
+50% pipe (top), mio_throttle a top-3 stall. Levers RE-CONFIRMED dead: A-side
+ldmatrix -3.8% (amortized 8x), forced occupancy flat. The one open lever =
+MMQ's ntx: each warp computes 2 row-minitiles (MR 64->128) and SHARES one B
+ldmatrix load across both -> LSU-loads/MMA 1.5->1.0. Accumulator regs double
+(occupancy-irrelevant here, so free). Sweep: NT=96 best (+3.4%), NT=128 spills
+acc (+1.7%), NT=64 loses A-reuse (-0.8%) -- all BITWISE (per-output FP order
+unchanged). tools/gemm_ntx_spike.cu. Ported as k_gemm_mma_ntx<Q4IN,96>
+(MR=128, g64, no split-K -- serves the SATURATED large-T grid, the opposite
+regime from split-K's underfill). Dispatch: g64 + nt-auto + T>=96 + blocks_mr64
+>= 2*SMs. Gated to sm_120+ (major>=12): the win is 5090-measured and Ampere
+kernel wins don't always transfer (GEMV sweep was sm_86-NEGATIVE); Q27_PF_NTX=0
+opts out. IN-ENGINE: NLL bitwise-identical on/off (1.914814 both, q4+q8 layers),
+fires on q4 rows=10240 + q8 rows=5120 at T=1024; --nll 40x1024 wall 13.41->12.52s
+(~6%, amplified by the big head GEMM). GATES green: canonical a2982c51 +
+f64e7c02 + sampled 900031e9 EXACT, test_kernels/ninv/fused_smoke PASS. Cold-
+prefill lever (warm turns skip prefill via the checkpoint); stacks with split-K.
+Not yet released; sm_86/89 ntx measurement open (needs 3090/4090).
+
+## 2026-07-19 -- club-3090 quality 8-pack + tool-drift mode 12 (cli-40 35%->48%)
+
+Ran noonghunna/benchlocal-cli quality-test.sh --full (8 packs, /150) against
+q27 q4s (4.55bpw) + turbo3 3-bit KV, no-think, for the club-3090 cross-engine
+table (issue #741). Quality is card-independent (kernels), run on the 5090.
+BASELINE 101/150 (67%): toolcall 14/15, structout/dataextract/bugfind 13/15,
+instruct/reasonmath 12/15, hermes 10-13/20 (agentic variance), cli-40 14/40.
+The 6 non-agentic packs = 77/90 (85%, W4A16-band) -> turbo3+q4s behavioral
+quality is SOUND (the maintainer's open question answered: 3-bit KV + 4.55bpw
+does not crater quality). Two artifacts + one real fix:
+- hermesagent-20 first scored 0/20 = ALL "model unreachable at
+  host.docker.internal Connection refused": q27 binds 127.0.0.1 (loopback
+  default since v0.1.1), unreachable from the in-container agent. --host 0.0.0.0
+  fixed it (13/20). Networking, not quality.
+- q27 is NO-THINK by design (ignores request enable_thinking): deterministic
+  packs score IDENTICALLY under default-thinking and NO_THINKING=1 (toolcall
+  14/15, instruct 12/15 both) -> one /150, no think-off/on split. [6] with data.
+- cli-40 14/40 (35%) = the real weak spot. Server log showed the drift: the
+  model emits {"name": bash, "arguments": {...}} -- UNQUOTED tool-name value.
+  Invalid JSON -> UN-RESCUED -> agent turn stops (turnsUsed=0). DRIFT MODE 12
+  (api_common.h fix_unquoted_name): quote a bareword after "name": IFF it
+  EXACTLY matches a registered tool; args are already valid JSON so the object
+  then parses on the normal path. SAFE (prose/null/numbers/unknown names
+  untouched; test_tool_drift.cpp mode12 + negative). MEASURED: cli-40 35% ->
+  48% (14->19/40), 0 UN-RESCUED across the run (was 3-4). Remaining cli-40
+  failures are now real capability misses (agent runs a command and stops on
+  its own), not parser drops. Distinct from Faisal's issue #4 (raw shell cmd in
+  the name slot, truncated, unrecoverable). Fixed /150 ~106+. MTP accept (card-
+  independent): code 2.91 tok/round (~48% @depth-4), prose 2.46 (~37%); adaptive
+  ceiling holds at 4 (deeper drafts don't promote) -- the 116/89 code/narrative
+  mechanism. gemm/ntx binaries unaffected; drift fix is api_common.h only.
+
+## 2026-07-19 -- v0.3.4 RELEASED (tag @ 54d0a42)
+
+github.com/signalnine/q27/releases/tag/v0.3.4. Two changes since v0.3.3:
+(1) prefill ntx M-minitile GEMM (5db46e4) -- each warp computes 2 row-minitiles
+sharing one B ldmatrix load, cutting LSU-loads/MMA 1.5->1.0 (ncu: LSU 50% top
+pipe, occupancy-invariant); +3.4% GEMM / ~6% cold-prefill wall, BITWISE, fires
+on the saturated large-T grid (stacks with v0.3.3 split-K's underfill regime),
+gated sm_120 where measured (Q27_PF_NTX=0 opts out). fp4/tcgen05 confirmed a
+hardware dead end for hand-written kernels on sm_120/121 (ptxas feature-gates
+to sm_100). (2) tool-drift mode 12 (54d0a42) -- recover unquoted tool-name value
+{"name": bash, ...} by quoting a bareword that exactly matches a registered
+tool; cli-40 35%->48% on the club-3090 quality harness, 0 unrecoverable. GATES
+green at tag: canonical a2982c51 + f64e7c02 + sampled 900031e9 EXACT,
+test_kernels/ninv/fused_smoke/tool-drift/drift-corpus PASS, tri-arch
+(sm_86/89/120 cuobjdump-confirmed on all 4 binaries). Assets: tarball (4
+binaries + MIT LICENSE, sha256 6bcbd783) + SHA256SUMS-0.3.4. Driver floor r580+
+unchanged. Also this session: club-3090 8-pack canonical 110/150 (q4s+turbo3,
+into the W4A16 band), issue #741; sm_86/89 ntx measurement still open.
+
+## 2026-07-20 -- tool-drift mode 11 refinement: mostly-escaped content (issue #4)
+
+@chaudhryfaisal 2nd UN-RESCUED case (Kilocode `write`): content is MOSTLY-valid
+JSON-escaped (\n \t \" all escaped) with ONE sparse escape error (\"strings" --
+bare closing quote) + a trailing </tool_call>. Mode 11 missed it two ways:
+(1) json(span).dump() DOUBLE-escapes already-escaped content (would write
+literal backslashes into the file), (2) the trailing tag made every recon's
+json::parse fail. Fix (api_common.h): minimal_escape_body (escape ONLY
+unescaped quotes/controls, keep valid \-escapes -- handles both fully-raw
+[mode 11 original] and mostly-escaped) + first_balanced_object (take the first
+top-level {...}, dropping </tool_call>/prose trailers). Recovers name=write +
+correct content ("fmt" quotes preserved). Regression: test_tool_drift.cpp
+"mode11 mostly-escaped content + trailing tag"; all modes 10/11/12 + corpus
+green. Kilocode tools confirmed lowercase (write/read/bash/...). Distinct from
+the truncated raw-shell-in-name case (still genuinely unrecoverable). NOT in
+v0.3.4 -- needs v0.3.5 or build-from-master.
+
+## 2026-07-20 -- thunderdome (Kilo-format replay) -> tool-drift mode 12b
+
+Replayed Kilocode's exact wire format (system + tool schema from issue #4)
+against q27 /v1/messages on hard coding tasks, stubbed tool results, drift
+capture on. Found+fixed one real edge: mode 12b -- dropped OPENING quote of the
+name value {"name": read", ...} (bareword + stray closing quote). Mode 12's
+naive quoting made "read"" (invalid); fix: add the closing quote only if one
+isn't already present. test_tool_drift.cpp mode12b. Non-findings: a max_tokens
+truncation was a test-budget artifact (clean at 16384). OPEN (surfaced, NOT
+fixed -- tradeoff): the bare-call recovery recovers a COMPLETE tool call even
+inside a ```json fence or inline prose ("emit {"name":"bash",...}") -> a prose/
+example -> unintended-execution vector. Fence-skip is the candidate fix but
+must not misfire on writes whose CONTENT contains fences, and must not weaken
+the wrapper-drop recovery Faisal depends on. Product/security call pending.
+
+## 2026-07-20 -- fence-skip guard + streaming stray-close strip
+
+Two robustness fixes from the thunderdome + Faisal's 3rd report:
+- FENCE-SKIP (api_common.h inside_fence): the bare-call recovery no longer
+  recovers a complete tool call whose { sits inside a ```fenced``` block -- a
+  displayed example or echoed injection is not a call the model is making
+  (prose->execution guard). Counts ``` ONLY before the call's opener, so a
+  write whose VALUE contains fences still recovers. Faisal-style bare calls
+  (no fence before them) unaffected. test_tool_drift.cpp fence-skip x2.
+- STREAMING STRAY-CLOSE (stream_split.h): a </tool_call> in the TEXT channel is
+  always stray (a real one follows an opener that switches to TOOL first), so
+  it's stripped instead of leaked into visible text -- fixes Faisal's "</tool_call>
+  still there" (bare multi-call sessions). Token-boundary safe (tail_keep).
+  Real pairs / <think> / split tags unaffected. tools/test_stream_split.cpp (7).
+Residual (documented, not fixed): the bare-call JSON itself still streams as
+text before post-hoc recovery (inherent to stream-then-recover); only the
+wrapper TAGS are stripped. Inline (un-fenced) prose tool calls also still
+recover -- rarer than the fenced shape.
+
+## 2026-07-20 -- v0.3.5 RELEASED (tag @ a2cc8b8)
+
+github.com/signalnine/q27/releases/tag/v0.3.5. Tool-call parser hardening, 3
+commits since v0.3.4 (all api_common.h / stream_split.h -- no kernel changes),
+from issue #4 (@chaudhryfaisal) + a Kilocode-format replay sweep (thunderdome):
+(1) mostly-escaped content values recover (minimal-escape + first-balanced-
+object, 546d7bf); (2) dropped-opening-quote name {"name": read", ...} (9d9dcd5);
+(3) fence-skip -- don't recover a complete call inside a ```fence``` (prose/echo-
+injection -> execution guard) + streaming stray-</tool_call> strip (a2cc8b8).
+Regression: test_tool_drift.cpp (12 cases) + tools/test_stream_split.cpp (7).
+GATES green at tag: canonical a2982c51 + f64e7c02 + sampled 900031e9 EXACT,
+test_kernels/ninv/fused_smoke/tool-drift/stream-split/drift-corpus PASS, tri-arch
+(sm_86/89/120 cuobjdump-confirmed on all 4). Assets: tarball (4 binaries + MIT
+LICENSE, sha256 13a89d62) + SHA256SUMS-0.3.5. Driver floor r580+ unchanged.
+Residual: bare-call JSON still streams as text before post-hoc recovery (only
+wrapper tags stripped); un-fenced inline-prose calls still recover (rarer).

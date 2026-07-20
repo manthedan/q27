@@ -4,10 +4,12 @@
 //   model emits  <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>
 //   results go back as user content wrapped in <tool_response>...</tool_response>
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
 #include <set>
 #include <string>
@@ -296,6 +298,120 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
         msgs.push_back({role, content});
     }
     return msgs;
+}
+
+// OpenAI chat/completions tools -> the same {"type":"function","function":{...}}
+// shape tools_preamble/chatml_prompt expect. Unlike anthropic_tools_json this
+// is nearly a pass-through (the wire shape already matches); entries missing
+// "type":"function" or a function.name are dropped rather than failing the
+// whole request, mirroring the Responses bridge's tolerance of hosted tool
+// types it doesn't model (review parity: a malformed ONE tool must not take
+// down an otherwise-valid request).
+inline json openai_tools_json(const json& body) {
+    json out = json::array();
+    if (body.contains("tools") && body["tools"].is_array())
+        for (auto& t : body["tools"]) {
+            if (!t.is_object() || t.value("type", "") != "function") continue;
+            if (!t.contains("function") || !t["function"].is_object()) continue;
+            const json& fn = t["function"];
+            if (!fn.contains("name") || !fn["name"].is_string()) continue;
+            out.push_back({{"type", "function"},
+                           {"function", {{"name", fn["name"]},
+                                         {"description", fn.value("description", "")},
+                                         {"parameters", fn.contains("parameters")
+                                                            ? fn["parameters"]
+                                                            : json::object()}}}});
+        }
+    return out;
+}
+
+// OpenAI chat/completions messages -> Msg list, the /v1/chat/completions twin
+// of anthropic_msgs. Two bridges the flat "content is a string" reading
+// misses entirely (silently dropping the model's own tool use from history,
+// which breaks any multi-turn agentic loop after the first call):
+//   - assistant.tool_calls[] (OpenAI shape: function.arguments is a JSON
+//     STRING) -> reconstructed <tool_call> marker(s), appended after any
+//     sibling content text (order matches anthropic_msgs' text-then-tool_use
+//     handling).
+//   - role:"tool" (tool_call_id + content) -> folded into a <tool_response>-
+//     wrapped USER turn, same as anthropic_msgs' tool_result bridge. The
+//     call_id is intentionally not echoed into the prompt text: the chat
+//     template's <tool_response> carries no id, and the fine-tune associates
+//     a result with the immediately preceding call by POSITION.
+//   - role:"developer" (the newer OpenAI system-role alias) -> "system",
+//     matching the /v1/responses bridge.
+inline std::vector<Msg> openai_msgs(const json& body) {
+    std::vector<Msg> msgs;
+    if (!body.contains("messages") || !body["messages"].is_array()) return msgs;
+    for (auto& m : body["messages"]) {
+        if (!m.is_object()) continue;
+        std::string role = m.value("role", "user");
+        if (role == "developer") role = "system";
+        std::string content;
+        if (m.contains("content")) {
+            if (m["content"].is_string()) content = m["content"];
+            else if (m["content"].is_array())
+                for (auto& part : m["content"])
+                    if (part.is_object() && part.value("type", "") == "text")
+                        content += part.value("text", "");
+        }
+        if (role == "tool") {
+            msgs.push_back({"user", tool_response_text(content)});
+            continue;
+        }
+        if (role == "assistant" && m.contains("tool_calls") && m["tool_calls"].is_array()) {
+            for (auto& tc : m["tool_calls"]) {
+                if (!tc.is_object() || !tc.contains("function") || !tc["function"].is_object())
+                    continue;
+                const json& fn = tc["function"];
+                std::string name = fn.value("name", std::string());
+                json args = json::object();
+                if (fn.contains("arguments")) {
+                    if (fn["arguments"].is_string()) {
+                        // OpenAI wire shape: a JSON-encoded string. Keep the
+                        // raw string (rather than dropping the call) if it
+                        // fails to parse -- same "never lose a turn" stance
+                        // as parse_tool_call's double-encode tolerance.
+                        try { args = json::parse(fn["arguments"].get<std::string>()); }
+                        catch (...) { args = fn["arguments"]; }
+                    } else args = fn["arguments"];
+                }
+                if (!content.empty() && content.back() != '\n') content += "\n";
+                content += tool_call_text(name, args);
+            }
+        }
+        msgs.push_back({role, content});
+    }
+    return msgs;
+}
+
+// tool_choice (OpenAI shape): "auto"/absent -> AUTO (unchanged behavior);
+// "none" -> NONE (tools stripped from the prompt entirely -- the model gets
+// no tool definitions and cannot call anything this turn); "required" or a
+// named {"type":"function","function":{"name":...}} -> FORCED. FORCED is a
+// soft force (prompt-injected <tool_call> opener + pre-seeded stream router,
+// see server.cu) -- it is NOT combined with --constrain-tools grammar
+// masking (documented limitation: the grammar's engage trigger scans
+// GENERATED text for the <tool_call> marker, which never appears in the
+// output when it was injected into the PROMPT instead).
+struct ToolChoice {
+    enum Mode { AUTO, NONE, FORCED } mode = AUTO;
+    std::string forced_name; // empty = any registered tool eligible
+};
+inline ToolChoice parse_tool_choice(const json& body) {
+    ToolChoice tc;
+    if (!body.contains("tool_choice")) return tc;
+    const json& v = body["tool_choice"];
+    if (v.is_string()) {
+        if (v == "none") tc.mode = ToolChoice::NONE;
+        else if (v == "required") tc.mode = ToolChoice::FORCED;
+        // "auto" or any other/unknown string: default AUTO
+    } else if (v.is_object() && v.value("type", "") == "function" && v.contains("function") &&
+               v["function"].is_object()) {
+        tc.mode = ToolChoice::FORCED;
+        tc.forced_name = v["function"].value("name", std::string());
+    }
+    return tc;
 }
 
 // Parsed model tool call. `ok` false if the JSON was malformed (raw kept).
@@ -946,11 +1062,191 @@ inline void scan_namedropped(const std::string& text, const json* tools,
 // per-segment recovery) pass false: a segment boundary is not a truncation
 // and inventing framing there false-positives prose fragments into calls
 // (codex P2, 2026-07-17). prefix = text before the first recovered call.
-// `tools` (optional) enables mode-6 name inference.
+// `tools` (optional) enables mode-6 name inference. allow_o10 (default on)
+// gates the mode-10 dropped-opener re-parse recursion (2026-07-20, ported
+// from upstream/master: a still-broken splice passes false so it cannot loop).
+//
+// The helpers below (minimal_escape_body / first_balanced_object /
+// inside_fence / recover_raw_value_call) are upstream's drift mode-11 raw
+// code-body rescue; the function body that uses them follows.
+// (close open string, strip junk tags, close braces). prefix = text before
+// the first recovered call. `tools` (optional) enables mode-6 name inference.
+// Drift mode 11 (2026-07-19, issue #4): a tool call whose big string argument
+// is a raw code body with unescaped inner quotes / newlines / braces
+// ({"name":"Write","arguments":{"content":"<raw source, to end>"}}). Normal
+// JSON parsing dies on the first inner `"`, and no local escape heuristic is
+// safe (code has `",` `"}` `[]string{"a","b"}` everywhere). Recover
+// positionally: the raw value runs to the end of the object, so its terminator
+// is the last `"` before the object's closing braces. Extract that span
+// literally, then parse the object with the big value blanked to pick up name
+// + any other scalar args. Registered-tool + shell-parses gating keeps prose
+// out. Handles content-last and scalar-args-before-content; a scalar AFTER the
+// big value (rare ordering) over-captures -- accepted vs the current total
+// failure (the UN-RESCUED session death). Only runs when nothing else parsed.
+// Escape ONLY what's actually unescaped in a nearly-valid JSON string body:
+// a valid \-escape is kept verbatim, a bare `"` or raw control char is
+// escaped, a lone `\` is doubled. Unlike json(s).dump() this does NOT double-
+// escape content the model already escaped correctly (\n \t \" ...), which is
+// the mostly-escaped-with-sparse-errors case (issue #4, 2026-07-20:
+// {"content":"...\"fmt\"...\"strings"..."} -- most quotes escaped, one not).
+inline std::string minimal_escape_body(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\') {
+            if (i + 1 < s.size()) {
+                char n = s[i + 1];
+                if (n == '"' || n == '\\' || n == '/' || n == 'b' || n == 'f' || n == 'n' ||
+                    n == 'r' || n == 't' || n == 'u') {
+                    out += '\\';
+                    out += n;
+                    i++;
+                    continue;
+                }
+            }
+            out += "\\\\";
+            continue;
+        }
+        if (c == '"') {
+            out += "\\\"";
+            continue;
+        }
+        if (c < 0x20) {
+            switch (c) {
+                case '\n': out += "\\n"; break;
+                case '\t': out += "\\t"; break;
+                case '\r': out += "\\r"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                default: {
+                    char buf[8];
+                    snprintf(buf, sizeof buf, "\\u%04x", c);
+                    out += buf;
+                }
+            }
+            continue;
+        }
+        out += (char)c;
+    }
+    return out;
+}
+
+// Return the first top-level balanced {...} (JSON string/escape aware), so
+// trailing junk after the call object -- </tool_call>, prose, a second blob --
+// doesn't make json::parse reject an otherwise-valid reconstruction.
+inline std::string first_balanced_object(const std::string& s) {
+    size_t start = s.find('{');
+    if (start == std::string::npos) return "";
+    int depth = 0;
+    bool in_str = false, esc = false;
+    for (size_t i = start; i < s.size(); i++) {
+        char ch = s[i];
+        if (esc) { esc = false; continue; }
+        if (in_str) {
+            if (ch == '\\') esc = true;
+            else if (ch == '"') in_str = false;
+            continue;
+        }
+        if (ch == '"') in_str = true;
+        else if (ch == '{') depth++;
+        else if (ch == '}') {
+            if (--depth == 0) return s.substr(start, i - start + 1);
+        }
+    }
+    return "";
+}
+
+// True if `pos` sits inside an open ```...``` fenced code block (an odd number
+// of ``` precede it). A tool call the model INTENDS to emit is never markdown-
+// fenced; a call shown as an example, or echoed from an injected file/page, is.
+// We look ONLY before `pos`, so a write whose VALUE contains fences (its ``` are
+// after the call's opener) is not mistaken for a fenced call.
+inline bool inside_fence(const std::string& s, size_t pos) {
+    size_t f = 0, count = 0;
+    while ((f = s.find("```", f)) != std::string::npos && f < pos) {
+        count++;
+        f += 3;
+    }
+    return (count & 1) != 0;
+}
+
+inline bool recover_raw_value_call(const std::string& text, const json& tools,
+                                   std::vector<ToolCall>& out) {
+    size_t mo = text.rfind("{\"name\"");
+    if (mo == std::string::npos) return false;
+    if (inside_fence(text, mo)) return false; // fenced example, not a real call
+    size_t colon = text.find(':', mo + 6);
+    if (colon == std::string::npos) return false;
+    size_t q1 = text.find('"', colon + 1);
+    if (q1 == std::string::npos) return false;
+    size_t q2 = text.find('"', q1 + 1);
+    if (q2 == std::string::npos) return false;
+    const std::string nm = text.substr(q1 + 1, q2 - q1 - 1);
+    const json* fn = nullptr;
+    for (const auto& t : tools)
+        if (t.contains("function") && t["function"].value("name", std::string()) == nm) {
+            fn = &t["function"];
+            break;
+        }
+    if (!fn) return false;
+    std::vector<std::string> strkeys;
+    if (fn->contains("parameters") && (*fn)["parameters"].is_object()) {
+        const json& pr = (*fn)["parameters"];
+        if (pr.contains("properties") && pr["properties"].is_object())
+            for (auto it = pr["properties"].begin(); it != pr["properties"].end(); ++it)
+                if (it.value().is_object() &&
+                    it.value().value("type", std::string()) == "string")
+                    strkeys.push_back(it.key());
+    }
+    if (strkeys.empty()) return false;
+    // For each string param, forward-scan candidate terminators of ITS value:
+    // escape the span [opener+1, cand), keep the tail after cand literal, and
+    // parse the reconstructed object. The FIRST candidate that parses is the
+    // real terminator -- inner quotes leave the tail as un-parseable raw code,
+    // and a scalar arg after the value forces the correct earlier terminator
+    // (making that arg a valid sibling). Ordering-independent. The call must
+    // be at the end of the model output, which is the UN-RESCUED reality.
+    for (const auto& k : strkeys) {
+        size_t kp = text.find("\"" + k + "\"", mo);
+        if (kp == std::string::npos) continue;
+        size_t kc = text.find(':', kp + k.size() + 2);
+        if (kc == std::string::npos) continue;
+        size_t opener = text.find('"', kc + 1);
+        if (opener == std::string::npos) continue;
+        for (size_t cand = text.find('"', opener + 1); cand != std::string::npos;
+             cand = text.find('"', cand + 1)) {
+            // Minimal-escape the value body (don't double-escape already-valid
+            // \-escapes) and trim trailing junk by taking the first balanced
+            // object, so both fully-raw and mostly-escaped content recover.
+            const std::string body = minimal_escape_body(text.substr(opener + 1, cand - opener - 1));
+            const std::string recon = first_balanced_object(
+                text.substr(mo, opener - mo) + "\"" + body + "\"" + text.substr(cand + 1));
+            if (recon.empty()) continue;
+            json obj;
+            try { obj = json::parse(recon); } catch (...) { continue; }
+            if (!obj.is_object() || obj.value("name", std::string()) != nm) continue;
+            json args = obj.contains("arguments") && obj["arguments"].is_object()
+                            ? obj["arguments"]
+                            : json::object();
+            ToolCall tc;
+            tc.ok = true;
+            tc.name = nm;
+            tc.arguments = std::move(args);
+            fprintf(stderr, "[drift] mode-11 raw-value rescue: %s.%s (%zu bytes)\n", nm.c_str(),
+                    k.c_str(), cand - opener - 1);
+            out.push_back(std::move(tc));
+            return true;
+        }
+    }
+    return false;
+}
+
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr,
-                                                   bool allow_trunc_repair = true) {
+                                                   bool allow_trunc_repair = true,
+                                                   bool allow_o10 = true) {
     std::vector<ToolCall> out;
     if (tool_strict()) {
         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
@@ -979,7 +1275,50 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         }
         return s;
     };
-    const std::string text = fix_arg_quote(escape_content_tags(text_in));
+    // drift mode 12 (2026-07-19, club-3090 cli-40 agent): the model drops the
+    // QUOTES around the tool-NAME value -- {"name": bash, "arguments": {...}}.
+    // Invalid JSON, so the whole call went UN-RESCUED and the agent's turn
+    // stopped (turnsUsed=0). The arguments are valid JSON, so once the bare
+    // name is quoted the object parses on the normal path. SAFE because we only
+    // quote a bareword that EXACTLY matches a registered tool name -- prose,
+    // non-tool JSON, null/numbers, and unknown names are left untouched.
+    auto fix_unquoted_name = [](std::string s, const json* tools) {
+        if (!tools || !tools->is_array()) return s;
+        size_t p = 0;
+        while ((p = s.find("\"name\":", p)) != std::string::npos) {
+            size_t c = p + 7;
+            while (c < s.size() && (s[c] == ' ' || s[c] == '\t' || s[c] == '\n' || s[c] == '\r'))
+                c++;
+            if (c < s.size() && s[c] != '"' &&
+                (isalpha((unsigned char)s[c]) || s[c] == '_')) {
+                size_t e = c;
+                while (e < s.size() && (isalnum((unsigned char)s[e]) || s[e] == '_' ||
+                                        s[e] == '-' || s[e] == '.'))
+                    e++;
+                const std::string word = s.substr(c, e - c);
+                bool match = false;
+                for (const auto& t : *tools)
+                    if (t.contains("function") &&
+                        t["function"].value("name", std::string()) == word) {
+                        match = true;
+                        break;
+                    }
+                if (match) {
+                    // Add the closing quote only if one isn't already there:
+                    // {"name": bash,   -> both quotes; {"name": read"  (dropped
+                    // OPENING quote, stray close) -> opening only (thunderdome).
+                    if (!(e < s.size() && s[e] == '"')) s.insert(e, "\"");
+                    s.insert(c, "\"");
+                    p = e + 2;
+                    continue;
+                }
+            }
+            p = c;
+        }
+        return s;
+    };
+    const std::string text =
+        fix_unquoted_name(fix_arg_quote(escape_content_tags(text_in)), tools);
     const bool m3 = (text != text_in);              // mode 3: <content>-tagged value rewritten
     const bool m4 = text.find("{\"tool_call\":") != std::string::npos; // mode 4: JSON-keyed opener
     size_t first = std::string::npos;
@@ -993,6 +1332,13 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // "successfully" closes into one merged garbage command (review
         // 2026-07-17). Unbalanced-with-m10 segments rescan with the
         // unconditional terminator and take the pre-mode-10 repair path.
+        // A {...} sitting inside a ```fenced``` block is a displayed example /
+        // echoed injection, not a call the model is making -- don't recover it
+        // (upstream inside_fence guard, 2026-07-19).
+        if (inside_fence(text, i)) {
+            i = text.find('{', i + 1);
+            continue;
+        }
         bool m5_here = false, m10_here = false;
         auto scan_seg = [&](bool m10_look, std::string& san) -> size_t {
             san.clear();
@@ -1101,6 +1447,30 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 continue;
             }
         } else if (m8cand && tools) {
+            // mode 10 tail (2026-07-18): flat name+args -- a STRING "name"
+            // matching a registered tool, with the arguments as SIBLING keys
+            // instead of nested under "arguments" ({"name":"Read","file_path":
+            // ...}). This is what the mode-10 opener-splice produces, and
+            // the model also emits it wrapper-less. Validate the name against
+            // the registry so prose JSON with a "name" field can't match.
+            if (j8.contains("name") && j8["name"].is_string()) {
+                const std::string cand = j8["name"].get<std::string>();
+                bool known = false;
+                for (const auto& t : *tools)
+                    if (t.contains("function") &&
+                        t["function"].value("name", std::string()) == cand) { known = true; break; }
+                if (known && !cand.empty()) {
+                    json args = json::object();
+                    for (auto it = j8.begin(); it != j8.end(); ++it)
+                        if (it.key() != "name") args[it.key()] = it.value();
+                    ToolCall tc; tc.ok = true; tc.name = cand; tc.arguments = std::move(args);
+                    if (first == std::string::npos) first = i;
+                    out.push_back(std::move(tc));
+                    m8 = true;
+                    i = text.find('{', end + 1);
+                    continue;
+                }
+            }
             // mode 8: alias-named call object ({"function": "Read", ...});
             // registered-name validation inside keeps prose JSON out
             std::string an;
@@ -1132,6 +1502,68 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             p = strip_ws2(p.substr(0, p.size() - 8));
         *prefix = p;
     }
+    // Drift mode 10 (2026-07-18, SWE-bench flask-5014 first-tool-call
+    // rescue miss): the model drops the ENTIRE `{"name": "` opener, emitting
+    // `NAME", "key": val ...}` with no brace at all -- so the {-scanner above
+    // finds no candidate. When nothing else rescued and a KNOWN tool name is
+    // followed by the `", "` argument-separator signature (and is not already
+    // properly quoted), splice the opener back and re-parse ONCE (allow_o10
+    // false in the recursion so a still-broken splice cannot loop). This is
+    // the deterministic early-quit the n=3 seal caught: a missed first call
+    // ends the agent turn with a leaked-JSON text response.
+    if (out.empty() && allow_o10 && tools && tools->is_array()) {
+        for (const auto& t : *tools) {
+            std::string nm = t.contains("function")
+                                 ? t["function"].value("name", std::string())
+                                 : std::string();
+            if (nm.empty()) continue;
+            const std::string sig = nm + "\", \"";
+            size_t p = text.find(sig);
+            if (p == std::string::npos) continue;
+            if (p > 0 && text[p - 1] == '"') continue; // already `"name": "NAME"`
+            std::string synth = text.substr(0, p) + "{\"name\": \"" + text.substr(p);
+            if (synth.find('}') == std::string::npos) synth += "}";
+            std::string pre2;
+            auto rec = parse_bare_tool_calls(synth, &pre2, tools,
+                                             allow_trunc_repair, /*allow_o10=*/false);
+            if (!rec.empty()) {
+                out = std::move(rec);
+                if (prefix) *prefix = pre2;
+                fprintf(stderr, "[drift] mode-10 dropped-opener rescue: %s\n", nm.c_str());
+                break;
+            }
+        }
+    }
+    // mode 11: raw code-body string value (unescaped inner quotes/newlines).
+    // The positional recovery restores the FULL string value, so it is the
+    // right answer whenever the value genuinely contains unescaped inner
+    // quotes. Our stepper's mode-10 lookahead can reach a *parseable but
+    // wrong* segment on exactly that input (it re-escapes the first inner
+    // quote, truncating the value and swallowing any sibling scalar -- the
+    // "scalar-after-content" case, wrong-ok). Upstream's plain in-string scan
+    // cannot parse that input at all, so it always falls through to mode 11.
+    // To match upstream's recovery on this overlap: prefer mode 11's positional
+    // result over the scan's mode-10-re-escaped candidate; if mode 11 also
+    // declines, keep the scan's (it is still the best available read of a
+    // genuinely-mode-10 string). Runs as last resort too. Multi-call: mode 11
+    // only returns the LAST `{"name"` call, so preserve any earlier calls the
+    // scan recovered normally (only the trailing candidate is m10-suspect) --
+    // replacing the whole vector would silently drop them (codex P2).
+    if (tools && tools->is_array() && (out.empty() || (m10 && !out.empty()))) {
+        std::vector<ToolCall> raw;
+        if (recover_raw_value_call(text, *tools, raw) && !raw.empty()) {
+            if (m10 && out.size() > 1) {
+                out.back() = std::move(raw.back()); // replace only the m10-wrong tail
+            } else {
+                out = std::move(raw);
+            }
+            if (prefix) {
+                size_t mo = text.rfind("{\"name\"");
+                *prefix = mo != std::string::npos ? strip_ws2(text.substr(0, mo))
+                                                  : std::string();
+            }
+        }
+    }
     // Drift catalog (exit gate, docs/sampling-exit-gate.md): tag which tool-format
     // drift mode(s) the fallback chain rescued, or flag an intended call it could
     // NOT recover. Log-only; the parse result is unchanged.
@@ -1154,6 +1586,19 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
         fprintf(stderr, "[drift] UN-RESCUED (ntools=%d) intended tool call: %.400s\n",
                 tools ? (int)tools->size() : -1, text_in.c_str());
+        // Corpus capture: Q27_DRIFT_CORPUS=<file> appends the FULL untruncated
+        // miss (the stderr line caps at 400 chars, which is why issue #4's
+        // payload wasn't visible). Each miss is a replayable fixture for
+        // tools/test_tool_drift_corpus.cpp -- turns an unknown drift mode into
+        // a permanent regression the next time it recurs. NUL-separated
+        // records so embedded newlines don't confuse the reader.
+        if (const char* cp = getenv("Q27_DRIFT_CORPUS")) {
+            if (FILE* f = fopen(cp, "ab")) {
+                fwrite(text_in.data(), 1, text_in.size(), f);
+                fputc('\0', f);
+                fclose(f);
+            }
+        }
     }
     return out;
 }
@@ -1168,5 +1613,162 @@ inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* pr
     return v.front();
 }
 
+// ---- OpenAI /v1/chat/completions response shaping -------------------------
+// Pulled out of server.cu (same rationale as the Anthropic helpers above):
+// pure JSON assembly, unit-tested without CUDA. server.cu's job is only to
+// wire the engine callbacks that feed `calls`/`text` -- an exact mechanical
+// twin of the already-shipped /v1/messages plumbing.
+
+inline json openai_tool_call_json(const std::string& id, const ToolCall& c) {
+    return {{"id", id}, {"type", "function"},
+            {"function", {{"name", c.name}, {"arguments", c.arguments.dump()}}}};
+}
+
+// Non-streaming choices[0].message. content is null ONLY when there is at
+// least one tool call and no leftover text (matches real OpenAI's
+// convention); otherwise content is always the string (possibly empty),
+// never null, so a plain content-only turn never confuses a strict client.
+// `calls` may include ok==false entries (malformed calls) -- the caller is
+// expected to have already folded those into `text` (matching the
+// /v1/messages precedent) before calling this. `reasoning` (optional):
+// non-empty adds a `reasoning_content` field -- not part of the official
+// OpenAI schema, but the de facto convention vLLM/SGLang/llama.cpp's server
+// all converged on for surfacing a reasoning model's thinking trace over the
+// chat/completions wire; unknown fields are inert to clients that don't
+// look for it.
+inline json openai_chat_message_json(const std::string& text, const std::vector<ToolCall>& calls,
+                                     long rid, const std::string& reasoning = std::string()) {
+    json msg = {{"role", "assistant"}};
+    json tool_calls = json::array();
+    int i = 0;
+    for (auto& c : calls)
+        if (c.ok)
+            tool_calls.push_back(openai_tool_call_json(
+                "call_q27_" + std::to_string(rid) + "_" + std::to_string(i++), c));
+    bool any_call = !tool_calls.empty();
+    msg["content"] = (any_call && text.empty()) ? json(nullptr) : json(text);
+    if (any_call) msg["tool_calls"] = tool_calls;
+    if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
+    return msg;
+}
+
+// Streamed reasoning_content delta (see openai_chat_message_json's comment
+// for the convention this matches).
+inline json openai_reasoning_delta(const std::string& t) {
+    return {{"reasoning_content", t}};
+}
+
+// One SSE chunk envelope (chat.completion.chunk), shared by every delta this
+// endpoint emits (content, tool_calls, or the terminal empty-delta chunk).
+inline json openai_stream_chunk(const std::string& id, const std::string& obj, long created,
+                                const std::string& model, const json& delta,
+                                const char* finish_reason = nullptr) {
+    json choice = {{"index", 0}, {"delta", delta},
+                   {"finish_reason", finish_reason ? json(finish_reason) : json(nullptr)}};
+    return {{"id", id}, {"object", obj}, {"created", created}, {"model", model},
+            {"choices", json::array({choice})}};
+}
+
+// One streamed tool_calls[] delta entry. Whole-shot (id+name+full arguments
+// in a single chunk) rather than incremental-argument streaming -- matches
+// the existing /v1/messages input_json_delta precedent (one full
+// partial_json chunk per call, not char-by-char) and is spec-valid: a client
+// that expects incremental fragments just accumulates a single fragment.
+inline json openai_tool_call_delta(int index, const std::string& id, const ToolCall& c) {
+    return {{"tool_calls", json::array({{{"index", index},
+                                         {"id", id},
+                                         {"type", "function"},
+                                         {"function", {{"name", c.name},
+                                                       {"arguments", c.arguments.dump()}}}}})}};
+}
+
+// ---- API key authentication -----------------------------------------------
+// q27 has no auth by default (loopback-only is the safety net) -- these are
+// the pure, testable pieces of an opt-in bearer/x-api-key check, wired into
+// a pre-routing handler in server.cu when --api-key/--api-key-file/
+// Q27_API_KEY configure at least one key.
+
+// Constant-time string comparison: prevents a timing side-channel where an
+// early-exit compare leaks how many leading bytes of a guessed key matched
+// via response-time variance. Deliberately does not early-exit on length
+// mismatch either (still walks max(a,b) bytes) or on the first bit
+// difference (accumulates via OR instead of returning).
+inline bool secure_compare(const std::string& a, const std::string& b) {
+    size_t n = std::max(a.size(), b.size());
+    unsigned char diff = (unsigned char)(a.size() != b.size());
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = i < a.size() ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < b.size() ? (unsigned char)b[i] : 0;
+        diff |= (unsigned char)(ca ^ cb);
+    }
+    return diff == 0;
+}
+
+// q27 serves two API families with two different native auth header
+// conventions -- support both, so neither client population needs special
+// configuration:
+//   Authorization: Bearer <key>   -- OpenAI / llama.cpp convention (Kilocode
+//                                    and other OpenAI-compatible clients)
+//   x-api-key: <key>              -- Anthropic convention (what Claude Code
+//                                    actually sends to /v1/messages)
+// x-api-key wins if a request somehow sends both (arbitrary but
+// deterministic; no client sends both in practice). Returns "" if neither
+// header is present/well-formed.
+inline std::string extract_api_key(const std::string& authorization_header,
+                                   const std::string& x_api_key_header) {
+    if (!x_api_key_header.empty()) return x_api_key_header;
+    static const std::string prefix = "Bearer ";
+    if (authorization_header.size() > prefix.size() &&
+        authorization_header.compare(0, prefix.size(), prefix) == 0)
+        return authorization_header.substr(prefix.size());
+    return "";
+}
+
+// True if `provided` matches ANY configured key. Always scans every key
+// (no early return on the first match) so total compare time depends only
+// on key count/length, not on which key -- if any -- matched, or how far
+// into it a wrong guess got. An empty `provided` is always rejected without
+// comparing (an empty key is never configured -- see set_api_keys below --
+// so this is a fast path, not a security-relevant branch).
+inline bool api_key_valid(const std::string& provided, const std::vector<std::string>& keys) {
+    if (provided.empty()) return false;
+    bool any = false;
+    for (auto& k : keys) any |= secure_compare(provided, k);
+
+    return any;
+}
+
+// 401 body shaped per API family, matching the existing anthropic_error_json
+// / OpenAI-error-shape split already used elsewhere in this file for 400s --
+// each client SDK gets the error shape it actually parses.
+inline std::string auth_error_json(bool anthropic_shape) {
+    if (anthropic_shape) return anthropic_error_json("authentication_error", "invalid x-api-key");
+    json e = {{"error", {{"message", "Incorrect API key provided"},
+                         {"type", "invalid_request_error"},
+                         {"code", "invalid_api_key"}}}};
+    return e.dump();
+}
+
+// Load newline-separated keys from a file (llama.cpp --api-key-file
+// convention: one key per line, blank lines and lines starting with '#'
+// ignored, surrounding whitespace trimmed). Returns false (and leaves `out`
+// untouched) if the file can't be opened, so the caller can fail loudly
+// with the actual path rather than silently starting with no auth.
+inline bool load_api_key_file(const std::string& path, std::vector<std::string>* out) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+    std::vector<std::string> keys;
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t a = line.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) continue;
+        size_t b = line.find_last_not_of(" \t\r\n");
+        line = line.substr(a, b - a + 1);
+        if (line.empty() || line[0] == '#') continue;
+        keys.push_back(line);
+    }
+    for (auto& k : keys) out->push_back(std::move(k));
+    return true;
+}
 
 } // namespace q27

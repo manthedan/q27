@@ -1689,16 +1689,12 @@ private:
         // state for shapes that may never arrive. YAGNI.
         gc_misses_++;
         const auto t0 = std::chrono::steady_clock::now();
-        cudaGraph_t g = nullptr;
-        cudaGraphExec_t x = nullptr;
-        CUDA_CHECK(cudaStreamBeginCapture(cstm, cudaStreamCaptureModeRelaxed));
-        fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx, sampled,
-                           /*ev_draft_end=*/nullptr, mf);
-        CUDA_CHECK(cudaStreamEndCapture(cstm, &g));
-        CUDA_CHECK(cudaGraphInstantiate(&x, g, 0));
-        const auto t1 = std::chrono::steady_clock::now();
-        CUDA_CHECK(cudaGraphLaunch(x, cstm)); // THIS round runs via the exec
-        if ((int)gcache_.size() >= gc_cap_) { // LRU victim out first
+        // Evict-at-cap BEFORE capture/instantiate (2026-07-17 4-lane crash):
+        // the old evict-after order held cap+1 execs at the boundary, so a
+        // headroom-shrunk cap still overflowed by one exec's allocation on
+        // the instantiate -- the ctor guard shrank to 20 and the server
+        // died instantiating entry 21.
+        auto evict_lru = [&] {
             size_t victim = 0;
             for (size_t i = 1; i < gcache_.size(); i++)
                 if (gcache_[i].tick < gcache_[victim].tick) victim = i;
@@ -1708,7 +1704,50 @@ private:
                         gc_rounds_, gc_cap_, gcache_[victim].tick);
             gc_destroy(gcache_[victim]);
             gcache_.erase(gcache_.begin() + victim);
+        };
+        while ((int)gcache_.size() >= gc_cap_) evict_lru();
+        cudaGraph_t g = nullptr;
+        cudaGraphExec_t x = nullptr;
+        CUDA_CHECK(cudaStreamBeginCapture(cstm, cudaStreamCaptureModeRelaxed));
+        fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx, sampled,
+                           /*ev_draft_end=*/nullptr, mf);
+        CUDA_CHECK(cudaStreamEndCapture(cstm, &g));
+        // Instantiate is the one device allocation on the round path that can
+        // OOM on a tight boot (this line killed a 4x49152 server mid-traffic,
+        // BUILDLOG 2026-07-17). Shrink-never-abort, same recovery shape as
+        // the guard trip above: clear the sticky error, evict LRU and retry;
+        // if the cache is EMPTY and it still OOMs, graphs cannot work at this
+        // headroom -- disable the cache for the rest of the run and serve
+        // this (and every later) round eagerly. Non-OOM errors keep the
+        // loud-abort contract.
+        cudaError_t ierr = cudaGraphInstantiate(&x, g, 0);
+        while (ierr == cudaErrorMemoryAllocation && !gcache_.empty()) {
+            (void)cudaGetLastError();
+            fprintf(stderr,
+                    "[gcache] r=%ld instantiate OOM -- evicting LRU and retrying "
+                    "(%zu entries)\n",
+                    gc_rounds_, gcache_.size());
+            evict_lru();
+            ierr = cudaGraphInstantiate(&x, g, 0);
         }
+        if (ierr != cudaSuccess) {
+            (void)cudaGetLastError();
+            if (ierr != cudaErrorMemoryAllocation) CUDA_CHECK(ierr);
+            (void)cudaGraphDestroy(g);
+            fprintf(stderr,
+                    "[gcache] instantiate OOM with cache empty -- graph cache OFF for "
+                    "the rest of this run, eager fused rounds (h=%ld m=%ld ev=%ld)\n",
+                    gc_hits_, gc_misses_, gc_evictions_);
+            graphs_on_ = false;
+            // M1 posture: re-stage perms before the eager round (idempotent;
+            // the captured staging copies above were recorded, not executed).
+            for (int i = 0; i < k; i++) es[i]->stage_perm_async(cstm);
+            fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx,
+                               sampled, /*ev_draft_end=*/nullptr, mf);
+            return;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        CUDA_CHECK(cudaGraphLaunch(x, cstm)); // THIS round runs via the exec
         GCacheEnt ent;
         ent.key = key;
         ent.graph = g;

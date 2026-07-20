@@ -12,3 +12,6 @@ bonsai-27b-whitepaper.pdf
 
 # KL baseline dumps (GiB-scale f32 logits; regenerable via --logits-dump)
 *.logits
+
+# swebench per-run engine journals (transient artifacts)
+bench/swebench/*.journal

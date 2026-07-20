@@ -597,6 +597,15 @@ int main(int argc, char** argv) {
         std::vector<int> tk(fb / 4);
         if (fread(tk.data(), 4, tk.size(), f) != tk.size()) { fclose(f); return 1; }
         fclose(f);
+        for (size_t gi = 0; gi < tk.size(); gi++)
+            if (tk[gi] < 0 || tk[gi] >= VOCAB) {
+                fprintf(stderr,
+                        "--nll input: id %d at offset %zu is outside the vocab (0..%d) -- "
+                        "this file is not int32 token ids (raw text? tokenize it first; "
+                        "the house corpus is wiki.test.*.i32)\n",
+                        tk[gi], gi, VOCAB - 1);
+                return 1;
+            }
         int N = std::min((int)tk.size(), std::min(kvstats_n, ctx));
         fprintf(stderr, "kvstats: prefilling %d tokens\n", N);
         int* d_toks;
@@ -666,6 +675,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         fclose(f);
+        for (size_t gi = 0; gi < tk.size(); gi++)
+            if (tk[gi] < 0 || tk[gi] >= VOCAB) {
+                fprintf(stderr,
+                        "--nll input: id %d at offset %zu is outside the vocab (0..%d) -- "
+                        "this file is not int32 token ids (raw text? tokenize it first; "
+                        "the house corpus is wiki.test.*.i32)\n",
+                        tk[gi], gi, VOCAB - 1);
+                return 1;
+            }
         const DevTensor& onw = e.dm.get("output_norm.weight");
         const DevTensor& head = e.dm.get("output.weight");
         const int PT = Engine::PF_T;

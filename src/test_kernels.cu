@@ -500,21 +500,27 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
         CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
         return (double)ms / REPS;
     };
-    // (a) Q8 verify head
+    // (a) verify head -- dtype-dispatched. q4s/q8-family tiers carry a
+    // single Q4 head; the old unconditional gemv_q8_n read Q4 bytes as Q8
+    // and aborted. Time whichever kernel the tier's head actually uses.
     const q27::DevTensor& hd = dm.upload("output.weight");
     const q27::Tensor& ht = m.get("output.weight");
+    const bool head_q4 = ht.dtype == q27::DType::Q4_G64;
+    auto head_gemv = [&](q27k::XQuant* q, int nb, float** y) {
+        if (head_q4)
+            q27k::gemv_q4_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                            ht.rows(), cols, 0);
+        else
+            q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                            ht.rows(), cols, 0);
+    };
     double h5 = timeit([&] {
-        q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, qs, 5, ys,
-                        ht.rows(), cols, 0);
-        q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, qs + 5, 5, ys + 5,
-                        ht.rows(), cols, 0);
+        head_gemv(qs, 5, ys);
+        head_gemv(qs + 5, 5, ys + 5);
     });
-    double h10 = timeit([&] {
-        q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, qs, 10, ys,
-                        ht.rows(), cols, 0);
-    });
-    printf("  gemv10 head Q8: 2x5=%.3fms 1x10=%.3fms ratio(10 vs 2x5)=%.2f\n", h5, h10,
-           h10 / h5);
+    double h10 = timeit([&] { head_gemv(qs, 10, ys); });
+    printf("  gemv10 head %s: 2x5=%.3fms 1x10=%.3fms ratio(10 vs 2x5)=%.2f\n",
+           head_q4 ? "Q4" : "Q8", h5, h10, h10 / h5);
     // (b) Q4 ffn_gate rotating 4 layers
     const char* names[4] = {"blk.0.ffn_gate.weight", "blk.1.ffn_gate.weight",
                             "blk.2.ffn_gate.weight", "blk.4.ffn_gate.weight"};
@@ -537,13 +543,17 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
     printf("  gemv10 ffn Q4 (L2-rotated): 2x5=%.3fms 1x10=%.3fms ratio=%.2f\n", f5, f10,
            f10 / f5);
     // correctness: lane 7 of a fresh 10-lane HEAD run == a plain 1-lane gemv
-    // (must re-run the head here -- the ffn bench above overwrote ys[])
-    q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, qs, 10, ys, ht.rows(),
-                    cols, 0);
+    // (must re-run the head here -- the ffn bench above overwrote ys[]).
+    // Dtype-matched to the tier's head kernel.
+    head_gemv(qs, 10, ys);
     std::vector<float> got(128), ref(128);
     CUDA_CHECK(cudaMemcpy(got.data(), ys[7], 128 * 4, cudaMemcpyDeviceToHost));
-    q27k::gemv_q8((const int8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0], ht.rows(),
-                  cols, 0);
+    if (head_q4)
+        q27k::gemv_q4((const uint8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
+                      ht.rows(), cols, 0);
+    else
+        q27k::gemv_q8((const int8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
+                      ht.rows(), cols, 0);
     CUDA_CHECK(cudaMemcpy(ref.data(), ys[0], 128 * 4, cudaMemcpyDeviceToHost));
     double maxd = 0;
     for (int i = 0; i < 128; i++) maxd = std::max(maxd, (double)std::fabs(got[i] - ref[i]));

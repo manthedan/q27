@@ -672,9 +672,23 @@ int main(int argc, char** argv) {
     const std::string n_ffn_down = first_with("ffn_down.weight");   // Q4, 5120 x 17408
     const std::string n_ssm_out = first_with("ssm_out.weight");     // Q8, 5120 x 6144
     const std::string n_ssm_alpha = first_with("ssm_alpha.weight"); // F16, 48 x 5120
-    if (!m.find("output_q4.weight")) { fprintf(stderr, "ninv_test: no output_q4\n"); return 1; }
+    // Q4 head source for the tall-head kernel rows: output_q4.weight (the
+    // v1.3/v1.4/q8 draft-head copy) if present, else the single Q4 head
+    // (q4s tier). A pure-Q8 head tier has no Q4 head shape -- skip those
+    // rows (the ffn_down rows still exercise gemv_q4_n/vgemm_q4 on the
+    // wide-K shape, so Q4 kernel coverage survives).
+    const char* head_q4_name = m.find("output_q4.weight") ? "output_q4.weight"
+                               : (m.find("output.weight") && m.get("output.weight").dtype ==
+                                                                  q27::DType::Q4_G64)
+                                   ? "output.weight"
+                                   : nullptr;
+    const bool have_q4_head = head_q4_name != nullptr;
+    if (!have_q4_head)
+        fprintf(stderr,
+                "ninv_test: no Q4 head tensor (pure-Q8 tier) -- skipping the 2 head-Q4 "
+                "rows; ffn_down still covers the Q4 kernels\n");
     const q27::DevTensor& w_down = dm.upload(n_ffn_down);
-    const q27::DevTensor& w_head = dm.upload("output_q4.weight");   // Q4, 248320 x 5120
+    const q27::DevTensor& w_head = dm.upload(have_q4_head ? head_q4_name : n_ffn_down); // Q4
     const q27::DevTensor& w_sout = dm.upload(n_ssm_out);
     const q27::DevTensor& w_alpha = dm.upload(n_ssm_alpha);
 
@@ -727,7 +741,12 @@ int main(int argc, char** argv) {
     };
     // family verdicts aggregate the per-weight tables
     int fam_fail[3] = {0, 0, 0};
-    for (const Row& r : rows) fam_fail[r.fam] += run_table(r.tag, r.fam, *r.w, d_ws, r.salt);
+    for (const Row& r : rows) {
+        // skip the two head-Q4 rows when the tier has no Q4 head (w_head
+        // aliases ffn_down there, already covered by its own rows)
+        if (!have_q4_head && (r.w == &w_head)) continue;
+        fam_fail[r.fam] += run_table(r.tag, r.fam, *r.w, d_ws, r.salt);
+    }
 
     printf("\nfamily verdicts: vgemm_verify %s | gemv_q4_n/gemv_q8_n %s | gemv_f16_3 %s\n",
            fam_fail[F_VGEMM] ? "FAIL" : "PASS", fam_fail[F_GEMV] ? "FAIL" : "PASS",

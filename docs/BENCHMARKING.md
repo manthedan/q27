@@ -6,14 +6,14 @@ comparison against the [llama-cpp-turboquant](https://github.com/) fork with
 
 | engine | build | quant | spec-decode |
 |---|---|---|---|
-| **q27** | git `94e645a` | NVFP4 **5.25 bpw** | MTP head + SuffixDraft (fused verify) |
+| **q27** | git `94e645a` | q27 4-bit (Q4_G64/Q8_G128 mix) **5.25 bpw effective** | MTP head + SuffixDraft (fused verify) |
 | **llama-cpp-turboquant** (TheTom fork) | git `c3e6dbb13` | Q5_K_M **~5.5 bpw** | `--spec-type ngram-mod` (n_match=24, n_max=64, n_min=48) |
 | **llama.cpp mainline** | git `13e67386` (2026-07-01) | Q5_K_M **~5.5 bpw** | run two ways: none (stock), and `--spec-type draft-mtp --spec-draft-n-max 6` (same MTP head as q27) |
 | **vLLM** | `vllm/vllm-openai:nightly` | NVFP4 (`unsloth/Qwen3.6-27B-NVFP4`, compressed-tensors) | `speculative-config {method:mtp, num_speculative_tokens:3}` — the model's MTP head |
 
 All three serve the **same base model** (Qwen3.6-27B-MTP; the `qwen35` GGUF arch,
 which mainline supports as `LLM_ARCH_QWEN35`). The only unavoidable confound is
-quantization (both llama builds carry ~0.25 bpw more than q27's NVFP4); it is
+quantization (both llama builds carry ~0.25 bpw more than q27's 4-bit tier); it is
 disclosed on every result and it favors llama, so any q27 win is conservative.
 Mainline is the **stock, no-drafter floor**: it isolates how much of the gap is
 the base decode kernel vs the drafter, and shows exactly what `ngram-mod` adds
@@ -21,6 +21,11 @@ over vanilla llama.cpp. (Mainline `13e67386` is ~2 weeks behind true nightly but
 carries the `qwen35` arch and the Anthropic `/v1/messages` endpoint; a fresh
 rebuild risks the known sm_120 toolchain traps and would not move the base-kernel
 number materially.)
+
+> **Serving headline (2026-07-16, v0.2.0):** 2 slots batch through one
+> fused weight sweep + graph replay -- **1.41x aggregate over FIFO on both
+> KV formats**, solo cost <=0.07%, zero-config. Full table + methodology:
+> "Single-box serving: 2-slot continuous-batching aggregate" below.
 
 ## Fairness controls (every cross-engine run)
 
@@ -62,7 +67,7 @@ Three regimes, chosen to bracket drafter behavior:
    climbs run-to-run (novel 56 → 79 → 97 t/s). Use the **cold** run (first call,
    or restart the server between prompts). q27 keeps no server-side table, so its
    number is request-invariant.
-2. **Cross-quant divergence.** Q5 vs NVFP4 can pick a different greedy token on
+2. **Cross-quant divergence.** Q5 vs q27's 4-bit tier can pick a different greedy token on
    the same prompt, after which the two engines generate different text (and
    different token counts). Such a payload is no longer a like-for-like
    comparison — drop it (this is why `echo_ctx26k` is excluded).
@@ -115,6 +120,40 @@ does not differentiate engines. The file-overlap signal is enough to confirm the
 agent did something on-target; anyone wanting the resolve % can run the `swebench`
 harness over the same pinned patches.
 
+### n=3 seal (2026-07-17 late, engine @ de5564c)
+
+The 07-14 table above is n=1 per instance (disclosed). Re-run at n=3
+on the two engines that carry the headline claim -- q27 and the
+mainstream ceiling (mainline llama.cpp + the same MTP head):
+
+| engine | decode t/s (3x12 instances, journal-aggregated) | wall (sum, 3 reps) | nonempty | gold-file |
+|---|---|---|---|---|
+| **q27** (vanilla, bare boot, post drift-mode-10 fix) | **201.2** (780 reqs, 178.2K tok) | 1876 s | **12/12** all reps | 11/12 all reps |
+| llama.cpp + MTP (13e67386) | 120.9 (703 reqs, 213.6K tok) | 2742 s | 12/12 | 11-12/12 |
+| q27 pre-fix (07-17, drift bug) | 192.4 | 1734 s | 10-11/12 | 9-10/12 |
+
+Sealed ratio: **1.66x decode** at n=3 (201.2 vs 120.9), and q27
+now MATCHES llama's 12/12 nonempty quality. The 07-17 pre-fix seal was
+1.59x with a 10-11/12 quality asterisk -- that asterisk was drift mode
+10 (a tool-parser miss ending some first tool calls early, root-caused
++ fixed in 601d7c3). Re-seal 07-18 on the fixed build: both previously
+-empty instances (flask-5014 deterministic, xarray-4094 lottery) now
+complete, still-empty NONE across all 3 reps. Wall rose 1734->1876s
+BECAUSE the fixed agent does real work on the two instances that used
+to quit at turn 1 -- decode t/s is the clean speed metric.
+
+The quality column is the honest cost of the reroll: q27 drew a
+DETERMINISTIC early-eos basin on `pallets__flask-5014` (main turn:
+23.7K-token prompt, 45 tokens, end=eos, byte-identical across all
+three reps -- the same one-shot-quit class the 07-16 task-dome
+found on v1.4 at 131K) plus a 2-of-3 lottery basin on
+`pydata__xarray-4094` (agent works, never lands the edit; one
+63-turn spin). llama drew neither. Greedy basins re-roll across
+legitimate engine changes; this pair is now the standing regression
+probe for the early-quit class, and the [drift] first-tool-call
+rescue miss (flagged at the dome) graduates from "deserves a look"
+to "has a reproducer".
+
 ## Reproduce
 
 Prereqs: Docker + the `thunderdome/claude-code` image (or any image with node +
@@ -149,8 +188,14 @@ bash bench/swebench/run.sh llamamain     # -> results.llamamain.jsonl (unit llam
 #       ...same launch... --spec-type draft-mtp --spec-draft-n-max 6
 bash bench/swebench/run.sh llamammtp     # -> results.llamammtp.jsonl (unit llamammtp-eval)
 
-# 4c. (vLLM) needs two extra pieces: vLLM has no /v1/messages, so Claude Code talks
+# 4c. (vLLM) needs two extra pieces: vLLM's 07-14 nightly ran without a working /v1/messages for
+#     this setup, so Claude Code talks
 #     to a litellm Anthropic->OpenAI shim on :8081 that forwards to vLLM on :8080.
+#     (2026-07-17 note: current vLLM's Python frontend now serves
+#     /v1/messages natively via an Anthropic->OpenAI double adapter;
+#     the Rust frontend still lacks it. A native-endpoint rerun would
+#     remove the shim hop -- unmeasured, flagged for the next vLLM
+#     pass.)
 #     - vLLM (5090-only, single-seq, MTP, qwen3_coder tool parser for the XML tool format):
 #         docker run --gpus '"device=0"' -p 8080:8000 -v <hf_cache>:/root/.cache/huggingface \
 #           vllm/vllm-openai:nightly --model unsloth/Qwen3.6-27B-NVFP4 --served-model-name vllm-qwen \
@@ -211,7 +256,7 @@ The five engines decompose the gap cleanly (all same model + MTP head available)
   for a mainstream engine on this model, not a one-off.
 - **On that same MTP head, q27 is still ~1.73× faster than both** (202.7 vs
   ~117). That residual is q27's engine — the fused shared-KV MTP+SuffixDraft
-  verify, NVFP4 kernels, and tie/tolerance discipline — not the drafter *choice*.
+  verify, the Q4/Q8 dp4a kernels, and tie/tolerance discipline — not the drafter *choice*.
   It matches Method A, where q27 leads llama+MTP on novel generation (157 vs 92
   t/s) but ties on echo (178 vs 184).
 - **vLLM pays a wall-time tax this benchmark exposes.** Its decode (117) is
@@ -222,7 +267,10 @@ The five engines decompose the gap cleanly (all same model + MTP head available)
   reuse prefix/checkpoint state across turns, so they convert competitive decode
   into far lower wall time. This is an arch-support gap, not raw kernel speed, but
   it's real for anyone serving this model agentically on vLLM today.
-- **Quality is engine-independent** (11–12/12 edited-gold-file across all five) —
+- **Quality converged to the model once both tool protocols were validated**
+  (11–12/12 edited-gold-file across all five) — engines CAN move quality
+  through tool-protocol failures (the strict-parser episode scored a 0.00
+  on exactly that class before the tolerant parser landed) —
   the model is identical; the engine only changes speed. The 1-instance spread is
   agentic noise.
 
@@ -261,6 +309,292 @@ the documented A1 suffix-trim policy (it did here — 4 trim rounds/leg fp8,
 concurrency rep-to-rep on BOTH legs (quantized-KV tie re-rolls; the docs
 md5 sets still match A vs B).
 
+## vs club-3090 community recipes (their harness, our silicon)
+
+club-3090 maintains the largest public cross-rig benchmark matrix for
+this model family (vLLM / llama.cpp / ik_llama / beellama recipes on
+3090/4090/5090-class cards). On 2026-07-16 we ran THEIR canonical
+harness verbatim against q27 -- endpoint-only mode, zero q27-side
+special-casing:
+
+```
+cd club-3090 && URL=http://localhost:8020 CONTAINER=none PP=1 bash scripts/bench.sh
+```
+
+Their protocol: 3 warmups + 5 measured runs of two fixed prompts
+(narrative essay `max_tokens=1000`, Python quicksort `max_tokens=800`),
+streaming `/v1/chat/completions` at temperature 0.6 / top_p 0.95 with
+`enable_thinking:false`; **wall TPS** = completion_tokens / wall (their
+headline) and **decode TPS** = completion_tokens / (wall - client TTFT);
+plus salted, cache-busted prefill probes at ~10K and ~90K token depths
+(prefill t/s = prompt_tokens / TTFT, client-observed). Token counts come
+from the OpenAI `stream_options.include_usage` usage chunk -- the q27
+server grew that (commit `aa991de`) as the comparability prerequisite.
+Each GPU was benched TWICE (their own repeatability practice); both
+passes shown.
+
+q27 rows (vanilla qwen36-27b-mtp, single slot, bare v0.2.0 serving
+defaults, this rig, 2026-07-16):
+
+| q27 config | ctx | narr wall (decode) t/s | code wall (decode) t/s | TTFT | prefill t/s @10K / @90K |
+|---|---|---|---|---|---|
+| **5090** (W12, fp8 KV + fdmma, auto-ctx), pass 1 | 262144 | **144.15 (151.81)** | **193.04 (210.92)** | 350 ms | 3372 / 2559 |
+| 5090, pass 2 | 262144 | 143.97 (151.62) | 192.82 (210.65) | 350 ms | 3350 / 2560 |
+| **3090** (w8, fp16 KV + h16 mma, `--ctx 24576`), pass 1 | 24576 | **84.06 (88.59)** | **105.76 (115.08)** | 609 ms | 1124 / SKIP (>ctx) |
+| 3090, pass 2 | 24576 | 83.41 (87.88) | 105.67 (114.97) | 611 ms | 1123 / SKIP (>ctx) |
+
+In-run CV <= 0.3%, pass-to-pass <= 0.8%. q27's own `[req]` telemetry
+agrees with their client-side decode numbers within 0.5% (5090: 151.4
+t/s at 2.64 tok/round narrative, 209.8 at 3.86 code; 3090: 88.2 /
+114.5) -- two independent instruments, one answer.
+
+Their published rows (club-3090 `BENCHMARKS.md`, quoted as-is with rig +
+date -- their numbers on their community rigs, NOT re-measured here):
+
+| their row (rig, date) | ctx | narr t/s | code t/s |
+|---|---|---|---|
+| 1x5090 vLLM DFlash fp8 (@efschu, 575 W, 2026-05-07) | 49K | 126.53 wall (127.98 decode) | 200.11 wall (204.80 decode) |
+| 1x3090 ik_llama two-stage (370 W, 2026-05-24) | 200K | 59.4 decode | 97.8 decode |
+| 1x3090 ik_llama MTP (370 W, 2026-05-23) | 200K | 59.67 wall (60.39 decode) | 68.78 wall (72.40 decode) |
+| 1x3090 llama.cpp MTP (2026-05-23) | 200K | 49.69 wall (50.27 decode) | 57.50 wall (58.92 decode) |
+| 1x3090 beellama DFlash (370 W, 2026-05-30) | 102K | 50.2 wall (50.4 decode) | 99.7 wall (101.3 decode) |
+| 1x3090 vLLM long-text | 90K | ~50 | ~67 |
+| *multi-GPU context:* 2x3090 vLLM dual (290 W, 2026-07-09) | 262K | 96 decode | 127 decode |
+| *multi-GPU context:* 2x5090 vLLM dual (2026-06-25) | 262K | 153.41 wall (154.62 decode) | 196.91 wall (200.13 decode) |
+
+Read (decode-to-decode, spec-on vs spec-on):
+
+- **5090**: q27 **+19% narrative** over their best single-5090 row
+  (151.8 vs 127.98 decode); code is a near-tie (**+3%**, 210.9 vs 204.80
+  -- DFlash N=5 is strongest exactly on token-predictable code). On wall
+  TPS q27 wins narrative +14% and cedes 3.5% on code. A single q27 5090
+  lands within 2-6% of their DUAL-5090 vLLM aggregate row (144/193 vs
+  153/197 wall).
+- **3090**: q27 **+47% narrative** over the best published single-3090
+  decode (88.6 vs ik MTP 60.39) and **+14% code** over the best (115.1
+  vs beellama DFlash 101.3; +18% vs ik two-stage 97.8, +95% vs mainline
+  llama.cpp MTP 58.92). A single q27 3090 reaches ~91% of their 2x3090
+  vLLM dual decode row (96/127).
+- **Prefill**: on the 3090 their llama-family rows publish the same
+  client-observed PP instrument -- mainline 1025, ik 1109 -- and q27
+  measures 1092-1126: parity on Ampere prefill (consistent with the
+  07-12 raw-kernel A/B where llama led). The 5090 client-observed
+  2.56K t/s at 90K depth matches q27's engine-side pf rate (2557-2583).
+- **TTFT on tiny prompts** is q27's worst number in their table: ~350 ms
+  (5090) / ~610 ms (3090) prefill-pipeline floor on 25-token prompts,
+  where their vLLM rows publish ~51-53 ms. Gone by the first token;
+  stated because their table shows it. *(Fixed 2026-07-17: the serial
+  prefill walk under 32 tokens was the whole floor -- Q27_PF_BATCH_MIN
+  routes tiny prompts down the chunked path; TTFT now 31-33 ms (5090)
+  / 53-55 ms (3090). See the addendum follow-up below.)*
+
+Caveats, theirs and ours, stated plainly:
+
+- **Cross-rig variance dominates.** Their own rulebook: "variations ...
+  usually trace back to power caps, PCIe lane counts, or pin." These are
+  OUR numbers on OUR silicon vs their contributors' rigs. Concretely:
+  most of their 3090 rows ran at a 370 W cap and they document -29..-42%
+  decode going 370->230 W; our 3090 ran at stock (observed draw ~417 W).
+  Part of the 3090 gap is power, not engine.
+- **Sampling parity is temp+top_p only.** Their harness pins temperature
+  0.6 / top_p 0.95 in the request; their engines compose a server-default
+  top_k=20 on top, and q27 has no top_k. A sampling-distribution nuance,
+  TPS-neutral -- every run on both sides decodes to the max_tokens cap.
+- **Wall vs decode preserved** per their two-metric convention; both are
+  quoted wherever they publish both.
+- **Spec-to-spec is fair**: every headline row of theirs is
+  speculation-on (MTP / two-stage / DFlash); q27 runs its own MTP +
+  suffix stack. Nobody here is compared spec-off.
+- **Their FAIL-drop rule** (failed runs fall out of the summary stats):
+  no q27 run failed in any of the four passes. The one non-measurement
+  is the 3090 90K prefill depth, which their harness SKIPped cleanly on
+  q27's context-limit 400 (24576 ctx < 90K) -- their documented over-ctx
+  path, not a failure.
+- **Context ceiling is the honest trade on the 3090 row.** Their 3090
+  recipes serve 102K-200K; this q27 3090 config serves 24576 (fp16 KV on
+  24 GB; the 5090-calibrated auto-ctx anchor over-sizes on sm_86 -- auto
+  36864 and explicit 32768 both OOM at spec-graph instantiation under
+  the 07-16 defaults, 24576 boots). *(Auto-ctx recalibrated 2026-07-17
+  -- measured-free sizing, exact per-token KV; picks now boot on both
+  cards. See the BUILDLOG entry.)* q27's turbo3 KV serves 131072 on
+  this same card at 102.2 t/s live agentic decode (BUILDLOG 2026-07-12);
+  that config was not the one benched here. *(2026-07-17: turbo3 is now
+  the sm_86 serving default at the FULL 262144 window -- see the
+  addendum below.)*
+- **Quant tiers differ across all rows** (theirs: AutoRound-INT4,
+  Q4_K_M, IQ4_KS, Q5_K_S; q27: its own Q4_G64/Q8_G128 v1.4 tier, 17.73 GB --
+  same model family, not identical checkpoints. And their rows are dated
+  2026-05..07 on the engine pins of those days; engines move.
+
+### Matched-bpw rerun: q4s-v1 in the community 4-bit band (2026-07-16)
+
+The run above carried the "quant tiers differ" caveat: the 5.25-bpw
+default tier sits above their 4-bit recipes. The q4s-v1 repack (15.46
+GB, **4.55 bpw**: Q8 promotions cut to 41 tensors, single Q4 lm_head;
+BUILDLOG "q4s tier SHIPPED" + "q4s-v1 REPACK VALIDATION") drops q27
+into their band, so this is the harness rerun with weights-bpw matched.
+Same command, endpoint-only, two passes per GPU, bare serving defaults
+(only `--ctx` differs on the 3090, see below). q27 bpw figures are the
+tier labels (whole-model bytes / params, same denominator as the 5.25
+default). Their AutoRound INT4 rows are ~4.1 bpw on the *linears* but
+~5.0-5.3 whole-model once the fp16 embeddings + lm_head are counted --
+q4s (Q8 embed, Q4 head) undercuts even that.
+
+| config (weights bpw) | ctx | narr wall (decode) t/s | code wall (decode) t/s |
+|---|---|---|---|
+| **q27 q4s-v1, 5090** (4.55), pass 1 | 262144 | **146.82 (154.20)** | **181.60 (196.16)** |
+| q27 q4s-v1, 5090, pass 2 | 262144 | 146.58 (153.94) | 181.49 (196.02) |
+| q27 v1.4, 5090 (5.25), best pass (above) | 262144 | 144.15 (151.81) | 193.04 (210.92) |
+| their 1x5090 vLLM DFlash (AutoRound INT4 ~4.1 linears / ~5.0-5.3 whole) | 49K | 126.53 (127.98) | 200.11 (204.80) |
+| **q27 q4s-v1, 3090** (4.55), pass 1 | **61440** | **88.51 (93.16)** | **99.39 (106.92)** |
+| q27 q4s-v1, 3090, pass 2 | 61440 | 87.84 (92.43) | 99.21 (106.72) |
+| q27 v1.4, 3090 (5.25), best pass (above) | 24576 | 84.06 (88.59) | 105.76 (115.08) |
+| their 1x3090 ik_llama two-stage (IQ4_KS ~4.25) | 200K | 59.4 decode | 97.8 decode |
+| their 1x3090 ik_llama MTP (IQ4_KS ~4.25) | 200K | 59.67 (60.39) | 68.78 (72.40) |
+| their 1x3090 llama.cpp MTP (Q4_K_M ~4.85) | 200K | 49.69 (50.27) | 57.50 (58.92) |
+| their 1x3090 beellama DFlash (Q5_K_S ~5.36 + IQ4_XS draft) | 102K | 50.2 (50.4) | 99.7 (101.3) |
+
+Same instruments as above: in-run CV <= 0.3%, pass-to-pass <= 0.8%;
+engine `[req]` telemetry agrees with their client-side decode within
+0.5% (5090: 153.5-153.9 t/s at 2.58 tok/round narrative, 195.1-195.3
+at 3.45 code; 3090: 92.1-93.0 at 2.67, 106.3-106.5 at 3.17). 3090 at
+stock power (observed ~417 W) vs their mostly 370 W-capped rows -- the
+power caveat from the v1.4 run stands unchanged.
+
+Read, decode-to-decode:
+
+- **3090 matched-bpw**: q4s **+54% narrative** over the best published
+  single-3090 decode (93.2 vs ik MTP 60.39, now at comparable bpw) and
+  **+5.5% code** over beellama DFlash (106.9 vs 101.3 -- and DFlash
+  carries 0.8 MORE bpw here). vs our own v1.4 rows: narrative +5.2%,
+  code **-7.2%** -- the single-Q4-head tier re-rolls the code
+  acceptance basin (tok/round 3.86 -> 3.45 on the 5090 code prompt;
+  narrative 2.64 -> 2.58 barely moves), so the byte savings win on
+  low-acceptance traffic and lose on high-acceptance code. Same
+  pattern both GPUs.
+- **5090**: q4s narrative 154.2 stays +20% over their best single-5090
+  decode (127.98); code 196.2 now cedes **-4.2%** to their DFlash
+  204.80 (v1.4 was +3%) -- the code-acceptance price above, stated
+  plainly.
+- **Context ceiling, the headline q4s buys**: the 3090 config serves
+  **61440** (boots; 65536 OOMs at spec-graph instantiation; auto-ctx
+  still 5090-calibrated, picks 69632 and OOMs) -- **2.5x** the v1.4
+  config's 24576 on the same card, same fp16-KV defaults. The 2.27 GB
+  of freed weights went straight to KV. Their 3090 rows still serve
+  102-200K; closing the rest is the turbo3 lever (131K on this card,
+  BUILDLOG 2026-07-12), not weights. *(Both flags resolved 2026-07-17:
+  auto-ctx recalibrated to measured-free sizing, and q4s + turbo3
+  boots the full 262144 window on this 3090 -- needle 6/6 at a 233K
+  prompt. See the BUILDLOG entry and the addendum below.)*
+- **KV-bits asymmetry, theirs-favoring**: our 3090 leg runs fp16 KV
+  (16 bits/token-channel) vs their 3090 rows' q4_0/q5_0 KV (~4-5
+  bits). They spend ~3x fewer bits on KV -- that is where their 200K
+  ceilings come from, and it makes the decode comparison conservative
+  in their favor on memory traffic (their KV reads are smaller).
+- **Quality ladder at 0.66 bpw less** (q4s vs v1.4, validation run
+  2026-07-16, BUILDLOG "q4s-v1 REPACK VALIDATION"): wikitext-2 PPL
+  **8.0197 vs 8.0409 (-0.26%, q4s BETTER**; +1.29% vs the Q5_K_M bar
+  vs v1.4's +1.55%); agentic-corpus NLL flat at CC depths except one
+  content-diverse bucket (16k-32k **+2.63%**, generic-corpus control
+  -1.29..+1.21% across the same depths => content noise, not
+  systematic); needle spot 2/2 exact at ~149K/~24K depth in a 248.7K
+  prompt. The cheaper quant does not pay a measured quality tax; it
+  pays a code-acceptance speed tax.
+
+### Addendum 2026-07-17 -- turbo3 closes the 3090 context column
+
+Same card, same harness, q4s + `Q27_KV=turbo3`, auto-ctx (recalibrated
+this day) lands the **full 262144 native window on the 24 GB 3090**
+(0.67 GB spare at ready; needle 6/6 verbatim on a ~233K-token haystack,
+deepest plant ~95%). Decode does not pay for it -- it gains:
+
+| 3090 leg (q4s) | narr wall/decode | code wall/decode | TTFT | ctx |
+|---|---|---|---|---|
+| fp16 KV (07-16 leg) | 88.5 / 93.2 | 99.4 / 106.9 | ~565ms | 61440 |
+| turbo3 KV (07-17) | **89.45 / 94.23** | **108.32 / 117.38** | 567ms | **262144** |
+
+The 5090's turbo3 decode tax inverts on Ampere: 800 B vs 4096 B per KV
+pair per token, and on a bandwidth-starved part the KV-read savings beat
+the dequant compute (code +9.8% decode). Prefill tax ~3% at 10K (1096
+vs 1131 tok/s); the 90K-class prefill leg is measurable for the first
+time on this card (643 tok/s cache-busted, previously SKIPped as
+over-ctx). Against their published single-3090 rows this config now
+leads every column at once: narrative decode 94.2 vs ik's 60.4, code
+117.4 vs beellama DFlash's 101.3, at 262K ctx vs their 102-200K
+ceilings. The context trade flagged above is closed.
+
+**Same-day follow-up -- the TTFT anomaly is dead too** (BUILDLOG
+"Ampere pass"): the 350/567ms TTFT floors were prompts <32 tokens
+taking a serial prefill walk (~22ms/token sm_86, ~11 sm_120); with
+`Q27_PF_BATCH_MIN=2` (CC profile default) tiny prompts ride the
+chunked path. Post-fix, same harness: **5090 TTFT 31-33ms** (their
+best single-5090 ~51ms), **3090 TTFT 53-55ms** (parity with their
+class), 5090 narrative wall 146.8 -> 161.1 (+9.7%), 3090 code wall
+108.3 -> 115.5 (+6.6%). Decode rates re-roll +-1-5% on the new
+tiny-prompt transcripts. turbo3 is also now the serving DEFAULT on
+sm_86 (bare boot = turbo3 @ 262144 on a 3090).
+
+### Independent tool: llama-benchy (2026-07-19, RTX 5090, q4s fp8)
+
+[llama-benchy](https://github.com/eugr/llama-benchy) is a community
+llama-bench-style benchmarker for any OpenAI endpoint -- MTP-aware, real
+Gutenberg-text prompts, correct TTFT (to first usable token), and it can
+separate cold prefill from prompt-processing over already-cached context.
+That last mode is the one that quantifies q27's actual differentiator.
+
+Cold sweep (`--pp 512 --tg 128 --depth 0 4096 16384 65536 --runs 3`,
+tokenizer `Qwen/Qwen3.6-27B`):
+
+| depth | prefill pp (t/s) | decode tg (t/s) | cold TTFT |
+|---|---|---|---|
+| 0     | 3386 | 159.2 | 193 ms |
+| 4096  | 3548 | 127.3 | 1.34 s |
+| 16384 | 3361 | 120.9 | 5.07 s |
+| 65536 | 2779 | 102.4 | 23.8 s |
+
+tg=159 at depth 0 cross-checks the club-harness narrative decode (162).
+Prefill holds 2.8-3.5K t/s on the 5090's fp8-MMA path. Cold TTFT grows
+with depth because a cold turn re-prefills the whole context -- which is
+exactly what q27's GDN-state checkpoint avoids on warm turns:
+
+**Cached-context follow-up at d65536 (`--enable-prefix-caching`): a
+512-token turn over already-cached 65K context = TTFT 2.13 s vs the
+cold 23.8 s -- 11x.** The checkpoint engages on `/v1/chat/completions`,
+not just the Anthropic `/v1/messages` path. This is the "q27 doesn't
+re-prefill" claim measured by a third-party tool: on multi-turn agentic
+traffic (every turn a warm follow-up at growing depth) q27 pays the 2 s,
+a paged-KV engine pays the 24 s -- the mechanism behind the 4.7x wall
+gap vs vLLM.
+
+Honest reads: the cold deep-prefill (23.8 s at 65K) is real -- q27 has
+no fp8-MMA prefill leg on sm_86, and even on the 5090 a cold 65K prefill
+is 24 s; the win is entirely in NOT paying it twice. Decode holds
+~100 t/s at 65K depth (KV-streaming bound, cache-independent).
+
+### Addendum 2026-07-17 -- first 4090 (sm_89) numbers, RunPod field test
+
+q27's first run on Ada silicon (RunPod RTX 4090 24GB, CUDA 12.6
+toolkit -- 12.4+ is a hard floor, older ptxas rejects the sm_89 e4m3
+MMA forms). q4s tier, w8 build, their bench.sh verbatim on-pod:
+
+| 4090 leg (q4s, auto-ctx) | narr wall/decode | code wall/decode | TTFT | ctx |
+|---|---|---|---|---|
+| fp8 KV (sm_89 default) | 102.06 / 102.58 | 135.48 / 136.64 | 49ms | 110592 |
+| turbo3 KV | -- | 130.95 / 132.03 | 50ms | **262144** |
+
+vs their best published single-4090 (ik two-stage, 82.5/120.9 decode
+@160K): **+24% narrative / +13% code at 1.6x the context** (fp8), or
+the full native window at a 3.4% code toll (turbo3). The turbo3 tax
+ladder now spans three arches: 5090 fp8-wins-big, 4090 fp8-wins-small,
+3090 turbo3-wins-outright -- compute-vs-bandwidth, exactly as the
+physics predicts. Cross-arch determinism: the sm_89 CLI canonical is
+byte-identical to the sm_86 anchor (8196e65e... for q4s -- one anchor
+per SASS family, 8.x and 12.x), and the fp8 serving probe matched the
+5090's greedy output byte-for-byte. Prefill on Ada is near-5090-class
+(~3.1K tok/s at 10K on turbo3). auto-ctx gained an sm_89 base (Ada's
+fixed stack measured ~1 GB over the sm_120 constants; the
+pre-calibration pick survived with 40 MB to spare).
+
 ## History / non-reproducible baselines
 
 An earlier cross-engine run used 3 **private** greenfield tasks (not
@@ -272,7 +606,8 @@ captures on public tasks.
 ## Honest caveats
 
 - Quantization confound: the two llama builds are Q5_K_M (+0.25 bpw vs q27's
-  NVFP4, favors llama); vLLM is NVFP4 (the *same* quant family as q27, so the
+  q27's 4-bit, favors llama); vLLM is NVFP4 proper -- e2m1 + fp8 block scales,
+  a different format than q27's integer group quant but the same bit class, so the
   cleanest comparison), but from a different checkpoint (`unsloth`, the multimodal
   variant — its unused vision tower costs VRAM, which is why vLLM ran at 131072
   ctx not higher).

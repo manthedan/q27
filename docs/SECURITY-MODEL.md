@@ -59,20 +59,28 @@ left as-is by design. (Finding numbers follow the external review.)
 default, unbounded work queue, O(n^2) BPE on long mergeable words. Every one of these is
 a network-exposure or adversarial-input concern. On localhost with a cooperative client
 there is no attacker to send an oversized body or a pathological merge word, and the
-operator does not DoS themselves. *Mitigation already available:* `--host 127.0.0.1`
-closes the bind concern in one flag the day it matters. *One caveat with a self-inflicted
+operator does not DoS themselves. *Update 2026-07-12 (0b34934): the default bind is now
+`127.0.0.1`; a non-loopback bind is an explicit `--host` opt-in, so the bind half of this
+finding is closed in code, not just dispositioned.* *Update 2026-07-19: opt-in
+`--api-key`/`--api-key-file`/`Q27_API_KEY` auth exists now (see the addendum below) --
+the auth half of this finding has a mitigation available, but it is a shared-secret
+gate, not the TLS/rate-limiting/request-size-bounding the finding also names. Those
+remain open; see "When this model breaks" for the recommended disposition if any of them
+become relevant.* *One caveat with a self-inflicted
 edge:* the quadratic BPE (`tokenizer.cpp:110-121`, erase-in-loop, no word-length cap) can
 bite the operator's own coding-agent workload -- a single large no-whitespace blob
 (minified JS, base64) collapses to one word and tokenizes O(n^2) single-threaded before
 any context check. Not a security issue, but the one sub-point of #3 worth a bounded-word
-fix on performance grounds. See carve-outs.
+fix on performance grounds. *Shipped 2026-07-14 (94e645a): WORD_CAP=1024 chunks over-cap
+words; inert below 1024 B, canonical byte-identical.*
 
 **#5 -- Disconnected clients keep consuming GPU; public `/health?verify` stalls
 inference.** Both are resource-abuse vectors: a hostile client disconnects mid-generation
 to waste GPU, or hammers the weight-checksum endpoint to stall decode. A single operator
 who disconnects has simply cancelled their own work, and does not attack their own health
 endpoint. Cancellation-on-disconnect is a *nicety* (frees your own GPU sooner), not a
-security control -- tracked as ordinary polish, not a fix-now item.
+security control. *The nicety shipped 2026-07-14 (94e645a): all three streaming APIs
+(OpenAI, Anthropic, Responses) now stop generating when the client drops.*
 
 **#6 -- Tool parsing "fails open."** The tolerant parser scans prose for call-shaped
 JSON, repairs truncation, and does not check parsed tool names against the request's
@@ -119,6 +127,13 @@ already opt-in, already documented OFF under `--slots`. Not a new finding.
 > and the correctness bugs (L2-eps, Model move-assign UB, DeviceModel double-free, --ctx
 > floor) in commits fd0f504 and 4fa9d24. Canonical 4c4120c7 unchanged. The multi-tenant /
 > untrusted-artifact findings above remain dispositioned out by design (not "unfixed vulns").
+
+> **STATUS 2026-07-14 (second triage, BUILDLOG "security/robustness review triage"):** the
+> remaining single-user polish landed in 94e645a -- empty prompts now rejected HTTP 400 at the
+> handler plus a `ckpt_best()` size_t-underflow fix (a REAL crash found past #2's analysis: it
+> ran at slot selection, before the engine-entry `NP>=1` guard, once any checkpoint existed),
+> disconnect cancellation on all streaming APIs, BPE WORD_CAP=1024, terminal `finish_reason`.
+> The hostile-artifact findings (#9/#10/#11 class) stayed dispositioned out per this doc.
 
 The "ignore multi-tenant" instruction must not bury these. None of them need an attacker.
 A benign malformed request, an oversized-but-honest prompt, or untrusted *content* (not
@@ -180,7 +195,7 @@ worth an actual fix pass, ranked by how easily normal use hits them.
    - **L2-norm epsilon mismatch:** batched prefill uses `max(sum, eps)` (`prefill.cu:644`)
      while serial/spec use `max(sum, eps^2)` (`blocks.cu:44`). A genuine batched-vs-serial
      numeric divergence -- relevant to this project's *bitwise-prefill-identity* invariant,
-     which is load-bearing for the warm-vs-cold gates. Worth reconciling on the merits, quite
+     which the warm-vs-cold gates depend on. Worth reconciling on the merits, quite
      apart from security.
    - **`Model` move-assign UB** (`loader.cpp:46`, explicit `~Model()` then assign into dead
      members) and **`DeviceModel` implicitly copyable** despite owning raw CUDA pointers
@@ -202,7 +217,83 @@ network/multi-tenant posture.
 
 ---
 
-## When this model breaks (re-activation triggers)
+## Addendum 2026-07-16: the continuous-batching surface
+
+v0.2.0 ships continuous batching ON by default in the serving profile (BUILDLOG
+2026-07-14..16): a conductor thread fuses concurrent slots' decode rounds into shared
+weight sweeps (plus replayed CUDA graphs) and streams tokens back through per-request
+TokenQueues. What this does and does not change here:
+
+- **The tenancy row above is unchanged.** Batch mode co-schedules *the operator's own*
+  concurrent requests on one GPU; no new principal exists, so cross-request co-residency
+  in a fused round is a performance structure, not a trust boundary. The moment slots
+  serve distinct principals, the "When this model breaks" triggers below apply exactly
+  as written.
+- **Cross-request contamination is a gated numeric claim, not an assumption.** Batched
+  output is byte-identical to the solo references (master-gate refs, canonical,
+  sampled-seed, ninv incl. the table-twin leg), and a request alone on the box runs the
+  k==1 solo path (0.00% measured delta).
+- **Error posture (A2).** CUDA failures stay process-fatal -- the server exits rather than
+  serve past a poisoned GPU context. A host-side exception in one member's round
+  bookkeeping fails *that member's* queue only; the fused round continues for the rest.
+- **Config guard is two-tier (M2).** User-explicit `Q27_BATCH=1` plus an incompatible env
+  (`Q27_PMIN<=0`, `Q27_DEXIT=0`, `Q27_SAMPLE_PLAIN`, `Q27_TOOL_SPLIT`) is a fail-fast
+  FATAL exit; profile-*default* batching auto-disables with a one-line notice and serves
+  exactly as pre-batching. Kill switches: `Q27_BATCH=0`, `Q27_BATCH_GRAPH=0`,
+  `Q27_PROFILE=ref`.
+
+Nothing in this addendum re-activates or weakens the dispositions above; the DoS /
+multi-tenant / hostile-artifact scoping is unaffected.
+
+---
+
+## Addendum 2026-07-19: opt-in API key authentication
+
+`--api-key`/`--api-key-file`/`Q27_API_KEY` add an optional shared-secret gate
+(`server.cu`, httplib pre-routing handler; `api_common.h` for the constant-time
+compare and header parsing). This does **not** change the threat model or
+tenancy row above, and does not supersede this doc's closing recommendation
+("bind `127.0.0.1`, terminate auth/TLS/rate-limiting at an authenticated
+reverse proxy" for real exposure) -- it is a lighter-weight option for the
+middle ground between pure loopback-trust and standing up a full proxy: a
+trusted-LAN deployment, a quick tunnel, or a container where the operator
+wants *something* between "wide open" and "not reachable at all" without the
+operational overhead of nginx/Caddy in front.
+
+**What it is:** a single shared secret (or a small rotation set via
+`--api-key-file`/multiple `--api-key` flags), checked via
+`Authorization: Bearer <key>` or `x-api-key: <key>` before route dispatch.
+Constant-time comparison; `/health` stays open for infra health checks.
+
+**What it explicitly is NOT** -- the rest of finding #3 and the DoS/tenancy
+findings above are otherwise unchanged by this:
+- Not TLS. The key travels in plaintext over an unencrypted connection
+  unless the operator adds TLS separately (a reverse proxy, an SSH tunnel,
+  a VPN). A shared secret sent in the clear over an untrusted network is
+  interceptable.
+- Not rate-limiting or request-size bounding (finding #3's other
+  sub-points -- unbounded httplib payload size, unbounded work queue --
+  are still open).
+- Not multi-tenant isolation. One valid key authenticates the caller as
+  *the* operator, full stop -- there is still one principal, one KV/mask
+  cache, one set of slots. This narrows "who can send requests" without
+  adding any of the per-tenant isolation findings #2/#8 above would need
+  for actual multi-tenant serving.
+- Not a defense against a compromised or malicious *client* -- it defends
+  the boundary between "has the key" and "does not," not what a key-holder
+  can do once authenticated (still everything, per the existing threat
+  model).
+
+**Revised tripwire guidance:** the first bullet under "When this model
+breaks" below (non-loopback bind) is now a *spectrum* rather than a binary
+-- non-loopback + no key is unchanged (fully open, findings #3/#5/#8 fully
+live); non-loopback + `--api-key` narrows the exposure to "anyone with the
+key" but the rest of finding #3 (no TLS, no size/rate bounding) and the
+tenancy findings (#2 leak-half, #8) are unaffected and still require the
+proxy-based disposition this doc recommends if the deployment is genuinely
+multi-tenant or internet-facing.
+
+
 
 This entire doc is contingent. The out-of-scope findings become live again the instant any
 of these becomes true -- treat this list as the tripwire:

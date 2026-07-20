@@ -104,6 +104,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s model.q27 model.tok [--port N] [--host H] [--ctx C]\n"
+                "  [--api-key KEY] [--api-key-file PATH]\n"
                 "  Defaults (2026-07-10) = the measured Claude-Code stack: fp8 KV +\n"
                 "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=<W_MAX> + Q27_FD=mma (sm_89+)\n"
                 "  + fast-head + no-think + phase stats; --ctx auto-sizes to VRAM\n"
@@ -111,7 +112,14 @@ int main(int argc, char** argv) {
                 "  Q27_PROFILE=ref (conservative\n"
                 "  reference: fp16/ungated/no-suffix/fd2), any individual Q27_* env,\n"
                 "  --kv-fp16 --no-fast-head --think. The CLI binary keeps reference\n"
-                "  defaults (bitwise canonical).\n",
+                "  defaults (bitwise canonical).\n"
+                "  Auth: no API key is required by default (loopback-only is the\n"
+                "  safety net). --api-key KEY may repeat; --api-key-file PATH loads\n"
+                "  one key per line (# comments ignored); Q27_API_KEY adds one more.\n"
+                "  Any configured key is accepted via 'Authorization: Bearer <key>'\n"
+                "  (OpenAI/llama.cpp convention) or 'x-api-key: <key>' (Anthropic\n"
+                "  convention, what Claude Code sends) on every endpoint except\n"
+                "  /health.\n",
                 argv[0]);
         return 1;
     }
@@ -129,6 +137,7 @@ int main(int argc, char** argv) {
     int think_flag = -1;
     bool kv_fp16 = false;
     bool constrain_tools = false;
+    std::vector<std::string> api_keys;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -141,7 +150,33 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--think")) think_flag = 1;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
+        else if (!strcmp(argv[i], "--api-key") && i + 1 < argc) api_keys.push_back(argv[++i]);
+        else if (!strcmp(argv[i], "--api-key-file") && i + 1 < argc) {
+            if (!q27::load_api_key_file(argv[++i], &api_keys)) {
+                fprintf(stderr, "error: --api-key-file %s: could not open\n", argv[i]);
+                return 1;
+            }
+        }
     }
+    // Q27_API_KEY: a second, additive source (not exclusive with the CLI
+    // flags above -- all configured keys are valid simultaneously, matching
+    // --api-key-file's multi-key semantics). Preferred for containerized
+    // deployments where CLI args are visible via `ps` but env vars set
+    // through the orchestrator's secret store are not.
+    if (const char* envkey = getenv("Q27_API_KEY"))
+        if (envkey[0]) api_keys.push_back(envkey);
+    // The existing loopback-by-default posture (see the comment above host's
+    // declaration) was this server's ONLY safety net before auth existed.
+    // Now that --api-key/--api-key-file/Q27_API_KEY exist, warn loudly
+    // (not refuse -- some deployments intentionally run without auth behind
+    // their OWN reverse-proxy auth layer, and silently breaking that on
+    // upgrade would be worse) when binding non-loopback with none configured.
+    if (api_keys.empty() && host != "127.0.0.1" && host != "localhost" && host != "::1")
+        fprintf(stderr,
+                "WARNING: binding %s with NO API key configured (--api-key / "
+                "--api-key-file / Q27_API_KEY) -- this server will accept "
+                "unauthenticated requests from anyone who can reach it.\n",
+                host.c_str());
     // CC-SERVING DEFAULTS (width-12 + tuning day, 2026-07-10): a bare
     // `q27-server model tok` serves the full measured stack -- the exact
     // config every live trial and record number was earned on. Mechanism:
@@ -179,13 +214,24 @@ int main(int argc, char** argv) {
             setenv("Q27_FD", "mma", 0);
         } else if (cc_arch >= 80) {
             // H16 (fp16-MMA) verify: Ampere gets the mma path too
-            // (2026-07-12, docs/plans/2026-07-12-fdmma-f16.md); KV default
-            // stays fp16 there (no fp8 HW) -- turbo3 opt-in recommended.
+            // (2026-07-12, docs/plans/2026-07-12-fdmma-f16.md).
+            // KV defaults to turbo3 on Ampere (2026-07-17, Gabe sign-off):
+            // no fp8 HW here, and the 5090's turbo3 decode tax INVERTS on a
+            // bandwidth-starved part -- 3090 q4s decode narr +1.1% / code
+            // +9.8% over fp16 at 4.27x the context (262144 on 24 GB, needle
+            // 6/6 @233K; BUILDLOG 2026-07-17). setenv(overwrite=0): any
+            // user Q27_KV wins; Q27_PROFILE=ref keeps fp16.
+            setenv("Q27_KV", "turbo3", 0);
             setenv("Q27_FD", "mma", 0);
         }
         setenv("Q27_PMIN", "0.5", 0);
         setenv("Q27_MAXD", "auto7", 0);
         setenv("Q27_SUFFIX", "1", 0);
+        // Tiny prompts through the CHUNKED prefill path (2026-07-17, Ampere
+        // tuning pass): the serial walk below Q27_PF_BATCH_MIN costs ~22ms
+        // per token on sm_86 (TTFT 567ms on a 23-token prompt) and clears
+        // the slot's prefix cache. ref profile keeps the engine default 32.
+        setenv("Q27_PF_BATCH_MIN", "2", 0);
         // W16: was the literal "12". The suffix wants the widest verify the
         // build actually has -- the engine clamps sfx_w to W_MAX anyway, so the
         // literal silently meant "W_MAX" on the w8 build and "12" everywhere
@@ -207,6 +253,27 @@ int main(int argc, char** argv) {
         setenv("Q27_BATCH_GRAPH", "1", 0);
         setenv("Q27_BATCH_GRAPH_CAP", "64", 0);
     }
+    // Q27_SAMPLED=0 (issue #1, small-VRAM greedy boots): the engine skips the
+    // sampled graph set; this server refuses temperature>0 requests with a
+    // 400 up front. Contradiction guard (two-tier precedent): forcing
+    // sampling onto a boot that cannot sample is a config error -- refuse
+    // loudly at boot, not per-request.
+    const bool sampled_on = [] {
+        const char* e = getenv("Q27_SAMPLED");
+        return !e || atoi(e) != 0;
+    }();
+    if (!sampled_on) {
+        const char* ft = getenv("Q27_FORCE_TEMP");
+        if (ft && atof(ft) > 0.0) {
+            fprintf(stderr,
+                    "q27-server: FATAL -- Q27_SAMPLED=0 with Q27_FORCE_TEMP=%s: every "
+                    "request would be forced onto the disabled sampled path\n",
+                    ft);
+            exit(1);
+        }
+        fprintf(stderr,
+                "sampled graphs OFF (Q27_SAMPLED=0): temperature>0 requests get 400\n");
+    }
     fprintf(stderr,
             "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
             "think=%d\n",
@@ -218,62 +285,28 @@ int main(int argc, char** argv) {
             getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
             no_think_srv ? 0 : 1);
 
-    // --ctx auto (single-slot): size the KV budget to free VRAM. The fixed
-    // cost (weights + GDN role sets + graph zoo + buffers) SCALES WITH
-    // Q27_W_MAX -- each width adds one role set (~157MB) and ~one perm's
-    // worth of captured graphs (~130MB), so a narrow build frees budget.
-    // Anchor: 131072 fp8 W_MAX=12 measured ~27.0GB total on the 17.73GB
-    // v1.4 artifact => non-weight base ~1.27GB + weights (stat'd from the
-    // model file, so heavier tiers like q6-v1 at 20.49GB size correctly) +
-    // (W_MAX+1)*0.157 roles + W_MAX*0.13 graphs.
-    // per-token = 34KB fp8 / 68KB fp16 (attn + MTP KV). NOTE the anchor was
-    // calibrated on the 5090 fp8/mma path; the sm_86 fp16/fd2 fallback runs
-    // heavier, so on a 24GB card the fit can still miss -- hence no forced
-    // floor: clamp to what actually fits and warn rather than OOM.
-    if (ctx < 0) {
-        if (n_slots > 1) {
-            ctx = 8192; // legacy default; multi-slot should pass --ctx
-            fprintf(stderr, "--ctx not set with --slots %d: using %d (pass --ctx)\n", n_slots,
-                    ctx);
-        } else {
-            size_t free_b = 0, total_b = 0;
-            CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-            const char* kvv = getenv("Q27_KV");
-            const bool fp8 = kvv && !strcmp(kvv, "fp8");
-            const bool t3 = kvv && !strcmp(kvv, "turbo3");
-            const bool t3v = kvv && !strcmp(kvv, "turbo3v");
-            struct stat wst {};
-            const double wbytes = stat(model.c_str(), &wst) == 0 ? (double)wst.st_size : 17.73e9;
-            const double fixed = wbytes + 1.27e9 + (Q27_W_MAX + 1) * 0.157e9 + Q27_W_MAX * 0.13e9;
-            // per-token KV bytes across the 17 attn+MTP cache pairs: turbo3
-            // 2*400 B, turbo3v 2048+400 B, fp8 2*1024, fp16 2*2048
-            const double slack = 1.0e9,
-                         per_tok = t3 ? 13.6e3 : t3v ? 41.6e3 : fp8 ? 34e3 : 68e3;
-            long budget = (long)((double)free_b - fixed - slack);
-            long c = budget > 0 ? (long)(budget / per_tok) : 0;
-            // cap: native window (262144) for the compact KV formats
-            // (2026-07-11, Gabe sign-off: fp8 measured to 294912 on the
-            // 5090, turbo3 to 655360 with needle 6/6 @361K -- the cap is a
-            // TTFT/estimate-margin guard, not a VRAM fact); fp16 keeps the
-            // historical 131072 (it barely clears it anyway).
-            const long cap = (fp8 || t3 || t3v) ? 262144 : 131072;
-            if (c > cap) c = cap;
-            ctx = (int)(c / 4096 * 4096);
-            if (ctx < 4096) {
-                fprintf(stderr,
-                        "--ctx auto: only %d fits (free %.1fGB, %s KV, W_MAX=%d) -- likely to "
-                        "OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
-                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
-                if (ctx < 2048) ctx = 2048; // give the ctor a floor to fail loudly at
-            } else {
-                fprintf(stderr, "--ctx auto: %d (free %.1fGB, %s KV, W_MAX=%d)\n", ctx,
-                        free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
-                if (ctx < 16384)
-                    fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
-            }
-        }
-    }
+    // Per-engine non-KV reserve, the single source of truth shared by
+    // auto-ctx (below) and the multi-slot skip loop. roles + graph zoo +
+    // scratch, arch/width/gate scaled. Calibrated to the known-good 2x48K
+    // fp8 anchor on a 32GB 5090 (~5.8 GB/slot on W12). See the auto-ctx
+    // comment for the term-by-term rationale.
+    const double kEngGw8 = Q27_W_MAX < 8 ? Q27_W_MAX : 8;
+    const double kEngGwx = cc_arch >= 89 ? 0.13e9 : 0.43e9;
+    const double kEngGraphs = kEngGw8 * 0.13e9 + (Q27_W_MAX - kEngGw8) * kEngGwx;
+    const double kEngMonoSave = cc_arch >= 89 ? 0.08e9 : 0.15e9;
+    const double kEngSampSave = cc_arch >= 89 ? 0.34e9 : 0.60e9;
+    const double kEngBase = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
+    // per-slot non-KV = single-engine stack + co-residency scratch (the
+    // multi-slot `per_slot` in the auto-ctx block); the skip loop reserves
+    // this + KV so it agrees with what auto-ctx sized for.
+    const size_t ENG_FIXED_BYTES =
+        (size_t)(kEngBase + kEngGraphs + (Q27_W_MAX + 1) * 0.157e9 + 2.2e9 -
+                 (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave));
 
+    // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17), and
+    // multi-slot-aware since 2026-07-18: each borrowing engine carries its
+    // own role sets + graph zoo + KV, so N slots divide the budget. Sized in
+    // the post-upload block below; no legacy 8192 fallback.
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);
     fprintf(stderr, "loading model...\n");
@@ -286,6 +319,110 @@ int main(int argc, char** argv) {
     shared_dm.upload_all();
     shared_dm.checksum_baseline();
     fprintf(stderr, "resident: %.2f GB (checksummed)\n", shared_dm.bytes_resident() / 1e9);
+
+    // --ctx auto (single-slot): size the KV budget to MEASURED free VRAM
+    // with the weights already resident, so tier size (q4s/v1.4/q6),
+    // upload alignment overhead, and any co-tenant process fall out of the
+    // measurement instead of a model. What remains estimated is the non-KV
+    // stack allocated after this point (GDN role sets + spec/sample graph
+    // zoo + workspaces): each width adds one role set (~157MB) and ~one
+    // perm's worth of graphs (~130MB), plus an arch base -- the sm_86
+    // fd2/h16 path carries heavier workspaces than sm_120, and the old
+    // 1.27GB anchor predates the P1-P3 graph growth (calibrated 2026-07-17
+    // from in-process free deltas on both cards; see BUILDLOG).
+    // per-token KV bytes are EXACT: 18 K/V pairs (17 attn + 1 MTP),
+    // per-buffer/token = N_KV*HEAD_DIM*esz (fp16 2048 B, fp8 1024 B) or
+    // N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3. MIRROR WARNING: matches
+    // Engine::kv_bytes -- update together.
+    {
+        // clamp slot count BEFORE auto-ctx divides the budget by it. Ceiling
+        // 8 = the conductor's hard MAX_K/2 fusion limit (W_PLUMB=16 lane
+        // slots, floor-2 trim); slots past what VRAM fits are skipped in the
+        // build loop below. Raised from 4 (2026-07-18): the 96GB PRO 6000
+        // fit 4x262144 with 28.9 GB idle -- 4 was a VRAM guess, 8 is the
+        // real plumbing ceiling.
+        n_slots = std::max(1, std::min(8, n_slots));
+        size_t free_b = 0, total_b = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        fprintf(stderr, "vram: free %.2f GB post-weights\n", free_b / 1e9);
+        if (ctx < 0) {
+            const char* kvv = getenv("Q27_KV");
+            const bool fp8 = kvv && !strcmp(kvv, "fp8");
+            const bool t3 = kvv && !strcmp(kvv, "turbo3");
+            const bool t3v = kvv && !strcmp(kvv, "turbo3v");
+            const double pair = t3 ? 800.0 : t3v ? 2448.0 : fp8 ? 2048.0 : 4096.0;
+            const double per_tok = 18.0 * pair;
+            // calibrated 2026-07-17 (in-process free deltas, q4s tier):
+            // sm_120 W12 fp8@131072: non-KV stack 4.49GB => base 0.89;
+            // sm_86 w8 fp16@61440: 4.22GB => base 1.77 (turbo3 measured
+            // +0.08 -- inside slack). Retro-check: predicts the hand-found
+            // v1.4 3090 ceiling (24576) and the q4s 61440 knife-edge fit.
+            // sm_89 calibrated 2026-07-18 (RunPod 4090 field test, two boots
+            // agreeing within 75 MB): Ada's fixed stack runs ~1 GB fatter
+            // than sm_120's -- the pre-calibration pick survived with 40 MB
+            // to spare. >8-width graph slope on sm_89 is UNMEASURED; it
+            // deliberately shares sm_86's fat slope below (under-pick beats
+            // a dead boot).
+            const double base = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
+            // SINGLE-slot non-KV stack (base + roles + graph zoo - capture
+            // saves), unchanged and calibrated: this is what N==1 uses, and
+            // it must stay exact (drives the 262144/57344/... single-slot
+            // picks). Reuses the hoisted width/arch-scaled terms.
+            const double single_fixed = base + kEngGraphs + (Q27_W_MAX + 1) * 0.157e9 -
+                                        (constrain_tools ? 0.0 : kEngMonoSave) -
+                                        (sampled_on ? 0.0 : kEngSampSave);
+            long budget, c;
+            if (n_slots <= 1) {
+                const double slack = 0.25e9;
+                budget = (long)((double)free_b - single_fixed - slack);
+                c = budget > 0 ? (long)(budget / per_tok) : 0;
+            } else {
+                // MULTI-slot: every slot is a full co-resident engine.
+                // PER_SLOT = single_fixed + ~2.2 GB fragmentation/scratch that
+                // co-residency adds (calibrated to the shipped 2x48K fp8
+                // anchor on a 32GB 5090 == ~6.6 GB/slot on W12). Reduce the
+                // slot count first so the picked ctx and the log are HONEST
+                // (the build-loop skip is then a pure safety net), then split.
+                const double per_slot = single_fixed + 2.2e9;
+                int fit = (int)(free_b / (per_slot + per_tok * 4096.0));
+                if (fit < 1) fit = 1;
+                if (fit < n_slots) {
+                    fprintf(stderr,
+                            "--ctx auto: only %d of %d requested slots fit in %.1f GB "
+                            "(~%.1f GB/slot fixed) -- sizing for %d\n",
+                            fit, n_slots, free_b / 1e9, per_slot / 1e9, fit);
+                    n_slots = fit;
+                }
+                const double slack = 0.25e9 * n_slots;
+                budget = (long)((double)free_b - n_slots * per_slot - slack);
+                c = budget > 0 ? (long)(budget / (per_tok * n_slots)) : 0;
+            }
+            // cap: native window (262144) for the compact KV formats
+            // (2026-07-11, Gabe sign-off: fp8 measured to 294912 on the
+            // 5090, turbo3 to 655360 with needle 6/6 @361K -- the cap is a
+            // TTFT/estimate-margin guard, not a VRAM fact); fp16 keeps the
+            // historical 131072 (it barely clears it anyway).
+            const long cap = (fp8 || t3 || t3v) ? 262144 : 131072;
+            if (c > cap) c = cap;
+            ctx = (int)(c / 4096 * 4096);
+            if (ctx < 4096) {
+                fprintf(stderr,
+                        "--ctx auto: only %d fits (free %.1fGB post-weights, %s KV, W_MAX=%d) -- "
+                        "likely to OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
+                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16",
+                        Q27_W_MAX);
+                if (ctx < 2048) ctx = 2048; // give the ctor a floor to fail loudly at
+            } else {
+                fprintf(stderr,
+                        "--ctx auto: %d%s (free %.1fGB post-weights, %s KV, W_MAX=%d)\n", ctx,
+                        n_slots > 1 ? " per slot" : "", free_b / 1e9,
+                        t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
+                if (ctx < 16384)
+                    fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
+            }
+            if (n_slots > 1) slot1_ctx = ctx; // auto: every slot gets the same window
+        }
+    }
     // R1 multi-slot: N engines borrow the one uploaded weight set. Slot 0
     // gets --ctx; slots 1+ get --slot1-ctx (subagent/background conversations
     // measured 11-18K in R0). Per-slot GDN snapshot + ckpt ring + KV means an
@@ -303,7 +440,9 @@ int main(int argc, char** argv) {
         bool stamp_on_free = false;          // LRU-stamp when freed (not refused)
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
-    n_slots = std::max(1, std::min(4, n_slots));
+    // n_slots already clamped to [1,8] above (before auto-ctx divided the
+    // budget by it); the conductor's MAX_K/2 fusion ceiling is 8.
+    n_slots = std::max(1, std::min(8, n_slots));
     std::vector<Slot> slots;
     for (int si = 0; si < n_slots; si++) {
         int sctx = si == 0 ? ctx : slot1_ctx;
@@ -320,8 +459,12 @@ int main(int argc, char** argv) {
             size_t row_b = (slots[0].eng->kv_bytes(false) + slots[0].eng->kv_bytes(true)) /
                            slots[0].eng->max_ctx;
             size_t kvb = (size_t)sctx * row_b * (slots[0].eng->kcache.size() + 1);
-            size_t need = slots[0].eng->gdn_state_bytes + (700ull << 20) + kvb + (kvb >> 3) +
-                          (512ull << 20);
+            // Per-engine non-KV reserve = ENG_FIXED_BYTES (the same constant
+            // auto-ctx sizes with, so the two estimators agree) + KV + margin.
+            // The old need[] used a hardcoded ~1.2 GB that omitted the
+            // graph zoo, so a slot could pass here and then OOM building its
+            // own zoo (2026-07-18: aligned to ENG_FIXED_BYTES).
+            size_t need = ENG_FIXED_BYTES + kvb + (kvb >> 3) + (256ull << 20);
             if (freeb < need) {
                 fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB needed\n", si,
                         freeb / 1e9, need / 1e9);
@@ -332,10 +475,20 @@ int main(int argc, char** argv) {
         s.id = si;
         s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx);
         s.eng->fast_head = fast;
+        // graph-zoo capture gate (issue #1): without --constrain-tools the
+        // P11 monolithic draft/verify graphs are unreachable -- skip capture.
+        s.eng->capture_constrained = constrain_tools;
         s.eng->build_graph();
         s.eng->build_spec_graphs();
         slots.push_back(std::move(s));
         fprintf(stderr, "slot %d ready: ctx=%d\n", si, sctx);
+    }
+    {
+        // headroom line (also the auto-ctx calibration probe: this minus the
+        // post-weights line minus exact KV = the non-KV fixed stack)
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        fprintf(stderr, "vram: free %.2f GB at ready\n", free_b / 1e9);
     }
     // Admission clamps below use the LARGEST slot; the routed slot re-clamps.
     int max_slot_ctx = 0;
@@ -833,6 +986,36 @@ int main(int argc, char** argv) {
                 res.status);
     });
 
+    // Opt-in API key auth (no-op, zero overhead beyond one empty-vector
+    // check per request, when api_keys is empty -- the loopback-only
+    // default is unchanged). /health is intentionally exempt: infra health
+    // checks (load balancers, container orchestrators) need it reachable
+    // without distributing the secret to that infrastructure. Every other
+    // endpoint requires a valid key. Runs before route dispatch, so an
+    // invalid/missing key never reaches slot allocation, tokenization, or
+    // any generation work.
+    if (!api_keys.empty()) {
+        srv.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
+            if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
+            std::string provided = q27::extract_api_key(req.get_header_value("Authorization"),
+                                                         req.get_header_value("x-api-key"));
+            if (q27::api_key_valid(provided, api_keys))
+                return httplib::Server::HandlerResponse::Unhandled;
+            // Anthropic-shaped error for the Anthropic-shaped endpoint
+            // family (Claude Code's SDK reads error.message off this exact
+            // shape -- see anthropic_error_json's own comment); OpenAI-
+            // shaped for everything else, matching the 400-error split
+            // already used elsewhere in this file.
+            bool anthropic_shape = req.path.rfind("/v1/messages", 0) == 0;
+            res.status = 401;
+            if (!anthropic_shape) res.set_header("WWW-Authenticate", "Bearer");
+            res.set_content(q27::auth_error_json(anthropic_shape), "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        });
+        fprintf(stderr, "API key authentication enabled (%zu key%s configured)\n",
+                api_keys.size(), api_keys.size() == 1 ? "" : "s");
+    }
+
     srv.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
         // /health?verify=1 recomputes the resident-weight checksums (~20 ms;
         // read-only, so safe concurrently with generation -- but it launches
@@ -856,7 +1039,16 @@ int main(int argc, char** argv) {
         res.set_content(j.dump(), "application/json");
     });
 
-    // ---------------- OpenAI chat/completions (text only) ----------------
+    // ---------------- OpenAI chat/completions ----------------
+    // Tool calling: only /v1/chat/completions with a "messages" body gets the
+    // think/tool-aware path below (routed_chat) -- /v1/completions and any
+    // chat body that falls back to a raw "prompt" keep the ORIGINAL text-only
+    // behavior byte-for-byte (build_prompt, unchanged). This mirrors the
+    // /v1/messages tool pipeline exactly (chatml_prompt + tools_preamble +
+    // ToolConstrainer + StreamSplitter + parse_tool_call/parse_bare_tool_calls);
+    // only the request/response bridging (openai_msgs/openai_tools_json in
+    // api_common.h) and the output envelope (OpenAI tool_calls[] shape,
+    // finish_reason="tool_calls") are new.
 
     auto build_prompt = [&](const json& body) -> std::vector<int> {
         if (body.contains("messages")) {
@@ -893,9 +1085,64 @@ int main(int argc, char** argv) {
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
         int n_max = body.value("max_tokens", 256);
         bool stream = body.value("stream", false);
+        // stream_options.include_usage (OpenAI streaming spec, both API
+        // shapes): when true, one extra SSE chunk -- empty choices + the
+        // usage totals -- goes out after the finish_reason chunk, before
+        // [DONE]. Tolerant parse: a non-object stream_options or non-bool
+        // include_usage reads as false (a malformed option must not throw
+        // out of the handler). Absent/false -> zero framing change.
+        bool inc_usage = false;
+        if (stream && body.contains("stream_options") && body["stream_options"].is_object()) {
+            const auto& so = body["stream_options"];
+            inc_usage = so.contains("include_usage") && so["include_usage"].is_boolean() &&
+                        so["include_usage"].get<bool>();
+        }
+        // Tool-calling admission: gate strictly on chat==true AND an actual
+        // "messages" array, so /v1/completions and the raw-"prompt" chat
+        // fallback are provably untouched by anything below (they never
+        // enter any of the branches this flag guards).
+        const bool routed_chat = chat && body.contains("messages") && body["messages"].is_array();
+        json tools = json::array();
+        q27::ToolChoice tchoice;
+        std::vector<std::string> tool_names_v;
+        if (routed_chat) {
+            tchoice = q27::parse_tool_choice(body);
+            tools = tchoice.mode == q27::ToolChoice::NONE ? json::array() : q27::openai_tools_json(body);
+            if (constrain_tools && tools.is_array())
+                for (auto& t : tools)
+                    if (t.contains("function") && t["function"].contains("name"))
+                        tool_names_v.push_back(t["function"]["name"].get<std::string>());
+            // named-forced tool_choice restricts the grammar to that one name;
+            // "required" (no name) leaves every registered tool eligible.
+            if (tchoice.mode == q27::ToolChoice::FORCED && !tchoice.forced_name.empty())
+                tool_names_v = {tchoice.forced_name};
+        }
+        long rid = req_counter++;
         auto tk0 = std::chrono::steady_clock::now();
-        std::vector<int> prompt = build_prompt(body);
-        ReqTrace rt{req_counter++, chat ? "oai" : "cmpl", conv_fp(body),
+        std::vector<int> prompt;
+        int stable_len = -1; // -1 = legacy tail snapshot (build_prompt's fallback path)
+        if (routed_chat) {
+            bool think = body.value("enable_thinking", true);
+            if (body.contains("chat_template_kwargs"))
+                think = body["chat_template_kwargs"].value("enable_thinking", think);
+            if (no_think_srv) think = false;
+            size_t stable_off = 0;
+            std::string rendered =
+                q27::chatml_prompt(q27::openai_msgs(body), tools, think, &stable_off);
+            // FORCED tool_choice: inject the opener into the volatile tail
+            // (past stable_off, alongside the assistant-open/think-prefill --
+            // P8 prefix-cache reuse is unaffected). The stream router below
+            // is pre-seeded straight into the TOOL channel since the marker
+            // itself never appears in the GENERATED text this way.
+            if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
+            prompt = tok.encode(rendered.substr(0, stable_off));
+            stable_len = (int)prompt.size();
+            std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
+            prompt.insert(prompt.end(), tailv.begin(), tailv.end());
+        } else {
+            prompt = build_prompt(body);
+        }
+        ReqTrace rt{rid, chat ? "oai" : "cmpl", conv_fp(body),
                     std::chrono::steady_clock::now(), ms_since(tk0)};
         // Reject an empty prompt before slot selection: reuse_len() would run
         // ckpt_best() over an empty vector, and (pre-fix) a zero-token prompt
@@ -927,6 +1174,20 @@ int main(int argc, char** argv) {
         }
         if ((int)prompt.size() + n_max > max_slot_ctx)
             n_max = max_slot_ctx - (int)prompt.size();
+        // Q27_SAMPLED=0 preflight: the sampled graphs were never captured.
+        // (Q27_FORCE_TEMP>0 is a boot-time FATAL on such boots, so the
+        // request-absent default here is genuinely greedy.)
+        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+            res.status = 400;
+            res.set_content(json{{"error",
+                                  {{"message", "sampling disabled: server booted with "
+                                               "Q27_SAMPLED=0 (greedy-only)"},
+                                   {"type", "invalid_request_error"},
+                                   {"code", "sampling_disabled"}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
         long created = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::system_clock::now().time_since_epoch())
                            .count();
@@ -938,6 +1199,9 @@ int main(int argc, char** argv) {
             Slot& sl = claim_slot(prompt); // may wait for a free engine
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            HookGuard hooks{eng}; // safe even when routed_chat is false: hooks
+                                  // are never set on that path, so the clear
+                                  // on scope-exit is a no-op (P15 M1 pattern)
             eng.samp = parse_sample(body);
             // Q27_BATCH: solo keeps the whole-call lease; batch mode scopes
             // its prefill lease inside batch_generate (A7) and re-stamps qw.
@@ -948,41 +1212,141 @@ int main(int argc, char** argv) {
             // re-clamp to the routed slot (rows P+1..P+gate_maxd+1 must stay
             // in ctx; reserve derived from the engine's active max depth)
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
-            std::string text;
+
+            if (!routed_chat) {
+                // ORIGINAL text-only behavior, byte-for-byte unchanged.
+                std::string text;
+                q27::Utf8Gate ugate;
+                auto on_tok = [&](int id) {
+                    text += ugate.feed(tok.decode_one(id));
+                    return true;
+                };
+                Engine::DecodeTask bt;
+                std::string berr;
+                int n = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr, -1,
+                                                   qw, rt, bt, &berr)
+                                  : eng.generate(prompt, n_max, EOS, on_tok);
+                eng.on_round_gap = nullptr;
+                text += ugate.flush();
+                req_log(rt, qw, eng, sl.id, bat_stats(bt));
+                // batch error surfacing (review pass 2): nothing emitted = an
+                // honest 500 in the OpenAI error envelope; if tokens WERE
+                // produced, keep the 200 with the partial text -- end=error is
+                // already in the [req] line either way.
+                if (!berr.empty() && n == 0) {
+                    res.status = 500;
+                    res.set_content(json{{"error", {{"message", berr},
+                                                    {"type", "api_error"}}}}
+                                        .dump(),
+                                    "application/json");
+                    return;
+                }
+                json choice;
+                if (chat)
+                    choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
+                              {"message", {{"role", "assistant"}, {"content", text}}}};
+                else
+                    choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
+                              {"text", text}};
+                json out = {{"id", "q27-0"}, {"object", obj}, {"created", created},
+                            {"model", served_name}, {"choices", json::array({choice})},
+                            {"usage", {{"prompt_tokens", (int)prompt.size()},
+                                       {"completion_tokens", n},
+                                       {"total_tokens", (int)prompt.size() + n}}}};
+                res.set_content(jdump(out), "application/json");
+                return;
+            }
+
+            // routed_chat: think/tool-aware path, an exact mechanical twin of
+            // the /v1/messages non-stream handler above, OpenAI-shaped output.
+            StreamSplitter sp;
             q27::Utf8Gate ugate;
+            std::string think, text, tool_buf;
+            std::vector<q27::ToolCall> calls;
+            auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
+                if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
+                if (!tool_buf.empty()) { // tool segment closed
+                    calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                    tool_buf.clear();
+                }
+                (ch == StreamSplitter::THINK ? think : text) += t;
+            };
+            ToolConstrainer tc;
+            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+            tc.host2dev = &sl.tool_mask_host2dev;
+            // FORCED requests are prompt-injected past the <tool_call> marker
+            // (above) -- scan_round's engage trigger scans GENERATED text for
+            // that marker and will never fire, so grammar masking is skipped
+            // for those (documented limitation, api_common.h ToolChoice
+            // comment); AUTO (the default) and NONE are unaffected.
+            tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
+                        eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
+            tc.begin(tool_names_v);
+            // FORCED: the opener was injected into the PROMPT, not generated,
+            // so the splitter must start already inside the TOOL channel or
+            // the call body would be read back as ordinary text.
+            if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
+            eng.on_pending = [&](int id) { tc.on_pending(id); };
+            eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
+            if (tc.enabled)
+                eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
             auto on_tok = [&](int id) {
-                text += ugate.feed(tok.decode_one(id));
+                for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                 return true;
             };
             Engine::DecodeTask bt;
             std::string berr;
-            int n = conductor ? batch_generate(eng, prompt, n_max, on_tok, nullptr, -1,
-                                               qw, rt, bt, &berr)
-                              : eng.generate(prompt, n_max, EOS, on_tok);
+            int n = conductor
+                        ? batch_generate(eng, prompt, n_max, on_tok,
+                                         [&](int id) { tc.on_id(id); }, stable_len, qw,
+                                         rt, bt, &berr)
+                        : eng.generate(prompt, n_max, EOS, [&](int id) {
+                              tc.on_id(id);
+                              return on_tok(id);
+                          }, stable_len);
+            tc.end();
+            eng.on_pending = nullptr;
+            eng.on_drafts = nullptr;
+            eng.on_round = nullptr;
             eng.on_round_gap = nullptr;
-            text += ugate.flush();
-            req_log(rt, qw, eng, sl.id, bat_stats(bt));
-            // batch error surfacing (review pass 2): nothing emitted = an
-            // honest 500 in the OpenAI error envelope; if tokens WERE
-            // produced, keep the 200 with the partial text -- end=error is
-            // already in the [req] line either way.
+            req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
             if (!berr.empty() && n == 0) {
                 res.status = 500;
-                res.set_content(json{{"error", {{"message", berr},
-                                                {"type", "api_error"}}}}
+                res.set_content(json{{"error", {{"message", berr}, {"type", "api_error"}}}}
                                     .dump(),
                                 "application/json");
                 return;
             }
-            json choice;
-            if (chat)
-                choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
-                          {"message", {{"role", "assistant"}, {"content", text}}}};
-            else
-                choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
-                          {"text", text}};
-            json out = {{"id", "q27-0"}, {"object", obj}, {"created", created},
-                        {"model", served_name}, {"choices", json::array({choice})},
+            for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
+            for (auto& [ch, t] : sp.flush()) route(ch, t);
+            if (!tool_buf.empty())
+                calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+
+            std::string tx = q27::strip_ws2(text);
+            for (auto& c : calls)
+                if (!c.ok) tx += (tx.empty() ? "" : "\n") + c.raw;
+            if (tools.is_array() && !tools.empty()) {
+                // wrapper-less call recovery (see parse_bare_tool_calls)
+                std::string pre;
+                auto bcs = q27::parse_bare_tool_calls(tx, &pre, &tools);
+                if (!bcs.empty()) {
+                    fprintf(stderr,
+                            "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
+                            bcs.size());
+                    tx = pre;
+                    for (auto& bc : bcs) calls.push_back(bc);
+                }
+            }
+            bool any_call = false;
+            for (auto& c : calls)
+                if (c.ok) any_call = true;
+            json msg = q27::openai_chat_message_json(tx, calls, rid, q27::strip_ws2(think));
+            json choice = {{"index", 0},
+                          {"finish_reason", any_call ? "tool_calls" : (n >= n_max ? "length" : "stop")},
+                          {"message", msg}};
+            json out = {{"id", "chatcmpl-q27-" + std::to_string(rid)}, {"object", obj},
+                        {"created", created}, {"model", served_name},
+                        {"choices", json::array({choice})},
                         {"usage", {{"prompt_tokens", (int)prompt.size()},
                                    {"completion_tokens", n},
                                    {"total_tokens", (int)prompt.size() + n}}}};
@@ -991,13 +1355,16 @@ int main(int argc, char** argv) {
         }
 
         res.set_header("Content-Type", "text/event-stream");
+        const bool has_tools = tools.is_array() && !tools.empty();
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, created, chat, obj, objd, rt](size_t, httplib::DataSink& sink) {
+            [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
+             tools, tool_names_v, tchoice, stable_len, has_tools, rid](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                HookGuard hooks{eng}; // see the non-stream twin
                 eng.samp = samp;
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
@@ -1009,44 +1376,178 @@ int main(int argc, char** argv) {
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
                 };
+
+                if (!routed_chat) {
+                    // ORIGINAL text-only streaming behavior, byte-for-byte unchanged.
+                    q27::Utf8Gate ugate;
+                    auto piece_chunk = [&](const std::string& piece) {
+                        json delta = chat ? json{{"content", piece}} : json{};
+                        json choice = chat
+                            ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
+                            : json{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
+                        return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                                    {"model", served_name}, {"choices", json::array({choice})}};
+                    };
+                    auto on_tok = [&](int id) {
+                        // empty pieces (control tokens, gate holdbacks) still probe
+                        // the socket so a disconnected client stops generation
+                        return send(piece_chunk(ugate.feed(tok.decode_one(id))));
+                    };
+                    Engine::DecodeTask bt;
+                    // TODO(batch error surfacing): on a failed queue (A2) this
+                    // stream just ends with a normal finish_reason -- the OpenAI
+                    // SSE shape has no standard mid-stream error event, so none
+                    // is invented; end=error lands in the [req] line and
+                    // [req-error] carries the what().
+                    int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
+                                                              -1, qw, rt, bt, nullptr)
+                                             : eng.generate(prompt, nm, EOS, on_tok);
+                    eng.on_round_gap = nullptr;
+                    std::string tailp = ugate.flush();
+                    if (!tailp.empty()) send(piece_chunk(tailp));
+                    // Terminal chunk with a real finish_reason (OpenAI streaming spec):
+                    // clients otherwise never learn whether generation hit EOS or the
+                    // token cap. produced >= nm == the length cap; else a stop.
+                    {
+                        const char* fr = produced >= nm ? "length" : "stop";
+                        json fchoice = chat ? json{{"index", 0}, {"delta", json::object()},
+                                                   {"finish_reason", fr}}
+                                            : json{{"index", 0}, {"text", ""}, {"finish_reason", fr}};
+                        send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                                  {"model", served_name}, {"choices", json::array({fchoice})}});
+                    }
+                    // stream_options.include_usage: final usage chunk (empty
+                    // choices) mirroring the non-stream usage body above.
+                    if (inc_usage)
+                        send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                                  {"model", served_name}, {"choices", json::array()},
+                                  {"usage", {{"prompt_tokens", (int)prompt.size()},
+                                             {"completion_tokens", produced},
+                                             {"total_tokens", (int)prompt.size() + produced}}}});
+                    req_log(rt, qw, eng, sl.id, bat_stats(bt));
+                    std::string done = "data: [DONE]\n\n";
+                    sink.write(done.data(), done.size());
+                    sink.done();
+                    return true;
+                }
+
+                // routed_chat: think/tool-aware streaming path, an exact
+                // mechanical twin of the /v1/messages SSE handler above.
+                const std::string cid = "chatcmpl-q27-" + std::to_string(rid);
+                ToolConstrainer tc;
+                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+                tc.host2dev = &sl.tool_mask_host2dev;
+                tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
+                            eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
+                tc.begin(tool_names_v);
+                StreamSplitter sp;
+                if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
                 q27::Utf8Gate ugate;
-                auto piece_chunk = [&](const std::string& piece) {
-                    json delta = chat ? json{{"content", piece}} : json{};
-                    json choice = chat
-                        ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
-                        : json{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
-                    return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
-                                {"model", served_name}, {"choices", json::array({choice})}};
+                bool alive = true; // cleared when a write fails (client disconnected)
+                int tool_idx = 0;
+                bool any_call = false;
+                std::string tool_buf, text_accum;
+                auto emit_tool = [&]() {
+                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    tool_buf.clear();
+                    if (!c.ok) { // malformed: surface as text so nothing is lost
+                        if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                           json{{"content", c.raw}})))
+                            alive = false;
+                        return;
+                    }
+                    any_call = true;
+                    std::string tid =
+                        "call_q27_" + std::to_string(rid) + "_" + std::to_string(tool_idx);
+                    bool ok = send(q27::openai_stream_chunk(
+                        cid, objd, created, served_name,
+                        q27::openai_tool_call_delta(tool_idx, tid, c)));
+                    tool_idx++;
+                    if (!ok) alive = false;
                 };
+                auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
+                    if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
+                    if (!tool_buf.empty()) emit_tool();
+                    if (t.empty()) return;
+                    // reasoning_content (no official OpenAI field for this;
+                    // matches the vLLM/SGLang/llama.cpp convention -- see
+                    // openai_reasoning_delta) rather than leaking raw <think>
+                    // tags into `content` (the bug this whole path also
+                    // happens to fix).
+                    if (ch == StreamSplitter::THINK) {
+                        if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                            q27::openai_reasoning_delta(t))))
+                            alive = false;
+                        return;
+                    }
+                    text_accum += t;
+                    if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                       json{{"content", t}})))
+                        alive = false;
+                };
+                eng.on_pending = [&](int id) { tc.on_pending(id); };
+                eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
+                if (tc.enabled)
+                    eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
                 auto on_tok = [&](int id) {
-                    // empty pieces (control tokens, gate holdbacks) still probe
-                    // the socket so a disconnected client stops generation
-                    return send(piece_chunk(ugate.feed(tok.decode_one(id))));
+                    for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
+                    return alive; // stop generating once the client has disconnected
                 };
                 Engine::DecodeTask bt;
-                // TODO(batch error surfacing): on a failed queue (A2) this
-                // stream just ends with a normal finish_reason -- the OpenAI
-                // SSE shape has no standard mid-stream error event, so none
-                // is invented; end=error lands in the [req] line and
-                // [req-error] carries the what().
-                int produced = conductor ? batch_generate(eng, prompt, nm, on_tok, nullptr,
-                                                          -1, qw, rt, bt, nullptr)
-                                         : eng.generate(prompt, nm, EOS, on_tok);
+                int produced = conductor
+                                   ? batch_generate(eng, prompt, nm, on_tok,
+                                                    [&](int id) { tc.on_id(id); },
+                                                    stable_len, qw, rt, bt, nullptr)
+                                   : eng.generate(prompt, nm, EOS, [&](int id) {
+                                         tc.on_id(id);
+                                         return on_tok(id);
+                                     }, stable_len);
+                tc.end();
+                eng.on_pending = nullptr;
+                eng.on_drafts = nullptr;
+                eng.on_round = nullptr;
                 eng.on_round_gap = nullptr;
-                std::string tailp = ugate.flush();
-                if (!tailp.empty()) send(piece_chunk(tailp));
-                // Terminal chunk with a real finish_reason (OpenAI streaming spec):
-                // clients otherwise never learn whether generation hit EOS or the
-                // token cap. produced >= nm == the length cap; else a stop.
-                {
-                    const char* fr = produced >= nm ? "length" : "stop";
-                    json fchoice = chat ? json{{"index", 0}, {"delta", json::object()},
-                                               {"finish_reason", fr}}
-                                        : json{{"index", 0}, {"text", ""}, {"finish_reason", fr}};
-                    send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
-                              {"model", served_name}, {"choices", json::array({fchoice})}});
+                req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
+                for (auto& [ch, t] : sp.feed(ugate.flush())) emit_seg(ch, t);
+                for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
+                if (!tool_buf.empty()) emit_tool();
+                if (has_tools) {
+                    // wrapper-less call recovery: text already streamed as a
+                    // content delta (cosmetic); the tool_calls delta still fires
+                    std::string pre;
+                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre, &tools);
+                    if (!bcs.empty()) {
+                        fprintf(stderr,
+                                "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
+                                bcs.size());
+                        any_call = true;
+                        for (auto& bc : bcs) {
+                            std::string tid = "call_q27_" + std::to_string(rid) + "_" +
+                                              std::to_string(tool_idx);
+                            bool ok = send(q27::openai_stream_chunk(
+                                cid, objd, created, served_name,
+                                q27::openai_tool_call_delta(tool_idx, tid, bc)));
+                            tool_idx++;
+                            if (!ok) alive = false;
+                        }
+                    }
                 }
-                req_log(rt, qw, eng, sl.id, bat_stats(bt));
+                // TODO(batch error surfacing): no standard OpenAI mid-stream
+                // error chunk exists (matches the plain-text leg's TODO
+                // above); end=error lands in the [req] line, [req-error]
+                // carries the what() (batch_generate logs it unconditionally
+                // when err_out is null, same as that leg's nullptr err_out).
+                {
+                    const char* fr = any_call ? "tool_calls" : (produced >= nm ? "length" : "stop");
+                    send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                  json::object(), fr));
+                }
+                if (inc_usage)
+                    send(json{{"id", cid}, {"object", objd}, {"created", created},
+                              {"model", served_name}, {"choices", json::array()},
+                              {"usage", {{"prompt_tokens", (int)prompt.size()},
+                                         {"completion_tokens", produced},
+                                         {"total_tokens", (int)prompt.size() + produced}}}});
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
                 sink.done();
@@ -1126,6 +1627,13 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[ctx-limit] prompt=%zu max=%d -> 400\n", prompt.size(),
                     max_prompt);
             anthropic_400(res, q27::ctx_limit_error_message((int)prompt.size(), max_prompt));
+            return;
+        }
+        // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
+        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+            anthropic_400(res,
+                          "sampling disabled: server booted with Q27_SAMPLED=0 "
+                          "(greedy-only)");
             return;
         }
         if ((int)prompt.size() + n_max > max_slot_ctx)
@@ -1544,6 +2052,14 @@ int main(int argc, char** argv) {
         if ((int)prompt.size() > max_prompt) {
             res.status = 400; // context_length_exceeded is fatal-class for codex, correctly
             res.set_content("{\"error\":{\"code\":\"context_length_exceeded\"}}",
+                            "application/json");
+            return;
+        }
+        // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
+        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+            res.status = 400;
+            res.set_content("{\"error\":{\"code\":\"sampling_disabled\",\"message\":"
+                            "\"sampling disabled: server booted with Q27_SAMPLED=0\"}}",
                             "application/json");
             return;
         }
