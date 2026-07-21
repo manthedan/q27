@@ -1,6 +1,6 @@
 # Metal sampled MTP — CUDA Phase-2 rejection sampling on the host path
 
-Status: **IN PROGRESS** — Phase 0 implemented (helpers + unit tests green); engine/server pending.  
+Status: **IN PROGRESS** — Phase 0 clean (Codex); Phase 1a–1c implemented, build green; live gates pending.  
 Branch: `agent-fenced-body-write` (or a follow-on branch if this stack splits).  
 Machine: any Metal Mac with an official MTP pack for live gates; unit tests are CPU-only.  
 Upstream design: `docs/sampling-design.md`, `docs/sampling-phase2-impl.md` (CUDA DONE 2026-07-05).
@@ -134,41 +134,39 @@ reconciled. Prefer: write → commit → `autoreview --mode commit` → fix → 
   - [x] composition: histogram of pending ≈ residual `sample_served` (MAE)
   - [x] accept rate ≈ analytic p_served (Monte Carlo, |emp−p|<0.04 @ N=4000)
 - [x] `make build/test_sampling && ./build/test_sampling` green
-- [ ] Commit + Codex autoreview clean
+- [x] Commit + Codex autoreview clean (`d58ea12` + fix `4d8757f`)
 
-### Phase 1a — `MetalEngine::mtp_sample_round`  `[ ]`
+### Phase 1a — `MetalEngine::mtp_sample_round`  `[x]` (pending commit/review)
 
 **Files:** `src/metal/metal_engine.{h,cpp}`
 
-- [ ] New method: same draft/verify as `mtp_round`, accept via `spec_rejection_accept`
-- [ ] Readback multi-lane logits from `clogits_`
-- [ ] Commit path shared with greedy (`gdn_replay`, EOS clamp, encode rules, live_width adapt)
-- [ ] Bootstrap: first pending after prefill is **sampled** (caller/server already does this at temp>0)
-- [ ] Fallback when live < 2 / context tight: one serial sample+step (not greedy step)
-- [ ] Greedy `mtp_round` **untouched** (bitwise)
-- [ ] Unit / engine self-check if any; else deferred to P2
+- [x] New method: same draft/verify as `mtp_round`, accept via `spec_rejection_accept`
+- [x] Readback multi-lane logits from `clogits_`
+- [x] Commit path shared with greedy (`gdn_replay`, EOS clamp, encode rules, live_width adapt)
+- [x] Bootstrap: first pending after prefill is **sampled** (CLI/server)
+- [x] Fallback when live < 2 / context tight: one serial sample+step (not greedy step)
+- [x] Greedy `mtp_round` **untouched** (bitwise)
+- [x] Unit / engine self-check if any; else deferred to P2
 - [ ] Commit + Codex autoreview clean
 
-### Phase 1b — Server route  `[ ]`
+### Phase 1b — Server route  `[x]` (pending commit/review)
 
 **Files:** `src/metal/metal_server.cpp`  
-**Caution:** may already have uncommitted sampling-default edits from another agent — rebase/merge carefully; do not clobber.
+**Note:** folded with pre-existing uncommitted sampling-default flags (other agent); kept and extended.
 
-- [ ] `mtp = mtp_width && has_mtp && (temp==0 || sample_mtp_enabled)`
-  - v1: enable sampled MTP whenever `temp>0 && mtp_width && has_mtp`
-- [ ] Quantum loop: `mtp_sample_round` under one lease (mirror greedy MTP quantum)
-- [ ] Tool constraining stays off under sampling (existing rule)
-- [ ] Trace logs effective path (`mtp_sample` vs `plain_sample` vs `mtp_greedy`)
+- [x] `mtp` resolved post-slot with `has_mtp()`; sampled MTP when temp>0 && !Q27_SAMPLE_PLAIN
+- [x] Quantum loop: `mtp_sample_round` under one lease (mirror greedy MTP quantum)
+- [x] Tool constraining stays off under sampling (existing rule)
+- [x] Boot stderr notes sampled-MTP vs suffix-disengage
 - [ ] Commit + Codex autoreview clean
 
-### Phase 1c — CLI  `[ ]`
+### Phase 1c — CLI  `[x]` (pending commit/review)
 
 **Files:** `src/metal/metal_cli.cpp`
 
-- [ ] Drop hard error “sampling cannot be combined with speculative modes” for MTP
-- [ ] Keep reject for oracle / modes that stay greedy-only if still true
-- [ ] `--temperature` + `--mtp` routes to sample path
-- [ ] Optional `Q27_SAMPLE_PLAIN=1` force plain sample (CUDA parity for A/B)
+- [x] Drop hard error for temp+MTP; keep reject for suffix/oracle
+- [x] `--temperature` + `--mtp` routes to sample path
+- [x] Optional `Q27_SAMPLE_PLAIN=1` force plain sample (CUDA parity for A/B)
 - [ ] Commit + Codex autoreview clean
 
 ### Phase 1d — Gate harness (draft anytime, run after P1)  `[ ]`
@@ -206,9 +204,11 @@ reconciled. Prefer: write → commit → `autoreview --mode commit` → fix → 
 | Date | What | Result |
 |------|------|--------|
 | 2026-07-21 | Plan written; parallel map; phases checked | this doc |
-| 2026-07-21 | Phase 0 helpers+tests (`build_served_*`, `spec_rejection_accept`) | `./build/test_sampling` PASS |
-| | Phase 0 commit + Codex autoreview | *pending* |
-| | Phase 1a engine | *pending* |
+| 2026-07-21 | Phase 0 helpers+tests | `d58ea12`; tests PASS |
+| 2026-07-21 | Codex P2 empty-residual throw | `4d8757f`; autoreview **clean** |
+| 2026-07-21 | Phase 1a–1c engine+CLI+server (uncommitted) | builds green |
+| | Phase 1 commit + Codex autoreview | *pending* |
+| | Phase 2 live gates on MTP pack | *pending* |
 
 ## Review workflow
 

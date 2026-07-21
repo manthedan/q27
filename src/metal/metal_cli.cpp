@@ -11,6 +11,7 @@
 #include <exception>
 #include <filesystem>
 #include <iterator>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -290,8 +291,12 @@ int main(int argc, char** argv) {
         if ((mtp_width != 0) + (suffix_width != 0) + (oracle_width != 0) > 1)
             throw std::runtime_error("--mtp, --suffix, and --oracle are mutually exclusive");
         q27::validate_sampling(sampling);
-        if(sampling.temperature>0 && (mtp_width || suffix_width || oracle_width))
-            throw std::runtime_error("sampling cannot be combined with speculative modes");
+        // Sampled MTP is supported (rejection-sample accept on greedy drafts).
+        // Suffix/oracle stay greedy-only for now (plan Phase 4 / non-goal).
+        if(sampling.temperature>0 && (suffix_width || oracle_width))
+            throw std::runtime_error("sampling cannot be combined with --suffix/--oracle");
+        if(sampling.temperature>0 && mtp_width && getenv("Q27_SAMPLE_PLAIN"))
+            mtp_width = 0; // force plain sample for A/B (CUDA parity)
         if (oracle_width && (oracle_width < 2 || oracle_width > 48))
             throw std::runtime_error("--oracle width must be 2..48 (VERIFY_CHUNK_MAX)");
         if (oracle_width && count < oracle_width + 2)
@@ -1391,12 +1396,36 @@ int main(int argc, char** argv) {
                     engine.position());
             generated = engine.generate_from_pending(pending, count);
         } else {
-            generated = sampling.temperature>0 ? engine.generate_sampled(prompt,count,sampling)
-                                           : mtp_width ? engine.generate_mtp(prompt,count,mtp_width)
-                                           : suffix_width ? (suffix_serial
-                                                  ? engine.generate_suffix_serial(prompt,count,suffix_width)
-                                                  : engine.generate_suffix(prompt,count,suffix_width))
-                                                          : engine.generate(prompt,count);
+            if (sampling.temperature > 0 && mtp_width) {
+                // Sampled MTP: prefill leaves logits for the first gen token;
+                // sample that pending (not the greedy argmax), then run
+                // mtp_sample_round quanta — mirrors server routing.
+                (void)engine.ingest_prompt(prompt, true, true);
+                std::mt19937_64 rng(sampling.seed);
+                uint32_t pending = engine.sample_from_logits(sampling, rng);
+                generated.clear();
+                generated.reserve(count);
+                uint32_t live_width = std::min(mtp_width, 4u);
+                std::vector<uint32_t> committed;
+                while (generated.size() < count) {
+                    if (generated.size() + 1 == count) {
+                        generated.push_back(pending);
+                        break;
+                    }
+                    committed.clear();
+                    pending = engine.mtp_sample_round(pending, (uint32_t)(count - generated.size()),
+                                                      UINT32_MAX, mtp_width, live_width,
+                                                      sampling, rng, committed);
+                    generated.insert(generated.end(), committed.begin(), committed.end());
+                }
+            } else {
+                generated = sampling.temperature>0 ? engine.generate_sampled(prompt,count,sampling)
+                                               : mtp_width ? engine.generate_mtp(prompt,count,mtp_width)
+                                               : suffix_width ? (suffix_serial
+                                                      ? engine.generate_suffix_serial(prompt,count,suffix_width)
+                                                      : engine.generate_suffix(prompt,count,suffix_width))
+                                                              : engine.generate(prompt,count);
+            }
         }
         if(!dump_logits.empty()) {
             std::vector<float> logits=engine.read_logits();

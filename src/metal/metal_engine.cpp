@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 
 #include <fcntl.h>
@@ -1829,6 +1830,109 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
     live_width = accepted + 1 == live ? std::min(width, live_width + 2)
                                       : std::max(2u, accepted + 2);
     return predictions[commit_n - 1];
+}
+
+// Sampled MTP: greedy drafts, rejection-sample accept (Phase 0 host walk).
+// Draft + verify match mtp_round; only the accept/pending tail differs.
+uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uint32_t eos,
+                                       uint32_t width, uint32_t& live_width,
+                                       const SamplingParams& params, std::mt19937_64& rng,
+                                       std::vector<uint32_t>& committed) {
+    validate_sampling(params);
+    if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (!has_mtp_)
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use plain sampling");
+    if (width < 2 || width > CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: MTP width must be 2..12");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: batched MTP requires chunked prefill");
+    if (remaining < 2)
+        throw std::runtime_error("q27 Metal: MTP sample round needs remaining >= 2");
+    if (pending == eos) {
+        committed.push_back(pending);
+        return pending;
+    }
+    uint32_t live = std::min(std::min(live_width, width), remaining);
+    if ((uint64_t)position_ + live > max_context_)
+        live = (uint32_t)(max_context_ - position_);
+    if (live < 2) {
+        // Serial sample fallback: emit pending, encode it, sample next.
+        committed.push_back(pending);
+        if (pending == eos) return pending;
+        (void)step(pending);
+        return sample_from_logits(params, rng);
+    }
+    static const bool trace = getenv("Q27_MTP_TRACE") != nullptr;
+    auto clock = [] { return std::chrono::steady_clock::now(); };
+    auto since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    auto draft_start = clock();
+    std::vector<uint32_t> lanes(live);
+    lanes[0] = pending;
+    const BackendBuffer* hidden = x1_.get();
+    for (uint32_t lane = 1; lane < live; lane++) {
+        lanes[lane] = mtp_forward(*hidden, lanes[lane - 1], position_ + lane - 1);
+        hidden = mtp_hidden_out_.get();
+    }
+    last_spec_stats_.rounds++;
+    last_spec_stats_.drafted += live - 1;
+    auto verify_start = clock();
+    {
+        CommandBatch batch(backend_);
+        chunk_forward(lanes.data(), live, /*verify=*/true);
+        BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
+        backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
+                                        N_EMBD, live, EPS, x5);
+        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        // No argmax_rows — acceptance is rejection sampling on full logits.
+        batch.finish();
+    }
+    std::vector<float> lane_logits((size_t)live * VOCAB);
+    backend_.read(*clogits_, 0, lane_logits.data(),
+                  (uint64_t)live * VOCAB * sizeof(float));
+    std::vector<uint32_t> drafts(live - 1);
+    for (uint32_t i = 0; i + 1 < live; i++) drafts[i] = lanes[i + 1];
+    SpecRejectResult accept =
+        spec_rejection_accept(lane_logits.data(), live, VOCAB, drafts.data(), params, rng);
+    // accepted drafts before first reject (or all), for width adaptation.
+    const uint32_t accepted = accept.n - 1;
+    uint32_t commit_n = std::min(accept.n, remaining);
+    uint32_t encoded = commit_n == remaining ? commit_n - 1 : commit_n;
+    for (uint32_t i = 0; i < commit_n; i++)
+        if (lanes[i] == eos) {
+            commit_n = i + 1;
+            encoded = i;
+            break;
+        }
+    last_spec_stats_.accepted += commit_n > 0 ? commit_n - 1 : 0;
+    auto commit_start = clock();
+    if (encoded) {
+        CommandBatch batch(backend_);
+        gdn_replay(encoded);
+        backend_.copy(*cfinal_, (uint64_t)(encoded - 1) * N_EMBD * sizeof(float),
+                      *x1_, 0, (uint64_t)N_EMBD * sizeof(float));
+        backend_.copy(*clogits_, (uint64_t)(encoded - 1) * VOCAB * sizeof(float),
+                      *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+        batch.finish();
+    }
+    position_ += encoded;
+    if (trace)
+        fprintf(stderr,
+                "mtp sample round: live %u n %u stop %u exclude %d | draft %.2fs verify %.2fs commit %.2fs\n",
+                live, accept.n, accept.stop_lane, (int)accept.exclude,
+                std::chrono::duration<double>(verify_start - draft_start).count(),
+                std::chrono::duration<double>(commit_start - verify_start).count(),
+                since(commit_start));
+    committed.insert(committed.end(), lanes.begin(), lanes.begin() + commit_n);
+    live_width = accepted + 1 == live ? std::min(width, live_width + 2)
+                                      : std::max(2u, accepted + 2);
+    // Full walk used → pending already sampled. Remaining/EOS clamp → sample
+    // from the last committed lane's logits (mirrors greedy predictions[c-1]).
+    if (commit_n == accept.n) return accept.pending;
+    ServedDistribution stop = build_served_distribution(
+        lane_logits.data() + (size_t)(commit_n - 1) * VOCAB, VOCAB, params);
+    return sample_served(stop, rng, /*exclude=*/-1);
 }
 
 // Gate 0 oracle round: mtp_round with the layer-64 draft stage replaced by

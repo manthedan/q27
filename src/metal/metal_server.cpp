@@ -181,6 +181,27 @@ uint32_t parse_u32(const std::string& text, const char* option) {
     return (uint32_t)value;
 }
 
+float parse_float(const std::string& text, const char* option) {
+    if (text.empty()) throw std::runtime_error(std::string("invalid ")+option);
+    // stof parses "nan"/"inf" successfully -- reject non-finite here so the
+    // range checks at the call sites cannot be bypassed.
+    size_t used=0; float value=std::stof(text,&used);
+    if(used!=text.size() || !std::isfinite(value)) throw std::runtime_error(std::string("invalid ")+option);
+    return value;
+}
+
+// Served sampling defaults, resolved once in main from
+// --temperature-default / --top-p-default / --top-k-default (flag wins; env
+// twins Q27_METAL_{TEMPERATURE,TOP_P,TOP_K}_DEFAULT). They apply only when a
+// request OMITS the field -- explicit client values always win. With neither
+// flag nor env they hold the shipped greedy values (0 / 1 / 0), so the
+// greedy path stays bitwise. temp>0 keeps MTP when --mtp is set (sampled
+// rejection-accept path); suffix still disengages (greedy-only). Tool
+// constraining stays greedy-only. Trace logs effective sampling per request.
+float sampling_default_temperature=0.0f;
+float sampling_default_top_p=1.0f;
+uint32_t sampling_default_top_k=0;
+
 std::vector<uint32_t> to_u32(const std::vector<int>& ids) {
     std::vector<uint32_t> result; result.reserve(ids.size());
     for(int id:ids) { if(id<0) throw std::runtime_error("tokenizer returned a negative id"); result.push_back((uint32_t)id); }
@@ -681,6 +702,8 @@ struct Runtime {
                     {"snapshot_max_bytes",snapshot_max_bytes_config},
                     {"snapshot_spine_pin",snapshot_spine_pin_config},
                     {"max_tokens_default",max_tokens_default_config},
+                    {"sampling_default",{{"temperature",sampling_default_temperature},
+                        {"top_p",sampling_default_top_p},{"top_k",sampling_default_top_k}}},
                     {"kv_fp16_except",e.kv_fp16_except()},{"kv_fp16_cell_masks",cell_masks},
                     {"kv_side_codec",e.kv_fp16_except()?(e.kv_side_codec()?"e4m3":"fp16"):"none"},
                     {"gemm_half",shared->backend.gemm_half_enabled()},
@@ -986,8 +1009,11 @@ struct Runtime {
                 bool experimental_exact_prefix_save=false) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         q27::validate_sampling(sampling);
-        const bool mtp=mtp_width!=0 && sampling.temperature==0.0f;
+        // `mtp` (prefill warm + decode path) is resolved after the slot's
+        // engine is bound — it needs has_mtp() so bonsai packs with a stale
+        // --mtp flag still plain-sample instead of throwing in mtp_warm.
         const bool sfx=suffix_width!=0 && sampling.temperature==0.0f;
+        const bool sample_plain=getenv("Q27_SAMPLE_PLAIN")!=nullptr;
         const auto arrive=std::chrono::steady_clock::now();
 
         // ---- slot acquisition (route_ only; never held across GPU work) ----
@@ -1076,6 +1102,10 @@ struct Runtime {
             }
         } slot_release{*this,*slot};
         q27::MetalEngine& engine=slot->engine;
+        // Warm MTP whenever the artifact has the layer and we will use it:
+        // greedy MTP, or sampled MTP (not Q27_SAMPLE_PLAIN force-off).
+        const bool mtp=mtp_width!=0 && engine.has_mtp() &&
+            !(sampling.temperature>0.0f && sample_plain);
 
         // First lease acquisition stamps the gate wait; every engine call
         // below runs under one of these scoped leases.
@@ -1359,7 +1389,40 @@ struct Runtime {
         } constraint_cleanup{*this,tc,engine};
 
         // ---- generation, one quantum per lease ----
-        if(sampling.temperature>0.0f) {
+        // Sampled MTP (temp>0 + --mtp + has_mtp): rejection-sample accept on
+        // greedy drafts. Q27_SAMPLE_PLAIN=1 forces the slow plain sample path
+        // for distribution A/B. Bonsai (no MTP layer) falls through to plain.
+        if(sampling.temperature>0.0f && mtp_width!=0 && engine.has_mtp() &&
+           engine.chunked_prefill() && !sample_plain) {
+            std::mt19937_64 rng(sampling.seed);
+            {
+                // Prefill left a greedy pending; first emitted token is sampled.
+                auto gpu=lease_now();
+                pending=engine.sample_from_logits(sampling,rng);
+            }
+            uint32_t live_width=std::min(mtp_width,4u);
+            std::vector<uint32_t> committed;
+            bool stopped=false;
+            while(!stopped && produced<count) {
+                if(produced+1==count) {
+                    if(pending!=eos_id) deliver(pending);
+                    else cause=q27::MetalEngine::StopCause::Eos;
+                    break;
+                }
+                committed.clear();
+                {
+                    auto gpu=lease_now();
+                    pending=engine.mtp_sample_round(pending,count-produced,eos_id,mtp_width,
+                                                    live_width,sampling,rng,committed);
+                }
+                spec_rounds_total.fetch_add(1,std::memory_order_relaxed);
+                spec_committed_total.fetch_add(committed.size(),std::memory_order_relaxed);
+                for(uint32_t token:committed) {
+                    if(token==eos_id) { cause=q27::MetalEngine::StopCause::Eos; stopped=true; break; }
+                    if(!deliver(token)) { stopped=true; break; }
+                }
+            }
+        } else if(sampling.temperature>0.0f) {
             std::mt19937_64 rng(sampling.seed);
             while(produced<count) {
                 uint32_t token;
@@ -1544,9 +1607,18 @@ const char* anthropic_stop(Runtime::Finish f) {
 
 q27::SamplingParams sampling_params(const json& body) {
     q27::SamplingParams result;
-    result.temperature=body.value("temperature",0.0f);
-    result.top_p=body.value("top_p",1.0f);
-    result.top_k=body.value("top_k",0u);
+    result.temperature=sampling_default_temperature;
+    result.top_p=sampling_default_top_p;
+    result.top_k=sampling_default_top_k;
+    // Present-but-null falls back to the served default rather than throwing
+    // (clients send null-valued fields -- max_tokens handles the same pi.dev
+    // shape below).
+    if(body.contains("temperature") && body["temperature"].is_number())
+        result.temperature=body["temperature"].get<float>();
+    if(body.contains("top_p") && body["top_p"].is_number())
+        result.top_p=body["top_p"].get<float>();
+    if(body.contains("top_k") && body["top_k"].is_number())
+        result.top_k=body["top_k"].get<uint32_t>();
     result.seed=body.value("seed",0ull);
     q27::validate_sampling(result);
     return result;
@@ -1611,8 +1683,9 @@ int main(int argc,char** argv) {
     if(argc<3) {
         fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n"
                        "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
+                       "       [--temperature-default T] [--top-p-default P] [--top-k-default K]\n"
                        "       [--experimental-prefix-cache path]\n"
-                       "       (the snapshot/max-tokens/budget flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,SNAPSHOT_SPINE_PIN,MAX_TOKENS_DEFAULT,BUDGET_MB}; an explicit flag wins)\n",argv[0]);
+                       "       (the snapshot/max-tokens/budget/sampling-default flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,SNAPSHOT_SPINE_PIN,MAX_TOKENS_DEFAULT,BUDGET_MB,TEMPERATURE_DEFAULT,TOP_P_DEFAULT,TOP_K_DEFAULT}; an explicit flag wins)\n",argv[0]);
         return 1;
     }
     try {
@@ -1624,6 +1697,11 @@ int main(int argc,char** argv) {
         // snapshot_auto keeps a signed sentinel because 0 is meaningful
         // (hint-only saves).
         uint32_t budget_mb=0,snapshot_max_mb=0,max_tokens_default=0;
+        // Sampling-default sentinels double as "flag absent" (-1 / 0 /
+        // UINT32_MAX are all outside the valid ranges); with neither flag
+        // nor env the resolved values are the shipped greedy defaults.
+        float temperature_default=-1.0f, top_p_default=0.0f;
+        uint32_t top_k_default=UINT32_MAX;
         long long snapshot_auto=-1;
         int spine_pin=-1;   // -1 = unset (env/default); 0/1 explicit flag
         bool turbo3=false; bool constrain_tools=false;
@@ -1651,6 +1729,9 @@ int main(int argc,char** argv) {
             else if(arg=="--snapshot-max-mb" && i+1<argc) { snapshot_max_mb=parse_u32(argv[++i],"--snapshot-max-mb"); if(!snapshot_max_mb||snapshot_max_mb>(1u<<24)) throw std::runtime_error("--snapshot-max-mb must be an integer 1..16777216"); }
             else if(arg=="--snapshot-auto" && i+1<argc) { snapshot_auto=parse_u32(argv[++i],"--snapshot-auto"); if(snapshot_auto>(1ll<<24)) throw std::runtime_error("--snapshot-auto must be an integer 0..16777216"); }
             else if(arg=="--max-tokens-default" && i+1<argc) { max_tokens_default=parse_u32(argv[++i],"--max-tokens-default"); if(!max_tokens_default) throw std::runtime_error("--max-tokens-default must be >= 1"); }
+            else if(arg=="--temperature-default" && i+1<argc) { temperature_default=parse_float(argv[++i],"--temperature-default"); if(temperature_default<0.0f) throw std::runtime_error("--temperature-default must be >= 0"); }
+            else if(arg=="--top-p-default" && i+1<argc) { top_p_default=parse_float(argv[++i],"--top-p-default"); if(top_p_default<=0.0f||top_p_default>1.0f) throw std::runtime_error("--top-p-default must be in (0,1]"); }
+            else if(arg=="--top-k-default" && i+1<argc) { top_k_default=parse_u32(argv[++i],"--top-k-default"); if(top_k_default==UINT32_MAX) throw std::runtime_error("invalid --top-k-default"); }
             else if(arg=="--budget-mb" && i+1<argc) { budget_mb=parse_u32(argv[++i],"--budget-mb"); if(!budget_mb||budget_mb>(1u<<24)) throw std::runtime_error("--budget-mb must be an integer 1..16777216"); }
             else if(arg=="--snapshot-spine-pin" && i+1<argc) { spine_pin=(int)parse_u32(argv[++i],"--snapshot-spine-pin"); if(spine_pin>1) throw std::runtime_error("--snapshot-spine-pin must be 0 or 1"); }
             else throw std::runtime_error("unknown/incomplete argument: "+arg);
@@ -1684,6 +1765,34 @@ int main(int argc,char** argv) {
                     throw std::runtime_error("Q27_METAL_MAX_TOKENS_DEFAULT must be >= 1");
             }
         max_tokens_default_flag=max_tokens_default;
+        if(temperature_default<0.0f)
+            if(const char* e=getenv("Q27_METAL_TEMPERATURE_DEFAULT"); e && *e) {
+                temperature_default=parse_float(e,"Q27_METAL_TEMPERATURE_DEFAULT");
+                if(temperature_default<0.0f) throw std::runtime_error("Q27_METAL_TEMPERATURE_DEFAULT must be >= 0");
+            }
+        if(top_p_default==0.0f)
+            if(const char* e=getenv("Q27_METAL_TOP_P_DEFAULT"); e && *e) {
+                top_p_default=parse_float(e,"Q27_METAL_TOP_P_DEFAULT");
+                if(top_p_default<=0.0f||top_p_default>1.0f) throw std::runtime_error("Q27_METAL_TOP_P_DEFAULT must be in (0,1]");
+            }
+        if(top_k_default==UINT32_MAX)
+            if(const char* e=getenv("Q27_METAL_TOP_K_DEFAULT"); e && *e) {
+                top_k_default=parse_u32(e,"Q27_METAL_TOP_K_DEFAULT");
+                if(top_k_default==UINT32_MAX) throw std::runtime_error("invalid Q27_METAL_TOP_K_DEFAULT");
+            }
+        // Neither flag nor env: the shipped greedy defaults (bitwise unchanged).
+        if(temperature_default<0.0f) temperature_default=0.0f;
+        if(top_p_default==0.0f) top_p_default=1.0f;
+        if(top_k_default==UINT32_MAX) top_k_default=0;
+        sampling_default_temperature=temperature_default;
+        sampling_default_top_p=top_p_default;
+        sampling_default_top_k=top_k_default;
+        if(sampling_default_temperature>0.0f && width)
+            fprintf(stderr,"[sampling-default] temperature default %.4g uses sampled MTP (rejection accept) when --mtp is set; set temperature=0 per-request for greedy MTP\n",
+                    (double)sampling_default_temperature);
+        if(sampling_default_temperature>0.0f && suffix_width)
+            fprintf(stderr,"[sampling-default] temperature default %.4g disengages suffix speculation for requests that omit temperature (suffix is greedy-only)\n",
+                    (double)sampling_default_temperature);
         Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count,
                         budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto,max_tokens_default,spine_pin,
                         !experimental_prefix_dir.empty());

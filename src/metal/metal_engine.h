@@ -197,6 +197,18 @@ class MetalEngine {
     // so a finished stream never encodes past its end.
     uint32_t mtp_round(uint32_t pending, uint32_t remaining, uint32_t eos, uint32_t width,
                        uint32_t& live_width, std::vector<uint32_t>& committed);
+    // Sampled MTP quantum (docs/metal/plans/2026-07-21-metal-sampled-mtp.md):
+    // same greedy MTP drafts + batched verify as mtp_round, but the accept
+    // tail is Leviathan/Chen rejection sampling against the served target
+    // (temperature/top_p/top_k) and the next pending is sampled, not argmax'd.
+    // Request-owned rng (like sample_from_logits). Greedy mtp_round stays
+    // bitwise-untouched. Callers should use temperature > 0; at temperature 0
+    // the walk degenerates to a delta-at-argmax accept that is not the
+    // equality path (prefer mtp_round).
+    uint32_t mtp_sample_round(uint32_t pending, uint32_t remaining, uint32_t eos,
+                              uint32_t width, uint32_t& live_width,
+                              const SamplingParams& params, std::mt19937_64& rng,
+                              std::vector<uint32_t>& committed);
     // Sample one token from the current logits; the sampled-decode quantum
     // is sample_from_logits + step under one GPU lease. The RNG belongs to
     // the request, not the engine, so interleaved slots stay reproducible.
