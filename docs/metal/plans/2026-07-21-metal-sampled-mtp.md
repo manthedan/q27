@@ -206,9 +206,11 @@ reconciled. Prefer: write → commit → `autoreview --mode commit` → fix → 
 | 2026-07-21 | Plan written; parallel map; phases checked | this doc |
 | 2026-07-21 | Phase 0 helpers+tests | `d58ea12`; tests PASS |
 | 2026-07-21 | Codex P2 empty-residual throw | `4d8757f`; autoreview **clean** |
-| 2026-07-21 | Phase 1a–1c engine+CLI+server (uncommitted) | builds green |
-| | Phase 1 commit + Codex autoreview | *pending* |
-| | Phase 2 live gates on MTP pack | *pending* |
+| 2026-07-21 | Phase 1a–1c engine+CLI+server | `27ed0d4` |
+| 2026-07-21 | Codex P1 CLI has_mtp/chunked guard + gate script | `c545d81` |
+| 2026-07-21 | Live smoke official MTP pack, T=0.7 top_k=20 n=16 | **works**: 5 rounds, 13 drafted, 10 accepted (**76.9%**); wall ~0.17 t/s (host nucleus sort over full vocab is the bottleneck — Phase 4 top-k) |
+| | Phase 1 Codex autoreview after CLI fix | *pending* |
+| | Phase 2 full gate script on quiet machine | *pending* |
 
 ## Review workflow
 
