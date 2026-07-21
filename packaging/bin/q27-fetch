@@ -65,7 +65,13 @@ hf_download() { # $1=remote-file $2=dest  (resumable)
     # repo, whose integrity is already md5-pinned via the registry; that repo
     # has no source-GGUF commit, so resolving the pinned rev would 404.
     [ "$KIND" = "repack" ] && rev="$(source_rev_for)"
-    curl -L --fail --continue-at - \
+    # Optional auth: an HF_TOKEN lifts anonymous -> free-tier resolver quotas
+    # (3,000 -> 5,000 req/5min) and unlocks gated repos. Anonymous curl is fine
+    # for our public direct tiers (one resumable artifact), so this is purely
+    # opt-in — unset means no header, no dependency.
+    local -a auth=()
+    [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+    curl -L --fail --continue-at - "${auth[@]}" \
         "https://huggingface.co/$REPO/resolve/$rev/$file" -o "$dest"
 }
 
