@@ -605,9 +605,16 @@ extern "C" q27_agent_status q27_agent_generate(
                     q27_agent_tool_name_expects_body(
                         constrainer->tg.tool_name().c_str())) {
                     // Body tools continue free-decoding for a same-turn
-                    // markdown fence. Re-engaging a second tool call is not
-                    // constrained here; the parser rejects tool-shaped bodies.
+                    // markdown fence. Disable further engage so a literal
+                    // <tool_call> inside file content cannot re-arm masks.
                     awaiting_fenced_body = true;
+                    constrainer->enabled = false;
+                    constrainer->active = false;
+                    try {
+                        engine->session->set_tool_constraint(-1);
+                    } catch (...) {
+                        // Mask clear is best-effort; free decode continues.
+                    }
                 }
             }
 

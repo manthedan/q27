@@ -268,9 +268,10 @@ extern "C" int q27_agent_payload_rejected(const unsigned char *bytes, size_t len
         return i + n <= len &&
                std::memcmp(bytes + i, lit, n) == 0;
     };
+    // Only reject true tool-protocol wrappers. Do not ban bare JSON like
+    // package.json ({"name":...}) — that false-positived legitimate files.
     if (starts_with("<tool_call") || starts_with("</tool_call") ||
-        starts_with("<q27_raw_payload_request") ||
-        starts_with("{\"name\"") || starts_with("{\"name\":")) {
+        starts_with("<q27_raw_payload_request")) {
         set_error(error, error_cap,
                   "payload looks like a tool call; emit file bytes in a "
                   "markdown fence after </tool_call>, not another tool call");
@@ -297,7 +298,17 @@ extern "C" void q27_agent_tool_call_free(q27_agent_tool_call *call) {
     std::free(call->input);
     std::free(call->replacement);
     std::free(call->selection);
+    std::free(call->body_error);
     *call = q27_agent_tool_call{};
+}
+
+static char *dup_error_message(const char *message) {
+    if (!message || !*message) message = "unusable tool body";
+    const size_t n = std::strlen(message);
+    char *copy = static_cast<char *>(std::malloc(n + 1));
+    if (!copy) return nullptr;
+    std::memcpy(copy, message, n + 1);
+    return copy;
 }
 
 extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
@@ -493,14 +504,18 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         static const std::string close = "</tool_call>";
         const size_t begin = text.find(open);
         if (begin == std::string::npos) return Q27_TOOL_CALL_NONE;
-        if (text.find(open, begin + open.size()) != std::string::npos) {
-            set_error(error, error_cap, "multiple tool calls are not allowed in one turn");
-            return Q27_TOOL_CALL_INVALID;
-        }
         const size_t json_start = begin + open.size();
         const size_t end = text.find(close, json_start);
-        if (end == std::string::npos || text.find(close, end + close.size()) != std::string::npos) {
+        if (end == std::string::npos) {
             set_error(error, error_cap, "tool call is not closed exactly once");
+            return Q27_TOOL_CALL_INVALID;
+        }
+        // A second opener before the first closer is a second call inside the
+        // JSON header region. Openers after the closer are body text (allowed
+        // only for body tools, and rejected later if they form the body).
+        const size_t second_open = text.find(open, begin + open.size());
+        if (second_open != std::string::npos && second_open < end) {
+            set_error(error, error_cap, "multiple tool calls are not allowed in one turn");
             return Q27_TOOL_CALL_INVALID;
         }
         const size_t after = end + close.size();
@@ -514,6 +529,14 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         const json& args = outer["arguments"];
         const int expects_body = q27_agent_tool_name_expects_body(name.c_str());
         if (!expects_body) {
+            if (text.find(close, after) != std::string::npos) {
+                set_error(error, error_cap, "tool call is not closed exactly once");
+                return Q27_TOOL_CALL_INVALID;
+            }
+            if (second_open != std::string::npos) {
+                set_error(error, error_cap, "multiple tool calls are not allowed in one turn");
+                return Q27_TOOL_CALL_INVALID;
+            }
             for (size_t i = after; i < text.size(); ++i) {
                 const char c = text[i];
                 if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
@@ -605,6 +628,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         }
 
         int missing_body = 0;
+        char *body_error = nullptr;
         if (expects_body) {
             const unsigned char *tail =
                 reinterpret_cast<const unsigned char *>(text.data() + after);
@@ -614,15 +638,30 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                    (tail[non_ws] == ' ' || tail[non_ws] == '\t' ||
                     tail[non_ws] == '\r' || tail[non_ws] == '\n'))
                 ++non_ws;
+            // Body-tool schema is valid even when the fence is missing or
+            // unusable: return VALID + missing_body so the control loop can
+            // soft-fail with a tool_response and let the model retry.
             if (non_ws >= tail_len) {
                 missing_body = 1;
+                body_error = dup_error_message(
+                    "body tool requires a markdown-fenced body after "
+                    "</tool_call>; do not emit another tool call");
             } else if (!q27_agent_extract_fenced_body(tail, tail_len, &body,
                                                       &body_len, error,
                                                       error_cap)) {
-                return Q27_TOOL_CALL_INVALID;
+                missing_body = 1;
+                body_error = dup_error_message(
+                    error[0] ? error :
+                    "body tools require a markdown-fenced body after "
+                    "</tool_call>");
             } else if (q27_agent_payload_rejected(body, body_len, error,
                                                   error_cap)) {
-                return Q27_TOOL_CALL_INVALID;
+                std::free(body);
+                body = nullptr;
+                body_len = 0;
+                missing_body = 1;
+                body_error = dup_error_message(
+                    error[0] ? error : "unusable tool body");
             } else if (request.kind == Q27_TOOL_WRITE ||
                        request.kind == Q27_TOOL_OVERWRITE) {
                 // Whole-file tools: body is file content (optional outer
@@ -640,6 +679,13 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                 request.replacement_len = body_len;
                 body = nullptr;
             }
+            if (missing_body && !body_error) {
+                body_error = dup_error_message("unusable tool body");
+            }
+            if (missing_body && !body_error) {
+                set_error(error, error_cap, "out of memory recording body error");
+                return Q27_TOOL_CALL_INVALID;
+            }
         }
 
         request.path = reinterpret_cast<char *>(path);
@@ -651,6 +697,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         call->replacement = replacement;
         call->selection = reinterpret_cast<char *>(selection);
         call->missing_body = missing_body;
+        call->body_error = body_error;
         path = input = replacement = selection = nullptr;
         return Q27_TOOL_CALL_VALID;
     } catch (const std::bad_alloc&) {

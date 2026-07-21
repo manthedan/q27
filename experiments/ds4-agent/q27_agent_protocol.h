@@ -30,8 +30,11 @@ typedef struct {
     unsigned char *input;
     unsigned char *replacement;
     char *selection;
-    // 1 when a body-tool call is schema-valid but missing its required fence.
+    // 1 when a body-tool call is schema-valid but the fenced body is missing
+    // or unusable (soft-fail path; no side effect).
     int missing_body;
+    // Optional owned message for missing/unusable body (free with tool_call_free).
+    char *body_error;
 } q27_agent_tool_call;
 
 // Returns the fixed registry and instructions inserted into the system message
@@ -57,8 +60,9 @@ int q27_agent_payload_rejected(const unsigned char *bytes, size_t len,
 
 // Parses exactly one closed wrapped call. Prefix prose is allowed.
 // Non-body tools forbid non-whitespace after the closer.
-// Body tools require a markdown-fenced body after the closer (optional for
-// empty overwrite/write only when the fence body is empty). VALID owns all
+// Body tools expect a markdown-fenced body after the closer. An empty *fenced*
+// body is valid; a missing or unusable fence returns VALID with missing_body
+// set so the control loop can soft-fail without a side effect. VALID owns all
 // request bytes in `call`; release with tool_call_free.
 q27_agent_tool_call_status q27_agent_parse_tool_call(
     const unsigned char *bytes, size_t len,

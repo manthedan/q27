@@ -56,10 +56,35 @@ int main() {
 
     CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
                 "\"path\":\"x.py\"}}</tool_call>\n"
-                "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"x.py\"}}"
+                "print(\"no fence\")\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1 && call.body_error,
+          "unfenced body soft-fails with missing_body");
+    q27_agent_tool_call_free(&call);
+
+    CHECK(parse("<tool_call>{\"name\":\"read\",\"arguments\":{"
+                "\"path\":\"a\"}}</tool_call>"
+                "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"b\"}}"
                 "</tool_call>",
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
-          "tool-shaped body is rejected");
+          "second tool_call for non-body tools still fails");
+
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"pkg.json\"}}</tool_call>\n"
+                "```json\n{\"name\":\"demo\",\"version\":\"1\"}\n```\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body &&
+          call.request.input_len == std::strlen("{\"name\":\"demo\",\"version\":\"1\"}\n"),
+          "package.json-style {\"name\" body is allowed");
+    q27_agent_tool_call_free(&call);
+
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```\n<tool_call>{\"name\":\"write\"}</tool_call>\n```\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1 && call.body_error,
+          "tool-shaped fenced body soft-fails");
+    q27_agent_tool_call_free(&call);
 
     std::string overwrite = "<tool_call>{\"name\":\"overwrite\",\"arguments\":{"
         "\"path\":\"x.py\"}}</tool_call>\n```\nfull file\n```\n";

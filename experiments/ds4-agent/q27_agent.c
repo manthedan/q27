@@ -1103,7 +1103,7 @@ static int adaptive_turn_limit(q27_agent_worker *worker,
                                uint32_t context_tokens, int enable_tools,
                                uint32_t *limit) {
     // Tool turns retain a continuation margin. Plain terminal turns retain a
-    // smaller margin. Bulk payload turns use the reserve-aware helper directly
+    // smaller margin. Same-turn body tools share ordinary adaptive margins;
     // because they must also leave room for response framing before mutation.
     return adaptive_turn_limit_with_reserve(
         worker, chat, think, context_tokens, enable_tools ? 512 : 256, limit);
@@ -1211,36 +1211,11 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
             // Same-turn fenced body: no second free raw-payload generation.
             // Missing or tool-shaped bodies fail closed with no side effect.
             if (call.missing_body) {
-                if (!append_failed_tool_response(
-                        chat,
-                        "body tool requires a markdown-fenced body after "
-                        "</tool_call>; do not emit another tool call")) {
-                    q27_agent_tool_call_free(&call);
-                    return 0;
-                }
-                q27_agent_tool_call_free(&call);
-                ++tool_rounds;
-                continue;
-            }
-            char body_error[256] = {0};
-            if (call.request.kind == Q27_TOOL_WRITE ||
-                call.request.kind == Q27_TOOL_OVERWRITE) {
-                if (q27_agent_payload_rejected(call.request.input,
-                                               call.request.input_len,
-                                               body_error, sizeof(body_error))) {
-                    if (!append_failed_tool_response(chat, body_error)) {
-                        q27_agent_tool_call_free(&call);
-                        return 0;
-                    }
-                    q27_agent_tool_call_free(&call);
-                    ++tool_rounds;
-                    continue;
-                }
-            } else if (q27_agent_payload_rejected(
-                           call.request.replacement,
-                           call.request.replacement_len, body_error,
-                           sizeof(body_error))) {
-                if (!append_failed_tool_response(chat, body_error)) {
+                const char *msg = call.body_error && call.body_error[0] ?
+                    call.body_error :
+                    "body tool requires a markdown-fenced body after "
+                    "</tool_call>; do not emit another tool call";
+                if (!append_failed_tool_response(chat, msg)) {
                     q27_agent_tool_call_free(&call);
                     return 0;
                 }
