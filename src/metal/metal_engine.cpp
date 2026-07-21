@@ -2462,12 +2462,14 @@ std::vector<uint32_t> MetalEngine::generate_mtp_sampled(const std::vector<uint32
         throw std::runtime_error("q27 Metal: sampled MTP requires chunked prefill");
     if (width < 2 || width > CHUNK_MAX)
         throw std::runtime_error("q27 Metal: MTP width must be 2..12");
-    if (!count) return {};
     if ((uint64_t)prompt.size() + count > max_context_ + 1)
         throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
-    // Prefill leaves logits for the first gen token; sample that pending
-    // (not the greedy argmax from ingest_prompt's return).
+    last_spec_stats_ = {};
+    // Prefill leaves logits for the first gen token (always — including count==0
+    // so --dump-logits / reuse see prompt-conditioned state). Sample pending
+    // only when generating (not the greedy argmax from ingest_prompt's return).
     (void)ingest_prompt(prompt, true, true);
+    if (!count) return {};
     std::mt19937_64 rng(params.seed);
     uint32_t pending = sample_from_logits(params, rng);
     std::vector<uint32_t> generated;
