@@ -1396,10 +1396,16 @@ int main(int argc, char** argv) {
                     engine.position());
             generated = engine.generate_from_pending(pending, count);
         } else {
-            if (sampling.temperature > 0 && mtp_width) {
-                // Sampled MTP: prefill leaves logits for the first gen token;
-                // sample that pending (not the greedy argmax), then run
-                // mtp_sample_round quanta — mirrors server routing.
+            // Sampled MTP only when the pack has the layer and chunked verify
+            // is available — mirror server has_mtp()/chunked_prefill() gates
+            // so Bonsai or serial-prefill falls back to plain sampling (codex P1).
+            const bool use_mtp_sample =
+                sampling.temperature > 0 && mtp_width &&
+                engine.has_mtp() && engine.chunked_prefill() &&
+                !getenv("Q27_SAMPLE_PLAIN");
+            if (use_mtp_sample) {
+                // Prefill leaves logits for the first gen token; sample that
+                // pending (not the greedy argmax), then mtp_sample_round quanta.
                 (void)engine.ingest_prompt(prompt, true, true);
                 std::mt19937_64 rng(sampling.seed);
                 uint32_t pending = engine.sample_from_logits(sampling, rng);
