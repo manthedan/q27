@@ -42,6 +42,16 @@ void q27_agent_engine_close(q27_agent_engine *engine) {
     free(engine);
 }
 
+void q27_agent_engine_set_mtp_width(q27_agent_engine *engine, uint32_t width) {
+    (void)engine;
+    (void)width;
+}
+
+uint32_t q27_agent_engine_mtp_width(const q27_agent_engine *engine) {
+    (void)engine;
+    return 0;
+}
+
 q27_agent_status q27_agent_engine_tokenizer_sha1(
     q27_agent_engine *engine, unsigned char out_sha1[20],
     char *error, size_t error_cap) {

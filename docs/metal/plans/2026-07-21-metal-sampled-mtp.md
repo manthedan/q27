@@ -1,6 +1,6 @@
 # Metal sampled MTP — CUDA Phase-2 rejection sampling on the host path
 
-Status: **PHASE 2 DONE** — overnight suite green on quiet machine (`logs/overnight-sampled-mtp-20260721-013859`). Correctness + accept-vs-temp hold; wall t/s ship bar **miss** (sample-mtp ≲ plain on N=96 Fibonacci). See progress log.  
+Status: **PHASE 2 DONE + agent MTP** — overnight green; wall miss diagnosed (verify ≈ serial step; host RS free); native agent free-decode MTP sample path landed.  
 
 Branch: `agent-fenced-body-write` (or a follow-on branch if this stack splits).  
 Machine: any Metal Mac with an official MTP pack for live gates; unit tests are CPU-only.  
@@ -196,7 +196,7 @@ Checklist after the run:
 - [ ] Device nucleus/Gumbel only if profiled hot
 - [ ] Sampled suffix-burst
 - [ ] Constrained + sampled MTP (CUDA Phase 3 analogue)
-- [ ] Native agent MTP sample path (still serial sample today)
+- [x] Native agent MTP sample path (free-decode; serial under tool masks)
 
 ## Overnight run (quiet machine)
 
@@ -234,6 +234,8 @@ Offline-only dry run: `SKIP_LIVE=1 tools/overnight_sampled_mtp.sh`.
 | 2026-07-21 | GPU top-k + offset bind + agent recipe | `96a717f` `be98a1c` clean |
 | 2026-07-21 | Overnight orchestrator + docs + reject-walk parity tests + `generate_mtp_sampled` | landed pre-overnight |
 | 2026-07-21 | **Phase 2 overnight** `logs/overnight-sampled-mtp-20260721-013859` | **ALL LEGS PASS**. Gate: seeded identity, seed varies, sampled≠greedy, plain trajectory, traces+drafts. **Leg 2 wall (N=96):** greedy **3.50** t/s (90.8% accept), sample-mtp **3.38** t/s (83.5%), plain-sample **3.66** t/s — sample-mtp **not** faster than plain (~0.92×); ship bar **miss** on Fibonacci short-gen. **Leg 3 accept@T (N=32):** T0/0.3 **88%**, T0.7 **65.5%**, T1.0 **77.8%**, T1.5 **45.5%**. False-positive pgrep warn (matched `q27-agent-tui` path). |
+| 2026-07-21 | **Why sample-mtp lost** (`Q27_MTP_TRACE` n=32) | Host reject walk **free** (commit ~0s). GPU top-k **on**. Steady-state: draft ~0.04s/r, **verify ~0.49s/r** ≈ one serial step. sample vs greedy delta is accept rate (~3.5% wall). First-round cold verify 4.7s punishes short N. Steady gen-only sample ~5 t/s theoretical after warm-up; overnight still ~flat with plain because multi-lane verify does not undercut serial step enough on this pack/prompt. **Product takeaway:** sampling is the loop-break feature; MTP is opportunistic speed when accept stays high — not yet a wall win vs plain. |
+| 2026-07-21 | Native agent free-decode MTP | `--mtp N` + `q27_agent_engine_set_mtp_width`; temp>0 → `mtp_sample_round`, temp==0 → `mtp_round`; tool masks force serial; `q27` wrapper defaults `--mtp 4` when `Q27_AGENT_TEMPERATURE` set (`Q27_AGENT_MTP` override/0). |
 | | Phase 4 further speed (device nucleus only if profiled hot) | optional; top-k already in |
 | | Longer / multi-prompt wall A/B to re-check ship bar | *pending* if we want product claim |
 | | Quality A/B before sampling defaults-on | Phase 3 blocker |

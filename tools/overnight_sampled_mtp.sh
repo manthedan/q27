@@ -56,7 +56,10 @@ die() { log "FAIL: $*"; echo "FAIL: $*" >>"$OUTDIR/SUMMARY.md"; exit 1; }
 log "outdir=$OUTDIR"
 
 # Refuse to start if another q27 engine process is holding weights (best-effort).
-if pgrep -f 'q27-metal-server|q27-agent|build/q27-metal ' >/dev/null 2>&1; then
+# Match process names, not path substrings (q27-agent-tui was a false positive).
+if pgrep -x 'q27-metal-server' >/dev/null 2>&1 ||
+   pgrep -x 'q27-agent' >/dev/null 2>&1 ||
+   pgrep -f '(^|/)(build/)?q27-metal( |$)' >/dev/null 2>&1; then
   log "WARN: another q27 process may be running — live legs can thrash memory"
   echo "- **warn:** other q27 process detected at start" >>"$OUTDIR/SUMMARY.md"
 fi

@@ -77,10 +77,13 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
                                           const char *tokenizer_path,
                                           uint32_t context,
                                           char *error, size_t error_cap);
+// mtp_width: 0 = serial decode only; 2..12 = free-decode MTP (sampled when
+// temperature > 0). Active tool grammar still forces serial.
 q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
                                              const char *tokenizer_path,
                                              uint32_t context,
                                              const char *workspace_root,
+                                             uint32_t mtp_width,
                                              char *error, size_t error_cap);
 
 // Deep-copies every message before returning. enable_tools opts into the fixed

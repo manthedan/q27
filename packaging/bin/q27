@@ -221,23 +221,37 @@ cmd_agent() {
     if [ -n "${Q27_AGENT_SEED:-}" ]; then
         sample_args+=(--seed "$Q27_AGENT_SEED")
     fi
+    # MTP free-decode: when sampling is on, default --mtp 4 so rejection
+    # accept can break greedy argmax loops (still serial under tool masks).
+    # Explicit Q27_AGENT_MTP=0 disables; Q27_AGENT_MTP=N overrides width.
+    # Without temperature, leave MTP off unless the operator sets it (keeps
+    # historical greedy bitwise path).
+    local mtp_args=()
+    if [ -n "${Q27_AGENT_MTP:-}" ]; then
+        mtp_args+=(--mtp "$Q27_AGENT_MTP")
+    elif [ -n "${Q27_AGENT_TEMPERATURE:-}" ]; then
+        mtp_args+=(--mtp 4)
+    fi
     echo "q27 agent: pack=$n context=$context workspace=$workspace" >&2
     echo "  automatic tools enabled; shell retains your local account's filesystem access" >&2
     if [ ${#sample_args[@]} -gt 0 ]; then
         echo "  sampling: ${sample_args[*]}" >&2
+    fi
+    if [ ${#mtp_args[@]} -gt 0 ]; then
+        echo "  mtp: ${mtp_args[*]}" >&2
     fi
     if [ -n "${Q27_AGENT_SESSION:-}" ]; then
         q27_run_consumer "$agent" "$art" "$tok" \
             --context "$context" --max-tokens "$max_tokens" \
             --auto-tools --workspace "$workspace" \
             --session "$Q27_AGENT_SESSION" \
-            "${sample_args[@]}" "$@"
+            "${sample_args[@]}" "${mtp_args[@]}" "$@"
         return $?
     fi
     q27_run_consumer "$agent" "$art" "$tok" \
         --context "$context" --max-tokens "$max_tokens" \
         --auto-tools --workspace "$workspace" \
-        "${sample_args[@]}" "$@"
+        "${sample_args[@]}" "${mtp_args[@]}" "$@"
 }
 
 cmd_bench()  { exec "$HERE/q27-bench" "$@"; }

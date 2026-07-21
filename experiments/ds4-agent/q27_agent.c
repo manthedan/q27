@@ -106,10 +106,14 @@ static void usage(FILE *out, const char *argv0) {
         "      --top-p P          nucleus sampling in (0,1] (default 1)\n"
         "      --top-k K          sample from top-K; 0 = full vocab (default 0)\n"
         "      --seed N           RNG seed when temperature > 0 (default 0)\n"
+        "      --mtp N            free-decode MTP width 0|2..12 (default 0;\n"
+        "                         temp>0 uses rejection-sample accept; tool\n"
+        "                         masks still force serial decode)\n"
         "  -h, --help              show this help\n"
         "\n"
         "Tool grammar stays engaged under temperature sampling (masks apply\n"
-        "before the draw). Compaction summaries always run greedy.\n"
+        "before the draw). Compaction summaries always run greedy. MTP is a\n"
+        "speed path for free text; sampling (temp>0) is the loop-break path.\n"
         "\n"
         "interactive: :save, :compact, :read PATH, :search PATH NEEDLE,\n"
         "             :shell COMMAND, :quit\n",
@@ -1480,6 +1484,7 @@ int main(int argc, char **argv) {
         "Answer concisely.";
     uint32_t context = 8192, max_tokens = 512, max_tool_rounds = 8;
     uint32_t compact_at = 0, compact_keep = 4, compact_tokens = 1024;
+    uint32_t mtp_width = 0;
     int think = 1, jsonl = 0, auto_tools = 0, max_tokens_explicit = 0;
     int adaptive_tokens = 0;
     q27_agent_sampling sampling = sampling_greedy();
@@ -1576,6 +1581,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "q27-agent: invalid seed\n");
                 return 2;
             }
+        } else if (!strcmp(arg, "--mtp")) {
+            if (++i == argc || !parse_u32_allow_zero(argv[i], &mtp_width) ||
+                mtp_width == 1 || mtp_width > 12) {
+                fprintf(stderr, "q27-agent: mtp width must be 0 or 2..12\n");
+                return 2;
+            }
         } else if (!strcmp(arg, "--output-format")) {
             if (++i == argc ||
                 (strcmp(argv[i], "text") && strcmp(argv[i], "jsonl"))) {
@@ -1628,12 +1639,18 @@ int main(int argc, char **argv) {
     char error[512] = {0};
     unsigned char tokenizer_sha1[20];
     q27_agent_worker *worker = q27_agent_worker_start_at(
-        model, tokenizer, context, workspace, error, sizeof(error));
+        model, tokenizer, context, workspace, mtp_width, error, sizeof(error));
     if (!worker) {
         fprintf(stderr, "q27-agent: worker start failed: %s\n",
                 error[0] ? error : "unknown error");
         close_signal_pipe();
         return 1;
+    }
+    if (mtp_width >= 2) {
+        fprintf(stderr,
+                "q27-agent: mtp=%u (free-decode; %s; tool masks force serial)\n",
+                mtp_width,
+                sampling.temperature > 0.0f ? "sampled accept" : "greedy accept");
     }
     if (!q27_agent_worker_tokenizer_sha1(worker, tokenizer_sha1)) {
         fprintf(stderr, "q27-agent: worker tokenizer identity unavailable\n");

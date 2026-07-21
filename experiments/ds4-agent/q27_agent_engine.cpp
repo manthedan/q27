@@ -61,6 +61,7 @@ struct q27_agent_engine {
     char poison_error[256] = {0};
     unsigned char tokenizer_sha1[20] = {0};
     uint32_t context;
+    uint32_t mtp_width = 0; // 0 = serial; 2..12 = free-decode MTP quanta
 
     q27_agent_engine(const char *model_path, const char *tokenizer_path, uint32_t ctx)
         : context(ctx) {
@@ -121,6 +122,19 @@ extern "C" q27_agent_engine *q27_agent_engine_open(
         set_error(error, error_cap, "unknown engine-open failure");
     }
     return nullptr;
+}
+
+extern "C" void q27_agent_engine_set_mtp_width(q27_agent_engine *engine,
+                                               uint32_t width) {
+    if (!engine) return;
+    // 0 disables; 1 is not a valid MTP width (needs pending+draft). Clamp.
+    if (width == 1) width = 0;
+    if (width > 12) width = 12;
+    engine->mtp_width = width;
+}
+
+extern "C" uint32_t q27_agent_engine_mtp_width(const q27_agent_engine *engine) {
+    return engine ? engine->mtp_width : 0;
 }
 
 extern "C" void q27_agent_engine_close(q27_agent_engine *engine) {
@@ -593,19 +607,24 @@ extern "C" q27_agent_status q27_agent_generate(
         bool stopped_for_tool_call = false;
         bool awaiting_fenced_body = false;
         q27::agent::StallWatcher stall_watcher;
-        while (produced < max_tokens && current != eos) {
-            if (!alive(opaque)) {
-                if (output_tokens) *output_tokens = produced;
-                return cancelled();
-            }
+        // Adaptive live width for free-decode MTP (mirrors metal_server).
+        uint32_t live_width =
+            engine->mtp_width >= 2 ? std::min(engine->mtp_width, 4u) : 0;
+        const bool sample_plain = getenv("Q27_SAMPLE_PLAIN") != nullptr;
 
+        // Stream one non-EOS token: tool scan → stall → sink → produced++.
+        // Returns: 0 ok continue, 1 stop (tool close / max), -1 cancelled,
+        // -2 stalled. Sets call_closed / awaiting_fenced_body as needed.
+        auto emit_one = [&](uint32_t token, bool *call_closed_out) -> int {
+            if (call_closed_out) *call_closed_out = false;
+            if (!alive(opaque)) return -1;
             bool call_closed = false;
             if (constrainer) {
                 const long engaged_before = constrainer->engaged;
                 const bool active_before = constrainer->active;
-                const int token = static_cast<int>(current);
-                (void)constrainer->scan_round(&token, 1);
-                constrainer->on_id(token);
+                const int t = static_cast<int>(token);
+                (void)constrainer->scan_round(&t, 1);
+                constrainer->on_id(t);
                 const bool newly_engaged =
                     constrainer->engaged != engaged_before;
                 if (constrainer->pool_dead ||
@@ -638,10 +657,11 @@ extern "C" q27_agent_status q27_agent_generate(
                     }
                 }
             }
+            if (call_closed_out) *call_closed_out = call_closed;
 
             const std::string bytes =
-                engine->tokenizer->decode_one(static_cast<int>(current));
-            if (stall_watcher.observe(current, bytes) !=
+                engine->tokenizer->decode_one(static_cast<int>(token));
+            if (stall_watcher.observe(token, bytes) !=
                 q27::agent::StallReason::None) {
                 // Prior streamed bytes cannot be withdrawn. The triggering
                 // token is not streamed or recorded, and all resident reuse
@@ -650,62 +670,154 @@ extern "C" q27_agent_status q27_agent_generate(
                 engine->agent_session.invalidate();
                 if (output_tokens) *output_tokens = produced;
                 set_error(error, error_cap, "generation stalled");
-                return Q27_AGENT_STALLED;
+                return -2;
             }
-            if (!bytes.empty() && !sink(bytes.data(), bytes.size(), opaque)) {
-                if (output_tokens) *output_tokens = produced;
-                return cancelled();
-            }
+            if (!bytes.empty() && !sink(bytes.data(), bytes.size(), opaque))
+                return -1;
             ++produced;
             // The callback is irreversible: publish accounting before any
             // allocation, Metal step, or other bookkeeping can fail.
             if (output_tokens) *output_tokens = produced;
             if (call_closed && tool_call_complete) *tool_call_complete = 1;
-
-            // Non-body tools: a closed call is a semantic terminal. Body tools
-            // keep generating until EOS so the fenced payload can follow
-            // </tool_call> in the same turn.
             const bool stop_for_closed_call =
                 call_closed && !awaiting_fenced_body;
-            if (produced == max_tokens || stop_for_closed_call) {
-                if (stop_for_closed_call) stopped_for_tool_call = true;
+            if (stop_for_closed_call) stopped_for_tool_call = true;
+            if (produced == max_tokens || stop_for_closed_call) return 1;
+            return 0;
+        };
+
+        auto finalize_last = [&](uint32_t token, bool already_encoded) -> void {
+            try {
+                if (!engine->agent_session.record_emitted(token))
+                    throw std::runtime_error(
+                        "agent session emitted-token mismatch");
+            } catch (...) {
+                engine->agent_session.invalidate();
+                return;
+            }
+            if (already_encoded) {
+                if (!engine->agent_session.mark_pending_encoded())
+                    engine->agent_session.invalidate();
+                return;
+            }
+            // Final-token Metal ingestion is bookkeeping: cancellation
+            // invalidates reuse, while a runtime failure poisons the next
+            // command, but neither reverses this result.
+            if (engine->session->position() < engine->context) {
+                if (!alive(opaque)) {
+                    engine->agent_session.invalidate();
+                    return;
+                }
                 try {
-                    if (!engine->agent_session.record_emitted(current))
+                    (void)engine->session->step(token);
+                    if (!engine->agent_session.mark_pending_encoded())
                         throw std::runtime_error(
-                            "agent session emitted-token mismatch");
+                            "agent session final-token mismatch");
+                } catch (const std::exception& e) {
+                    engine->agent_session.invalidate();
+                    engine->poisoned = true;
+                    set_error(engine->poison_error,
+                              sizeof(engine->poison_error), e.what());
                 } catch (...) {
                     engine->agent_session.invalidate();
-                    break;
+                    engine->poisoned = true;
+                    set_error(engine->poison_error,
+                              sizeof(engine->poison_error),
+                              "unknown final-token ingestion failure");
                 }
-                // Final-token Metal ingestion is also bookkeeping:
-                // cancellation invalidates reuse, while a runtime failure
-                // poisons the next command, but neither reverses this result.
-                if (engine->session->position() < engine->context) {
-                    if (!alive(opaque)) {
-                        engine->agent_session.invalidate();
+                if (!alive(opaque)) engine->agent_session.invalidate();
+            }
+        };
+
+        while (produced < max_tokens && current != eos) {
+            if (!alive(opaque)) {
+                if (output_tokens) *output_tokens = produced;
+                return cancelled();
+            }
+
+            const uint32_t remaining = max_tokens - produced;
+            // Free-decode MTP only: active tool masks require serial sample
+            // so constrained logits stay fail-closed (server same rule).
+            const bool tools_masking =
+                constrainer.has_value() && constrainer->active;
+            const bool can_mtp =
+                live_width >= 2 && engine->session->has_mtp() &&
+                engine->session->chunked_prefill() && remaining >= 2 &&
+                !tools_masking && !sample_plain;
+
+            if (can_mtp) {
+                // Drain the full committed burst before stopping. mtp_* already
+                // advanced Metal over `encoded` rows; skipping a trailing
+                // token would desync the session ledger from position_.
+                std::vector<uint32_t> committed;
+                const uint32_t pos_before = engine->session->position();
+                uint32_t next_pending;
+                if (use_sample) {
+                    next_pending = engine->session->mtp_sample_round(
+                        current, remaining, eos, engine->mtp_width, live_width,
+                        params, rng, committed);
+                } else {
+                    next_pending = engine->session->mtp_round(
+                        current, remaining, eos, engine->mtp_width, live_width,
+                        committed);
+                }
+                const uint32_t encoded =
+                    engine->session->position() - pos_before;
+                bool stop_after_burst = false;
+                for (size_t i = 0; i < committed.size(); ++i) {
+                    const uint32_t tok = committed[i];
+                    if (tok == eos) {
+                        // Do not stream EOS (serial loop also exits before).
+                        current = eos;
+                        stop_after_burst = true;
                         break;
                     }
-                    try {
-                        current = engine->session->step(current);
+                    bool call_closed = false;
+                    const int er = emit_one(tok, &call_closed);
+                    if (er == -2) return Q27_AGENT_STALLED;
+                    if (er == -1) {
+                        if (output_tokens) *output_tokens = produced;
+                        return cancelled();
+                    }
+                    if (er == 1) stop_after_burst = true;
+                    if (!engine->agent_session.record_emitted(tok))
+                        throw std::runtime_error(
+                            "agent session emitted-token mismatch");
+                    if (i < encoded) {
                         if (!engine->agent_session.mark_pending_encoded())
                             throw std::runtime_error(
-                                "agent session final-token mismatch");
-                    } catch (const std::exception& e) {
-                        engine->agent_session.invalidate();
-                        engine->poisoned = true;
-                        set_error(engine->poison_error,
-                                  sizeof(engine->poison_error), e.what());
-                        break;
-                    } catch (...) {
-                        engine->agent_session.invalidate();
-                        engine->poisoned = true;
-                        set_error(engine->poison_error,
-                                  sizeof(engine->poison_error),
-                                  "unknown final-token ingestion failure");
-                        break;
+                                "agent session token-step mismatch");
+                    } else {
+                        // Remaining-edge final lane: not encoded by mtp_*.
+                        (void)engine->session->step(tok);
+                        if (!engine->agent_session.mark_pending_encoded())
+                            throw std::runtime_error(
+                                "agent session token-step mismatch");
                     }
-                    if (!alive(opaque)) engine->agent_session.invalidate();
+                    if (!alive(opaque)) {
+                        if (output_tokens) *output_tokens = produced;
+                        return cancelled();
+                    }
                 }
+                if (stop_after_burst || current == eos) break;
+                current = next_pending;
+                if (!alive(opaque)) {
+                    if (output_tokens) *output_tokens = produced;
+                    return cancelled();
+                }
+                continue;
+            }
+
+            // ---- serial quantum (tools active, no MTP, or remaining < 2) ----
+            bool call_closed = false;
+            const int er = emit_one(current, &call_closed);
+            if (er == -2) return Q27_AGENT_STALLED;
+            if (er == -1) {
+                if (output_tokens) *output_tokens = produced;
+                return cancelled();
+            }
+            if (er == 1) {
+                finalize_last(current, /*already_encoded=*/false);
                 break;
             }
             if (!engine->agent_session.record_emitted(current))
