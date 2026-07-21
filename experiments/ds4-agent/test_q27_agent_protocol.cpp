@@ -10,10 +10,10 @@
 
 static q27_agent_tool_call_status parse(const std::string& text,
                                         q27_agent_tool_call& call,
-                                        char *error, size_t cap) {
+                                        char *error, size_t cap, int eos = 1) {
     return q27_agent_parse_tool_call(
         reinterpret_cast<const unsigned char *>(text.data()), text.size(),
-        &call, error, cap);
+        &call, error, cap, eos);
 }
 
 int main() {
@@ -117,6 +117,19 @@ int main() {
           std::string(reinterpret_cast<const char *>(call.request.input),
                       call.request.input_len) == "print(1)\n",
           "unclosed fence at EOS recovers body");
+    q27_agent_tool_call_free(&call);
+
+    // Output-limit stop: the same unclosed fence must NOT recover — the body
+    // is truncated and publishing it would silently write a partial file
+    // (codex branch-review P1). Soft-fail with an actionable error instead.
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```python\nprint(1)\n",
+                call, error, sizeof(error), /*eos=*/0) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1 &&
+          call.body_error &&
+          std::string(call.body_error).find("output limit") != std::string::npos,
+          "unclosed fence at max_tokens fails closed (no truncated publish)");
     q27_agent_tool_call_free(&call);
 
     // Second tool call after an unclosed fence must not land as file content.

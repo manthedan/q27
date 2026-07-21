@@ -64,10 +64,15 @@ int q27_agent_payload_rejected(const unsigned char *bytes, size_t len,
 // body is valid; a missing or unusable fence returns VALID with missing_body
 // set so the control loop can soft-fail without a side effect. VALID owns all
 // request bytes in `call`; release with tool_call_free.
+// eos_reached must reflect how the turn ended: the unclosed-fence recovery is
+// only legal at a real EOS (the observed pattern it exists for). After a
+// non-EOS stop (max_tokens output limit) an unclosed fence means the body is
+// TRUNCATED; recovering it would silently publish a partial file (codex
+// branch-review P1), so it fails closed like any other unusable fence.
 q27_agent_tool_call_status q27_agent_parse_tool_call(
     const unsigned char *bytes, size_t len,
     q27_agent_tool_call *call,
-    char *error, size_t error_cap);
+    char *error, size_t error_cap, int eos_reached);
 void q27_agent_tool_call_free(q27_agent_tool_call *call);
 
 // Removes one unambiguous outer Markdown fence from a known whole-file
@@ -85,13 +90,16 @@ int q27_agent_unwrap_whole_file_source_fence(
 // *out_len. Returns 1 on success, 0 when no usable fence body is present.
 // Prefers a CommonMark-closed fence; if the opener is present but the closer
 // is missing (common EOS under free-decode), recovers content through end of
-// turn after stripping trailing </tool_call> protocol echo. After a closed
+// turn after stripping trailing </tool_call> protocol echo — but ONLY when
+// eos_reached is true: after an output-limit stop the unclosed body is
+// truncated and must not be published. After a closed
 // fence, only whitespace and extra literal </tool_call> tags are tolerated;
 // other trailing bytes fail closed so a premature ``` cannot silently
 // truncate a published body.
 int q27_agent_extract_fenced_body(const unsigned char *bytes, size_t len,
                                   unsigned char **out, size_t *out_len,
-                                  char *error, size_t error_cap);
+                                  char *error, size_t error_cap,
+                                  int eos_reached);
 
 #ifdef __cplusplus
 }

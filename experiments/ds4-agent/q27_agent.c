@@ -1210,9 +1210,10 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
             return 0;
         output_buffer generated = {0};
         int engine_closed_call = 0;
+        int turn_eos = 0;
         turn_accounting accounting = {0};
         if (!run_turn(worker, chat, think, 1, turn_max_tokens, sampling,
-                      jsonl, 1, &generated, &engine_closed_call, NULL,
+                      jsonl, 1, &generated, &engine_closed_call, &turn_eos,
                       &accounting)) {
             free(generated.bytes);
             return 0;
@@ -1223,7 +1224,7 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         const size_t generated_bytes = generated.len;
         q27_agent_tool_call_status parsed = q27_agent_parse_tool_call(
             (const unsigned char *)(generated.bytes ? generated.bytes : ""),
-            generated.len, &call, error, sizeof(error));
+            generated.len, &call, error, sizeof(error), turn_eos);
         if (parsed == Q27_TOOL_CALL_NONE) {
             free(generated.bytes);
             if (engine_closed_call) {

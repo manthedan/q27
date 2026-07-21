@@ -154,6 +154,8 @@ const std::string& preamble() {
                  "Create one new workspace-relative regular file. JSON args: path only. "
                  "Immediately after </tool_call>, emit the complete file as a markdown "
                  "fenced block (```lang then body then ```). Never put file content in JSON. "
+                 "The block's final newline is part of the file; a file without a "
+                 "trailing newline is not representable in this transport. "
                  "Fails if the path already exists; use overwrite for full rewrite or edit "
                  "for a small unique patch."},
                 {"parameters", {{"type", "object"},
@@ -166,7 +168,9 @@ const std::string& preamble() {
                 {"description",
                  "Create or replace the entire contents of one workspace-relative regular "
                  "file. JSON args: path only. Immediately after </tool_call>, emit the "
-                 "complete file as a markdown fenced block. Prefer overwrite for full-file "
+                 "complete file as a markdown fenced block. The block's final newline is "
+                 "part of the file; a file without a trailing newline is not "
+                 "representable in this transport. Prefer overwrite for full-file "
                  "rewrites; use edit only for short unique patches."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
@@ -316,7 +320,8 @@ static char *dup_error_message(const char *message) {
 extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
                                              size_t len, unsigned char **out,
                                              size_t *out_len, char *error,
-                                             size_t error_cap) {
+                                             size_t error_cap,
+                                             int eos_reached) {
     if (out) *out = nullptr;
     if (out_len) *out_len = 0;
     if (!bytes || !out || !out_len) {
@@ -451,6 +456,16 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
     // by taking the body as everything after the opener, then stripping only
     // trailing whole-line protocol-echo </tool_call> tags. A premature ```
     // closer with more source still fails above (non-ws after closer).
+    // The recovery is ONLY legal at a real EOS: after a max_tokens/output-limit
+    // stop the unclosed body is truncated, and publishing it would silently
+    // write a partial file (codex branch-review P1).
+    if (!eos_reached) {
+        set_error(error, error_cap,
+                  "generation ended before the closing fence (output limit); "
+                  "the truncated body was not published — retry with a smaller "
+                  "body or a larger turn budget");
+        return 0;
+    }
     if (content_start > len) {
         set_error(error, error_cap, "markdown fence body is not closed");
         return 0;
@@ -631,7 +646,7 @@ extern "C" int q27_agent_unwrap_whole_file_source_fence(
 
 extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
     const unsigned char *bytes, size_t len, q27_agent_tool_call *call,
-    char *error, size_t error_cap) {
+    char *error, size_t error_cap, int eos_reached) {
     if (call) *call = q27_agent_tool_call{};
     // Same-turn bodies can approach the filesystem tool's 8 MiB file cap; leave
     // headroom for ChatML prose, the JSON header, and outer fence lines.
@@ -791,7 +806,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                     "</tool_call>; do not emit another tool call");
             } else if (!q27_agent_extract_fenced_body(tail, tail_len, &body,
                                                       &body_len, error,
-                                                      error_cap)) {
+                                                      error_cap, eos_reached)) {
                 missing_body = 1;
                 body_error = dup_error_message(
                     (error && error_cap && error[0]) ? error :
