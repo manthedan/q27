@@ -50,6 +50,7 @@ q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
     size_t message_count, int enable_thinking, int enable_tools,
     uint32_t max_tokens, q27_agent_text_sink sink,
+    q27_agent_prefill_sink prefill_sink,
     q27_agent_alive_check alive, void *opaque,
     uint32_t *prompt_tokens, uint32_t *cached_tokens,
     uint32_t *prefill_tokens, uint32_t *output_tokens,
@@ -88,6 +89,20 @@ q27_agent_status q27_agent_generate(
         *prefill_tokens = 9;
         *output_tokens = 12;
         *tool_call_complete = 1;
+        return Q27_AGENT_OK;
+    }
+    if (messages[0].content_len == 4 &&
+        memcmp(messages[0].content, "prog", 4) == 0) {
+        if (!prefill_sink || !prefill_sink(200, 8, 0, opaque) ||
+            !prefill_sink(200, 8, 96, opaque) ||
+            !prefill_sink(200, 8, 192, opaque) ||
+            !sink("p", 1, opaque))
+            return Q27_AGENT_CANCELLED;
+        *prompt_tokens = 200;
+        *cached_tokens = 8;
+        *prefill_tokens = 192;
+        *output_tokens = 1;
+        *eos_reached = 1;
         return Q27_AGENT_OK;
     }
     if (messages[0].content_len == 5 &&
@@ -221,6 +236,11 @@ typedef struct {
     int tool_call_complete;
     int eos_reached;
     int states;
+    int prefill_events;
+    int prefill_after_delta;
+    uint32_t progress_prompt_tokens;
+    uint32_t progress_cached_tokens;
+    uint32_t progress_prefill_tokens;
     int tool_outputs;
     int terminals;
     q27_agent_tool_kind tool_kind;
@@ -248,6 +268,13 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
         }
         out->last_sequence = event.sequence;
         if (event.type == Q27_EVENT_STATE) out->states++;
+        if (event.type == Q27_EVENT_PREFILL_PROGRESS) {
+            out->prefill_events++;
+            if (out->deltas) out->prefill_after_delta = 1;
+            out->progress_prompt_tokens = event.prompt_tokens;
+            out->progress_cached_tokens = event.cached_tokens;
+            out->progress_prefill_tokens = event.prefill_tokens;
+        }
         if (event.type == Q27_EVENT_TEXT_DELTA ||
             event.type == Q27_EVENT_TOOL_OUTPUT) {
             if (event.type == Q27_EVENT_TEXT_DELTA) out->deltas++;
@@ -368,6 +395,23 @@ int main(void) {
           "terminal session accounting and EOS completion survive event queue");
     CHECK(q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "terminal consumption reopens admission");
+
+    q27_agent_message progress = {
+        .role = "user", .content = "prog", .content_len = 4};
+    CHECK(q27_agent_worker_submit(worker, &progress, 1, 0, 0, 8, alive, NULL,
+                                  &command, error, sizeof(error)) == Q27_AGENT_OK,
+          "prefill progress command submits");
+    CHECK(drain_command(worker, command, &result) &&
+          result.states == 1 && result.prefill_events == 3 &&
+          !result.prefill_after_delta && result.deltas == 1 &&
+          result.len == 1 && result.bytes[0] == 'p' &&
+          result.progress_prompt_tokens == 200 &&
+          result.progress_cached_tokens == 8 &&
+          result.progress_prefill_tokens == 192 &&
+          result.prompt_tokens == 200 && result.cached_tokens == 8 &&
+          result.prefill_tokens == 192 && result.output_tokens == 1 &&
+          result.eos_reached == 1,
+          "prefill progress is exact, ordered, and matches terminal accounting");
 
     q27_agent_message stalled = {
         .role = "user", .content = "stall", .content_len = 5};

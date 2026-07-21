@@ -343,6 +343,26 @@ static int event_text_sink(const char *bytes, size_t len, void *opaque) {
     return queued;
 }
 
+static int event_prefill_sink(uint32_t prompt_tokens,
+                              uint32_t cached_tokens,
+                              uint32_t prefill_tokens,
+                              void *opaque) {
+    generation_context *context = opaque;
+    q27_agent_event event = {
+        .type = Q27_EVENT_PREFILL_PROGRESS,
+        .command_id = context->command_id,
+        .state = Q27_WORKER_GENERATING,
+        .status = Q27_AGENT_OK,
+        .prompt_tokens = prompt_tokens,
+        .cached_tokens = cached_tokens,
+        .prefill_tokens = prefill_tokens
+    };
+    int queued = event_enqueue(context->worker, event,
+                               combined_alive, context, 0);
+    if (!queued && combined_alive(context)) context->queue_error = 1;
+    return queued;
+}
+
 static int event_tool_sink(const unsigned char *bytes, size_t len, void *opaque) {
     generation_context *context = opaque;
     q27_agent_event event = {
@@ -535,7 +555,8 @@ static void *worker_main(void *opaque) {
         } else {
             status = q27_agent_generate(
                 engine, messages.items, messages.len, enable_thinking,
-                enable_tools, max_tokens, event_text_sink, combined_alive,
+                enable_tools, max_tokens, event_text_sink,
+                event_prefill_sink, combined_alive,
                 &context, &prompt_tokens, &cached_tokens, &prefill_tokens,
                 &output_tokens, &tool_call_complete, &eos_reached,
                 error, sizeof(error));

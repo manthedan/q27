@@ -410,6 +410,7 @@ extern "C" q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
     size_t message_count, int enable_thinking, int enable_tools,
     uint32_t max_tokens, q27_agent_text_sink sink,
+    q27_agent_prefill_sink prefill_sink,
     q27_agent_alive_check alive, void *opaque,
     uint32_t *prompt_tokens, uint32_t *cached_tokens,
     uint32_t *prefill_tokens, uint32_t *output_tokens,
@@ -455,6 +456,19 @@ extern "C" q27_agent_status q27_agent_generate(
             return Q27_AGENT_CANCELLED;
         };
         if (!alive(opaque)) return cancelled();
+        uint32_t prefilled = 0;
+        auto record_prefill = [&](uint32_t count) {
+            prefilled += count;
+            if (prefill_tokens) *prefill_tokens = prefilled;
+        };
+        auto publish_prefill = [&]() {
+            return !prefill_sink || prefill_sink(
+                static_cast<uint32_t>(ids.size()),
+                static_cast<uint32_t>(plan.cached_tokens),
+                prefilled, opaque);
+        };
+        if (!publish_prefill()) return cancelled();
+        uint32_t last_reported_prefill = 0;
 
         size_t offset = 0;
         uint32_t current = 0;
@@ -467,7 +481,7 @@ extern "C" q27_agent_status q27_agent_generate(
             offset = plan.append_offset;
             if (plan.finalize_pending) {
                 current = engine->session->step(ids[offset - 1]);
-                if (prefill_tokens) ++*prefill_tokens;
+                record_prefill(1);
                 if (!engine->agent_session.mark_pending_encoded())
                     throw std::runtime_error("agent session pending-token mismatch");
                 if (!alive(opaque)) return cancelled();
@@ -484,14 +498,29 @@ extern "C" q27_agent_status q27_agent_generate(
                 q27::MetalEngine::prefill_chunk_max(), chunkable - offset));
             engine->session->prefill_chunk(ids.data() + offset, count);
             offset += count;
-            if (prefill_tokens) *prefill_tokens += count;
+            record_prefill(count);
             if (!alive(opaque)) return cancelled();
+            const uint32_t completed = prefilled;
+            if (completed - last_reported_prefill >=
+                q27::MetalEngine::prefill_chunk_max()) {
+                if (!publish_prefill()) return cancelled();
+                last_reported_prefill = completed;
+            }
         }
         while (offset < ids.size()) {
             current = engine->session->step(ids[offset++]);
-            if (prefill_tokens) ++*prefill_tokens;
+            record_prefill(1);
             if (!alive(opaque)) return cancelled();
+            const uint32_t completed = prefilled;
+            if (completed - last_reported_prefill >=
+                q27::MetalEngine::prefill_chunk_max()) {
+                if (!publish_prefill()) return cancelled();
+                last_reported_prefill = completed;
+            }
         }
+        if (prefilled != last_reported_prefill &&
+            !publish_prefill())
+            return cancelled();
         if (offset == plan.append_offset && !plan.finalize_pending)
             current = engine->session->pending_from_logits();
 

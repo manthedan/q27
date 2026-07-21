@@ -19,6 +19,10 @@ typedef struct {
 } q27_agent_message;
 
 typedef int (*q27_agent_text_sink)(const char *bytes, size_t len, void *opaque);
+typedef int (*q27_agent_prefill_sink)(uint32_t prompt_tokens,
+                                      uint32_t cached_tokens,
+                                      uint32_t prefill_tokens,
+                                      void *opaque);
 typedef int (*q27_agent_alive_check)(void *opaque);
 
 typedef enum {
@@ -48,6 +52,9 @@ q27_agent_status q27_agent_engine_tokenizer_sha1(
 // bound) from max-token/tool-call termination. Conservative empty-decode,
 // whitespace-run, identical-token, and short-cycle bounds return
 // Q27_AGENT_STALLED before streaming the triggering token and invalidate reuse.
+// When prefill_sink is non-null, it receives an initial exact cached-prefix
+// update, fixed 96-new-token updates at completed GPU boundaries, and a final
+// update before the first generated text token. Returning zero cancels safely.
 q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      const q27_agent_message *messages,
                                      size_t message_count,
@@ -55,6 +62,7 @@ q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      int enable_tools,
                                      uint32_t max_tokens,
                                      q27_agent_text_sink sink,
+                                     q27_agent_prefill_sink prefill_sink,
                                      q27_agent_alive_check alive,
                                      void *opaque,
                                      uint32_t *prompt_tokens,

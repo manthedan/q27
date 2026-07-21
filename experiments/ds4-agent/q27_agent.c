@@ -302,6 +302,7 @@ static int output_has_nonspace(const output_buffer *out) {
 static const char *event_type_name(q27_agent_event_type type) {
     switch (type) {
     case Q27_EVENT_STATE: return "state";
+    case Q27_EVENT_PREFILL_PROGRESS: return "prefill_progress";
     case Q27_EVENT_TEXT_DELTA: return "text_delta";
     case Q27_EVENT_TOOL_OUTPUT: return "tool_output";
     case Q27_EVENT_SELECTIONS: return "selection_handles";
@@ -681,6 +682,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
     uint32_t prompt_tokens = 0, cached_tokens = 0;
     uint32_t prefill_tokens = 0, output_tokens = 0;
     int tool_call_complete = 0, eos_reached = 0, terminal = 0;
+    int prefill_line_open = 0;
     while (!terminal) {
         q27_agent_event event;
         int got = q27_agent_worker_next_event(worker, &event,
@@ -697,6 +699,27 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
             free(output.bytes);
             q27_agent_worker_request_stop(worker);
             return 0;
+        }
+        if (event.type == Q27_EVENT_PREFILL_PROGRESS &&
+            !jsonl && display_text && isatty(STDERR_FILENO) &&
+            event.prompt_tokens) {
+            uint64_t completed = (uint64_t)event.cached_tokens +
+                                 event.prefill_tokens;
+            if (completed > event.prompt_tokens) completed = event.prompt_tokens;
+            const unsigned percent =
+                (unsigned)(completed * 100 / event.prompt_tokens);
+            if (fprintf(stderr,
+                        "\r[q27-agent prefill %llu/%u (%u%%); cached=%u]",
+                        (unsigned long long)completed, event.prompt_tokens,
+                        percent, event.cached_tokens) < 0 || fflush(stderr) == EOF) {
+                output.failed = 1;
+            } else if (completed == event.prompt_tokens) {
+                if (fputc('\n', stderr) == EOF || fflush(stderr) == EOF)
+                    output.failed = 1;
+                prefill_line_open = 0;
+            } else {
+                prefill_line_open = 1;
+            }
         }
         if (event.type == Q27_EVENT_TEXT_DELTA) {
             if (!output_append(&output, event.data, event.data_len))
@@ -735,6 +758,13 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
         }
     }
 
+    if (prefill_line_open) {
+        if (fputc('\n', stderr) == EOF || fflush(stderr) == EOF) {
+            fprintf(stderr, "q27-agent: output failure\n");
+            free(output.bytes);
+            return 0;
+        }
+    }
     if (!jsonl && display_text &&
         (status == Q27_AGENT_OK || output.len > 0) &&
         (fputc('\n', stdout) == EOF || fflush(stdout) == EOF)) {

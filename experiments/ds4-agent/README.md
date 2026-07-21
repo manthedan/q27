@@ -26,8 +26,9 @@ See `THIRD_PARTY_NOTICES.md` for attribution.
 The C process owns the transcript, durable manifest, compaction policy,
 terminal loop, streaming output, and interrupt decision. A dedicated pthread
 opens, owns, drives, snapshots, restores, and closes the engine. Submission deep-copies the complete message array; the UI thread then
-drains a bounded owned event queue (`state`, binary `text_delta`, and exactly
-one terminal). There is no server, socket, HTTP, SSE, or API-shape translation.
+drains a bounded owned event queue (`state`, exact `prefill_progress`, binary
+`text_delta`, and exactly one terminal). There is no server, socket, HTTP, SSE,
+or API-shape translation.
 
 The friendly source-checkout entry point builds and starts B1 with context
 32768, adaptive output, automatic tools, and workspace `$PWD`:
@@ -54,7 +55,11 @@ Interactive mode omits `--prompt`; `:quit` exits. Machine-readable events use:
 ```
 
 Every JSONL row carries monotonic `seq`, `command_id`, event `type`, state,
-status, accounting, and exact `data_b64` bytes. Diagnostics remain on stderr.
+status, accounting, and exact `data_b64` bytes. `prefill_progress` reports the
+initial cached-prefix jump, fixed 96-new-token completed GPU boundaries, and a
+final update before `text_delta`; `cached_tokens + prefill_tokens` is completed
+prompt ingestion. Interactive text mode renders the same progress in place on
+stderr, leaving stdout clean. Diagnostics remain on stderr.
 A watchdog terminal is emitted as `type=generation_stalled`, `status=stalled`,
 and exact data `generation stalled`.
 Tokenizer counts and Q27SNAP1 save/load use the same internal command/event
@@ -303,8 +308,9 @@ the dedicated engine-owner thread. The JSONL smoke produced exactly
 `state → text_delta → turn_done`; decoding `data_b64` yielded `events`.
 `build/test_q27_agent_worker` uses a fake adapter to gate startup failure,
 deep binary message/tool ownership, monotonic generation and tool lifecycle
-events, an explicit stalled-generation terminal, request rejection, 4094-event
-queue backpressure (5000 deltas), cancellation terminals, and shutdown ordering
+events, exact prefill-progress ordering/accounting, an explicit
+stalled-generation terminal, request rejection, 4094-event queue backpressure
+(5000 deltas), cancellation terminals, and shutdown ordering
 without loading a model. `build/test_q27_agent_tools` gates binary
 read/search/write/edit-selection/shell output, path and symlink rejection,
 create-only atomic write publication, exact-one edit publication/mode
