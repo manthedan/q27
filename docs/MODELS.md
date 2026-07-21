@@ -138,6 +138,15 @@ export ANTHROPIC_BASE_URL=http://localhost:8080 && claude
 Switch packs any time: `q27 pull <name>`, stop the server, `q27 serve
 <name>`. Weights are mmap'd, so a warm-cache switch is seconds.
 
+**Faster downloads.** `q27 pull` downloads with `curl` (single stream, ~10
+MB/s on most links) and resumes if interrupted. To go faster: set
+[`HF_TOKEN`](https://huggingface.co/settings/tokens) to move off the
+anonymous per-IP quota (required for gated repos); and, only if your
+connection is much faster than ~10 MB/s, install the `hf` CLI with a parallel
+backend (`pip install "huggingface_hub[hf_xet]"`) and pull with
+`Q27_USE_HF_CLI=1 q27 pull <name>`. The CLI opt-in is off by default because
+on plain-LFS repos (our current packs) `curl` is already as fast.
+
 ## 5. Help us validate the big tiers
 
 The maintainer's laptop tops out at 24 GB, so **q6 / q6k / q8 and the

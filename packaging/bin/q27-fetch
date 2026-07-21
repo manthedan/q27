@@ -71,6 +71,53 @@ hf_download() { # $1=remote-file $2=dest  (resumable)
     # opt-in — unset means no header, no dependency.
     local -a auth=()
     [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+
+    # OPT-IN fast path: `hf download`. Off by default — curl is the predictable,
+    # resumable default (~11 MB/s single stream, which we measured BEATS the CLI
+    # on our plain-LFS repo). The CLI can win on a fast link + Xet-backed repo
+    # (hf_xet scales up to 64 parallel streams), but its adaptive concurrency
+    # starts at 1 stream and ramps slowly — and on plain-LFS repos like ours it
+    # was ~5x SLOWER than curl (~2 vs ~11 MB/s). So we only use it when the user
+    # explicitly opts in with Q27_USE_HF_CLI=1 (and has a parallel backend:
+    # hf_transfer+HF_HUB_ENABLE_HF_TRANSFER=1, or hf_xet). The CLI honors
+    # HF_TOKEN itself. Integrity is unchanged: the caller still md5/sha-verifies
+    # the result. Q27_NO_HF_CLI=1 also forces curl.
+    local hf_fast=""
+    if [ -n "${Q27_USE_HF_CLI:-}" ] && [ -z "${Q27_NO_HF_CLI:-}" ] \
+       && command -v hf >/dev/null 2>&1; then
+        if command -v python3 >/dev/null 2>&1 && python3 -c 'import hf_transfer' 2>/dev/null; then
+            if [ "${HF_HUB_ENABLE_HF_TRANSFER:-}" = "1" ]; then
+                hf_fast=1
+            fi
+        elif command -v python3 >/dev/null 2>&1 && python3 -c 'import hf_xet' 2>/dev/null; then
+            hf_fast=1
+        fi
+        if [ -z "$hf_fast" ]; then
+            echo "q27-fetch: Q27_USE_HF_CLI set but no parallel backend" >&2
+            echo "  (hf_transfer+HF_HUB_ENABLE_HF_TRANSFER=1, or hf_xet); using curl" >&2
+        fi
+    fi
+    if [ -n "$hf_fast" ]; then
+        local dl_dir dl_base staged
+        dl_dir="$(dirname "$dest")"
+        dl_base="$(basename "$dest")"
+        # If the dest is a staging name (e.g. <name>.tok.part for the tokenizer),
+        # fetch the real remote filename into the same dir and rename into place.
+        case "$dl_base" in
+            "$file") staged="" ;;
+            *) staged="$dl_base" ;;
+        esac
+        if hf download "$REPO" "$file" --revision "$rev" --local-dir "$dl_dir" >/dev/null 2>&1 \
+           && [ -f "$dl_dir/$file" ]; then
+            if [ -n "$staged" ]; then
+                mv -f "$dl_dir/$file" "$dest"
+            fi
+            return 0
+        fi
+        rm -f "$dl_dir/$file"
+        echo "q27-fetch: hf CLI fast path failed; falling back to curl" >&2
+    fi
+
     curl -L --fail --continue-at - "${auth[@]}" \
         "https://huggingface.co/$REPO/resolve/$rev/$file" -o "$dest"
 }

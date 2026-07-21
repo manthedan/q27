@@ -30,6 +30,19 @@ This downloads the pre-repacked artifact and its tokenizer, checksum-verified.
 No Python or build step needed. See [MODELS.md](MODELS.md) for what each pack
 is and the speed/context tables — but as a rule of thumb: **16 GB → t2**
 (best quality that fits) or **b1** (smallest + fastest); **24 GB+ → default**
+
+**Speed up downloads (optional).** Pulls use `curl` by default — a single
+stream, ~10 MB/s on most connections. Two ways to do better:
+
+- **Set `HF_TOKEN`** ([create one](https://huggingface.co/settings/tokens)).
+  Anonymous downloads share a per-IP quota; a token lifts you to the
+  authenticated tier and is required for gated repos. `q27 pull` picks it up
+  automatically.
+- **On a fast connection, opt into the `hf` CLI** for parallel downloads.
+  Install it plus a parallel backend (`pip install "huggingface_hub[hf_xet]"`),
+  then `Q27_USE_HF_CLI=1 q27 pull b1`. This only helps if your link is faster
+  than ~10 MB/s and the repo is Xet-backed; on our current packs plain `curl`
+  is already as fast, so leave it off unless you've measured a win.
 (the official model with its MTP head).
 
 ## 3. Run it
