@@ -86,6 +86,22 @@ int main() {
           "tool-shaped fenced body soft-fails");
     q27_agent_tool_call_free(&call);
 
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"doc.md\"}}</tool_call>\n"
+                "````md\n"
+                "example:\n"
+                "```\n"
+                "code\n"
+                "```\n"
+                "````\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body &&
+          std::string(reinterpret_cast<const char *>(call.request.input),
+                      call.request.input_len) ==
+              "example:\n```\ncode\n```\n",
+          "longer outer fence allows nested triple-backtick content");
+    q27_agent_tool_call_free(&call);
+
     std::string overwrite = "<tool_call>{\"name\":\"overwrite\",\"arguments\":{"
         "\"path\":\"x.py\"}}</tool_call>\n```\nfull file\n```\n";
     CHECK(parse(overwrite, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&

@@ -325,16 +325,21 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
     while (i < len && (bytes[i] == ' ' || bytes[i] == '\t' ||
                        bytes[i] == '\r' || bytes[i] == '\n'))
         ++i;
-    if (i + 3 > len || std::memcmp(bytes + i, "```", 3) != 0) {
+    // CommonMark-style: opener of N>=3 backticks; closer is a line of only
+    // optional indent spaces + M>=N backticks (so content may contain
+    // standalone ``` lines by using a longer outer fence, e.g. ````).
+    size_t open_ticks = 0;
+    while (i + open_ticks < len && bytes[i + open_ticks] == '`') ++open_ticks;
+    if (open_ticks < 3) {
         set_error(error, error_cap,
                   "body tools require a markdown-fenced body after </tool_call>");
         return 0;
     }
-    size_t opening_end = i + 3;
+    size_t opening_end = i + open_ticks;
     while (opening_end < len && bytes[opening_end] != '\n' &&
            bytes[opening_end] != '\r') {
         const unsigned char c = bytes[opening_end];
-        if (opening_end - (i + 3) >= 31 ||
+        if (opening_end - (i + open_ticks) >= 31 ||
             !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
               (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '_')) {
             set_error(error, error_cap, "invalid markdown fence language label");
@@ -354,7 +359,10 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
         }
         ++content_start;
     }
-    // Find the first subsequent line that is only optional spaces + >=3 ticks.
+    // Line-oriented fence transport: content is every byte up to (not including)
+    // the closer line. A non-empty last content line therefore ends with its
+    // terminating LF/CRLF; that is intentional markdown semantics, not a
+    // post-process "add newline". Empty files use an empty fence body.
     for (size_t line_start = content_start; line_start <= len;) {
         size_t line_end = line_start;
         while (line_end < len && bytes[line_end] != '\n') ++line_end;
@@ -367,7 +375,8 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
             ++candidate;
         size_t ticks_end = candidate;
         while (ticks_end < logical_end && bytes[ticks_end] == '`') ++ticks_end;
-        if (ticks_end - candidate >= 3) {
+        const size_t close_ticks = ticks_end - candidate;
+        if (close_ticks >= open_ticks) {
             size_t tail = ticks_end;
             while (tail < logical_end &&
                    (bytes[tail] == ' ' || bytes[tail] == '\t'))
