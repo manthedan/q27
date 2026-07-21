@@ -660,7 +660,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                                                       error_cap)) {
                 missing_body = 1;
                 body_error = dup_error_message(
-                    error[0] ? error :
+                    (error && error_cap && error[0]) ? error :
                     "body tools require a markdown-fenced body after "
                     "</tool_call>");
             } else if (q27_agent_payload_rejected(body, body_len, error,
@@ -670,7 +670,8 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                 body_len = 0;
                 missing_body = 1;
                 body_error = dup_error_message(
-                    error[0] ? error : "unusable tool body");
+                    (error && error_cap && error[0]) ? error :
+                    "unusable tool body");
             } else if (request.kind == Q27_TOOL_WRITE ||
                        request.kind == Q27_TOOL_OVERWRITE) {
                 // Whole-file tools: body is file content (optional outer
