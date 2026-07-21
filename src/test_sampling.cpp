@@ -142,6 +142,21 @@ int main() {
                 if(tok==1) { fprintf(stderr,"excluded token re-emitted\n"); return 1; }
             }
         }
+        // Singleton nucleus + exclude must not re-emit (throws instead).
+        {
+            std::vector<float> peak={-50.0f,20.0f,-50.0f};
+            q27::SamplingParams p1{1.0f,1.0f,1,1}; // top_k=1 → delta at argmax=1
+            auto dist=q27::build_served_distribution(peak,p1);
+            if(dist.tokens.size()!=1 || dist.tokens[0]!=1) {
+                fprintf(stderr,"expected singleton nucleus on argmax\n"); return 1;
+            }
+            bool threw=false;
+            try {
+                std::mt19937_64 r(1);
+                (void)q27::sample_served(dist,r,/*exclude=*/1);
+            } catch(const std::runtime_error&) { threw=true; }
+            if(!threw) { fprintf(stderr,"singleton exclude must throw, not re-emit\n"); return 1; }
+        }
 
         // p=0 draft (outside nucleus) always rejects → stop_lane=0, exclude=draft.
         {

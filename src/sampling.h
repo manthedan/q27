@@ -209,9 +209,12 @@ inline double served_probability(const ServedDistribution& d,uint32_t token) {
 }
 
 // Sample from the served nucleus, optionally excluding one token (residual
-// resample after a rejected draft). If exclude removes all mass, falls back
-// to the highest-weight non-excluded nucleus token, else argmax_token if it
-// is not excluded, else the first remaining nucleus token.
+// resample after a rejected draft). Never returns `exclude`. If exclude
+// removes all mass (singleton nucleus on the rejected draft), throws —
+// re-emitting the excluded token would violate the residual distribution
+// (codex P2 on Phase 0). Callers that need a soft fallback must widen the
+// nucleus (e.g. drop top_k) before sampling; the Metal sample round keeps
+// vocab-wide logits and only hits this when p(draft) was already ~1.
 inline uint32_t sample_served(const ServedDistribution& d,std::mt19937_64& random,
                               int32_t exclude=-1) {
     if(d.tokens.empty()) throw std::runtime_error("q27: empty served distribution");
@@ -221,21 +224,9 @@ inline uint32_t sample_served(const ServedDistribution& d,std::mt19937_64& rando
         total+=d.weights[i];
     }
     if(!(total>0.0)) {
-        uint32_t best=d.argmax_token;
-        double best_w=-1.0;
-        for(size_t i=0;i<d.tokens.size();i++) {
-            if(exclude>=0 && (int32_t)d.tokens[i]==exclude) continue;
-            if(d.weights[i]>best_w) { best_w=d.weights[i]; best=d.tokens[i]; }
-        }
-        if(exclude>=0 && (int32_t)best==exclude) {
-            // Nucleus was a singleton on exclude — any other token is illegal
-            // under the served dist; return argmax of the original row if
-            // different, else 0 (caller should not hit this on real logits).
-            if((int32_t)d.argmax_token!=exclude) return d.argmax_token;
-            return d.tokens.front()==(uint32_t)exclude && d.tokens.size()>1
-                ? d.tokens[1] : d.tokens.front();
-        }
-        return best;
+        if(exclude>=0)
+            throw std::runtime_error("q27: empty residual after excluding draft from nucleus");
+        return d.argmax_token;
     }
     std::uniform_real_distribution<double> distribution(0.0,total);
     double draw=distribution(random);
@@ -244,11 +235,11 @@ inline uint32_t sample_served(const ServedDistribution& d,std::mt19937_64& rando
         draw-=d.weights[i];
         if(draw<=0.0) return d.tokens[i];
     }
-    // Numeric tail: last non-excluded.
+    // Numeric tail: last non-excluded (total>0 guarantees one exists).
     for(size_t i=d.tokens.size();i-- > 0;) {
         if(exclude<0 || (int32_t)d.tokens[i]!=exclude) return d.tokens[i];
     }
-    return d.tokens.back();
+    throw std::runtime_error("q27: sample_served internal: no non-excluded token");
 }
 
 // Result of one speculative verify-tail rejection walk.
