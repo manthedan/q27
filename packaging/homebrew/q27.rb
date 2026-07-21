@@ -65,7 +65,9 @@ class Q27 < Formula
     %w[q27-bench q27-report q27-fetch].each do |t|
       bin.install_symlink libexec/"q27/bin"/t
     end
-    doc.install "README.md", "docs/METAL_PROGRESS.md", "docs/MODELS.md"
+    # User-facing docs (METAL_PROGRESS moved to docs/metal/ in the docs reorg).
+    doc.install "README.md", "docs/GETTING-STARTED.md", "docs/MODELS.md",
+                "docs/QA_BEFORE_RELEASES.md", "docs/SECURITY-MODEL.md"
   end
 
   def caveats
