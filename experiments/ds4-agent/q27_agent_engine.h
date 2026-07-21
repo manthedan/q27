@@ -46,7 +46,9 @@ q27_agent_status q27_agent_engine_tokenizer_sha1(
 // only when its exact generated-token ledger is a stable prefix of that render
 // and the Metal position agrees. Any mismatch resets and re-prefills. Any
 // cancellation/runtime error invalidates reuse for the next call. When
-// enable_tools is set, greedy decode grammar-locks registered <tool_call>
+// enable_tools is set, greedy decode grammar-locks registered <tool_call>.
+// Body tools (write/overwrite/edit/edit_selection) continue free-decoding after
+// </tool_call> so a same-turn markdown-fenced body can follow.
 // bodies and stops exactly after a valid closer. eos_reached distinguishes a
 // natural complete response (including EOS as the next token at the exact
 // bound) from max-token/tool-call termination. Conservative empty-decode,

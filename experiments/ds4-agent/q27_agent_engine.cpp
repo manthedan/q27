@@ -570,6 +570,7 @@ extern "C" q27_agent_status q27_agent_generate(
         const uint32_t eos = static_cast<uint32_t>(engine->tokenizer->eos());
         uint32_t produced = 0;
         bool stopped_for_tool_call = false;
+        bool awaiting_fenced_body = false;
         q27::agent::StallWatcher stall_watcher;
         while (produced < max_tokens && current != eos) {
             if (!alive(opaque)) {
@@ -600,6 +601,14 @@ extern "C" q27_agent_status q27_agent_generate(
                 call_closed = !constrainer->active &&
                               constrainer->tg.closed() &&
                               (active_before || newly_engaged);
+                if (call_closed &&
+                    q27_agent_tool_name_expects_body(
+                        constrainer->tg.tool_name().c_str())) {
+                    // Body tools continue free-decoding for a same-turn
+                    // markdown fence. Re-engaging a second tool call is not
+                    // constrained here; the parser rejects tool-shaped bodies.
+                    awaiting_fenced_body = true;
+                }
             }
 
             const std::string bytes =
@@ -625,11 +634,13 @@ extern "C" q27_agent_status q27_agent_generate(
             if (output_tokens) *output_tokens = produced;
             if (call_closed && tool_call_complete) *tool_call_complete = 1;
 
-            // A closed tool call is a semantic terminal: never generate prose
-            // after </tool_call>. Like max_tokens, the visible final token is
-            // irreversible; resident finalization is best-effort bookkeeping.
-            if (produced == max_tokens || call_closed) {
-                if (call_closed) stopped_for_tool_call = true;
+            // Non-body tools: a closed call is a semantic terminal. Body tools
+            // keep generating until EOS so the fenced payload can follow
+            // </tool_call> in the same turn.
+            const bool stop_for_closed_call =
+                call_closed && !awaiting_fenced_body;
+            if (produced == max_tokens || stop_for_closed_call) {
+                if (stop_for_closed_call) stopped_for_tool_call = true;
                 try {
                     if (!engine->agent_session.record_emitted(current))
                         throw std::runtime_error(

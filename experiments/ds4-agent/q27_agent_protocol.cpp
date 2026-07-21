@@ -14,8 +14,15 @@ using nlohmann::json;
 namespace {
 
 constexpr const char *kToolNames[] = {
-    "read", "search", "write", "edit", "edit_selection", "shell"};
+    "read", "search", "write", "overwrite", "edit", "edit_selection", "shell"};
 constexpr size_t kToolNameCount = sizeof(kToolNames) / sizeof(kToolNames[0]);
+
+// Indices into kToolNames for body-bearing tools.
+constexpr size_t kWriteIdx = 2;
+constexpr size_t kOverwriteIdx = 3;
+constexpr size_t kEditIdx = 4;
+constexpr size_t kEditSelectionIdx = 5;
+constexpr size_t kShellIdx = 6;
 
 void set_error(char *out, size_t cap, const char *message) noexcept {
     if (out && cap) std::snprintf(out, cap, "%s", message ? message : "invalid tool call");
@@ -142,16 +149,37 @@ const std::string& preamble() {
                     {"required", json::array({"path", "needle"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
-                {"name", kToolNames[2]},
-                {"description", "Begin creating one new workspace-relative regular file. Supply only the path. After validation, a separate raw-payload turn requests the exact file content without JSON escaping. Fails if the path already exists; use edit for existing files."},
+                {"name", kToolNames[kWriteIdx]},
+                {"description",
+                 "Create one new workspace-relative regular file. JSON args: path only. "
+                 "Immediately after </tool_call>, emit the complete file as a markdown "
+                 "fenced block (```lang then body then ```). Never put file content in JSON. "
+                 "Fails if the path already exists; use overwrite for full rewrite or edit "
+                 "for a small unique patch."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
                         {"path", {{"type", "string"}}}}},
                     {"required", json::array({"path"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
-                {"name", kToolNames[3]},
-                {"description", "Begin replacing exactly one nonempty literal byte-string match in an existing workspace-relative regular file. Supply path and old only. After validation, a separate raw-payload turn requests the replacement without JSON escaping."},
+                {"name", kToolNames[kOverwriteIdx]},
+                {"description",
+                 "Create or replace the entire contents of one workspace-relative regular "
+                 "file. JSON args: path only. Immediately after </tool_call>, emit the "
+                 "complete file as a markdown fenced block. Prefer overwrite for full-file "
+                 "rewrites; use edit only for short unique patches."},
+                {"parameters", {{"type", "object"},
+                    {"properties", {
+                        {"path", {{"type", "string"}}}}},
+                    {"required", json::array({"path"})},
+                    {"additionalProperties", false}}}}}},
+            {{"type", "function"}, {"function", {
+                {"name", kToolNames[kEditIdx]},
+                {"description",
+                 "Replace exactly one short unique nonempty literal match in an existing "
+                 "file. JSON args: path and old (old max 512 bytes). Immediately after "
+                 "</tool_call>, emit the replacement as a markdown fenced block. Never put "
+                 "replacement bytes in JSON. For whole-file rewrites use overwrite."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
                         {"path", {{"type", "string"}}},
@@ -159,8 +187,11 @@ const std::string& preamble() {
                     {"required", json::array({"path", "old"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
-                {"name", kToolNames[4]},
-                {"description", "Begin replacing the exact bytes identified by a recent read/search selection handle. Supply path and selection only. Stale, unknown, or path-mismatched handles fail without mutation. After validation, a separate raw-payload turn requests the replacement."},
+                {"name", kToolNames[kEditSelectionIdx]},
+                {"description",
+                 "Replace the exact bytes identified by a recent read/search selection "
+                 "handle. JSON args: path and selection only. Immediately after "
+                 "</tool_call>, emit the replacement as a markdown fenced block."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
                         {"path", {{"type", "string"}}},
@@ -168,7 +199,7 @@ const std::string& preamble() {
                     {"required", json::array({"path", "selection"})},
                     {"additionalProperties", false}}}}}},
             {{"type", "function"}, {"function", {
-                {"name", kToolNames[5]},
+                {"name", kToolNames[kShellIdx]},
                 {"description", "Run one bounded no-fork shell job in the workspace. Pipelines and background jobs are unavailable."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
@@ -178,7 +209,18 @@ const std::string& preamble() {
                     {"required", json::array({"command"})},
                     {"additionalProperties", false}}}}}}
         });
-        return q27::tools_preamble(tools);
+        // Extra protocol note outside the JSON schema list: same-turn fence body.
+        std::string base = q27::tools_preamble(tools);
+        base +=
+            "\nBody tools (write, overwrite, edit, edit_selection): after the "
+            "closed </tool_call>, emit exactly one markdown fenced body and end "
+            "the turn. Example:\n"
+            "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"hello.py\"}}"
+            "</tool_call>\n"
+            "```python\nprint(f\"hi {name}\")\n```\n"
+            "Do not emit another tool call as the body. Do not put source code "
+            "inside JSON arguments.\n";
+        return base;
     }();
     return value;
 }
@@ -196,6 +238,59 @@ extern "C" size_t q27_agent_tool_names(const char *const **names_out) {
     return kToolNameCount;
 }
 
+extern "C" int q27_agent_tool_name_expects_body(const char *name) {
+    if (!name) return 0;
+    return !std::strcmp(name, "write") || !std::strcmp(name, "overwrite") ||
+           !std::strcmp(name, "edit") || !std::strcmp(name, "edit_selection");
+}
+
+extern "C" int q27_agent_tool_kind_expects_body(q27_agent_tool_kind kind) {
+    return kind == Q27_TOOL_WRITE || kind == Q27_TOOL_OVERWRITE ||
+           kind == Q27_TOOL_EDIT;
+}
+
+extern "C" int q27_agent_payload_rejected(const unsigned char *bytes, size_t len,
+                                          char *error, size_t error_cap) {
+    if (!bytes && len) {
+        set_error(error, error_cap, "invalid payload pointer");
+        return 1;
+    }
+    size_t i = 0;
+    while (i < len && (bytes[i] == ' ' || bytes[i] == '\t' ||
+                       bytes[i] == '\r' || bytes[i] == '\n'))
+        ++i;
+    if (i >= len) {
+        // Empty bodies are legal for empty-file create/delete-style edits.
+        return 0;
+    }
+    auto starts_with = [&](const char *lit) {
+        const size_t n = std::strlen(lit);
+        return i + n <= len &&
+               std::memcmp(bytes + i, lit, n) == 0;
+    };
+    if (starts_with("<tool_call") || starts_with("</tool_call") ||
+        starts_with("<q27_raw_payload_request") ||
+        starts_with("{\"name\"") || starts_with("{\"name\":")) {
+        set_error(error, error_cap,
+                  "payload looks like a tool call; emit file bytes in a "
+                  "markdown fence after </tool_call>, not another tool call");
+        return 1;
+    }
+    // Reject pure-whitespace bodies that are not empty after trim when the
+    // only non-ws content is more fencing without a closer — handled by
+    // extract. Here reject control-character-only junk beyond common text.
+    size_t printable = 0;
+    for (size_t j = i; j < len; ++j) {
+        const unsigned char c = bytes[j];
+        if (c == '\t' || c == '\n' || c == '\r' || c >= 0x20) ++printable;
+    }
+    if (printable == 0 && len > 0) {
+        set_error(error, error_cap, "payload has no printable file bytes");
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" void q27_agent_tool_call_free(q27_agent_tool_call *call) {
     if (!call) return;
     std::free(call->path);
@@ -203,6 +298,100 @@ extern "C" void q27_agent_tool_call_free(q27_agent_tool_call *call) {
     std::free(call->replacement);
     std::free(call->selection);
     *call = q27_agent_tool_call{};
+}
+
+extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
+                                             size_t len, unsigned char **out,
+                                             size_t *out_len, char *error,
+                                             size_t error_cap) {
+    if (out) *out = nullptr;
+    if (out_len) *out_len = 0;
+    if (!bytes || !out || !out_len) {
+        set_error(error, error_cap, "invalid fenced-body extract arguments");
+        return 0;
+    }
+    size_t i = 0;
+    while (i < len && (bytes[i] == ' ' || bytes[i] == '\t' ||
+                       bytes[i] == '\r' || bytes[i] == '\n'))
+        ++i;
+    if (i + 3 > len || std::memcmp(bytes + i, "```", 3) != 0) {
+        set_error(error, error_cap,
+                  "body tools require a markdown-fenced body after </tool_call>");
+        return 0;
+    }
+    size_t opening_end = i + 3;
+    while (opening_end < len && bytes[opening_end] != '\n' &&
+           bytes[opening_end] != '\r') {
+        const unsigned char c = bytes[opening_end];
+        if (opening_end - (i + 3) >= 31 ||
+            !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '_')) {
+            set_error(error, error_cap, "invalid markdown fence language label");
+            return 0;
+        }
+        ++opening_end;
+    }
+    if (opening_end >= len) {
+        set_error(error, error_cap, "unterminated markdown fence opener");
+        return 0;
+    }
+    size_t content_start = opening_end + 1;
+    if (bytes[opening_end] == '\r') {
+        if (content_start >= len || bytes[content_start] != '\n') {
+            set_error(error, error_cap, "invalid markdown fence line ending");
+            return 0;
+        }
+        ++content_start;
+    }
+    // Find the first subsequent line that is only optional spaces + >=3 ticks.
+    for (size_t line_start = content_start; line_start <= len;) {
+        size_t line_end = line_start;
+        while (line_end < len && bytes[line_end] != '\n') ++line_end;
+        size_t logical_end = line_end;
+        if (logical_end > line_start && bytes[logical_end - 1] == '\r')
+            --logical_end;
+        size_t candidate = line_start;
+        while (candidate < logical_end && candidate - line_start < 3 &&
+               bytes[candidate] == ' ')
+            ++candidate;
+        size_t ticks_end = candidate;
+        while (ticks_end < logical_end && bytes[ticks_end] == '`') ++ticks_end;
+        if (ticks_end - candidate >= 3) {
+            size_t tail = ticks_end;
+            while (tail < logical_end &&
+                   (bytes[tail] == ' ' || bytes[tail] == '\t'))
+                ++tail;
+            if (tail == logical_end) {
+                // Trailing bytes after the closer line must be whitespace only.
+                size_t after = line_end < len ? line_end + 1 : len;
+                for (size_t j = after; j < len; ++j) {
+                    const char c = static_cast<char>(bytes[j]);
+                    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+                        set_error(error, error_cap,
+                                  "non-whitespace after fenced body closer");
+                        return 0;
+                    }
+                }
+                const size_t content_len = line_start - content_start;
+                unsigned char *copy = static_cast<unsigned char *>(
+                    std::malloc(content_len + 1));
+                if (!copy) {
+                    set_error(error, error_cap, "out of memory extracting body");
+                    return 0;
+                }
+                if (content_len)
+                    std::memcpy(copy, bytes + content_start, content_len);
+                copy[content_len] = 0;
+                *out = copy;
+                *out_len = content_len;
+                return 1;
+            }
+        }
+        if (line_end >= len) break;
+        line_start = line_end + 1;
+    }
+    set_error(error, error_cap, "markdown fence body is not closed");
+    return 0;
 }
 
 extern "C" int q27_agent_unwrap_whole_file_source_fence(
@@ -308,20 +497,14 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
             set_error(error, error_cap, "multiple tool calls are not allowed in one turn");
             return Q27_TOOL_CALL_INVALID;
         }
-        const size_t body_start = begin + open.size();
-        const size_t end = text.find(close, body_start);
+        const size_t json_start = begin + open.size();
+        const size_t end = text.find(close, json_start);
         if (end == std::string::npos || text.find(close, end + close.size()) != std::string::npos) {
             set_error(error, error_cap, "tool call is not closed exactly once");
             return Q27_TOOL_CALL_INVALID;
         }
-        for (size_t i = end + close.size(); i < text.size(); ++i) {
-            const char c = text[i];
-            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
-                set_error(error, error_cap, "text after tool call is forbidden");
-                return Q27_TOOL_CALL_INVALID;
-            }
-        }
-        const json outer = json::parse(text.substr(body_start, end - body_start));
+        const size_t after = end + close.size();
+        const json outer = json::parse(text.substr(json_start, end - json_start));
         if (!only_keys(outer, {"name", "arguments"}) ||
             !outer["name"].is_string() || !outer["arguments"].is_object()) {
             set_error(error, error_cap, "tool call must contain only name and object arguments");
@@ -329,21 +512,34 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         }
         const std::string name = outer["name"].get<std::string>();
         const json& args = outer["arguments"];
+        const int expects_body = q27_agent_tool_name_expects_body(name.c_str());
+        if (!expects_body) {
+            for (size_t i = after; i < text.size(); ++i) {
+                const char c = text[i];
+                if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+                    set_error(error, error_cap, "text after tool call is forbidden");
+                    return Q27_TOOL_CALL_INVALID;
+                }
+            }
+        }
         q27_agent_tool_request request{};
         request.timeout_ms = 30000;
         request.max_output_bytes = 256u * 1024u;
         unsigned char *path = nullptr, *input = nullptr, *replacement = nullptr;
         unsigned char *selection = nullptr;
+        unsigned char *body = nullptr;
+        size_t body_len = 0;
         struct LocalCleanup {
             unsigned char *&path;
             unsigned char *&input;
             unsigned char *&replacement;
             unsigned char *&selection;
+            unsigned char *&body;
             ~LocalCleanup() {
                 std::free(path); std::free(input); std::free(replacement);
-                std::free(selection);
+                std::free(selection); std::free(body);
             }
-        } cleanup{path, input, replacement, selection};
+        } cleanup{path, input, replacement, selection, body};
         size_t path_len = 0;
 
         bool valid = false;
@@ -357,17 +553,29 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                     path_len > 0 &&
                     copy_string(args, "needle", &input, &request.input_len, false) &&
                     request.input_len > 0;
-        } else if (name == kToolNames[2] && only_keys(args, {"path"})) {
+        } else if (name == kToolNames[kWriteIdx] && only_keys(args, {"path"})) {
             request.kind = Q27_TOOL_WRITE;
             valid = copy_string(args, "path", &path, &path_len, true) &&
                     path_len > 0;
-        } else if (name == kToolNames[3] && only_keys(args, {"path", "old"})) {
+        } else if (name == kToolNames[kOverwriteIdx] && only_keys(args, {"path"})) {
+            request.kind = Q27_TOOL_OVERWRITE;
+            valid = copy_string(args, "path", &path, &path_len, true) &&
+                    path_len > 0;
+        } else if (name == kToolNames[kEditIdx] && only_keys(args, {"path", "old"})) {
             request.kind = Q27_TOOL_EDIT;
             valid = copy_string(args, "path", &path, &path_len, true) &&
                     path_len > 0 &&
                     copy_string(args, "old", &input, &request.input_len, false) &&
-                    request.input_len > 0;
-        } else if (name == kToolNames[4] &&
+                    request.input_len > 0 &&
+                    request.input_len <= Q27_AGENT_EDIT_OLD_MAX_BYTES;
+            if (valid == false && path && input &&
+                request.input_len > Q27_AGENT_EDIT_OLD_MAX_BYTES) {
+                set_error(error, error_cap,
+                          "edit old is too long; use overwrite for full-file "
+                          "rewrites or a shorter unique old match");
+                return Q27_TOOL_CALL_INVALID;
+            }
+        } else if (name == kToolNames[kEditSelectionIdx] &&
                    only_keys(args, {"path", "selection"})) {
             request.kind = Q27_TOOL_EDIT;
             size_t selection_len = 0;
@@ -376,11 +584,8 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                     copy_string(args, "selection", &selection,
                                 &selection_len, true) &&
                     selection_len > 0 && selection_len <= 64;
-        } else if (name == kToolNames[5] && args.is_object() &&
+        } else if (name == kToolNames[kShellIdx] && args.is_object() &&
                    args.size() >= 1 && args.size() <= 3 && args.contains("command")) {
-            for (auto it = args.begin(); it != args.end(); ++it)
-                if (it.key() != "command" && it.key() != "timeout_ms" &&
-                    it.key() != "max_output_bytes") valid = false;
             request.kind = Q27_TOOL_SHELL;
             valid = true;
             for (auto it = args.begin(); valid && it != args.end(); ++it)
@@ -398,6 +603,45 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
             set_error(error, error_cap, "unknown tool or arguments do not match its strict schema");
             return Q27_TOOL_CALL_INVALID;
         }
+
+        int missing_body = 0;
+        if (expects_body) {
+            const unsigned char *tail =
+                reinterpret_cast<const unsigned char *>(text.data() + after);
+            const size_t tail_len = text.size() - after;
+            size_t non_ws = 0;
+            while (non_ws < tail_len &&
+                   (tail[non_ws] == ' ' || tail[non_ws] == '\t' ||
+                    tail[non_ws] == '\r' || tail[non_ws] == '\n'))
+                ++non_ws;
+            if (non_ws >= tail_len) {
+                missing_body = 1;
+            } else if (!q27_agent_extract_fenced_body(tail, tail_len, &body,
+                                                      &body_len, error,
+                                                      error_cap)) {
+                return Q27_TOOL_CALL_INVALID;
+            } else if (q27_agent_payload_rejected(body, body_len, error,
+                                                  error_cap)) {
+                return Q27_TOOL_CALL_INVALID;
+            } else if (request.kind == Q27_TOOL_WRITE ||
+                       request.kind == Q27_TOOL_OVERWRITE) {
+                // Whole-file tools: body is file content (optional outer
+                // language-matched unwrap happens later at publish time only
+                // for write/overwrite with a known source extension).
+                std::free(input);
+                input = body;
+                request.input_len = body_len;
+                body = nullptr;
+            } else {
+                // Edit tools: JSON `old`/selection stay in input; fence is
+                // replacement bytes.
+                std::free(replacement);
+                replacement = body;
+                request.replacement_len = body_len;
+                body = nullptr;
+            }
+        }
+
         request.path = reinterpret_cast<char *>(path);
         request.input = input;
         request.replacement = replacement;
@@ -406,6 +650,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         call->input = input;
         call->replacement = replacement;
         call->selection = reinterpret_cast<char *>(selection);
+        call->missing_body = missing_body;
         path = input = replacement = selection = nullptr;
         return Q27_TOOL_CALL_VALID;
     } catch (const std::bad_alloc&) {

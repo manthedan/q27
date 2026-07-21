@@ -349,8 +349,10 @@ static const char *tool_kind_name(q27_agent_tool_kind kind) {
     case Q27_TOOL_EDIT: return "edit";
     case Q27_TOOL_SHELL: return "shell";
     case Q27_TOOL_WRITE: return "write";
+    case Q27_TOOL_OVERWRITE: return "overwrite";
     case Q27_TOOL_WRITE_PREFLIGHT: return "write_preflight";
     case Q27_TOOL_EDIT_PREFLIGHT: return "edit_preflight";
+    case Q27_TOOL_OVERWRITE_PREFLIGHT: return "overwrite_preflight";
     }
     return "unknown";
 }
@@ -1128,74 +1130,9 @@ static int prepare_turn(q27_agent_worker *worker, transcript *chat, int think,
     return 1;
 }
 
-// Generates bulk file bytes in a dedicated no-thinking, no-tools turn. The
-// model emits only payload bytes; EOS is the sole completion boundary, so file
-// syntax never has to be escaped for JSON or a textual delimiter. Returns 1
-// with an owned payload, 0 for an incomplete bounded generation, and -1 for an
-// infrastructure/cancellation failure. Incomplete payloads are removed from
-// the transcript and must never reach a filesystem tool.
-static int generate_raw_payload(q27_agent_worker *worker, transcript *chat,
-                                q27_agent_tool_kind kind,
-                                uint32_t context_tokens,
-                                uint32_t configured_max_tokens,
-                                int adaptive_tokens, int stream_text,
-                                output_buffer *payload,
-                                turn_accounting *accounting) {
-    static const char write_request[] =
-        "<q27_raw_payload_request version=\"2\" kind=\"write\">\n"
-        "Emit the exact complete file content only. Do not emit JSON, a tool "
-        "call, markdown fences, commentary, or thinking. End the response "
-        "immediately after the final file byte.\n"
-        "</q27_raw_payload_request>";
-    static const char edit_request[] =
-        "<q27_raw_payload_request version=\"2\" kind=\"edit\">\n"
-        "Emit the exact replacement bytes only. Do not emit JSON, a tool "
-        "call, markdown fences, commentary, or thinking. End the response "
-        "immediately after the final replacement byte. Emit an empty response "
-        "to delete the selected old bytes.\n"
-        "</q27_raw_payload_request>";
-    if (payload) *payload = (output_buffer){0};
-    if (accounting) *accounting = (turn_accounting){0};
-    if (!payload || !accounting ||
-        (kind != Q27_TOOL_WRITE && kind != Q27_TOOL_EDIT))
-        return -1;
-
-    const size_t checkpoint = chat->len;
-    const char *request = kind == Q27_TOOL_WRITE ? write_request : edit_request;
-    if (!transcript_append(chat, "user", request)) return -1;
-
-    uint32_t payload_max_tokens = configured_max_tokens;
-    // A successful raw generation is still inside a tool transaction. Retain
-    // both the 512-token tool-response/framing reserve and the 512-token next
-    // continuation reserve now, rather than generating bytes that the
-    // pre-side-effect accounting must inevitably reject later.
-    if (adaptive_tokens && !adaptive_turn_limit_with_reserve(
-            worker, chat, 0, context_tokens, 1024, &payload_max_tokens)) {
-        transcript_truncate(chat, checkpoint);
-        return 0;
-    }
-    if (stream_text)
-        fprintf(stderr, "[q27-agent streaming raw %s payload]\n",
-                tool_kind_name(kind));
-    int eos_reached = 0;
-    if (!run_turn(worker, chat, 0, 0, payload_max_tokens, 0, stream_text,
-                  payload, NULL, &eos_reached, accounting)) {
-        transcript_truncate(chat, checkpoint);
-        free(payload->bytes);
-        *payload = (output_buffer){0};
-        return -1;
-    }
-    if (!eos_reached) {
-        transcript_truncate(chat, checkpoint);
-        free(payload->bytes);
-        *payload = (output_buffer){0};
-        *accounting = (turn_accounting){0};
-        return 0;
-    }
-    fprintf(stderr, "[q27-agent raw-payload kind=%s bytes=%zu]\n",
-            tool_kind_name(kind), payload->len);
-    return 1;
-}
+// Write/edit bodies are same-turn markdown fences after </tool_call>. The
+// old free second-turn raw-payload path is gone: under greedy Bonsai it
+// re-emitted tool calls as file content.
 
 static int append_failed_tool_response(transcript *chat, const char *message) {
     output_buffer empty = {0};
@@ -1270,15 +1207,64 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         size_t latest_generated_bytes = generated_bytes;
         turn_accounting latest_accounting = accounting;
         int payload_unwrapped = 0;
-        if (call.request.kind == Q27_TOOL_WRITE ||
-            call.request.kind == Q27_TOOL_EDIT) {
-            // Reject impossible destinations/matches before spending a second
-            // generation on bulk content. This is advisory only: the final
-            // mutating tool repeats every check under its stronger atomic race
-            // defenses.
+        if (q27_agent_tool_kind_expects_body(call.request.kind)) {
+            // Same-turn fenced body: no second free raw-payload generation.
+            // Missing or tool-shaped bodies fail closed with no side effect.
+            if (call.missing_body) {
+                if (!append_failed_tool_response(
+                        chat,
+                        "body tool requires a markdown-fenced body after "
+                        "</tool_call>; do not emit another tool call")) {
+                    q27_agent_tool_call_free(&call);
+                    return 0;
+                }
+                q27_agent_tool_call_free(&call);
+                ++tool_rounds;
+                continue;
+            }
+            char body_error[256] = {0};
+            if (call.request.kind == Q27_TOOL_WRITE ||
+                call.request.kind == Q27_TOOL_OVERWRITE) {
+                if (q27_agent_payload_rejected(call.request.input,
+                                               call.request.input_len,
+                                               body_error, sizeof(body_error))) {
+                    if (!append_failed_tool_response(chat, body_error)) {
+                        q27_agent_tool_call_free(&call);
+                        return 0;
+                    }
+                    q27_agent_tool_call_free(&call);
+                    ++tool_rounds;
+                    continue;
+                }
+            } else if (q27_agent_payload_rejected(
+                           call.request.replacement,
+                           call.request.replacement_len, body_error,
+                           sizeof(body_error))) {
+                if (!append_failed_tool_response(chat, body_error)) {
+                    q27_agent_tool_call_free(&call);
+                    return 0;
+                }
+                q27_agent_tool_call_free(&call);
+                ++tool_rounds;
+                continue;
+            }
+
             q27_agent_tool_request preflight = call.request;
-            preflight.kind = call.request.kind == Q27_TOOL_WRITE ?
-                Q27_TOOL_WRITE_PREFLIGHT : Q27_TOOL_EDIT_PREFLIGHT;
+            if (call.request.kind == Q27_TOOL_WRITE)
+                preflight.kind = Q27_TOOL_WRITE_PREFLIGHT;
+            else if (call.request.kind == Q27_TOOL_OVERWRITE)
+                preflight.kind = Q27_TOOL_OVERWRITE_PREFLIGHT;
+            else
+                preflight.kind = Q27_TOOL_EDIT_PREFLIGHT;
+            // Preflight is path/match only; strip body bytes from the check.
+            if (preflight.kind == Q27_TOOL_WRITE_PREFLIGHT ||
+                preflight.kind == Q27_TOOL_OVERWRITE_PREFLIGHT) {
+                preflight.input = NULL;
+                preflight.input_len = 0;
+            } else {
+                preflight.replacement = NULL;
+                preflight.replacement_len = 0;
+            }
             q27_agent_tool_result preflight_result = {0};
             if (!run_tool(worker, &preflight, 0, 0, NULL,
                           &preflight_result, NULL)) {
@@ -1296,62 +1282,34 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                 continue;
             }
 
-            output_buffer payload = {0};
-            turn_accounting payload_accounting = {0};
-            int payload_status = generate_raw_payload(
-                worker, chat, call.request.kind, context_tokens, max_tokens,
-                adaptive_tokens, !jsonl, &payload, &payload_accounting);
-            if (payload_status < 0) {
-                free(payload.bytes);
-                q27_agent_tool_call_free(&call);
-                return 0;
-            }
-            if (payload_status == 0) {
-                fprintf(stderr,
-                        "[q27-agent raw payload incomplete; discarded; no side effect]\n");
-                if (!append_failed_tool_response(
-                        chat, "raw payload did not reach EOS; no side effect")) {
-                    q27_agent_tool_call_free(&call);
-                    return 0;
-                }
-                q27_agent_tool_call_free(&call);
-                ++tool_rounds;
-                continue;
-            }
-            const size_t transcript_payload_bytes = payload.len;
-            // Only whole-file writes have enough semantic authority to treat
-            // an outer source fence as transport decoration. An edit payload
-            // may intentionally insert a fenced block inside a source string
-            // or comment, so fragment replacements always remain exact.
-            if (payload.bytes && call.request.kind == Q27_TOOL_WRITE) {
+            // Whole-file tools may drop one unambiguous outer source fence
+            // when the language label matches the path extension. Edit
+            // replacements stay byte-exact (fences may be intentional content).
+            if ((call.request.kind == Q27_TOOL_WRITE ||
+                 call.request.kind == Q27_TOOL_OVERWRITE) &&
+                call.input && call.request.input_len) {
+                size_t body_len = call.request.input_len;
                 int unwrapped = q27_agent_unwrap_whole_file_source_fence(
-                    call.request.path, (unsigned char *)payload.bytes,
-                    &payload.len);
+                    call.request.path, call.input, &body_len);
                 if (unwrapped < 0) {
-                    free(payload.bytes);
                     q27_agent_tool_call_free(&call);
                     return 0;
                 }
-                payload_unwrapped = unwrapped == 1;
-                if (payload_unwrapped)
+                if (unwrapped == 1) {
+                    payload_unwrapped = 1;
+                    call.request.input_len = body_len;
                     fprintf(stderr,
-                            "[q27-agent removed outer Markdown fence from raw %s payload]\n",
+                            "[q27-agent removed nested source fence from %s body]\n",
                             tool_kind_name(call.request.kind));
+                }
             }
-            if (call.request.kind == Q27_TOOL_WRITE) {
-                call.input = (unsigned char *)payload.bytes;
-                call.request.input = (const unsigned char *)payload.bytes;
-                call.request.input_len = payload.len;
-            } else {
-                call.replacement = (unsigned char *)payload.bytes;
-                call.request.replacement = (const unsigned char *)payload.bytes;
-                call.request.replacement_len = payload.len;
-            }
-            payload.bytes = NULL;
-            // Context accounting follows the exact assistant transcript,
-            // including a transport fence even when publication removes it.
-            latest_generated_bytes = transcript_payload_bytes;
-            latest_accounting = payload_accounting;
+            fprintf(stderr,
+                    "[q27-agent same-turn fenced body kind=%s bytes=%zu%s]\n",
+                    tool_kind_name(call.request.kind),
+                    (call.request.kind == Q27_TOOL_EDIT) ?
+                        call.request.replacement_len :
+                        call.request.input_len,
+                    payload_unwrapped ? " (unwrapped)" : "");
         }
 
         // Reserve enough worst-case one-byte tokens for the tool-response

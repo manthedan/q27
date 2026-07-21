@@ -32,11 +32,14 @@ int main() {
     q27_agent_tool_call_free(&call);
 
     std::string write = "<tool_call>{\"name\":\"write\",\"arguments\":{"
-        "\"path\":\"new.bin\"}}</tool_call>";
+        "\"path\":\"new.py\"}}</tool_call>\n"
+        "```python\nprint(f\"hi {name}\")\n```\n";
     CHECK(parse(write, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
-          call.request.kind == Q27_TOOL_WRITE && !call.request.input &&
-          call.request.input_len == 0,
-          "write control call carries only a path");
+          call.request.kind == Q27_TOOL_WRITE && !call.missing_body &&
+          call.request.input_len == std::strlen("print(f\"hi {name}\")\n") &&
+          !std::memcmp(call.request.input, "print(f\"hi {name}\")\n",
+                       call.request.input_len),
+          "write carries same-turn fenced body with f-string intact");
     q27_agent_tool_call_free(&call);
 
     CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
@@ -44,13 +47,38 @@ int main() {
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
           "write rejects JSON-embedded content");
 
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1 && call.request.kind == Q27_TOOL_WRITE,
+          "write without fence is valid-but-missing-body");
+    q27_agent_tool_call_free(&call);
+
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"x.py\"}}"
+                "</tool_call>",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
+          "tool-shaped body is rejected");
+
+    std::string overwrite = "<tool_call>{\"name\":\"overwrite\",\"arguments\":{"
+        "\"path\":\"x.py\"}}</tool_call>\n```\nfull file\n```\n";
+    CHECK(parse(overwrite, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.request.kind == Q27_TOOL_OVERWRITE &&
+          call.request.input_len == std::strlen("full file\n") &&
+          !std::memcmp(call.request.input, "full file\n", call.request.input_len),
+          "overwrite accepts fenced whole-file body");
+    q27_agent_tool_call_free(&call);
+
     std::string edit = "<tool_call>{\"name\":\"edit\",\"arguments\":{"
-        "\"path\":\"a.bin\",\"old\":\"a\\u0000b\"}}</tool_call>";
+        "\"path\":\"a.bin\",\"old\":\"a\\u0000b\"}}</tool_call>\n"
+        "```\nrepl\n```\n";
     CHECK(parse(edit, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
           call.request.kind == Q27_TOOL_EDIT && call.request.input_len == 3 &&
           !std::memcmp(call.request.input, "a\0b", 3) &&
-          !call.request.replacement && call.request.replacement_len == 0,
-          "edit control call carries old bytes but no replacement");
+          call.request.replacement_len == 5 &&
+          !std::memcmp(call.request.replacement, "repl\n", 5),
+          "edit control keeps old in JSON; replacement is fenced body");
     q27_agent_tool_call_free(&call);
 
     CHECK(parse("<tool_call>{\"name\":\"edit\",\"arguments\":{"
@@ -59,13 +87,22 @@ int main() {
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
           "edit rejects JSON-embedded replacement");
 
+    std::string long_old(600, 'x');
+    std::string huge_edit =
+        "<tool_call>{\"name\":\"edit\",\"arguments\":{\"path\":\"a.py\","
+        "\"old\":\"" + long_old + "\"}}</tool_call>\n```\ny\n```\n";
+    CHECK(parse(huge_edit, call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
+          "edit rejects oversized old; force overwrite");
+
     std::string selected = "<tool_call>{\"name\":\"edit_selection\",\"arguments\":{"
-        "\"path\":\"a.bin\",\"selection\":\"s12345678-9\"}}</tool_call>";
+        "\"path\":\"a.bin\",\"selection\":\"s12345678-9\"}}</tool_call>\n"
+        "```\nnew\n```\n";
     CHECK(parse(selected, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
           call.request.kind == Q27_TOOL_EDIT && !call.request.input &&
           call.request.input_len == 0 && call.selection &&
-          !std::strcmp(call.selection, "s12345678-9"),
-          "edit_selection carries only its short opaque handle");
+          !std::strcmp(call.selection, "s12345678-9") &&
+          call.request.replacement_len == 4,
+          "edit_selection carries handle plus fenced replacement");
     q27_agent_tool_call_free(&call);
     CHECK(parse("<tool_call>{\"name\":\"edit_selection\",\"arguments\":{"
                 "\"path\":\"a\",\"selection\":\"s1\",\"old\":\"x\"}}"
@@ -87,7 +124,7 @@ int main() {
           "unknown arguments fail closed");
     CHECK(parse("<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"x\"}}</tool_call>junk",
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
-          "post-call prose fails closed");
+          "post-call prose fails closed for non-body tools");
     CHECK(parse("<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}",
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
           "truncated wrapper fails closed");
@@ -164,20 +201,34 @@ int main() {
           multiple_fences_len == sizeof(multiple_fences) - 1,
           "earlier closing fence makes the wrapper ambiguous");
 
+    CHECK(q27_agent_tool_name_expects_body("write") == 1 &&
+          q27_agent_tool_name_expects_body("overwrite") == 1 &&
+          q27_agent_tool_name_expects_body("edit") == 1 &&
+          q27_agent_tool_name_expects_body("read") == 0,
+          "body-tool routing helper");
+    char reject_err[128] = {0};
+    static const unsigned char toolish[] =
+        "<tool_call>\n{\"name\":\"write\"}\n</tool_call>";
+    CHECK(q27_agent_payload_rejected(toolish, sizeof(toolish) - 1, reject_err,
+                                     sizeof(reject_err)) != 0,
+          "payload rejector catches tool-shaped bytes");
+
     const char *const *names = nullptr;
-    CHECK(q27_agent_tool_names(&names) == 6 && names &&
+    CHECK(q27_agent_tool_names(&names) == 7 && names &&
           !std::strcmp(names[0], "read") && !std::strcmp(names[1], "search") &&
-          !std::strcmp(names[2], "write") && !std::strcmp(names[3], "edit") &&
-          !std::strcmp(names[4], "edit_selection") &&
-          !std::strcmp(names[5], "shell"),
+          !std::strcmp(names[2], "write") && !std::strcmp(names[3], "overwrite") &&
+          !std::strcmp(names[4], "edit") &&
+          !std::strcmp(names[5], "edit_selection") &&
+          !std::strcmp(names[6], "shell"),
           "prompt and constrained decoder share one ordered registry");
 
     const char *preamble = q27_agent_tool_preamble();
     CHECK(preamble && std::strstr(preamble, "<tools>") &&
           std::strstr(preamble, "\"name\":\"read\"") &&
           std::strstr(preamble, "\"name\":\"write\"") &&
+          std::strstr(preamble, "\"name\":\"overwrite\"") &&
           std::strstr(preamble, "\"name\":\"edit_selection\"") &&
-          std::strstr(preamble, "\"name\":\"shell\"") &&
+          std::strstr(preamble, "markdown fenced") &&
           std::strstr(preamble, "additionalProperties"),
           "fixed strict registry is present in preamble");
 

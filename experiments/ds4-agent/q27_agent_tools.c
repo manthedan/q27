@@ -149,7 +149,8 @@ static void result_errno(q27_agent_tool_result *result, const char *prefix) {
 static int request_valid(const q27_agent_tool_request *request,
                          q27_agent_tool_result *result) {
     if (!request || request->kind < Q27_TOOL_READ ||
-        request->kind > Q27_TOOL_EDIT_PREFLIGHT || !request->max_output_bytes ||
+        request->kind > Q27_TOOL_OVERWRITE_PREFLIGHT ||
+        !request->max_output_bytes ||
         request->max_output_bytes > OUTPUT_MAX_BYTES ||
         request->input_len > FILE_MAX_BYTES ||
         request->replacement_len > FILE_MAX_BYTES) {
@@ -179,13 +180,15 @@ static int request_valid(const q27_agent_tool_request *request,
         result_error(result, "search needle must not be empty");
         return 0;
     }
-    if (request->kind == Q27_TOOL_WRITE &&
+    if ((request->kind == Q27_TOOL_WRITE ||
+         request->kind == Q27_TOOL_OVERWRITE) &&
         ((request->input_len && !request->input) ||
          request->replacement_len)) {
         result_error(result, "invalid write content");
         return 0;
     }
-    if (request->kind == Q27_TOOL_WRITE_PREFLIGHT &&
+    if ((request->kind == Q27_TOOL_WRITE_PREFLIGHT ||
+         request->kind == Q27_TOOL_OVERWRITE_PREFLIGHT) &&
         (request->input || request->input_len || request->replacement ||
          request->replacement_len)) {
         result_error(result, "write preflight accepts only a path");
@@ -617,6 +620,12 @@ static int atomic_create_between(int source_parent, const char *source,
 #endif
 }
 
+// Replace-or-create: POSIX renameat overwrites a same-type destination file.
+static int atomic_replace_between(int source_parent, const char *source,
+                                  int target_parent, const char *target) {
+    return renameat(source_parent, source, target_parent, target);
+}
+
 static int remove_pinned_regular_file(int parent, const char *name,
                                       int file_fd) {
     struct stat pinned, named;
@@ -645,7 +654,7 @@ static int open_validated_write_target(int rootfd, const char *path,
     if (!open_parent(rootfd, path, &parent, &leaf, result)) return 0;
     struct stat existing;
     if (fstatat(parent, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0) {
-        result_error(result, "write target already exists; use edit");
+        result_error(result, "write target already exists; use overwrite");
         close(parent);
         free(leaf);
         return 0;
@@ -701,7 +710,77 @@ static q27_agent_status run_write_preflight(
     free(leaf);
     result->exit_code = 0;
     snprintf(result->message, sizeof(result->message),
-             "write target is ready for a raw payload");
+             "write target is ready");
+    return Q27_AGENT_OK;
+}
+
+static int open_validated_overwrite_target(int rootfd, const char *path,
+                                           int *parent_out, char **leaf_out,
+                                           int *exists_out,
+                                           q27_agent_tool_result *result) {
+    int parent = -1;
+    char *leaf = NULL;
+    if (!open_parent(rootfd, path, &parent, &leaf, result)) return 0;
+    struct stat existing;
+    if (fstatat(parent, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!S_ISREG(existing.st_mode)) {
+            result_error(result, "overwrite target must be a regular file");
+            close(parent);
+            free(leaf);
+            return 0;
+        }
+        *exists_out = 1;
+    } else if (errno == ENOENT) {
+        *exists_out = 0;
+    } else {
+        result_errno(result, "cannot inspect overwrite target");
+        close(parent);
+        free(leaf);
+        return 0;
+    }
+    struct stat parent_stat;
+    if (fstat(parent, &parent_stat) != 0 || !S_ISDIR(parent_stat.st_mode) ||
+        parent_stat.st_uid != geteuid() || (parent_stat.st_mode & 0022)) {
+        result_error(result,
+                     "write parent must be owner-owned and not group/other writable");
+        close(parent);
+        free(leaf);
+        return 0;
+    }
+    int parent_acl = fd_has_granting_acl(parent);
+    if (parent_acl != 0) {
+        result_error(result, parent_acl > 0 ?
+                     "write parent has a granting extended ACL" :
+                     "cannot inspect write parent ACL");
+        close(parent);
+        free(leaf);
+        return 0;
+    }
+    *parent_out = parent;
+    *leaf_out = leaf;
+    return 1;
+}
+
+static q27_agent_status run_overwrite_preflight(
+    int rootfd, const q27_agent_tool_request *request,
+    q27_agent_alive_check alive, void *opaque,
+    q27_agent_tool_result *result) {
+    int parent = -1;
+    char *leaf = NULL;
+    int exists = 0;
+    if (!open_validated_overwrite_target(rootfd, request->path, &parent, &leaf,
+                                         &exists, result))
+        return Q27_AGENT_OK;
+    if (!alive(opaque)) {
+        close(parent);
+        free(leaf);
+        return Q27_AGENT_CANCELLED;
+    }
+    close(parent);
+    free(leaf);
+    result->exit_code = 0;
+    snprintf(result->message, sizeof(result->message),
+             exists ? "overwrite target is ready" : "overwrite will create path");
     return Q27_AGENT_OK;
 }
 
@@ -709,11 +788,19 @@ static q27_agent_status run_write(int rootfd,
                                   const q27_agent_tool_request *request,
                                   q27_agent_alive_check alive, void *opaque,
                                   q27_agent_tool_result *result) {
+    const int is_overwrite = request->kind == Q27_TOOL_OVERWRITE;
     int parent = -1;
     char *leaf = NULL;
-    if (!open_validated_write_target(rootfd, request->path, &parent, &leaf,
-                                     result))
+    int target_exists = 0;
+    if (is_overwrite) {
+        if (!open_validated_overwrite_target(rootfd, request->path, &parent,
+                                             &leaf, &target_exists, result))
+            return Q27_AGENT_OK;
+        (void)target_exists;
+    } else if (!open_validated_write_target(rootfd, request->path, &parent,
+                                            &leaf, result)) {
         return Q27_AGENT_OK;
+    }
     if (!alive(opaque)) {
         close(parent);
         free(leaf);
@@ -841,7 +928,14 @@ static q27_agent_status run_write(int rootfd,
         }
     }
     if (prepared) {
-        if (atomic_create_between(stage_fd, payload_name, parent, leaf) == 0) {
+        int publish_rc = -1;
+        if (is_overwrite)
+            publish_rc = atomic_replace_between(stage_fd, payload_name, parent,
+                                                leaf);
+        else
+            publish_rc = atomic_create_between(stage_fd, payload_name, parent,
+                                               leaf);
+        if (publish_rc == 0) {
             renamed = 1;
             const int dirsync_result = fsync(parent);
             const int dirsync_errno = errno;
@@ -870,8 +964,8 @@ static q27_agent_status run_write(int rootfd,
                 result_error(result,
                              "atomic write publication failed validation");
             }
-        } else if (errno == EEXIST) {
-            result_error(result, "write target already exists; use edit");
+        } else if (!is_overwrite && errno == EEXIST) {
+            result_error(result, "write target already exists; use overwrite");
         }
     }
     if (!published && result->exit_code == -1 && !result->message[0] &&
@@ -1393,12 +1487,15 @@ q27_agent_status q27_agent_tool_execute(
         status = run_read(rootfd, request, sink, alive, opaque, result);
     else if (request->kind == Q27_TOOL_SEARCH)
         status = run_search(rootfd, request, sink, alive, opaque, result);
-    else if (request->kind == Q27_TOOL_WRITE)
+    else if (request->kind == Q27_TOOL_WRITE ||
+             request->kind == Q27_TOOL_OVERWRITE)
         status = run_write(rootfd, request, alive, opaque, result);
     else if (request->kind == Q27_TOOL_EDIT)
         status = run_edit(rootfd, request, alive, opaque, result);
     else if (request->kind == Q27_TOOL_WRITE_PREFLIGHT)
         status = run_write_preflight(rootfd, request, alive, opaque, result);
+    else if (request->kind == Q27_TOOL_OVERWRITE_PREFLIGHT)
+        status = run_overwrite_preflight(rootfd, request, alive, opaque, result);
     else
         status = run_edit_preflight(rootfd, request, alive, opaque, result);
     close(rootfd);

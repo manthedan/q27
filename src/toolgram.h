@@ -53,6 +53,9 @@ struct ToolGrammar {
     bool done() const { return !dead_ && (st_ == DONE_ || st_ == CLOSER_ || st_ == CLOSED_); }
     // literal </tool_call> fully matched -- constraint can disengage
     bool closed() const { return !dead_ && st_ == CLOSED_; }
+    // Accepted tool-name value once NAME_VAL has matched a registered name.
+    // Empty before that point; stable through CLOSED_ for body-tool routing.
+    const std::string& tool_name() const { return name_pref_; }
 
     // would every byte of s be legal from the current state?
     bool token_ok(const std::string& s) const {

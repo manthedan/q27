@@ -17,10 +17,13 @@ typedef enum {
     Q27_TOOL_EDIT,
     Q27_TOOL_SHELL,
     Q27_TOOL_WRITE,
+    // Create-or-replace whole file (same payload channel as write).
+    Q27_TOOL_OVERWRITE,
     // Internal validation-only commands. They are never model-visible and
     // perform no filesystem mutation.
     Q27_TOOL_WRITE_PREFLIGHT,
-    Q27_TOOL_EDIT_PREFLIGHT
+    Q27_TOOL_EDIT_PREFLIGHT,
+    Q27_TOOL_OVERWRITE_PREFLIGHT
 } q27_agent_tool_kind;
 
 enum { Q27_TOOL_MAX_SELECTIONS = 32 };
