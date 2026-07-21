@@ -179,7 +179,9 @@ const std::string& preamble() {
                  "Replace exactly one short unique nonempty literal match in an existing "
                  "file. JSON args: path and old (old max 512 bytes). Immediately after "
                  "</tool_call>, emit the replacement as a markdown fenced block. Never put "
-                 "replacement bytes in JSON. For whole-file rewrites use overwrite."},
+                 "replacement bytes in JSON. The block's final newline is transport only: "
+                 "it is dropped when your old match does not end with a newline. For "
+                 "whole-file rewrites use overwrite."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
                         {"path", {{"type", "string"}}},

@@ -1461,6 +1461,19 @@ static q27_agent_status run_shell(int workspace_fd,
     return call_status;
 }
 
+void q27_agent_edit_normalize(q27_agent_tool_request *request) {
+    if (!request || request->kind != Q27_TOOL_EDIT) return;
+    if (!request->replacement || !request->replacement_len) return;
+    if (!request->input || !request->input_len) return;
+    if (request->input[request->input_len - 1] == '\n') return;
+    if (request->replacement[request->replacement_len - 1] != '\n') return;
+    size_t strip = 1;
+    if (request->replacement_len >= 2 &&
+        request->replacement[request->replacement_len - 2] == '\r')
+        strip = 2;
+    request->replacement_len -= strip;
+}
+
 q27_agent_status q27_agent_tool_execute(
     int workspace_fd, const q27_agent_tool_request *request,
     q27_agent_tool_sink sink, q27_agent_alive_check alive, void *opaque,

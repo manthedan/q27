@@ -96,6 +96,17 @@ q27_agent_status q27_agent_tool_execute(
     void *opaque,
     q27_agent_tool_result *result);
 
+// Transport-LF rule for fenced edit bodies (codex branch-review P1): the
+// same-turn markdown fence always publishes its body with the newline that
+// precedes the closing fence, so an inline replacement (old bytes NOT ending
+// with '\n') would silently gain a newline. When the old bytes do not end
+// with a line feed, drop exactly one trailing line ending ("\r\n" or "\n")
+// from the replacement; matches that end with a newline keep the replacement
+// verbatim (line replacements are LF-terminated by construction). Stripping
+// to zero bytes is legal — it makes inline deletion expressible. Whole-file
+// tools (write/overwrite) do NOT use this: their bodies keep the final LF.
+void q27_agent_edit_normalize(q27_agent_tool_request *request);
+
 #ifdef __cplusplus
 }
 #endif

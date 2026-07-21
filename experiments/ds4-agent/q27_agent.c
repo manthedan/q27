@@ -1282,6 +1282,12 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                 continue;
             }
 
+            // Transport-LF rule for edit (codex branch-review P1): the fenced
+            // body's final newline is transport when the old bytes do not end
+            // with a newline — normalize once, before preflight and execution.
+            if (call.request.kind == Q27_TOOL_EDIT)
+                q27_agent_edit_normalize(&call.request);
+
             q27_agent_tool_request preflight = call.request;
             if (call.request.kind == Q27_TOOL_WRITE)
                 preflight.kind = Q27_TOOL_WRITE_PREFLIGHT;

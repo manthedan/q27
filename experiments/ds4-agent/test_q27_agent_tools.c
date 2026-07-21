@@ -535,6 +535,61 @@ int main(void) {
           "pre-launch cancellation is honored");
 
     capture_reset(&out);
+
+    // Transport-LF normalization for fenced edit bodies (codex branch-review
+    // P1): inline matches (old bytes not LF-terminated) drop exactly one
+    // trailing line ending from the replacement; LF-terminated matches keep
+    // the replacement verbatim.
+    {
+        q27_agent_tool_request norm = {
+            .kind = Q27_TOOL_EDIT, .path = "sub/data.bin",
+            .input = (const unsigned char *)"foo", .input_len = 3,
+            .replacement = (const unsigned char *)"bar\n", .replacement_len = 4};
+        q27_agent_edit_normalize(&norm);
+        CHECK(norm.replacement_len == 3 &&
+                  !memcmp(norm.replacement, "bar", 3),
+              "inline match: transport LF stripped from replacement");
+
+        norm = (q27_agent_tool_request){
+            .kind = Q27_TOOL_EDIT, .path = "sub/data.bin",
+            .input = (const unsigned char *)"foo\n", .input_len = 4,
+            .replacement = (const unsigned char *)"bar\n", .replacement_len = 4};
+        q27_agent_edit_normalize(&norm);
+        CHECK(norm.replacement_len == 4,
+              "line match: replacement keeps its final LF verbatim");
+
+        norm = (q27_agent_tool_request){
+            .kind = Q27_TOOL_EDIT, .path = "sub/data.bin",
+            .input = (const unsigned char *)"foo", .input_len = 3,
+            .replacement = (const unsigned char *)"bar\r\n", .replacement_len = 5};
+        q27_agent_edit_normalize(&norm);
+        CHECK(norm.replacement_len == 3 &&
+                  !memcmp(norm.replacement, "bar", 3),
+              "inline match: transport CRLF stripped from replacement");
+
+        norm = (q27_agent_tool_request){
+            .kind = Q27_TOOL_EDIT, .path = "sub/data.bin",
+            .input = (const unsigned char *)"foo", .input_len = 3,
+            .replacement = (const unsigned char *)"\n", .replacement_len = 1};
+        q27_agent_edit_normalize(&norm);
+        CHECK(norm.replacement_len == 0,
+              "inline match: newline-only body becomes a deletion");
+
+        norm = (q27_agent_tool_request){
+            .kind = Q27_TOOL_EDIT, .path = "sub/data.bin",
+            .input = (const unsigned char *)"foo", .input_len = 3,
+            .replacement = (const unsigned char *)"bar", .replacement_len = 3};
+        q27_agent_edit_normalize(&norm);
+        CHECK(norm.replacement_len == 3,
+              "replacement without trailing LF is untouched");
+
+        norm = (q27_agent_tool_request){
+            .kind = Q27_TOOL_WRITE, .path = "sub/data.bin",
+            .input = (const unsigned char *)"body\n", .input_len = 5};
+        q27_agent_edit_normalize(&norm);
+        CHECK(norm.input_len == 5, "non-edit kinds are not normalized");
+    }
+
     close(workspace_fd);
     unlink(linkpath);
     unlink(root_file);
