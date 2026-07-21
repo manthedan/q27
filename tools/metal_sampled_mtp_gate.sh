@@ -76,8 +76,30 @@ run "plain sample force" env Q27_SAMPLE_PLAIN=1 "$BIN" "$MODEL" "$TOK" --ctx "$C
 grep -q '^generated:' "$outp" || die "plain sample produced no generated: line"
 echo "PASS: Q27_SAMPLE_PLAIN trajectory" >&2
 
+# Run binary with TRACE; require exit 0 and write stderr to a file.
+# Prints match count for PATTERN on stdout of this function via echo.
+run_traced() {
+  local pattern=$1; shift
+  local tf
+  tf=$(mktemp)
+  set +e
+  env Q27_MTP_TRACE=1 "$@" >/dev/null 2>"$tf"
+  local rc=$?
+  set -e
+  cat "$tf" >&2
+  if [[ $rc -ne 0 ]]; then
+    rm -f "$tf"
+    die "command failed (exit $rc): $*"
+  fi
+  local n
+  n=$(rg -c "$pattern" "$tf" || true)
+  n=${n:-0}
+  rm -f "$tf"
+  echo "$n"
+}
+
 # 5) Capability proof: sampled path must emit mtp sample round traces
-# (codex P2 — without this the script can PASS on plain-sample fallback).
+# and speculation stats with drafts>0 (codex P2).
 echo "=== sampled-MTP route must fire ===" >&2
 trace_file=$(mktemp)
 set +e
@@ -96,32 +118,30 @@ if [[ "$sample_rounds" -lt 1 ]]; then
   die "no 'mtp sample round' traces — pack lacks MTP/chunked prefill or route fell back to plain sample"
 fi
 echo "PASS: mtp sample round traces=$sample_rounds" >&2
-# Also require speculation stats line with non-zero drafts when stderr has it.
-if rg -q 'speculation:.*drafts' "$trace_file"; then
-  if rg -q 'speculation: 0 rounds' "$trace_file"; then
-    die "speculation stats show 0 rounds despite sample traces"
-  fi
-  echo "PASS: speculation stats present" >&2
-fi
+# Require speculation stats with drafts > 0 (proves drafts ran, not only traces).
+stats_line=$(rg 'speculation: [0-9]+ rounds, [0-9]+ drafts' "$trace_file" | tail -1 || true)
+[[ -n "$stats_line" ]] || die "missing speculation stats line"
+drafts=$(echo "$stats_line" | sed -n 's/.*speculation: [0-9]* rounds, \([0-9]*\) drafts.*/\1/p')
+[[ -n "$drafts" && "$drafts" -gt 0 ]] || die "speculation drafts not >0 (line: $stats_line)"
+echo "PASS: speculation drafts=$drafts" >&2
+rm -f "$trace_file"
 
-# 6) Acceptance telemetry (tokens/round) via Q27_MTP_TRACE on a short run
+# 6) Acceptance telemetry — each temp must exit 0 and produce traces.
 echo "=== acceptance-vs-temp (trace, short) ===" >&2
 for T in 0.0 0.3 0.7 1.0; do
   if [[ "$T" == "0.0" ]]; then
-    tr=$(env Q27_MTP_TRACE=1 "$BIN" "$MODEL" "$TOK" --ctx "$CTX" --mtp "$MTP" \
-      -n 24 --prompt "$PROMPT" 2>&1 >/dev/null | tee /dev/stderr | rg -c 'mtp round:' || true)
-    tr=${tr:-0}
+    tr=$(run_traced 'mtp round:' "$BIN" "$MODEL" "$TOK" --ctx "$CTX" --mtp "$MTP" \
+      -n 24 --prompt "$PROMPT")
     [[ "$tr" -ge 1 ]] || die "greedy T=0 produced no mtp round traces"
     echo "T=$T greedy mtp_round lines: $tr" >&2
   else
-    tr=$(env Q27_MTP_TRACE=1 "$BIN" "$MODEL" "$TOK" --ctx "$CTX" --mtp "$MTP" \
+    tr=$(run_traced 'mtp sample round:' "$BIN" "$MODEL" "$TOK" --ctx "$CTX" --mtp "$MTP" \
       --temperature "$T" --top-p 0.95 --top-k 20 --seed "$SEED" -n 24 \
-      --prompt "$PROMPT" 2>&1 >/dev/null | tee /dev/stderr | rg -c 'mtp sample round:' || true)
-    tr=${tr:-0}
+      --prompt "$PROMPT")
     [[ "$tr" -ge 1 ]] || die "T=$T produced no mtp sample round traces"
     echo "T=$T mtp_sample_round lines: $tr" >&2
   fi
 done
 
-rm -f "$out1" "$out2" "$out3" "$outg" "$outp" "$trace_file"
+rm -f "$out1" "$out2" "$out3" "$outg" "$outp"
 echo "metal_sampled_mtp_gate: PASS (smoke)" >&2
