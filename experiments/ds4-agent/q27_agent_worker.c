@@ -5,6 +5,7 @@
 #include "q27_agent_worker.h"
 
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -685,8 +686,12 @@ q27_agent_status q27_agent_worker_submit(
         copy_error(error, error_cap, "invalid worker submission");
         return Q27_AGENT_REJECTED;
     }
-    // Mirror validate_sampling without throwing across the C ABI.
-    if (!(sampling.temperature >= 0.0f) ||
+    // Mirror validate_sampling without throwing across the C ABI. Reject
+    // non-finite values here (including +inf) so a bad C-ABI caller gets
+    // REJECTED while the worker stays IDLE — not a late generate throw that
+    // publishes ERROR and permanently poisons the worker.
+    if (!isfinite(sampling.temperature) || sampling.temperature < 0.0f ||
+        !isfinite(sampling.top_p) ||
         !(sampling.top_p > 0.0f && sampling.top_p <= 1.0f)) {
         copy_error(error, error_cap, "invalid sampling parameters");
         return Q27_AGENT_REJECTED;

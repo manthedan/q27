@@ -1,6 +1,7 @@
 #include "q27_agent_worker.h"
 
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -380,6 +381,27 @@ int main(void) {
     CHECK(q27_agent_worker_tokenizer_sha1(worker, tokenizer_sha1) &&
           tokenizer_sha1[0] == 42 && tokenizer_sha1[19] == 42,
           "worker exports owner-pinned tokenizer identity");
+
+    // Non-finite sampling must REJECT without admitting a command that would
+    // poison the worker via a late generate-side validation throw.
+    q27_agent_message probe = {
+        .role = "user", .content = "ok", .content_len = 2};
+    q27_agent_sampling inf_temp = sampling_greedy();
+    inf_temp.temperature = INFINITY;
+    uint64_t bad_command = 99;
+    CHECK(q27_agent_worker_submit(worker, &probe, 1, 0, 0, 8, inf_temp, alive,
+                                  NULL, &bad_command, error, sizeof(error)) ==
+              Q27_AGENT_REJECTED &&
+          bad_command == 0 &&
+          q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
+          "non-finite temperature is rejected while worker stays idle");
+    q27_agent_sampling nan_top_p = sampling_greedy();
+    nan_top_p.top_p = NAN;
+    CHECK(q27_agent_worker_submit(worker, &probe, 1, 0, 0, 8, nan_top_p, alive,
+                                  NULL, &bad_command, error, sizeof(error)) ==
+              Q27_AGENT_REJECTED &&
+          q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
+          "non-finite top_p is rejected while worker stays idle");
 
     // submit owns a deep binary copy: mutate the source immediately afterward.
     char binary[] = {'x', '\0', 'y'};
