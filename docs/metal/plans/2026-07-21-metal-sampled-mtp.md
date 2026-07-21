@@ -240,7 +240,7 @@ Offline-only dry run: `SKIP_LIVE=1 tools/overnight_sampled_mtp.sh`.
 | | Phase 4 further speed (device nucleus only if profiled hot) | optional; top-k already in |
 | | Longer / multi-prompt wall A/B to re-check ship bar | *pending* if we want product claim |
 | | End-to-end distribution A/B: plain vs sampled-MTP unigram histogram (χ²/TV), plus real-logits full-vs-topk-candidates `p_served` parity | *pending* — correctness claim is unit-math-level only today |
-| | Live smoke `q27-agent --mtp N --temperature 0.7 --auto-tools` exercising a fenced write body | *pending* — agent burst/ledger path has no automated or live coverage yet |
+| 2026-07-21 | **Live agent smokes** `logs/agent-smoke-20260721/` | **PASS.** Smoke1 minimal sample+auto-tools: 41s, `Hello!`, exit 0 (serial under tools). Smoke2 write+`--mtp 4`+TRACE: 76s, toolgram serial then **7× mtp sample round** on fenced body, `hello_q27.txt` exact, tool exit 0, session reuse on follow-up. |
 | | Quality A/B before sampling defaults-on | Phase 3 blocker |
 
 ## Review workflow
