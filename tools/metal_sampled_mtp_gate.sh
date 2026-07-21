@@ -76,20 +76,52 @@ run "plain sample force" env Q27_SAMPLE_PLAIN=1 "$BIN" "$MODEL" "$TOK" --ctx "$C
 grep -q '^generated:' "$outp" || die "plain sample produced no generated: line"
 echo "PASS: Q27_SAMPLE_PLAIN trajectory" >&2
 
-# 5) Acceptance telemetry (tokens/round) via Q27_MTP_TRACE on a short run
+# 5) Capability proof: sampled path must emit mtp sample round traces
+# (codex P2 — without this the script can PASS on plain-sample fallback).
+echo "=== sampled-MTP route must fire ===" >&2
+trace_file=$(mktemp)
+set +e
+env Q27_MTP_TRACE=1 "$BIN" "$MODEL" "$TOK" --ctx "$CTX" --mtp "$MTP" \
+  --temperature 0.7 --top-p 0.95 --top-k 20 --seed "$SEED" -n 24 \
+  --prompt "$PROMPT" >"$out1" 2>"$trace_file"
+rc=$?
+set -e
+[[ $rc -eq 0 ]] || die "sampled MTP run failed (exit $rc); stderr: $(tail -5 "$trace_file")"
+sample_rounds=$(rg -c 'mtp sample round:' "$trace_file" || true)
+sample_rounds=${sample_rounds:-0}
+if [[ "$sample_rounds" -lt 1 ]]; then
+  echo "--- stderr ---" >&2
+  cat "$trace_file" >&2
+  rm -f "$trace_file" "$out1" "$out2" "$out3" "$outg" "$outp"
+  die "no 'mtp sample round' traces — pack lacks MTP/chunked prefill or route fell back to plain sample"
+fi
+echo "PASS: mtp sample round traces=$sample_rounds" >&2
+# Also require speculation stats line with non-zero drafts when stderr has it.
+if rg -q 'speculation:.*drafts' "$trace_file"; then
+  if rg -q 'speculation: 0 rounds' "$trace_file"; then
+    die "speculation stats show 0 rounds despite sample traces"
+  fi
+  echo "PASS: speculation stats present" >&2
+fi
+
+# 6) Acceptance telemetry (tokens/round) via Q27_MTP_TRACE on a short run
 echo "=== acceptance-vs-temp (trace, short) ===" >&2
 for T in 0.0 0.3 0.7 1.0; do
   if [[ "$T" == "0.0" ]]; then
     tr=$(env Q27_MTP_TRACE=1 "$BIN" "$MODEL" "$TOK" --ctx "$CTX" --mtp "$MTP" \
-      -n 32 --prompt "$PROMPT" 2>&1 >/dev/null | tee /dev/stderr | rg -c 'mtp round:' || true)
-    echo "T=$T greedy mtp_round lines: ${tr:-0}" >&2
+      -n 24 --prompt "$PROMPT" 2>&1 >/dev/null | tee /dev/stderr | rg -c 'mtp round:' || true)
+    tr=${tr:-0}
+    [[ "$tr" -ge 1 ]] || die "greedy T=0 produced no mtp round traces"
+    echo "T=$T greedy mtp_round lines: $tr" >&2
   else
     tr=$(env Q27_MTP_TRACE=1 "$BIN" "$MODEL" "$TOK" --ctx "$CTX" --mtp "$MTP" \
-      --temperature "$T" --top-p 0.95 --top-k 20 --seed "$SEED" -n 32 \
+      --temperature "$T" --top-p 0.95 --top-k 20 --seed "$SEED" -n 24 \
       --prompt "$PROMPT" 2>&1 >/dev/null | tee /dev/stderr | rg -c 'mtp sample round:' || true)
-    echo "T=$T mtp_sample_round lines: ${tr:-0}" >&2
+    tr=${tr:-0}
+    [[ "$tr" -ge 1 ]] || die "T=$T produced no mtp sample round traces"
+    echo "T=$T mtp_sample_round lines: $tr" >&2
   fi
 done
 
-rm -f "$out1" "$out2" "$out3" "$outg" "$outp"
+rm -f "$out1" "$out2" "$out3" "$outg" "$outp" "$trace_file"
 echo "metal_sampled_mtp_gate: PASS (smoke)" >&2
