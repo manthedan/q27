@@ -1263,6 +1263,10 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                     call.body_error :
                     "body tool requires a markdown-fenced body after "
                     "</tool_call>; do not emit another tool call";
+                // Surface soft-fails for operators; previously only the model
+                // saw the tool_response, so silent missing/unclosed fences
+                // looked like a successful closed tool call.
+                fprintf(stderr, "[q27-agent body soft-fail: %s]\n", msg);
                 if (!append_failed_tool_response(chat, msg)) {
                     q27_agent_tool_call_free(&call);
                     return 0;

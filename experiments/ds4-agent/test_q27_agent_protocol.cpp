@@ -86,6 +86,39 @@ int main() {
           "repeated trailing </tool_call> echo is ignored");
     q27_agent_tool_call_free(&call);
 
+    // Live T2/sampled failure: opener + full file + trailing protocol echo,
+    // no closing ```. Recover the body rather than soft-fail forever.
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"python_file.py\"}}</tool_call>\n"
+                "```python\n"
+                "def main():\n"
+                "    print(f\"hi {name}\")\n"
+                "\n"
+                "if __name__ == \"__main__\":\n"
+                "    main()\n"
+                "</tool_call>\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body &&
+          std::string(reinterpret_cast<const char *>(call.request.input),
+                      call.request.input_len) ==
+              "def main():\n"
+              "    print(f\"hi {name}\")\n"
+              "\n"
+              "if __name__ == \"__main__\":\n"
+              "    main()\n",
+          "unclosed fence recovers body and strips trailing </tool_call>");
+    q27_agent_tool_call_free(&call);
+
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```python\nprint(1)\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body &&
+          std::string(reinterpret_cast<const char *>(call.request.input),
+                      call.request.input_len) == "print(1)\n",
+          "unclosed fence at EOS recovers body");
+    q27_agent_tool_call_free(&call);
+
     // Premature fence closer must still soft-fail: remaining source is not
     // protocol echo, so we refuse to publish a truncated body.
     CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"

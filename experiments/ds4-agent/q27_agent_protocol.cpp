@@ -437,8 +437,74 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
         if (line_end >= len) break;
         line_start = line_end + 1;
     }
-    set_error(error, error_cap, "markdown fence body is not closed");
-    return 0;
+
+    // Observed T2/sampled pattern: open ```lang, emit the whole file, hit EOS
+    // (or a trailing </tool_call> echo) without a closing fence line. Recover
+    // by taking the body as everything after the opener, then stripping only
+    // trailing whitespace and protocol-echo </tool_call> tags. A premature
+    // ``` closer with more source still fails above (non-ws after closer).
+    if (content_start > len) {
+        set_error(error, error_cap, "markdown fence body is not closed");
+        return 0;
+    }
+    size_t end = len;
+    auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    };
+    // Strip trailing </tool_call> protocol echo (and whitespace around those
+    // tags) without eating the body's final content newline when no tag is
+    // present — unlike a full trim of trailing whitespace.
+    static const char kCloseTag[] = "</tool_call>";
+    constexpr size_t kCloseTagLen = sizeof(kCloseTag) - 1;
+    for (;;) {
+        size_t t = end;
+        while (t > content_start && is_ws(bytes[t - 1])) --t;
+        if (t < content_start + kCloseTagLen) {
+            // Too short to hold </tool_call>. If the body is only whitespace,
+            // treat as empty; otherwise keep the short real content (common
+            // for tiny files under unclosed-fence recovery).
+            if (t == content_start) end = content_start;
+            break;
+        }
+        if (std::memcmp(bytes + (t - kCloseTagLen), kCloseTag,
+                        kCloseTagLen) != 0)
+            break; // keep end (includes trailing newlines after last content)
+        end = t - kCloseTagLen;
+    }
+    // Optional dangling closer line at EOF (only spaces + >=open_ticks
+    // backticks). end = start of that line so content keeps the preceding LF
+    // — same inclusion rule as a normal closed fence.
+    {
+        size_t scan = end;
+        while (scan > content_start && is_ws(bytes[scan - 1])) --scan;
+        size_t line = scan;
+        while (line > content_start && bytes[line - 1] != '\n') --line;
+        size_t p = line;
+        while (p < scan && bytes[p] == ' ') ++p;
+        size_t ticks = 0;
+        while (p + ticks < scan && bytes[p + ticks] == '`') ++ticks;
+        size_t q = p + ticks;
+        while (q < scan && (bytes[q] == ' ' || bytes[q] == '\t')) ++q;
+        if (ticks >= open_ticks && q == scan) end = line;
+    }
+    const size_t content_len = end > content_start ? end - content_start : 0;
+    // Empty after stripping protocol echo is not a deliberate empty file
+    // (those use a closed empty fence). Fail closed so the model retries.
+    if (content_len == 0) {
+        set_error(error, error_cap, "markdown fence body is not closed");
+        return 0;
+    }
+    unsigned char *copy =
+        static_cast<unsigned char *>(std::malloc(content_len + 1));
+    if (!copy) {
+        set_error(error, error_cap, "out of memory extracting body");
+        return 0;
+    }
+    std::memcpy(copy, bytes + content_start, content_len);
+    copy[content_len] = 0;
+    *out = copy;
+    *out_len = content_len;
+    return 1;
 }
 
 extern "C" int q27_agent_unwrap_whole_file_source_fence(
