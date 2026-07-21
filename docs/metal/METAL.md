@@ -28,7 +28,7 @@ make test-metal
 
 `Q27_METAL_SOURCE=/path/to/q27_kernels.metal` overrides the runtime shader path.
 
-`build/q27-metal` is the baseline Metal inference executable. It is functionally correct on the official artifact but not performance-competitive yet. The existing CUDA executable remains unchanged and is the production/reference backend. See `docs/METAL_PROGRESS.md` for checkpoint gates and measured status.
+`build/q27-metal` is the baseline Metal inference executable. It is functionally correct on the official artifact but not performance-competitive yet. The existing CUDA executable remains unchanged and is the production/reference backend. See `docs/metal/METAL_PROGRESS.md` for checkpoint gates and measured status.
 
 ## Implementation order
 

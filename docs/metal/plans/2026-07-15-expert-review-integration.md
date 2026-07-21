@@ -176,7 +176,7 @@ caffeinate/matched-thermal protocol rules from run-level to bench-level.
    pressure differs from their 6-accumulator concern); the grouping sweep
    is still worth running on the decode-into-registers reuse path.
 5. Default branch now `metal` — the Metal ledgers/plans they couldn't find
-   are at `docs/METAL_PROGRESS.md` and `docs/plans/2026-07-15-*`.
+   are at `docs/metal/METAL_PROGRESS.md` and `docs/plans/2026-07-15-*`.
 
 ## Priority deltas accepted
 

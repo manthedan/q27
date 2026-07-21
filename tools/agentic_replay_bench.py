@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Agentic replay bench — the product-truth serving number
-(docs/plans/2026-07-17-agentic-replay-bench.md). Stdlib only.
+(docs/metal/plans/2026-07-17-agentic-replay-bench.md). Stdlib only.
 
 Replays a corpus (agentic_replay_extract.py) serially against a running
 q27 server via /v1/completions with stream=true: the rendered prompt is

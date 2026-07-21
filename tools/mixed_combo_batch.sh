@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Mixed-tier COMBO batch (docs/plans/2026-07-17-mixed-tier-census.md, combo
+# Mixed-tier COMBO batch (docs/metal/plans/2026-07-17-mixed-tier-census.md, combo
 # phase): the first-pass census proved single-class deltas are non-additive
 # (gdn_qkv alone beats all-T2), so the three registered compositions of the
 # gate-passing classes are measured directly. Derived from

@@ -1,6 +1,6 @@
 # tools/eval — capability-eval harness v1
 
-Triage item U2 (docs/plans/2026-07-17-ds4-product-triage.md): gate
+Triage item U2 (docs/metal/plans/2026-07-17-ds4-product-triage.md): gate
 infrastructure for "does the agent still finish tasks" questions that
 NLL/KL/needle cannot answer. Pure CPU, Python 3 stdlib only, no model
 loads anywhere in this directory.
@@ -37,7 +37,7 @@ loads anywhere in this directory.
   spot-check set (120 items: 60 anchored MC, 40 numeric word problems,
   20 freeform short answers; fields prompt_id/prompt/gold/category).
   Authored for the mixed-pack ship gate
-  (docs/plans/2026-07-17-census-capability-spotcheck.md). Agreement is a
+  (docs/metal/plans/2026-07-17-census-capability-spotcheck.md). Agreement is a
   supporting read only; the amended A6 gate is ground-truth accuracy
   non-inferiority and its verdict driver is not yet authored.
 - `promptlint.py` — structural lint for the prompt set: unique ids

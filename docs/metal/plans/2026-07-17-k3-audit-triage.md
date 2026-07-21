@@ -1,6 +1,6 @@
 # k3 audit triage — 2026-07-17
 
-Source: docs/k3-review-2026-07-15.md (full Metal backend audit: kernels, engine,
+Source: docs/metal/k3-review-2026-07-15.md (full Metal backend audit: kernels, engine,
 backend host; static read, tree at 83e4800 — its D5 inventory already cites the
 same-day am_pack fix, so the read is current). Every finding was source-verified
 before a verdict. Outcome: **nothing rejected** — the cleanest external audit to

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Prefix-recurrence economics for the --trace stream (I1 design check,
-# docs/plans/2026-07-17-i1-strip-design-check.md): the proactive strip /
+# docs/metal/plans/2026-07-17-i1-strip-design-check.md): the proactive strip /
 # re-materialization lever is worth building only if real serving traffic
 # recurs to the same prompt families with short gaps. This prices it.
 #

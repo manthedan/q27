@@ -1,6 +1,6 @@
 #!/bin/zsh
 # KV-codec step 2: KVarN-style scaling arms on the turbo3 round-trip
-# (docs/plans/2026-07-16-kv-codec-step2.md). Stats pass (per-feature RMS,
+# (docs/metal/plans/2026-07-16-kv-codec-step2.md). Stats pass (per-feature RMS,
 # KL-zero canary rides along), then K:scale32 / K:feature / K:both at the
 # step-1 corpus config (--nll-long 8192 => 8,191 positions, comparable to
 # step 1's K arm: mean 0.00677, p99 0.064, max 2.52).

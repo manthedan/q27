@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Agentic replay corpus extractor
-(docs/plans/2026-07-17-agentic-replay-bench.md). Stdlib only, no model.
+(docs/metal/plans/2026-07-17-agentic-replay-bench.md). Stdlib only, no model.
 
 Reads a server trace (--trace JSONL) and emits a replay corpus: one line
 per completed generation turn, in trace order, carrying the RENDERED

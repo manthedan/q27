@@ -1,6 +1,6 @@
 #!/bin/bash
 # Quiet-machine ship-line bench for the Q4/Q8 chunk-GEMM schedule port
-# (pre-registered in docs/plans/2026-07-17-t2-prefill-throughput.md):
+# (pre-registered in docs/metal/plans/2026-07-17-t2-prefill-throughput.md):
 #   "a watcher waits for >=10 min input idle, stops the T2 server, runs
 #    float/half at 8352 (x2) and 960, restarts the server. >=1.7x ships
 #    default-ON; <1.7x ships nothing but the parked kernels + the honest

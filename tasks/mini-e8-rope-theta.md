@@ -1,6 +1,6 @@
 # Task for mac-mini: E8 — RoPE theta-precision probe at depth (P2)
 
-From the k3 audit triage (docs/plans/2026-07-17-k3-audit-triage.md, D3/E8);
+From the k3 audit triage (docs/metal/plans/2026-07-17-k3-audit-triage.md, D3/E8);
 operator-authorized 2026-07-17 ("do it" on the parallelization plan). **Queued
 behind mini-e2-gqa-partials — finish that first**, this one is model-free and
 patient.

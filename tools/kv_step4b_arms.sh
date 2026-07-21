@@ -1,6 +1,6 @@
 #!/bin/zsh
 # KV-codec step 4b: design-step decomposition arms (control anchor + l7h1 / l7h1k / l63v holds)
-# (docs/plans/2026-07-17-kv-codec-step4-probe.md). Arm A control (mode 3,
+# (docs/metal/plans/2026-07-17-kv-codec-step4-probe.md). Arm A control (mode 3,
 # empty mask) then arm B probe (census cells 10,11,125,127 held fp16),
 # 8,191 positions each at the step-1/2 corpus config.
 set -u

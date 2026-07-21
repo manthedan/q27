@@ -58,7 +58,7 @@ class MetalEngine {
     MetalEngine& operator=(const MetalEngine&) = delete;
     ~MetalEngine();
 
-    // G6 admission accounting (docs/plans/2026-07-16-g6-admission.md).
+    // G6 admission accounting (docs/metal/plans/2026-07-16-g6-admission.md).
     // These mirror the constructor's allocations and capture_state()'s
     // snapshot composition — keep them paired with those sites.
     bool has_mtp() const { return has_mtp_; }
@@ -86,7 +86,7 @@ class MetalEngine {
                                        uint32_t count, uint32_t width);
     // Verify/oracle width ceiling, decoupled from the width-12 NLL/KL
     // contract exactly as PREFILL_CHUNK_MAX decoupled prompt ingestion
-    // (docs/plans/2026-07-16-lever2-verify-width.md). Sizes cfinal_/
+    // (docs/metal/plans/2026-07-16-lever2-verify-width.md). Sizes cfinal_/
     // clogits_/cpred_ and the gdn_replay parks; mtp_round stays capped at
     // CHUNK_MAX until the MTP lane machinery is testable (24 GB rig).
     static constexpr uint32_t VERIFY_CHUNK_MAX = 48;
@@ -175,7 +175,7 @@ class MetalEngine {
                                         const TokenSink& sink, StopCause& cause);
 
     // Scheduling-quantum surface (multislot Phase 1,
-    // docs/plans/2026-07-15-multislot-phase1.md): each call submits bounded
+    // docs/metal/plans/2026-07-15-multislot-phase1.md): each call submits bounded
     // GPU work so a serving scheduler can interleave engines on one Shared.
     //
     // prefill_chunk encodes 2..PREFILL_CHUNK_MAX prompt tokens through the
@@ -219,7 +219,7 @@ class MetalEngine {
 
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);
-    // Prefix snapshots to disk (docs/plans/2026-07-16-prefix-snapshots.md,
+    // Prefix snapshots to disk (docs/metal/plans/2026-07-16-prefix-snapshots.md,
     // Phase 1): the capture/restore composition streamed through host
     // memory with plain file I/O (no mmap — ds4's lesson). save writes
     // path.tmp then renames; load validates the whole file structure
@@ -277,7 +277,7 @@ class MetalEngine {
     // to one attention layer (absolute index, layer%4==3) and one KV head.
     // UINT32_MAX for layer/head widens that axis back to "all".
     void set_kv_attrib_cell(uint32_t mode, uint32_t layer, uint32_t head);
-    // Step-2 scaling arms (docs/plans/2026-07-16-kv-codec-step2.md), on top
+    // Step-2 scaling arms (docs/metal/plans/2026-07-16-kv-codec-step2.md), on top
     // of an already-selected side arm: scale32 keeps the group scale in f32
     // through the round-trip; feature_scales (2*16*4*256 floats,
     // [side][attn_idx][head][dim]) descale each dimension before the
@@ -289,7 +289,7 @@ class MetalEngine {
     // both sides. read_kv_attrib_stats returns the 2*16*4*256 accumulator.
     void set_kv_attrib_stats();
     void read_kv_attrib_stats(std::vector<float>& out);
-    // Step-4 exception probe (docs/plans/2026-07-17-kv-codec-step4-probe.md):
+    // Step-4 exception probe (docs/metal/plans/2026-07-17-kv-codec-step4-probe.md):
     // round-trip BOTH sides of every attention layer through the turbo3
     // quantizer EXCEPT the listed census cells (attn_idx*8 + head*2 + side),
     // which stay clean fp16. n == 0 is the control arm (everything
@@ -298,7 +298,7 @@ class MetalEngine {
     void set_kv_attrib_except(const uint32_t* cells, size_t n);
     // True when Q27_METAL_KV_FP16_CELLS armed production fp16 exception
     // side caches on this engine. Snapshots carry the side rows (v2,
-    // docs/plans/2026-07-17-kv-except-snapshot-v2.md); the head masks are
+    // docs/metal/plans/2026-07-17-kv-except-snapshot-v2.md); the head masks are
     // the snapshot-config identity — a snapshot only restores into an
     // engine with the exact same cell list, and the server keys its disk
     // store off them so mismatched configs miss instead of rejecting.
@@ -353,7 +353,7 @@ class MetalEngine {
     uint8_t kv_attrib_masks_[16] = {};
     std::shared_ptr<BackendBuffer> kv_attrib_aux_;
     // Production KV fp16 exception cells
-    // (docs/plans/2026-07-17-kv-except-production.md): per masked head, a
+    // (docs/metal/plans/2026-07-17-kv-except-production.md): per masked head, a
     // kv_heads=1 fp16 side cache in the turbo3 WHT domain; the head's
     // query-head window is re-attended f16 against it, overwriting the
     // production dispatch's output rows. Parsed from

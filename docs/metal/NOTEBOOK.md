@@ -20,7 +20,7 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
 > envelope-gated against the serial walk (`build/q27-metal`,
 > `build/q27-metal-server`). CUDA remains the behavioral reference. Ternary
 > (T2, 7.15 GB) and official (17 GiB) tiers serve; binary B1 is quality-GO,
-> kernel-pending. See [`docs/METAL_PROGRESS.md`](docs/METAL_PROGRESS.md) —
+> kernel-pending. See [`docs/metal/METAL_PROGRESS.md`](docs/metal/METAL_PROGRESS.md) —
 > the "Current state" table there is the accurate summary; negative results
 > are recorded with mechanisms.
 

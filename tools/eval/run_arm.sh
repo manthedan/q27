@@ -1,6 +1,6 @@
 #!/bin/bash
 # Census capability spot-check — one arm's generation pass
-# (docs/plans/2026-07-17-census-capability-spotcheck.md).
+# (docs/metal/plans/2026-07-17-census-capability-spotcheck.md).
 #
 #   usage: run_arm.sh <arm-name> <base-url> <local-model-path> [outdir]
 #   e.g.:  run_arm.sh t2-base http://127.0.0.1:8213 models/ternary-bonsai-27b/ternary-bonsai-27b-t2.q27

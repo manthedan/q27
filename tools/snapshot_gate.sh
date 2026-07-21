@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Prefix-snapshot Phase 1 gates (docs/plans/2026-07-16-prefix-snapshots.md):
+# Prefix-snapshot Phase 1 gates (docs/metal/plans/2026-07-16-prefix-snapshots.md):
 # fresh-process byte identity for both KV dtypes, then the reject matrix
 # (truncated file, corrupted identity, wrong dtype, position > context),
 # then the crash-consistency legs (k3 audit B1/E2) driven by the engine's

@@ -51,7 +51,7 @@ reduction axis for every matmul weight in this model.
   512 consecutive weights = exactly 4 groups
 - produced losslessly (byte-copy of code bytes) from the PrismML fork's ggml type 42
   ("Q2_0", 34-byte `{fp16 d; u8 qs[32]}` blocks) — same within-byte order and decode
-  formula; see docs/plans/2026-07-14-ternary-tier.md for the authoritative source
+  formula; see docs/metal/plans/2026-07-14-ternary-tier.md for the authoritative source
   reading. Ternary packs quantize `token_embd`, `output`, `ssm_alpha`, `ssm_beta`
   ternary too (unlike the official-tier policy); norms/`ssm_a`/`ssm_dt.bias`/
   `ssm_conv1d` stay F32. No MTP layer (`blk.64.*`) and no `output_q4.weight` alias —
@@ -66,7 +66,7 @@ reduction axis for every matmul weight in this model.
 - effective 1.125 bpw; produced losslessly (byte-copy) from the PrismML fork's
   ggml type 41 ("Q1_0", 18-byte `{fp16 d; u8 qs[16]}` blocks) — layout read at
   source, tag prism-b9591-62061f9 (`dequantize_row_q1_0`); see
-  docs/plans/2026-07-15-binary-tier.md. Used by the dspark drafter pack
+  docs/metal/plans/2026-07-15-binary-tier.md. Used by the dspark drafter pack
   (`token_embd.weight` only) and by the full binary tier
   (`quant_policy: bonsai-b1-v1`): every Q1_0 tensor byte-copied, all other
   tensors must be F32 (repack.py hard-fails otherwise — there is no illegal
@@ -86,7 +86,7 @@ reduction axis for every matmul weight in this model.
   tag (`dequantize_row_q4_1`). Used by the dspark drafter pack: Q4_1 tensors
   byte-copied, `token_embd` B1_G128, BF16 heads widened exactly to F32, norms/
   biases F32; no `blk.64.*`, no `output_q4.weight` alias. See
-  docs/plans/2026-07-16-dspark-port-phase0.md for the drafter contract.
+  docs/metal/plans/2026-07-16-dspark-port-phase0.md for the drafter contract.
 
 ### T3_G128 (experimental, parked — no artifacts produced)
 - base-3 recode of T2: 5 codes per byte (`c0 + 3c1 + 9c2 + 27c3 + 81c4`,
@@ -94,7 +94,7 @@ reduction axis for every matmul weight in this model.
   125–127; slots 3–4 must be code 1), scales as T2. 1.75 bpw effective.
 - dtype id 5 is reserved and the Metal decode GEMV exists and is gated, but
   the Phase-0 bench killed the format on M4: decode-bound at ~50 GB/s vs
-  T2's ~95 (see docs/plans/2026-07-15-t3-packing.md). `tools/repack.py`
+  T2's ~95 (see docs/metal/plans/2026-07-15-t3-packing.md). `tools/repack.py`
   never emits it.
 
 ## Quant policy (v1)

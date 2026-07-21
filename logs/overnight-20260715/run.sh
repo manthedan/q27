@@ -1,7 +1,7 @@
 #!/bin/bash
 # Overnight vendor-stack batch — 2026-07-15, 24GB M4 (daily driver, user-authorized)
-# Batch A: binary-tier Phase 0A (docs/plans/2026-07-15-binary-tier.md)
-# Batch B: sibling-drafter probe Phase 0 (docs/plans/2026-07-15-sibling-drafter-probe.md)
+# Batch A: binary-tier Phase 0A (docs/metal/plans/2026-07-15-binary-tier.md)
+# Batch B: sibling-drafter probe Phase 0 (docs/metal/plans/2026-07-15-sibling-drafter-probe.md)
 # All model loads strictly serialized. Runs in their fork stack only — no q27 engine work.
 set -uo pipefail
 Q27=~/projects/q27

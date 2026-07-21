@@ -26,7 +26,7 @@ ELIGIBLE = {
 # fail the LIVE turn instead of forwarding it. Messages requests are therefore
 # dump-only (harvest for out-of-band prewarm) until the extractor is generalized
 # for the trailing-system shape. See
-# docs/plans/2026-07-17-experimental-harness-prefix-cache.md.
+# docs/metal/plans/2026-07-17-experimental-harness-prefix-cache.md.
 PREWARM_APIS = {"chat_completions", "responses"}
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",

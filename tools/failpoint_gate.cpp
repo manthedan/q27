@@ -1,5 +1,5 @@
 // Post-throw engine-state gate (k3 audit B2/E4, pre-registered in
-// docs/plans/2026-07-17-k3-audit-triage.md leg 4).
+// docs/metal/plans/2026-07-17-k3-audit-triage.md leg 4).
 //
 // The Q27_METAL_FAIL_FINISH countdown is read at the process's first
 // finish_command and fires ONCE, so a single armed process can observe the

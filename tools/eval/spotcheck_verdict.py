@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Census capability spot-check verdict
-(docs/plans/2026-07-17-census-capability-spotcheck.md). Stdlib only,
+(docs/metal/plans/2026-07-17-census-capability-spotcheck.md). Stdlib only,
 consumes SAVED generations — never runs a model.
 
 Reads per-arm generation files written by run_arm.sh

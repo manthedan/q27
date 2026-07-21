@@ -112,16 +112,16 @@ answers created.
 
 ## Reading order
 
-1. `docs/METAL_PROGRESS.md` — the ledger; the Current-state table at the
+1. `docs/metal/METAL_PROGRESS.md` — the ledger; the Current-state table at the
    top plus the last ~5 entries are the frontier.
-2. `docs/plans/2026-07-17-mixed-tier-census.md` — the grafting census:
+2. `docs/metal/plans/2026-07-17-mixed-tier-census.md` — the grafting census:
    pre-registration, grafting-vs-attribution caveat, ship bands, results
    (readout summary in the ledger's 2026-07-17 evening entry; full table
    publishing from the mini lane).
-3. `docs/plans/2026-07-16-dspark-port-phase0.md` — the parked drafter
+3. `docs/metal/plans/2026-07-16-dspark-port-phase0.md` — the parked drafter
    port: full contract, measured verdict, and the whitepaper
    reconciliation addendum.
-4. `docs/plans/2026-07-17-b1-select-round2.md` — the B1 kernel round and
+4. `docs/metal/plans/2026-07-17-b1-select-round2.md` — the B1 kernel round and
    the corrected cold-pack-paging diagnosis.
 5. `README.md` Speed/Server sections for the calibrated numbers;
    `docs/BENCHMARKING.md` for the CUDA-side methodology.

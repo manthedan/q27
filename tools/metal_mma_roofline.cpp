@@ -1,5 +1,5 @@
 // A/B/C MMA roofline — the one-day prefill-maturity decision
-// (docs/plans/2026-07-16-mma-roofline.md, round-3 Q1).
+// (docs/metal/plans/2026-07-16-mma-roofline.md, round-3 Q1).
 //
 // Closing the 48.79 -> 52.48 tok/s fork gap needs an 8.1% GEMM-kernel
 // speedup with GEMM at 94.3% of prefill GPU time. This tool measures, at
@@ -66,7 +66,7 @@ constexpr size_t N_SHAPES = sizeof(SHAPES) / sizeof(Shape);
 // per-tile char->half converts before any production pre-pass is built.
 // D = lever 1 direct-RHS probe (64x32 weight-staged tile, RHS read from
 // device via simdgroup_load, int8->half K-major pre-pass charged to the
-// arm; docs/plans/2026-07-16-lever1-direct-rhs.md).
+// arm; docs/metal/plans/2026-07-16-lever1-direct-rhs.md).
 enum Arm { C = 0, BEQ = 1, B = 2, A = 3, CX = 4, D = 5, D2 = 6, F = 7, K = 8, N_ARMS = 9 };
 const char* ARM_NAMES[N_ARMS] = {"C", "Beq", "B", "A", "Cx", "D", "D2", "F", "K"};
 static_assert(TRIALS % N_ARMS == 0,
@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
     printf("aggregate C/D2  (lever 1 quadrant map) : %.3f [%.3f, %.3f]  (incl. RHS pre-pass)\n",
            Rd2.mean, Rd2.lo, Rd2.hi);
     printf("aggregate C/F   (f16-accumulate probe) : %.3f [%.3f, %.3f]\n", Rf.mean, Rf.lo, Rf.hi);
-    // f16-acc kill line (docs/plans/2026-07-16-f16acc-probe.md, BaseRT
+    // f16-acc kill line (docs/metal/plans/2026-07-16-f16acc-probe.md, BaseRT
     // survey import #1): graduate/park on the 1.10 line, CB-sided.
     const char* fv =
         Rf.lo >= 1.10 ? "lower bound >= 1.10: GRADUATE — build the production trial behind Q27_METAL_GEMM_F16ACC + envelope pair"
@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
                       : "INCONCLUSIVE: CI straddles the 1.05 line — extend trials once before parking";
     printf("function-constant probe verdict (C/K): %s\n", kv2);
     if (X_ROWS <= 16) {
-        // Lever 1 decision (docs/plans/2026-07-16-lever1-direct-rhs.md):
+        // Lever 1 decision (docs/metal/plans/2026-07-16-lever1-direct-rhs.md):
         // verify-shape verdict on the lower 95% CB, park line 1.3x.
         const Stat best = Rd2.mean > Rd.mean ? Rd2 : Rd;
         const char* lv = best.lo >= 2.0 ? ">=2.0x: target met — integrate behind the verify path"

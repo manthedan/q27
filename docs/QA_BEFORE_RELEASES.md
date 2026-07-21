@@ -21,7 +21,7 @@ Box legend: **M4** = the 24 GB serving Mac (this repo's metal lane),
       (logs/q4port-20260717/COORDINATION.md — two OOM crashes proved why:
       never two 17 GB residents; pgrep+curl health-check before any
       server launch).
-- [ ] `docs/METAL_PROGRESS.md` chronicle current through HEAD (grep-count
+- [ ] `docs/metal/METAL_PROGRESS.md` chronicle current through HEAD (grep-count
       each new entry's headline == 1 after any merge).
 
 ## 1. Build + unit (M4, ~5 min)

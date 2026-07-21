@@ -1,6 +1,6 @@
 #!/bin/bash
 # Live gates for the /v1/responses full parity port + error-class split
-# (docs/plans/2026-07-17-responses-parity-residue.md). Runs against an
+# (docs/metal/plans/2026-07-17-responses-parity-residue.md). Runs against an
 # already-running q27-metal-server; greedy; contention-tolerant (no timing).
 #   usage: tools/responses_parity_gate.sh [base-url]   (default http://127.0.0.1:8213)
 set -u

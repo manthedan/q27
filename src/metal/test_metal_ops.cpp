@@ -617,7 +617,7 @@ int test_attention_gqa_path() {
     return failures;
 }
 
-// KV fp16 exception window entries (docs/plans/2026-07-17-kv-except-production.md,
+// KV fp16 exception window entries (docs/metal/plans/2026-07-17-kv-except-production.md,
 // pre-registered gate 2). Three independent checks: (a) the head-rows side
 // store copies exactly one head's slice out of the packed staging layout
 // (exact — it is a float->half cast copy); (b) the decode window dispatch
@@ -933,7 +933,7 @@ int test_attention_gqa_tiled_parity() {
 // the exact top-k (value desc, index asc tie-break), stay within capacity
 // on realistic logits, and signal fallback (count > capacity) on
 // degenerate tie storms.
-// fp8-KV control arm (docs/plans/2026-07-17-fp8-kv-control.md): the attrib
+// fp8-KV control arm (docs/metal/plans/2026-07-17-fp8-kv-control.md): the attrib
 // store's mode 4 must land every value on the OCP e4m3 grid with true RNE,
 // subnormals at 2^-9, and +-448 saturation — on BOTH sides. Golden cases
 // pin the tie/boundary behavior by hand; a CPU mirror sweeps the rest.

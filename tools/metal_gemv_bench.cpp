@@ -489,7 +489,7 @@ void build_q_synth(q27::MetalBackend& backend, const Shape& s, uint32_t seed,
 }
 
 // With q4_candidate set (--q4-candidate N, the Q4 rewrite-round arms,
-// docs/plans/2026-07-17-q4-rewrite-round.md), the Q4_G64 shapes (candidates
+// docs/metal/plans/2026-07-17-q4-rewrite-round.md), the Q4_G64 shapes (candidates
 // 2-3), the Q8 shapes (candidate 4), or all shapes (candidate 1 = production
 // through the probe path, A/B parity) run matvec_q4_probe instead of the
 // production dispatch; the ffn sibling pair runs as two probe singles (the

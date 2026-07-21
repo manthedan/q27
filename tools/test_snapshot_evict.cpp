@@ -1,4 +1,4 @@
-// T1 gate G1 (docs/plans/2026-07-18-t1-snapshot-eviction-classes.md):
+// T1 gate G1 (docs/metal/plans/2026-07-18-t1-snapshot-eviction-classes.md):
 // spine-vs-leaf eviction ORDERING, offline — no model, no GPU, no server.
 // This box holds exactly one resident model, so the ordering logic lives in
 // header-only snapshot_evict.h and is tested here against synthetic inputs.

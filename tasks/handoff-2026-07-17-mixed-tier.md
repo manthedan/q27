@@ -1,9 +1,9 @@
 # Handoff — mixed-tier census → ship gates (2026-07-17, mini)
 
-Read this + `docs/plans/2026-07-17-mixed-tier-census.md` (the plan doc is the
+Read this + `docs/metal/plans/2026-07-17-mixed-tier-census.md` (the plan doc is the
 authoritative record; its RESULTS / combo / original ship-gate sections are
 complete). Later expert-review amendments add A5/A6 and product gates before
-any serving claim; `docs/HANDOFF-2026-07-17.md` is the newer global handoff.
+any serving claim; `docs/metal/HANDOFF-2026-07-17.md` is the newer global handoff.
 
 ## Where things stand
 

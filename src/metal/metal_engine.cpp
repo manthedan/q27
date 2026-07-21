@@ -96,7 +96,7 @@ void MetalEngine::validate_architecture() const {
     const std::string policy = meta.value("quant_policy", std::string());
     const bool ternary = policy == "bonsai-t2-v1";
     const bool binary = policy == "bonsai-b1-v1";
-    // Mixed-tier census packs (docs/plans/2026-07-17-mixed-tier-census.md,
+    // Mixed-tier census packs (docs/metal/plans/2026-07-17-mixed-tier-census.md,
     // tools/q27_mix.py): per-tensor T2/B1 routing over the same bonsai
     // shape. Both tiers' layout declarations are demanded below.
     const bool mixed = policy == "bonsai-mixed-v1";
@@ -315,7 +315,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     const uint64_t partial_bytes =
         gqa_partial_peak(max_context_, backend_.gqa_block_size(), chunk_capable);
     // Production KV fp16 exception cells
-    // (docs/plans/2026-07-17-kv-except-production.md): parse the env once
+    // (docs/metal/plans/2026-07-17-kv-except-production.md): parse the env once
     // here so the side-cache bytes join the same reservation. Cells use
     // census numbering (attn_idx*8 + head*2 + side); v1 requires a head's K
     // and V cells together (step 4b: K alone retains nothing, V alone
@@ -758,7 +758,7 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
     position_=snapshot.position;
 }
 
-// ---- Prefix snapshots to disk (docs/plans/2026-07-16-prefix-snapshots.md).
+// ---- Prefix snapshots to disk (docs/metal/plans/2026-07-16-prefix-snapshots.md).
 // Format Q27SNAP1 (LE): magic, artifact identity (file size + SHA1 of the
 // first 64 KB), kv dtype, position, token metadata, then length-prefixed
 // blobs in capture_state() order. Plain read/write, never mmap.
@@ -1506,7 +1506,7 @@ void MetalEngine::gdn_replay(uint32_t count) {
 }
 
 // K chained greedy steps in one command buffer: each step's embedding reads
-// the token id the previous argmax wrote (docs/plans/2026-07-15-resident-greedy.md),
+// the token id the previous argmax wrote (docs/metal/plans/2026-07-15-resident-greedy.md),
 // and an in-batch copy archives every id into token_ring_ for one readback.
 // Refuses to run under an active tool constraint — grammar feeding is a
 // host-per-token loop by construction.

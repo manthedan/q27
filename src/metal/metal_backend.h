@@ -69,7 +69,7 @@ class MetalBackend final : public ComputeBackend {
                       const BackendBuffer& w_or_seed, const BackendBuffer* w_scales,
                       const BackendBuffer* x, const BackendBuffer* x_scales,
                       BackendBuffer& y);
-    // B1 Phase 0B probe (bench-only, docs/plans/2026-07-15-binary-tier.md):
+    // B1 Phase 0B probe (bench-only, docs/metal/plans/2026-07-15-binary-tier.md):
     // candidate 1 select / 2 sign-XOR / 3 int8 bitplane+popcount, raw
     // buffers, no DType. Candidate 3 dispatches its activation preprocess
     // (int8 quantize + bitplane transpose + group sums) before the dot, so
@@ -199,7 +199,7 @@ class MetalBackend final : public ComputeBackend {
     void kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer& v,
                            BackendBuffer& k_cache, BackendBuffer& v_cache,
                            uint32_t position, uint32_t row_length, uint32_t tokens) override;
-    // KV fp16 exception cells (docs/plans/2026-07-17-kv-except-production.md),
+    // KV fp16 exception cells (docs/metal/plans/2026-07-17-kv-except-production.md),
     // Metal-only concrete entries (not on the ComputeBackend interface): copy
     // one head's K/V rows into a kv_heads=1 fp16 side cache, and re-run f16
     // attention over that head's query-head window against the side cache,
@@ -245,7 +245,7 @@ class MetalBackend final : public ComputeBackend {
                                  float scale, BackendBuffer* partials) override;
     // Phase-0 probes for cache-block scheduling R1/R1b — bench-only entry
     // points (build/metal_attn_bench), never engine-routed; see
-    // docs/plans/2026-07-15-cache-block-scheduling.md. k/v caches hold rows
+    // docs/metal/plans/2026-07-15-cache-block-scheduling.md. k/v caches hold rows
     // head-major: (kvh * seq_cap + pos) * 100 bytes.
     // Probe entries always run blocked, so partials is required (callers are
     // benches; they allocate their own scratch sized for their sweep).
@@ -288,7 +288,7 @@ class MetalBackend final : public ComputeBackend {
     // Effective causal-GQA block size (Q27_METAL_GQA_BLOCK or 1024): engines
     // size their per-engine partials buffer from it at construction.
     uint32_t gqa_block_size() const;
-    // Envelope-instrument hooks (docs/plans/2026-07-16-envelope-instrument.md):
+    // Envelope-instrument hooks (docs/metal/plans/2026-07-16-envelope-instrument.md):
     // flip the backend-global reduction-order knobs between two engines'
     // lockstep passes. Instrument use only — production reads the env once.
     // CONTRACT: these are BACKEND-scoped, not per-engine. Engines sharing

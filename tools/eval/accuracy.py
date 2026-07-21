@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Gold-accuracy driver for the capability spot-check set
-(docs/plans/2026-07-19-task-level-suite-mixed-packs.md). Stdlib only,
+(docs/metal/plans/2026-07-19-task-level-suite-mixed-packs.md). Stdlib only,
 consumes SAVED per-arm generation JSONL written by run_arm.sh
 (<dir>/<arm>.<mode>.jsonl, rows {"id","prompt_id","text"}) and scores each
 row against the gold answer in tools/eval/prompts/<mode>.jsonl using the

@@ -1,5 +1,5 @@
 // Phase-0 synthetic deep-KV attention benchmark (cache-block scheduling,
-// docs/plans/2026-07-15-cache-block-scheduling.md).
+// docs/metal/plans/2026-07-15-cache-block-scheduling.md).
 //
 // Measures the GQA attention dispatch cost at depth against synthetic KV
 // caches — no model, memory-safe — separating the decode grid from the

@@ -1,7 +1,7 @@
 # B1 select kernel round 2 — pre-registration (2026-07-17)
 
 The one kernel look funded by Phase 0A-q27's decode-economics leg
-(docs/plans/2026-07-15-binary-tier.md RESULTS: artifact decode 17.28/17.09
+(docs/metal/plans/2026-07-15-binary-tier.md RESULTS: artifact decode 17.28/17.09
 tok/s = CONDITIONAL band; resident ceiling 19.39 tok/s at 69.9 GB/s vs T2's
 same-bench 11.54 at 78.5 — the select kernel streams at 0.89 of T2's rate).
 The operator's go 2026-07-17 ("let's work on 3" on the post-census queue).

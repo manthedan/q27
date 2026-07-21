@@ -1,6 +1,6 @@
 #!/bin/bash
 # Pre-registered Q4 half-GEMM ship-line bench, serverless variant
-# (docs/plans/2026-07-17-t2-prefill-throughput.md, "Q4/Q8 chunk-GEMM
+# (docs/metal/plans/2026-07-17-t2-prefill-throughput.md, "Q4/Q8 chunk-GEMM
 # schedule port"). The standing watcher (tools/quiet_q4_bench.sh) hard-requires
 # a canonical T2 server to stop/restore; since 2026-07-18 there is no live
 # pi traffic and no resident server, so the service lifecycle is moot. This

@@ -9,10 +9,10 @@ Usage:
 
 Ternary source packs (PrismML fork "Q2_0", ggml type 42) are detected
 automatically and repacked losslessly to T2_G128 (quant_policy bonsai-t2-v1);
-see docs/FORMAT.md and docs/plans/2026-07-14-ternary-tier.md for the encoding.
+see docs/FORMAT.md and docs/metal/plans/2026-07-14-ternary-tier.md for the encoding.
 Binary source packs (fork "Q1_0", ggml type 41, non-dspark arch) likewise
 repack losslessly to B1_G128 (quant_policy bonsai-b1-v1);
-see docs/plans/2026-07-15-binary-tier.md.
+see docs/metal/plans/2026-07-15-binary-tier.md.
 """
 import argparse
 import json

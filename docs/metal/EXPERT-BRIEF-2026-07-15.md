@@ -41,11 +41,11 @@ the progress ledgers double as lab notebooks.
 ## Reading order (key docs)
 
 1. `README.md` — project overview and headline results.
-2. `docs/METAL_PROGRESS.md` — **the Metal ledger**; the last ~10 entries are
+2. `docs/metal/METAL_PROGRESS.md` — **the Metal ledger**; the last ~10 entries are
    the current frontier. Best single document for state.
-3. `docs/plans/2026-07-14-ternary-tier.md` — the ternary tier end-to-end
+3. `docs/metal/plans/2026-07-14-ternary-tier.md` — the ternary tier end-to-end
    (motivation, format, kernels, gates, whitepaper follow-ups).
-4. `docs/plans/2026-07-15-ds4-survey.md` — our analysis of ds4's Metal
+4. `docs/metal/plans/2026-07-15-ds4-survey.md` — our analysis of ds4's Metal
    engine vs ours, leverage-ranked; doubles as our near-term Metal roadmap.
 5. Active plan docs (all `docs/plans/2026-07-15-*`): `binary-tier`,
    `t3-packing`, `cache-block-scheduling`, `metal-multislot`,

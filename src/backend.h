@@ -247,7 +247,7 @@ class ComputeBackend {
     // head = UINT32_MAX round-trips every head of the selected side; a
     // specific head narrows attribution to one (layer is the caller's cut).
     // flags/scale_off/aux: step-2 scaling arms and the per-feature stats
-    // pass (docs/plans/2026-07-16-kv-codec-step2.md). aux may be null when
+    // pass (docs/metal/plans/2026-07-16-kv-codec-step2.md). aux may be null when
     // flags need no buffer.
     virtual void kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
                                           BackendBuffer& k_cache, BackendBuffer& v_cache,
@@ -260,7 +260,7 @@ class ComputeBackend {
     }
     // partials: caller-owned scratch for the blocked-GQA softmax partials
     // (engines allocate it once at construction, sized for their own
-    // max context — docs/plans/2026-07-17-metal-review-triage.md E2). May
+    // max context — docs/metal/plans/2026-07-17-metal-review-triage.md E2). May
     // be null only when the call cannot route to the blocked kernels.
     virtual void attention_f16_causal(const BackendBuffer& q, uint32_t q_stride,
                                       uint32_t q_row_stride, const BackendBuffer& k_cache,

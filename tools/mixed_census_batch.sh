@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Mixed weight-tier census batch (docs/plans/2026-07-17-mixed-tier-census.md):
+# Mixed weight-tier census batch (docs/metal/plans/2026-07-17-mixed-tier-census.md):
 # baselines (all-B1, all-T2) then one class-flip arm at a time — build the
 # mixed pack with q27_mix.py, validate, 8K wikitext NLL, DELETE the pack
 # (13 GiB free on the mini; one arm pack exists at any moment). Resumable:

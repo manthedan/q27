@@ -593,7 +593,7 @@ struct JsonSanitizerStepper {
 };
 
 // Incremental tool-call argument streamer (pre-registered:
-// docs/plans/2026-07-17-incremental-tool-call-streaming.md). Shares the
+// docs/metal/plans/2026-07-17-incremental-tool-call-streaming.md). Shares the
 // mode-5/10 drift semantics of JsonSanitizerStepper but deliberately keeps
 // its OWN loop: it is STREAMING (no full buffer for quote_terminates_string
 // lookahead — it holds a quote for a one-byte lookahead instead) and adds

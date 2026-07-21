@@ -1,4 +1,4 @@
-# Metal audit (docs/metal-review-2026-07-17.md) — source-verified triage
+# Metal audit (docs/metal/metal-review-2026-07-17.md) — source-verified triage
 
 Reviewed 2026-07-16 night against the live tree (the audit is fresh — it
 covers `q27_b1_x_prep`, landed the same evening in e94e1cf). House rule

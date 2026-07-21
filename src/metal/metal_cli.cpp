@@ -316,7 +316,7 @@ int main(int argc, char** argv) {
             if (kl_kv || chunk_parity || turbo3_kv || serial_prefill || !dump_logits.empty())
                 throw std::runtime_error("--envelope is its own instrument; drop --kl-kv/--chunk-parity/--kv turbo3/--prefill serial/--dump-logits");
         }
-        // Prefix snapshots, Phase 1 (docs/plans/2026-07-16-prefix-snapshots.md):
+        // Prefix snapshots, Phase 1 (docs/metal/plans/2026-07-16-prefix-snapshots.md):
         // greedy serial generation only — every excluded mode either mutates
         // state the snapshot doesn't describe (speculative) or changes the
         // continuation (sampling), which would make the byte-identity gate
@@ -598,7 +598,7 @@ int main(int argc, char** argv) {
         }
 
         if (!envelope_mode.empty()) {
-            // Envelope instrument (docs/plans/2026-07-16-envelope-instrument.md):
+            // Envelope instrument (docs/metal/plans/2026-07-16-envelope-instrument.md):
             // two engines, one mapping, teacher-forced in lockstep; the mode
             // picks the same-model reduction-order pair. Metrics per Q6:
             // whole-vocab max|d|/RMS as diagnostics, KL, top-1 flips with
@@ -770,7 +770,7 @@ int main(int argc, char** argv) {
             if (!kv_stats_out.empty()) subject.set_kv_attrib_stats();
             if (!kv_rt_feature.empty()) {
                 // Stats file -> clamped per-feature RMS scales (step 2,
-                // docs/plans/2026-07-16-kv-codec-step2.md): s >= 1e-3 x the
+                // docs/metal/plans/2026-07-16-kv-codec-step2.md): s >= 1e-3 x the
                 // side's mean RMS so dead features cannot explode the arm.
                 FILE* sf = fopen(kv_rt_feature.c_str(), "rb");
                 if (!sf) throw std::runtime_error("cannot open stats file: " + kv_rt_feature);
@@ -1272,7 +1272,7 @@ int main(int argc, char** argv) {
             return ok ? 0 : 1;
         }
 
-        // Gate 0 oracle verifier (docs/plans/2026-07-15-sibling-drafter-probe.md):
+        // Gate 0 oracle verifier (docs/metal/plans/2026-07-15-sibling-drafter-probe.md):
         // can batched verification pay AT ALL on this hardware? Replay a known
         // greedy continuation as free draft proposals (D=0, perfect acceptance)
         // through the batched verify rounds and price them against the

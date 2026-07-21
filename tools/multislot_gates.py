@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multislot Phase 1 gates G1/G2/G3/G5 (docs/plans/2026-07-15-multislot-phase1.md).
+"""Multislot Phase 1 gates G1/G2/G3/G5 (docs/metal/plans/2026-07-15-multislot-phase1.md).
 
 Starts the Metal server with --slots 2 and checks:
   G2  determinism: the same greedy request returns byte-identical text when

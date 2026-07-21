@@ -1,4 +1,4 @@
-// T1 gate G3 (docs/plans/2026-07-18-t1-snapshot-eviction-classes.md):
+// T1 gate G3 (docs/metal/plans/2026-07-18-t1-snapshot-eviction-classes.md):
 // the decision number, OFFLINE — drive the REAL DiskSnapshotStore::
 // evict_past_budget over a fabricated directory that mirrors the recorded
 // pi session, both pin directions. No model, no GPU, no server (this box

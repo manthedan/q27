@@ -3,7 +3,7 @@
 # One process per cell: quantize exactly one (attention layer, KV head, K|V)
 # cell through the turbo3 round-trip, 2,048 wikitext2 positions vs the fp16
 # baseline. cell id = attn_idx*8 + head*2 + side (side 0=K, 1=V).
-# ~2.5 min/cell => ~5.3 h. Plan: docs/plans/2026-07-16-kv-codec-census.md
+# ~2.5 min/cell => ~5.3 h. Plan: docs/metal/plans/2026-07-16-kv-codec-census.md
 set -u
 cd "$(dirname "$0")/.."
 

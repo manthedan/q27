@@ -14,7 +14,7 @@ further along. This doc is the queue so nothing is lost in the meantime.
 2. **README width note for 24 GB cards** — the default `Q27_W_MAX=12`
    graph zoo (~2.7 GB) does not fit a 3090 next to the 17.7 GB weights
    (dies in `cudaGraphInstantiate`); `-DQ27_W_MAX=8` fits with ~0.9 GB
-   headroom. Evidence: `docs/plans/2026-07-16-3090-graph-oom.md`
+   headroom. Evidence: `docs/metal/plans/2026-07-16-3090-graph-oom.md`
    (per-family attribution, both widths measured on yukon). One
    paragraph + maybe a Makefile comment.
 3. **`Q27_GRAPH_TRACE=1` instrument** (optional, offer-not-push) —

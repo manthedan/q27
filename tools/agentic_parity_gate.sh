@@ -1,6 +1,6 @@
 #!/bin/bash
 # Live gates for the Metal server agentic-parity round
-# (docs/plans/2026-07-17-metal-agentic-parity.md). Runs against an already-
+# (docs/metal/plans/2026-07-17-metal-agentic-parity.md). Runs against an already-
 # running q27-metal-server; greedy decode; contention-tolerant (no timing).
 #   usage: tools/agentic_parity_gate.sh [base-url]   (default http://127.0.0.1:8213)
 set -u

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Production-domain exception sweep (docs/plans/2026-07-17-kv-except-production.md,
+# Production-domain exception sweep (docs/metal/plans/2026-07-17-kv-except-production.md,
 # gate-3 FAIL follow-up): which attention layer's head-pairs, protected in
 # PRODUCTION (Q27_METAL_KV_FP16_CELLS), kill the pos-1000 tail event? The
 # attrib-derived list did not transfer at the knife-edge (l7h1: attrib

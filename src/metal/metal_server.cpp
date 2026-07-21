@@ -205,7 +205,7 @@ std::string text_content(const json& content) {
 // speaks openai-completions, so this endpoint must round-trip tool traffic —
 // assistant.tool_calls arrays and role:"tool" results are reconstructed to
 // the model's <tool_call>/<tool_response> markers (agentic-parity round,
-// docs/plans/2026-07-17-metal-agentic-parity.md).
+// docs/metal/plans/2026-07-17-metal-agentic-parity.md).
 std::vector<q27::Msg> openai_msgs(const json& body) {
     std::vector<q27::Msg> msgs;
     if(body.contains("system")) {
@@ -749,7 +749,7 @@ struct Runtime {
         if(slots.front()->engine.kv_fp16_except())
             fprintf(stderr,"q27 Metal server: KV exception cells active (Q27_METAL_KV_FP16_CELLS, side codec %s); side caches ride prefix/disk snapshots (v2)\n",
                     slots.front()->engine.kv_side_codec()?"e4m3":"fp16");
-        // G6 admission (docs/plans/2026-07-16-g6-admission.md): additional
+        // G6 admission (docs/metal/plans/2026-07-16-g6-admission.md): additional
         // slots must fit the FULL per-slot footprint — KV + this slot's own
         // GQA partials (per-engine since audit E2, charged inside
         // kv_reserved_bytes) + fixed engine state + snapshot capacity x
@@ -872,7 +872,7 @@ struct Runtime {
                 fprintf(stderr,"prefix-snapshots: WARNING — no chunked prefill on this device; "
                         "\"snapshot\" hints are ignored (loads still served)\n");
             // Auto-snapshot threshold (2026-07-17 T2 prefill finding,
-            // docs/plans/2026-07-17-t2-prefill-throughput.md): chunked
+            // docs/metal/plans/2026-07-17-t2-prefill-throughput.md): chunked
             // prefill is compute-mature at ~28-40 tok/s on the M4, so a
             // large agentic prompt (pi ~8.4K tokens, CC larger) costs
             // minutes of TTFT — and real agent clients never send the
@@ -2089,7 +2089,7 @@ int main(int argc,char** argv) {
 
         // ---- OpenAI /v1/chat/completions ----
         // Structured tool traffic both directions (agentic-parity round,
-        // docs/plans/2026-07-17-metal-agentic-parity.md): incoming
+        // docs/metal/plans/2026-07-17-metal-agentic-parity.md): incoming
         // assistant.tool_calls / role:"tool" via openai_msgs above; outgoing
         // <tool_call> segments become message.tool_calls (non-streaming) or
         // one delta.tool_calls chunk per call (streaming) with finish_reason

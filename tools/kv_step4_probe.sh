@@ -1,6 +1,6 @@
 #!/bin/zsh
 # KV-codec step 4 probe: joint 4-cell hold-out arms
-# (docs/plans/2026-07-17-kv-codec-step4-probe.md). Arm A control (mode 3,
+# (docs/metal/plans/2026-07-17-kv-codec-step4-probe.md). Arm A control (mode 3,
 # empty mask) then arm B probe (census cells 10,11,125,127 held fp16),
 # 8,191 positions each at the step-1/2 corpus config.
 set -u

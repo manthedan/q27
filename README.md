@@ -93,7 +93,7 @@ they are.
   for your Mac** — the M-chip speed table, the quant×context memory-fit
   table, and the recommendation guide behind `q27 recommend`. Start here as
   a user.
-- [docs/METAL_PROGRESS.md](docs/METAL_PROGRESS.md): the Metal ledger,
+- [docs/metal/METAL_PROGRESS.md](docs/metal/METAL_PROGRESS.md): the Metal ledger,
   with a maintained **Current state** table on top of an append-only
   dated chronicle. Start here for the Apple Silicon side.
 - [docs/BUILDLOG.md](docs/BUILDLOG.md): the CUDA build log (P0–P9).
@@ -106,7 +106,7 @@ they are.
 - [docs/SPEC.md](docs/SPEC.md): per-layer forward-pass semantics.
 - [docs/plans/](docs/plans/): pre-registered experiment plans, each with
   gates and kill lines and with results appended below the line.
-- [docs/NOTEBOOK.md](docs/NOTEBOOK.md): the scratch pad this README used
+- [docs/metal/NOTEBOOK.md](docs/metal/NOTEBOOK.md): the scratch pad this README used
   to be, preserving upstream's working notes, performance model, risk
   register, and progress logs verbatim. No longer maintained.
 
@@ -151,7 +151,7 @@ mixed-graft thesis is now **permanently closed**: the gdn_pair rescue
 exonerated the pack (the repetition loop was a serving-binary artifact),
 and A5-on-gdn_pair KILLED the strongest arm on both corpora. History and
 the negative result are recorded in
-[`docs/plans/2026-07-17-mixed-tier-census.md`](docs/plans/2026-07-17-mixed-tier-census.md).
+[`docs/metal/plans/2026-07-17-mixed-tier-census.md`](docs/metal/plans/2026-07-17-mixed-tier-census.md).
 
 Verify every download against its `CHECKSUMS.md5`. The fine-tune variant
 of the official model is `signalnine/Qwopus3.6-27B-v2-MTP-q27`.

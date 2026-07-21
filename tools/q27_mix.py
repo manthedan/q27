@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Assemble a mixed-tier q27 pack from two compatible Bonsai containers.
 
-Mixed weight-tier census (docs/plans/2026-07-17-mixed-tier-census.md):
+Mixed weight-tier census (docs/metal/plans/2026-07-17-mixed-tier-census.md):
 every tensor comes from the BASE pack except those matching --take, which
 come from the DONOR pack. The packs are architecture-compatible Bonsai
 siblings; this is a pure byte-level reassembly — no quantization runs.
