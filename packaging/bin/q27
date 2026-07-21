@@ -221,15 +221,14 @@ cmd_agent() {
     if [ -n "${Q27_AGENT_SEED:-}" ]; then
         sample_args+=(--seed "$Q27_AGENT_SEED")
     fi
-    # MTP free-decode: when sampling is on, default --mtp 4 so rejection
-    # accept can break greedy argmax loops (still serial under tool masks).
-    # Explicit Q27_AGENT_MTP=0 disables; Q27_AGENT_MTP=N overrides width.
-    # Without temperature, leave MTP off unless the operator sets it (keeps
-    # historical greedy bitwise path).
+    # MTP: default --mtp 4 only for positive temperature (sampled free-decode
+    # / fenced-body speed). Explicit Q27_AGENT_MTP always wins (0 disables).
+    # temperature=0 must not enable greedy MTP — keeps historical path (P2).
     local mtp_args=()
     if [ -n "${Q27_AGENT_MTP:-}" ]; then
         mtp_args+=(--mtp "$Q27_AGENT_MTP")
-    elif [ -n "${Q27_AGENT_TEMPERATURE:-}" ]; then
+    elif [ -n "${Q27_AGENT_TEMPERATURE:-}" ] && \
+         [ "$(printf '%s\n' "$Q27_AGENT_TEMPERATURE" | awk '{print ($1+0)>0}')" = "1" ]; then
         mtp_args+=(--mtp 4)
     fi
     echo "q27 agent: pack=$n context=$context workspace=$workspace" >&2

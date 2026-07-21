@@ -736,19 +736,24 @@ extern "C" q27_agent_status q27_agent_generate(
             }
 
             const uint32_t remaining = max_tokens - produced;
-            // Free-decode MTP only: active tool masks require serial sample
-            // so constrained logits stay fail-closed (server same rule).
+            // MTP only when tool grammar cannot open/close mid-burst:
+            // active masks need serial sample (fail-closed), and an *enabled*
+            // constrainer can still engage on free text — a multi-token MTP
+            // draft would select unconstrained tokens after `<tool_call>`.
+            // After body-tool close, awaiting_fenced_body disables engage so
+            // MTP is safe for long fenced payloads. Matches metal_server's
+            // "no MTP under tool constraint" boundary (codex P1).
             const bool tools_masking =
                 constrainer.has_value() && constrainer->active;
+            const bool tools_may_engage =
+                constrainer.has_value() && constrainer->enabled &&
+                !awaiting_fenced_body;
             const bool can_mtp =
                 live_width >= 2 && engine->session->has_mtp() &&
                 engine->session->chunked_prefill() && remaining >= 2 &&
-                !tools_masking && !sample_plain;
+                !tools_masking && !tools_may_engage && !sample_plain;
 
             if (can_mtp) {
-                // Drain the full committed burst before stopping. mtp_* already
-                // advanced Metal over `encoded` rows; skipping a trailing
-                // token would desync the session ledger from position_.
                 std::vector<uint32_t> committed;
                 const uint32_t pos_before = engine->session->position();
                 uint32_t next_pending;
@@ -779,7 +784,6 @@ extern "C" q27_agent_status q27_agent_generate(
                         if (output_tokens) *output_tokens = produced;
                         return cancelled();
                     }
-                    if (er == 1) stop_after_burst = true;
                     if (!engine->agent_session.record_emitted(tok))
                         throw std::runtime_error(
                             "agent session emitted-token mismatch");
@@ -793,6 +797,22 @@ extern "C" q27_agent_status q27_agent_generate(
                         if (!engine->agent_session.mark_pending_encoded())
                             throw std::runtime_error(
                                 "agent session token-step mismatch");
+                    }
+                    // Non-body tool close: stop at the closing token like the
+                    // serial path. Do not stream post-</tool_call> junk from
+                    // the rest of the burst (parser rejects it). Any already-
+                    // encoded trailing Metal rows desync the ledger — drop
+                    // reuse fail-closed (codex P1).
+                    if (er == 1 && call_closed && !awaiting_fenced_body) {
+                        if (i + 1 < committed.size())
+                            engine->agent_session.invalidate();
+                        stop_after_burst = true;
+                        break;
+                    }
+                    if (er == 1) {
+                        // max_tokens (or body-tool path): drain remaining so
+                        // encoded rows stay ledger-aligned when possible.
+                        stop_after_burst = true;
                     }
                     if (!alive(opaque)) {
                         if (output_tokens) *output_tokens = produced;

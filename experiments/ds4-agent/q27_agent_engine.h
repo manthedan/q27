@@ -48,10 +48,10 @@ q27_agent_engine *q27_agent_engine_open(const char *model_path,
                                          uint32_t context,
                                          char *error, size_t error_cap);
 void q27_agent_engine_close(q27_agent_engine *engine);
-// MTP draft width for free-decode quanta (0 = serial only). Values 2..12
-// enable greedy mtp_round (temp==0) or mtp_sample_round (temp>0) when the
-// artifact has an MTP layer and tool grammar is not actively masking. Tool-
-// constrained tokens stay serial so masks remain fail-closed.
+// MTP draft width (0 = serial only). Values 2..12 enable greedy mtp_round
+// (temp==0) or mtp_sample_round (temp>0) when the artifact has an MTP layer
+// and tool grammar cannot engage mid-burst. Tool-enabled free text and
+// active masks stay serial so JSON stays fail-closed.
 void q27_agent_engine_set_mtp_width(q27_agent_engine *engine, uint32_t width);
 uint32_t q27_agent_engine_mtp_width(const q27_agent_engine *engine);
 q27_agent_status q27_agent_engine_tokenizer_sha1(
@@ -67,8 +67,10 @@ q27_agent_status q27_agent_engine_tokenizer_sha1(
 // fail-closed). Body tools (write/overwrite/edit/edit_selection) continue
 // free-decoding after </tool_call> so a same-turn markdown-fenced body can
 // follow. When mtp_width>=2 and the pack has MTP, free-decode quanta use
-// batched MTP (rejection-sampled accept under temperature>0) — the product
-// lever against greedy argmax loops; active tool masks force serial sample.
+// batched MTP (rejection-sampled accept under temperature>0) only while tool
+// grammar cannot engage — serial for tool-enabled free text (fail-closed),
+// MTP again for fenced-body free-decode after body tools. Sampling is the
+// primary loop-break; MTP is opportunistic speed on safe free text.
 // eos_reached distinguishes a natural complete response (including
 // EOS as the next token at the exact bound) from max-token/tool-call
 // termination. Conservative empty-decode, whitespace-run, identical-token,
