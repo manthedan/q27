@@ -60,6 +60,11 @@ export Q27_AGENT_WORKSPACE="$TMP/work space"
 export Q27_AGENT_MAX_TOKENS=77
 export Q27_AGENT_SESSION="$TMP/session file.q27agent"
 export Q27_RUN_DIR="$TMP/run"
+# Deterministic sampling baseline: the operator's ambient Q27_AGENT_* sampling
+# vars must not leak into these scenarios (the bonsai soft-default keys off
+# whether Q27_AGENT_TEMPERATURE is SET, so a stray export inverts the policy).
+unset Q27_AGENT_TEMPERATURE Q27_AGENT_TOP_P Q27_AGENT_TOP_K Q27_AGENT_SEED \
+      Q27_AGENT_MTP
 lock_available() {
     "$PYTHON" - "$Q27_RUN_DIR/consumer.lock" <<'PY'
 import fcntl, os, sys
@@ -112,9 +117,31 @@ $TMP/home/b1/model.tok
 $TMP/work space
 --session
 $TMP/session file.q27agent
+--temperature
+0.6
+--top-p
+0.95
+--top-k
+20
 --no-think
 EOF
 diff -u "$TMP/expected" "$TMP/args"
+# b1 is bonsai-b1-v1: the pack-split soft-default must fire when
+# Q27_AGENT_TEMPERATURE is unset, and the stderr hint must name the escape.
+grep -q 'bonsai default; Q27_AGENT_TEMPERATURE=0 for greedy' "$TMP/stderr" || {
+    echo "FAIL: bonsai soft-default hint missing from stderr" >&2; exit 1; }
+
+# Greedy escape: explicit TEMPERATURE=0 passes --temperature 0 with NO
+# top-p/top-k companions (stays on the binary's pure-argmax path).
+Q27_CAPTURE="$TMP/args-greedy" Q27_CAPTURE_PID="$TMP/consumer-pid-greedy" \
+    Q27_AGENT_TEMPERATURE=0 PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" agent b1 --no-think \
+    >"$TMP/stdout-greedy" 2>"$TMP/stderr-greedy"
+grep -A1 '^--temperature$' "$TMP/args-greedy" | grep -qx '0' || {
+    echo "FAIL: TEMPERATURE=0 escape did not pass --temperature 0" >&2; exit 1; }
+if grep -q '^--top-p$' "$TMP/args-greedy"; then
+    echo "FAIL: TEMPERATURE=0 escape added top-p companions" >&2; exit 1
+fi
 [ ! -s "$TMP/stdout" ] || {
     echo "FAIL: supervisor banner polluted agent stdout" >&2; exit 1; }
 grep -q '^q27 agent: pack=b1 context=1234 workspace=' "$TMP/stderr"
