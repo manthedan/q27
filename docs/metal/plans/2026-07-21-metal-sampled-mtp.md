@@ -208,7 +208,7 @@ reconciled. Prefer: write → commit → `autoreview --mode commit` → fix → 
 | 2026-07-21 | Codex P2 empty-residual throw | `4d8757f`; autoreview **clean** |
 | 2026-07-21 | Phase 1a–1c engine+CLI+server | `27ed0d4` |
 | 2026-07-21 | Codex P1 CLI has_mtp/chunked guard + gate script | `c545d81` |
-| 2026-07-21 | Live smoke official MTP pack, T=0.7 top_k=20 n=16 | **works**: 5 rounds, 13 drafted, 10 accepted (**76.9%**); wall slow on first smoke (host full-vocab nucleus — Phase 4) |
+| 2026-07-21 | Live smoke official MTP pack, T=0.7 top_k=20 n=16 | **works**: 5 rounds, 13 drafted, 10 accepted (**76.9%**). Wall ~0.17 t/s is **not** a perf baseline — operator had another model resident (memory pressure); re-bench on a quiet machine. Host full-vocab nucleus may still matter at scale (Phase 4) but was not the measured cause here. |
 | 2026-07-21 | CLI has_mtp guard + gate script harden | `c545d81`…`5547704`; gate Codex **clean** |
 | | Phase 2 full `metal_sampled_mtp_gate.sh` on quiet machine | *pending* (script ready) |
 | | Phase 4 GPU top-k / cut readback for speed | *pending* (correctness first) |
