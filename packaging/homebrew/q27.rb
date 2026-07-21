@@ -10,8 +10,8 @@
 class Q27 < Formula
   desc "Ternary-quantized 27B LLM inference engine for Apple silicon (Metal)"
   homepage "https://github.com/manthedan/q27"
-  url "https://github.com/manthedan/q27/archive/refs/tags/metal-v0.5.0.tar.gz"
-  sha256 "f4872aa62d582b5c76e435cc0db37768e76cf66743e567c9b2bc72d32c123a56"
+  url "https://github.com/manthedan/q27/archive/refs/tags/metal-v0.5.1.tar.gz"
+  sha256 "eb31d5a0920f3a499abe4ec1ae28aad77a25e79d4c64be94199f0d4d07069bea"
   license "MIT"
 
   depends_on arch: :arm64
