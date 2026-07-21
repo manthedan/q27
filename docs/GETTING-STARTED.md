@@ -1,0 +1,74 @@
+# Getting started with q27
+
+The short path from zero to a running 27B model on Apple silicon. Everything
+here goes through the `q27` command the Homebrew install gives you.
+
+## 1. Install
+
+```bash
+brew install manthedan/tap/q27
+```
+
+This installs the Metal engine, the OpenAI/Anthropic-compatible server, the
+`q27` wrapper, and the experimental `q27-agent`. **Model weights are not
+included** — you pull a pack next.
+
+Requires: macOS on Apple silicon (M1 or newer). Memory depends on the pack:
+8 GB for **b1**, 16 GB for **t2**, 24 GB+ for **default**. `q27 recommend`
+tells you what fits your machine.
+
+## 2. Pull a model pack
+
+`q27` picks the right pack for your RAM, or you name one:
+
+```bash
+q27 pull            # auto-pick by RAM
+q27 pull b1         # or a specific pack
+```
+
+This downloads the pre-repacked artifact and its tokenizer, checksum-verified.
+No Python or build step needed. See [MODELS.md](MODELS.md) for what each pack
+is and the speed/context tables — but as a rule of thumb: **16 GB → t2**
+(best quality that fits) or **b1** (smallest + fastest); **24 GB+ → default**
+(the official model with its MTP head).
+
+## 3. Run it
+
+**Serve it** (OpenAI/Anthropic-compatible endpoint on port 8080):
+
+```bash
+q27 serve
+export ANTHROPIC_BASE_URL=http://localhost:8080 && claude
+```
+
+**Or try the native agent** (no server; links the engine directly). It turns
+on local file/shell tools and uses your current directory as its workspace,
+so `cd` into a scratch directory first:
+
+```bash
+mkdir -p /tmp/q27-play && cd /tmp/q27-play
+q27 agent
+```
+
+Type a prompt, Enter; `:quit` exits. Try `Create hello.py that prints hello,
+then run it`. See [MODELS.md](MODELS.md) §6 for sessions, tool limits, and the
+safety model.
+
+## 4. Useful next steps
+
+```bash
+q27 recommend       # the pack + context table for THIS machine
+q27 ls              # installed packs + which is servable
+q27 bench --fast    # quick benchmark of an installed pack
+q27 report --full   # diagnostic bundle (helps validate the big tiers)
+```
+
+Switch packs any time: `q27 pull <name>`, then `q27 serve <name>`. Weights
+are mmap'd, so a warm switch is seconds.
+
+## Where to read more
+
+- [MODELS.md](MODELS.md) — packs, quants, context windows, expected speeds.
+- [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md) — the quality gates behind each tier.
+- [SECURITY-MODEL.md](SECURITY-MODEL.md) — the agent's tool/workspace safety model.
+- [metal/](metal/) — the Metal development records (if you want the *why*).

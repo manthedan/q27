@@ -86,29 +86,37 @@ The parked list is as load-bearing as the shipped list.
 
 ## More documentation
 
-The lab records are the real documentation of *why* things are the way
-they are.
+**Using q27** (start here):
 
+- [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md): install, pull a pack,
+  serve it, and try the agent — the short path from zero to a running model.
 - [docs/MODELS.md](docs/MODELS.md): **which pack (quant) and context window
   for your Mac** — the M-chip speed table, the quant×context memory-fit
-  table, and the recommendation guide behind `q27 recommend`. Start here as
-  a user.
-- [docs/metal/METAL_PROGRESS.md](docs/metal/METAL_PROGRESS.md): the Metal ledger,
-  with a maintained **Current state** table on top of an append-only
-  dated chronicle. Start here for the Apple Silicon side.
-- [docs/BUILDLOG.md](docs/BUILDLOG.md): the CUDA build log (P0–P9).
-- [docs/BENCHMARKING.md](docs/BENCHMARKING.md): cross-engine
-  methodology, fairness controls, and reproduce steps for the SWE-bench
-  numbers.
+  table, and the recommendation guide behind `q27 recommend`.
+- [docs/QA_BEFORE_RELEASES.md](docs/QA_BEFORE_RELEASES.md): the quality
+  gates every tier passes before it ships.
+- [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md): the agent's tool and
+  workspace safety model.
+
+**Metal development** (the Apple Silicon side, why things are the way they
+are): see [docs/metal/](docs/metal/) — the Metal ledger
+([METAL_PROGRESS.md](docs/metal/METAL_PROGRESS.md), a maintained **Current
+state** table over an append-only chronicle), the backend design
+([METAL.md](docs/metal/METAL.md)), handoffs/reviews, and
+[docs/metal/plans/](docs/metal/plans/): our pre-registered experiment plans,
+each with gates and kill lines and results appended below the line.
+
+**Format & spec** (shared):
+
 - [docs/FORMAT.md](docs/FORMAT.md): the `.q27` container and every
-  dtype (Q4/Q8/T2/B1/Q4_1), with encodings verified against their
-  sources.
+  dtype (Q4/Q8/T2/B1/Q4_1), with encodings verified against their sources.
 - [docs/SPEC.md](docs/SPEC.md): per-layer forward-pass semantics.
-- [docs/plans/](docs/plans/): pre-registered experiment plans, each with
-  gates and kill lines and with results appended below the line.
-- [docs/metal/NOTEBOOK.md](docs/metal/NOTEBOOK.md): the scratch pad this README used
-  to be, preserving upstream's working notes, performance model, risk
-  register, and progress logs verbatim. No longer maintained.
+
+**Upstream CUDA** (the reference implementation's records, kept in place):
+[docs/BUILDLOG.md](docs/BUILDLOG.md) (build log, P0–P9),
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md) (cross-engine methodology and
+reproduce steps), the design/decision docs at [docs/](docs/), and
+[docs/plans/](docs/plans/) (upstream's experiment plans through 2026-07-14).
 
 ## Model weights
 
