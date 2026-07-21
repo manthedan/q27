@@ -128,6 +128,55 @@ int main() {
         }
     }
 
+    // ---- Full vs candidates: reject-walk token identity under top_k ----
+    {
+        // Same multi-lane logits + drafts + seed: building ServedDistribution
+        // from full rows vs from an exact top-k over-set must yield identical
+        // SpecRejectResult sequences (n, stop_lane, exclude, pending).
+        const uint32_t live=3,vocab=128,k=20;
+        std::vector<float> lanes((size_t)live*vocab);
+        uint32_t lcg=424242;
+        for(float& x:lanes) {
+            lcg=lcg*1664525u+1013904223u;
+            x=(float)(lcg>>8)/8388608.0f*8.0f-4.0f;
+        }
+        // Plant sharp draft peaks so acceptance is non-degenerate.
+        lanes[0*vocab+7]=6.0f;
+        lanes[1*vocab+11]=5.5f;
+        lanes[2*vocab+3]=5.0f;
+        uint32_t drafts[2]={7,11};
+        q27::SamplingParams p{0.85f,0.95f,k,9001};
+        std::vector<q27::ServedDistribution> full_d(live),cand_d(live);
+        for(uint32_t lane=0;lane<live;lane++) {
+            const float* row=lanes.data()+(size_t)lane*vocab;
+            full_d[lane]=q27::build_served_distribution(row,vocab,p);
+            std::vector<uint32_t> rank(vocab);
+            for(uint32_t i=0;i<vocab;i++) rank[i]=i;
+            std::partial_sort(rank.begin(),rank.begin()+k+9,rank.end(),
+                              [&](uint32_t a,uint32_t b){
+                                  return row[a]!=row[b]?row[a]>row[b]:a<b;});
+            const uint32_t over=k+9;
+            std::vector<float> cv(over); std::vector<uint32_t> ci(over);
+            for(uint32_t i=0;i<over;i++) { ci[i]=rank[i]; cv[i]=row[rank[i]]; }
+            std::mt19937_64 sh(lane+3); std::shuffle(ci.begin(),ci.end(),sh);
+            for(uint32_t i=0;i<over;i++) cv[i]=row[ci[i]];
+            cand_d[lane]=q27::build_served_from_candidates(cv.data(),ci.data(),over,p);
+        }
+        std::mt19937_64 ra(p.seed),rb(p.seed);
+        for(int iter=0;iter<200;iter++) {
+            auto fa=q27::spec_rejection_accept(full_d.data(),live,drafts,ra);
+            auto ca=q27::spec_rejection_accept(cand_d.data(),live,drafts,rb);
+            if(fa.n!=ca.n || fa.stop_lane!=ca.stop_lane || fa.exclude!=ca.exclude ||
+               fa.pending!=ca.pending) {
+                fprintf(stderr,"reject-walk full vs cand diverge iter=%d "
+                        "n %u/%u stop %u/%u excl %d/%d pend %u/%u\n",
+                        iter,fa.n,ca.n,fa.stop_lane,ca.stop_lane,
+                        (int)fa.exclude,(int)ca.exclude,fa.pending,ca.pending);
+                return 1;
+            }
+        }
+    }
+
     // ---- Spec rejection sampling (Metal sampled-MTP Phase 0) ----
     {
         // build_served + sample_served draw-for-draw match sample_logits_cpu

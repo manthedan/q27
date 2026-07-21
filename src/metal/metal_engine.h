@@ -84,6 +84,12 @@ class MetalEngine {
     std::vector<uint32_t> generate(const std::vector<uint32_t>& prompt, uint32_t count);
     std::vector<uint32_t> generate_mtp(const std::vector<uint32_t>& prompt,
                                        uint32_t count, uint32_t width);
+    // Sampled MTP whole-run driver (docs/metal/plans/2026-07-21-metal-sampled-mtp.md):
+    // sample first pending from prefill logits, then mtp_sample_round quanta.
+    // Requires has_mtp() + chunked_prefill(); temperature should be > 0.
+    std::vector<uint32_t> generate_mtp_sampled(const std::vector<uint32_t>& prompt,
+                                               uint32_t count, uint32_t width,
+                                               const SamplingParams& params);
     // Verify/oracle width ceiling, decoupled from the width-12 NLL/KL
     // contract exactly as PREFILL_CHUNK_MAX decoupled prompt ingestion
     // (docs/metal/plans/2026-07-16-lever2-verify-width.md). Sizes cfinal_/

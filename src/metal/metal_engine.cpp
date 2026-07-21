@@ -2451,6 +2451,42 @@ std::vector<uint32_t> MetalEngine::generate_mtp(const std::vector<uint32_t>& pro
     return generate_from_pending(pending, count, width);
 }
 
+std::vector<uint32_t> MetalEngine::generate_mtp_sampled(const std::vector<uint32_t>& prompt,
+                                                          uint32_t count, uint32_t width,
+                                                          const SamplingParams& params) {
+    validate_sampling(params);
+    if (prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
+    if (!has_mtp_)
+        throw std::runtime_error("q27 Metal: artifact has no MTP layer; use plain sampling");
+    if (!chunked_prefill_)
+        throw std::runtime_error("q27 Metal: sampled MTP requires chunked prefill");
+    if (width < 2 || width > CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: MTP width must be 2..12");
+    if (!count) return {};
+    if ((uint64_t)prompt.size() + count > max_context_ + 1)
+        throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
+    // Prefill leaves logits for the first gen token; sample that pending
+    // (not the greedy argmax from ingest_prompt's return).
+    (void)ingest_prompt(prompt, true, true);
+    std::mt19937_64 rng(params.seed);
+    uint32_t pending = sample_from_logits(params, rng);
+    std::vector<uint32_t> generated;
+    generated.reserve(count);
+    uint32_t live_width = std::min(width, 4u);
+    std::vector<uint32_t> committed;
+    while (generated.size() < count) {
+        if (generated.size() + 1 == count) {
+            generated.push_back(pending);
+            break;
+        }
+        committed.clear();
+        pending = mtp_sample_round(pending, (uint32_t)(count - generated.size()),
+                                   UINT32_MAX, width, live_width, params, rng, committed);
+        generated.insert(generated.end(), committed.begin(), committed.end());
+    }
+    return generated;
+}
+
 // Suffix-burst round (2026-07-16-suffix-burst-verify.md): oracle_round's
 // caller-lane verify chunk + batched head + argmax, then mtp_round's REAL
 // acceptance walk, commit_n/encoded rules, and early-EOS clamp (e765dde) —

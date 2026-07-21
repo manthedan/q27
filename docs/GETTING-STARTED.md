@@ -79,6 +79,36 @@ so only one can run at once — starting either while the other is up gives
 first (`Ctrl-C` / `:quit`) before starting the other. This is a deliberate
 memory-safety guard, not a bug.
 
+## 3b. Sampling + MTP (optional)
+
+Default decode is still **greedy** (temperature 0). For Qwen-card-style
+sampling:
+
+```bash
+# Native agent: set temperature; top_p=0.95 and top_k=20 fill in if omitted
+Q27_AGENT_TEMPERATURE=0.6 q27 agent default   # official MTP pack if installed
+
+# Metal CLI (source checkout): greedy MTP vs sampled MTP
+./build/q27-metal MODEL.q27 MODEL.tok --mtp 4 -n 64 --prompt "..."
+./build/q27-metal MODEL.q27 MODEL.tok --mtp 4 \
+  --temperature 0.7 --top-p 0.95 --top-k 20 --seed 1 -n 64 --prompt "..."
+```
+
+On an **official MTP pack** (`default` / `qwen36-27b-mtp`), `temp > 0` +
+`--mtp` uses **sampled MTP** (greedy drafts, rejection-sample accept). Bonsai
+packs have no MTP layer and fall back to plain serial sampling. Force plain
+sample for A/B: `Q27_SAMPLE_PLAIN=1`.
+
+Quiet-machine overnight suite (units + gate + t/s A/B + temp curve):
+
+```bash
+MODEL=models/qwen36-27b-mtp/qwen36-27b-mtp.q27 \
+TOK=models/qwen36-27b-mtp/qwen36-27b-mtp.tok \
+  tools/overnight_sampled_mtp.sh
+```
+
+Details: [metal/plans/2026-07-21-metal-sampled-mtp.md](metal/plans/2026-07-21-metal-sampled-mtp.md).
+
 ## 4. Useful next steps
 
 ```bash

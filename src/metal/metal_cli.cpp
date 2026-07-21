@@ -11,7 +11,6 @@
 #include <exception>
 #include <filesystem>
 #include <iterator>
-#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1396,42 +1395,22 @@ int main(int argc, char** argv) {
                     engine.position());
             generated = engine.generate_from_pending(pending, count);
         } else {
-            // Sampled MTP only when the pack has the layer and chunked verify
-            // is available — mirror server has_mtp()/chunked_prefill() gates
-            // so Bonsai or serial-prefill falls back to plain sampling (codex P1).
+            // Sampled MTP when the pack has the layer and chunked verify —
+            // mirror server has_mtp()/chunked_prefill() gates so Bonsai falls
+            // back to plain sampling (codex P1). Q27_SAMPLE_PLAIN forces plain.
             const bool use_mtp_sample =
                 sampling.temperature > 0 && mtp_width &&
                 engine.has_mtp() && engine.chunked_prefill() &&
                 !getenv("Q27_SAMPLE_PLAIN");
-            if (use_mtp_sample) {
-                // Prefill leaves logits for the first gen token; sample that
-                // pending (not the greedy argmax), then mtp_sample_round quanta.
-                (void)engine.ingest_prompt(prompt, true, true);
-                std::mt19937_64 rng(sampling.seed);
-                uint32_t pending = engine.sample_from_logits(sampling, rng);
-                generated.clear();
-                generated.reserve(count);
-                uint32_t live_width = std::min(mtp_width, 4u);
-                std::vector<uint32_t> committed;
-                while (generated.size() < count) {
-                    if (generated.size() + 1 == count) {
-                        generated.push_back(pending);
-                        break;
-                    }
-                    committed.clear();
-                    pending = engine.mtp_sample_round(pending, (uint32_t)(count - generated.size()),
-                                                      UINT32_MAX, mtp_width, live_width,
-                                                      sampling, rng, committed);
-                    generated.insert(generated.end(), committed.begin(), committed.end());
-                }
-            } else {
+            if (use_mtp_sample)
+                generated = engine.generate_mtp_sampled(prompt, count, mtp_width, sampling);
+            else
                 generated = sampling.temperature>0 ? engine.generate_sampled(prompt,count,sampling)
                                                : mtp_width ? engine.generate_mtp(prompt,count,mtp_width)
                                                : suffix_width ? (suffix_serial
                                                       ? engine.generate_suffix_serial(prompt,count,suffix_width)
                                                       : engine.generate_suffix(prompt,count,suffix_width))
                                                               : engine.generate(prompt,count);
-            }
         }
         if(!dump_logits.empty()) {
             std::vector<float> logits=engine.read_logits();

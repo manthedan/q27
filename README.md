@@ -269,7 +269,10 @@ Q27_AGENT_SESSION=work.q27agent make agent
 Q27_AGENT_CONTEXT=16384 make agent
 Q27_AGENT_WORKSPACE=/path/to/project make agent
 # optional non-greedy decode (default remains temperature 0):
-Q27_AGENT_TEMPERATURE=0.7 Q27_AGENT_TOP_P=0.95 Q27_AGENT_TOP_K=20 make agent
+Q27_AGENT_TEMPERATURE=0.7 make agent
+# top_p=0.95 and top_k=20 fill in when only temperature is set; override with
+# Q27_AGENT_TOP_P / Q27_AGENT_TOP_K. Official MTP packs keep MTP under sampling
+# on the Metal server/CLI path; the native agent is still serial sample today.
 ```
 
 The published v0.3 Homebrew archive predates this supervisor subcommand;

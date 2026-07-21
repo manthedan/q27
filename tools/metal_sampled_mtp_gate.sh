@@ -7,7 +7,23 @@
 #   MODEL=path/to.q27 TOK=path/to.tok tools/metal_sampled_mtp_gate.sh
 # Optional:
 #   BIN=build/q27-metal  MTP=4  N=48  SEED=42  CTX=2048
+# Overnight suite: tools/overnight_sampled_mtp.sh
 set -euo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+metal_sampled_mtp_gate.sh — correctness smoke for Metal sampled MTP
+
+Requires an official MTP pack (blk.64). Env:
+  MODEL  TOK           required paths
+  BIN                  default build/q27-metal
+  MTP N SEED CTX PROMPT
+
+For a full quiet-machine overnight (units + gate + t/s A/B + temp curve):
+  tools/overnight_sampled_mtp.sh
+EOF
+  exit 0
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BIN:-$ROOT/build/q27-metal}"
@@ -22,7 +38,7 @@ PROMPT="${PROMPT:-Write a short Python function that returns the nth Fibonacci n
 die() { echo "metal_sampled_mtp_gate: $*" >&2; exit 1; }
 
 [[ -x "$BIN" ]] || die "missing binary $BIN (make build/q27-metal)"
-[[ -n "$MODEL" && -f "$MODEL" ]] || die "set MODEL= to an official MTP .q27 pack"
+[[ -n "$MODEL" && -f "$MODEL" ]] || die "set MODEL= to an official MTP .q27 pack (or --help)"
 [[ -n "$TOK" && -f "$TOK" ]] || die "set TOK= to the matching .tok"
 
 run() {
