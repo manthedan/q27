@@ -33,6 +33,16 @@ typedef enum {
     Q27_AGENT_STALLED = 4   // bounded output watchdog; resident reuse invalidated
 } q27_agent_status;
 
+// Decode sampling. temperature == 0 (or top_k == 1) is pure greedy and must
+// stay bitwise-identical to the historical agent path. top_p must be in (0,1];
+// use 1.0f when temperature is 0. seed seeds mt19937_64 when sampling.
+typedef struct {
+    float temperature;
+    float top_p;
+    uint32_t top_k;
+    uint64_t seed;
+} q27_agent_sampling;
+
 q27_agent_engine *q27_agent_engine_open(const char *model_path,
                                          const char *tokenizer_path,
                                          uint32_t context,
@@ -46,23 +56,25 @@ q27_agent_status q27_agent_engine_tokenizer_sha1(
 // only when its exact generated-token ledger is a stable prefix of that render
 // and the Metal position agrees. Any mismatch resets and re-prefills. Any
 // cancellation/runtime error invalidates reuse for the next call. When
-// enable_tools is set, greedy decode grammar-locks registered <tool_call>.
-// Body tools (write/overwrite/edit/edit_selection) continue free-decoding after
-// </tool_call> so a same-turn markdown-fenced body can follow.
-// bodies and stops exactly after a valid closer. eos_reached distinguishes a
-// natural complete response (including EOS as the next token at the exact
-// bound) from max-token/tool-call termination. Conservative empty-decode,
-// whitespace-run, identical-token, and short-cycle bounds return
-// Q27_AGENT_STALLED before streaming the triggering token and invalidate reuse.
-// When prefill_sink is non-null, it receives an initial exact cached-prefix
-// update, fixed 96-new-token updates at completed GPU boundaries, and a final
-// update before the first generated text token. Returning zero cancels safely.
+// enable_tools is set, decode grammar-locks registered <tool_call> (masks
+// apply to both greedy and temperature sampling so tool JSON stays
+// fail-closed). Body tools (write/overwrite/edit/edit_selection) continue
+// free-decoding after </tool_call> so a same-turn markdown-fenced body can
+// follow. eos_reached distinguishes a natural complete response (including
+// EOS as the next token at the exact bound) from max-token/tool-call
+// termination. Conservative empty-decode, whitespace-run, identical-token,
+// and short-cycle bounds return Q27_AGENT_STALLED before streaming the
+// triggering token and invalidate reuse. When prefill_sink is non-null, it
+// receives an initial exact cached-prefix update, fixed 96-new-token updates
+// at completed GPU boundaries, and a final update before the first generated
+// text token. Returning zero cancels safely.
 q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      const q27_agent_message *messages,
                                      size_t message_count,
                                      int enable_thinking,
                                      int enable_tools,
                                      uint32_t max_tokens,
+                                     q27_agent_sampling sampling,
                                      q27_agent_text_sink sink,
                                      q27_agent_prefill_sink prefill_sink,
                                      q27_agent_alive_check alive,

@@ -268,6 +268,8 @@ Q27_AGENT_PACK=t2 make agent                    # choose another local pack
 Q27_AGENT_SESSION=work.q27agent make agent
 Q27_AGENT_CONTEXT=16384 make agent
 Q27_AGENT_WORKSPACE=/path/to/project make agent
+# optional non-greedy decode (default remains temperature 0):
+Q27_AGENT_TEMPERATURE=0.7 Q27_AGENT_TOP_P=0.95 Q27_AGENT_TOP_K=20 make agent
 ```
 
 The published v0.3 Homebrew archive predates this supervisor subcommand;
@@ -275,8 +277,11 @@ The published v0.3 Homebrew archive predates this supervisor subcommand;
 Friends testing it now should use a source checkout and `make agent`.
 
 `Q27_AGENT_PACK`, `Q27_AGENT_MAX_TOKENS`, and `Q27_AGENT_SESSION` provide
-script-friendly defaults. The wrapper holds a private kernel lifetime lock
-shared with `q27 serve`, preventing concurrent multi-GB model launches. The
+script-friendly defaults; sampling env vars pass through to
+`--temperature` / `--top-p` / `--top-k` / `--seed` when set. Tool grammar
+stays engaged under temperature sampling. The wrapper holds a private kernel
+lifetime lock shared with `q27 serve`, preventing concurrent multi-GB model
+launches. The
 lock is inherited across `exec` and released automatically on every process
 exit, including signals and crashes. Read/search results expose short,
 digest-bound line-selection handles so B1 can edit one exact occurrence without

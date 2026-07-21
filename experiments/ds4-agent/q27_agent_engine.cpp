@@ -4,6 +4,7 @@
 #include "q27_agent_stall.h"
 
 #include "../../src/metal/metal_engine.h"
+#include "../../src/sampling.h"
 #include "../../src/tokenizer.h"
 #include "../../src/toolconstrain.h"
 
@@ -15,6 +16,7 @@
 #include <fcntl.h>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -409,7 +411,8 @@ extern "C" q27_agent_status q27_agent_engine_load_session(
 extern "C" q27_agent_status q27_agent_generate(
     q27_agent_engine *engine, const q27_agent_message *messages,
     size_t message_count, int enable_thinking, int enable_tools,
-    uint32_t max_tokens, q27_agent_text_sink sink,
+    uint32_t max_tokens, q27_agent_sampling sampling,
+    q27_agent_text_sink sink,
     q27_agent_prefill_sink prefill_sink,
     q27_agent_alive_check alive, void *opaque,
     uint32_t *prompt_tokens, uint32_t *cached_tokens,
@@ -434,6 +437,18 @@ extern "C" q27_agent_status q27_agent_generate(
     }
 
     try {
+        q27::SamplingParams params;
+        params.temperature = sampling.temperature;
+        params.top_p = sampling.top_p;
+        params.top_k = sampling.top_k;
+        params.seed = sampling.seed;
+        q27::validate_sampling(params);
+        // temperature 0 or top_k 1: keep the historical pure-argmax path so
+        // tool grammar + session reuse stay bitwise-stable with prior agents.
+        const bool use_sample =
+            params.temperature > 0.0f && params.top_k != 1;
+        std::mt19937_64 rng(params.seed);
+
         std::vector<uint32_t> ids;
         if (!render_messages(engine, messages, message_count, enable_thinking,
                              ids, error, error_cap))
@@ -521,8 +536,14 @@ extern "C" q27_agent_status q27_agent_generate(
         if (prefilled != last_reported_prefill &&
             !publish_prefill())
             return cancelled();
-        if (offset == plan.append_offset && !plan.finalize_pending)
+        // First generated token: sample from resident logits when requested.
+        // Greedy keeps the old argmax path (pending_from_logits when prefill
+        // left logits without a step return; otherwise last step's argmax).
+        if (use_sample) {
+            current = engine->session->sample_from_logits(params, rng);
+        } else if (offset == plan.append_offset && !plan.finalize_pending) {
             current = engine->session->pending_from_logits();
+        }
 
         // The GPU and ledger now agree at the complete rendered prompt.
         engine->agent_session.commit_prompt(ids);
@@ -693,9 +714,25 @@ extern "C" q27_agent_status q27_agent_generate(
                 if (output_tokens) *output_tokens = produced;
                 return cancelled();
             }
-            current = engine->session->step(current);
-            if (!engine->agent_session.mark_pending_encoded())
-                throw std::runtime_error("agent session token-step mismatch");
+            // Encode the emitted token. Greedy uses step's returned argmax as
+            // the next id; sampling advances with step then draws from the
+            // (possibly tool-masked) logits — same mask surface as greedy.
+            if (use_sample) {
+                (void)engine->session->step(current);
+                if (!engine->agent_session.mark_pending_encoded())
+                    throw std::runtime_error(
+                        "agent session token-step mismatch");
+                if (!alive(opaque)) {
+                    if (output_tokens) *output_tokens = produced;
+                    return cancelled();
+                }
+                current = engine->session->sample_from_logits(params, rng);
+            } else {
+                current = engine->session->step(current);
+                if (!engine->agent_session.mark_pending_encoded())
+                    throw std::runtime_error(
+                        "agent session token-step mismatch");
+            }
             if (!alive(opaque)) {
                 if (output_tokens) *output_tokens = produced;
                 return cancelled();

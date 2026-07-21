@@ -192,18 +192,38 @@ cmd_agent() {
             echo "q27 agent: cannot resolve the current workspace" >&2; exit 1; }
     fi
     max_tokens="${Q27_AGENT_MAX_TOKENS:-auto}"
+    # Optional sampling (omit for greedy default). Pass through only when set
+    # so the binary's defaults stay bitwise-greedy.
+    local sample_args=()
+    if [ -n "${Q27_AGENT_TEMPERATURE:-}" ]; then
+        sample_args+=(--temperature "$Q27_AGENT_TEMPERATURE")
+    fi
+    if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
+        sample_args+=(--top-p "$Q27_AGENT_TOP_P")
+    fi
+    if [ -n "${Q27_AGENT_TOP_K:-}" ]; then
+        sample_args+=(--top-k "$Q27_AGENT_TOP_K")
+    fi
+    if [ -n "${Q27_AGENT_SEED:-}" ]; then
+        sample_args+=(--seed "$Q27_AGENT_SEED")
+    fi
     echo "q27 agent: pack=$n context=$context workspace=$workspace" >&2
     echo "  automatic tools enabled; shell retains your local account's filesystem access" >&2
+    if [ ${#sample_args[@]} -gt 0 ]; then
+        echo "  sampling: ${sample_args[*]}" >&2
+    fi
     if [ -n "${Q27_AGENT_SESSION:-}" ]; then
         q27_run_consumer "$agent" "$art" "$tok" \
             --context "$context" --max-tokens "$max_tokens" \
             --auto-tools --workspace "$workspace" \
-            --session "$Q27_AGENT_SESSION" "$@"
+            --session "$Q27_AGENT_SESSION" \
+            "${sample_args[@]}" "$@"
         return $?
     fi
     q27_run_consumer "$agent" "$art" "$tok" \
         --context "$context" --max-tokens "$max_tokens" \
-        --auto-tools --workspace "$workspace" "$@"
+        --auto-tools --workspace "$workspace" \
+        "${sample_args[@]}" "$@"
 }
 
 cmd_bench()  { exec "$HERE/q27-bench" "$@"; }

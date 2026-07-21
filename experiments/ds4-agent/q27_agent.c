@@ -22,6 +22,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -101,7 +102,14 @@ static void usage(FILE *out, const char *argv0) {
         "      --compact-at N     auto-compact at this prompt size (default 75%% context)\n"
         "      --compact-keep N   retain this many recent root turns (default 4)\n"
         "      --compact-tokens N summary generation bound (default 1024)\n"
+        "      --temperature T    sampling temperature (default 0 = greedy)\n"
+        "      --top-p P          nucleus sampling in (0,1] (default 1)\n"
+        "      --top-k K          sample from top-K; 0 = full vocab (default 0)\n"
+        "      --seed N           RNG seed when temperature > 0 (default 0)\n"
         "  -h, --help              show this help\n"
+        "\n"
+        "Tool grammar stays engaged under temperature sampling (masks apply\n"
+        "before the draw). Compaction summaries always run greedy.\n"
         "\n"
         "interactive: :save, :compact, :read PATH, :search PATH NEEDLE,\n"
         "             :shell COMMAND, :quit\n",
@@ -141,6 +149,42 @@ static int parse_u32(const char *text, uint32_t *out) {
     if (errno || !end || *end || value == 0 || value > UINT32_MAX) return 0;
     *out = (uint32_t)value;
     return 1;
+}
+
+static int parse_u32_allow_zero(const char *text, uint32_t *out) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno || !end || *end || value > UINT32_MAX) return 0;
+    *out = (uint32_t)value;
+    return 1;
+}
+
+static int parse_u64(const char *text, uint64_t *out) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (errno || !end || *end) return 0;
+    *out = (uint64_t)value;
+    return 1;
+}
+
+static int parse_float(const char *text, float *out) {
+    char *end = NULL;
+    errno = 0;
+    float value = strtof(text, &end);
+    if (errno || !end || *end || !isfinite(value)) return 0;
+    *out = value;
+    return 1;
+}
+
+static q27_agent_sampling sampling_greedy(void) {
+    q27_agent_sampling s;
+    s.temperature = 0.0f;
+    s.top_p = 1.0f;
+    s.top_k = 0;
+    s.seed = 0;
+    return s;
 }
 
 static int private_file_sha256(const char *path, unsigned char digest[32],
@@ -647,7 +691,8 @@ static int run_session_command(q27_agent_worker *worker,
 }
 
 static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
-                    int enable_tools, uint32_t max_tokens, int jsonl,
+                    int enable_tools, uint32_t max_tokens,
+                    q27_agent_sampling sampling, int jsonl,
                     int display_text, output_buffer *completed_output,
                     int *completed_tool_call, int *completed_eos,
                     turn_accounting *completed_accounting) {
@@ -668,7 +713,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
     char error[512] = {0};
     uint64_t command_id = 0;
     q27_agent_status submitted = q27_agent_worker_submit(
-        worker, view, chat->len, think, enable_tools, max_tokens,
+        worker, view, chat->len, think, enable_tools, max_tokens, sampling,
         continue_running, NULL, &command_id, error, sizeof(error));
     // submit deep-copies every message; the UI transcript is no longer pinned
     // for the duration of generation.
@@ -885,8 +930,9 @@ static int compact_transcript(q27_agent_worker *worker, transcript *chat,
         return 0;
     }
     output_buffer summary = {0};
-    if (!run_turn(worker, &summary_chat, 0, 0, summary_limit, 0, 0,
-                  &summary, NULL, NULL, NULL)) {
+    // Compaction summaries are always greedy for stable session anchors.
+    if (!run_turn(worker, &summary_chat, 0, 0, summary_limit,
+                  sampling_greedy(), 0, 0, &summary, NULL, NULL, NULL)) {
         transcript_free(&summary_chat); free(summary.bytes); return 0;
     }
     transcript_free(&summary_chat);
@@ -928,7 +974,7 @@ static int compact_transcript(q27_agent_worker *worker, transcript *chat,
     // is an exact prefix of the compacted transcript after the retained tail
     // is appended, making immediate Q27SNAP1 publication/resume sound.
     output_buffer acknowledgement = {0};
-    if (!run_turn(worker, &compacted, 0, 0, 32, 0, 0,
+    if (!run_turn(worker, &compacted, 0, 0, 32, sampling_greedy(), 0, 0,
                   &acknowledgement, NULL, NULL, NULL)) {
         free(acknowledgement.bytes); transcript_free(&compacted); return 0;
     }
@@ -1146,6 +1192,7 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
                            q27_agent_selection_ledger *selections,
                            int think, uint32_t context_tokens,
                            uint32_t max_tokens, int adaptive_tokens, int jsonl,
+                           q27_agent_sampling sampling,
                            uint32_t max_tool_rounds, uint32_t compact_at,
                            uint32_t compact_tokens, uint32_t compact_keep) {
     uint32_t tool_rounds = 0;
@@ -1158,8 +1205,9 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         output_buffer generated = {0};
         int engine_closed_call = 0;
         turn_accounting accounting = {0};
-        if (!run_turn(worker, chat, think, 1, turn_max_tokens, jsonl, 1,
-                      &generated, &engine_closed_call, NULL, &accounting)) {
+        if (!run_turn(worker, chat, think, 1, turn_max_tokens, sampling,
+                      jsonl, 1, &generated, &engine_closed_call, NULL,
+                      &accounting)) {
             free(generated.bytes);
             return 0;
         }
@@ -1430,6 +1478,7 @@ int main(int argc, char **argv) {
     uint32_t compact_at = 0, compact_keep = 4, compact_tokens = 1024;
     int think = 1, jsonl = 0, auto_tools = 0, max_tokens_explicit = 0;
     int adaptive_tokens = 0;
+    q27_agent_sampling sampling = sampling_greedy();
     q27_agent_selection_ledger *selections = NULL;
 
     for (int i = 1; i < argc; ++i) {
@@ -1499,6 +1548,28 @@ int main(int argc, char **argv) {
             if (++i == argc || !parse_u32(argv[i], &compact_tokens) ||
                 compact_tokens > 16384) {
                 fprintf(stderr, "q27-agent: compact tokens must be 1..16384\n");
+                return 2;
+            }
+        } else if (!strcmp(arg, "--temperature")) {
+            if (++i == argc || !parse_float(argv[i], &sampling.temperature) ||
+                sampling.temperature < 0.0f) {
+                fprintf(stderr, "q27-agent: temperature must be a finite value >= 0\n");
+                return 2;
+            }
+        } else if (!strcmp(arg, "--top-p")) {
+            if (++i == argc || !parse_float(argv[i], &sampling.top_p) ||
+                !(sampling.top_p > 0.0f && sampling.top_p <= 1.0f)) {
+                fprintf(stderr, "q27-agent: top-p must be in (0,1]\n");
+                return 2;
+            }
+        } else if (!strcmp(arg, "--top-k")) {
+            if (++i == argc || !parse_u32_allow_zero(argv[i], &sampling.top_k)) {
+                fprintf(stderr, "q27-agent: invalid top-k\n");
+                return 2;
+            }
+        } else if (!strcmp(arg, "--seed")) {
+            if (++i == argc || !parse_u64(argv[i], &sampling.seed)) {
+                fprintf(stderr, "q27-agent: invalid seed\n");
                 return 2;
             }
         } else if (!strcmp(arg, "--output-format")) {
@@ -1664,15 +1735,16 @@ int main(int argc, char **argv) {
         if (ok && auto_tools)
             ok = run_agent_cycle(worker, &chat, selections,
                                  think, context, max_tokens,
-                                 adaptive_tokens, jsonl, max_tool_rounds, compact_at,
+                                 adaptive_tokens, jsonl, sampling,
+                                 max_tool_rounds, compact_at,
                                  compact_tokens, compact_keep);
         else if (ok) {
             uint32_t turn_max_tokens = 0;
             ok = prepare_turn(worker, &chat, think, context, max_tokens,
                               adaptive_tokens, 0, compact_at, compact_tokens,
                               compact_keep, &turn_max_tokens) &&
-                 run_turn(worker, &chat, think, 0, turn_max_tokens, jsonl, 1,
-                          NULL, NULL, NULL, NULL);
+                 run_turn(worker, &chat, think, 0, turn_max_tokens, sampling,
+                          jsonl, 1, NULL, NULL, NULL, NULL);
         }
         if (ok) ok = save_session(worker, session_path,
                                   &current_snapshot_name, &chat, think,
@@ -1775,7 +1847,8 @@ int main(int argc, char **argv) {
             if (ok && auto_tools)
                 ok = run_agent_cycle(worker, &chat, selections,
                                      think, context, max_tokens,
-                                     adaptive_tokens, jsonl, max_tool_rounds, compact_at,
+                                     adaptive_tokens, jsonl, sampling,
+                                     max_tool_rounds, compact_at,
                                      compact_tokens, compact_keep);
             else if (ok) {
                 uint32_t turn_max_tokens = 0;
@@ -1784,7 +1857,7 @@ int main(int argc, char **argv) {
                                   compact_tokens, compact_keep,
                                   &turn_max_tokens) &&
                      run_turn(worker, &chat, think, 0, turn_max_tokens,
-                              jsonl, 1, NULL, NULL, NULL, NULL);
+                              sampling, jsonl, 1, NULL, NULL, NULL, NULL);
             }
             if (ok) ok = save_session(worker, session_path,
                                       &current_snapshot_name, &chat, think,

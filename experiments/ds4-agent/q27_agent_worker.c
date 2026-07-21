@@ -68,6 +68,7 @@ struct q27_agent_worker {
     int enable_thinking;
     int enable_tools;
     uint32_t max_tokens;
+    q27_agent_sampling sampling;
     q27_agent_alive_check alive;
     void *alive_opaque;
     uint64_t command_id;
@@ -483,6 +484,7 @@ static void *worker_main(void *opaque) {
         const int enable_thinking = worker->enable_thinking;
         const int enable_tools = worker->enable_tools;
         const uint32_t max_tokens = worker->max_tokens;
+        const q27_agent_sampling sampling = worker->sampling;
         q27_agent_alive_check alive = worker->alive;
         void *alive_opaque = worker->alive_opaque;
         const uint64_t command_id = worker->command_id;
@@ -556,7 +558,7 @@ static void *worker_main(void *opaque) {
         } else {
             status = q27_agent_generate(
                 engine, messages.items, messages.len, enable_thinking,
-                enable_tools, max_tokens, event_text_sink,
+                enable_tools, max_tokens, sampling, event_text_sink,
                 event_prefill_sink, combined_alive,
                 &context, &prompt_tokens, &cached_tokens, &prefill_tokens,
                 &output_tokens, &tool_call_complete, &eos_reached,
@@ -674,12 +676,19 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
 q27_agent_status q27_agent_worker_submit(
     q27_agent_worker *worker, const q27_agent_message *messages,
     size_t message_count, int enable_thinking, int enable_tools,
-    uint32_t max_tokens, q27_agent_alive_check alive, void *opaque,
+    uint32_t max_tokens, q27_agent_sampling sampling,
+    q27_agent_alive_check alive, void *opaque,
     uint64_t *command_id,
     char *error, size_t error_cap) {
     if (command_id) *command_id = 0;
     if (!worker || !messages || !message_count || !max_tokens || !alive) {
         copy_error(error, error_cap, "invalid worker submission");
+        return Q27_AGENT_REJECTED;
+    }
+    // Mirror validate_sampling without throwing across the C ABI.
+    if (!(sampling.temperature >= 0.0f) ||
+        !(sampling.top_p > 0.0f && sampling.top_p <= 1.0f)) {
+        copy_error(error, error_cap, "invalid sampling parameters");
         return Q27_AGENT_REJECTED;
     }
     owned_messages copied;
@@ -699,6 +708,7 @@ q27_agent_status q27_agent_worker_submit(
     worker->enable_thinking = enable_thinking;
     worker->enable_tools = enable_tools;
     worker->max_tokens = max_tokens;
+    worker->sampling = sampling;
     worker->alive = alive;
     worker->alive_opaque = opaque;
     worker->command_id = ++worker->next_command_id;

@@ -85,11 +85,12 @@ q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
 
 // Deep-copies every message before returning. enable_tools opts into the fixed
 // native-tool grammar; a closed call ends generation and is reported on the
-// terminal event. Prefill progress is reported before text at fixed 96-token
-// intervals plus initial/final boundaries. Watchdog termination reports Q27_EVENT_STALLED with
-// Q27_AGENT_STALLED and leaves worker admission reusable. alive/opaque remain borrowed
-// until the command's terminal event is consumed; the owner must keep them
-// valid and close submission admission before destructive stop.
+// terminal event. sampling is copied by value (temperature 0 keeps the greedy
+// path). Prefill progress is reported before text at fixed 96-token intervals
+// plus initial/final boundaries. Watchdog termination reports Q27_EVENT_STALLED
+// with Q27_AGENT_STALLED and leaves worker admission reusable. alive/opaque
+// remain borrowed until the command's terminal event is consumed; the owner
+// must keep them valid and close submission admission before destructive stop.
 q27_agent_status q27_agent_worker_submit(
     q27_agent_worker *worker,
     const q27_agent_message *messages,
@@ -97,6 +98,7 @@ q27_agent_status q27_agent_worker_submit(
     int enable_thinking,
     int enable_tools,
     uint32_t max_tokens,
+    q27_agent_sampling sampling,
     q27_agent_alive_check alive,
     void *opaque,
     uint64_t *command_id,

@@ -24,9 +24,11 @@ source, place the B1 artifact/tokenizer under `models/`, and run:
     make agent
 
 The underlying `./packaging/bin/q27 agent [pack]` defaults to context 32768,
-adaptive generation limits, automatic tools, and the physical current
-workspace. Override with `Q27_AGENT_PACK`, `Q27_AGENT_CONTEXT`,
-`Q27_AGENT_WORKSPACE`, `Q27_AGENT_MAX_TOKENS`, or `Q27_AGENT_SESSION`.
+adaptive generation limits, automatic tools, greedy decode, and the physical
+current workspace. Override with `Q27_AGENT_PACK`, `Q27_AGENT_CONTEXT`,
+`Q27_AGENT_WORKSPACE`, `Q27_AGENT_MAX_TOKENS`, `Q27_AGENT_SESSION`, or
+sampling via `Q27_AGENT_TEMPERATURE` / `Q27_AGENT_TOP_P` / `Q27_AGENT_TOP_K` /
+`Q27_AGENT_SEED` (omit for greedy).
 The supervisor holds one private lifetime lock across `agent` and `serve` so
 concurrent launches cannot double-load multi-GB weights. Automatic file tools
 are workspace-bounded, but shell retains the local account's filesystem
