@@ -1632,11 +1632,29 @@ q27::SamplingParams sampling_params(const json& body) {
     if(body.contains("top_k")) {
         const json& v=body["top_k"];
         if(!v.is_null()) {
-            if(!v.is_number()) throw std::runtime_error("invalid top_k");
-            result.top_k=v.get<uint32_t>();
+            // Integer type required: a JSON float (1.5) would silently
+            // truncate to top_k==1 (pure argmax) and a negative would wrap
+            // to a huge unsigned (codex branch-review P2).
+            if(!v.is_number_integer() && !v.is_number_unsigned())
+                throw std::runtime_error("invalid top_k");
+            const long long k=v.get<long long>();
+            if(k<0 || (unsigned long long)k>UINT32_MAX)
+                throw std::runtime_error("invalid top_k");
+            result.top_k=(uint32_t)k;
         }
     }
-    result.seed=body.value("seed",0ull);
+    result.seed=0;
+    if(body.contains("seed")) {
+        const json& v=body["seed"];
+        if(!v.is_null()) {
+            if(v.is_number_unsigned()) result.seed=v.get<uint64_t>();
+            else if(v.is_number_integer()) {
+                const long long s=v.get<long long>();
+                if(s<0) throw std::runtime_error("invalid seed");
+                result.seed=(uint64_t)s;
+            } else throw std::runtime_error("invalid seed");
+        }
+    }
     q27::validate_sampling(result);
     return result;
 }
