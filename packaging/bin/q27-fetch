@@ -118,7 +118,10 @@ hf_download() { # $1=remote-file $2=dest  (resumable)
         echo "q27-fetch: hf CLI fast path failed; falling back to curl" >&2
     fi
 
-    curl -L --fail --continue-at - "${auth[@]}" \
+    # ${auth[@]+...} (not bare "${auth[@]}") so an empty array is safe under
+    # `set -u` on bash 3.2 (macOS /bin/bash), which errors on empty-array
+    # expansion. Expands to nothing when auth is empty, the header when set.
+    curl -L --fail --continue-at - ${auth[@]+"${auth[@]}"} \
         "https://huggingface.co/$REPO/resolve/$rev/$file" -o "$dest"
 }
 
