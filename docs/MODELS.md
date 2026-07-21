@@ -187,6 +187,14 @@ q27 agent
 Type a prompt, Enter; `:quit` exits. Try `Create hello.py that prints hello,
 then run it`.
 
+Two things to know. First, the default is **b1** specifically (not "whatever
+fits your RAM" like `q27 serve`), so if you pulled only a bigger pack, pass
+its name — `q27 agent t2` — or you'll get `b1 is not installed`. Second,
+**the agent and the server can't run at the same time**: each loads the full
+model, and the wrapper refuses to start one while the other is up
+(`... already running`). Stop the first before starting the other; that guard
+is deliberate memory safety, not a bug.
+
 Sessions are opt-in and durable (autosave + resume). Point the wrapper at a
 session file and it reuses it across runs:
 

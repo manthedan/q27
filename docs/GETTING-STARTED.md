@@ -54,6 +54,18 @@ Type a prompt, Enter; `:quit` exits. Try `Create hello.py that prints hello,
 then run it`. See [MODELS.md](MODELS.md) §6 for sessions, tool limits, and the
 safety model.
 
+**Which pack does the agent use?** Unlike `q27 serve` (which auto-picks for
+your RAM), `q27 agent` defaults to **b1** — so if you pulled a different pack,
+name it: `q27 agent t2` (or `default`, `q8`, …). It errors with
+`b1 is not installed` if you only pulled a bigger pack; that's your cue to
+pass the pack you have. `q27 ls` shows what you've pulled.
+
+**One model at a time.** The server and the agent each load the full model,
+so only one can run at once — starting either while the other is up gives
+`q27: a low-level q27 server or native agent is already running.` Stop the
+first (`Ctrl-C` / `:quit`) before starting the other. This is a deliberate
+memory-safety guard, not a bug.
+
 ## 4. Useful next steps
 
 ```bash
