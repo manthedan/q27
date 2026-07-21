@@ -221,15 +221,13 @@ cmd_agent() {
     if [ -n "${Q27_AGENT_SEED:-}" ]; then
         sample_args+=(--seed "$Q27_AGENT_SEED")
     fi
-    # MTP: default --mtp 4 only for positive temperature (sampled free-decode
-    # / fenced-body speed). Explicit Q27_AGENT_MTP always wins (0 disables).
-    # temperature=0 must not enable greedy MTP — keeps historical path (P2).
+    # MTP free-decode is opt-in: Q27_AGENT_MTP=N (0 disables). No implicit
+    # default — sampled MTP measured ~0.87x plain decode on the official pack
+    # (overnight 2026-07-21) and Bonsai packs have no MTP layer at all, so an
+    # implicit default is slower-or-inert everywhere today.
     local mtp_args=()
     if [ -n "${Q27_AGENT_MTP:-}" ]; then
         mtp_args+=(--mtp "$Q27_AGENT_MTP")
-    elif [ -n "${Q27_AGENT_TEMPERATURE:-}" ] && \
-         awk -v t="$Q27_AGENT_TEMPERATURE" 'BEGIN{exit !(t+0>0)}'; then
-        mtp_args+=(--mtp 4)
     fi
     echo "q27 agent: pack=$n context=$context workspace=$workspace" >&2
     echo "  automatic tools enabled; shell retains your local account's filesystem access" >&2
@@ -244,13 +242,13 @@ cmd_agent() {
             --context "$context" --max-tokens "$max_tokens" \
             --auto-tools --workspace "$workspace" \
             --session "$Q27_AGENT_SESSION" \
-            "${sample_args[@]}" "${mtp_args[@]}" "$@"
+            ${sample_args[@]+"${sample_args[@]}"} ${mtp_args[@]+"${mtp_args[@]}"} "$@"
         return $?
     fi
     q27_run_consumer "$agent" "$art" "$tok" \
         --context "$context" --max-tokens "$max_tokens" \
         --auto-tools --workspace "$workspace" \
-        "${sample_args[@]}" "${mtp_args[@]}" "$@"
+        ${sample_args[@]+"${sample_args[@]}"} ${mtp_args[@]+"${mtp_args[@]}"} "$@"
 }
 
 cmd_bench()  { exec "$HERE/q27-bench" "$@"; }

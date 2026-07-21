@@ -86,7 +86,10 @@ sampling:
 
 ```bash
 # Native agent: set temperature; top_p=0.95 and top_k=20 fill in if omitted
-Q27_AGENT_TEMPERATURE=0.6 q27 agent default   # official MTP pack if installed
+Q27_AGENT_TEMPERATURE=0.6 q27 agent default
+# Agent MTP free-decode is opt-in (official packs only; engages only where
+# the tool grammar cannot — fenced bodies / tools-off):
+Q27_AGENT_TEMPERATURE=0.6 Q27_AGENT_MTP=4 q27 agent default
 
 # Metal CLI (source checkout): greedy MTP vs sampled MTP
 ./build/q27-metal MODEL.q27 MODEL.tok --mtp 4 -n 64 --prompt "..."
