@@ -11,19 +11,16 @@ class Q27 < Formula
   desc "Ternary-quantized 27B LLM inference engine for Apple silicon (Metal)"
   homepage "https://github.com/manthedan/q27"
   url "https://github.com/manthedan/q27/archive/refs/tags/metal-v0.5.0.tar.gz"
-  sha256 "4751967c628b3279f1bde885eec1b5ce95ae45b0b0e5f5042d257d3e24b7425e"
-  # The metal-v* tag line is independent of upstream's v0.3.x CUDA tags; set
-  # the version explicitly since the "metal-v" prefix doesn't parse to one.
-  version "0.5.0"
+  sha256 "f4872aa62d582b5c76e435cc0db37768e76cf66743e567c9b2bc72d32c123a56"
   license "MIT"
 
-  depends_on :macos
   depends_on arch: :arm64
+  depends_on :macos
 
   def install
     shader = pkgshare/"q27_kernels.metal"
     ENV["CXXFLAGS"] =
-      %Q{-O2 -std=c++17 -Wall -Wextra -DQ27_SHADER_PATH='"#{shader}"'}
+      %Q(-O2 -std=c++17 -Wall -Wextra -DQ27_SHADER_PATH='"#{shader}"')
     system "make", "build/q27-metal", "build/q27-metal-server",
            "build/tokenize_to_bin",
            "build/metal_decode_bench", "build/metal_prefill_bench",
