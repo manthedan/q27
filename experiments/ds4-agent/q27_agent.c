@@ -11,15 +11,20 @@
  * happens only after the generation terminal; the control thread then submits
  * a separate tool command. Q27AGT2 manifests pair exact transcripts with
  * private Q27SNAP1 state; bounded model summaries compact only at complete
- * root-turn boundaries. A richer terminal UI remains a later slice.
+ * root-turn boundaries. Interactive TTY mode uses a linenoise-backed TUI
+ * (status footer + line editing); see docs/metal/plans/2026-07-21-agent-tui.md.
  * See THIRD_PARTY_NOTICES.md.
  */
 
+#include "q27_agent_commands.h"
+#include "q27_agent_editor.h"
 #include "q27_agent_persistence.h"
 #include "q27_agent_protocol.h"
 #include "q27_agent_selections.h"
+#include "q27_agent_tui.h"
 #include "q27_agent_worker.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -35,21 +40,58 @@
 #include <CommonCrypto/CommonDigest.h>
 
 static volatile sig_atomic_t interrupted = 0;
+/* Last caught signal number; only SIGINT is soft-cancellable (resume editor). */
+static volatile sig_atomic_t last_signal = 0;
 static int signal_pipe[2] = {-1, -1};
+/* Set only for the interactive TTY editor loop so --prompt keeps legacy
+ * prefill chrome even when stderr is a TTY. */
+static int interactive_tui_progress = 0;
+/* Configured engine context for status footer ctx X/Y (not prompt size). */
+static uint32_t agent_configured_context = 0;
 // An exact boundary after the generated schema makes durable tool-protocol
 // identity unambiguous even when the caller's custom system text is arbitrary.
 static const char tool_protocol_boundary[] =
     "\n<q27_tool_protocol version=\"selection-handles-v1\"/>\n\n";
 
 static void on_signal(int sig) {
-    (void)sig;
     int saved_errno = errno;
     interrupted = 1;
+    last_signal = sig;
     if (signal_pipe[1] >= 0) {
         const unsigned char byte = 1;
         (void)write(signal_pipe[1], &byte, 1);
     }
     errno = saved_errno;
+}
+
+/* Clear a soft SIGINT so the interactive loop can resume. Never overwrites a
+ * hard signal: only store last_signal=0 while the latch is still SIGINT.
+ * Returns 0 if a hard signal is present or arrives during the transition. */
+static int try_ack_sigint(void) {
+    if (last_signal != SIGINT) return 0;
+    interrupted = 0;
+    if (last_signal != SIGINT) {
+        interrupted = 1;
+        return 0;
+    }
+    last_signal = 0;
+    if (last_signal != 0 && last_signal != SIGINT) {
+        interrupted = 1;
+        return 0;
+    }
+    if (signal_pipe[0] >= 0) {
+        for (;;) {
+            struct pollfd p = {.fd = signal_pipe[0], .events = POLLIN};
+            if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) break;
+            unsigned char sink[64];
+            if (read(signal_pipe[0], sink, sizeof(sink)) <= 0) break;
+        }
+    }
+    if (last_signal != 0 && last_signal != SIGINT) {
+        interrupted = 1;
+        return 0;
+    }
+    return 1;
 }
 
 typedef struct {
@@ -111,8 +153,9 @@ static void usage(FILE *out, const char *argv0) {
         "Tool grammar stays engaged under temperature sampling (masks apply\n"
         "before the draw). Compaction summaries always run greedy.\n"
         "\n"
-        "interactive: :save, :compact, :read PATH, :search PATH NEEDLE,\n"
-        "             :shell COMMAND, :quit\n",
+        "interactive (TTY): linenoise editor + status footer; /help for\n"
+        "  commands. Slash and colon forms both work (/save, :save, …).\n"
+        "interactive (pipe): plain line reader; same commands.\n",
         argv0);
 }
 
@@ -250,6 +293,42 @@ static int transcript_append_len(transcript *t, const char *role,
 
 static int transcript_append(transcript *t, const char *role, const char *content) {
     return transcript_append_len(t, role, content, strlen(content));
+}
+
+/* Harness-authored tool responses use this exact open tag (see
+ * append_tool_response). Require the close tag and a preceding assistant
+ * </tool_call> so ordinary chat text is not mistaken for tool evidence. */
+static int transcript_is_auto_tool_response_at(const transcript *t, size_t i) {
+    static const char open[] = "<tool_response>\n";
+    static const char close[] = "\n</tool_response>";
+    static const char call_close[] = "</tool_call>";
+    const size_t open_len = sizeof(open) - 1;
+    const size_t close_len = sizeof(close) - 1;
+    const size_t call_close_len = sizeof(call_close) - 1;
+    if (!t || i == 0 || i >= t->len) return 0;
+    const owned_message *m = &t->items[i];
+    if (!m->role || strcmp(m->role, "user") || !m->content ||
+        m->content_len < open_len + close_len ||
+        memcmp(m->content, open, open_len) ||
+        memcmp(m->content + m->content_len - close_len, close, close_len))
+        return 0;
+    const owned_message *prev = &t->items[i - 1];
+    return prev->role && !strcmp(prev->role, "assistant") && prev->content &&
+           prev->content_len >= call_close_len &&
+           memmem(prev->content, prev->content_len, call_close,
+                  call_close_len) != NULL;
+}
+
+/* Pop the last message if it is a human user prompt (not a tool_response). */
+static void transcript_pop_last_human_user(transcript *t) {
+    if (!t || t->len <= 1) return;
+    const size_t i = t->len - 1;
+    if (!t->items[i].role || strcmp(t->items[i].role, "user") ||
+        transcript_is_auto_tool_response_at(t, i))
+        return;
+    free(t->items[i].role);
+    free(t->items[i].content);
+    t->len--;
 }
 
 static int transcript_append_assistant(transcript *t, const char *content,
@@ -729,7 +808,8 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
     uint32_t prompt_tokens = 0, cached_tokens = 0;
     uint32_t prefill_tokens = 0, output_tokens = 0;
     int tool_call_complete = 0, eos_reached = 0, terminal = 0;
-    int prefill_line_open = 0;
+    int prefill_line_open = 0, gen_status_shown = 0;
+    uint32_t seen_prompt_tokens = 0;
     while (!terminal) {
         q27_agent_event event;
         int got = q27_agent_worker_next_event(worker, &event,
@@ -750,15 +830,43 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
         if (event.type == Q27_EVENT_PREFILL_PROGRESS &&
             !jsonl && display_text && isatty(STDERR_FILENO) &&
             event.prompt_tokens) {
+            seen_prompt_tokens = event.prompt_tokens;
             uint64_t completed = (uint64_t)event.cached_tokens +
                                  event.prefill_tokens;
             if (completed > event.prompt_tokens) completed = event.prompt_tokens;
             const unsigned percent =
                 (unsigned)(completed * 100 / event.prompt_tokens);
-            if (fprintf(stderr,
-                        "\r[q27-agent prefill %llu/%u (%u%%); cached=%u]",
-                        (unsigned long long)completed, event.prompt_tokens,
-                        percent, event.cached_tokens) < 0 || fflush(stderr) == EOF) {
+            int wrote;
+            /* ANSI erase + TUI status only in the interactive TUI loop; plain
+             * TTY/--prompt/TERM=dumb keep the legacy one-line progress form. */
+            if (interactive_tui_progress && q27_tui_available()) {
+                q27_tui_status pst = {
+                    .phase = Q27_TUI_PREFILL,
+                    .ctx_used = (uint32_t)completed,
+                    .ctx_size = agent_configured_context
+                                    ? agent_configured_context
+                                    : event.prompt_tokens,
+                    .prefill_done = (uint32_t)completed,
+                    .prefill_total = event.prompt_tokens,
+                };
+                char sbuf[256];
+                if (q27_tui_format_status(&pst, sbuf, sizeof(sbuf)) > 0)
+                    wrote = fprintf(stderr, "\r\x1b[2K%s", sbuf);
+                else
+                    wrote = fprintf(stderr,
+                                    "\r[q27-agent prefill %llu/%u (%u%%); "
+                                    "cached=%u]",
+                                    (unsigned long long)completed,
+                                    event.prompt_tokens, percent,
+                                    event.cached_tokens);
+            } else {
+                wrote = fprintf(stderr,
+                                "\r[q27-agent prefill %llu/%u (%u%%); cached=%u]",
+                                (unsigned long long)completed,
+                                event.prompt_tokens, percent,
+                                event.cached_tokens);
+            }
+            if (wrote < 0 || fflush(stderr) == EOF) {
                 output.failed = 1;
             } else if (completed == event.prompt_tokens) {
                 if (fputc('\n', stderr) == EOF || fflush(stderr) == EOF)
@@ -769,6 +877,29 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
             }
         }
         if (event.type == Q27_EVENT_TEXT_DELTA) {
+            /* Phase 1: one-shot generating chrome on stderr (sticky multiphase
+             * footer while streaming is Phase 2 — editor is already stopped). */
+            if (!gen_status_shown && interactive_tui_progress && !jsonl &&
+                display_text && isatty(STDERR_FILENO)) {
+                if (prefill_line_open) {
+                    if (fputc('\n', stderr) == EOF) output.failed = 1;
+                    prefill_line_open = 0;
+                }
+                q27_tui_status gst = {
+                    .phase = Q27_TUI_GENERATING,
+                    .ctx_used = seen_prompt_tokens
+                                    ? seen_prompt_tokens
+                                    : (event.prompt_tokens
+                                           ? event.prompt_tokens
+                                           : prompt_tokens),
+                    .ctx_size = agent_configured_context,
+                    .gen_tokens = 0,
+                };
+                char sbuf[256];
+                if (q27_tui_format_status(&gst, sbuf, sizeof(sbuf)) > 0)
+                    (void)fprintf(stderr, "%s\n", sbuf);
+                gen_status_shown = 1;
+            }
             if (!output_append(&output, event.data, event.data_len))
                 output.failed = 1;
             if (!jsonl && display_text && !output.failed && event.data_len &&
@@ -1607,6 +1738,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "q27-agent: compaction threshold exceeds context\n");
         return 2;
     }
+    agent_configured_context = context;
 
     if (!setup_signal_pipe()) {
         fprintf(stderr, "q27-agent: could not create signal pipe: %s\n",
@@ -1652,6 +1784,7 @@ int main(int argc, char **argv) {
     transcript chat = {0};
     char *current_snapshot_name = NULL;
     int ok = 1, loaded_session = 0;
+    uint32_t last_ctx_used = 0;
     if (session_path) {
         struct stat session_stat;
         if (lstat(session_path, &session_stat) == 0) {
@@ -1701,6 +1834,7 @@ int main(int argc, char **argv) {
                     current_snapshot_name = saved.snapshot_name;
                     saved.snapshot_name = NULL;
                     loaded_session = 1;
+                    last_ctx_used = restored_tokens;
                     fprintf(stderr,
                             "[q27-agent session loaded: %s; ledger=%u]\n",
                             session_path, restored_tokens);
@@ -1754,52 +1888,202 @@ int main(int argc, char **argv) {
                                   &current_snapshot_name, &chat, think,
                                   auto_tools, context, tokenizer_sha1, jsonl);
     } else if (ok) {
-        char *line = NULL;
-        size_t len = 0, cap = 0;
+        const int use_tui = !jsonl && q27_tui_available();
+        interactive_tui_progress = use_tui;
+        q27_agent_editor *editor =
+            use_tui ? q27_agent_editor_create(signal_pipe[0]) : NULL;
+        if (use_tui && !editor) {
+            fprintf(stderr, "q27-agent: out of memory creating editor\n");
+            ok = 0;
+        }
+        char *plain_line = NULL;
+        size_t plain_len = 0, plain_cap = 0;
         input_reader reader = {0};
-        fprintf(stderr, "q27-agent native session; enter :quit to exit\n");
+
+        if (ok) {
+            fprintf(stderr,
+                    "q27-agent native session; /help for commands, /quit to exit\n");
+            if (use_tui)
+                fprintf(stderr,
+                        "TUI: linenoise editor + status footer (ds4/pi inspired)\n");
+        }
+
         while (ok) {
             if (interrupted) { ok = 0; break; }
-            fputs("q27> ", stderr);
-            fflush(stderr);
-            errno = 0;
-            int had_newline = 0;
-            int result = read_line_interruptible(&reader, &line, &len, &cap,
+
+            q27_tui_status st = {
+                .phase = Q27_TUI_IDLE,
+                .ctx_used = last_ctx_used,
+                .ctx_size = context,
+            };
+            if (editor) q27_agent_editor_set_status(editor, &st);
+
+            char *owned_line = NULL;
+            size_t len = 0;
+            int result;
+            if (editor) {
+                result = q27_agent_editor_read_line(editor, &owned_line);
+                if (result == 1 && owned_line) len = strlen(owned_line);
+            } else {
+                fputs("q27> ", stderr);
+                fflush(stderr);
+                errno = 0;
+                int had_newline = 0;
+                result = read_line_interruptible(&reader, &plain_line,
+                                                 &plain_len, &plain_cap,
                                                  &had_newline);
+                if (result == 1) {
+                    if (had_newline && plain_len > 0 && plain_line &&
+                        plain_line[plain_len - 1] == '\r')
+                        --plain_len;
+                    len = plain_len;
+                    /* Copy exact byte length (not strndup): embedded NULs must
+                     * survive until the memchr check below, and empty lines
+                     * leave plain_line NULL. */
+                    owned_line = malloc(plain_len + 1);
+                    if (!owned_line) {
+                        fprintf(stderr, "q27-agent: out of memory\n");
+                        ok = 0;
+                        break;
+                    }
+                    if (plain_len && plain_line)
+                        memcpy(owned_line, plain_line, plain_len);
+                    owned_line[plain_len] = '\0';
+                }
+            }
+
             if (result <= 0) {
                 if (result == -2) {
                     fputc('\n', stderr);
                     ok = 0;
-                } else if (result == -1) {
+                    free(owned_line);
+                    break;
+                }
+                if (result == -1 && errno == EILSEQ) {
+                    fprintf(stderr, "q27-agent: input contains NUL\n");
+                    free(owned_line);
+                    continue;
+                }
+                if (result == -1) {
                     fprintf(stderr, "q27-agent: stdin read failed: %s\n",
                             strerror(errno));
                     ok = 0;
                 }
+                free(owned_line);
                 break;
             }
-            if (had_newline && len > 0 && line[len-1] == '\r') --len;
-            if ((len == 5 && !memcmp(line, ":quit", 5)) ||
-                (len == 2 && !memcmp(line, ":q", 2))) break;
-            if (len == 0) continue;
-            if (line[0] == ':') {
-                if (memchr(line, '\0', len)) {
-                    fprintf(stderr, "q27-agent: tool command contains NUL\n");
+            if (len == 0) {
+                free(owned_line);
+                continue;
+            }
+            if (memchr(owned_line, '\0', len)) {
+                fprintf(stderr, "q27-agent: input contains NUL\n");
+                free(owned_line);
+                continue;
+            }
+
+            q27_agent_cmd cmd;
+            /* JSONL interactive mode keeps legacy colon commands (:quit, …)
+             * but must pass slash-prefixed user text through as prompts
+             * (e.g. /tmp/foo). Non-JSONL accepts both / and : forms. */
+            const int parse_as_cmd =
+                !jsonl || (len > 0 && owned_line[0] == ':');
+            if (parse_as_cmd && q27_agent_cmd_parse(owned_line, len, &cmd)) {
+                if (cmd.kind == Q27_CMD_QUIT) {
+                    free(owned_line);
+                    break;
+                }
+                if (cmd.kind == Q27_CMD_HELP) {
+                    fputs(q27_agent_cmd_help_text(), stderr);
+                    free(owned_line);
                     continue;
                 }
-                char *tool_line = strndup(line, len);
-                if (!tool_line) { ok = 0; break; }
-                if (!strcmp(tool_line, ":save")) {
+                if (cmd.kind == Q27_CMD_SESSION) {
+                    fprintf(stderr,
+                            "session: path=%s snapshot=%s ctx=%u think=%s "
+                            "auto_tools=%s turns≈%zu\n",
+                            session_path ? session_path : "(none)",
+                            current_snapshot_name ? current_snapshot_name
+                                                  : "(none)",
+                            context, think ? "on" : "off",
+                            auto_tools ? "on" : "off",
+                            chat.len > 0 ? (chat.len - 1) / 2 : 0);
+                    free(owned_line);
+                    continue;
+                }
+                if (cmd.kind == Q27_CMD_NEW) {
+                    /* Durable discard first; only then clear the in-memory
+                     * transcript so a failed CAS/IO cannot leave a half-reset.
+                     * Return 2 means the namespace was already mutated (manifest
+                     * gone) but a later step failed — still clear CAS state. */
+                    if (session_path) {
+                        char discard_err[256] = {0};
+                        int discard_rc = q27_agent_session_discard(
+                            session_path, current_snapshot_name,
+                            discard_err, sizeof(discard_err));
+                        if (discard_rc == 0) {
+                            fprintf(stderr,
+                                    "q27-agent: /new could not discard session: "
+                                    "%s\n",
+                                    discard_err[0] ? discard_err : "unknown");
+                            free(owned_line);
+                            continue;
+                        }
+                        if (discard_rc == 2) {
+                            fprintf(stderr,
+                                    "q27-agent: /new: session namespace partially "
+                                    "discarded (%s); clearing in-memory state\n",
+                                    discard_err[0] ? discard_err : "uncertain");
+                        }
+                        free(current_snapshot_name);
+                        current_snapshot_name = NULL;
+                    } else {
+                        free(current_snapshot_name);
+                        current_snapshot_name = NULL;
+                    }
+                    /* Keep system message (index 0); drop the rest. */
+                    while (chat.len > 1) {
+                        free(chat.items[chat.len - 1].role);
+                        free(chat.items[chat.len - 1].content);
+                        chat.len--;
+                    }
+                    /* Drop process-local edit-selection authority from the
+                     * prior transcript so stale handles cannot be reused. */
+                    q27_agent_selection_ledger_free(selections);
+                    selections = q27_agent_selection_ledger_create(arc4random());
+                    if (!selections) {
+                        fprintf(stderr,
+                                "q27-agent: could not reallocate selection "
+                                "ledger after /new\n");
+                        ok = 0;
+                        free(owned_line);
+                        break;
+                    }
+                    last_ctx_used = 0;
+                    if (session_path)
+                        fprintf(stderr,
+                                "[q27-agent new transcript; system retained; "
+                                "session %s discarded]\n",
+                                session_path);
+                    else
+                        fprintf(stderr,
+                                "[q27-agent new transcript; system retained]\n");
+                    free(owned_line);
+                    continue;
+                }
+                if (cmd.kind == Q27_CMD_SAVE) {
                     if (!session_path)
-                        fprintf(stderr, "q27-agent: :save requires --session FILE\n");
+                        fprintf(stderr,
+                                "q27-agent: /save requires --session FILE\n");
                     else
                         ok = save_session(worker, session_path,
                                           &current_snapshot_name, &chat, think,
                                           auto_tools, context, tokenizer_sha1,
                                           jsonl);
-                    free(tool_line);
+                    free(owned_line);
                     continue;
                 }
-                if (!strcmp(tool_line, ":compact")) {
+                if (cmd.kind == Q27_CMD_COMPACT) {
                     if (!(chat.len & 1)) {
                         fprintf(stderr,
                                 "q27-agent: cannot compact an incomplete turn\n");
@@ -1810,44 +2094,77 @@ int main(int argc, char **argv) {
                                    compact_tokens, compact_keep)) {
                         fprintf(stderr,
                                 "q27-agent: no eligible turns to compact\n");
-                    } else if (session_path) {
-                        ok = save_session(worker, session_path,
-                                          &current_snapshot_name, &chat, think,
-                                          auto_tools, context, tokenizer_sha1,
-                                          jsonl);
+                    } else {
+                        if (interactive_tui_progress) {
+                            uint32_t counted = 0;
+                            if (transcript_prompt_tokens(worker, &chat, think,
+                                                         &counted) &&
+                                counted)
+                                last_ctx_used = counted;
+                        }
+                        if (session_path)
+                            ok = save_session(worker, session_path,
+                                              &current_snapshot_name, &chat,
+                                              think, auto_tools, context,
+                                              tokenizer_sha1, jsonl);
                     }
-                    free(tool_line);
+                    free(owned_line);
                     continue;
                 }
-                q27_agent_tool_request request = {
-                    .timeout_ms = 30000, .max_output_bytes = 256 * 1024};
-                if (!strncmp(tool_line, ":read ", 6) && tool_line[6]) {
-                    request.kind = Q27_TOOL_READ;
-                    request.path = tool_line + 6;
-                } else if (!strncmp(tool_line, ":search ", 8)) {
-                    char *path = tool_line + 8;
-                    char *space = strchr(path, ' ');
-                    if (space && space[1]) {
-                        *space = '\0';
-                        request.kind = Q27_TOOL_SEARCH;
-                        request.path = path;
-                        request.input = (unsigned char *)(space + 1);
-                        request.input_len = strlen(space + 1);
+                if (cmd.kind == Q27_CMD_READ || cmd.kind == Q27_CMD_SEARCH ||
+                    cmd.kind == Q27_CMD_SHELL) {
+                    q27_agent_tool_request request = {
+                        .timeout_ms = 30000, .max_output_bytes = 256 * 1024};
+                    if (cmd.kind == Q27_CMD_READ && cmd.args && cmd.args[0]) {
+                        request.kind = Q27_TOOL_READ;
+                        request.path = cmd.args;
+                    } else if (cmd.kind == Q27_CMD_SEARCH && cmd.args) {
+                        char *path = cmd.args;
+                        char *sep = path;
+                        while (*sep && !isspace((unsigned char)*sep)) sep++;
+                        if (*sep) {
+                            *sep = '\0';
+                            char *needle = sep + 1;
+                            while (*needle &&
+                                   isspace((unsigned char)*needle))
+                                needle++;
+                            if (*needle && path[0]) {
+                                request.kind = Q27_TOOL_SEARCH;
+                                request.path = path;
+                                request.input = (unsigned char *)needle;
+                                request.input_len = strlen(needle);
+                            }
+                        }
+                    } else if (cmd.kind == Q27_CMD_SHELL && cmd.args &&
+                               cmd.args[0]) {
+                        request.kind = Q27_TOOL_SHELL;
+                        request.input = (unsigned char *)cmd.args;
+                        request.input_len = strlen(cmd.args);
                     }
-                } else if (!strncmp(tool_line, ":shell ", 7) && tool_line[7]) {
-                    request.kind = Q27_TOOL_SHELL;
-                    request.input = (unsigned char *)(tool_line + 7);
-                    request.input_len = strlen(tool_line + 7);
+                    if (request.kind == Q27_TOOL_NONE)
+                        fprintf(stderr, "q27-agent: invalid tool command\n");
+                    else {
+                        ok = run_tool(worker, &request, jsonl, 1, NULL, NULL,
+                                      NULL);
+                        /* Soft-cancel tools on SIGINT only; SIGTERM exits. */
+                        if (!ok && interrupted && last_signal == SIGINT &&
+                            try_ack_sigint())
+                            ok = 1;
+                    }
+                    free(owned_line);
+                    continue;
                 }
-                if (request.kind == Q27_TOOL_NONE)
-                    fprintf(stderr, "q27-agent: invalid tool command\n");
-                else
-                    ok = run_tool(worker, &request, jsonl, 1, NULL, NULL,
-                                  NULL);
-                free(tool_line);
-                continue;
+                if (cmd.kind == Q27_CMD_UNKNOWN) {
+                    fprintf(stderr,
+                            "q27-agent: unknown command (try /help)\n");
+                    free(owned_line);
+                    continue;
+                }
             }
-            ok = transcript_append_len(&chat, "user", line, len);
+
+            /* Keep user text for cancel rollback: prepare_turn may compact
+             * and rewrite indices, so a pre-append length is not stable. */
+            ok = transcript_append_len(&chat, "user", owned_line, len);
             if (ok && auto_tools)
                 ok = run_agent_cycle(worker, &chat, selections,
                                      think, context, max_tokens,
@@ -1856,19 +2173,115 @@ int main(int argc, char **argv) {
                                      compact_tokens, compact_keep);
             else if (ok) {
                 uint32_t turn_max_tokens = 0;
+                turn_accounting accounting = {0};
                 ok = prepare_turn(worker, &chat, think, context, max_tokens,
                                   adaptive_tokens, 0, compact_at,
                                   compact_tokens, compact_keep,
                                   &turn_max_tokens) &&
                      run_turn(worker, &chat, think, 0, turn_max_tokens,
-                              sampling, jsonl, 1, NULL, NULL, NULL, NULL);
+                              sampling, jsonl, 1, NULL, NULL, NULL,
+                              &accounting);
+                /* Recount only when the TUI footer will show it. */
+                if (ok && interactive_tui_progress) {
+                    uint32_t counted = 0;
+                    if (transcript_prompt_tokens(worker, &chat, think,
+                                                 &counted) &&
+                        counted)
+                        last_ctx_used = counted;
+                    else if (accounting.prompt_tokens)
+                        last_ctx_used = accounting.prompt_tokens;
+                } else if (ok && accounting.prompt_tokens) {
+                    last_ctx_used = accounting.prompt_tokens;
+                }
+            }
+            /* SIGINT cancels the active turn and resumes the editor. SIGTERM
+             * (and other hard signals) keep the interrupted latch and exit.
+             * Soft path: roll back when no tool work has been recorded yet;
+             * if auto-tools already ran, keep tool evidence, close an incomplete
+             * (even-length) turn, save, then resume. Idle SIGINT exits via
+             * read_line -2. */
+            if (!ok && interrupted) {
+                if (last_signal != SIGINT) {
+                    free(owned_line);
+                    owned_line = NULL;
+                    break;
+                }
+                /* Last human user (not harness tool_response) ⇒ cancel before
+                 * any assistant/tool work: drop that prompt. Otherwise close
+                 * open tool structure and make the transcript odd-length. */
+                const int last_is_human_user =
+                    chat.len > 1 && chat.items[chat.len - 1].role &&
+                    !strcmp(chat.items[chat.len - 1].role, "user") &&
+                    !transcript_is_auto_tool_response_at(&chat, chat.len - 1);
+                if (last_is_human_user) {
+                    transcript_pop_last_human_user(&chat);
+                } else {
+                    static const char call_close[] = "</tool_call>";
+                    if (chat.len > 1 && chat.items[chat.len - 1].role &&
+                        !strcmp(chat.items[chat.len - 1].role, "assistant") &&
+                        chat.items[chat.len - 1].content &&
+                        chat.items[chat.len - 1].content_len >=
+                            sizeof(call_close) - 1 &&
+                        memmem(chat.items[chat.len - 1].content,
+                               chat.items[chat.len - 1].content_len,
+                               call_close, sizeof(call_close) - 1)) {
+                        if (!append_failed_tool_response(
+                                &chat, "interrupted by user")) {
+                            fprintf(stderr,
+                                    "q27-agent: could not close interrupted "
+                                    "tool call\n");
+                            free(owned_line);
+                            owned_line = NULL;
+                            ok = 0;
+                            break;
+                        }
+                    }
+                    if (chat.len > 1 && !(chat.len & 1)) {
+                        static const char interrupted_note[] =
+                            "[interrupted by user]";
+                        if (!transcript_append_assistant(
+                                &chat, interrupted_note,
+                                sizeof(interrupted_note) - 1, think)) {
+                            fprintf(stderr,
+                                    "q27-agent: could not close interrupted "
+                                    "turn\n");
+                            free(owned_line);
+                            owned_line = NULL;
+                            ok = 0;
+                            break;
+                        }
+                    }
+                }
+                free(owned_line);
+                owned_line = NULL;
+                if (!try_ack_sigint()) {
+                    ok = 0;
+                    break;
+                }
+                ok = 1;
+                if (!last_is_human_user && session_path)
+                    (void)save_session(worker, session_path,
+                                       &current_snapshot_name, &chat, think,
+                                       auto_tools, context, tokenizer_sha1,
+                                       jsonl);
+                continue;
+            }
+            free(owned_line);
+            owned_line = NULL;
+            /* After auto-tools turns, refresh TUI footer ctx when shown. */
+            if (ok && auto_tools && interactive_tui_progress) {
+                uint32_t counted = 0;
+                if (transcript_prompt_tokens(worker, &chat, think, &counted) &&
+                    counted)
+                    last_ctx_used = counted;
             }
             if (ok) ok = save_session(worker, session_path,
                                       &current_snapshot_name, &chat, think,
                                       auto_tools, context, tokenizer_sha1,
                                       jsonl);
         }
-        free(line);
+        free(plain_line);
+        q27_agent_editor_free(editor);
     }
 
     q27_agent_selection_ledger_free(selections);

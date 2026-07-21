@@ -355,9 +355,18 @@ After Phase 0, port from the pinned DS4 agent in this order:
 5. ~~q27 `<tool_call>` parsing and constrained generation (not DSML)~~;
 6. ~~transcript/session persistence using `Q27SNAP1` (not DS4 payloads)~~;
 7. ~~compaction~~;
-8. optional terminal UI and browser tooling.
+8. **terminal UI (in progress on `agent-tui`)** — linenoise editor, status
+   footer, slash commands; design note
+   `docs/metal/plans/2026-07-21-agent-tui.md`. Browser tooling still deferred.
 
-The remaining product slice is optional terminal/browser UX. Persistence and
-compaction retain the exact resident-token ledger and private-file publication
-contract; tool calls remain opt-in and continue to use separate
-generation/tool terminals.
+### Interactive TUI (Phase 1)
+
+On a TTY, interactive mode uses a ds4-style linenoise editor with:
+
+- line editing, history, multiline paste
+- sticky status footer (`ctx used/size | idle|prefill|…`)
+- slash commands (`/help`, `/quit`, `/save`, `/compact`, `/session`, `/new`,
+  `/read`, `/search`, `/shell`) plus legacy colon forms
+
+Non-TTY stdin keeps the plain interruptible line reader. JSONL and
+`--prompt` paths are unchanged.

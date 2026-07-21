@@ -23,8 +23,10 @@ typedef struct { unsigned char *p; size_t len; size_t cap; } bytes;
 
 static int read_private_file(const char *path, unsigned char **data, size_t *len,
                              char *error, size_t error_cap);
-static int manifest_snapshot_name(const char *path, char **name,
-                                  char *error, size_t error_cap);
+static int read_private_fd(int fd, unsigned char **data, size_t *len,
+                           char *error, size_t error_cap);
+static int manifest_snapshot_name_at(int dfd, const char *base, char **name,
+                                     char *error, size_t error_cap);
 
 static void set_error(char *out, size_t cap, const char *text) {
     if (out && cap) snprintf(out, cap, "%s", text ? text : "session error");
@@ -351,8 +353,8 @@ int q27_agent_session_publish(const char *manifest_path,
     int current_matches = 0;
     if (old_snapshot_name) {
         char *current_name = NULL;
-        current_matches = manifest_snapshot_name(
-            manifest_path, &current_name, error, error_cap) &&
+        current_matches = manifest_snapshot_name_at(
+            dfd, base, &current_name, error, error_cap) &&
             !strcmp(current_name, old_snapshot_name);
         free(current_name);
     } else {
@@ -426,43 +428,170 @@ int q27_agent_session_publish(const char *manifest_path,
     return result;
 }
 
-static int read_private_file(const char *path, unsigned char **data, size_t *len,
-                             char *error, size_t error_cap) {
+int q27_agent_session_discard(const char *manifest_path,
+                              const char *expected_snapshot_name,
+                              char *error, size_t error_cap) {
+    char *dir = NULL, *base = NULL;
+    if (!manifest_path ||
+        !split_path(manifest_path, &dir, &base, error, error_cap))
+        return 0;
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        set_errno_error(error, error_cap, "cannot open session directory");
+        free(dir); free(base); return 0;
+    }
+    if (!protected_directory(dfd, error, error_cap)) {
+        close(dfd); free(dir); free(base); return 0;
+    }
+    size_t lock_len = strlen(base) + sizeof("..lock");
+    char *lock_name = malloc(lock_len);
+    if (!lock_name) {
+        set_error(error, error_cap, "out of memory");
+        close(dfd); free(dir); free(base); return 0;
+    }
+    snprintf(lock_name, lock_len, ".%s.lock", base);
+    int lock_fd = openat(dfd, lock_name,
+                         O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (lock_fd < 0 || fchmod(lock_fd, 0600) != 0 ||
+        flock(lock_fd, LOCK_EX) != 0) {
+        set_errno_error(error, error_cap, "cannot lock session for discard");
+        if (lock_fd >= 0) close(lock_fd);
+        free(lock_name); close(dfd); free(dir); free(base);
+        return 0;
+    }
+    free(lock_name);
+
+    struct stat current;
+    int missing = fstatat(dfd, base, &current, AT_SYMLINK_NOFOLLOW) != 0 &&
+                  errno == ENOENT;
+    if (missing) {
+        /* Manifest already gone — still require durable snapshot cleanup. */
+        int cleaned = 0;
+        if (expected_snapshot_name &&
+            valid_snapshot_name(expected_snapshot_name)) {
+            if (unlinkat(dfd, expected_snapshot_name, 0) != 0 &&
+                errno != ENOENT) {
+                set_errno_error(error, error_cap,
+                                "cannot unlink expected session snapshot");
+                close(lock_fd); close(dfd); free(dir); free(base);
+                return 0;
+            }
+            cleaned = 1;
+        }
+        if (cleaned) {
+            int sync_result = fsync(dfd);
+#ifdef Q27_AGENT_PERSISTENCE_TESTING
+            if (getenv("Q27_AGENT_TEST_DIR_FSYNC_FAIL")) {
+                errno = EIO;
+                sync_result = -1;
+            }
+#endif
+            if (sync_result != 0) {
+                set_errno_error(error, error_cap,
+                                "session discarded but directory sync failed");
+                close(lock_fd); close(dfd); free(dir); free(base);
+                return 2;
+            }
+        }
+        close(lock_fd); close(dfd); free(dir); free(base);
+        return 1;
+    }
+
+    char *live_name = NULL;
+    /* CAS against the pinned directory, not the original pathname (symlink
+     * races on a parent path must not delete a different directory's files). */
+    if (!manifest_snapshot_name_at(dfd, base, &live_name, error, error_cap)) {
+        close(lock_fd); close(dfd); free(dir); free(base);
+        return 0;
+    }
+    if (!expected_snapshot_name) {
+        /* No in-process CAS baseline: refuse to delete a live session that
+         * another process may have published after we started empty. */
+        set_error(error, error_cap,
+                  "session exists but this process has no expected snapshot");
+        free(live_name); close(lock_fd); close(dfd); free(dir); free(base);
+        return 0;
+    }
+    if (strcmp(live_name, expected_snapshot_name) != 0) {
+        set_error(error, error_cap,
+                  "session manifest changed since this process loaded it");
+        free(live_name); close(lock_fd); close(dfd); free(dir); free(base);
+        return 0;
+    }
+
+    if (unlinkat(dfd, base, 0) != 0 && errno != ENOENT) {
+        set_errno_error(error, error_cap, "cannot unlink session manifest");
+        free(live_name); close(lock_fd); close(dfd); free(dir); free(base);
+        return 0;
+    }
+    /* Manifest is gone from this process's view. Later failures must report
+     * partial success (2) so callers drop CAS expectations. */
+    if (valid_snapshot_name(live_name)) {
+        if (unlinkat(dfd, live_name, 0) != 0 && errno != ENOENT) {
+            set_errno_error(error, error_cap, "cannot unlink session snapshot");
+            free(live_name); close(lock_fd); close(dfd); free(dir); free(base);
+            return 2;
+        }
+    }
+    int sync_result = fsync(dfd);
+#ifdef Q27_AGENT_PERSISTENCE_TESTING
+    if (getenv("Q27_AGENT_TEST_DIR_FSYNC_FAIL")) {
+        errno = EIO;
+        sync_result = -1;
+    }
+#endif
+    if (sync_result != 0) {
+        set_errno_error(error, error_cap,
+                        "session discarded but directory sync failed");
+        free(live_name); close(lock_fd); close(dfd); free(dir); free(base);
+        return 2;
+    }
+    free(live_name); close(lock_fd); close(dfd); free(dir); free(base);
+    return 1;
+}
+
+static int read_private_fd(int fd, unsigned char **data, size_t *len,
+                           char *error, size_t error_cap) {
     *data = NULL; *len = 0;
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) { set_errno_error(error, error_cap, "cannot open session manifest"); return 0; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
         (st.st_mode & 077) != 0 || st.st_size < 0 ||
         (uint64_t)st.st_size > SESSION_MAX_BYTES) {
-        close(fd); errno = EPERM;
+        errno = EPERM;
         set_error(error, error_cap, "session manifest is not a private bounded regular file");
         return 0;
     }
     size_t n = (size_t)st.st_size;
     unsigned char *p = malloc(n ? n : 1);
-    if (!p) { close(fd); set_error(error, error_cap, "out of memory"); return 0; }
+    if (!p) { set_error(error, error_cap, "out of memory"); return 0; }
     size_t at = 0;
     while (at < n) {
         ssize_t got = read(fd, p + at, n - at);
         if (got < 0 && errno == EINTR) continue;
-        if (got <= 0) { free(p); close(fd); set_error(error, error_cap, "truncated session manifest"); return 0; }
+        if (got <= 0) { free(p); set_error(error, error_cap, "truncated session manifest"); return 0; }
         at += (size_t)got;
     }
     unsigned char extra;
     ssize_t more;
     do { more = read(fd, &extra, 1); } while (more < 0 && errno == EINTR);
-    close(fd);
     if (more != 0) { free(p); set_error(error, error_cap, "session manifest changed while reading"); return 0; }
     *data = p; *len = n; return 1;
 }
 
-static int manifest_snapshot_name(const char *path, char **name,
-                                  char *error, size_t error_cap) {
+static int read_private_file(const char *path, unsigned char **data, size_t *len,
+                             char *error, size_t error_cap) {
+    *data = NULL; *len = 0;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) { set_errno_error(error, error_cap, "cannot open session manifest"); return 0; }
+    int ok = read_private_fd(fd, data, len, error, error_cap);
+    close(fd);
+    return ok;
+}
+
+static int parse_manifest_snapshot_name(const unsigned char *data, size_t len,
+                                        char **name, char *error,
+                                        size_t error_cap) {
     *name = NULL;
-    unsigned char *data = NULL;
-    size_t len = 0;
-    if (!read_private_file(path, &data, &len, error, error_cap)) return 0;
     int ok = len >= SESSION_HEADER_BYTES + 4 &&
              !memcmp(data, session_magic, 8) &&
              crc32_bytes(data, len - 4) == get_u32(data + len - 4);
@@ -471,18 +600,34 @@ static int manifest_snapshot_name(const char *path, char **name,
     if (!ok || !snap_len || snap_len > 255 || snap_len > body_len ||
         body_len != len - SESSION_HEADER_BYTES - 4 ||
         memchr(data + SESSION_HEADER_BYTES, '\0', snap_len)) {
-        free(data);
         set_error(error, error_cap, "invalid current Q27AGT2 manifest");
         return 0;
     }
     *name = strndup((const char *)data + SESSION_HEADER_BYTES, snap_len);
-    free(data);
     if (!*name || !valid_snapshot_name(*name)) {
         free(*name); *name = NULL;
         set_error(error, error_cap, "invalid current snapshot name");
         return 0;
     }
     return 1;
+}
+
+static int manifest_snapshot_name_at(int dfd, const char *base, char **name,
+                                     char *error, size_t error_cap) {
+    *name = NULL;
+    int fd = openat(dfd, base, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        set_errno_error(error, error_cap, "cannot open session manifest");
+        return 0;
+    }
+    unsigned char *data = NULL;
+    size_t len = 0;
+    int ok = read_private_fd(fd, &data, &len, error, error_cap);
+    close(fd);
+    if (!ok) return 0;
+    ok = parse_manifest_snapshot_name(data, len, name, error, error_cap);
+    free(data);
+    return ok;
 }
 
 static int message_contains(const q27_agent_message *message,

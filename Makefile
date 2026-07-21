@@ -18,7 +18,7 @@ all: build/inspect build/test_kernels build/q27 build/q27-server build/test_toke
 agent: build/q27-agent
 	Q27_BIN_DIR="$(CURDIR)/build" ./packaging/bin/q27 agent
 
-test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker
+test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui
 	./build/test_artifacts
 	./build/test_depthctl
 	./build/test_toolconstrain
@@ -45,6 +45,7 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	./build/test_q27_agent_stall
 	./build/test_q27_agent_persistence
 	./build/test_q27_agent_worker
+	./build/test_q27_agent_tui
 	./packaging/test_q27_wrapper.sh
 	python3 tools/test_experimental_prefix_cache.py
 
@@ -85,6 +86,13 @@ build/test_q27_agent_worker: experiments/ds4-agent/test_q27_agent_worker.c exper
 	        experiments/ds4-agent/test_q27_agent_worker.c experiments/ds4-agent/q27_agent_worker.c \
 	        experiments/ds4-agent/q27_agent_tools.c experiments/ds4-agent/q27_agent_sha256.c -o $@
 
+build/test_q27_agent_tui: experiments/ds4-agent/test_q27_agent_tui.c experiments/ds4-agent/q27_agent_tui.c \
+                          experiments/ds4-agent/q27_agent_commands.c experiments/ds4-agent/q27_agent_tui.h \
+                          experiments/ds4-agent/q27_agent_commands.h | build
+	$(CC) $(CFLAGS) -I experiments/ds4-agent \
+	        experiments/ds4-agent/test_q27_agent_tui.c experiments/ds4-agent/q27_agent_tui.c \
+	        experiments/ds4-agent/q27_agent_commands.c -o $@
+
 ifeq ($(UNAME_S),Darwin)
 test-metal: build/test_metal build/test_metal_ops build/test_metal_stream
 	./build/test_metal
@@ -121,7 +129,7 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp sr
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
 
-build/q27_agent_c.o: experiments/ds4-agent/q27_agent.c experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_protocol.h experiments/ds4-agent/q27_agent_persistence.h experiments/ds4-agent/q27_agent_selections.h | build
+build/q27_agent_c.o: experiments/ds4-agent/q27_agent.c experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_protocol.h experiments/ds4-agent/q27_agent_persistence.h experiments/ds4-agent/q27_agent_selections.h experiments/ds4-agent/q27_agent_tui.h experiments/ds4-agent/q27_agent_editor.h experiments/ds4-agent/q27_agent_commands.h | build
 	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent.c -o $@
 
 build/q27_agent_worker_c.o: experiments/ds4-agent/q27_agent_worker.c experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_tools.h | build
@@ -142,12 +150,24 @@ build/q27_agent_sha256_c.o: experiments/ds4-agent/q27_agent_sha256.c experiments
 build/q27_agent_selections_c.o: experiments/ds4-agent/q27_agent_selections.c experiments/ds4-agent/q27_agent_selections.h experiments/ds4-agent/q27_agent_tools.h | build
 	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent_selections.c -o $@
 
-build/q27-agent: build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o experiments/ds4-agent/q27_agent_engine.cpp experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_session.h experiments/ds4-agent/q27_agent_stall.h src/toolconstrain.h src/toolgram.h \
+build/q27_agent_tui_c.o: experiments/ds4-agent/q27_agent_tui.c experiments/ds4-agent/q27_agent_tui.h | build
+	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent_tui.c -o $@
+
+build/q27_agent_commands_c.o: experiments/ds4-agent/q27_agent_commands.c experiments/ds4-agent/q27_agent_commands.h | build
+	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent_commands.c -o $@
+
+build/q27_agent_editor_c.o: experiments/ds4-agent/q27_agent_editor.c experiments/ds4-agent/q27_agent_editor.h experiments/ds4-agent/q27_agent_tui.h experiments/ds4-agent/third_party/linenoise/linenoise.h | build
+	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent_editor.c -o $@
+
+build/q27_agent_linenoise_c.o: experiments/ds4-agent/third_party/linenoise/linenoise.c experiments/ds4-agent/third_party/linenoise/linenoise.h | build
+	$(CC) $(CFLAGS) -I experiments/ds4-agent/third_party/linenoise -c experiments/ds4-agent/third_party/linenoise/linenoise.c -o $@
+
+build/q27-agent: build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o build/q27_agent_tui_c.o build/q27_agent_commands_c.o build/q27_agent_editor_c.o build/q27_agent_linenoise_c.o experiments/ds4-agent/q27_agent_engine.cpp experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_session.h experiments/ds4-agent/q27_agent_stall.h src/toolconstrain.h src/toolgram.h \
                  src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h \
                  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -fobjc-arc -pthread -I src/metal -I experiments/ds4-agent \
-	        build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o experiments/ds4-agent/q27_agent_engine.cpp src/metal/metal_engine.cpp \
+	        build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o build/q27_agent_tui_c.o build/q27_agent_commands_c.o build/q27_agent_editor_c.o build/q27_agent_linenoise_c.o experiments/ds4-agent/q27_agent_engine.cpp src/metal/metal_engine.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
 
