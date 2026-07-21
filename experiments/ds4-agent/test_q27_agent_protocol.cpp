@@ -119,6 +119,31 @@ int main() {
           "unclosed fence at EOS recovers body");
     q27_agent_tool_call_free(&call);
 
+    // Second tool call after an unclosed fence must not land as file content.
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```python\nprint(1)\n"
+                "<tool_call>{\"name\":\"shell\",\"arguments\":{"
+                "\"command\":\"pwd\"}}</tool_call>\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1,
+          "unclosed fence with a second tool call soft-fails");
+    q27_agent_tool_call_free(&call);
+
+    // Content that ends with the literal tag mid-line is kept (not protocol
+    // echo, which is always a whole trailing line).
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.txt\"}}</tool_call>\n"
+                "```\n"
+                "note: ends with </tool_call>\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body &&
+          std::string(reinterpret_cast<const char *>(call.request.input),
+                      call.request.input_len) ==
+              "note: ends with </tool_call>\n",
+          "unclosed recovery keeps mid-line </tool_call> content");
+    q27_agent_tool_call_free(&call);
+
     // Premature fence closer must still soft-fail: remaining source is not
     // protocol echo, so we refuse to publish a truncated body.
     CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"

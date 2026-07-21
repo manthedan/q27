@@ -441,8 +441,8 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
     // Observed T2/sampled pattern: open ```lang, emit the whole file, hit EOS
     // (or a trailing </tool_call> echo) without a closing fence line. Recover
     // by taking the body as everything after the opener, then stripping only
-    // trailing whitespace and protocol-echo </tool_call> tags. A premature
-    // ``` closer with more source still fails above (non-ws after closer).
+    // trailing whole-line protocol-echo </tool_call> tags. A premature ```
+    // closer with more source still fails above (non-ws after closer).
     if (content_start > len) {
         set_error(error, error_cap, "markdown fence body is not closed");
         return 0;
@@ -451,9 +451,12 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
     auto is_ws = [](unsigned char c) {
         return c == ' ' || c == '\t' || c == '\r' || c == '\n';
     };
-    // Strip trailing </tool_call> protocol echo (and whitespace around those
-    // tags) without eating the body's final content newline when no tag is
-    // present — unlike a full trim of trailing whitespace.
+    // Strip trailing whole-line </tool_call> protocol echo only. A content
+    // line that ends with the literal tag (e.g. a string/docs sample) is kept
+    // because the tag is not line-leading. Residual ambiguity: a file whose
+    // *entire last line* is </tool_call> under an unclosed fence is
+    // indistinguishable from protocol echo and is stripped (same class as
+    // closed-fence trailing-echo residual).
     static const char kCloseTag[] = "</tool_call>";
     constexpr size_t kCloseTagLen = sizeof(kCloseTag) - 1;
     for (;;) {
@@ -461,15 +464,18 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
         while (t > content_start && is_ws(bytes[t - 1])) --t;
         if (t < content_start + kCloseTagLen) {
             // Too short to hold </tool_call>. If the body is only whitespace,
-            // treat as empty; otherwise keep the short real content (common
-            // for tiny files under unclosed-fence recovery).
+            // treat as empty; otherwise keep the short real content.
             if (t == content_start) end = content_start;
             break;
         }
         if (std::memcmp(bytes + (t - kCloseTagLen), kCloseTag,
                         kCloseTagLen) != 0)
-            break; // keep end (includes trailing newlines after last content)
-        end = t - kCloseTagLen;
+            break;
+        const size_t tag_at = t - kCloseTagLen;
+        // Require a whole trailing line: tag at body start or after '\n'.
+        if (tag_at != content_start && bytes[tag_at - 1] != '\n')
+            break;
+        end = tag_at;
     }
     // Optional dangling closer line at EOF (only spaces + >=open_ticks
     // backticks). end = start of that line so content keeps the preceding LF
@@ -493,6 +499,18 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
     if (content_len == 0) {
         set_error(error, error_cap, "markdown fence body is not closed");
         return 0;
+    }
+    // Fail closed if the unclosed region contains another tool-call opener:
+    // recovery would otherwise publish a second call as file bytes (closed
+    // fences already reject non-ws after the closer).
+    static const char kOpenTag[] = "<tool_call";
+    constexpr size_t kOpenTagLen = sizeof(kOpenTag) - 1;
+    for (size_t j = content_start; j + kOpenTagLen <= end; ++j) {
+        if (std::memcmp(bytes + j, kOpenTag, kOpenTagLen) == 0) {
+            set_error(error, error_cap,
+                      "unclosed fence body contains another tool call");
+            return 0;
+        }
     }
     unsigned char *copy =
         static_cast<unsigned char *>(std::malloc(content_len + 1));
