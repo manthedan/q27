@@ -552,6 +552,7 @@ static void *worker_main(void *opaque) {
             Q27_EVENT_TOOL_DONE : kind == REQUEST_SESSION ?
             Q27_EVENT_SESSION_DONE :
             status == Q27_AGENT_REJECTED ? Q27_EVENT_REJECTED :
+            status == Q27_AGENT_STALLED ? Q27_EVENT_STALLED :
             status == Q27_AGENT_ERROR ? Q27_EVENT_ERROR : Q27_EVENT_TURN_DONE;
         publish_terminal(worker, command_id, terminal_type, status, prompt_tokens,
                          cached_tokens, prefill_tokens, output_tokens,
@@ -812,6 +813,7 @@ int q27_agent_worker_next_event(q27_agent_worker *worker,
                          event->type == Q27_EVENT_TOOL_DONE ||
                          event->type == Q27_EVENT_SESSION_DONE ||
                          event->type == Q27_EVENT_REJECTED ||
+                         event->type == Q27_EVENT_STALLED ||
                          event->type == Q27_EVENT_ERROR;
     if (terminal && event->command_id == worker->command_id) {
         worker->terminal_pending = 0;

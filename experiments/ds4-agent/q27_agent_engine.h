@@ -25,7 +25,8 @@ typedef enum {
     Q27_AGENT_OK = 0,
     Q27_AGENT_CANCELLED = 1,
     Q27_AGENT_REJECTED = 2, // request validation failed; engine remains reusable
-    Q27_AGENT_ERROR = 3     // engine/runtime failure; worker may be poisoned
+    Q27_AGENT_ERROR = 3,    // engine/runtime failure; worker may be poisoned
+    Q27_AGENT_STALLED = 4   // bounded output watchdog; resident reuse invalidated
 } q27_agent_status;
 
 q27_agent_engine *q27_agent_engine_open(const char *model_path,
@@ -44,7 +45,9 @@ q27_agent_status q27_agent_engine_tokenizer_sha1(
 // enable_tools is set, greedy decode grammar-locks registered <tool_call>
 // bodies and stops exactly after a valid closer. eos_reached distinguishes a
 // natural complete response (including EOS as the next token at the exact
-// bound) from max-token/tool-call termination.
+// bound) from max-token/tool-call termination. Conservative empty-decode,
+// whitespace-run, identical-token, and short-cycle bounds return
+// Q27_AGENT_STALLED before streaming the triggering token and invalidate reuse.
 q27_agent_status q27_agent_generate(q27_agent_engine *engine,
                                      const q27_agent_message *messages,
                                      size_t message_count,

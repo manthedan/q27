@@ -68,6 +68,15 @@ q27_agent_status q27_agent_generate(
         return Q27_AGENT_REJECTED;
     }
     if (!alive(opaque)) return Q27_AGENT_CANCELLED;
+    if (messages[0].content_len == 5 &&
+        memcmp(messages[0].content, "stall", 5) == 0) {
+        if (!sink("partial", 7, opaque)) return Q27_AGENT_CANCELLED;
+        *prompt_tokens = 6;
+        *prefill_tokens = 6;
+        *output_tokens = 1;
+        snprintf(error, error_cap, "generation stalled");
+        return Q27_AGENT_STALLED;
+    }
     if (messages[0].content_len == 4 &&
         memcmp(messages[0].content, "call", 4) == 0) {
         static const char body[] =
@@ -202,7 +211,9 @@ typedef struct {
     size_t deltas;
     uint64_t last_sequence;
     q27_agent_status terminal_status;
+    q27_agent_event_type terminal_type;
     q27_agent_worker_state terminal_state;
+    char terminal_message[64];
     uint32_t prompt_tokens;
     uint32_t cached_tokens;
     uint32_t prefill_tokens;
@@ -250,11 +261,17 @@ static int drain_command(q27_agent_worker *worker, uint64_t command_id,
                        event.type == Q27_EVENT_TOOL_DONE ||
                        event.type == Q27_EVENT_SESSION_DONE ||
                        event.type == Q27_EVENT_REJECTED ||
+                       event.type == Q27_EVENT_STALLED ||
                        event.type == Q27_EVENT_ERROR;
         if (terminal) {
             out->terminals++;
             out->terminal_status = event.status;
+            out->terminal_type = event.type;
             out->terminal_state = event.state;
+            size_t message_len = event.data_len < sizeof(out->terminal_message) - 1 ?
+                                 event.data_len : sizeof(out->terminal_message) - 1;
+            if (message_len) memcpy(out->terminal_message, event.data, message_len);
+            out->terminal_message[message_len] = '\0';
             out->prompt_tokens = event.prompt_tokens;
             out->cached_tokens = event.cached_tokens;
             out->prefill_tokens = event.prefill_tokens;
@@ -351,6 +368,22 @@ int main(void) {
           "terminal session accounting and EOS completion survive event queue");
     CHECK(q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
           "terminal consumption reopens admission");
+
+    q27_agent_message stalled = {
+        .role = "user", .content = "stall", .content_len = 5};
+    CHECK(q27_agent_worker_submit(worker, &stalled, 1, 0, 1, 8, alive, NULL,
+                                  &command, error, sizeof(error)) == Q27_AGENT_OK,
+          "watchdog terminal command submits");
+    CHECK(drain_command(worker, command, &result) &&
+          result.states == 1 && result.deltas == 1 && result.terminals == 1 &&
+          result.len == 7 && !memcmp(result.bytes, "partial", 7) &&
+          result.terminal_type == Q27_EVENT_STALLED &&
+          result.terminal_status == Q27_AGENT_STALLED &&
+          result.terminal_state == Q27_WORKER_IDLE &&
+          result.output_tokens == 1 && result.eos_reached == 0 &&
+          !strcmp(result.terminal_message, "generation stalled") &&
+          q27_agent_worker_get_state(worker) == Q27_WORKER_IDLE,
+          "stalled generation is explicit, accounted, and reopens worker admission");
 
     q27_agent_message call = {
         .role = "user", .content = "call", .content_len = 4};

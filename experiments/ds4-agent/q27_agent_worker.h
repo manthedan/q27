@@ -37,6 +37,7 @@ typedef enum {
     Q27_EVENT_TOOL_DONE,
     Q27_EVENT_SESSION_DONE,
     Q27_EVENT_REJECTED,
+    Q27_EVENT_STALLED,
     Q27_EVENT_ERROR
 } q27_agent_event_type;
 
@@ -83,7 +84,8 @@ q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
 
 // Deep-copies every message before returning. enable_tools opts into the fixed
 // native-tool grammar; a closed call ends generation and is reported on the
-// terminal event. alive/opaque remain borrowed
+// terminal event. Watchdog termination reports Q27_EVENT_STALLED with
+// Q27_AGENT_STALLED and leaves worker admission reusable. alive/opaque remain borrowed
 // until the command's terminal event is consumed; the owner must keep them
 // valid and close submission admission before destructive stop.
 q27_agent_status q27_agent_worker_submit(

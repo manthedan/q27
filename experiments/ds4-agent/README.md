@@ -55,6 +55,8 @@ Interactive mode omits `--prompt`; `:quit` exits. Machine-readable events use:
 
 Every JSONL row carries monotonic `seq`, `command_id`, event `type`, state,
 status, accounting, and exact `data_b64` bytes. Diagnostics remain on stderr.
+A watchdog terminal is emitted as `type=generation_stalled`, `status=stalled`,
+and exact data `generation stalled`.
 Tokenizer counts and Q27SNAP1 save/load use the same internal command/event
 boundary. JSONL exposes validated loads and emits a distinct `session_done`
 only after durable manifest publication (or a rejected `session_done` on
@@ -260,8 +262,15 @@ allowed only when the prior exact prompt-plus-generated token ledger is a
 stable prefix and `MetalEngine::position()` matches its encoded length. The
 adapter finalizes each emitted token into resident state when context permits,
 then ingests only the newly rendered ChatML suffix. Any token or position
-mismatch resets and re-prefills; cancellation or runtime error invalidates the
-ledger so the next valid request also resets.
+mismatch resets and re-prefills; cancellation, runtime error, or watchdog stall
+invalidates the ledger so the next valid request also resets.
+
+Generation has conservative allocation-free no-progress bounds: 64 consecutive
+empty decoded tokens, 256 consecutive ASCII whitespace bytes, 128 identical
+tokens, or a 2–8-token cycle spanning 256 tokens. The triggering token is not
+streamed. Earlier streamed bytes remain an irreversible preview, but the turn
+fails with `generation stalled`; incomplete calls and raw payloads are discarded
+without side effects.
 
 The no-thinking prefix is retained in the private assistant transcript, even
 though it is not duplicated on stdout. This makes the next render token-exact
@@ -294,14 +303,16 @@ the dedicated engine-owner thread. The JSONL smoke produced exactly
 `state → text_delta → turn_done`; decoding `data_b64` yielded `events`.
 `build/test_q27_agent_worker` uses a fake adapter to gate startup failure,
 deep binary message/tool ownership, monotonic generation and tool lifecycle
-events, request rejection, 4094-event queue backpressure (5000 deltas),
-cancellation terminals, and shutdown ordering without loading a model.
-`build/test_q27_agent_tools` gates binary read/search/write/edit-selection/shell output,
+events, an explicit stalled-generation terminal, request rejection, 4094-event
+queue backpressure (5000 deltas), cancellation terminals, and shutdown ordering
+without loading a model. `build/test_q27_agent_tools` gates binary
+read/search/write/edit-selection/shell output, path and symlink rejection,
+create-only atomic write publication, exact-one edit publication/mode
+preservation, shell workspace, timeout, cancellation, and output bounds.
 `build/test_q27_agent_selections` gates annotation budgets, exact handle
-resolution, path mismatch, unknown IDs, and 256-slot expiry,
-path and symlink rejection, create-only atomic write publication, exact-one
-edit publication/mode preservation, shell workspace, timeout, cancellation,
-and output bounds.
+resolution, path mismatch, unknown IDs, and 256-slot expiry.
+`build/test_q27_agent_stall` gates every watchdog threshold, progress resets,
+and a long progressing-output control.
 `build/test_q27_agent_persistence` gates binary transcript round trips, CRC
 rejection, mode-0600 publication, immutable snapshot replacement, and
 tool-boundary-preserving compaction cuts. Their ASan/UBSan legs are clean.

@@ -272,8 +272,11 @@ shared with `q27 serve`, preventing concurrent multi-GB model launches. The
 lock is inherited across `exec` and released automatically on every process
 exit, including signals and crashes. Read/search results expose short,
 digest-bound line-selection handles so B1 can edit one exact occurrence without
-regenerating a unique `old` string; stale selections fail before mutation. File
-helpers stay workspace-bounded, but automatic shell retains the local account's
+regenerating a unique `old` string; stale selections fail before mutation.
+Conservative no-progress bounds terminate pathological output explicitly as
+`generation stalled`, invalidate resident reuse, and discard incomplete calls
+or raw payloads without side effects. File helpers stay workspace-bounded, but
+automatic shell retains the local account's
 filesystem access; use a disposable checkout when testing an untrusted prompt.
 
 ## Server

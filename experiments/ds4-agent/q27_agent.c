@@ -309,6 +309,7 @@ static const char *event_type_name(q27_agent_event_type type) {
     case Q27_EVENT_TOOL_DONE: return "tool_done";
     case Q27_EVENT_SESSION_DONE: return "session_done";
     case Q27_EVENT_REJECTED: return "rejected";
+    case Q27_EVENT_STALLED: return "generation_stalled";
     case Q27_EVENT_ERROR: return "error";
     }
     return "unknown";
@@ -320,6 +321,7 @@ static const char *status_name(q27_agent_status status) {
     case Q27_AGENT_CANCELLED: return "cancelled";
     case Q27_AGENT_REJECTED: return "rejected";
     case Q27_AGENT_ERROR: return "error";
+    case Q27_AGENT_STALLED: return "stalled";
     }
     return "unknown";
 }
@@ -515,6 +517,7 @@ static int run_tool(q27_agent_worker *worker,
         if (jsonl && !print_json_event(&event)) output_failed = 1;
         terminal = event.type == Q27_EVENT_TOOL_DONE ||
                    event.type == Q27_EVENT_REJECTED ||
+                   event.type == Q27_EVENT_STALLED ||
                    event.type == Q27_EVENT_ERROR;
         if (terminal) {
             status = event.status;
@@ -620,6 +623,7 @@ static int run_session_command(q27_agent_worker *worker,
         }
         terminal = event.type == Q27_EVENT_SESSION_DONE ||
                    event.type == Q27_EVENT_REJECTED ||
+                   event.type == Q27_EVENT_STALLED ||
                    event.type == Q27_EVENT_ERROR;
         if (terminal) {
             status = event.status;
@@ -707,6 +711,7 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
 
         terminal = event.type == Q27_EVENT_TURN_DONE ||
                    event.type == Q27_EVENT_REJECTED ||
+                   event.type == Q27_EVENT_STALLED ||
                    event.type == Q27_EVENT_ERROR;
         if (terminal) {
             status = event.status;

@@ -1,6 +1,7 @@
 #include "q27_agent_engine.h"
 #include "q27_agent_protocol.h"
 #include "q27_agent_session.h"
+#include "q27_agent_stall.h"
 
 #include "../../src/metal/metal_engine.h"
 #include "../../src/tokenizer.h"
@@ -540,6 +541,7 @@ extern "C" q27_agent_status q27_agent_generate(
         const uint32_t eos = static_cast<uint32_t>(engine->tokenizer->eos());
         uint32_t produced = 0;
         bool stopped_for_tool_call = false;
+        q27::agent::StallWatcher stall_watcher;
         while (produced < max_tokens && current != eos) {
             if (!alive(opaque)) {
                 if (output_tokens) *output_tokens = produced;
@@ -573,6 +575,17 @@ extern "C" q27_agent_status q27_agent_generate(
 
             const std::string bytes =
                 engine->tokenizer->decode_one(static_cast<int>(current));
+            if (stall_watcher.observe(current, bytes) !=
+                q27::agent::StallReason::None) {
+                // Prior streamed bytes cannot be withdrawn. The triggering
+                // token is not streamed or recorded, and all resident reuse
+                // authority is discarded before reporting the distinct
+                // terminal reason.
+                engine->agent_session.invalidate();
+                if (output_tokens) *output_tokens = produced;
+                set_error(error, error_cap, "generation stalled");
+                return Q27_AGENT_STALLED;
+            }
             if (!bytes.empty() && !sink(bytes.data(), bytes.size(), opaque)) {
                 if (output_tokens) *output_tokens = produced;
                 return cancelled();
