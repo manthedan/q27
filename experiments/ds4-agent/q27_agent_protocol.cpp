@@ -359,10 +359,14 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
         }
         ++content_start;
     }
-    // Line-oriented fence transport: content is every byte up to (not including)
-    // the closer line. A non-empty last content line therefore ends with its
-    // terminating LF/CRLF; that is intentional markdown semantics, not a
-    // post-process "add newline". Empty files use an empty fence body.
+    // Line-oriented fence transport (CommonMark code-fence semantics): content
+    // is every byte up to (not including) the closer line. A non-empty final
+    // content line therefore ends with its terminating LF/CRLF — this is not a
+    // silent rewrite of an arbitrary byte string; the fence grammar cannot
+    // express "last line without line ending" any more than CommonMark can.
+    // Empty files use an empty fence body. Models that need a trailing newline
+    // (normal for source) already get one; that is the intentional trade for
+    // no-JSON escaping.
     for (size_t line_start = content_start; line_start <= len;) {
         size_t line_end = line_start;
         while (line_end < len && bytes[line_end] != '\n') ++line_end;
@@ -503,7 +507,11 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
     const unsigned char *bytes, size_t len, q27_agent_tool_call *call,
     char *error, size_t error_cap) {
     if (call) *call = q27_agent_tool_call{};
-    if (!bytes || !call || len > 1024u * 1024u) {
+    // Same-turn bodies can approach the filesystem tool's 8 MiB file cap; leave
+    // headroom for ChatML prose, the JSON header, and outer fence lines.
+    constexpr size_t kMaxToolCallParseBytes =
+        8u * 1024u * 1024u + 256u * 1024u;
+    if (!bytes || !call || len > kMaxToolCallParseBytes) {
         set_error(error, error_cap, "invalid or oversized tool-call parser input");
         return Q27_TOOL_CALL_INVALID;
     }
