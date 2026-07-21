@@ -62,6 +62,64 @@ int main() {
           "unfenced body soft-fails with missing_body");
     q27_agent_tool_call_free(&call);
 
+    // Observed T2 pattern: well-formed fence, then a spurious second
+    // </tool_call> after free-decode. Body must still publish.
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"amazing.py\"}}</tool_call>\n"
+                "```python\nprint(f\"wow {n}\")\n```\n"
+                "</tool_call>\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body && call.request.kind == Q27_TOOL_WRITE &&
+          call.request.input_len == std::strlen("print(f\"wow {n}\")\n") &&
+          !std::memcmp(call.request.input, "print(f\"wow {n}\")\n",
+                       call.request.input_len),
+          "trailing protocol-echo </tool_call> after fence is ignored");
+    q27_agent_tool_call_free(&call);
+
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```\nbody\n```\n"
+                "</tool_call>\n</tool_call>\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body &&
+          call.request.input_len == std::strlen("body\n"),
+          "repeated trailing </tool_call> echo is ignored");
+    q27_agent_tool_call_free(&call);
+
+    // Premature fence closer must still soft-fail: remaining source is not
+    // protocol echo, so we refuse to publish a truncated body.
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```python\n"
+                "s = \"\"\"\n"
+                "```\n"
+                "\"\"\"\n"
+                "print(s)\n"
+                "```\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1,
+          "premature fence closer with trailing source still soft-fails");
+    q27_agent_tool_call_free(&call);
+
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```\nok\n```\n"
+                "Done writing.\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1,
+          "trailing prose after fence still soft-fails");
+    q27_agent_tool_call_free(&call);
+
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```\nok\n```\n"
+                "<tool_call>{\"name\":\"shell\",\"arguments\":{"
+                "\"command\":\"pwd\"}}</tool_call>\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1,
+          "second tool call after fence still soft-fails (no silent multi-tool)");
+    q27_agent_tool_call_free(&call);
+
     CHECK(parse("<tool_call>{\"name\":\"read\",\"arguments\":{"
                 "\"path\":\"a\"}}</tool_call>"
                 "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"b\"}}"

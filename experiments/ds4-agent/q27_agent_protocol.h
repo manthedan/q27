@@ -83,6 +83,9 @@ int q27_agent_unwrap_whole_file_source_fence(
 // Extracts a required outer markdown fence from `bytes` (already a body
 // region). On success, allocates a NUL-terminated body into *out and sets
 // *out_len. Returns 1 on success, 0 when no complete fence is present.
+// After a closed fence, only whitespace and extra literal </tool_call> tags
+// are tolerated (model protocol echo); other trailing bytes fail closed so a
+// premature ``` cannot silently truncate a published body.
 int q27_agent_extract_fenced_body(const unsigned char *bytes, size_t len,
                                   unsigned char **out, size_t *out_len,
                                   char *error, size_t error_cap);

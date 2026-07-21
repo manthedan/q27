@@ -386,15 +386,38 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
                    (bytes[tail] == ' ' || bytes[tail] == '\t'))
                 ++tail;
             if (tail == logical_end) {
-                // Trailing bytes after the closer line must be whitespace only.
-                size_t after = line_end < len ? line_end + 1 : len;
-                for (size_t j = after; j < len; ++j) {
-                    const char c = static_cast<char>(bytes[j]);
-                    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
-                        set_error(error, error_cap,
-                                  "non-whitespace after fenced body closer");
-                        return 0;
-                    }
+                // After a well-formed fence closer, the body is fully
+                // delimited. Tolerate trailing protocol-echo junk that greedy
+                // models often re-emit after free-decoding the fence
+                // (extra </tool_call>), but do NOT accept arbitrary trailing
+                // prose/code: a premature ``` closer would otherwise publish a
+                // truncated file and silently drop the rest.
+                //
+                // Residual ambiguity (accepted): a line of only ``` followed by
+                // nothing but </tool_call> looks identical to a real closer plus
+                // protocol echo. That case cannot be rejected without undoing
+                // the T2 fix; after-fence bytes are never intended file content
+                // (file bytes live inside the fence). Premature ``` that leaves
+                // more source still fails below.
+                size_t j = line_end < len ? line_end + 1 : len;
+                auto skip_ws = [&]() {
+                    while (j < len &&
+                           (bytes[j] == ' ' || bytes[j] == '\t' ||
+                            bytes[j] == '\r' || bytes[j] == '\n'))
+                        ++j;
+                };
+                skip_ws();
+                static const char kCloseTag[] = "</tool_call>";
+                constexpr size_t kCloseTagLen = sizeof(kCloseTag) - 1;
+                while (j + kCloseTagLen <= len &&
+                       std::memcmp(bytes + j, kCloseTag, kCloseTagLen) == 0) {
+                    j += kCloseTagLen;
+                    skip_ws();
+                }
+                if (j != len) {
+                    set_error(error, error_cap,
+                              "non-whitespace after fenced body closer");
+                    return 0;
                 }
                 const size_t content_len = line_start - content_start;
                 unsigned char *copy = static_cast<unsigned char *>(
