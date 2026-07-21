@@ -419,6 +419,12 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
                               "non-whitespace after fenced body closer");
                     return 0;
                 }
+                // Content always ends with the LF preceding the closer line:
+                // a payload WITHOUT a trailing newline is not representable in
+                // this transport (accepted limitation — the raw-payload channel
+                // it replaced accepted arbitrary bytes but was unrecoverable in
+                // practice; a no-final-LF write would need an explicit protocol
+                // extension, e.g. a call-JSON flag the writer honors).
                 const size_t content_len = line_start - content_start;
                 unsigned char *copy = static_cast<unsigned char *>(
                     std::malloc(content_len + 1));

@@ -1612,13 +1612,30 @@ q27::SamplingParams sampling_params(const json& body) {
     result.top_k=sampling_default_top_k;
     // Present-but-null falls back to the served default rather than throwing
     // (clients send null-valued fields -- max_tokens handles the same pi.dev
-    // shape below).
-    if(body.contains("temperature") && body["temperature"].is_number())
-        result.temperature=body["temperature"].get<float>();
-    if(body.contains("top_p") && body["top_p"].is_number())
-        result.top_p=body["top_p"].get<float>();
-    if(body.contains("top_k") && body["top_k"].is_number())
-        result.top_k=body["top_k"].get<uint32_t>();
+    // shape below). Any OTHER non-number type is malformed: reject it instead
+    // of silently serving the default while the client believes its sampling
+    // settings were honored (codex branch-review P2).
+    if(body.contains("temperature")) {
+        const json& v=body["temperature"];
+        if(!v.is_null()) {
+            if(!v.is_number()) throw std::runtime_error("invalid temperature");
+            result.temperature=v.get<float>();
+        }
+    }
+    if(body.contains("top_p")) {
+        const json& v=body["top_p"];
+        if(!v.is_null()) {
+            if(!v.is_number()) throw std::runtime_error("invalid top_p");
+            result.top_p=v.get<float>();
+        }
+    }
+    if(body.contains("top_k")) {
+        const json& v=body["top_k"];
+        if(!v.is_null()) {
+            if(!v.is_number()) throw std::runtime_error("invalid top_k");
+            result.top_k=v.get<uint32_t>();
+        }
+    }
     result.seed=body.value("seed",0ull);
     q27::validate_sampling(result);
     return result;
