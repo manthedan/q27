@@ -1119,6 +1119,55 @@ int test_topk(q27::MetalBackend& backend) {
     std::vector<float> boundary(n, -50.0f);
     for (uint32_t i = 0; i < 40; i++) boundary[(i * 3797u + 11u) % n] = 100.0f + (float)i;
     check(boundary, 40, "boundary-exact");
+
+    // Multi-row offset: two packed vocab rows; top-k on row 1 via byte offset
+    // must match a standalone top-k on that row alone (sampled-MTP clogits path).
+    {
+        constexpr uint32_t rows = 2, kn = 40;
+        std::vector<float> packed((size_t)rows * n);
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t i = 0; i < n; i++)
+                packed[(size_t)r * n + i] = uniform() * 12.0f + (float)r;
+        // Plant unique highs in row 1 so the set is unambiguous.
+        for (uint32_t i = 0; i < kn; i++)
+            packed[n + ((i * 3797u + 13u) % n)] = 200.0f + (float)i;
+        auto pb = upload_buffer(backend, packed);
+        backend.topk(*pb, n, kn, *values_buffer, *indices_buffer, *count_buffer,
+                     (uint64_t)n * sizeof(float));
+        uint32_t count = 0;
+        backend.read(*count_buffer, 0, &count, 4);
+        if (count < kn) {
+            fprintf(stderr, "topk offset: count %u < k %u\n", count, kn);
+            failures++;
+        } else {
+            std::vector<uint32_t> got(count);
+            backend.read(*indices_buffer, 0, got.data(), count * 4);
+            std::vector<float> row1(packed.begin() + n, packed.begin() + 2 * n);
+            std::vector<uint32_t> order(n);
+            for (uint32_t i = 0; i < n; i++) order[i] = i;
+            std::partial_sort(order.begin(), order.begin() + kn, order.end(),
+                              [&](uint32_t a, uint32_t b) {
+                                  return row1[a] != row1[b] ? row1[a] > row1[b] : a < b;
+                              });
+            std::vector<bool> present(n, false);
+            for (uint32_t index : got) {
+                if (index >= n) {
+                    fprintf(stderr, "topk offset: index %u out of row range\n", index);
+                    failures++;
+                    present.clear();
+                    break;
+                }
+                present[index] = true;
+            }
+            if (!present.empty())
+                for (uint32_t i = 0; i < kn; i++)
+                    if (!present[order[i]]) {
+                        fprintf(stderr, "topk offset: missing rank %u (index %u)\n", i, order[i]);
+                        failures++;
+                        break;
+                    }
+        }
+    }
     return failures;
 }
 

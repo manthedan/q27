@@ -1916,11 +1916,14 @@ void MetalBackend::argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out
 }
 
 void MetalBackend::topk(const BackendBuffer& x, uint32_t n, uint32_t k,
-                        BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count) {
+                        BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count,
+                        uint64_t x_offset_bytes) {
     const MetalBuffer& input=metal_buffer(x);
     MetalBuffer& vb=metal_buffer(values); MetalBuffer& ib=metal_buffer(indices); MetalBuffer& cb=metal_buffer(count);
     if (!n || !k || k > 256) throw std::runtime_error("q27 Metal: top-k requires 1..256 candidates");
-    check_range(input.size(),0,(uint64_t)n*4,"top-k input"); check_range(cb.size(),0,4,"top-k count");
+    if (x_offset_bytes % 4) throw std::runtime_error("q27 Metal: top-k input offset must be float-aligned");
+    check_range(input.size(),x_offset_bytes,(uint64_t)n*4,"top-k input");
+    check_range(cb.size(),0,4,"top-k count");
     const uint64_t capacity=std::min(vb.size(),ib.size())/4;
     if (capacity < 2*(uint64_t)k) throw std::runtime_error("q27 Metal: top-k output capacity below 2k");
     if (impl_->batching) throw std::runtime_error("q27 Metal: top-k requires its own command");
@@ -1928,7 +1931,8 @@ void MetalBackend::topk(const BackendBuffer& x, uint32_t n, uint32_t k,
     TopkArgs args{n,k,(uint32_t)std::min<uint64_t>(capacity,UINT32_MAX)};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_topk_logits"); [enc setComputePipelineState:impl_->topk_logits_p];
-        [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
+        [enc setBuffer:input.handle() offset:(NSUInteger)x_offset_bytes atIndex:0];
+        [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:ib.handle() offset:0 atIndex:2]; [enc setBuffer:cb.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];

@@ -192,9 +192,11 @@ reconciled. Prefer: write → commit → `autoreview --mode commit` → fix → 
 - [ ] Optional: pack-split defaults (bonsai sample, MTP greedy-or-sample with MTP on)
 - [ ] Agent path: optional later expose MTP sample through session (agent is serial today)
 
-### Phase 4 — Optional polish  `[~]` (top-k path in progress)
+### Phase 4 — Optional polish  `[~]`
 
 - [x] Per-lane GPU top-k when `top_k` in 1..256 (`build_served_from_candidates` + mtp_sample_round)
+- [x] Offset bind on `clogits_` rows (no per-lane copy into `logits_`)
+- [x] Agent recipe: temp set ⇒ default top_p=0.95 top_k=20 if omitted (`packaging/bin/q27`)
 - [ ] Device nucleus/Gumbel only if profiled hot
 - [ ] Sampled suffix-burst
 - [ ] Constrained + sampled MTP (CUDA Phase 3 analogue)

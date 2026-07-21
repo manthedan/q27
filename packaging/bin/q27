@@ -193,16 +193,30 @@ cmd_agent() {
     fi
     max_tokens="${Q27_AGENT_MAX_TOKENS:-auto}"
     # Optional sampling (omit for greedy default). Pass through only when set
-    # so the binary's defaults stay bitwise-greedy.
+    # so the binary's defaults stay bitwise-greedy. When temperature is set,
+    # fill Qwen-card companions if omitted: top_p=0.95, top_k=20 (coding /
+    # thinking-precise recipe). Explicit TOP_P / TOP_K always win. top_k=20
+    # also enables the Metal sampled-MTP GPU top-k accept path.
     local sample_args=()
     if [ -n "${Q27_AGENT_TEMPERATURE:-}" ]; then
         sample_args+=(--temperature "$Q27_AGENT_TEMPERATURE")
-    fi
-    if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
-        sample_args+=(--top-p "$Q27_AGENT_TOP_P")
-    fi
-    if [ -n "${Q27_AGENT_TOP_K:-}" ]; then
-        sample_args+=(--top-k "$Q27_AGENT_TOP_K")
+        if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
+            sample_args+=(--top-p "$Q27_AGENT_TOP_P")
+        else
+            sample_args+=(--top-p 0.95)
+        fi
+        if [ -n "${Q27_AGENT_TOP_K:-}" ]; then
+            sample_args+=(--top-k "$Q27_AGENT_TOP_K")
+        else
+            sample_args+=(--top-k 20)
+        fi
+    else
+        if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
+            sample_args+=(--top-p "$Q27_AGENT_TOP_P")
+        fi
+        if [ -n "${Q27_AGENT_TOP_K:-}" ]; then
+            sample_args+=(--top-k "$Q27_AGENT_TOP_K")
+        fi
     fi
     if [ -n "${Q27_AGENT_SEED:-}" ]; then
         sample_args+=(--seed "$Q27_AGENT_SEED")

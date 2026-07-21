@@ -124,9 +124,14 @@ class ComputeBackend {
     // must fall back to a full logits readback. Candidates are unordered;
     // the caller sorts. Must run outside a command batch: the count buffer
     // is CPU-cleared immediately before dispatch.
+    // x_offset_bytes: byte offset into x for multi-row logits (e.g. clogits_
+    // lane * VOCAB * 4). Indices in the output are relative to that row
+    // (0..n-1), not absolute buffer indices.
     virtual void topk(const BackendBuffer& x, uint32_t n, uint32_t k,
-                      BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count) {
+                      BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count,
+                      uint64_t x_offset_bytes = 0) {
         (void)x; (void)n; (void)k; (void)values; (void)indices; (void)count;
+        (void)x_offset_bytes;
         throw std::runtime_error("q27: backend has no top-k primitive");
     }
     virtual void kv_store_f16(const BackendBuffer& k, const BackendBuffer& v,

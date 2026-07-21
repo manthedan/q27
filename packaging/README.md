@@ -28,7 +28,10 @@ adaptive generation limits, automatic tools, greedy decode, and the physical
 current workspace. Override with `Q27_AGENT_PACK`, `Q27_AGENT_CONTEXT`,
 `Q27_AGENT_WORKSPACE`, `Q27_AGENT_MAX_TOKENS`, `Q27_AGENT_SESSION`, or
 sampling via `Q27_AGENT_TEMPERATURE` / `Q27_AGENT_TOP_P` / `Q27_AGENT_TOP_K` /
-`Q27_AGENT_SEED` (omit for greedy).
+`Q27_AGENT_SEED` (omit for greedy). When only temperature is set, the wrapper
+fills Qwen-card companions `top_p=0.95` and `top_k=20` unless overridden —
+and `top_k=20` engages Metal's GPU top-k path for sampled MTP when serving
+an official MTP pack.
 The supervisor holds one private lifetime lock across `agent` and `serve` so
 concurrent launches cannot double-load multi-GB weights. Automatic file tools
 are workspace-bounded, but shell retains the local account's filesystem

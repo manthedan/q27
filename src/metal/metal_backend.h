@@ -127,7 +127,8 @@ class MetalBackend final : public ComputeBackend {
                    float freq_base) override;
     void argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out_index) override;
     void topk(const BackendBuffer& x, uint32_t n, uint32_t k,
-              BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count) override;
+              BackendBuffer& values, BackendBuffer& indices, BackendBuffer& count,
+              uint64_t x_offset_bytes = 0) override;
     // Constrained decoding: -inf every logit whose bit is clear in the
     // uint32 bitset at mask_offset (word-aligned) inside masks.
     void mask_logits(BackendBuffer& logits, const BackendBuffer& masks,

@@ -1900,11 +1900,11 @@ uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uin
         params.top_k >= 1 && params.top_k <= 256) {
         used_topk = true;
         for (uint32_t lane = 0; lane < live; lane++) {
-            backend_.copy(*clogits_, (uint64_t)lane * VOCAB * sizeof(float),
-                          *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+            // Bind clogits_ row via byte offset — no full-row copy into logits_.
             // topk requires its own command (CPU-clears count); not batchable.
-            backend_.topk(*logits_, VOCAB, params.top_k, *topk_values_,
-                          *topk_indices_, *topk_count_);
+            const uint64_t row_off = (uint64_t)lane * VOCAB * sizeof(float);
+            backend_.topk(*clogits_, VOCAB, params.top_k, *topk_values_,
+                          *topk_indices_, *topk_count_, row_off);
             uint32_t count = 0;
             backend_.read(*topk_count_, 0, &count, sizeof(count));
             if (count < params.top_k || count > TOPK_CAPACITY) {
