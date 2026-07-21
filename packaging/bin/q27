@@ -228,7 +228,7 @@ cmd_agent() {
     if [ -n "${Q27_AGENT_MTP:-}" ]; then
         mtp_args+=(--mtp "$Q27_AGENT_MTP")
     elif [ -n "${Q27_AGENT_TEMPERATURE:-}" ] && \
-         [ "$(printf '%s\n' "$Q27_AGENT_TEMPERATURE" | awk '{print ($1+0)>0}')" = "1" ]; then
+         awk -v t="$Q27_AGENT_TEMPERATURE" 'BEGIN{exit !(t+0>0)}'; then
         mtp_args+=(--mtp 4)
     fi
     echo "q27 agent: pack=$n context=$context workspace=$workspace" >&2
