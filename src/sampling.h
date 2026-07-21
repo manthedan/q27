@@ -199,6 +199,58 @@ inline ServedDistribution build_served_distribution(const std::vector<float>& lo
     return build_served_distribution(logits.data(),(uint32_t)logits.size(),p);
 }
 
+// Served nucleus from a GPU top-k over-set (value, index pairs containing the
+// true top-k). Arithmetic mirrors sample_candidates_cpu so accept probs match
+// plain sampling under the same top_k. Used by Metal mtp_sample_round to avoid
+// full-vocab readback when top_k is in 1..256.
+inline ServedDistribution build_served_from_candidates(const float* values,
+                                                       const uint32_t* indices,
+                                                       uint32_t count,
+                                                       const SamplingParams& p) {
+    validate_sampling(p);
+    if(!values || !indices || !count)
+        throw std::runtime_error("q27: empty candidates for served dist");
+    ServedDistribution d;
+    std::vector<uint32_t> order(count);
+    for(uint32_t i=0;i<count;i++) order[i]=i;
+    auto before=[&](uint32_t a,uint32_t b) {
+        return values[a]!=values[b] ? values[a]>values[b] : indices[a]<indices[b];
+    };
+    d.argmax_token = indices[*std::min_element(order.begin(),order.end(),before)];
+    if(p.temperature==0.0f || p.top_k==1) {
+        d.tokens.push_back(d.argmax_token);
+        d.weights.push_back(1.0);
+        d.total = 1.0;
+        return d;
+    }
+    std::sort(order.begin(),order.end(),before);
+    const size_t keep=p.top_k?std::min<size_t>(p.top_k,count):count;
+    order.resize(keep);
+    const double maximum=values[order.front()]/(double)p.temperature;
+    d.tokens.reserve(keep); d.weights.reserve(keep);
+    for(uint32_t slot:order) {
+        double weight=std::exp(values[slot]/(double)p.temperature-maximum);
+        if(!std::isfinite(weight)) weight=0.0;
+        d.tokens.push_back(indices[slot]);
+        d.weights.push_back(weight);
+        d.total+=weight;
+    }
+    if(!(d.total>0.0)) {
+        d.tokens={d.argmax_token}; d.weights={1.0}; d.total=1.0;
+        return d;
+    }
+    if(p.top_p<1.0f) {
+        const double cutoff=d.total*p.top_p; double cumulative=0.0; size_t retained=0;
+        do { cumulative+=d.weights[retained++]; }
+        while(retained<d.weights.size() && cumulative<cutoff);
+        while(retained<d.weights.size() &&
+              values[order[retained]]==values[order[retained-1]])
+            cumulative+=d.weights[retained++];
+        d.tokens.resize(retained); d.weights.resize(retained); d.total=cumulative;
+    }
+    return d;
+}
+
 // p_served(token) under the nucleus; 0 if outside. Uses mass renormalization
 // (weight/total) — required for top_p<1 accept tests (CUDA mass fix).
 inline double served_probability(const ServedDistribution& d,uint32_t token) {
@@ -254,11 +306,38 @@ struct SpecRejectResult {
     uint32_t pending = 0;
 };
 
-// lanes_logits: contiguous [live * vocab] floats from multi-lane verify.
-// draft_tokens: length live-1 — the greedy proposals for positions after pending
-//   (i.e. lanes[1..live-1] in mtp_round notation).
-// Pending (always committed as the first token of the round) is NOT re-sampled.
+// Walk using pre-built per-lane served distributions (full-logits or top-k
+// candidates). draft_tokens length live-1. Pending is NOT re-sampled.
 // temperature==0 callers should use equality accept, not this path.
+inline SpecRejectResult spec_rejection_accept(const ServedDistribution* lane_dists,
+                                              uint32_t live,
+                                              const uint32_t* draft_tokens,
+                                              std::mt19937_64& random) {
+    if(!lane_dists || live<2)
+        throw std::runtime_error("q27: spec rejection needs live>=2 lanes");
+    if(!draft_tokens)
+        throw std::runtime_error("q27: spec rejection needs draft tokens");
+    const uint32_t max_draft = live - 1;
+    SpecRejectResult r;
+    r.stop_lane = max_draft; // all-accept → free bonus on last lane
+    r.exclude = -1;
+    for(uint32_t k=0;k<max_draft;k++) {
+        const double p = served_probability(lane_dists[k],draft_tokens[k]);
+        // u ~ U[0,1). Accept when u < p (CUDA k_spec_accept). p==0 ⇒ always reject.
+        std::uniform_real_distribution<double> unit(0.0,1.0);
+        const double u = unit(random);
+        if(u < p) continue;
+        r.stop_lane = k;
+        r.exclude = (int32_t)draft_tokens[k];
+        break;
+    }
+    r.n = r.stop_lane + 1;
+    r.pending = sample_served(lane_dists[r.stop_lane],random,r.exclude);
+    return r;
+}
+
+// lanes_logits: contiguous [live * vocab] floats from multi-lane verify.
+// draft_tokens: length live-1 — greedy proposals (lanes[1..live-1]).
 inline SpecRejectResult spec_rejection_accept(const float* lanes_logits,uint32_t live,
                                               uint32_t vocab,
                                               const uint32_t* draft_tokens,
@@ -269,27 +348,10 @@ inline SpecRejectResult spec_rejection_accept(const float* lanes_logits,uint32_t
         throw std::runtime_error("q27: spec rejection needs live>=2 lanes");
     if(!draft_tokens)
         throw std::runtime_error("q27: spec rejection needs draft tokens");
-    const uint32_t max_draft = live - 1;
-    SpecRejectResult r;
-    r.stop_lane = max_draft; // all-accept → free bonus on last lane
-    r.exclude = -1;
-    for(uint32_t k=0;k<max_draft;k++) {
-        ServedDistribution dist =
-            build_served_distribution(lanes_logits+(size_t)k*vocab,vocab,params);
-        const double p = served_probability(dist,draft_tokens[k]);
-        // u ~ U[0,1). Accept when u < p (CUDA k_spec_accept). p==0 ⇒ always reject.
-        std::uniform_real_distribution<double> unit(0.0,1.0);
-        const double u = unit(random);
-        if(u < p) continue;
-        r.stop_lane = k;
-        r.exclude = (int32_t)draft_tokens[k];
-        break;
-    }
-    r.n = r.stop_lane + 1;
-    ServedDistribution stop =
-        build_served_distribution(lanes_logits+(size_t)r.stop_lane*vocab,vocab,params);
-    r.pending = sample_served(stop,random,r.exclude);
-    return r;
+    std::vector<ServedDistribution> dists(live);
+    for(uint32_t k=0;k<live;k++)
+        dists[k]=build_served_distribution(lanes_logits+(size_t)k*vocab,vocab,params);
+    return spec_rejection_accept(dists.data(),live,draft_tokens,random);
 }
 
 // Convenience overload: drafts as vector; lanes as flat vector length live*vocab.

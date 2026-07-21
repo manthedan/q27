@@ -89,6 +89,45 @@ int main() {
         }
     }
 
+    // ---- Served dist from GPU top-k candidates (Phase 4 speed path) ----
+    {
+        // Full-logits build_served and candidate over-set must agree on
+        // p_served for every token when the over-set contains exact top-k.
+        const uint32_t n=512;
+        std::vector<float> full(n); uint32_t lcg=99;
+        for(uint32_t i=0;i<n;i++) {
+            lcg=lcg*1664525u+1013904223u;
+            full[i]=(float)(lcg>>8)/8388608.0f*10.0f-5.0f;
+        }
+        std::vector<uint32_t> rank(n);
+        for(uint32_t i=0;i<n;i++) rank[i]=i;
+        std::sort(rank.begin(),rank.end(),[&](uint32_t a,uint32_t b){
+            return full[a]!=full[b]?full[a]>full[b]:a<b;});
+        for(uint32_t k:{3u,20u,64u}) {
+            const uint32_t over=k+11;
+            std::vector<float> cv(over); std::vector<uint32_t> ci(over);
+            for(uint32_t i=0;i<over;i++) { cv[i]=full[rank[i]]; ci[i]=rank[i]; }
+            // Shuffle over-set so order is not pre-sorted (GPU top-k is unordered).
+            std::mt19937_64 sh(k*17); std::shuffle(ci.begin(),ci.end(),sh);
+            for(uint32_t i=0;i<over;i++) cv[i]=full[ci[i]];
+            q27::SamplingParams p{0.9f,0.95f,k,1};
+            auto full_d=q27::build_served_distribution(full,p);
+            auto cand_d=q27::build_served_from_candidates(cv.data(),ci.data(),over,p);
+            if(full_d.tokens.size()!=cand_d.tokens.size()) {
+                fprintf(stderr,"cand nucleus size %zu vs full %zu k=%u\n",
+                        cand_d.tokens.size(),full_d.tokens.size(),k); return 1;
+            }
+            for(uint32_t t=0;t<n;t++) {
+                double pf=q27::served_probability(full_d,t);
+                double pc=q27::served_probability(cand_d,t);
+                if(std::fabs(pf-pc)>1e-9) {
+                    fprintf(stderr,"cand p_served mismatch t=%u k=%u full=%g cand=%g\n",
+                            t,k,pf,pc); return 1;
+                }
+            }
+        }
+    }
+
     // ---- Spec rejection sampling (Metal sampled-MTP Phase 0) ----
     {
         // build_served + sample_served draw-for-draw match sample_logits_cpu

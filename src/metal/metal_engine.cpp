@@ -1885,16 +1885,51 @@ uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uin
         backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                         N_EMBD, live, EPS, x5);
         backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
-        // No argmax_rows — acceptance is rejection sampling on full logits.
+        // No argmax_rows — acceptance is rejection sampling on the served dist.
         batch.finish();
     }
-    std::vector<float> lane_logits((size_t)live * VOCAB);
-    backend_.read(*clogits_, 0, lane_logits.data(),
-                  (uint64_t)live * VOCAB * sizeof(float));
     std::vector<uint32_t> drafts(live - 1);
     for (uint32_t i = 0; i + 1 < live; i++) drafts[i] = lanes[i + 1];
+
+    // Prefer per-lane GPU top-k when top_k is set (card recipe uses 20):
+    // ~k floats/ids per lane instead of full VOCAB readback + partial_sort.
+    // Fall back to full logits on opt-out, top_k==0, or degenerate over-set.
+    std::vector<ServedDistribution> lane_dists(live);
+    bool used_topk = false;
+    if (gpu_sample_ && params.temperature > 0.0f &&
+        params.top_k >= 1 && params.top_k <= 256) {
+        used_topk = true;
+        for (uint32_t lane = 0; lane < live; lane++) {
+            backend_.copy(*clogits_, (uint64_t)lane * VOCAB * sizeof(float),
+                          *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+            // topk requires its own command (CPU-clears count); not batchable.
+            backend_.topk(*logits_, VOCAB, params.top_k, *topk_values_,
+                          *topk_indices_, *topk_count_);
+            uint32_t count = 0;
+            backend_.read(*topk_count_, 0, &count, sizeof(count));
+            if (count < params.top_k || count > TOPK_CAPACITY) {
+                used_topk = false;
+                break;
+            }
+            std::vector<float> values(count);
+            std::vector<uint32_t> indices(count);
+            backend_.read(*topk_values_, 0, values.data(), count * sizeof(float));
+            backend_.read(*topk_indices_, 0, indices.data(), count * sizeof(uint32_t));
+            lane_dists[lane] = build_served_from_candidates(
+                values.data(), indices.data(), count, params);
+        }
+    }
+    if (!used_topk) {
+        std::vector<float> lane_logits((size_t)live * VOCAB);
+        backend_.read(*clogits_, 0, lane_logits.data(),
+                      (uint64_t)live * VOCAB * sizeof(float));
+        for (uint32_t lane = 0; lane < live; lane++)
+            lane_dists[lane] = build_served_distribution(
+                lane_logits.data() + (size_t)lane * VOCAB, VOCAB, params);
+    }
+
     SpecRejectResult accept =
-        spec_rejection_accept(lane_logits.data(), live, VOCAB, drafts.data(), params, rng);
+        spec_rejection_accept(lane_dists.data(), live, drafts.data(), rng);
     // accepted drafts before first reject (or all), for width adaptation.
     const uint32_t accepted = accept.n - 1;
     uint32_t commit_n = std::min(accept.n, remaining);
@@ -1919,8 +1954,8 @@ uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uin
     position_ += encoded;
     if (trace)
         fprintf(stderr,
-                "mtp sample round: live %u n %u stop %u exclude %d | draft %.2fs verify %.2fs commit %.2fs\n",
-                live, accept.n, accept.stop_lane, (int)accept.exclude,
+                "mtp sample round: live %u n %u stop %u exclude %d topk %d | draft %.2fs verify %.2fs commit %.2fs\n",
+                live, accept.n, accept.stop_lane, (int)accept.exclude, used_topk ? 1 : 0,
                 std::chrono::duration<double>(verify_start - draft_start).count(),
                 std::chrono::duration<double>(commit_start - verify_start).count(),
                 since(commit_start));
@@ -1928,11 +1963,9 @@ uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uin
     live_width = accepted + 1 == live ? std::min(width, live_width + 2)
                                       : std::max(2u, accepted + 2);
     // Full walk used → pending already sampled. Remaining/EOS clamp → sample
-    // from the last committed lane's logits (mirrors greedy predictions[c-1]).
+    // from the last committed lane (mirrors greedy predictions[c-1]).
     if (commit_n == accept.n) return accept.pending;
-    ServedDistribution stop = build_served_distribution(
-        lane_logits.data() + (size_t)(commit_n - 1) * VOCAB, VOCAB, params);
-    return sample_served(stop, rng, /*exclude=*/-1);
+    return sample_served(lane_dists[commit_n - 1], rng, /*exclude=*/-1);
 }
 
 // Gate 0 oracle round: mtp_round with the layer-64 draft stage replaced by
