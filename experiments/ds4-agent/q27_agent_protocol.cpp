@@ -472,10 +472,21 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
                         kCloseTagLen) != 0)
             break;
         const size_t tag_at = t - kCloseTagLen;
-        // Require a whole trailing line: tag at body start or after '\n'.
-        if (tag_at != content_start && bytes[tag_at - 1] != '\n')
-            break;
-        end = tag_at;
+        // Whole trailing line only: from previous '\n' (or body start) to the
+        // tag, only spaces/tabs — so "  </tool_call>" is echo, but
+        // "note: </tool_call>" is content.
+        size_t line_start = tag_at;
+        while (line_start > content_start && bytes[line_start - 1] != '\n')
+            --line_start;
+        bool protocol_line = true;
+        for (size_t p = line_start; p < tag_at; ++p) {
+            if (bytes[p] != ' ' && bytes[p] != '\t') {
+                protocol_line = false;
+                break;
+            }
+        }
+        if (!protocol_line) break;
+        end = line_start;
     }
     // Optional dangling closer line at EOF (only spaces + >=open_ticks
     // backticks). end = start of that line so content keeps the preceding LF
