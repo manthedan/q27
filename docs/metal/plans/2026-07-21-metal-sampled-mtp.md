@@ -1,6 +1,6 @@
 # Metal sampled MTP — CUDA Phase-2 rejection sampling on the host path
 
-Status: **IN PROGRESS** — Phase 0 clean (Codex); Phase 1a–1c implemented, build green; live gates pending.  
+Status: **IN PROGRESS** — Phase 0–1 landed + Codex-clean; live smoke OK; full gate / perf next.  
 Branch: `agent-fenced-body-write` (or a follow-on branch if this stack splits).  
 Machine: any Metal Mac with an official MTP pack for live gates; unit tests are CPU-only.  
 Upstream design: `docs/sampling-design.md`, `docs/sampling-phase2-impl.md` (CUDA DONE 2026-07-05).
@@ -208,9 +208,10 @@ reconciled. Prefer: write → commit → `autoreview --mode commit` → fix → 
 | 2026-07-21 | Codex P2 empty-residual throw | `4d8757f`; autoreview **clean** |
 | 2026-07-21 | Phase 1a–1c engine+CLI+server | `27ed0d4` |
 | 2026-07-21 | Codex P1 CLI has_mtp/chunked guard + gate script | `c545d81` |
-| 2026-07-21 | Live smoke official MTP pack, T=0.7 top_k=20 n=16 | **works**: 5 rounds, 13 drafted, 10 accepted (**76.9%**); wall ~0.17 t/s (host nucleus sort over full vocab is the bottleneck — Phase 4 top-k) |
-| | Phase 1 Codex autoreview after CLI fix | *pending* |
-| | Phase 2 full gate script on quiet machine | *pending* |
+| 2026-07-21 | Live smoke official MTP pack, T=0.7 top_k=20 n=16 | **works**: 5 rounds, 13 drafted, 10 accepted (**76.9%**); wall slow on first smoke (host full-vocab nucleus — Phase 4) |
+| 2026-07-21 | CLI has_mtp guard + gate script harden | `c545d81`…`5547704`; gate Codex **clean** |
+| | Phase 2 full `metal_sampled_mtp_gate.sh` on quiet machine | *pending* (script ready) |
+| | Phase 4 GPU top-k / cut readback for speed | *pending* (correctness first) |
 
 ## Review workflow
 
