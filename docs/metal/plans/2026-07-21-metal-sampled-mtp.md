@@ -1,6 +1,7 @@
 # Metal sampled MTP — CUDA Phase-2 rejection sampling on the host path
 
-Status: **READY FOR OVERNIGHT** — Phase 0–1 + top-k polish landed; run `tools/overnight_sampled_mtp.sh` on a quiet machine for Phase 2 numbers.  
+Status: **PHASE 2 DONE** — overnight suite green on quiet machine (`logs/overnight-sampled-mtp-20260721-013859`). Correctness + accept-vs-temp hold; wall t/s ship bar **miss** (sample-mtp ≲ plain on N=96 Fibonacci). See progress log.  
+
 Branch: `agent-fenced-body-write` (or a follow-on branch if this stack splits).  
 Machine: any Metal Mac with an official MTP pack for live gates; unit tests are CPU-only.  
 Upstream design: `docs/sampling-design.md`, `docs/sampling-phase2-impl.md` (CUDA DONE 2026-07-05).
@@ -165,24 +166,19 @@ reconciled. Prefer: write → commit → `autoreview --mode commit` → fix → 
 - [x] Acceptance-vs-temp legs (short in gate; long in overnight)
 - [x] Overnight orchestrator (units + gate + wall A/B + temp curve → OUTDIR/SUMMARY.md)
 
-### Phase 2 — Live gates on official MTP pack  `[ ]` **← overnight**
+### Phase 2 — Live gates on official MTP pack  `[x]` **2026-07-21 overnight**
 
-**Run once on a quiet machine** (no other model loaded):
-
-```bash
-MODEL=models/qwen36-27b-mtp/qwen36-27b-mtp.q27 \
-TOK=models/qwen36-27b-mtp/qwen36-27b-mtp.tok \
-  tools/overnight_sampled_mtp.sh
-# optional: N_AB=128 N_TEMP=48 OUTDIR=logs/overnight-...
-```
+**Ran:** `logs/overnight-sampled-mtp-20260721-013859`  
+`MODEL=models/qwen36-27b-mtp/…` mtp=4 ctx=2048 seed=42 N_gate=48 N_ab=96 N_temp=32  
+Host: mac.lan arm64; finished 01:45 PT (~6 min wall).
 
 Checklist after the run:
 
-- [ ] `SUMMARY.md` Leg 0–3 all green
-- [ ] Paste wall t/s (greedy / sample-mtp / plain) into progress log
-- [ ] Paste acceptance-vs-temp speculation lines
-- [ ] Expect accept hold ~through T≲0.7 (CUDA prior); document sag at T≥1
-- [ ] Ship bar: sample-mtp ≫ plain sample at moderate T (≥ ~1.15×) or record miss
+- [x] `SUMMARY.md` Leg 0–3 all green
+- [x] Paste wall t/s (greedy / sample-mtp / plain) into progress log
+- [x] Paste acceptance-vs-temp speculation lines
+- [x] Accept hold strong at low T; sag at T=1.5 (45.5%) as expected; T=0.7 still 65.5%
+- [x] Ship bar: sample-mtp ≫ plain (≥ ~1.15×) — **MISS** on this prompt/N (see log)
 
 ### Phase 3 — Defaults / product  `[ ]` (blocked on exit criterion)
 
@@ -236,9 +232,11 @@ Offline-only dry run: `SKIP_LIVE=1 tools/overnight_sampled_mtp.sh`.
 | 2026-07-21 | Live smoke official MTP pack, T=0.7 top_k=20 n=16 | **works**: 5 rounds, 13 drafted, 10 accepted (**76.9%**). Wall ~0.17 t/s is **not** a perf baseline — operator had another model resident (memory pressure); re-bench on a quiet machine. Host full-vocab nucleus may still matter at scale (Phase 4) but was not the measured cause here. |
 | 2026-07-21 | CLI has_mtp guard + gate script harden | `c545d81`…`5547704`; gate Codex **clean** |
 | 2026-07-21 | GPU top-k + offset bind + agent recipe | `96a717f` `be98a1c` clean |
-| 2026-07-21 | Overnight orchestrator + docs + reject-walk parity tests + `generate_mtp_sampled` | *this commit* |
-| | Phase 2 full `metal_sampled_mtp_gate.sh` on quiet machine | *pending* (script ready) |
-| | Phase 4 GPU top-k / cut readback for speed | *pending* (correctness first) |
+| 2026-07-21 | Overnight orchestrator + docs + reject-walk parity tests + `generate_mtp_sampled` | landed pre-overnight |
+| 2026-07-21 | **Phase 2 overnight** `logs/overnight-sampled-mtp-20260721-013859` | **ALL LEGS PASS**. Gate: seeded identity, seed varies, sampled≠greedy, plain trajectory, traces+drafts. **Leg 2 wall (N=96):** greedy **3.50** t/s (90.8% accept), sample-mtp **3.38** t/s (83.5%), plain-sample **3.66** t/s — sample-mtp **not** faster than plain (~0.92×); ship bar **miss** on Fibonacci short-gen. **Leg 3 accept@T (N=32):** T0/0.3 **88%**, T0.7 **65.5%**, T1.0 **77.8%**, T1.5 **45.5%**. False-positive pgrep warn (matched `q27-agent-tui` path). |
+| | Phase 4 further speed (device nucleus only if profiled hot) | optional; top-k already in |
+| | Longer / multi-prompt wall A/B to re-check ship bar | *pending* if we want product claim |
+| | Quality A/B before sampling defaults-on | Phase 3 blocker |
 
 ## Review workflow
 
