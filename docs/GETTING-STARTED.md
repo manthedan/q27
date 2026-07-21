@@ -81,14 +81,20 @@ memory-safety guard, not a bug.
 
 ## 3b. Sampling + MTP (optional)
 
-Default decode is still **greedy** (temperature 0). For Qwen-card-style
-sampling:
+**Pack-split agent defaults** (`q27 agent`):
+
+| Pack | Default decode | Why |
+|------|----------------|-----|
+| **Bonsai** (`b1`, `t2`, …) | **Sample** T=0.6, top_p=0.95, top_k=20 | No MTP layer; sampling is the loop-break for interactive coding |
+| **Official MTP** (`default`, `q4s`, …) | **Greedy** (temperature 0) | Keep greedy MTP / eval reproducibility; sample is opt-in |
 
 ```bash
-# Native agent: set temperature; top_p=0.95 and top_k=20 fill in if omitted
-Q27_AGENT_TEMPERATURE=0.6 q27 agent default
-# Agent MTP free-decode is opt-in (official packs only; engages only where
-# the tool grammar cannot — fenced bodies / tools-off):
+q27 agent              # b1 → sampling on (bonsai soft-default)
+q27 agent default      # official → greedy unless you set temperature
+Q27_AGENT_TEMPERATURE=0 q27 agent b1          # force greedy on bonsai
+Q27_AGENT_TEMPERATURE=0.7 q27 agent default   # sample on official
+# MTP free-decode (official packs only; serial while tool grammar can engage;
+# resumes for fenced body after body tools):
 Q27_AGENT_TEMPERATURE=0.6 Q27_AGENT_MTP=4 q27 agent default
 
 # Metal CLI (source checkout): greedy MTP vs sampled MTP
@@ -97,9 +103,10 @@ Q27_AGENT_TEMPERATURE=0.6 Q27_AGENT_MTP=4 q27 agent default
   --temperature 0.7 --top-p 0.95 --top-k 20 --seed 1 -n 64 --prompt "..."
 ```
 
-On an **official MTP pack** (`default` / `qwen36-27b-mtp`), `temp > 0` +
-`--mtp` uses **sampled MTP** (greedy drafts, rejection-sample accept). Bonsai
-packs have no MTP layer and fall back to plain serial sampling. Force plain
+On an **official MTP pack**, `temp > 0` + `--mtp` uses **sampled MTP**
+(greedy drafts, rejection-sample accept). Bonsai has no MTP layer and uses
+plain serial sampling. Server/CLI remain greedy unless you pass temperature
+(or Metal `--temperature-default` / CUDA `Q27_FORCE_TEMP`). Force plain
 sample for A/B: `Q27_SAMPLE_PLAIN=1`.
 
 Quiet-machine overnight suite (units + gate + t/s A/B + temp curve):

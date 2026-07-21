@@ -183,8 +183,8 @@ Checklist after the run:
 ### Phase 3 — Defaults / product  `[ ]` (blocked on exit criterion)
 
 - [ ] **Do not** default sampling on until Thunderdome-class quality A/B + drift catalog under production sampling (see `docs/sampling-design.md` exit criterion)
-- [ ] Optional: pack-split defaults (bonsai sample, MTP greedy-or-sample with MTP on)
-- [ ] Agent path: optional later expose MTP sample through session (agent is serial today)
+- [x] Pack-split agent defaults: bonsai soft-sample T=0.6; official MTP stays greedy (`packaging/bin/q27`)
+- [x] Agent MTP sample path (free-decode when grammar cannot engage)
 
 ### Phase 4 — Optional polish  `[~]`
 
@@ -241,7 +241,8 @@ Offline-only dry run: `SKIP_LIVE=1 tools/overnight_sampled_mtp.sh`.
 | | Longer / multi-prompt wall A/B to re-check ship bar | *pending* if we want product claim |
 | | End-to-end distribution A/B: plain vs sampled-MTP unigram histogram (χ²/TV), plus real-logits full-vs-topk-candidates `p_served` parity | *pending* — correctness claim is unit-math-level only today |
 | 2026-07-21 | **Live agent smokes** `logs/agent-smoke-20260721/` | **PASS.** Smoke1 minimal sample+auto-tools: 41s, `Hello!`, exit 0 (serial under tools). Smoke2 write+`--mtp 4`+TRACE: 76s, toolgram serial then **7× mtp sample round** on fenced body, `hello_q27.txt` exact, tool exit 0, session reuse on follow-up. |
-| | Quality A/B before sampling defaults-on | Phase 3 blocker |
+| 2026-07-21 | Pack-split agent sampling defaults | Bonsai (`quant_policy bonsai-*`): soft-default T=0.6 top_p=0.95 top_k=20 when temp unset. Official MTP: greedy. Escape `Q27_AGENT_TEMPERATURE=0`. Docs: GETTING-STARTED §3b, packaging README, MODELS. Not a global server default (CUDA still greedy until FORCE_TEMP). |
+| | Quality A/B before sampling defaults-on *everywhere* (serve/official) | Phase 3 blocker — bonsai agent soft-default is intentional product exception |
 
 ## Review workflow
 

@@ -192,23 +192,45 @@ cmd_agent() {
             echo "q27 agent: cannot resolve the current workspace" >&2; exit 1; }
     fi
     max_tokens="${Q27_AGENT_MAX_TOKENS:-auto}"
-    # Optional sampling (omit for greedy default). Pass through only when set
-    # so the binary's defaults stay bitwise-greedy. When temperature is set,
-    # fill Qwen-card companions if omitted: top_p=0.95, top_k=20 (coding /
-    # thinking-precise recipe). Explicit TOP_P / TOP_K always win. top_k=20
-    # also enables the Metal sampled-MTP GPU top-k accept path.
+    # Pack-split sampling (docs/GETTING-STARTED §3b):
+    #   Bonsai (quant_policy bonsai-*): soft-default T=0.6 top_p=0.95 top_k=20
+    #     when Q27_AGENT_TEMPERATURE is unset — loop-break for coding agent;
+    #     no MTP layer so sampling is not trading away greedy MTP.
+    #   Official MTP packs: greedy unless temperature is set — keep greedy
+    #     MTP / eval reproducibility.
+    # Escape: Q27_AGENT_TEMPERATURE=0 (greedy on bonsai). Explicit temp always
+    # wins. CUDA is the same shape (greedy until Q27_FORCE_TEMP); the exit
+    # gate only *cleared* sampling as safe, it does not ship default-on.
+    local quant_policy sample_source=""
+    quant_policy="$(q27_registry_field "$n" 3 2>/dev/null || true)"
     local sample_args=()
-    if [ -n "${Q27_AGENT_TEMPERATURE:-}" ]; then
-        sample_args+=(--temperature "$Q27_AGENT_TEMPERATURE")
-        if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
-            sample_args+=(--top-p "$Q27_AGENT_TOP_P")
-        else
-            sample_args+=(--top-p 0.95)
-        fi
-        if [ -n "${Q27_AGENT_TOP_K:-}" ]; then
-            sample_args+=(--top-k "$Q27_AGENT_TOP_K")
-        else
-            sample_args+=(--top-k 20)
+    local temp=""
+    if [ -z "${Q27_AGENT_TEMPERATURE+x}" ]; then
+        case "$quant_policy" in
+            bonsai-*)
+                temp=0.6
+                sample_source="bonsai-default"
+                ;;
+        esac
+    else
+        temp="${Q27_AGENT_TEMPERATURE}"
+        sample_source="env"
+    fi
+    if [ -n "$temp" ]; then
+        sample_args+=(--temperature "$temp")
+        # Companions only when actually sampling (temp>0). Greedy temp=0
+        # stays on the binary's pure-argmax path.
+        if awk -v t="$temp" 'BEGIN{exit !(t+0>0)}'; then
+            if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
+                sample_args+=(--top-p "$Q27_AGENT_TOP_P")
+            else
+                sample_args+=(--top-p 0.95)
+            fi
+            if [ -n "${Q27_AGENT_TOP_K:-}" ]; then
+                sample_args+=(--top-k "$Q27_AGENT_TOP_K")
+            else
+                sample_args+=(--top-k 20)
+            fi
         fi
     else
         if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
@@ -232,7 +254,11 @@ cmd_agent() {
     echo "q27 agent: pack=$n context=$context workspace=$workspace" >&2
     echo "  automatic tools enabled; shell retains your local account's filesystem access" >&2
     if [ ${#sample_args[@]} -gt 0 ]; then
-        echo "  sampling: ${sample_args[*]}" >&2
+        if [ "$sample_source" = "bonsai-default" ]; then
+            echo "  sampling: ${sample_args[*]}  (bonsai default; Q27_AGENT_TEMPERATURE=0 for greedy)" >&2
+        else
+            echo "  sampling: ${sample_args[*]}" >&2
+        fi
     fi
     if [ ${#mtp_args[@]} -gt 0 ]; then
         echo "  mtp: ${mtp_args[*]}" >&2

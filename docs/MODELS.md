@@ -223,9 +223,12 @@ q27-agent ~/.q27/models/b1/*.q27 ~/.q27/models/b1/*.tok \
 Useful env knobs for the wrapper: `Q27_AGENT_PACK` (default pack, instead of
 the `[name]` argument), `Q27_AGENT_WORKSPACE` (override the workspace without
 `cd`), `Q27_AGENT_CONTEXT` (default 32768), `Q27_AGENT_MAX_TOKENS` (default
-`auto`). Inside the agent,
-`--max-tool-rounds N` (default 8) bounds how many tool calls one turn can
-chain, and `--compact-at`/`--compact-keep` tune auto-compaction.
+`auto`), and sampling (`Q27_AGENT_TEMPERATURE` / `TOP_P` / `TOP_K` / `SEED`).
+Bonsai packs soft-default to T=0.6 sampling; official MTP packs stay greedy
+unless temperature is set (`Q27_AGENT_TEMPERATURE=0` forces greedy on bonsai).
+Inside the agent, `--max-tool-rounds N` (default 8) bounds how many tool
+calls one turn can chain, and `--compact-at`/`--compact-keep` tune
+auto-compaction.
 
 Recommended tiers: **b1** or **t2** on 16 GB (fast, and the raw-payload file
 path is most exercised there); any official tier on bigger machines.
