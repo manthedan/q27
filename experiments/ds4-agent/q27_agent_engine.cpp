@@ -57,6 +57,11 @@ struct ThinkSpanTracker {
             tail.erase(0, tail.size() - 64);
         for (;;) {
             if (!in_think) {
+                /* First span only: after it closes, a literal <think> in
+                 * the answer or a tool body is CONTENT, not a new span —
+                 * reopening would let the budget inject </think> into
+                 * model-visible content (r6 codex P2). */
+                if (ever_opened) break;
                 auto pos = tail.find("<think>");
                 if (pos == std::string::npos) break;
                 in_think = true;

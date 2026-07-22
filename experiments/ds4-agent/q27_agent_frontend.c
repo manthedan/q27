@@ -723,6 +723,13 @@ static int json_unescape_to(const char *in, size_t in_len, char **out) {
         }
     }
     buf[o] = '\0';
+    /* Raw-copied bytes may be invalid UTF-8 (escapes are valid by
+     * construction): reject the field rather than let bad bytes flow into
+     * queue events and kill the Rust line reader (r6 codex P2). */
+    if (!q27_fp1_utf8_valid((const unsigned char *)buf, o)) {
+        free(buf);
+        return 0;
+    }
     *out = buf;
     return 1;
 }
@@ -814,6 +821,41 @@ static int json_get_number_int(const char *line, size_t len, const char *key,
     return 1;
 }
 
+/* One complete JSON value: balanced brackets, no unterminated string, and
+ * only whitespace after the top-level close (r6 codex P2). Scalars are not
+ * syntax-checked; this guards framing, not grammar. */
+static int json_structure_valid(const char *line, size_t len) {
+    const char *p = line;
+    const char *end = line + len;
+    int depth = 0;
+    while (p < end) {
+        const char c = *p;
+        if (c == '"') {
+            ++p;
+            while (p < end) {
+                if (*p == '\\') { p += 2; continue; }
+                if (*p == '"') break;
+                ++p;
+            }
+            if (p >= end) return 0;   /* unterminated string */
+            ++p;
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (--depth < 0) return 0;
+            if (depth == 0) {
+                ++p;
+                while (p < end && (*p == ' ' || *p == '\t')) ++p;
+                return p == end;      /* trailing garbage rejected */
+            }
+        }
+        ++p;
+    }
+    return 0;                          /* unbalanced: never closed */
+}
+
 int q27_fp1_parse_client_line(const char *line, size_t len, q27_fp1_op *out) {
     if (!out) return 0;
     *out = (q27_fp1_op){0};
@@ -821,9 +863,12 @@ int q27_fp1_parse_client_line(const char *line, size_t len, q27_fp1_op *out) {
         out->kind = Q27_FP1_OP_MALFORMED;
         return 1;
     }
-    /* Trim trailing CR. */
+    /* Trim trailing CR/LF/whitespace and C-string NUL terminators — callers
+     * may pass strlen()+1; the structural validator then sees a clean line
+     * (r6 codex P2). */
     while (len && (line[len - 1] == '\r' || line[len - 1] == '\n' ||
-                   line[len - 1] == ' ' || line[len - 1] == '\t'))
+                   line[len - 1] == ' ' || line[len - 1] == '\t' ||
+                   line[len - 1] == '\0'))
         --len;
     size_t start = 0;
     while (start < len &&
@@ -835,6 +880,10 @@ int q27_fp1_parse_client_line(const char *line, size_t len, q27_fp1_op *out) {
     }
     line += start;
     len -= start;
+    if (!json_structure_valid(line, len)) {
+        out->kind = Q27_FP1_OP_MALFORMED;
+        return 1;
+    }
 
     long version = 0;
     if (!json_get_number_int(line, len, "v", &version)) {
@@ -1193,8 +1242,12 @@ static void *fp1_reader_main(void *arg) {
             if (c == '\n') {
                 q27_fp1_op op = {0};
                 if (line_overflow) {
+                    static const char too_big[] =
+                        "ClientMessage exceeds 1 MiB";
                     op.kind = Q27_FP1_OP_MALFORMED;
-                    op.text = dup_n("ClientMessage exceeds 1 MiB", 28);
+                    /* sizeof-1, not a hand count: the literal is 27 bytes
+                     * and dup_n(…, 28) read one past it (r6 codex P2). */
+                    op.text = dup_n(too_big, sizeof(too_big) - 1);
                     (void)ctl_apply_op(&op);
                 } else if (len == 0) {
                     /* Empty lines: ignore. */

@@ -262,6 +262,32 @@ static void test_parse_client(void) {
         q27_fp1_op_free(&op);
     }
 
+    /* Structural validation (r6 codex P2): unbalanced or trailing-garbage
+     * frames are malformed, not dispatched. */
+    {
+        const char *open = "{\"v\":1,\"op\":\"quit\"";
+        CHECK(q27_fp1_parse_client_line(open, strlen(open), &op));
+        CHECK(op.kind == Q27_FP1_OP_MALFORMED);
+        q27_fp1_op_free(&op);
+        const char *trailing = "{\"v\":1,\"op\":\"quit\"} garbage";
+        CHECK(q27_fp1_parse_client_line(trailing, strlen(trailing), &op));
+        CHECK(op.kind == Q27_FP1_OP_MALFORMED);
+        q27_fp1_op_free(&op);
+        const char *unter = "{\"v\":1,\"op\":\"quit}";
+        CHECK(q27_fp1_parse_client_line(unter, strlen(unter), &op));
+        CHECK(op.kind == Q27_FP1_OP_MALFORMED);
+        q27_fp1_op_free(&op);
+    }
+
+    /* Invalid UTF-8 in a client string is dropped, not emitted (r6 codex P2). */
+    {
+        char badline[] = "{\"v\":1,\"op\":\"prompt\",\"text\":\"ok \xff\xfe\"}";
+        CHECK(q27_fp1_parse_client_line(badline, strlen(badline), &op));
+        CHECK(op.kind == Q27_FP1_OP_PROMPT);
+        CHECK(op.text && op.text[0] == '\0');
+        q27_fp1_op_free(&op);
+    }
+
     CHECK(q27_fp1_parse_client_line("{\"v\":1,\"op\":\"save\"}", 20, &op));
     CHECK(op.kind == Q27_FP1_OP_SAVE);
     q27_fp1_op_free(&op);

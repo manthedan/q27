@@ -2837,16 +2837,26 @@ int main(int argc, char **argv) {
                 ok = 1;
             }
 
-            /* A turn that fails with no worker terminal leaves the client
-             * hanging on the request: emit a correlated error terminal (r5
-             * codex P1). Cancel/stall/error paths already terminated through
-             * the worker funnel; this fires only when nothing did. */
+            /* A turn that fails with no worker terminal (prepare/compaction
+             * fails BEFORE the worker starts) leaves the engine untouched:
+             * recover by dropping the dangling user message, emit a
+             * correlated error terminal through the funnel, and KEEP the
+             * session (r6 codex P1 — r5 only noticed, then died via bye). */
             if (!ok && g_fp1_turn_terminals == terminals_before) {
-                const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
-                (void)q27_fp1_emit_notice(
-                    stdout, seq, op.client_req_id, "error", "turn_failed",
-                    "turn failed before completion; see stderr diagnostics",
-                    "idle");
+                transcript_pop_last_human_user(&chat);
+                static const char fail_msg[] =
+                    "turn failed before generation; prompt dropped";
+                q27_agent_event fail_ev = {0};
+                fail_ev.type = Q27_EVENT_ERROR;
+                fail_ev.sequence = q27_agent_worker_alloc_sequence(worker);
+                fail_ev.state = Q27_WORKER_IDLE;
+                fail_ev.status = Q27_AGENT_ERROR;
+                fail_ev.data = (unsigned char *)fail_msg;
+                fail_ev.data_len = sizeof(fail_msg) - 1;
+                g_fp1_active_req_id = op.client_req_id;
+                (void)print_json_event(&fail_ev);
+                g_fp1_active_req_id = NULL;
+                ok = 1;   /* recovered — keep accepting prompts */
             }
             q27_fp1_op_free(&op);
 
