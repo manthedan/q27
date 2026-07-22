@@ -1,12 +1,44 @@
 # QA before releases — the single release checklist
 
-**Status: v1 (2026-07-17, triage item I3).** One place that collects the
-gates currently scattered across the chronicle, `make` targets, and
-`tools/`. Run the whole list before any tagged release (`v0.1.0` cuts the
-homebrew formula's tarball — a tag says "someone ran this list"). A gate
-with a stale or skipped leg is recorded in the release notes with its
-reason; an unrecorded skip is a process failure (masked-failure lesson:
-the checklist must be able to fail).
+**Status: v2 (2026-07-22, risk tiers + the gate runner).** One place that
+collects the gates currently scattered across the chronicle, `make`
+targets, and `tools/`. A gate with a stale or skipped leg is recorded in
+the release notes with its reason; an unrecorded skip is a process
+failure (masked-failure lesson: the checklist must be able to fail).
+
+## Risk tiers (v2)
+
+Run the tier matching the release's delta; when in doubt, take the
+higher tier. The tier and its rationale belong in the release notes.
+`tools/release_gates.sh <A|B|C>` runs the whole tier, captures evidence
+to a dated dir, and prints the ledger.
+
+- **Tier A — numerics.** Anything touching `src/metal/q27_kernels.metal`,
+  `metal_engine.cpp/.h`, `metal_backend.mm/.h`, `sampling.h`,
+  `tokenizer.*`, `loader.cpp`, KV/snapshot formats. Everything in this
+  document: §1–§4 in full.
+- **Tier B — serving.** Server handlers/protocol (`metal_server.cpp`),
+  shared headers (`api_common.h`, `stream_split.h`, `tool_preamble.h`,
+  `toolgram.h`, `toolconstrain.h`), agent/TUI fronts, CLI. §1 (build,
+  test-cpu, tokenizer), the chunk-parity 384 sentinel (§2 first leg
+  only — proves decode was not touched by accident), §3 live-server
+  gates. Known-at-v2 notes: `constrain_gate.sh`/`ckpt_gate.sh` are
+  CUDA-side scripts (nvcc / CUDA `[gen]` log lines) — record as N/A;
+  G8d (Responses custom tool) rides the qwen36 think-forever pathology
+  and fails on model verbosity, not protocol — record, don't chase.
+- **Tier C — packaging/docs.** Formula, wrapper, README/docs, tooling
+  that never touches the engine: clean build + `test-cpu` +
+  `packaging/test_q27_wrapper.sh`.
+
+**CUDA-side legs** (§2 yukon gates, `constrain_gate.sh`, `ckpt_gate.sh`)
+run on yukon or not at all; on the Metal lane record them as N/A with
+the trigger-file check (loader.cpp / tokenizer / api_common.h /
+stream_split.h / tool_preamble.h touched ⇒ they are NOT N/A, find a way
+to run them).
+
+**Contended-machine rule:** no timed legs (perf spots, long decodes)
+while the box is in use; take short contended spots and cite the
+chronicle's quiet-machine numbers, or defer with a recorded reason.
 
 Box legend: **M4** = the 24 GB serving Mac (this repo's metal lane),
 **yukon** = the CUDA 5090 box, **mini** = the 16 GB secondary mac.
