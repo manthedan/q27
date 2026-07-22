@@ -620,6 +620,25 @@ static char *dup_n(const char *s, size_t n) {
     return out;
 }
 
+static int json_hex4(const char *in, size_t *io, size_t in_len,
+                     unsigned *out) {
+    if (*io + 4 >= in_len) return 0;
+    unsigned code = 0;
+    for (int k = 0; k < 4; ++k) {
+        char h = in[++(*io)];
+        code <<= 4;
+        if (h >= '0' && h <= '9') code |= (unsigned)(h - '0');
+        else if (h >= 'a' && h <= 'f') code |= (unsigned)(h - 'a' + 10);
+        else if (h >= 'A' && h <= 'F') code |= (unsigned)(h - 'A' + 10);
+        else return 0;
+    }
+    *out = code;
+    return 1;
+}
+
+/* JSON string unescape with owned output. \uXXXX surrogate pairs combine
+ * into one scalar (codex P2); unpaired surrogates are rejected rather than
+ * emitted as invalid UTF-8. */
 static int json_unescape_to(const char *in, size_t in_len, char **out) {
     char *buf = malloc(in_len + 1);
     if (!buf) return 0;
@@ -657,29 +676,42 @@ static int json_unescape_to(const char *in, size_t in_len, char **out) {
             buf[o++] = '\t';
             break;
         case 'u': {
-            if (i + 4 >= in_len) {
+            unsigned code = 0;
+            if (!json_hex4(in, &i, in_len, &code)) {
                 free(buf);
                 return 0;
             }
-            unsigned code = 0;
-            for (int k = 0; k < 4; ++k) {
-                char h = in[++i];
-                code <<= 4;
-                if (h >= '0' && h <= '9') code |= (unsigned)(h - '0');
-                else if (h >= 'a' && h <= 'f') code |= (unsigned)(h - 'a' + 10);
-                else if (h >= 'A' && h <= 'F') code |= (unsigned)(h - 'A' + 10);
-                else {
+            if (code >= 0xD800 && code <= 0xDBFF) {
+                /* High surrogate: a low one must follow as \uDC00..\uDFFF. */
+                if (i + 6 >= in_len || in[i + 1] != '\\' ||
+                    (in[i + 2] != 'u' && in[i + 2] != 'U')) {
                     free(buf);
                     return 0;
                 }
+                unsigned lo = 0;
+                i += 2;
+                if (!json_hex4(in, &i, in_len, &lo) ||
+                    lo < 0xDC00 || lo > 0xDFFF) {
+                    free(buf);
+                    return 0;
+                }
+                code = 0x10000u + ((code - 0xD800u) << 10) + (lo - 0xDC00u);
+            } else if (code >= 0xDC00 && code <= 0xDFFF) {
+                free(buf);   /* unpaired low surrogate */
+                return 0;
             }
             if (code < 0x80) {
                 buf[o++] = (char)code;
             } else if (code < 0x800) {
                 buf[o++] = (char)(0xc0 | (code >> 6));
                 buf[o++] = (char)(0x80 | (code & 0x3f));
-            } else {
+            } else if (code < 0x10000) {
                 buf[o++] = (char)(0xe0 | (code >> 12));
+                buf[o++] = (char)(0x80 | ((code >> 6) & 0x3f));
+                buf[o++] = (char)(0x80 | (code & 0x3f));
+            } else {
+                buf[o++] = (char)(0xf0 | (code >> 18));
+                buf[o++] = (char)(0x80 | ((code >> 12) & 0x3f));
                 buf[o++] = (char)(0x80 | ((code >> 6) & 0x3f));
                 buf[o++] = (char)(0x80 | (code & 0x3f));
             }
@@ -767,9 +799,17 @@ static int json_get_number_int(const char *line, size_t len, const char *key,
                                long *out) {
     const char *q = json_top_value(line, len, key);
     if (!q) return 0;
+    const char *end = line + len;
     char *endptr = NULL;
     long v = strtol(q, &endptr, 10);
     if (endptr == q) return 0;
+    /* The whole JSON numeric token must be an integer (codex P2): the byte
+     * after the digits must end the value — structural or whitespace.
+     * "1.5" / "1junk" must not parse as version 1. */
+    if (endptr < end && *endptr != ',' && *endptr != '}' &&
+        *endptr != ']' && *endptr != ' ' && *endptr != '\t' &&
+        *endptr != '\r' && *endptr != '\n')
+        return 0;
     *out = v;
     return 1;
 }

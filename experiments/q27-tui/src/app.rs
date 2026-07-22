@@ -267,6 +267,11 @@ impl Model {
                 if matches!(ev.state.as_deref(), Some("idle") | None) {
                     self.input_enabled = true;
                     self.phase = Phase::Idle;
+                } else {
+                    // Busy-state rejection of a slash op: the op completed,
+                    // so re-open input for queueing when advertised (codex
+                    // P2); the active turn keeps the phase.
+                    self.input_enabled = self.has_queue_feature();
                 }
             }
             "notice" => {
@@ -282,6 +287,8 @@ impl Model {
                 if matches!(ev.state.as_deref(), Some("idle") | None) {
                     self.input_enabled = true;
                     self.phase = Phase::Idle;
+                } else {
+                    self.input_enabled = self.has_queue_feature();
                 }
             }
             "error" | "generation_stalled" => {

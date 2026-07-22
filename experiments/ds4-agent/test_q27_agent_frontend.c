@@ -229,6 +229,39 @@ static void test_parse_client(void) {
         q27_fp1_op_free(&op);
     }
 
+    /* Strict version token (codex P2): fractional/trailing-junk versions
+     * are malformed, not v1. */
+    {
+        const char *frac = "{\"v\":1.5,\"op\":\"quit\"}";
+        CHECK(q27_fp1_parse_client_line(frac, strlen(frac), &op));
+        CHECK(op.kind == Q27_FP1_OP_MALFORMED);
+        q27_fp1_op_free(&op);
+        const char *junk = "{\"v\":1junk,\"op\":\"quit\"}";
+        CHECK(q27_fp1_parse_client_line(junk, strlen(junk), &op));
+        CHECK(op.kind == Q27_FP1_OP_MALFORMED);
+        q27_fp1_op_free(&op);
+    }
+
+    /* Surrogate pairs combine; unpaired surrogates reject (codex P2). */
+    {
+        const char *emoji =
+            "{\"v\":1,\"op\":\"prompt\",\"text\":\"\\uD83D\\uDE00\"}";
+        CHECK(q27_fp1_parse_client_line(emoji, strlen(emoji), &op));
+        CHECK(op.kind == Q27_FP1_OP_PROMPT);
+        CHECK(op.text && strlen(op.text) == 4 &&
+              (unsigned char)op.text[0] == 0xF0 &&
+              (unsigned char)op.text[1] == 0x9F &&
+              (unsigned char)op.text[2] == 0x98 &&
+              (unsigned char)op.text[3] == 0x80);
+        q27_fp1_op_free(&op);
+        const char *lone =
+            "{\"v\":1,\"op\":\"prompt\",\"text\":\"\\uD83D x\"}";
+        CHECK(q27_fp1_parse_client_line(lone, strlen(lone), &op));
+        CHECK(op.kind == Q27_FP1_OP_PROMPT);
+        CHECK(op.text && op.text[0] == '\0');   /* unpaired -> dropped to empty */
+        q27_fp1_op_free(&op);
+    }
+
     CHECK(q27_fp1_parse_client_line("{\"v\":1,\"op\":\"save\"}", 20, &op));
     CHECK(op.kind == Q27_FP1_OP_SAVE);
     q27_fp1_op_free(&op);

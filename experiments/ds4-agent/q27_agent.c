@@ -2348,17 +2348,45 @@ int main(int argc, char **argv) {
             q27_fp1_op op = {0};
             (void)q27_fp1_control_flush_drops(stdout, worker, "idle");
 
-            /* Control ops take priority over the backend prompt queue: a
-             * queue_clear (or cancel/save/...) that arrived before this
-             * iteration must take effect before the next queued prompt
-             * starts — the protocol's explicit queue_clear exception
-             * (codex P2). A control-channel prompt handled here simply runs
-             * before an older queued one; both complete.
-             * P4 post-terminal dequeue: prefer backend prompt queue over wait. */
+            /* Drain pending control ops before dequeuing prompts (the
+             * queue_clear exception, r1 codex P2). Busy-time prompt arrivals
+             * join the BACK of the backend queue so FIFO order and request
+             * correlation are preserved (r4 codex P1); other control ops
+             * dispatch in place below. */
             int from_prompt_queue = 0;
-            const int cr = q27_fp1_control_wait_op(&op, 0);
-            if (cr == 0) break; /* quit/stop */
-            if (cr < 0) {
+            int have_op = 0;
+            int quit_now = 0;
+            for (;;) {
+                const int cr = q27_fp1_control_wait_op(&op, 0);
+                if (cr == 0) { quit_now = 1; break; }   /* quit/stop */
+                if (cr < 0) break;                      /* control drained */
+                if (op.kind == Q27_FP1_OP_PROMPT) {
+                    const int pr = q27_fp1_prompt_queue_push(
+                        op.text, op.client_req_id);
+                    if (pr < 0) {
+                        const uint64_t seq =
+                            q27_agent_worker_alloc_sequence(worker);
+                        (void)q27_fp1_emit_rejected(
+                            stdout, seq, op.client_req_id, "busy",
+                            "out of memory", "idle");
+                    } else if (pr == 0) {
+                        const uint64_t seq =
+                            q27_agent_worker_alloc_sequence(worker);
+                        (void)q27_fp1_emit_rejected(
+                            stdout, seq, op.client_req_id, "queue_full",
+                            "prompt queue full (cap 8)", "idle");
+                    } else {
+                        (void)q27_fp1_emit_queue_from_worker(stdout, worker,
+                                                             "idle");
+                    }
+                    q27_fp1_op_free(&op);
+                    continue;
+                }
+                have_op = 1;
+                break;
+            }
+            if (quit_now) break;
+            if (!have_op) {
                 /* No pending control op — queued work may proceed. */
                 if (q27_fp1_prompt_queue_pop(&op)) {
                     from_prompt_queue = 1;
@@ -2632,6 +2660,9 @@ int main(int argc, char **argv) {
                     session_path, current_snapshot_name, context,
                     last_ctx_used, think, auto_tools,
                     chat.len > 0 ? (chat.len - 1) / 2 : 0);
+                /* Same idle-cancel no-op before manual tool work. */
+                if (q27_fp1_control_cancel_requested())
+                    q27_fp1_control_clear_cancel();
                 /* Manual tool events correlate to the manual request
                  * (codex P2); the borrow ends before the op is freed. */
                 g_fp1_active_req_id = op.client_req_id;
@@ -2684,6 +2715,13 @@ int main(int argc, char **argv) {
                 q27_fp1_op_free(&op);
                 continue;
             }
+
+            /* Idle cancel is a protocol no-op: a flag that arrived while
+             * idle must not cancel the fresh prompt about to start
+             * (r4 codex P1). A cancel meant for the new turn can only
+             * arrive during it. */
+            if (q27_fp1_control_cancel_requested())
+                q27_fp1_control_clear_cancel();
 
             ok = transcript_append(&chat, "user", op.text);
             /* Borrow the correlation id for the whole turn; the op (and its
