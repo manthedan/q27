@@ -55,7 +55,13 @@ impl Backend {
         if let Some(parent) = stderr_log.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let stderr_file = std::fs::File::create(&stderr_log)?;
+        // Exclusive + no-follow: a predictable temp path opened with
+        // File::create would let a local process pre-create or race a
+        // symlink and make us truncate/write its target (codex P2).
+        let stderr_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stderr_log)?;
 
         let mut cmd = Command::new(agent_bin);
         cmd.arg(model.as_ref())

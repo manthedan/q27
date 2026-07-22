@@ -30,7 +30,8 @@ char *q27_fp1_json_escape(const unsigned char *data, size_t len);
 int q27_fp1_utf8_valid(const unsigned char *data, size_t len);
 
 /* Emit one worker event. mode 0 = legacy jsonl shape; mode 1 = FP1 envelope. */
-int q27_fp1_print_event(FILE *out, const q27_agent_event *event, int mode);
+int q27_fp1_print_event(FILE *out, const q27_agent_event *event, int mode,
+                        const char *client_req_id);
 
 /* Control-plane lifecycle (FP1 only). seq from worker counter; command_id 0. */
 int q27_fp1_emit_hello(FILE *out, uint64_t seq, const char *model_path,

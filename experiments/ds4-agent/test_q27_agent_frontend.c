@@ -73,7 +73,7 @@ static void test_v0_shape(void) {
 
     FILE *f = tmpfile();
     CHECK(f != NULL);
-    CHECK(q27_fp1_print_event(f, &ev, /*mode=*/0));
+    CHECK(q27_fp1_print_event(f, &ev, /*mode=*/0, /*client_req_id=*/NULL));
     char *out = slurp_tmp(f);
     CHECK(out != NULL);
     /* v0 has no "v" field and no "text" field. */
@@ -100,7 +100,7 @@ static void test_v1_shape(void) {
 
     FILE *f = tmpfile();
     CHECK(f != NULL);
-    CHECK(q27_fp1_print_event(f, &ev, /*mode=*/1));
+    CHECK(q27_fp1_print_event(f, &ev, /*mode=*/1, "req-42"));
     char *out = slurp_tmp(f);
     CHECK(out != NULL);
     CHECK(strstr(out, "\"v\":1") != NULL);
@@ -109,6 +109,18 @@ static void test_v1_shape(void) {
     CHECK(strstr(out, "\"text\":\"Here is the fix\"") != NULL);
     CHECK(strstr(out, "\"stream\":\"assistant\"") != NULL);
     CHECK(strstr(out, "\"data_b64\"") != NULL);
+    /* Correlation id threads through to worker events (codex P1). */
+    CHECK(strstr(out, "\"client_req_id\":\"req-42\"") != NULL);
+    free(out);
+    fclose(f);
+
+    /* NULL correlation still prints an explicit null field. */
+    f = tmpfile();
+    CHECK(f != NULL);
+    CHECK(q27_fp1_print_event(f, &ev, /*mode=*/1, NULL));
+    out = slurp_tmp(f);
+    CHECK(out != NULL);
+    CHECK(strstr(out, "\"client_req_id\":null") != NULL);
     free(out);
     fclose(f);
 }

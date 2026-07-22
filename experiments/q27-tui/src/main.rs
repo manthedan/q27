@@ -114,8 +114,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let log_path = std::env::temp_dir().join(format!(
-        "q27-tui-stderr-{}.log",
-        std::process::id()
+        "q27-tui-stderr-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     ));
 
     eprintln!(
@@ -502,8 +506,20 @@ fn dispatch_input(
             backend.queue_clear().map(|_| ())
         }
         Some("cancel") | Some("interrupt") | Some("stop") => {
-            model.status_line = "cancelling…".into();
-            backend.cancel().map(|_| ())
+            // Guard like the Esc/^C key path: an idle agent treats SIGINT as
+            // the global interrupt and exits, so idle /cancel must be a
+            // no-op (codex P1).
+            let busy = !matches!(
+                model.phase,
+                app::Phase::Idle | app::Phase::Stopped | app::Phase::Starting
+            );
+            if busy {
+                model.status_line = "cancelling…".into();
+                backend.cancel().map(|_| ())
+            } else {
+                model.status_line = "nothing to cancel".into();
+                Ok(())
+            }
         }
         Some("quit") | Some("exit") | Some("q") => backend.quit(),
         Some(_) => {

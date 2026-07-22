@@ -231,7 +231,8 @@ static int json_put_cstr(FILE *out, const char *key, const char *value) {
                             (const unsigned char *)value, strlen(value));
 }
 
-int q27_fp1_print_event(FILE *out, const q27_agent_event *event, int mode) {
+int q27_fp1_print_event(FILE *out, const q27_agent_event *event, int mode,
+                        const char *client_req_id) {
     if (!out || !event) return 0;
     char *data_b64 = base64_encode(event->data, event->data_len);
     if (!data_b64) return 0;
@@ -262,14 +263,21 @@ int q27_fp1_print_event(FILE *out, const q27_agent_event *event, int mode) {
         const uint64_t ts = q27_fp1_now_ms();
         ok = fprintf(out,
             "{\"v\":1,\"seq\":%llu,\"type\":\"%s\",\"ts_ms\":%llu,"
-            "\"command_id\":%llu,\"client_req_id\":null,"
-            "\"state\":\"%s\",\"status\":\"%s\",\"code\":null",
+            "\"command_id\":%llu",
             (unsigned long long)event->sequence,
             event_type_name(event->type),
             (unsigned long long)ts,
-            (unsigned long long)event->command_id,
-            worker_state_name(event->state),
-            status_name(event->status)) >= 0;
+            (unsigned long long)event->command_id) >= 0;
+        /* Correlation is per active command: the FP1 loop retains the
+         * prompt's client_req_id for the whole turn and passes it here so
+         * deltas/terminals/tool events can be matched to a request
+         * (codex P1). NULL prints null. */
+        if (ok) ok = json_put_cstr(out, "client_req_id", client_req_id);
+        if (ok)
+            ok = fprintf(out,
+                ",\"state\":\"%s\",\"status\":\"%s\",\"code\":null",
+                worker_state_name(event->state),
+                status_name(event->status)) >= 0;
 
         /* Prefer UTF-8 text for chat-like payloads; always keep data_b64. */
         const int want_text =
@@ -544,6 +552,7 @@ const char *q27_fp1_help_text(void) {
 #include <fcntl.h>
 
 #define FP1_OP_QUEUE_CAP 16
+#define FP1_DROP_CAP 8
 /* Backend-owned prompt queue cap (§6.1) — mirrors linenoise default of 8. */
 #define FP1_PROMPT_QUEUE_CAP 8
 /* FP1 §3.3 soft cap: 1 MiB per NDJSON line. */
@@ -576,10 +585,14 @@ typedef struct {
     int quit_requested;
     char quit_reason[32];
     int wake_pipe[2];
-    /* Silent drops are forbidden (§2.6): sticky overflow for control plane. */
-    int drop_pending;
-    char drop_client_req_id[65];
-    char drop_code[32];
+    /* Silent drops are forbidden (§2.6): bounded per-request rejection ring
+     * for control-plane overflow (codex P2); beyond cap, coalesce into a
+     * count emitted as one summary rejection. */
+    size_t drop_head;
+    size_t drop_len;
+    char drop_reqs[FP1_DROP_CAP][65];
+    char drop_codes[FP1_DROP_CAP][32];
+    uint32_t drop_coalesced;
 } fp1_control;
 
 static fp1_control g_ctl = {
@@ -1005,16 +1018,44 @@ static int ctl_push_locked(const q27_fp1_op *op) {
 }
 
 static void ctl_note_drop_locked(const q27_fp1_op *op, const char *code) {
-    g_ctl.drop_pending = 1;
-    snprintf(g_ctl.drop_code, sizeof(g_ctl.drop_code), "%s",
+    /* Per-request record so every dropped caller gets its own rejection
+     * (codex P2); the ring is bounded, overflow coalesces to a count. */
+    if (g_ctl.drop_len >= FP1_DROP_CAP) {
+        g_ctl.drop_coalesced++;
+        pthread_cond_broadcast(&g_ctl.cv);
+        return;
+    }
+    const size_t idx = (g_ctl.drop_head + g_ctl.drop_len) % FP1_DROP_CAP;
+    snprintf(g_ctl.drop_codes[idx], sizeof(g_ctl.drop_codes[idx]), "%s",
              code ? code : "busy");
     if (op && op->client_req_id) {
-        snprintf(g_ctl.drop_client_req_id, sizeof(g_ctl.drop_client_req_id),
+        snprintf(g_ctl.drop_reqs[idx], sizeof(g_ctl.drop_reqs[idx]),
                  "%s", op->client_req_id);
     } else {
-        g_ctl.drop_client_req_id[0] = '\0';
+        g_ctl.drop_reqs[idx][0] = '\0';
     }
+    g_ctl.drop_len++;
     pthread_cond_broadcast(&g_ctl.cv);
+}
+
+/* Pop one drop record (caller holds no lock after return). Returns 1 with
+ * the record filled, 0 when the ring is empty. *coalesced receives (and
+ * clears) the overflow count only when the ring has just drained. */
+static int ctl_pop_drop_locked(char *code, size_t code_cap, char *req,
+                               size_t req_cap, uint32_t *coalesced) {
+    if (g_ctl.drop_len == 0) {
+        if (g_ctl.drop_coalesced && coalesced) {
+            *coalesced = g_ctl.drop_coalesced;
+            g_ctl.drop_coalesced = 0;
+            return 2;
+        }
+        return 0;
+    }
+    snprintf(code, code_cap, "%s", g_ctl.drop_codes[g_ctl.drop_head]);
+    snprintf(req, req_cap, "%s", g_ctl.drop_reqs[g_ctl.drop_head]);
+    g_ctl.drop_head = (g_ctl.drop_head + 1) % FP1_DROP_CAP;
+    g_ctl.drop_len--;
+    return 1;
 }
 
 static int ctl_apply_op(q27_fp1_op *op) {
@@ -1363,17 +1404,15 @@ int q27_fp1_control_reject_busy(FILE *out, q27_agent_worker *worker,
     for (;;) {
         q27_fp1_op op = {0};
         int drop = 0;
+        uint32_t coalesced = 0;
         char drop_code[32] = {0};
         char drop_req[65] = {0};
         pthread_mutex_lock(&g_ctl.mu);
-        if (g_ctl.drop_pending) {
-            drop = 1;
-            snprintf(drop_code, sizeof(drop_code), "%s",
-                     g_ctl.drop_code[0] ? g_ctl.drop_code : "busy");
-            snprintf(drop_req, sizeof(drop_req), "%s", g_ctl.drop_client_req_id);
-            g_ctl.drop_pending = 0;
-            g_ctl.drop_client_req_id[0] = '\0';
-            g_ctl.drop_code[0] = '\0';
+        const int dr = ctl_pop_drop_locked(drop_code, sizeof(drop_code),
+                                           drop_req, sizeof(drop_req),
+                                           &coalesced);
+        if (dr != 0) {
+            drop = dr;
             pthread_mutex_unlock(&g_ctl.mu);
         } else if (g_ctl.len == 0) {
             pthread_mutex_unlock(&g_ctl.mu);
@@ -1388,13 +1427,24 @@ int q27_fp1_control_reject_busy(FILE *out, q27_agent_worker *worker,
 
         const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
         int ok = 1;
+        if (drop == 2) {
+            char text[96];
+            snprintf(text, sizeof(text),
+                     "%u further control ops dropped (rejection cap)",
+                     (unsigned)coalesced);
+            ok = q27_fp1_emit_rejected(out, seq, NULL, "busy", text, state);
+            if (!ok) return 0;
+            continue;
+        }
         if (drop) {
             const char *req = drop_req[0] ? drop_req : NULL;
             const char *text =
                 !strcmp(drop_code, "busy")
                     ? "control queue full or worker busy; op dropped"
                     : "control queue full; op dropped";
-            ok = q27_fp1_emit_rejected(out, seq, req, drop_code, text, state);
+            ok = q27_fp1_emit_rejected(out, seq, req,
+                                       drop_code[0] ? drop_code : "busy",
+                                       text, state);
             if (!ok) return 0;
             continue;
         }
@@ -1454,22 +1504,26 @@ int q27_fp1_control_flush_drops(FILE *out, q27_agent_worker *worker,
     for (;;) {
         char drop_code[32] = {0};
         char drop_req[65] = {0};
+        uint32_t coalesced = 0;
         pthread_mutex_lock(&g_ctl.mu);
-        if (!g_ctl.drop_pending) {
-            pthread_mutex_unlock(&g_ctl.mu);
-            return 1;
-        }
-        snprintf(drop_code, sizeof(drop_code), "%s",
-                 g_ctl.drop_code[0] ? g_ctl.drop_code : "busy");
-        snprintf(drop_req, sizeof(drop_req), "%s", g_ctl.drop_client_req_id);
-        g_ctl.drop_pending = 0;
-        g_ctl.drop_client_req_id[0] = '\0';
-        g_ctl.drop_code[0] = '\0';
+        const int dr = ctl_pop_drop_locked(drop_code, sizeof(drop_code),
+                                           drop_req, sizeof(drop_req),
+                                           &coalesced);
         pthread_mutex_unlock(&g_ctl.mu);
+        if (dr == 0) return 1;
         const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
+        if (dr == 2) {
+            char text[96];
+            snprintf(text, sizeof(text),
+                     "%u further control ops dropped (rejection cap)",
+                     (unsigned)coalesced);
+            if (!q27_fp1_emit_rejected(out, seq, NULL, "busy", text, state))
+                return 0;
+            continue;
+        }
         const char *req = drop_req[0] ? drop_req : NULL;
         if (!q27_fp1_emit_rejected(
-                out, seq, req, drop_code,
+                out, seq, req, drop_code[0] ? drop_code : "busy",
                 "control queue full; op dropped", state))
             return 0;
     }

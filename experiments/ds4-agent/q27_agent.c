@@ -697,8 +697,14 @@ static const char *tool_kind_name(q27_agent_tool_kind kind) {
     return "unknown";
 }
 
+/* FP1 correlation: the idle loop retains the active prompt's client_req_id
+ * for the whole turn so every worker event printed through print_json_event
+ * carries it (codex P1). Borrowed pointer; owned by the op being run. */
+static const char *g_fp1_active_req_id = NULL;
+
 static int print_json_event(const q27_agent_event *event) {
-    return q27_fp1_print_event(stdout, event, q27_fp1_protocol());
+    return q27_fp1_print_event(stdout, event, q27_fp1_protocol(),
+                               g_fp1_active_req_id);
 }
 
 /* Emit type:idle control-plane readiness (FP1 only).
@@ -842,7 +848,8 @@ static int run_tool(q27_agent_worker *worker,
     if (q27_fp1_protocol() && request) {
         if (!detail[0]) tui_tool_detail(request, detail, sizeof(detail));
         const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
-        (void)q27_fp1_emit_tool_start(stdout, seq, command_id, NULL,
+        (void)q27_fp1_emit_tool_start(stdout, seq, command_id,
+                                      g_fp1_active_req_id,
                                       tool_kind_name(request->kind), detail,
                                       is_preflight);
     }
@@ -1461,7 +1468,7 @@ static int save_session_ex(q27_agent_worker *worker, const char *manifest_path,
                            char **current_snapshot_name, const transcript *chat,
                            int think, int auto_tools, uint32_t context,
                            const unsigned char tokenizer_sha1[20], int jsonl,
-                           const char *client_req_id) {
+                           int explicit_save, const char *client_req_id) {
     if (!manifest_path) return 1;
     if (!chat || chat->len < 3 || !(chat->len & 1)) {
         tui_diagf( "q27-agent: refusing to save an incomplete transcript\n");
@@ -1529,10 +1536,12 @@ static int save_session_ex(q27_agent_worker *worker, const char *manifest_path,
     }
     if (jsonl) {
         if (q27_fp1_protocol()) {
-            /* Explicit `save` op carries client_req_id → session_done.
-             * Implicit auto-saves (after turns / compact) keep stderr-only
-             * diagnostics so the stream is not spammed with action=save. */
-            if (client_req_id) {
+            /* Explicit `save` op → session_done ALWAYS, even when the op
+             * omitted client_req_id (null correlation is still a visible
+             * outcome; a silent success violates the event contract — codex
+             * P2). Implicit auto-saves (after turns / compact) keep
+             * stderr-only diagnostics so the stream is not spammed. */
+            if (explicit_save) {
                 char text_buf[640];
                 const char *text;
                 if (ok) {
@@ -1580,7 +1589,7 @@ static int save_session(q27_agent_worker *worker, const char *manifest_path,
                         const unsigned char tokenizer_sha1[20], int jsonl) {
     return save_session_ex(worker, manifest_path, current_snapshot_name, chat,
                            think, auto_tools, context, tokenizer_sha1, jsonl,
-                           NULL);
+                           /*explicit_save=*/0, NULL);
 }
 
 static int append_tool_response(transcript *chat,
@@ -2329,19 +2338,30 @@ int main(int argc, char **argv) {
             q27_fp1_op op = {0};
             (void)q27_fp1_control_flush_drops(stdout, worker, "idle");
 
-            /* P4 post-terminal dequeue: prefer backend prompt queue over wait. */
+            /* Control ops take priority over the backend prompt queue: a
+             * queue_clear (or cancel/save/...) that arrived before this
+             * iteration must take effect before the next queued prompt
+             * starts — the protocol's explicit queue_clear exception
+             * (codex P2). A control-channel prompt handled here simply runs
+             * before an older queued one; both complete.
+             * P4 post-terminal dequeue: prefer backend prompt queue over wait. */
             int from_prompt_queue = 0;
-            if (q27_fp1_prompt_queue_pop(&op)) {
-                from_prompt_queue = 1;
-                (void)q27_fp1_emit_queue_from_worker(stdout, worker, "idle");
-            } else {
-                int wr = q27_fp1_control_wait_op(&op, 200);
-                if (wr == 0) break; /* quit/stop */
-                if (wr < 0) {
-                    /* timeout — still check cancel-while-idle (no-op). */
-                    if (q27_fp1_control_cancel_requested())
-                        q27_fp1_control_clear_cancel();
-                    continue;
+            const int cr = q27_fp1_control_wait_op(&op, 0);
+            if (cr == 0) break; /* quit/stop */
+            if (cr < 0) {
+                /* No pending control op — queued work may proceed. */
+                if (q27_fp1_prompt_queue_pop(&op)) {
+                    from_prompt_queue = 1;
+                    (void)q27_fp1_emit_queue_from_worker(stdout, worker, "idle");
+                } else {
+                    int wr = q27_fp1_control_wait_op(&op, 200);
+                    if (wr == 0) break; /* quit/stop */
+                    if (wr < 0) {
+                        /* timeout — still check cancel-while-idle (no-op). */
+                        if (q27_fp1_control_cancel_requested())
+                            q27_fp1_control_clear_cancel();
+                        continue;
+                    }
                 }
             }
             (void)from_prompt_queue;
@@ -2422,7 +2442,7 @@ int main(int argc, char **argv) {
                     (void)save_session_ex(
                         worker, session_path, &current_snapshot_name, &chat,
                         think, auto_tools, context, tokenizer_sha1, jsonl,
-                        op.client_req_id);
+                        /*explicit_save=*/1, op.client_req_id);
                 }
                 q27_fp1_op_free(&op);
                 continue;
@@ -2652,8 +2672,14 @@ int main(int argc, char **argv) {
             }
 
             ok = transcript_append(&chat, "user", op.text);
-            q27_fp1_op_free(&op);
-            if (!ok) break;
+            /* Borrow the correlation id for the whole turn; the op (and its
+             * owned strings) stays alive until the turn settles (codex P1). */
+            g_fp1_active_req_id = op.client_req_id;
+            if (!ok) {
+                g_fp1_active_req_id = NULL;
+                q27_fp1_op_free(&op);
+                break;
+            }
 
             q27_fp1_set_session_report(
                 session_path, current_snapshot_name, context, last_ctx_used,
