@@ -1335,6 +1335,15 @@ static int ctl_apply_op(q27_fp1_op *op) {
         pthread_mutex_unlock(&g_ctl.mu);
         return 1;
     }
+    /* Ordered quit barrier (r17 codex P1): anything parsed AFTER a quit
+     * must not run — a same-read `quit\nprompt …` burst would otherwise
+     * execute post-quit work (including tools) before bye. */
+    if (g_ctl.quit_requested) {
+        ctl_note_drop_locked(op, "quit");
+        q27_fp1_op_free(op);
+        pthread_mutex_unlock(&g_ctl.mu);
+        return 0;
+    }
     int ok = ctl_push_locked(op);
     if (!ok) {
         /* Control queue full: surface on-stream (pre-P4 has no prompt queue). */
@@ -1708,7 +1717,9 @@ int q27_fp1_control_reject_busy(FILE *out, q27_agent_worker *worker,
         if (drop) {
             const char *req = drop_req[0] ? drop_req : NULL;
             const char *text =
-                !strcmp(drop_code, "busy")
+                !strcmp(drop_code, "quit")
+                    ? "received after quit; op dropped"
+                    : !strcmp(drop_code, "busy")
                     ? "control queue full or worker busy; op dropped"
                     : "control queue full; op dropped";
             ok = q27_fp1_emit_rejected(out, seq, req,
@@ -1791,9 +1802,13 @@ int q27_fp1_control_flush_drops(FILE *out, q27_agent_worker *worker,
             continue;
         }
         const char *req = drop_req[0] ? drop_req : NULL;
+        const char *text =
+            !strcmp(drop_code, "quit")
+                ? "received after quit; op dropped"
+                : "control queue full; op dropped";
         if (!q27_fp1_emit_rejected(
                 out, seq, req, drop_code[0] ? drop_code : "busy",
-                "control queue full; op dropped", state))
+                text, state))
             return 0;
     }
 }

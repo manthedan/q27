@@ -904,16 +904,22 @@ static int run_tool(q27_agent_worker *worker,
                         out_ptr = collapsed;
                         out_len = (size_t)cn;
                     }
-                } else if (event.data_len) {
-                    /* Small chunks were the hole: sanitize controls before
-                     * the terminal (r12/r13 codex P2 — code-point aware so
-                     * valid UTF-8 survives). Heap — output can be large. */
+                }
+                if (out_ptr == event.data && event.data_len) {
+                    /* Anything not collapsed must still be sanitized — and
+                     * failure must close, never fail open to raw bytes
+                     * (r17 codex P2). */
                     clean = malloc(event.data_len + 1);
                     if (clean) {
                         out_len = q27_tui_sanitize_bytes(
                             event.data, event.data_len, (char *)clean,
                             event.data_len + 1);
                         out_ptr = clean;
+                    } else {
+                        static const char suppressed[] =
+                            "[tool output suppressed: sanitize failed]\n";
+                        out_ptr = suppressed;
+                        out_len = sizeof(suppressed) - 1;
                     }
                 }
                 if (!tui_write_out(out_ptr, out_len))
@@ -1003,8 +1009,10 @@ static int run_session_command(q27_agent_worker *worker,
                                const char *snapshot_path,
                                const transcript *chat, int think,
                                const unsigned char expected_snapshot_sha256[32],
-                               int jsonl, uint32_t *tokens) {
+                               int jsonl, uint32_t *tokens,
+                               uint64_t *out_command_id) {
     if (tokens) *tokens = 0;
+    if (out_command_id) *out_command_id = 0;
     q27_agent_message *view = chat ? transcript_view(chat) : NULL;
     if (chat && !view) {
         tui_diagf( "q27-agent: out of memory\n");
@@ -1016,6 +1024,7 @@ static int run_session_command(q27_agent_worker *worker,
         worker, action, snapshot_path, view, chat ? chat->len : 0, think,
         expected_snapshot_sha256, &command_id, error, sizeof(error));
     free(view);
+    if (out_command_id) *out_command_id = command_id;
     if (submitted != Q27_AGENT_OK) {
         tui_diagf( "q27-agent: session command rejected: %s\n",
                 error[0] ? error : "unknown error");
@@ -1297,7 +1306,7 @@ static int transcript_prompt_tokens(q27_agent_worker *worker,
     // lifecycle so consumers see only user-visible generations/tools/session
     // publication, never a misleading terminal before the requested answer.
     return run_session_command(worker, Q27_SESSION_COUNT, NULL, chat, think,
-                               NULL, 0, tokens);
+                               NULL, 0, tokens, NULL);
 }
 
 // Summarize only complete root-turn groups. A root group starts at a user
@@ -1548,8 +1557,9 @@ static int save_session_ex(q27_agent_worker *worker, const char *manifest_path,
     // Snapshot writing is only phase one of persistence. Suppress its internal
     // SESSION_DONE in JSONL: durable success exists only after the manifest
     // transaction below, and the process exit status remains the outer proof.
+    uint64_t save_command_id = 0;
     int ok = run_session_command(worker, Q27_SESSION_SAVE, snapshot_path,
-                                 chat, think, NULL, 0, NULL);
+                                 chat, think, NULL, 0, NULL, &save_command_id);
     unsigned char snapshot_sha256[32];
     if (ok && !private_file_sha256(snapshot_path, snapshot_sha256,
                                    error, sizeof(error))) {
@@ -1602,7 +1612,10 @@ static int save_session_ex(q27_agent_worker *worker, const char *manifest_path,
                                     : "durable session publication failed";
                 }
                 const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
-                if (!q27_fp1_emit_session_done(stdout, seq, 0, client_req_id,
+                /* FP1: command_id is the worker ID whenever a real save
+                 * command ran (r17 codex P2). */
+                if (!q27_fp1_emit_session_done(stdout, seq, save_command_id,
+                                               client_req_id,
                                                "save", ok ? "ok" : "error",
                                                text, 0, "idle"))
                     ok = 0;
@@ -2349,7 +2362,7 @@ int main(int argc, char **argv) {
                 if (ok) ok = run_session_command(
                     worker, Q27_SESSION_LOAD, saved.snapshot_path,
                     &chat, think, saved.snapshot_sha256,
-                    jsonl, &restored_tokens);
+                    jsonl, &restored_tokens, NULL);
                 if (ok) {
                     current_snapshot_name = saved.snapshot_name;
                     saved.snapshot_name = NULL;
@@ -3017,6 +3030,10 @@ int main(int argc, char **argv) {
             }
         }
         q27_fp1_control_stop();
+        /* The reader thread is joined: every parsed op (including post-quit
+         * drops from the r17 barrier) is now queued — flush the rejections
+         * before the terminal bye frame; silent drops are forbidden. */
+        (void)q27_fp1_control_flush_drops(stdout, worker, "idle");
     } else if (ok) {
         /* Legacy interactive: linenoise TUI or plain reader (not FP1). */
         const int use_tui = !jsonl && q27_tui_available();
