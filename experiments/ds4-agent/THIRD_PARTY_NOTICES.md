@@ -35,3 +35,15 @@ DS4 is distributed under the MIT License:
 The Phase-0 implementation does not vendor the complete upstream file. If
 substantial DS4 source is copied during later phases, this notice must remain
 with the derived source and release artifacts.
+
+## linenoise (line editing)
+
+Interactive TUI input uses linenoise as shipped by antirez/ds4 (extended
+multiplex API with status footer support), derived from:
+
+- https://github.com/antirez/linenoise
+- vendored path: `experiments/ds4-agent/third_party/linenoise/`
+
+linenoise is distributed under a BSD-style license (see the copyright header in
+`linenoise.c` / `linenoise.h`): Copyright (c) 2010-2023 Salvatore Sanfilippo
+and Pieter Noordhuis.

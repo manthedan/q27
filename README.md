@@ -250,24 +250,30 @@ Quality and correctness instruments ride the same binary: `--nll`,
 
 ## Native coding agent
 
-The friendly source-checkout command builds and starts the B1 agent in the
-current directory:
+The friendly source-checkout command builds the agent + Ratatui frontend and
+starts B1 in the current directory:
 
 ```bash
 make agent
+# or, after a one-time PATH shim:
+make install-dev-q27
+q27 agent b1
 ```
 
-The equivalent current-source supervisor command is
-`./packaging/bin/q27 agent`. It defaults to B1, context 32768,
-`--max-tokens auto`, automatic tools, and the physical path of the current
-workspace. Packs and ordinary native-agent flags remain available:
+`q27 agent` (source packaging) defaults to B1, context 32768, `--max-tokens auto`,
+automatic tools, and the physical path of the current workspace. On a real TTY
+it prefers the Rust **q27-tui** client (Frontend Protocol v1); non-TTY /
+scripts fall back to the classic linenoise agent. Force either UI with
+`Q27_AGENT_UI=tui` or `Q27_AGENT_UI=classic`.
 
 ```bash
 make agent                                      # B1 in the current project
+make install-dev-q27 && q27 agent b1            # same, as a plain shell command
 Q27_AGENT_PACK=t2 make agent                    # choose another local pack
 Q27_AGENT_SESSION=work.q27agent make agent
 Q27_AGENT_CONTEXT=16384 make agent
 Q27_AGENT_WORKSPACE=/path/to/project make agent
+Q27_AGENT_UI=classic make agent                 # force linenoise (no Ratatui)
 # optional non-greedy decode (default remains temperature 0):
 Q27_AGENT_TEMPERATURE=0.7 make agent
 # top_p=0.95 and top_k=20 fill in when only temperature is set; override with
@@ -275,9 +281,8 @@ Q27_AGENT_TEMPERATURE=0.7 make agent
 # on the Metal server/CLI path; the native agent is still serial sample today.
 ```
 
-The published v0.3 Homebrew archive predates this supervisor subcommand;
-`q27 agent` will become the installed spelling in the next tagged release.
-Friends testing it now should use a source checkout and `make agent`.
+Slash commands in the Ratatui UI map to structured FP1 ops (`/help`, `/save`,
+`/compact`, `/session`, `/new`, `/read`, `/search`, `/shell`).
 
 `Q27_AGENT_PACK`, `Q27_AGENT_MAX_TOKENS`, and `Q27_AGENT_SESSION` provide
 script-friendly defaults; sampling env vars pass through to

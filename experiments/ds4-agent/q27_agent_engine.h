@@ -51,9 +51,20 @@ void q27_agent_engine_close(q27_agent_engine *engine);
 // MTP draft width (0 = serial only). Values 2..12 enable greedy mtp_round
 // (temp==0) or mtp_sample_round (temp>0) when the artifact has an MTP layer
 // and tool grammar cannot engage mid-burst. Tool-enabled free text and
-// active masks stay serial so JSON stays fail-closed.
+// active masks stay serial so JSON stays fail-closed. Budget-armed thinking
+// also stays serial so the per-token think-budget check can fire.
 void q27_agent_engine_set_mtp_width(q27_agent_engine *engine, uint32_t width);
 uint32_t q27_agent_engine_mtp_width(const q27_agent_engine *engine);
+
+// Optional think budget for streaming `<think>…</think>`. 0 = unlimited
+// (default). When non-zero and still inside an open think span after N tokens,
+// the engine *force-injects* `</think>\n\n` into the stream + KV (same close
+// the `--no-think` prefill uses) and **continues free generation** for the
+// answer within remaining max_tokens. Falls back to a length stop only if
+// there is no room for the close sequence plus one answer token. Independent
+// of the model; packs have no native thinking budget.
+void q27_agent_set_max_think_tokens(uint32_t n);
+uint32_t q27_agent_max_think_tokens(void);
 q27_agent_status q27_agent_engine_tokenizer_sha1(
     q27_agent_engine *engine, unsigned char out_sha1[20],
     char *error, size_t error_cap);

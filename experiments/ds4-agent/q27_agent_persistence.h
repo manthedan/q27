@@ -59,6 +59,18 @@ int q27_agent_session_load(const char *manifest_path,
                            char *error, size_t error_cap);
 void q27_agent_saved_session_free(q27_agent_saved_session *session);
 
+// Exclusive-locked discard for /new. expected_snapshot_name is the CAS
+// baseline: when non-NULL, unlinks only if the live manifest still names that
+// snapshot; when NULL, succeeds only if the manifest is already missing
+// (refuses to delete a live session the process never loaded). Manifest is
+// removed first, then the matching snapshot. Returns 1 on durable success, 2
+// if the namespace was mutated (manifest unlinked) but snapshot cleanup or
+// directory fsync failed (caller must still clear in-memory CAS state), 0 if
+// no mutation occurred (lock/CAS/pre-unlink I/O failure).
+int q27_agent_session_discard(const char *manifest_path,
+                              const char *expected_snapshot_name,
+                              char *error, size_t error_cap);
+
 // Chooses the first retained root user message while treating an assistant
 // tool call plus following <tool_response> user message as one indivisible
 // root turn. Returns 1 with cut_index, or 0 when there are not enough complete

@@ -9,6 +9,7 @@
 #include "../../src/toolconstrain.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +24,75 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+
+// Process-wide thinking budget (set once from CLI before any generate).
+static std::atomic<uint32_t> g_max_think_tokens{0};
+
+extern "C" void q27_agent_set_max_think_tokens(uint32_t n) {
+    g_max_think_tokens.store(n, std::memory_order_relaxed);
+}
+
+extern "C" uint32_t q27_agent_max_think_tokens(void) {
+    return g_max_think_tokens.load(std::memory_order_relaxed);
+}
+
+// Tiny sliding matcher for `<think>` / `</think>` in streamed decode bytes.
+struct ThinkSpanTracker {
+    bool in_think = false;
+    bool ever_opened = false;
+    uint32_t think_tokens = 0;
+    std::string tail; // partial tag match across token boundaries
+
+    void observe_token(const std::string &bytes) {
+        if (bytes.empty()) {
+            if (in_think) ++think_tokens;
+            return;
+        }
+        // Count this decode step as one think-token when already inside the span
+        // *before* this token, or when this token opens the span.
+        const bool was_in = in_think;
+        tail.append(bytes);
+        // Cap tail growth; tags are short.
+        if (tail.size() > 64)
+            tail.erase(0, tail.size() - 64);
+        for (;;) {
+            if (!in_think) {
+                auto pos = tail.find("<think>");
+                if (pos == std::string::npos) break;
+                in_think = true;
+                ever_opened = true;
+                tail.erase(0, pos + 7);
+            } else {
+                auto pos = tail.find("</think>");
+                if (pos == std::string::npos) break;
+                in_think = false;
+                tail.erase(0, pos + 8);
+            }
+        }
+        if (was_in || in_think) ++think_tokens;
+    }
+
+    void mark_closed() {
+        in_think = false;
+        tail.clear();
+    }
+};
+
+// Same ids the chat template uses for the empty-think prefill (`--no-think`).
+static std::vector<uint32_t> force_close_think_ids(q27::Tokenizer *tok) {
+    std::vector<uint32_t> ids;
+    if (!tok) return ids;
+    const int t_close = tok->token_id("</think>");
+    if (t_close >= 0) {
+        ids.push_back(static_cast<uint32_t>(t_close));
+        for (int id : tok->encode("\n\n"))
+            ids.push_back(static_cast<uint32_t>(id));
+    } else {
+        for (int id : tok->encode("</think>\n\n"))
+            ids.push_back(static_cast<uint32_t>(id));
+    }
+    return ids;
+}
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -606,11 +676,79 @@ extern "C" q27_agent_status q27_agent_generate(
         uint32_t produced = 0;
         bool stopped_for_tool_call = false;
         bool awaiting_fenced_body = false;
+        bool forced_think_close = false;
+        bool think_budget_fallback_stop = false;
+        const uint32_t max_think = g_max_think_tokens.load(std::memory_order_relaxed);
+        ThinkSpanTracker think_span;
         q27::agent::StallWatcher stall_watcher;
         // Adaptive live width for free-decode MTP (mirrors metal_server).
         uint32_t live_width =
             engine->mtp_width >= 2 ? std::min(engine->mtp_width, 4u) : 0;
         const bool sample_plain = getenv("Q27_SAMPLE_PLAIN") != nullptr;
+
+        // Advance one free-gen step: record emitted id, encode it, pick next.
+        auto advance_after_emit = [&](uint32_t emitted) -> bool {
+            if (!engine->agent_session.record_emitted(emitted))
+                throw std::runtime_error("agent session emitted-token mismatch");
+            if (!alive(opaque)) return false;
+            if (use_sample) {
+                (void)engine->session->step(emitted);
+                if (!engine->agent_session.mark_pending_encoded())
+                    throw std::runtime_error(
+                        "agent session token-step mismatch");
+                if (!alive(opaque)) return false;
+                current = engine->session->sample_from_logits(params, rng);
+            } else {
+                current = engine->session->step(emitted);
+                if (!engine->agent_session.mark_pending_encoded())
+                    throw std::runtime_error(
+                        "agent session token-step mismatch");
+            }
+            return alive(opaque);
+        };
+
+        // Inject </think>\n\n into the stream + KV (same close the no-think
+        // prefill uses), then free-sample the first answer token. Caller has
+        // already advanced past the last real think token. Returns false on
+        // cancel only.
+        auto force_close_think_and_continue =
+            [&](const std::vector<uint32_t> &force) -> bool {
+            for (size_t i = 0; i < force.size(); ++i) {
+                if (!alive(opaque)) return false;
+                if (produced >= max_tokens) {
+                    think_budget_fallback_stop = true;
+                    return true;
+                }
+                current = force[i];
+                const std::string bytes =
+                    engine->tokenizer->decode_one(static_cast<int>(current));
+                if (!bytes.empty() &&
+                    !sink(bytes.data(), bytes.size(), opaque)) {
+                    return false;
+                }
+                think_span.observe_token(bytes);
+                ++produced;
+                if (output_tokens) *output_tokens = produced;
+                const bool last = (i + 1 == force.size());
+                if (last) {
+                    // Encode close tags, then free-sample the first answer token.
+                    if (!advance_after_emit(current)) return false;
+                } else {
+                    // Intermediate force ids: step only, next current is forced.
+                    if (!engine->agent_session.record_emitted(current))
+                        throw std::runtime_error(
+                            "agent session emitted-token mismatch");
+                    if (!alive(opaque)) return false;
+                    (void)engine->session->step(current);
+                    if (!engine->agent_session.mark_pending_encoded())
+                        throw std::runtime_error(
+                            "agent session token-step mismatch");
+                }
+            }
+            think_span.mark_closed();
+            forced_think_close = true;
+            return true;
+        };
 
         // Stream one non-EOS token: tool scan → stall → sink → produced++.
         // Returns: 0 ok continue, 1 stop (tool close / max), -1 cancelled,
@@ -674,6 +812,11 @@ extern "C" q27_agent_status q27_agent_generate(
             }
             if (!bytes.empty() && !sink(bytes.data(), bytes.size(), opaque))
                 return -1;
+            // Track thinking span after the sink publishes (bytes are
+            // committed). Burst tokens pass through here too, so the think
+            // budget accounting covers the MTP path.
+            if (enable_thinking || max_think > 0)
+                think_span.observe_token(bytes);
             ++produced;
             // The callback is irreversible: publish accounting before any
             // allocation, Metal step, or other bookkeeping can fail.
@@ -742,16 +885,23 @@ extern "C" q27_agent_status q27_agent_generate(
             // draft would select unconstrained tokens after `<tool_call>`.
             // After body-tool close, awaiting_fenced_body disables engage so
             // MTP is safe for long fenced payloads. Matches metal_server's
-            // "no MTP under tool constraint" boundary (codex P1).
+            // "no MTP under tool constraint" boundary (codex P1). Merge note
+            // (agent-tui): MTP is also disabled while a think budget is
+            // armed inside a think span — bursts would skip the per-token
+            // budget check, so thinking decodes serially; the budget then
+            // fires every token and MTP re-engages for the answer.
             const bool tools_masking =
                 constrainer.has_value() && constrainer->active;
             const bool tools_may_engage =
                 constrainer.has_value() && constrainer->enabled &&
                 !awaiting_fenced_body;
+            const bool think_budget_armed =
+                max_think > 0 && think_span.in_think;
             const bool can_mtp =
                 live_width >= 2 && engine->session->has_mtp() &&
                 engine->session->chunked_prefill() && remaining >= 2 &&
-                !tools_masking && !tools_may_engage && !sample_plain;
+                !tools_masking && !tools_may_engage && !sample_plain &&
+                !think_budget_armed;
 
             if (can_mtp) {
                 std::vector<uint32_t> committed;
@@ -840,39 +990,57 @@ extern "C" q27_agent_status q27_agent_generate(
                 finalize_last(current, /*already_encoded=*/false);
                 break;
             }
-            if (!engine->agent_session.record_emitted(current))
-                throw std::runtime_error("agent session emitted-token mismatch");
-            if (!alive(opaque)) {
-                if (output_tokens) *output_tokens = produced;
-                return cancelled();
-            }
-            // Encode the emitted token. Greedy uses step's returned argmax as
-            // the next id; sampling advances with step then draws from the
-            // (possibly tool-masked) logits — same mask surface as greedy.
-            if (use_sample) {
-                (void)engine->session->step(current);
-                if (!engine->agent_session.mark_pending_encoded())
-                    throw std::runtime_error(
-                        "agent session token-step mismatch");
-                if (!alive(opaque)) {
+
+            // Think budget: force-close the span and keep decoding the answer
+            // instead of abandoning the turn mid-reasoning. Checked per
+            // published token here in the serial quantum; the can_mtp gate
+            // above keeps budget-armed thinking on this path.
+            const bool hit_think_budget =
+                max_think > 0 && think_span.in_think &&
+                think_span.think_tokens >= max_think;
+            if (hit_think_budget) {
+                const std::vector<uint32_t> force =
+                    force_close_think_ids(engine->tokenizer.get());
+                // Need room for </think>\n\n plus ≥1 answer token.
+                if (force.empty() ||
+                    produced + force.size() >= max_tokens) {
+                    think_budget_fallback_stop = true;
+                    finalize_last(current, /*already_encoded=*/false);
+                    break;
+                }
+                if (!advance_after_emit(current)) {
                     if (output_tokens) *output_tokens = produced;
                     return cancelled();
                 }
-                current = engine->session->sample_from_logits(params, rng);
-            } else {
-                current = engine->session->step(current);
-                if (!engine->agent_session.mark_pending_encoded())
-                    throw std::runtime_error(
-                        "agent session token-step mismatch");
+                if (!force_close_think_and_continue(force)) {
+                    if (output_tokens) *output_tokens = produced;
+                    return cancelled();
+                }
+                if (think_budget_fallback_stop) {
+                    // Mid-inject exhaustion — already emitted what we could.
+                    break;
+                }
+                // `current` is now the first free-gen token after </think>.
+                continue;
             }
-            if (!alive(opaque)) {
+
+            if (!advance_after_emit(current)) {
                 if (output_tokens) *output_tokens = produced;
                 return cancelled();
             }
         }
         if (output_tokens) *output_tokens = produced;
         if (eos_reached)
-            *eos_reached = current == eos && !stopped_for_tool_call;
+            *eos_reached = current == eos && !stopped_for_tool_call &&
+                           !think_budget_fallback_stop;
+        if (think_budget_fallback_stop) {
+            set_error(error, error_cap,
+                      "thinking token budget reached (no room to continue)");
+        } else if (forced_think_close) {
+            // Diagnostic only — turn still completed with an answer stream.
+            set_error(error, error_cap,
+                      "thinking token budget: forced </think> and continued");
+        }
         return Q27_AGENT_OK;
     } catch (const std::exception& e) {
         engine->agent_session.invalidate();

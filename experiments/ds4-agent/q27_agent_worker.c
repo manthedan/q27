@@ -4,6 +4,7 @@
 
 #include "q27_agent_worker.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
@@ -300,7 +301,11 @@ static int event_enqueue(q27_agent_worker *worker, q27_agent_event event,
     }
     if (allow_stopping && worker->stop)
         node->event.state = Q27_WORKER_STOPPING;
-    node->event.sequence = ++worker->next_sequence;
+    /* Sequence is assigned at dequeue/publish (next_event), not enqueue.
+     * Control-plane synthetic events share the same counter via
+     * q27_agent_worker_alloc_sequence; allocating here races with those
+     * publishes and can invert stream order vs seq order (FP1 §3.3). */
+    node->event.sequence = 0;
     if (worker->event_tail) worker->event_tail->next = node;
     else worker->event_head = node;
     worker->event_tail = node;
@@ -829,23 +834,50 @@ q27_agent_status q27_agent_worker_submit_session(
     return Q27_AGENT_OK;
 }
 
-int q27_agent_worker_next_event(q27_agent_worker *worker,
-                                q27_agent_event *event,
-                                char *error, size_t error_cap) {
+int q27_agent_worker_next_event_timeout(q27_agent_worker *worker,
+                                        q27_agent_event *event,
+                                        char *error, size_t error_cap,
+                                        int timeout_ms) {
     if (!worker || !event) {
         copy_error(error, error_cap, "invalid event request");
         return -1;
     }
     *event = (q27_agent_event){0};
+    struct timespec deadline;
+    int use_deadline = 0;
+    if (timeout_ms >= 0) {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += timeout_ms / 1000;
+        deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        use_deadline = 1;
+    }
     pthread_mutex_lock(&worker->mu);
     while (!worker->event_head && worker->state != Q27_WORKER_STOPPED &&
-           worker->state != Q27_WORKER_ERROR)
-        pthread_cond_wait(&worker->cv, &worker->mu);
+           worker->state != Q27_WORKER_ERROR) {
+        if (!use_deadline) {
+            pthread_cond_wait(&worker->cv, &worker->mu);
+            continue;
+        }
+        if (timeout_ms == 0) {
+            /* Non-blocking: leave the wait loop immediately. */
+            break;
+        }
+        int tw = pthread_cond_timedwait(&worker->cv, &worker->mu, &deadline);
+        if (tw == ETIMEDOUT) break;
+    }
     if (!worker->event_head) {
         int failed = worker->state == Q27_WORKER_ERROR;
+        int stopped = worker->state == Q27_WORKER_STOPPED || failed;
         if (failed) copy_error(error, error_cap, worker->error);
         pthread_mutex_unlock(&worker->mu);
-        return failed ? -1 : 0;
+        if (failed) return -1;
+        if (stopped) return 0;
+        /* Still live, no event yet → timeout. */
+        return use_deadline ? 2 : 0;
     }
     event_node *node = worker->event_head;
     worker->event_head = node->next;
@@ -854,6 +886,9 @@ int q27_agent_worker_next_event(q27_agent_worker *worker,
     worker->event_bytes -= node->charge;
     *event = node->event;
     node->event.data = NULL;
+    /* Publish-time sequence: same counter as alloc_sequence, stamped when the
+     * control plane takes the event (stream order == seq order). */
+    event->sequence = ++worker->next_sequence;
     const int terminal = event->type == Q27_EVENT_TURN_DONE ||
                          event->type == Q27_EVENT_TOOL_DONE ||
                          event->type == Q27_EVENT_SESSION_DONE ||
@@ -872,6 +907,13 @@ int q27_agent_worker_next_event(q27_agent_worker *worker,
     pthread_mutex_unlock(&worker->mu);
     free(node);
     return 1;
+}
+
+int q27_agent_worker_next_event(q27_agent_worker *worker,
+                                q27_agent_event *event,
+                                char *error, size_t error_cap) {
+    return q27_agent_worker_next_event_timeout(worker, event, error, error_cap,
+                                               -1);
 }
 
 int q27_agent_worker_tokenizer_sha1(q27_agent_worker *worker,
@@ -938,6 +980,14 @@ int q27_agent_worker_session_result_event(q27_agent_worker *worker,
     event->data_len = len;
     pthread_mutex_unlock(&worker->mu);
     return 1;
+}
+
+uint64_t q27_agent_worker_alloc_sequence(q27_agent_worker *worker) {
+    if (!worker) return 0;
+    pthread_mutex_lock(&worker->mu);
+    const uint64_t seq = ++worker->next_sequence;
+    pthread_mutex_unlock(&worker->mu);
+    return seq;
 }
 
 q27_agent_worker_state q27_agent_worker_get_state(q27_agent_worker *worker) {

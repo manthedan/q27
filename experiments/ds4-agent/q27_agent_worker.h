@@ -141,6 +141,13 @@ q27_agent_status q27_agent_worker_submit_session(
 int q27_agent_worker_next_event(q27_agent_worker *worker,
                                 q27_agent_event *event,
                                 char *error, size_t error_cap);
+// Like next_event, but timeout_ms >= 0 waits at most that many milliseconds.
+// Returns 2 on timeout with no event (worker still live). timeout_ms < 0 blocks
+// forever (same return codes as next_event).
+int q27_agent_worker_next_event_timeout(q27_agent_worker *worker,
+                                        q27_agent_event *event,
+                                        char *error, size_t error_cap,
+                                        int timeout_ms);
 void q27_agent_event_free(q27_agent_event *event);
 
 q27_agent_worker_state q27_agent_worker_get_state(q27_agent_worker *worker);
@@ -160,6 +167,14 @@ int q27_agent_worker_session_result_event(q27_agent_worker *worker,
                                           int success,
                                           const char *message,
                                           q27_agent_event *event);
+
+// Allocate a monotonic sequence for control-plane synthetic events
+// (hello / idle / bye / notice / rejected / queue / tool_start). Same counter
+// as worker events, which receive their seq at next_event (publish time) so
+// stream order equals seq order even when reject_busy interleaves mid-turn.
+// events so stream order equals seq order (FP1 §3.3). Returns 0 if worker is
+// NULL; otherwise a strictly positive seq.
+uint64_t q27_agent_worker_alloc_sequence(q27_agent_worker *worker);
 
 // Non-destructive: closes admission and asks the worker to stop after its
 // current bounded engine quantum. Callback-safe.

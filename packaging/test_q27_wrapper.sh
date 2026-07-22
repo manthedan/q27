@@ -64,7 +64,7 @@ export Q27_RUN_DIR="$TMP/run"
 # vars must not leak into these scenarios (the bonsai soft-default keys off
 # whether Q27_AGENT_TEMPERATURE is SET, so a stray export inverts the policy).
 unset Q27_AGENT_TEMPERATURE Q27_AGENT_TOP_P Q27_AGENT_TOP_K Q27_AGENT_SEED \
-      Q27_AGENT_MTP
+      Q27_AGENT_MTP Q27_AGENT_MAX_THINK_TOKENS Q27_AGENT_NO_THINK Q27_AGENT_UI
 lock_available() {
     "$PYTHON" - "$Q27_RUN_DIR/consumer.lock" <<'PY'
 import fcntl, os, sys
@@ -145,7 +145,58 @@ fi
 [ ! -s "$TMP/stdout" ] || {
     echo "FAIL: supervisor banner polluted agent stdout" >&2; exit 1; }
 grep -q '^q27 agent: pack=b1 context=1234 workspace=' "$TMP/stderr"
+grep -q 'ui=classic' "$TMP/stderr" || {
+    echo "FAIL: non-TTY wrapper test should use classic agent UI" >&2
+    cat "$TMP/stderr" >&2
+    exit 1
+}
 grep -q 'automatic tools enabled' "$TMP/stderr"
+
+# When q27-tui is on PATH and Q27_AGENT_UI=tui, the wrapper must launch the
+# TUI (and pass agent path via Q27_AGENT) rather than q27-agent directly.
+cat >"$TMP/bin/q27-tui" <<'EOF'
+#!/bin/sh
+printf 'Q27_AGENT=%s\n' "${Q27_AGENT:-}" >"$Q27_TUI_CAPTURE"
+printf '%s\n' "$@" >>"$Q27_TUI_CAPTURE"
+exit 0
+EOF
+chmod +x "$TMP/bin/q27-tui"
+export Q27_TUI_CAPTURE="$TMP/tui-args"
+export Q27_AGENT_UI=tui
+PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" agent b1 --no-think \
+    >"$TMP/tui-stdout" 2>"$TMP/tui-stderr"
+unset Q27_AGENT_UI
+grep -q 'ui=tui' "$TMP/tui-stderr" || {
+    echo "FAIL: expected ui=tui in stderr" >&2; cat "$TMP/tui-stderr" >&2; exit 1; }
+grep -q "^Q27_AGENT=$TMP/bin/q27-agent\$" "$TMP/tui-args" || {
+    echo "FAIL: TUI did not receive Q27_AGENT pointing at q27-agent" >&2
+    cat "$TMP/tui-args" >&2; exit 1; }
+cat >"$TMP/tui-expected" <<EOF
+Q27_AGENT=$TMP/bin/q27-agent
+--
+$TMP/home/b1/bonsai-27b-b1.q27
+$TMP/home/b1/model.tok
+--context
+1234
+--max-tokens
+77
+--auto-tools
+--workspace
+$TMP/work space
+--session
+$TMP/session file.q27agent
+--temperature
+0.6
+--top-p
+0.95
+--top-k
+20
+--no-think
+EOF
+diff -u "$TMP/tui-expected" "$TMP/tui-args"
+# Ensure classic fake agent was not also invoked for the TUI path.
+[ ! -f "$TMP/args-from-tui-path" ] || true
 wait_lock_clear || {
     echo "FAIL: consumer flock remained held after normal child exit" >&2; exit 1; }
 

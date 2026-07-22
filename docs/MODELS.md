@@ -171,8 +171,10 @@ The formula also installs **`q27-agent`**, a native C/C++ agent that links the
 engine directly — no server, no HTTP, no Anthropic/OpenAI shim. It owns the
 transcript, durable sessions, auto-compaction, and a set of local tools
 (read / search / write / edit / shell). **It is a Phase-0 experiment, not a
-finished product**: the terminal UX is a plain read-eval loop (a real TUI is on
-the roadmap), and it is the thing we most want feedback on.
+finished product**: interactive TTY mode now has a Phase-1 linenoise TUI
+(status footer, line editing, `/help` slash commands; see
+`docs/metal/plans/2026-07-21-agent-tui.md`), and it is the thing we most want
+feedback on.
 
 It uses whatever pack you already pulled — the `q27 agent` wrapper resolves
 the model and tokenizer for you (default pack **b1**, or pass another):
