@@ -1699,6 +1699,46 @@ static int prepare_turn(q27_agent_worker *worker, transcript *chat, int think,
 // old free second-turn raw-payload path is gone: under greedy Bonsai it
 // re-emitted tool calls as file content.
 
+static int append_failed_tool_response(transcript *chat, const char *message);
+
+/* Close out an interrupted/failed turn's transcript residue: pop a trailing
+ * human user message, or close an open assistant tool call with a failed
+ * tool response and even the transcript with a note. Shared by the cancel
+ * rollback and the FP1 failure recovery (r10 codex P1). Returns 0 only on
+ * allocation-class failures (caller exits the session). */
+static int fp1_close_incomplete_turn(transcript *chat, int think,
+                                     const char *tool_reason,
+                                     const char *note) {
+    const int last_is_human_user =
+        chat->len > 1 && chat->items[chat->len - 1].role &&
+        !strcmp(chat->items[chat->len - 1].role, "user") &&
+        !transcript_is_auto_tool_response_at(chat, chat->len - 1);
+    if (last_is_human_user) {
+        transcript_pop_last_human_user(chat);
+        return 1;
+    }
+    static const char call_close[] = "</tool_call>";
+    if (chat->len > 1 && chat->items[chat->len - 1].role &&
+        !strcmp(chat->items[chat->len - 1].role, "assistant") &&
+        chat->items[chat->len - 1].content &&
+        chat->items[chat->len - 1].content_len >= sizeof(call_close) - 1 &&
+        memmem(chat->items[chat->len - 1].content,
+               chat->items[chat->len - 1].content_len,
+               call_close, sizeof(call_close) - 1)) {
+        if (!append_failed_tool_response(chat, tool_reason)) {
+            tui_diagf("q27-agent: could not close interrupted tool call\n");
+            return 0;
+        }
+    }
+    if (chat->len > 1 && !(chat->len & 1)) {
+        if (!transcript_append_assistant(chat, note, strlen(note), think)) {
+            tui_diagf("q27-agent: could not close interrupted turn\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int append_failed_tool_response(transcript *chat, const char *message) {
     output_buffer empty = {0};
     q27_agent_tool_result result = {.exit_code = -1};
@@ -2592,9 +2632,11 @@ int main(int argc, char **argv) {
                                           : "compaction failed",
                                 last_ctx_used, "idle");
                         }
-                        if (compacted)
-                            (void)emit_fp1_idle(worker, last_ctx_used, context,
-                                                UINT32_MAX);
+                        /* Readiness after compact must not depend on the
+                         * outcome: clients re-enable prompts on the idle
+                         * EVENT, not the envelope state (r10 codex P2). */
+                        (void)emit_fp1_idle(worker, last_ctx_used, context,
+                                            UINT32_MAX);
                     }
                 }
                 q27_fp1_op_free(&op);
@@ -2834,44 +2876,12 @@ int main(int argc, char **argv) {
              * SIGINT ack above must not skip this rollback (codex P1). */
             if (turn_failed && cancel_any_path) {
                 /* Soft-recover: cancel is non-fatal on either path. */
-                const int last_is_human_user =
-                    chat.len > 1 && chat.items[chat.len - 1].role &&
-                    !strcmp(chat.items[chat.len - 1].role, "user") &&
-                    !transcript_is_auto_tool_response_at(&chat, chat.len - 1);
-                if (last_is_human_user) {
-                    transcript_pop_last_human_user(&chat);
-                } else {
-                    static const char call_close[] = "</tool_call>";
-                    if (chat.len > 1 && chat.items[chat.len - 1].role &&
-                        !strcmp(chat.items[chat.len - 1].role, "assistant") &&
-                        chat.items[chat.len - 1].content &&
-                        chat.items[chat.len - 1].content_len >=
-                            sizeof(call_close) - 1 &&
-                        memmem(chat.items[chat.len - 1].content,
-                               chat.items[chat.len - 1].content_len,
-                               call_close, sizeof(call_close) - 1)) {
-                        if (!append_failed_tool_response(
-                                &chat, "interrupted by user")) {
-                            tui_diagf(
-                                "q27-agent: could not close interrupted "
-                                "tool call\n");
-                            ok = 0;
-                            break;
-                        }
-                    }
-                    if (chat.len > 1 && !(chat.len & 1)) {
-                        static const char interrupted_note[] =
-                            "[interrupted by user]";
-                        if (!transcript_append_assistant(
-                                &chat, interrupted_note,
-                                sizeof(interrupted_note) - 1, think)) {
-                            tui_diagf(
-                                "q27-agent: could not close interrupted "
-                                "turn\n");
-                            ok = 0;
-                            break;
-                        }
-                    }
+                if (!fp1_close_incomplete_turn(&chat, think,
+                                               "interrupted by user",
+                                               "[interrupted by user]")) {
+                    q27_fp1_op_free(&op);
+                    ok = 0;
+                    break;
                 }
                 ok = 1;
             }
@@ -2885,7 +2895,15 @@ int main(int argc, char **argv) {
              * are rejected, so reporting idle would lie (r9 codex P1); fall
              * through with ok=0 and let bye carry the error. */
             if (!ok && q27_agent_worker_get_state(worker) != Q27_WORKER_ERROR) {
-                transcript_pop_last_human_user(&chat);
+                /* Same residue surgery as the cancel rollback — a failed
+                 * auto-tool cycle leaves an OPEN assistant tool call, not a
+                 * trailing user message (r10 codex P1). */
+                if (!fp1_close_incomplete_turn(&chat, think, "turn failed",
+                                               "[turn failed]")) {
+                    q27_fp1_op_free(&op);
+                    ok = 0;
+                    break;
+                }
                 if (g_fp1_turn_terminals == terminals_before) {
                     static const char fail_msg[] =
                         "turn failed before generation; prompt dropped";
