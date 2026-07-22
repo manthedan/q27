@@ -764,6 +764,60 @@ struct Runtime {
         if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
+        // G6 admission budget (hoisted 2026-07-22 for --ctx auto): the
+        // device serving envelope every slot's KV + fixed state + snapshot
+        // capacity must fit. Default = half the recommended working set
+        // (the engine KV check's convention); --budget-mb flag wins over
+        // the env twin. See the admission loop below for the full comment.
+        const char* budget_env=getenv("Q27_METAL_BUDGET_MB");
+        uint64_t budget=shared->backend.recommended_working_set_size()/2;
+        if(budget_mb) budget=(uint64_t)budget_mb*1024ull*1024ull; // --budget-mb, validated at parse
+        else if(budget_env) {
+            // Fail loud on a malformed override: "-1" through strtoull would
+            // wrap to an effectively unlimited budget and bypass the gate.
+            char* end=nullptr; errno=0;
+            const unsigned long long mb=strtoull(budget_env,&end,10);
+            if(errno || end==budget_env || *end || !mb || mb>(1ull<<24))
+                throw std::runtime_error("Q27_METAL_BUDGET_MB must be an integer 1..16777216");
+            budget=(uint64_t)mb*1024ull*1024ull;
+        }
+        if(ctx==0) {
+            // --ctx auto (upstream v0.4.0 parity; the default): size each
+            // slot's window to the device budget split across slots. The
+            // admission charge (KV reservation + fixed engine state +
+            // per-entry snapshot capacity — a snapshot is KV CONTENT, so it
+            // scales with ctx too) is exactly linear in ctx; two probe
+            // constructions solve slope + intercept without re-deriving the
+            // formula. Probes release their reservation at destruction.
+            const uint32_t p1=1024,p2=8192;
+            uint64_t t1,t2;
+            { q27::MetalEngine probe(shared,p1,turbo3);
+              t1=probe.kv_reserved_bytes()+(uint64_t)cache_entries*probe.snapshot_bytes()
+                +q27::MetalEngine::fixed_state_bytes(probe.chunked_prefill()); }
+            { q27::MetalEngine probe(shared,p2,turbo3);
+              t2=probe.kv_reserved_bytes()+(uint64_t)cache_entries*probe.snapshot_bytes()
+                +q27::MetalEngine::fixed_state_bytes(probe.chunked_prefill()); }
+            const double slope=(double)(t2-t1)/(double)(p2-p1);
+            const uint64_t intercept=t1-(uint64_t)(slope*p1);
+            const uint64_t slot_budget=slot_count?budget/slot_count:budget;
+            // Safety margin (upstream's arch-scaled margin twin): slope
+            // rounding and block-aligned snapshot sizing must never push
+            // the solved charge past the admission budget.
+            const uint64_t margin=std::max<uint64_t>(64ull<<20,slot_budget/64);
+            const uint64_t usable=slot_budget>margin?slot_budget-margin:0;
+            uint64_t solved=usable>intercept?(uint64_t)((usable-intercept)/slope):0;
+            if(solved>262144) solved=262144;   // model-family position cap
+            if(solved<1024)
+                throw std::runtime_error("--ctx auto: device budget fits only "+
+                    std::to_string(solved)+" tokens per slot; reduce --slots, raise --budget-mb, or use --kv turbo3");
+            ctx=(uint32_t)solved;
+            context=ctx;
+            fprintf(stderr,"q27 Metal server: --ctx auto: %u tokens per slot "
+                    "(%.0f charged bytes/token incl snapshot + %.1f MB fixed; "
+                    "budget %.0f MB across %u slot%s)\n",
+                    ctx,slope,intercept/1048576.0,budget/1048576.0,
+                    slot_count,slot_count==1?"":"s");
+        }
         slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
         // Snapshot v2 (2026-07-17-kv-except-snapshot-v2.md): exception
         // engines snapshot like any other — side rows ride every surface
@@ -781,18 +835,6 @@ struct Runtime {
         // working set, the engine KV check's convention). The engine's own
         // KV check stays underneath as defense in depth; a budget below
         // even one slot still serves one (never zero).
-        const char* budget_env=getenv("Q27_METAL_BUDGET_MB");
-        uint64_t budget=shared->backend.recommended_working_set_size()/2;
-        if(budget_mb) budget=(uint64_t)budget_mb*1024ull*1024ull; // --budget-mb, validated at parse
-        else if(budget_env) {
-            // Fail loud on a malformed override: "-1" through strtoull would
-            // wrap to an effectively unlimited budget and bypass the gate.
-            char* end=nullptr; errno=0;
-            const unsigned long long mb=strtoull(budget_env,&end,10);
-            if(errno || end==budget_env || *end || !mb || mb>(1ull<<24))
-                throw std::runtime_error("Q27_METAL_BUDGET_MB must be an integer 1..16777216");
-            budget=(uint64_t)mb*1024ull*1024ull;
-        }
         const q27::MetalEngine& e0=slots[0]->engine;
         const uint64_t per_slot=e0.kv_reserved_bytes()
                                +q27::MetalEngine::fixed_state_bytes(e0.chunked_prefill())
@@ -1716,7 +1758,7 @@ static int mark_supervisor_lock_close_on_exec() {
 int main(int argc,char** argv) {
     if (mark_supervisor_lock_close_on_exec() != 0) return 2;
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx 8192] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n"
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n"
                        "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
                        "       [--temperature-default T] [--top-p-default P] [--top-k-default K]\n"
                        "       [--experimental-prefix-cache path]\n"
@@ -1726,7 +1768,7 @@ int main(int argc,char** argv) {
     try {
         std::string model=argv[1],tok=argv[2],host="127.0.0.1";
         std::string trace_path,snapshot_dir,experimental_prefix_dir;
-        uint32_t port=8080,context=8192,width=0,suffix_width=0,prefix_entries=1,slot_count=2;
+        uint32_t port=8080,context=0,width=0,suffix_width=0,prefix_entries=1,slot_count=2;
         // Shipped-semantics knobs as flags (homebrew Phase-2 pre-tag);
         // sentinel = flag absent, Runtime falls back to the env twin.
         // snapshot_auto keeps a signed sentinel because 0 is meaningful
@@ -1744,7 +1786,10 @@ int main(int argc,char** argv) {
             std::string arg=argv[i];
             if(arg=="--host" && i+1<argc) host=argv[++i];
             else if(arg=="--port" && i+1<argc) port=parse_u32(argv[++i],"--port");
-            else if(arg=="--ctx" && i+1<argc) context=parse_u32(argv[++i],"--ctx");
+            else if(arg=="--ctx" && i+1<argc) {
+                const char* v=argv[++i];
+                context = !strcmp(v,"auto") ? 0u : parse_u32(v,"--ctx");
+            }
             else if(arg=="--mtp" && i+1<argc) width=parse_u32(argv[++i],"--mtp");
             else if(arg=="--suffix" && i+1<argc) suffix_width=parse_u32(argv[++i],"--suffix");
             else if(arg=="--prefix-entries" && i+1<argc) prefix_entries=parse_u32(argv[++i],"--prefix-entries");
