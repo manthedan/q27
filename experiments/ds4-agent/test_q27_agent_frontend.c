@@ -288,6 +288,16 @@ static void test_parse_client(void) {
         q27_fp1_op_free(&op);
     }
 
+    /* Overlong client_req_id is rejected, not truncated (r18 codex P2). */
+    {
+        const char *longid =
+            "{\"v\":1,\"op\":\"quit\",\"client_req_id\":\""
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+        CHECK(q27_fp1_parse_client_line(longid, strlen(longid), &op));
+        CHECK(op.kind == Q27_FP1_OP_MALFORMED);
+        q27_fp1_op_free(&op);
+    }
+
     /* Invalid UTF-8 in a client string is dropped, not emitted (r6 codex P2). */
     {
         char badline[] = "{\"v\":1,\"op\":\"prompt\",\"text\":\"ok \xff\xfe\"}";

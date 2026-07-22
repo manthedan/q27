@@ -3241,10 +3241,13 @@ int main(int argc, char **argv) {
                         tui_diagf(
                                 "q27-agent: /save requires --session FILE\n");
                     else
-                        ok = save_session(worker, session_path,
-                                          &current_snapshot_name, &chat, think,
-                                          auto_tools, context, tokenizer_sha1,
-                                          jsonl);
+                        /* User-requested save: report refusal, never skip
+                         * quietly like an auto-save (r18 codex P2). */
+                        ok = save_session_ex(worker, session_path,
+                                             &current_snapshot_name, &chat,
+                                             think, auto_tools, context,
+                                             tokenizer_sha1, jsonl,
+                                             /*explicit_save=*/1, NULL);
                     free(owned_line);
                     continue;
                 }

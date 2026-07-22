@@ -1062,8 +1062,13 @@ int q27_fp1_parse_client_line(const char *line, size_t len, q27_fp1_op *out) {
     }
     (void)json_get_string(line, len, "client_req_id", &out->client_req_id);
     if (out->client_req_id && strlen(out->client_req_id) > 64) {
-        /* Soft-trim for safety; keep the prefix. */
-        out->client_req_id[64] = '\0';
+        /* Reject, don't trim: two requests sharing a 64-char prefix would
+         * collide in queue snapshots and terminal events (r18 codex P2). */
+        free(op);
+        out->kind = Q27_FP1_OP_MALFORMED;
+        static const char too_long[] = "client_req_id exceeds 64 characters";
+        out->text = dup_n(too_long, sizeof(too_long) - 1);
+        return 1;
     }
 
     if (!strcmp(op, "prompt")) {
@@ -1359,6 +1364,17 @@ static int ctl_apply_op(q27_fp1_op *op) {
     return ok;
 }
 
+/* Reader-fatal: wake the control plane into shutdown (r18 codex P2) —
+ * exiting silently left the main loop waiting on wait_op forever. */
+static void fp1_signal_quit(const char *reason) {
+    pthread_mutex_lock(&g_ctl.mu);
+    g_ctl.quit_requested = 1;
+    snprintf(g_ctl.quit_reason, sizeof(g_ctl.quit_reason), "%s",
+             reason ? reason : "error");
+    pthread_cond_broadcast(&g_ctl.cv);
+    pthread_mutex_unlock(&g_ctl.mu);
+}
+
 static void *fp1_reader_main(void *arg) {
     (void)arg;
     char *line = NULL;
@@ -1385,6 +1401,7 @@ static void *fp1_reader_main(void *arg) {
         int ready = poll(fds, nfds, 200);
         if (ready < 0) {
             if (errno == EINTR) continue;
+            fp1_signal_quit("error");
             break;
         }
         if (nfds == 2 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
@@ -1401,6 +1418,7 @@ static void *fp1_reader_main(void *arg) {
         ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
         if (n < 0) {
             if (errno == EINTR) continue;
+            fp1_signal_quit("error");
             break;
         }
         if (n == 0) {
