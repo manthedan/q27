@@ -178,12 +178,12 @@ int main(int argc, char** argv) {
                 "[--prefill chunk|serial] [--nll-long N] [--kl-kv | --kl-kv-self | --kl-kv-k | --kl-kv-v | --kl-kv-fp8 | --kl-kv-cell N | --kl-kv-except LIST | --kl-kv-stats FILE] [--kv-rt-scale32] [--kv-rt-feature FILE] [--chunk-parity N] "
                 "[--kl-pair MODEL_B --kl-pair-out FILE | --logits-dump FILE | --kl-vs-dump FILE] "
                 "[--temperature T --top-p P --top-k K --seed S] "
-                "[--save-state file | --load-state file] [--dump-logits file]\n",
+                "[--save-state file | --load-state file] [--dump-logits file] [--dump-token-ids file]\n",
                 argv[0]);
         return 1;
     }
     try {
-        std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits,nll_path;
+        std::string model_path=argv[1],tokenizer_path=argv[2],token_list,prompt_text,dump_logits,nll_path,dump_token_ids;
         std::string save_state_path, load_state_path;
         uint32_t count=1,context=128,mtp_width=0,suffix_width=0,oracle_width=0,nll_long=0; bool suffix_serial=false; q27::SamplingParams sampling;
         bool eos_gate=false;
@@ -271,6 +271,7 @@ int main(int argc, char** argv) {
             else if (arg == "--save-state" && i + 1 < argc) save_state_path = argv[++i];
             else if (arg == "--load-state" && i + 1 < argc) load_state_path = argv[++i];
             else if (arg == "--dump-logits" && i + 1 < argc) dump_logits = argv[++i];
+            else if (arg == "--dump-token-ids" && i + 1 < argc) dump_token_ids = argv[++i];
             else if (arg == "--temperature" && i + 1 < argc) sampling.temperature=parse_float(argv[++i],"--temperature");
             else if (arg == "--top-p" && i + 1 < argc) sampling.top_p=parse_float(argv[++i],"--top-p");
             else if (arg == "--top-k" && i + 1 < argc) sampling.top_k=parse_u32(argv[++i],"--top-k");
@@ -1422,6 +1423,14 @@ int main(int argc, char** argv) {
         }
         auto finished = std::chrono::steady_clock::now();
 
+        if (!dump_token_ids.empty()) {
+            FILE *f = fopen(dump_token_ids.c_str(), "w");
+            if (!f) throw std::runtime_error("cannot open --dump-token-ids output file");
+            for (size_t i = 0; i < generated.size(); i++)
+                fprintf(f, "%s%u", i ? " " : "", generated[i]);
+            fprintf(f, "\n");
+            fclose(f);
+        }
         std::vector<int> ids(generated.begin(), generated.end());
         printf("generated:%s\n", tokenizer.decode(ids).c_str());
         fprintf(stderr, "%zu tokens in %.2f s (%.2f tok/s), position %u\n", generated.size(),
