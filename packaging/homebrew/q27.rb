@@ -1,6 +1,7 @@
 # Homebrew formula for the q27 Metal engine (packaging/homebrew/q27.rb).
-# Install directly:  brew install --formula ./packaging/homebrew/q27.rb
-# or from a tap that carries this file as Formula/q27.rb.
+# Canonical install via the tap:  brew install manthedan/tap/q27
+# (tap repo: github.com/manthedan/homebrew-tap — Formula/q27.rb is a copy
+# of this file; keep them in sync when pinning a release).
 #
 # Ships PREBUILT macOS arm64 binaries (the GoReleaser-pattern: binaries are
 # built and gated on the release machine, attached to the GitHub release,
@@ -15,6 +16,8 @@ class Q27 < Formula
   desc "Ternary-quantized 27B LLM inference engine for Apple silicon (Metal)"
   homepage "https://github.com/manthedan/q27"
   url "https://github.com/manthedan/q27/releases/download/metal-v0.6.0/q27-metal-v0.6.0-macos-arm64.tar.gz"
+  # Explicit: the asset name's "arm64" otherwise parses as the version.
+  version "0.6.0"
   sha256 "633d64e13706ff4017c1c9da39cbc63181d9aac6cb7017d28f8f9a000ed6ee47"
   license "MIT"
 
@@ -23,7 +26,7 @@ class Q27 < Formula
 
   def install
     # Prebuilt binaries (built with MACOSX_DEPLOYMENT_TARGET=13.0).
-    %w[q27-metal q27-metal-server q27-agent q27-tui tokenize_to_bin
+    %w[q27-metal q27-metal-server q27-agent q27-tui
        metal_decode_bench metal_prefill_bench].each do |b|
       bin.install "bin/#{b}"
     end
