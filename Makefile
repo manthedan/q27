@@ -16,9 +16,10 @@ all: build/inspect build/test_kernels build/q27 build/q27-server build/test_toke
 # Friendly source-checkout entry point. The supervisor resolves the local B1
 # artifact/tokenizer, enables bounded tools, and roots them at the caller's cwd.
 # Prefers Ratatui q27-tui (FP1) when built and stdin/stdout are TTYs.
-# The Rust TUI is OPTIONAL (r19 codex P2): `make agent` keeps the classic
-# path working on checkouts without Cargo; `make agent-tui` builds both.
-agent: build/q27-agent
+# The Rust TUI is built when Cargo is available (r19/r21 codex P2):
+# cargo-less checkouts keep the classic path; build errors surface normally.
+CARGO := $(shell command -v cargo 2>/dev/null)
+agent: build/q27-agent $(if $(CARGO),build/q27-tui,)
 	Q27_BIN_DIR="$(CURDIR)/build" ./packaging/bin/q27 agent
 
 tui: build/q27-tui

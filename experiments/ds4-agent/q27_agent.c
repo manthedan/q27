@@ -147,11 +147,22 @@ static void tui_soft_interrupt(void) {
 /* Wait for a worker event; while the busy editor is live, multiplex stdin so
  * the user can queue follow-up prompts. Returns the same codes as
  * q27_agent_worker_next_event_timeout (1 event, 0 stop, -1 error); never 2. */
+static const char *fp1_worker_state_name(q27_agent_worker *worker) {
+    /* Busy-control responses must report the real phase (r21 codex P2):
+     * tool commands are "tool_running", not "generating". */
+    switch (q27_agent_worker_get_state(worker)) {
+    case Q27_WORKER_TOOL_RUNNING: return "tool_running";
+    case Q27_WORKER_SESSION_IO: return "session_io";
+    default: return "generating";
+    }
+}
+
 static int tui_next_event(q27_agent_worker *worker, q27_agent_event *event,
                           char *error, size_t error_cap, int quiet) {
     if (q27_fp1_protocol()) {
         for (;;) {
-            (void)q27_fp1_control_reject_busy(stdout, worker, "generating");
+            (void)q27_fp1_control_reject_busy(stdout, worker,
+                                              fp1_worker_state_name(worker));
             int got = quiet ? q27_agent_worker_next_event_quiet(
                                   worker, event, error, error_cap, 40)
                             : q27_agent_worker_next_event_timeout(

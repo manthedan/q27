@@ -440,6 +440,19 @@ int q27_fp1_emit_history(FILE *out, q27_agent_worker *worker,
             (strcmp(m->role, "user") && strcmp(m->role, "assistant")))
             continue;   /* system preamble / tool messages are not replayed */
         if (!m->content || !m->content_len) continue;
+        /* Harness protocol messages are not chat (r21 codex P2): tool
+         * responses ride role "user", tool calls role "assistant". */
+        static const char tool_resp_open[] = "<tool_response>";
+        static const char tool_call_open[] = "<tool_call>";
+        if (!strcmp(m->role, "user") &&
+            m->content_len >= sizeof(tool_resp_open) - 1 &&
+            !memcmp(m->content, tool_resp_open, sizeof(tool_resp_open) - 1))
+            continue;
+        if (!strcmp(m->role, "assistant") &&
+            m->content_len >= sizeof(tool_call_open) - 1 &&
+            memmem(m->content, m->content_len,
+                   tool_call_open, sizeof(tool_call_open) - 1))
+            continue;
         size_t len = m->content_len;
         if (len > 4000) {
             len = 4000;
