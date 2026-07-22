@@ -174,36 +174,59 @@ size_t q27_tui_sanitize_bytes(const unsigned char *in, size_t in_len,
     if (!out || out_cap == 0) return 0;
     size_t o = 0;
     size_t i = 0;
-    while (i < in_len && o + 4 < out_cap) {
+    while (i < in_len) {
         const unsigned char c = in[i];
-        if (c == '\n') { out[o++] = '\n'; ++i; continue; }
-        if (c == '\t') { out[o++] = ' '; ++i; continue; }
-        if (c < 0x20 || c == 0x7f) { out[o++] = '.'; ++i; continue; }
-        if (c < 0x80) { out[o++] = (char)c; ++i; continue; }
-        /* Multibyte: decode-or-replace; never classify continuation bytes
-         * as C1 controls (r13 codex P2). */
-        size_t need = 0;
-        if (c >= 0xC2 && c <= 0xDF) need = 2;
-        else if (c >= 0xE0 && c <= 0xEF) need = 3;
-        else if (c >= 0xF0 && c <= 0xF4) need = 4;
-        int valid = need > 0 && i + need <= in_len;
-        if (valid) {
-            for (size_t k = 1; k < need; ++k)
-                if ((in[i + k] & 0xC0) != 0x80) { valid = 0; break; }
+        /* Bytes this step will write (1 for ASCII/replacements, cp_len for
+         * a copied sequence) — capacity is per-step so short inputs are
+         * not starved by a fixed reserve (r15 codex P2). */
+        size_t emit = 1;
+        size_t cp_len = 0;
+        int copy_seq = 0;
+        int c1_control = 0;
+        if (c >= 0x80) {
+            size_t need = 0;
+            if (c >= 0xC2 && c <= 0xDF) need = 2;
+            else if (c >= 0xE0 && c <= 0xEF) need = 3;
+            else if (c >= 0xF0 && c <= 0xF4) need = 4;
+            int valid = need > 0 && i + need <= in_len;
+            if (valid) {
+                for (size_t k = 1; k < need; ++k)
+                    if ((in[i + k] & 0xC0) != 0x80) { valid = 0; break; }
+            }
+            if (valid) {
+                const unsigned char c1 = in[i + 1];
+                if (c == 0xE0 && c1 < 0xA0) valid = 0;
+                if (c == 0xED && c1 > 0x9F) valid = 0;
+                if (c == 0xF0 && c1 < 0x90) valid = 0;
+                if (c == 0xF4 && c1 > 0x8F) valid = 0;
+            }
+            if (valid) {
+                /* The C1 control CODE POINT (U+0080..U+009F) is a control,
+                 * not text — but never classify continuation bytes as C1
+                 * (r13 codex P2). */
+                if (need == 2 && c == 0xC2 && in[i + 1] <= 0x9F) {
+                    c1_control = 1;
+                    cp_len = 2;
+                } else {
+                    copy_seq = 1;
+                    cp_len = need;
+                    emit = need;
+                }
+            }
         }
-        if (valid) {
-            const unsigned char c1 = in[i + 1];
-            if (c == 0xE0 && c1 < 0xA0) valid = 0;
-            if (c == 0xED && c1 > 0x9F) valid = 0;
-            if (c == 0xF0 && c1 < 0x90) valid = 0;
-            if (c == 0xF4 && c1 > 0x8F) valid = 0;
+        if (o + emit >= out_cap) break;   /* keep room for the NUL */
+        if (copy_seq) {
+            for (size_t k = 0; k < cp_len; ++k) out[o++] = (char)in[i + k];
+            i += cp_len;
+            continue;
         }
-        if (!valid) { out[o++] = '.'; ++i; continue; }
-        /* The C1 control CODE POINT (U+0080..U+009F, 0xC2 0x80-0x9F) is a
-         * control, not text. */
-        if (c == 0xC2 && in[i + 1] <= 0x9F) { out[o++] = '.'; i += 2; continue; }
-        for (size_t k = 0; k < need; ++k) out[o++] = (char)in[i + k];
-        i += need;
+        if (c1_control) { out[o++] = '.'; i += 2; continue; }
+        if (c >= 0x80) { out[o++] = '.'; ++i; continue; }   /* malformed */
+        if (c == '\n') out[o++] = '\n';
+        else if (c == '\t') out[o++] = ' ';
+        else if (c < 0x20 || c == 0x7f) out[o++] = '.';
+        else out[o++] = (char)c;
+        ++i;
     }
     out[o] = '\0';
     return o;

@@ -2674,9 +2674,13 @@ int main(int argc, char **argv) {
                         }
                         /* Readiness after compact must not depend on the
                          * outcome: clients re-enable prompts on the idle
-                         * EVENT, not the envelope state (r10 codex P2). */
-                        (void)emit_fp1_idle(worker, last_ctx_used, context,
-                                            UINT32_MAX);
+                         * EVENT, not the envelope state (r10 codex P2).
+                         * But a poisoned worker is not ready — skip the
+                         * event rather than lie (r15 codex P2). */
+                        if (q27_agent_worker_get_state(worker) !=
+                            Q27_WORKER_ERROR)
+                            (void)emit_fp1_idle(worker, last_ctx_used,
+                                                context, UINT32_MAX);
                     }
                 }
                 q27_fp1_op_free(&op);

@@ -55,13 +55,20 @@ impl Backend {
         if let Some(parent) = stderr_log.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Exclusive + no-follow: a predictable temp path opened with
-        // File::create would let a local process pre-create or race a
-        // symlink and make us truncate/write its target (codex P2).
-        let stderr_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&stderr_log)?;
+        // Exclusive + no-follow, owner-only: a predictable temp path opened
+        // with File::create would let a local process pre-create or race a
+        // symlink (codex P2 r1), and default permissions would leak agent
+        // stderr (paths, tool diagnostics) to other local users (r15 P2).
+        let stderr_file = {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&stderr_log)?
+        };
 
         let mut cmd = Command::new(agent_bin);
         cmd.arg(model.as_ref())
@@ -138,26 +145,13 @@ impl Backend {
 
     pub fn cancel(&mut self) -> Result<(), BackendError> {
         let id = self.next_req_id();
-        let send_result = self.send(&ClientMessage::cancel(id));
-        // Dual-path: FP1 cancel flag *and* SIGINT. The agent alive-check
-        // consults both (`cancel_requested` and `interrupted`). Classic
-        // linenoise only had SIGINT; if the NDJSON cancel is delayed or
-        // missed, the signal still aborts the active Metal quantum.
-        #[cfg(unix)]
-        {
-            let pid = self.child.id();
-            if pid > 0 {
-                unsafe {
-                    // libc not required as a crate dep — raw syscall.
-                    extern "C" {
-                        fn kill(pid: i32, sig: i32) -> i32;
-                    }
-                    const SIGINT: i32 = 2;
-                    let _ = kill(pid as i32, SIGINT);
-                }
-            }
-        }
-        send_result
+        // FP1 cancel only: the agent checks the flag in every alive() and
+        // treats an idle cancel as a no-op. The dual-path SIGINT raced the
+        // turn boundary — arriving after the turn finished but before we saw
+        // the terminal, it latched the global interrupt and killed the
+        // session with bye:error (r15 codex P1). A wedged backend is what
+        // quit/kill is for.
+        self.send(&ClientMessage::cancel(id))
     }
 
     pub fn quit(&mut self) -> Result<(), BackendError> {

@@ -233,6 +233,12 @@ impl Model {
             }
             "turn_done" => {
                 let toolish = ev.tool_call_complete.unwrap_or(false);
+                if (toolish) {
+                    // Envelope "idle" here only means the worker is free for
+                    // the NEXT TOOL — the control plane is still mid-loop, so
+                    // keep the busy phase (Esc must stay live; r15 codex P2).
+                    self.phase = Phase::Tool;
+                }
                 if !toolish {
                     self.finish_assistant_if_any();
                 }
@@ -478,7 +484,10 @@ impl Model {
     }
 
     pub fn push_user(&mut self, text: &str) {
-        self.scrollback.push(Block::User(text.to_string()));
+        // Pasted prompts can carry ESC/CSI/OSC from untrusted sources —
+        // sanitize like every other rendered string (r15 codex P2).
+        let text = sanitize_terminal_text(text);
+        self.scrollback.push(Block::User(text));
         if self.has_queue_feature() {
             self.input_enabled = true;
             self.status_line = if self.phase == Phase::Idle {
