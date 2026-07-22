@@ -1180,8 +1180,20 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
                         .gen_tokens = stream_chars, /* byte proxy until done */
                     };
                     tui_publish_status(&gst);
-                    if (!tui_write_out(event.data, event.data_len))
+                    /* Assistant text is untrusted terminal input — same
+                     * sanitizer as tool output (r16 codex P1). */
+                    unsigned char *clean_delta =
+                        event.data_len ? malloc(event.data_len + 1) : NULL;
+                    if (event.data_len && !clean_delta) {
                         output.failed = 1;
+                    } else {
+                        const size_t clean_len = q27_tui_sanitize_bytes(
+                            event.data, event.data_len, (char *)clean_delta,
+                            event.data_len + 1);
+                        if (!tui_write_out(clean_delta, clean_len))
+                            output.failed = 1;
+                    }
+                    free(clean_delta);
                 } else if (fwrite(event.data, 1, event.data_len, stdout) !=
                                event.data_len ||
                            fflush(stdout) == EOF) {
@@ -2598,12 +2610,15 @@ int main(int argc, char **argv) {
                         stdout, seq, op.client_req_id, "no_session",
                         "save requires --session FILE", "idle");
                 } else {
-                    /* Failure is reported via session_done status=error;
-                     * do not kill the control-plane session. */
-                    (void)save_session_ex(
-                        worker, session_path, &current_snapshot_name, &chat,
-                        think, auto_tools, context, tokenizer_sha1, jsonl,
-                        /*explicit_save=*/1, op.client_req_id);
+                    /* Failure is reported via session_done status=error —
+                     * but a poisoned worker makes continuing a lie:
+                     * propagate so bye carries the error (r16 codex P1). */
+                    if (!save_session_ex(
+                            worker, session_path, &current_snapshot_name, &chat,
+                            think, auto_tools, context, tokenizer_sha1, jsonl,
+                            /*explicit_save=*/1, op.client_req_id) &&
+                        q27_agent_worker_get_state(worker) == Q27_WORKER_ERROR)
+                        ok = 0;
                 }
                 q27_fp1_op_free(&op);
                 continue;
@@ -2677,10 +2692,16 @@ int main(int argc, char **argv) {
                          * EVENT, not the envelope state (r10 codex P2).
                          * But a poisoned worker is not ready — skip the
                          * event rather than lie (r15 codex P2). */
-                        if (q27_agent_worker_get_state(worker) !=
-                            Q27_WORKER_ERROR)
+                        const int worker_fatal =
+                            q27_agent_worker_get_state(worker) ==
+                            Q27_WORKER_ERROR;
+                        if (!worker_fatal)
                             (void)emit_fp1_idle(worker, last_ctx_used,
                                                 context, UINT32_MAX);
+                        /* Fatal compaction: the loop must not keep
+                         * advertising a session that cannot run (r16 P1). */
+                        if (worker_fatal)
+                            ok = 0;
                     }
                 }
                 q27_fp1_op_free(&op);
