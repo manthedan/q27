@@ -705,6 +705,11 @@ static const char *tool_kind_name(q27_agent_tool_kind kind) {
  * carries it (codex P1). Borrowed pointer; owned by the op being run. */
 static const char *g_fp1_active_req_id = NULL;
 
+/* Quit drained-prompts mode: a quit that predates the prompt being
+ * dispatched is converted to "stop after the drain" so continue_running
+ * does not instantly cancel that turn (r9 codex P1). */
+static int g_fp1_quit_after_drain = 0;
+
 /* Counts turn-terminal worker events (turn_done/stalled/error) printed
  * through the funnel — the prompt path uses it to detect a turn that
  * failed without any terminal so it can emit a correlated one (r5 P1). */
@@ -2359,7 +2364,7 @@ int main(int argc, char **argv) {
              * and queued prompts drain first — the documented
              * prompt-then-quit pipe must not discard the prompt (r7 P1). */
             if (interrupted) break;
-            if (q27_fp1_control_quit_requested() &&
+            if ((q27_fp1_control_quit_requested() || g_fp1_quit_after_drain) &&
                 !q27_fp1_control_pending() &&
                 q27_fp1_prompt_queue_len() == 0)
                 break;
@@ -2381,7 +2386,22 @@ int main(int argc, char **argv) {
             int quit_now = 0;
             for (;;) {
                 const int cr = q27_fp1_control_wait_op(&op, 0);
-                if (cr == 0) { quit_now = 1; break; }   /* quit/stop */
+                if (cr == 0) {
+                    /* quit/stop: prompts accepted BEFORE the quit still run
+                     * first (r9 codex P1 — the documented prompt-then-quit
+                     * pipe must drain, not discard). */
+                    if (q27_fp1_prompt_queue_len() == 0) {
+                        quit_now = 1;
+                        break;
+                    }
+                    if (q27_fp1_prompt_queue_pop(&op)) {
+                        from_prompt_queue = 1;
+                        (void)q27_fp1_emit_queue_from_worker(stdout, worker,
+                                                             "idle");
+                        have_op = 1;
+                    }
+                    break;
+                }
                 if (cr < 0) break;                      /* control drained */
                 if (op.kind == Q27_FP1_OP_PROMPT) {
                     const int pr = q27_fp1_prompt_queue_push(
@@ -2711,7 +2731,10 @@ int main(int argc, char **argv) {
                     (void)emit_fp1_idle(worker, last_ctx_used, context,
                                         UINT32_MAX);
                 q27_fp1_op_free(&op);
-                if (q27_fp1_control_quit_requested()) break;
+                if ((q27_fp1_control_quit_requested() ||
+                     g_fp1_quit_after_drain) &&
+                    !q27_fp1_control_pending() &&
+                    q27_fp1_prompt_queue_len() == 0) break;
                 continue;
             }
 
@@ -2745,6 +2768,14 @@ int main(int argc, char **argv) {
              * arrive during it. */
             if (q27_fp1_control_cancel_requested())
                 q27_fp1_control_clear_cancel();
+            /* Same for a quit that PREDATES this prompt: it means "stop
+             * after the drain", not "cancel this turn" — continue_running
+             * would kill the turn at token 0 (r9 codex P1). Re-honored at
+             * the loop level once the queues are empty. */
+            if (q27_fp1_control_quit_requested()) {
+                q27_fp1_control_clear_quit();
+                g_fp1_quit_after_drain = 1;
+            }
 
             ok = transcript_append(&chat, "user", op.text);
             /* Borrow the correlation id for the whole turn; the op (and its
@@ -2845,13 +2876,15 @@ int main(int argc, char **argv) {
                 ok = 1;
             }
 
-            /* Turn failed without a cancel. The worker is reusable after a
-             * stall and the FP1 contract expects post-terminal readiness
-             * (r8 codex P1): drop the dangling user message and KEEP the
-             * session — queued prompts must not be discarded via bye.
-             * When no terminal was emitted (pre-generation failure), add a
-             * correlated one (r6 codex P1). */
-            if (!ok) {
+            /* Turn failed without a cancel. Stalls are worker-reusable and
+             * the FP1 contract expects post-terminal readiness (r8 codex
+             * P1): drop the dangling user message and KEEP the session —
+             * queued prompts must not be discarded via bye. When no terminal
+             * was emitted (pre-generation failure), add a correlated one
+             * (r6 codex P1). A worker in ERROR is FATAL — future submissions
+             * are rejected, so reporting idle would lie (r9 codex P1); fall
+             * through with ok=0 and let bye carry the error. */
+            if (!ok && q27_agent_worker_get_state(worker) != Q27_WORKER_ERROR) {
                 transcript_pop_last_human_user(&chat);
                 if (g_fp1_turn_terminals == terminals_before) {
                     static const char fail_msg[] =
@@ -2885,13 +2918,14 @@ int main(int argc, char **argv) {
             }
             if (ok)
                 (void)emit_fp1_idle(worker, last_ctx_used, context, UINT32_MAX);
-            if (q27_fp1_control_quit_requested() &&
+            if ((q27_fp1_control_quit_requested() || g_fp1_quit_after_drain) &&
                 !q27_fp1_control_pending() &&
                 q27_fp1_prompt_queue_len() == 0)
                 break;
         }
-        if (q27_fp1_control_quit_requested()) {
+        if (q27_fp1_control_quit_requested() || g_fp1_quit_after_drain) {
             fp1_bye_reason = q27_fp1_control_quit_reason();
+            if (!fp1_bye_reason) fp1_bye_reason = "quit";
             if (fp1_bye_reason &&
                 (!strcmp(fp1_bye_reason, "stdin_eof") ||
                  !strcmp(fp1_bye_reason, "quit"))) {

@@ -646,6 +646,13 @@ static int json_unescape_to(const char *in, size_t in_len, char **out) {
     for (size_t i = 0; i < in_len; ++i) {
         char c = in[i];
         if (c != '\\') {
+            if (c == '\0') {
+                /* Embedded NUL would silently truncate every downstream
+                 * strlen user (prompts, queue entries, request ids, tool
+                 * args) — reject the field (r9 codex P2). */
+                free(buf);
+                return 0;
+            }
             buf[o++] = c;
             continue;
         }
@@ -679,6 +686,10 @@ static int json_unescape_to(const char *in, size_t in_len, char **out) {
             unsigned code = 0;
             if (!json_hex4(in, &i, in_len, &code)) {
                 free(buf);
+                return 0;
+            }
+            if (code == 0) {
+                free(buf);   /* \ — embedded NUL truncation (r9 codex P2) */
                 return 0;
             }
             if (code >= 0xD800 && code <= 0xDBFF) {
@@ -1419,6 +1430,12 @@ int q27_fp1_control_cancel_requested(void) {
 void q27_fp1_control_clear_cancel(void) {
     pthread_mutex_lock(&g_ctl.mu);
     g_ctl.cancel_requested = 0;
+    pthread_mutex_unlock(&g_ctl.mu);
+}
+
+void q27_fp1_control_clear_quit(void) {
+    pthread_mutex_lock(&g_ctl.mu);
+    g_ctl.quit_requested = 0;
     pthread_mutex_unlock(&g_ctl.mu);
 }
 

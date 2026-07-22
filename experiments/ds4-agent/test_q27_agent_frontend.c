@@ -297,6 +297,16 @@ static void test_parse_client(void) {
         q27_fp1_op_free(&op);
     }
 
+    /* Embedded NUL (raw or escaped) is rejected, not truncated (r9 codex P2). */
+    {
+        const char *nul =
+            "{\"v\":1,\"op\":\"prompt\",\"text\":\"abc\\u0000def\"}";
+        CHECK(q27_fp1_parse_client_line(nul, strlen(nul), &op));
+        CHECK(op.kind == Q27_FP1_OP_PROMPT);
+        CHECK(op.text && op.text[0] == '\0');
+        q27_fp1_op_free(&op);
+    }
+
     CHECK(q27_fp1_parse_client_line("{\"v\":1,\"op\":\"save\"}", 20, &op));
     CHECK(op.kind == Q27_FP1_OP_SAVE);
     q27_fp1_op_free(&op);

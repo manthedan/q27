@@ -122,6 +122,10 @@ int q27_fp1_control_cancel_requested(void);
 /* Clear cancel after the cancelled turn settles. */
 void q27_fp1_control_clear_cancel(void);
 
+/* Clear the quit flag but keep the reason — a quit that predates a drained
+ * prompt means "stop after the drain", not "cancel this turn" (r9 P1). */
+void q27_fp1_control_clear_quit(void);
+
 /* 1 if quit/EOF was requested. reason is "quit" or "stdin_eof". */
 int q27_fp1_control_quit_requested(void);
 
