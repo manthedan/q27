@@ -48,6 +48,16 @@ q27_agent_engine *q27_agent_engine_open(const char *model_path,
                                          uint32_t context,
                                          char *error, size_t error_cap);
 void q27_agent_engine_close(q27_agent_engine *engine);
+
+// Optional think budget for streaming `<think>…</think>`. 0 = unlimited
+// (default). When non-zero and still inside an open think span after N tokens,
+// the engine *force-injects* `</think>\n\n` into the stream + KV (same close
+// the `--no-think` prefill uses) and **continues free generation** for the
+// answer within remaining max_tokens. Falls back to a length stop only if
+// there is no room for the close sequence plus one answer token. Independent
+// of the model; packs have no native thinking budget.
+void q27_agent_set_max_think_tokens(uint32_t n);
+uint32_t q27_agent_max_think_tokens(void);
 q27_agent_status q27_agent_engine_tokenizer_sha1(
     q27_agent_engine *engine, unsigned char out_sha1[20],
     char *error, size_t error_cap);

@@ -9,9 +9,8 @@
 extern "C" {
 #endif
 
-/* Phase 1 wires IDLE (linenoise sticky footer between prompts) and PREFILL
- * (stderr progress during turns). GENERATING/TOOL/COMPACTING/SAVING/ERROR are
- * reserved for Phase 2 sticky multiphase chrome while the editor is stopped. */
+/* Multiphase chrome: IDLE between prompts; PREFILL/GENERATING/TOOL while a
+ * turn is live (sticky footer via linenoise when the busy editor is open). */
 typedef enum {
     Q27_TUI_IDLE = 0,
     Q27_TUI_PREFILL,
@@ -33,7 +32,16 @@ typedef struct {
     double gen_tps;
     const char *tool_name; /* borrowed; may be NULL */
     const char *detail;    /* borrowed error/tool detail; may be NULL */
+    uint32_t queue_len;    /* pending user prompts while busy */
 } q27_tui_status;
+
+/* Bounded prompt queue for queue-while-busy. Owns each line. */
+typedef struct {
+    char **items;
+    size_t len;
+    size_t cap;
+    size_t max_len; /* hard cap; 0 means default (8) */
+} q27_tui_prompt_queue;
 
 /* 1 when stdout and stdin are TTYs and TERM is usable for the TUI. */
 int q27_tui_available(void);
@@ -52,6 +60,32 @@ void q27_tui_format_progress_bar(int done, int total, int bar_width,
 /* ANSI escapes for linenoise status row (inverse-ish bar). Empty if no color. */
 const char *q27_tui_status_start_escape(void);
 const char *q27_tui_status_end_escape(void);
+
+/* Tool card lines (ASCII, no emoji). Returns bytes written or -1. */
+int q27_tui_format_tool_card_open(const char *kind, const char *detail,
+                                  char *buf, size_t buf_len);
+int q27_tui_format_tool_card_close(int exit_code, uint32_t output_bytes,
+                                   const char *message, char *buf,
+                                   size_t buf_len);
+
+/* Collapse helper: copy up to max_lines of text; if truncated, append a
+ * summary. Returns bytes written (excluding NUL) or -1. */
+int q27_tui_collapse_text(const char *text, size_t text_len, int max_lines,
+                          int max_chars, char *buf, size_t buf_len);
+
+/* Sanitize text for terminal chrome (tool cards / status). Strips ESC and
+ * other C0 controls so model- or filesystem-controlled strings cannot inject
+ * terminal sequences. Always NUL-terminates when out_len > 0. */
+void q27_tui_sanitize_display(const char *in, char *out, size_t out_len);
+
+void q27_tui_prompt_queue_init(q27_tui_prompt_queue *q, size_t max_len);
+void q27_tui_prompt_queue_free(q27_tui_prompt_queue *q);
+/* Push a copy of text. Returns 1 on success, 0 if full or OOM. */
+int q27_tui_prompt_queue_push(q27_tui_prompt_queue *q, const char *text,
+                              size_t len);
+/* Pop owned line (caller free). NULL if empty. */
+char *q27_tui_prompt_queue_pop(q27_tui_prompt_queue *q);
+size_t q27_tui_prompt_queue_len(const q27_tui_prompt_queue *q);
 
 #ifdef __cplusplus
 }

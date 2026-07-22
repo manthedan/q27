@@ -26,6 +26,17 @@ q27_bin() {
     if [ -x "$here/../bin/$name" ]; then printf '%s' "$here/../bin/$name"; return 0; fi
     if [ -x "$here/$name" ]; then printf '%s' "$here/$name"; return 0; fi
     if [ -x "$here/../../build/$name" ]; then printf '%s' "$here/../../build/$name"; return 0; fi
+    # Dev convenience: Ratatui frontend lives under experiments/ until installed.
+    if [ "$name" = "q27-tui" ]; then
+        if [ -x "$here/../../experiments/q27-tui/target/release/q27-tui" ]; then
+            printf '%s' "$here/../../experiments/q27-tui/target/release/q27-tui"
+            return 0
+        fi
+        if [ -x "$here/../../experiments/q27-tui/target/debug/q27-tui" ]; then
+            printf '%s' "$here/../../experiments/q27-tui/target/debug/q27-tui"
+            return 0
+        fi
+    fi
     command -v "$name" 2>/dev/null && return 0
     return 1
 }

@@ -7,7 +7,8 @@
 #   q27 pull [name]     recommend by RAM, or fetch a specific pack (resumable,
 #                       checksum-verified) into ~/.q27/models/<name>/
 #   q27 serve [name]    start the server on a pack (refuses if one is running)
-#   q27 agent [name]    start the native coding agent (default: b1)
+#   q27 agent [name]    start the native coding agent (default: b1; prefers
+#                       Ratatui q27-tui / FP1 over classic linenoise — see Q27_AGENT_UI)
 #   q27 ls              list installed packs + sizes + which is servable
 #   q27 rm <name>       delete a pack's cache
 #   q27 bench [--fast|--full] [packs..]   run the benchmark suite
@@ -116,6 +117,9 @@ q27_resident_consumer() {
             >/dev/null 2>&1 ||
         pgrep -x q27-agent >/dev/null 2>&1 ||
         pgrep -f '^([^[:space:]]*/)?q27-agent([[:space:]]|$)' \
+            >/dev/null 2>&1 ||
+        pgrep -x q27-tui >/dev/null 2>&1 ||
+        pgrep -f '^([^[:space:]]*/)?q27-tui([[:space:]]|$)' \
             >/dev/null 2>&1
 }
 
@@ -150,8 +154,27 @@ cmd_serve() {
         --max-tokens-default "${Q27_MAX_TOKENS:-16384}"
 }
 
+# Prefer Ratatui FP1 client when available. Override with Q27_AGENT_UI:
+#   auto (default) — TTY + q27-tui present → tui; else classic linenoise agent
+#   tui|ratatui|fp1 — require q27-tui
+#   classic|linenoise|agent|c — force legacy q27-agent TUI
+q27_agent_want_tui() {
+    case "${Q27_AGENT_UI:-auto}" in
+        tui|ratatui|fp1) return 0 ;;
+        classic|linenoise|agent|c) return 1 ;;
+        auto|"")
+            [ -t 0 ] && [ -t 1 ] && return 0
+            return 1
+            ;;
+        *)
+            echo "q27 agent: unknown Q27_AGENT_UI=${Q27_AGENT_UI} (use auto|tui|classic)" >&2
+            exit 1
+            ;;
+    esac
+}
+
 cmd_agent() {
-    local n="${Q27_AGENT_PACK:-b1}" agent
+    local n="${Q27_AGENT_PACK:-b1}" agent tui
     case "${1:-}" in
         --help|-h)
             agent="$(q27_bin q27-agent)" || {
@@ -207,23 +230,82 @@ cmd_agent() {
     if [ -n "${Q27_AGENT_SEED:-}" ]; then
         sample_args+=(--seed "$Q27_AGENT_SEED")
     fi
-    echo "q27 agent: pack=$n context=$context workspace=$workspace" >&2
+    # Hard-stop open <think> after N tokens (agent-side; model has no budget).
+    # Unset/empty = unlimited within max-tokens.
+    if [ -n "${Q27_AGENT_MAX_THINK_TOKENS:-}" ]; then
+        sample_args+=(--max-think-tokens "$Q27_AGENT_MAX_THINK_TOKENS")
+    fi
+    if [ -n "${Q27_AGENT_NO_THINK:-}" ] && [ "$Q27_AGENT_NO_THINK" != "0" ]; then
+        sample_args+=(--no-think)
+    fi
+
+    local common_args=(
+        --context "$context" --max-tokens "$max_tokens"
+        --auto-tools --workspace "$workspace"
+    )
+    if [ -n "${Q27_AGENT_SESSION:-}" ]; then
+        common_args+=(--session "$Q27_AGENT_SESSION")
+    fi
+
+    local ui="classic"
+    tui=""
+    if q27_agent_want_tui; then
+        tui="$(q27_bin q27-tui 2>/dev/null || true)"
+        if [ -n "$tui" ]; then
+            ui="tui"
+        else
+            case "${Q27_AGENT_UI:-auto}" in
+                tui|ratatui|fp1)
+                    echo "q27 agent: Q27_AGENT_UI=${Q27_AGENT_UI} but q27-tui not found" >&2
+                    echo "  build with: make build/q27-tui   (or cargo build -r -C experiments/q27-tui)" >&2
+                    exit 1
+                    ;;
+            esac
+            echo "q27 agent: q27-tui not found; falling back to classic agent UI" >&2
+        fi
+    fi
+
+    echo "q27 agent: pack=$n context=$context workspace=$workspace ui=$ui" >&2
     echo "  automatic tools enabled; shell retains your local account's filesystem access" >&2
     if [ ${#sample_args[@]} -gt 0 ]; then
         echo "  sampling: ${sample_args[*]}" >&2
     fi
-    if [ -n "${Q27_AGENT_SESSION:-}" ]; then
-        q27_run_consumer "$agent" "$art" "$tok" \
-            --context "$context" --max-tokens "$max_tokens" \
-            --auto-tools --workspace "$workspace" \
-            --session "$Q27_AGENT_SESSION" \
-            "${sample_args[@]}" "$@"
+
+    # Under `set -u`, empty `"${arr[@]}"` is unbound on some bashes — expand
+    # sampling args only when present.
+    local run_args=("${common_args[@]}")
+    if [ ${#sample_args[@]} -gt 0 ]; then
+        run_args+=("${sample_args[@]}")
+    fi
+    if [ $# -gt 0 ]; then
+        run_args+=("$@")
+    fi
+
+    if [ "$ui" = "tui" ]; then
+        # q27-tui spawns q27-agent --frontend-proto 1; point it at the same
+        # binary the wrapper resolved (Homebrew/PATH/dev build).
+        export Q27_AGENT="$agent"
+        # Metal shader auto-discovery also walks from the agent binary; keep
+        # explicit source-root hint when running from a checkout.
+        if [ -z "${Q27_METAL_SOURCE:-}" ]; then
+            local root shader
+            if [ -n "${Q27_SOURCE_ROOT:-}" ]; then
+                root="$Q27_SOURCE_ROOT"
+            else
+                root="$(cd "$HERE/../.." 2>/dev/null && pwd)" || root=""
+            fi
+            if [ -n "$root" ]; then
+                shader="$root/src/metal/q27_kernels.metal"
+                if [ -f "$shader" ]; then
+                    export Q27_METAL_SOURCE="$shader"
+                fi
+            fi
+        fi
+        q27_run_consumer "$tui" -- "$art" "$tok" "${run_args[@]}"
         return $?
     fi
-    q27_run_consumer "$agent" "$art" "$tok" \
-        --context "$context" --max-tokens "$max_tokens" \
-        --auto-tools --workspace "$workspace" \
-        "${sample_args[@]}" "$@"
+
+    q27_run_consumer "$agent" "$art" "$tok" "${run_args[@]}"
 }
 
 cmd_bench()  { exec "$HERE/q27-bench" "$@"; }

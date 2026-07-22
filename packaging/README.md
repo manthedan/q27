@@ -19,16 +19,54 @@ multi-GB weight lifecycle:
 
 The current source checkout adds the native-agent supervisor planned for the
 next tagged release. Friends testing it before that release should build from
-source, place the B1 artifact/tokenizer under `models/`, and run:
+source, place the B1 artifact/tokenizer under `models/` (or `q27 pull b1`),
+and run:
 
     make agent
+    # or one-time PATH shim (uses ~/.grok/bin when first on PATH):
+    make install-dev-q27
+    q27 agent b1
+
+On a TTY, `q27 agent` prefers the Rust Ratatui client (`q27-tui` / FP1);
+scripts and pipes fall back to the classic linenoise agent. Force either UI
+with `Q27_AGENT_UI=tui` or `Q27_AGENT_UI=classic`.
+
+In `q27-tui`, thinking is **collapsed by default** (one-line summary after the
+turn). Press **`t`** on an empty prompt to expand/collapse the full `<think>`
+trace. Live streaming still shows the open think span in full while it runs.
+**Esc** / **Ctrl-C** cancel the active turn; **`/cancel`** is the same.
 
 The underlying `./packaging/bin/q27 agent [pack]` defaults to context 32768,
 adaptive generation limits, automatic tools, greedy decode, and the physical
-current workspace. Override with `Q27_AGENT_PACK`, `Q27_AGENT_CONTEXT`,
-`Q27_AGENT_WORKSPACE`, `Q27_AGENT_MAX_TOKENS`, `Q27_AGENT_SESSION`, or
-sampling via `Q27_AGENT_TEMPERATURE` / `Q27_AGENT_TOP_P` / `Q27_AGENT_TOP_K` /
-`Q27_AGENT_SEED` (omit for greedy).
+current workspace. Override with:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `Q27_AGENT_PACK` | `b1` | Model pack name |
+| `Q27_AGENT_CONTEXT` | `32768` | Context window |
+| `Q27_AGENT_WORKSPACE` | cwd | Tool sandbox root |
+| `Q27_AGENT_MAX_TOKENS` | `auto` | Whole-turn gen bound (thinking **+** answer); `auto` ≤ 16384 |
+| `Q27_AGENT_MAX_THINK_TOKENS` | *unset* (**off**) | After N tokens in open `<think>`, force `</think>` and **continue the answer**; **not** a model feature |
+| `Q27_AGENT_NO_THINK` | *unset* | Set non-zero to pass `--no-think` (empty think prefill; answer directly) |
+| `Q27_AGENT_SESSION` | *unset* | Session snapshot path |
+| `Q27_AGENT_UI` | `auto` | `tui` \| `classic` \| `auto` |
+| `Q27_AGENT_TEMPERATURE` / `TOP_P` / `TOP_K` / `SEED` | *unset* | Sampling (omit for greedy) |
+
+**Thinking budget note.** Qwen-style packs do not expose a native “thinking
+budget.” Without `Q27_AGENT_MAX_THINK_TOKENS`, long reasoning is only bounded
+by `Q27_AGENT_MAX_TOKENS` (or adaptive `auto`). To cap runaway think under
+sampled decode:
+
+```sh
+Q27_AGENT_MAX_THINK_TOKENS=2048 Q27_AGENT_MAX_TOKENS=4096 q27 agent b1
+# or disable thinking entirely:
+Q27_AGENT_NO_THINK=1 q27 agent b1
+```
+
+When the think cap hits, the agent injects `</think>\n\n` (stream + KV) and
+keeps decoding the answer within remaining `max_tokens`. It only hard-stops
+mid-think if there is no room left for that close sequence.
+
 The supervisor holds one private lifetime lock across `agent` and `serve` so
 concurrent launches cannot double-load multi-GB weights. Automatic file tools
 are workspace-bounded, but shell retains the local account's filesystem

@@ -10,15 +10,29 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 UNAME_S   := $(shell uname -s)
 
-.PHONY: all clean test-cpu test-metal agent
+.PHONY: all clean test-cpu test-metal agent install-dev-q27
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
 
 # Friendly source-checkout entry point. The supervisor resolves the local B1
 # artifact/tokenizer, enables bounded tools, and roots them at the caller's cwd.
-agent: build/q27-agent
+# Prefers Ratatui q27-tui (FP1) when built and stdin/stdout are TTYs.
+agent: build/q27-agent build/q27-tui
 	Q27_BIN_DIR="$(CURDIR)/build" ./packaging/bin/q27 agent
 
-test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui
+# Put this checkout's packaging/bin/q27 first on PATH via ~/.grok/bin (already
+# first in many Grok/dev shells). After this, `q27 agent b1` uses source TUI.
+install-dev-q27: build/q27-agent build/q27-tui
+	@mkdir -p "$(HOME)/.grok/bin"
+	@printf '%s\n' '#!/bin/sh' \
+	  'export Q27_BIN_DIR="$(CURDIR)/build"' \
+	  'export Q27_SOURCE_ROOT="$(CURDIR)"' \
+	  'exec "$(CURDIR)/packaging/bin/q27" "$$@"' \
+	  >"$(HOME)/.grok/bin/q27"
+	@chmod 755 "$(HOME)/.grok/bin/q27"
+	@echo "installed $(HOME)/.grok/bin/q27 → source packaging (Q27_BIN_DIR=$(CURDIR)/build)"
+	@echo "try: q27 agent b1"
+
+test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui build/test_q27_agent_frontend
 	./build/test_artifacts
 	./build/test_depthctl
 	./build/test_toolconstrain
@@ -46,6 +60,7 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	./build/test_q27_agent_persistence
 	./build/test_q27_agent_worker
 	./build/test_q27_agent_tui
+	./build/test_q27_agent_frontend
 	./packaging/test_q27_wrapper.sh
 	python3 tools/test_experimental_prefix_cache.py
 
@@ -93,6 +108,16 @@ build/test_q27_agent_tui: experiments/ds4-agent/test_q27_agent_tui.c experiments
 	        experiments/ds4-agent/test_q27_agent_tui.c experiments/ds4-agent/q27_agent_tui.c \
 	        experiments/ds4-agent/q27_agent_commands.c -o $@
 
+build/test_q27_agent_frontend: experiments/ds4-agent/test_q27_agent_frontend.c \
+                               experiments/ds4-agent/q27_agent_frontend.c \
+                               experiments/ds4-agent/q27_agent_frontend.h \
+                               experiments/ds4-agent/q27_agent_worker.h \
+                               experiments/ds4-agent/q27_agent_engine.h \
+                               experiments/ds4-agent/q27_agent_tools.h | build
+	$(CC) $(CFLAGS) -pthread -I experiments/ds4-agent \
+	        experiments/ds4-agent/test_q27_agent_frontend.c \
+	        experiments/ds4-agent/q27_agent_frontend.c -o $@
+
 ifeq ($(UNAME_S),Darwin)
 test-metal: build/test_metal build/test_metal_ops build/test_metal_stream
 	./build/test_metal
@@ -129,8 +154,11 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp sr
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
 
-build/q27_agent_c.o: experiments/ds4-agent/q27_agent.c experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_protocol.h experiments/ds4-agent/q27_agent_persistence.h experiments/ds4-agent/q27_agent_selections.h experiments/ds4-agent/q27_agent_tui.h experiments/ds4-agent/q27_agent_editor.h experiments/ds4-agent/q27_agent_commands.h | build
+build/q27_agent_c.o: experiments/ds4-agent/q27_agent.c experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_protocol.h experiments/ds4-agent/q27_agent_persistence.h experiments/ds4-agent/q27_agent_selections.h experiments/ds4-agent/q27_agent_tui.h experiments/ds4-agent/q27_agent_editor.h experiments/ds4-agent/q27_agent_commands.h experiments/ds4-agent/q27_agent_frontend.h | build
 	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent.c -o $@
+
+build/q27_agent_frontend_c.o: experiments/ds4-agent/q27_agent_frontend.c experiments/ds4-agent/q27_agent_frontend.h experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_tools.h | build
+	$(CC) $(CFLAGS) -pthread -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent_frontend.c -o $@
 
 build/q27_agent_worker_c.o: experiments/ds4-agent/q27_agent_worker.c experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_tools.h | build
 	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent_worker.c -o $@
@@ -162,14 +190,22 @@ build/q27_agent_editor_c.o: experiments/ds4-agent/q27_agent_editor.c experiments
 build/q27_agent_linenoise_c.o: experiments/ds4-agent/third_party/linenoise/linenoise.c experiments/ds4-agent/third_party/linenoise/linenoise.h | build
 	$(CC) $(CFLAGS) -I experiments/ds4-agent/third_party/linenoise -c experiments/ds4-agent/third_party/linenoise/linenoise.c -o $@
 
-build/q27-agent: build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o build/q27_agent_tui_c.o build/q27_agent_commands_c.o build/q27_agent_editor_c.o build/q27_agent_linenoise_c.o experiments/ds4-agent/q27_agent_engine.cpp experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_session.h experiments/ds4-agent/q27_agent_stall.h src/toolconstrain.h src/toolgram.h \
+build/q27-agent: build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_frontend_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o build/q27_agent_tui_c.o build/q27_agent_commands_c.o build/q27_agent_editor_c.o build/q27_agent_linenoise_c.o experiments/ds4-agent/q27_agent_engine.cpp experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_session.h experiments/ds4-agent/q27_agent_stall.h src/toolconstrain.h src/toolgram.h \
                  src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h \
                  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -fobjc-arc -pthread -I src/metal -I experiments/ds4-agent \
-	        build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o build/q27_agent_tui_c.o build/q27_agent_commands_c.o build/q27_agent_editor_c.o build/q27_agent_linenoise_c.o experiments/ds4-agent/q27_agent_engine.cpp src/metal/metal_engine.cpp \
+	        build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_frontend_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o build/q27_agent_tui_c.o build/q27_agent_commands_c.o build/q27_agent_editor_c.o build/q27_agent_linenoise_c.o experiments/ds4-agent/q27_agent_engine.cpp src/metal/metal_engine.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
+
+# Rust Ratatui FP1 client (experiments/q27-tui). Copied into build/ so Q27_BIN_DIR works.
+build/q27-tui: experiments/q27-tui/Cargo.toml experiments/q27-tui/src/main.rs \
+               experiments/q27-tui/src/app.rs experiments/q27-tui/src/backend.rs \
+               experiments/q27-tui/src/proto.rs experiments/q27-tui/src/ui.rs \
+               experiments/q27-tui/src/md.rs experiments/q27-tui/src/theme.rs | build
+	cd experiments/q27-tui && cargo build --release
+	cp -f experiments/q27-tui/target/release/q27-tui $@
 
 build/metal_gemv_bench: tools/metal_gemv_bench.cpp src/metal/metal_backend.mm src/metal/metal_backend.h \
                         src/metal/q27_kernels.metal src/backend.h src/loader.cpp src/loader.h | build

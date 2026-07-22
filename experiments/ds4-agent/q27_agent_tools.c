@@ -1342,10 +1342,17 @@ static q27_agent_status run_shell(int workspace_fd,
     if (pid == 0) {
         setpgid(0, 0);
         close(pipes[0]);
-        if (dup2(pipes[1], STDOUT_FILENO) < 0 ||
+        /* Never inherit the agent TTY as stdin (busy linenoise is raw-mode).
+         * Shell tools are noninteractive; an open TTY would let them steal
+         * queued user keystrokes or block under raw termios. */
+        int devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (devnull < 0 ||
+            dup2(devnull, STDIN_FILENO) < 0 ||
+            dup2(pipes[1], STDOUT_FILENO) < 0 ||
             dup2(pipes[1], STDERR_FILENO) < 0 ||
             fchdir(workspace_fd) != 0)
             _exit(126);
+        if (devnull > STDERR_FILENO) close(devnull);
         close(pipes[1]);
 #if defined(__APPLE__)
         // A no-fork sandbox makes the job a genuinely bounded process tree:

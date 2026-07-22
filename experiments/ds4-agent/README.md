@@ -30,16 +30,22 @@ drains a bounded owned event queue (`state`, exact `prefill_progress`, binary
 `text_delta`, and exactly one terminal). There is no server, socket, HTTP, SSE,
 or API-shape translation.
 
-The friendly source-checkout entry point builds and starts B1 with context
-32768, adaptive output, automatic tools, and workspace `$PWD`:
+The friendly source-checkout entry point builds agent + Ratatui TUI and starts
+B1 with context 32768, adaptive output, automatic tools, and workspace `$PWD`:
 
 ```sh
 make agent
+make install-dev-q27   # optional: then `q27 agent b1` from any dir
+q27 agent b1
 ```
 
-Use `./packaging/bin/q27 agent t2` to select another local/installed pack;
-`Q27_AGENT_CONTEXT`, `Q27_AGENT_WORKSPACE`, and `Q27_AGENT_SESSION` override
-its defaults. The low-level invocation remains available:
+Use `./packaging/bin/q27 agent t2` to select another local/installed pack.
+Wrapper env overrides include `Q27_AGENT_CONTEXT`, `Q27_AGENT_WORKSPACE`,
+`Q27_AGENT_SESSION`, `Q27_AGENT_UI` (`tui`|`classic`|`auto`),
+`Q27_AGENT_MAX_TOKENS`, `Q27_AGENT_MAX_THINK_TOKENS` (agent-side open-`<think>`
+cap; **default off**), and `Q27_AGENT_NO_THINK=1`. See
+`packaging/README.md` for the full table. The low-level invocation remains
+available:
 
 ```sh
 make build/q27-agent
@@ -53,6 +59,29 @@ Interactive mode omits `--prompt`; `:quit` exits. Machine-readable events use:
 ./build/q27-agent MODEL.q27 MODEL.tok --prompt 'Reply: ready' \
   --no-think --output-format jsonl
 ```
+
+**Frontend Protocol v1 (FP1)** — headless brain for a separate TUI (Rust
+`experiments/q27-tui`). Spec: `docs/metal/plans/2026-07-21-frontend-protocol-v1.md`.
+
+```sh
+# One-shot with FP1 envelope (hello / idle / bye + text fields)
+./build/q27-agent MODEL.q27 MODEL.tok --frontend-proto 1 --prompt 'Reply: ready' \
+  --no-think --max-tokens 32
+
+# Interactive: stdin is NDJSON ClientMessage (prompt / cancel / quit)
+printf '%s\n' '{"v":1,"op":"prompt","text":"hi"}' '{"v":1,"op":"quit"}' |
+  ./build/q27-agent MODEL.q27 MODEL.tok --frontend-proto 1 --no-think
+
+# Rust frontend (spawns the above)
+cd experiments/q27-tui && cargo run --release -- -- MODEL.q27 MODEL.tok --auto-tools
+```
+
+**`q27-tui` keys (empty prompt line):** `t` expand/collapse finished thinking
+(default **collapsed**); `T` cycle theme; `m` toggle markdown. Live open
+`<think>` always streams in full. **Esc** / **Ctrl-C** / `/cancel` interrupt.
+
+Legacy `--output-format jsonl` (v0) is unchanged. FP1 forces the event stream
+on stdout and disables the linenoise TUI.
 
 Every JSONL row carries monotonic `seq`, `command_id`, event `type`, state,
 status, accounting, and exact `data_b64` bytes. `prefill_progress` reports the
@@ -257,6 +286,22 @@ are reserved separately. The limit is recomputed after every tool response and a
 compaction rewrite. Automatic shell execution
 remains subject to the single-process sandbox described above.
 
+### Thinking token cap (`--max-think-tokens`)
+
+Thinking is model behavior (Qwen-style open `<think>…</think>`), not a separate
+API budget. The engine can optionally hard-stop while that span is still open:
+
+| Flag / env | Default | Effect |
+|------------|---------|--------|
+| `--max-think-tokens N` / `Q27_AGENT_MAX_THINK_TOKENS` | **0 / unset = off** | After **N** tokens inside open `<think>`, **force-inject `</think>\n\n`** into the stream + resident KV (same close as `--no-think` prefill) and **keep generating the answer** within remaining `max_tokens`. Only hard-stops mid-think if there is no room for the close + ≥1 answer token. Status note: `thinking token budget: forced </think> and continued` |
+| `--no-think` / `Q27_AGENT_NO_THINK=1` | think enabled | Empty think prefill so the model answers without a long reasoning block |
+| `--max-tokens` / `Q27_AGENT_MAX_TOKENS` | 512 / auto / 4096 with auto-tools | Bounds **whole** generation (thinking + forced close + answer) |
+
+This is **agent-side**, not a model pack feature. Sampled B1 can reason for a
+long time under `auto` (up to 16k); set an explicit think cap and/or lower
+`max_tokens` when that is undesirable. The force-close is the practical way to
+get “stop thinking, now do the work” without discarding the turn.
+
 ### Resident session contract
 
 Every turn still re-renders the complete transcript for validation. Reuse is
@@ -359,12 +404,16 @@ After Phase 0, port from the pinned DS4 agent in this order:
    footer, slash commands; design note
    `docs/metal/plans/2026-07-21-agent-tui.md`. Browser tooling still deferred.
 
-### Interactive TUI (Phase 1)
+### Interactive TUI (Phase 1–2 + queue)
 
 On a TTY, interactive mode uses a ds4-style linenoise editor with:
 
 - line editing, history, multiline paste
-- sticky status footer (`ctx used/size | idle|prefill|…`)
+- sticky multiphase status footer (`ctx used/size | idle|prefill|generating|tool…`)
+  while a turn is live (prefill no longer fights stderr with `\r` lines)
+- tool cards (`┌─ read path=…` / `└─ ok exit=0 out=…`) with collapsed large dumps
+- queue-while-busy: type the next prompt during generation/tools (max 8; footer
+  shows `queue N`); drained before the next idle read
 - slash commands (`/help`, `/quit`, `/save`, `/compact`, `/session`, `/new`,
   `/read`, `/search`, `/shell`) plus legacy colon forms
 

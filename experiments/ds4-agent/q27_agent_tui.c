@@ -6,6 +6,8 @@
 #include <strings.h>
 #include <unistd.h>
 
+#define Q27_TUI_QUEUE_DEFAULT_MAX 8
+
 int q27_tui_available(void) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return 0;
     const char *term = getenv("TERM");
@@ -59,6 +61,17 @@ const char *q27_tui_status_start_escape(void) {
 
 const char *q27_tui_status_end_escape(void) {
     return "\x1b[0m";
+}
+
+static int append_queue_suffix(const q27_tui_status *st, char *buf, size_t buf_len,
+                               int n) {
+    if (!st || st->queue_len == 0 || n < 0) return n;
+    if ((size_t)n >= buf_len) return -1;
+    int extra = snprintf(buf + n, buf_len - (size_t)n, " | queue %u",
+                         st->queue_len);
+    if (extra < 0) return -1;
+    if ((size_t)n + (size_t)extra >= buf_len) return -1;
+    return n + extra;
 }
 
 int q27_tui_format_status(const q27_tui_status *st, char *buf, size_t buf_len) {
@@ -121,5 +134,155 @@ int q27_tui_format_status(const q27_tui_status *st, char *buf, size_t buf_len) {
     }
     if (n < 0) return -1;
     if ((size_t)n >= buf_len) return -1;
+    n = append_queue_suffix(st, buf, buf_len, n);
     return n;
+}
+
+int q27_tui_format_tool_card_open(const char *kind, const char *detail,
+                                  char *buf, size_t buf_len) {
+    if (!buf || buf_len == 0) return -1;
+    const char *k = kind && kind[0] ? kind : "tool";
+    int n;
+    if (detail && detail[0])
+        n = snprintf(buf, buf_len, "┌─ %s  %s\n", k, detail);
+    else
+        n = snprintf(buf, buf_len, "┌─ %s\n", k);
+    if (n < 0 || (size_t)n >= buf_len) return -1;
+    return n;
+}
+
+int q27_tui_format_tool_card_close(int exit_code, uint32_t output_bytes,
+                                   const char *message, char *buf,
+                                   size_t buf_len) {
+    if (!buf || buf_len == 0) return -1;
+    char size[32];
+    q27_tui_format_tokens(output_bytes, size, sizeof(size));
+    const char *mark = exit_code == 0 ? "ok" : "fail";
+    int n;
+    if (message && message[0])
+        n = snprintf(buf, buf_len, "└─ %s  exit=%d  out=%sB  %s\n",
+                     mark, exit_code, size, message);
+    else
+        n = snprintf(buf, buf_len, "└─ %s  exit=%d  out=%sB\n",
+                     mark, exit_code, size);
+    if (n < 0 || (size_t)n >= buf_len) return -1;
+    return n;
+}
+
+int q27_tui_collapse_text(const char *text, size_t text_len, int max_lines,
+                          int max_chars, char *buf, size_t buf_len) {
+    if (!buf || buf_len == 0) return -1;
+    if (!text) text_len = 0;
+    if (max_lines < 1) max_lines = 1;
+    if (max_chars < 16) max_chars = 16;
+    if ((size_t)max_chars + 64 > buf_len) max_chars = (int)buf_len - 64;
+    if (max_chars < 1) {
+        buf[0] = '\0';
+        return -1;
+    }
+
+    size_t i = 0;
+    int lines = 0;
+    size_t out = 0;
+    int truncated = 0;
+    while (i < text_len && lines < max_lines && (int)out < max_chars) {
+        unsigned char c = (unsigned char)text[i++];
+        if (out + 1 >= buf_len) {
+            truncated = 1;
+            break;
+        }
+        /* Terminal-safe: never emit NULs, C0 (except newline), DEL, or C1. */
+        if (c == '\t')
+            c = ' ';
+        else if (c == '\0' || (c < 0x20 && c != '\n') || c == 0x7f ||
+                 (c >= 0x80 && c <= 0x9f))
+            c = '.';
+        buf[out++] = (char)c;
+        if (c == '\n') lines++;
+    }
+    if (i < text_len) truncated = 1;
+    if (truncated) {
+        size_t rem = text_len - i;
+        int extra = snprintf(buf + out, buf_len - out,
+                             "%s… (%zu more bytes)\n",
+                             (out && buf[out - 1] != '\n') ? "\n" : "",
+                             rem);
+        if (extra < 0) return -1;
+        if ((size_t)extra >= buf_len - out) return -1;
+        out += (size_t)extra;
+    } else {
+        buf[out] = '\0';
+    }
+    return (int)out;
+}
+
+void q27_tui_sanitize_display(const char *in, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (!in) return;
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 1 < out_len; ) {
+        unsigned char c = (unsigned char)in[i++];
+        if (c == 0x1b || c == 0x9b) {
+            /* Drop CSI / OSC-ish sequences (ESC or C1 CSI): skip until final. */
+            while (in[i]) {
+                unsigned char d = (unsigned char)in[i++];
+                if (d >= 0x40 && d <= 0x7e) break;
+            }
+            continue;
+        }
+        /* C0, DEL, and C1 controls (0x80–0x9f) are not safe in chrome text. */
+        if (c < 0x20 || c == 0x7f || (c >= 0x80 && c <= 0x9f)) {
+            out[j++] = '?';
+            continue;
+        }
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
+}
+
+void q27_tui_prompt_queue_init(q27_tui_prompt_queue *q, size_t max_len) {
+    if (!q) return;
+    memset(q, 0, sizeof(*q));
+    q->max_len = max_len ? max_len : Q27_TUI_QUEUE_DEFAULT_MAX;
+}
+
+void q27_tui_prompt_queue_free(q27_tui_prompt_queue *q) {
+    if (!q) return;
+    for (size_t i = 0; i < q->len; i++) free(q->items[i]);
+    free(q->items);
+    memset(q, 0, sizeof(*q));
+}
+
+int q27_tui_prompt_queue_push(q27_tui_prompt_queue *q, const char *text,
+                              size_t len) {
+    if (!q || (!text && len)) return 0;
+    if (q->len >= q->max_len) return 0;
+    if (q->len == q->cap) {
+        size_t ncap = q->cap ? q->cap * 2 : 4;
+        if (ncap > q->max_len) ncap = q->max_len;
+        if (ncap <= q->cap) return 0;
+        char **ni = realloc(q->items, ncap * sizeof(*ni));
+        if (!ni) return 0;
+        q->items = ni;
+        q->cap = ncap;
+    }
+    char *copy = malloc(len + 1);
+    if (!copy) return 0;
+    if (len && text) memcpy(copy, text, len);
+    copy[len] = '\0';
+    q->items[q->len++] = copy;
+    return 1;
+}
+
+char *q27_tui_prompt_queue_pop(q27_tui_prompt_queue *q) {
+    if (!q || !q->len) return NULL;
+    char *line = q->items[0];
+    memmove(q->items, q->items + 1, (q->len - 1) * sizeof(q->items[0]));
+    q->len--;
+    return line;
+}
+
+size_t q27_tui_prompt_queue_len(const q27_tui_prompt_queue *q) {
+    return q ? q->len : 0;
 }

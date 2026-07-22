@@ -2,6 +2,7 @@
 #include "q27_agent_tui.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(cond) do { \
@@ -42,6 +43,11 @@ int main(void) {
     CHECK(q27_tui_format_status(&st, buf, sizeof(buf)) > 0);
     CHECK(strstr(buf, "read") != NULL);
 
+    st.phase = Q27_TUI_IDLE;
+    st.queue_len = 2;
+    CHECK(q27_tui_format_status(&st, buf, sizeof(buf)) > 0);
+    CHECK(strstr(buf, "queue 2") != NULL);
+
     q27_tui_format_tokens(500, buf, sizeof(buf));
     CHECK(!strcmp(buf, "500"));
     q27_tui_format_tokens(1500, buf, sizeof(buf));
@@ -51,6 +57,58 @@ int main(void) {
     q27_tui_format_progress_bar(8, 16, 8, bar, sizeof(bar));
     CHECK(bar[0] == '[');
     CHECK(strchr(bar, ']') != NULL);
+
+    CHECK(q27_tui_format_tool_card_open("read", "path=foo.c", buf,
+                                        sizeof(buf)) > 0);
+    CHECK(strstr(buf, "read") != NULL);
+    CHECK(strstr(buf, "path=foo.c") != NULL);
+    CHECK(q27_tui_format_tool_card_close(0, 1200, NULL, buf, sizeof(buf)) > 0);
+    CHECK(strstr(buf, "ok") != NULL);
+    CHECK(q27_tui_format_tool_card_close(1, 0, "denied", buf, sizeof(buf)) > 0);
+    CHECK(strstr(buf, "fail") != NULL);
+    CHECK(strstr(buf, "denied") != NULL);
+
+    const char long_text[] = "line1\nline2\nline3\nline4\nline5\n";
+    CHECK(q27_tui_collapse_text(long_text, strlen(long_text), 2, 200, buf,
+                                sizeof(buf)) > 0);
+    CHECK(strstr(buf, "line1") != NULL);
+    CHECK(strstr(buf, "more bytes") != NULL);
+
+    /* Binary / C1 controls must not survive collapse previews. */
+    char binary[] = {'a', '\0', (char)0x9b, '3', '1', 'm', 'x', '\n'};
+    int bn = q27_tui_collapse_text(binary, sizeof(binary), 4, 64, buf,
+                                   sizeof(buf));
+    CHECK(bn > 0);
+    CHECK(memchr(buf, '\0', (size_t)bn) == NULL ||
+          (size_t)bn == strlen(buf)); /* no interior NULs in printable span */
+    CHECK(memchr(buf, 0x9b, (size_t)bn) == NULL);
+    CHECK(strchr(buf, 'a') != NULL);
+
+    char dirty[] = "path=foo\x1b[31mbar\n";
+    char clean[64];
+    q27_tui_sanitize_display(dirty, clean, sizeof(clean));
+    CHECK(strstr(clean, "\x1b") == NULL);
+    CHECK(strchr(clean, '\n') == NULL);
+    CHECK(strstr(clean, "path=foo") != NULL);
+    char c1[] = "p\x9b" "31mx";
+    q27_tui_sanitize_display(c1, clean, sizeof(clean));
+    CHECK((unsigned char)clean[0] != 0x9b);
+    CHECK(strchr(clean, 'p') != NULL);
+
+    q27_tui_prompt_queue q;
+    q27_tui_prompt_queue_init(&q, 2);
+    CHECK(q27_tui_prompt_queue_push(&q, "one", 3));
+    CHECK(q27_tui_prompt_queue_push(&q, "two", 3));
+    CHECK(!q27_tui_prompt_queue_push(&q, "three", 5)); /* full */
+    CHECK(q27_tui_prompt_queue_len(&q) == 2);
+    char *a = q27_tui_prompt_queue_pop(&q);
+    char *b = q27_tui_prompt_queue_pop(&q);
+    CHECK(a && !strcmp(a, "one"));
+    CHECK(b && !strcmp(b, "two"));
+    CHECK(q27_tui_prompt_queue_pop(&q) == NULL);
+    free(a);
+    free(b);
+    q27_tui_prompt_queue_free(&q);
 
     char line1[] = "/help";
     q27_agent_cmd cmd;
