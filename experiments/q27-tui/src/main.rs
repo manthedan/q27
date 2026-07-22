@@ -529,10 +529,24 @@ fn dispatch_input(
             });
             Ok(())
         }
-        None => {
-            model.push_user(text);
-            backend.prompt(text).map(|_| ())
-        }
+        None => match backend.prompt(text) {
+            // Register the pending prompt only after the send succeeds, then
+            // reconcile on rejection / first turn event (r12 codex P2).
+            Ok(id) => {
+                model
+                    .pending_prompts
+                    .push((id, text.chars().take(48).collect()));
+                model.push_user(text);
+                Ok(())
+            }
+            Err(e) => {
+                model.scrollback.push(app::Block::Notice {
+                    severity: "error".into(),
+                    text: format!("prompt not sent: {e}"),
+                });
+                Ok(())
+            }
+        },
     }
 }
 

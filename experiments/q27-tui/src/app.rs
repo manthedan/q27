@@ -69,6 +69,9 @@ pub struct Model {
     pub last_error: Option<String>,
     pub status_line: String,
     pub input_enabled: bool,
+    /// Prompts sent but not yet accepted-visible (id, preview) — reconciled
+    /// on rejection or first correlated turn event (r12 codex P2).
+    pub pending_prompts: Vec<(String, String)>,
     pub bye_reason: Option<String>,
     pub saw_hello: bool,
     /// When false, thinking spans render as a one-line summary.
@@ -100,6 +103,7 @@ impl Default for Model {
             last_error: None,
             status_line: String::new(),
             input_enabled: false,
+            pending_prompts: Vec::new(),
             bye_reason: None,
             saw_hello: false,
             show_thinking: false,
@@ -132,6 +136,21 @@ impl Model {
             };
         }
 
+        // A prompt that produces any correlated turn event was accepted —
+        // clear its pending marker silently (r12 codex P2).
+        if let Some(id) = ev.client_req_id.as_deref() {
+            if matches!(
+                ev.type_name.as_str(),
+                "state"
+                    | "prefill_progress"
+                    | "text_delta"
+                    | "tool_start"
+                    | "turn_done"
+                    | "error"
+            ) {
+                self.reconcile_pending(id);
+            }
+        }
         match ev.type_name.as_str() {
             "hello" => {
                 self.saw_hello = true;
@@ -179,6 +198,8 @@ impl Model {
                 self.phase = Phase::Generating;
                 self.input_enabled = self.has_queue_feature();
                 if let Some(t) = ev.payload_text() {
+                    // Model output is untrusted terminal input too (r12 P2).
+                    let t = sanitize_terminal_text(&t);
                     self.assistant_buf.push_str(&t);
                 }
                 if let Some(o) = ev.output_tokens {
@@ -308,6 +329,13 @@ impl Model {
                 } else {
                     format!("[{code}] {text}")
                 };
+                // A rejected prompt's optimistic user block must not stand
+                // unqualified — name it (r12 codex P2).
+                let msg = match ev.client_req_id.as_deref()
+                    .and_then(|id| self.reconcile_pending(id)) {
+                    Some(preview) => format!("prompt not accepted: \u{201c}{preview}\u{201d} — {msg}"),
+                    None => msg,
+                };
                 self.scrollback.push(Block::Notice {
                     severity: "error".into(),
                     text: msg.clone(),
@@ -431,6 +459,15 @@ impl Model {
             self.phase = Phase::Generating;
             self.status_line = "submitting…".into();
         }
+    }
+
+    /// Drop a pending prompt marker by client_req_id, returning its preview
+    /// when still pending (accepted-silently vs rejected-with-notice).
+    fn reconcile_pending(&mut self, id: &str) -> Option<String> {
+        self.pending_prompts
+            .iter()
+            .position(|(pid, _)| pid == id)
+            .map(|pos| self.pending_prompts.remove(pos).1)
     }
 
     pub fn has_queue_feature(&self) -> bool {

@@ -895,6 +895,7 @@ static int run_tool(q27_agent_worker *worker,
                 const void *out_ptr = event.data;
                 size_t out_len = event.data_len;
                 char collapsed[640];
+                unsigned char *clean = NULL;
                 if (cards && event.data_len > 512) {
                     int cn = q27_tui_collapse_text((const char *)event.data,
                                                    event.data_len, 6, 480,
@@ -903,12 +904,31 @@ static int run_tool(q27_agent_worker *worker,
                         out_ptr = collapsed;
                         out_len = (size_t)cn;
                     }
+                } else if (event.data_len) {
+                    /* Small chunks were the hole: sanitize controls with the
+                     * collapse path's exact byte rules before the terminal
+                     * (r12 codex P2). Heap — output can be large. */
+                    clean = malloc(event.data_len);
+                    if (clean) {
+                        for (size_t bi = 0; bi < event.data_len; ++bi) {
+                            unsigned char c = event.data[bi];
+                            if (c == '\t')
+                                c = ' ';
+                            else if (c == '\0' || (c < 0x20 && c != '\n') ||
+                                     c == 0x7f || (c >= 0x80 && c <= 0x9f))
+                                c = '.';
+                            clean[bi] = c;
+                        }
+                        out_ptr = clean;
+                        out_len = event.data_len;
+                    }
                 }
                 if (!tui_write_out(out_ptr, out_len))
                     output_failed = 1;
                 else if (out_len)
                     display_open_line =
                         ((const unsigned char *)out_ptr)[out_len - 1] != '\n';
+                free(clean);
             }
         }
         if (jsonl && !print_json_event(&event)) output_failed = 1;
