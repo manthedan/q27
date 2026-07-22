@@ -163,6 +163,15 @@ q27_agent_want_tui() {
         tui|ratatui|fp1) return 0 ;;
         classic|linenoise|agent|c) return 1 ;;
         auto|"")
+            # One-shot / machine-output invocations never get the
+            # interactive client (r22 codex P2).
+            local a
+            for a in "$@"; do
+                case "$a" in
+                    -p|--prompt|--prompt=*|--output-format|--output-format=*|--frontend-proto|--frontend-proto=*)
+                        return 1 ;;
+                esac
+            done
             [ -t 0 ] && [ -t 1 ] && return 0
             return 1
             ;;
@@ -293,7 +302,7 @@ cmd_agent() {
 
     local ui="classic"
     tui=""
-    if q27_agent_want_tui; then
+    if q27_agent_want_tui "$@"; then
         tui="$(q27_bin q27-tui 2>/dev/null || true)"
         if [ -n "$tui" ]; then
             ui="tui"

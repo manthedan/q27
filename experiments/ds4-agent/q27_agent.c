@@ -2473,6 +2473,14 @@ int main(int argc, char **argv) {
                  run_turn(worker, &chat, think, 0, turn_max_tokens, sampling,
                           jsonl, 1, NULL, NULL, NULL, NULL);
         }
+        if (ok) {
+            /* One-shot accounting: recount so the FP1 idle reports the real
+             * context usage instead of 0 (r22 codex P2). */
+            uint32_t counted = 0;
+            if (transcript_prompt_tokens(worker, &chat, think, &counted) &&
+                counted)
+                last_ctx_used = counted;
+        }
         if (ok) ok = save_session(worker, session_path,
                                   &current_snapshot_name, &chat, think,
                                   auto_tools, context, tokenizer_sha1, jsonl);

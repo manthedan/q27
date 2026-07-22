@@ -303,25 +303,14 @@ void q27_tui_sanitize_display(const char *in, char *out, size_t out_len) {
     if (!out || out_len == 0) return;
     out[0] = '\0';
     if (!in) return;
-    size_t j = 0;
-    for (size_t i = 0; in[i] && j + 1 < out_len; ) {
-        unsigned char c = (unsigned char)in[i++];
-        if (c == 0x1b || c == 0x9b) {
-            /* Drop CSI / OSC-ish sequences (ESC or C1 CSI): skip until final. */
-            while (in[i]) {
-                unsigned char d = (unsigned char)in[i++];
-                if (d >= 0x40 && d <= 0x7e) break;
-            }
-            continue;
-        }
-        /* C0, DEL, and C1 controls (0x80–0x9f) are not safe in chrome text. */
-        if (c < 0x20 || c == 0x7f || (c >= 0x80 && c <= 0x9f)) {
-            out[j++] = '?';
-            continue;
-        }
-        out[j++] = (char)c;
-    }
-    out[j] = '\0';
+    /* Code-point rule via the shared sanitizer (r22 codex P2): the old
+     * byte-wise C1 check corrupted UTF-8 continuation bytes (€, U+0100)
+     * and the CSI-skip could swallow detail text. Display strings stay
+     * single-line, so newlines flatten to spaces afterwards. */
+    (void)q27_tui_sanitize_bytes((const unsigned char *)in, strlen(in),
+                                 out, out_len);
+    for (char *p = out; *p; ++p)
+        if (*p == '\n') *p = ' ';
 }
 
 void q27_tui_prompt_queue_init(q27_tui_prompt_queue *q, size_t max_len) {

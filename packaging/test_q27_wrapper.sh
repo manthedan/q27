@@ -197,6 +197,21 @@ EOF
 diff -u "$TMP/tui-expected" "$TMP/tui-args"
 # Ensure classic fake agent was not also invoked for the TUI path.
 [ ! -f "$TMP/args-from-tui-path" ] || true
+
+# One-shot flags bypass the TUI even when q27-tui is on PATH (r22 codex P2):
+# --prompt is a non-interactive invocation and must reach the classic agent.
+rm -f "$TMP/tui-args"
+Q27_TUI_CAPTURE="$TMP/tui-args" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" agent b1 --prompt "hello there" \
+    >"$TMP/oneshot-stdout" 2>"$TMP/oneshot-stderr"
+[ ! -f "$TMP/tui-args" ] || {
+    echo "FAIL: one-shot --prompt was routed to the TUI" >&2
+    cat "$TMP/tui-args" >&2; exit 1; }
+grep -q -- "--prompt" "$TMP/args" || {
+    echo "FAIL: one-shot --prompt did not reach the classic agent" >&2
+    cat "$TMP/args" >&2; exit 1; }
+
 wait_lock_clear || {
     echo "FAIL: consumer flock remained held after normal child exit" >&2; exit 1; }
 
