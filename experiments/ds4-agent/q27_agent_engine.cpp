@@ -970,6 +970,30 @@ extern "C" q27_agent_status q27_agent_generate(
                     }
                 }
                 if (stop_after_burst || current == eos) break;
+                /* A burst that OPENED a think span runs past the budget
+                 * within itself (the can_mtp gate only sees spans already
+                 * open). KV and ledger are burst-aligned at this point, so
+                 * force-close here instead of publishing one more think
+                 * token first (codex P2). Overshoot is bounded by the burst
+                 * width (≤3 tokens); per-token enforcement resumes on the
+                 * serial path the gate now forces. */
+                if (max_think > 0 && think_span.in_think &&
+                    think_span.think_tokens >= max_think) {
+                    const std::vector<uint32_t> force =
+                        force_close_think_ids(engine->tokenizer.get());
+                    if (force.empty() ||
+                        produced + force.size() >= max_tokens) {
+                        /* next_pending unpublished; ledger already aligned. */
+                        think_budget_fallback_stop = true;
+                        break;
+                    }
+                    if (!force_close_think_and_continue(force)) {
+                        if (output_tokens) *output_tokens = produced;
+                        return cancelled();
+                    }
+                    if (think_budget_fallback_stop) break;
+                    continue;
+                }
                 current = next_pending;
                 if (!alive(opaque)) {
                     if (output_tokens) *output_tokens = produced;

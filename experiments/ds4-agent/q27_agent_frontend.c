@@ -695,95 +695,83 @@ static int json_unescape_to(const char *in, size_t in_len, char **out) {
     return 1;
 }
 
-/* Find "key": value where value is a JSON string; returns owned unescaped. */
+/* Find a top-level "key": in the outermost object and return a pointer to
+ * the first value byte (past the colon and surrounding whitespace), or
+ * NULL. Control-plane fields live at depth 1 only: nested metadata and
+ * string VALUES that merely equal a key name must never be read as fields
+ * (codex P1 — `{"v":1,"meta":{"op":"quit"}}` is not a quit). */
+static const char *json_top_value(const char *line, size_t len,
+                                  const char *key) {
+    char pattern[80];
+    int pn = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    if (pn <= 0 || (size_t)pn >= sizeof(pattern)) return NULL;
+    const char *p = line;
+    const char *end = line + len;
+    int depth = 0;
+    while (p < end) {
+        const char c = *p;
+        if (c == '"') {
+            const char *str_start = p;
+            ++p;
+            while (p < end) {
+                if (*p == '\\') { p += 2; continue; }
+                if (*p == '"') break;
+                ++p;
+            }
+            if (p >= end) return NULL;
+            /* [str_start, p] spans one string token, quotes included. */
+            if (depth == 1 && (size_t)(p - str_start + 1) == (size_t)pn &&
+                !memcmp(str_start, pattern, (size_t)pn)) {
+                const char *q = p + 1;
+                while (q < end && (*q == ' ' || *q == '\t')) ++q;
+                if (q < end && *q == ':') {
+                    ++q;
+                    while (q < end && (*q == ' ' || *q == '\t')) ++q;
+                    if (q < end) return q;
+                }
+            }
+            ++p;
+            continue;
+        }
+        if (c == '{' || c == '[') ++depth;
+        else if (c == '}' || c == ']') --depth;
+        ++p;
+    }
+    return NULL;
+}
+
+/* Find top-level "key": value where value is a JSON string; owned unescape. */
 static int json_get_string(const char *line, size_t len, const char *key,
                            char **out) {
     *out = NULL;
-    char pattern[80];
-    int pn = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    if (pn <= 0 || (size_t)pn >= sizeof(pattern)) return 0;
-    const char *p = line;
+    const char *q = json_top_value(line, len, key);
+    if (!q) return 0;
     const char *end = line + len;
-    while (p < end) {
-        const char *found = NULL;
-        size_t remain = (size_t)(end - p);
-        if (remain < (size_t)pn) break;
-        for (size_t i = 0; i + (size_t)pn <= remain; ++i) {
-            if (p[i] == pattern[0] && !memcmp(p + i, pattern, (size_t)pn)) {
-                found = p + i;
-                break;
-            }
-        }
-        if (!found) return 0;
-        const char *q = found + pn;
-        while (q < end && (*q == ' ' || *q == '\t')) q++;
-        if (q >= end || *q != ':') {
-            p = found + 1;
-            continue;
-        }
-        q++;
-        while (q < end && (*q == ' ' || *q == '\t')) q++;
-        if (q >= end) return 0;
-        if (*q == 'n' && q + 4 <= end && !memcmp(q, "null", 4)) {
-            *out = NULL;
-            return 1;
-        }
-        if (*q != '"') {
-            p = found + 1;
-            continue;
-        }
-        q++;
-        const char *s = q;
-        while (q < end) {
-            if (*q == '\\') {
-                q += 2;
-                continue;
-            }
-            if (*q == '"') break;
-            q++;
-        }
-        if (q >= end || *q != '"') return 0;
-        return json_unescape_to(s, (size_t)(q - s), out);
+    if (*q == 'n' && q + 4 <= end && !memcmp(q, "null", 4)) {
+        *out = NULL;
+        return 1;
     }
-    return 0;
+    if (*q != '"') return 0;
+    ++q;
+    const char *s = q;
+    while (q < end) {
+        if (*q == '\\') { q += 2; continue; }
+        if (*q == '"') break;
+        ++q;
+    }
+    if (q >= end || *q != '"') return 0;
+    return json_unescape_to(s, (size_t)(q - s), out);
 }
 
 static int json_get_number_int(const char *line, size_t len, const char *key,
                                long *out) {
-    char pattern[80];
-    int pn = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    if (pn <= 0 || (size_t)pn >= sizeof(pattern)) return 0;
-    const char *p = line;
-    const char *end = line + len;
-    while (p < end) {
-        const char *found = NULL;
-        size_t remain = (size_t)(end - p);
-        for (size_t i = 0; i + (size_t)pn <= remain; ++i) {
-            if (p[i] == pattern[0] && !memcmp(p + i, pattern, (size_t)pn)) {
-                found = p + i;
-                break;
-            }
-        }
-        if (!found) return 0;
-        const char *q = found + pn;
-        while (q < end && (*q == ' ' || *q == '\t')) q++;
-        if (q >= end || *q != ':') {
-            p = found + 1;
-            continue;
-        }
-        q++;
-        while (q < end && (*q == ' ' || *q == '\t')) q++;
-        if (q >= end) return 0;
-        char *endptr = NULL;
-        long v = strtol(q, &endptr, 10);
-        if (endptr == q) {
-            p = found + 1;
-            continue;
-        }
-        *out = v;
-        return 1;
-    }
-    return 0;
+    const char *q = json_top_value(line, len, key);
+    if (!q) return 0;
+    char *endptr = NULL;
+    long v = strtol(q, &endptr, 10);
+    if (endptr == q) return 0;
+    *out = v;
+    return 1;
 }
 
 int q27_fp1_parse_client_line(const char *line, size_t len, q27_fp1_op *out) {

@@ -565,7 +565,10 @@ static int transcript_is_auto_tool_response_at(const transcript *t, size_t i) {
 
 /* Pop the last message if it is a human user prompt (not a tool_response). */
 static void transcript_pop_last_human_user(transcript *t) {
-    if (!t || t->len <= 1) return;
+    /* len==1 is a lone user message: exactly what a cancelled first turn
+     * leaves, and exactly what the rollback must pop (codex P1). The role
+     * checks below still protect a lone system/auto-tool message. */
+    if (!t || t->len < 1) return;
     const size_t i = t->len - 1;
     if (!t->items[i].role || strcmp(t->items[i].role, "user") ||
         transcript_is_auto_tool_response_at(t, i))
@@ -1471,6 +1474,13 @@ static int save_session_ex(q27_agent_worker *worker, const char *manifest_path,
                            int explicit_save, const char *client_req_id) {
     if (!manifest_path) return 1;
     if (!chat || chat->len < 3 || !(chat->len & 1)) {
+        /* A rolled-back cancelled turn can legitimately leave nothing worth
+         * saving: auto-save skips quietly (the next completed turn saves),
+         * while an explicit save op keeps the honest error (codex P1). */
+        if (!explicit_save) {
+            tui_diagf( "q27-agent: auto-save skipped (incomplete transcript)\n");
+            return 1;
+        }
         tui_diagf( "q27-agent: refusing to save an incomplete transcript\n");
         if (jsonl && q27_fp1_protocol() && worker) {
             const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
@@ -2622,7 +2632,11 @@ int main(int argc, char **argv) {
                     session_path, current_snapshot_name, context,
                     last_ctx_used, think, auto_tools,
                     chat.len > 0 ? (chat.len - 1) / 2 : 0);
+                /* Manual tool events correlate to the manual request
+                 * (codex P2); the borrow ends before the op is freed. */
+                g_fp1_active_req_id = op.client_req_id;
                 ok = run_tool(worker, &request, jsonl, 1, NULL, NULL, NULL);
+                g_fp1_active_req_id = NULL;
                 const int fp1_cancelled = q27_fp1_control_cancel_requested();
                 if (fp1_cancelled) q27_fp1_control_clear_cancel();
                 if (interrupted && last_signal == SIGINT) {
@@ -2698,23 +2712,33 @@ int main(int argc, char **argv) {
                      run_turn(worker, &chat, think, 0, turn_max_tokens,
                               sampling, jsonl, 1, NULL, NULL, NULL, NULL);
             }
+            g_fp1_active_req_id = NULL;
+            q27_fp1_op_free(&op);
 
             /* Message-driven cancel settles like SIGINT soft-cancel: recover
              * transcript, emit idle, keep accepting prompts (FP1 §6.1). */
             const int fp1_cancelled = q27_fp1_control_cancel_requested();
             if (fp1_cancelled) q27_fp1_control_clear_cancel();
 
+            const int turn_failed = !ok;
+            int cancel_any_path = fp1_cancelled;
             if (interrupted && last_signal == SIGINT) {
                 if (!try_ack_sigint()) {
                     ok = 0;
                     break;
                 }
+                cancel_any_path = 1;
                 ok = 1;
             } else if (interrupted) {
                 ok = 0;
                 break;
-            } else if (!ok && fp1_cancelled) {
-                /* Soft-recover: no SIGINT latch, but cancel is non-fatal. */
+            }
+            /* A cancelled turn leaves transcript residue (dangling user
+             * message or open tool call) no matter which cancel path fired —
+             * the Ratatui backend sends BOTH FP1-cancel and SIGINT, and the
+             * SIGINT ack above must not skip this rollback (codex P1). */
+            if (turn_failed && cancel_any_path) {
+                /* Soft-recover: cancel is non-fatal on either path. */
                 const int last_is_human_user =
                     chat.len > 1 && chat.items[chat.len - 1].role &&
                     !strcmp(chat.items[chat.len - 1].role, "user") &&

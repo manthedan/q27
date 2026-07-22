@@ -209,6 +209,26 @@ static void test_parse_client(void) {
     CHECK(op.kind == Q27_FP1_OP_QUIT);
     q27_fp1_op_free(&op);
 
+    /* Top-level only (codex P1): nested op strings and string values that
+     * equal a key name are NOT control-plane fields. */
+    {
+        const char *nested = "{\"v\":1,\"meta\":{\"op\":\"quit\"}}";
+        CHECK(q27_fp1_parse_client_line(nested, strlen(nested), &op));
+        CHECK(op.kind != Q27_FP1_OP_QUIT);
+        q27_fp1_op_free(&op);
+        const char *strval = "{\"v\":1,\"note\":\"op\",\"op\":\"quit\"}";
+        CHECK(q27_fp1_parse_client_line(strval, strlen(strval), &op));
+        CHECK(op.kind == Q27_FP1_OP_QUIT);
+        q27_fp1_op_free(&op);
+        const char *nested_tool =
+            "{\"v\":1,\"wrap\":{\"op\":\"tool\",\"kind\":\"shell\","
+            "\"command\":\"rm -rf x\"}}";
+        CHECK(q27_fp1_parse_client_line(nested_tool, strlen(nested_tool),
+                                        &op));
+        CHECK(op.kind != Q27_FP1_OP_TOOL);
+        q27_fp1_op_free(&op);
+    }
+
     CHECK(q27_fp1_parse_client_line("{\"v\":1,\"op\":\"save\"}", 20, &op));
     CHECK(op.kind == Q27_FP1_OP_SAVE);
     q27_fp1_op_free(&op);
