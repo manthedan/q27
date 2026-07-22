@@ -705,7 +705,15 @@ static const char *tool_kind_name(q27_agent_tool_kind kind) {
  * carries it (codex P1). Borrowed pointer; owned by the op being run. */
 static const char *g_fp1_active_req_id = NULL;
 
+/* Counts turn-terminal worker events (turn_done/stalled/error) printed
+ * through the funnel — the prompt path uses it to detect a turn that
+ * failed without any terminal so it can emit a correlated one (r5 P1). */
+static uint64_t g_fp1_turn_terminals = 0;
+
 static int print_json_event(const q27_agent_event *event) {
+    if (event->type == Q27_EVENT_TURN_DONE ||
+        event->type == Q27_EVENT_STALLED || event->type == Q27_EVENT_ERROR)
+        ++g_fp1_turn_terminals;
     return q27_fp1_print_event(stdout, event, q27_fp1_protocol(),
                                g_fp1_active_req_id);
 }
@@ -2214,7 +2222,19 @@ int main(int argc, char **argv) {
     int ok = 1, loaded_session = 0;
     uint32_t last_ctx_used = 0;
     const char *fp1_bye_reason = NULL;
-    if (session_path) {
+    /* FP1: hello FIRST — before any session-load worker events, so clients
+     * always initialize from the hello frame (r5 codex P2). The idle frame
+     * still comes after the restore so it can report restored context. */
+    if (ok && q27_fp1_protocol()) {
+        const uint64_t hello_seq = q27_agent_worker_alloc_sequence(worker);
+        if (!q27_fp1_emit_hello(stdout, hello_seq, model, tokenizer, context,
+                                workspace, session_path, auto_tools, think,
+                                max_tool_rounds, /*features_queue=*/1)) {
+            tui_diagf( "q27-agent: failed to emit FP1 hello\n");
+            ok = 0;
+        }
+    }
+    if (ok && session_path) {
         struct stat session_stat;
         if (lstat(session_path, &session_stat) == 0) {
             q27_agent_saved_session saved = {0};
@@ -2297,15 +2317,10 @@ int main(int argc, char **argv) {
     }
     if (!ok && chat.len == 0) tui_diagf( "q27-agent: session initialization failed\n");
 
-    /* FP1: hello once worker + session are ready, then idle before work. */
+    /* FP1: idle after worker + session are ready (hello already emitted
+     * above, before any session-load events). */
     if (ok && q27_fp1_protocol()) {
-        const uint64_t hello_seq = q27_agent_worker_alloc_sequence(worker);
-        if (!q27_fp1_emit_hello(stdout, hello_seq, model, tokenizer, context,
-                                workspace, session_path, auto_tools, think,
-                                max_tool_rounds, /*features_queue=*/1)) {
-            tui_diagf( "q27-agent: failed to emit FP1 hello\n");
-            ok = 0;
-        } else if (!emit_fp1_idle(worker, last_ctx_used, context, 0)) {
+        if (!emit_fp1_idle(worker, last_ctx_used, context, 0)) {
             tui_diagf( "q27-agent: failed to emit FP1 idle\n");
             ok = 0;
         }
@@ -2737,6 +2752,7 @@ int main(int argc, char **argv) {
                 session_path, current_snapshot_name, context, last_ctx_used,
                 think, auto_tools, chat.len > 0 ? (chat.len - 1) / 2 : 0);
 
+            const uint64_t terminals_before = g_fp1_turn_terminals;
             if (auto_tools)
                 ok = run_agent_cycle(worker, &chat, selections, think, context,
                                      max_tokens, adaptive_tokens, jsonl,
@@ -2751,7 +2767,9 @@ int main(int argc, char **argv) {
                               sampling, jsonl, 1, NULL, NULL, NULL, NULL);
             }
             g_fp1_active_req_id = NULL;
-            q27_fp1_op_free(&op);
+            /* op stays alive through the settle block: a terminal-less
+             * failure still needs its client_req_id for the correlated
+             * error below (r5 P1); freed after the settle. */
 
             /* Message-driven cancel settles like SIGINT soft-cancel: recover
              * transcript, emit idle, keep accepting prompts (FP1 §6.1). */
@@ -2818,6 +2836,19 @@ int main(int argc, char **argv) {
                 }
                 ok = 1;
             }
+
+            /* A turn that fails with no worker terminal leaves the client
+             * hanging on the request: emit a correlated error terminal (r5
+             * codex P1). Cancel/stall/error paths already terminated through
+             * the worker funnel; this fires only when nothing did. */
+            if (!ok && g_fp1_turn_terminals == terminals_before) {
+                const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
+                (void)q27_fp1_emit_notice(
+                    stdout, seq, op.client_req_id, "error", "turn_failed",
+                    "turn failed before completion; see stderr diagnostics",
+                    "idle");
+            }
+            q27_fp1_op_free(&op);
 
             if (ok) {
                 uint32_t counted = 0;
