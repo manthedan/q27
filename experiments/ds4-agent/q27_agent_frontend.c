@@ -122,8 +122,39 @@ char *q27_fp1_json_escape(const unsigned char *data, size_t len) {
             out[o++] = '0';
             out[o++] = hex[(c >> 4) & 0xf];
             out[o++] = hex[c & 0xf];
-        } else {
+        } else if (c < 0x80) {
             out[o++] = (char)c;
+        } else {
+            /* Copy only well-formed UTF-8 sequences; replace invalid bytes
+             * with U+FFFD so the NDJSON frame stays valid for strict
+             * readers (r13 codex P2 — arbitrary POSIX path/transcript bytes
+             * flow through here). */
+            size_t need = 0;
+            if (c >= 0xC2 && c <= 0xDF) need = 2;
+            else if (c >= 0xE0 && c <= 0xEF) need = 3;
+            else if (c >= 0xF0 && c <= 0xF4) need = 4;
+            int valid = need > 0 && i + need <= len;
+            if (valid) {
+                for (size_t k = 1; k < need; ++k) {
+                    if ((data[i + k] & 0xC0) != 0x80) { valid = 0; break; }
+                }
+            }
+            if (valid) {
+                const unsigned char c1 = data[i + 1];
+                if (c == 0xE0 && c1 < 0xA0) valid = 0;   /* overlong */
+                if (c == 0xED && c1 > 0x9F) valid = 0;   /* surrogate */
+                if (c == 0xF0 && c1 < 0x90) valid = 0;   /* overlong */
+                if (c == 0xF4 && c1 > 0x8F) valid = 0;   /* > U+10FFFF */
+            }
+            if (valid) {
+                for (size_t k = 0; k < need; ++k)
+                    out[o++] = (char)data[i + k];
+                i += need - 1;
+            } else {
+                out[o++] = (char)0xEF;
+                out[o++] = (char)0xBF;
+                out[o++] = (char)0xBD;
+            }
         }
     }
     out[o] = '\0';

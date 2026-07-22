@@ -169,6 +169,46 @@ int q27_tui_format_tool_card_close(int exit_code, uint32_t output_bytes,
     return n;
 }
 
+size_t q27_tui_sanitize_bytes(const unsigned char *in, size_t in_len,
+                              char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return 0;
+    size_t o = 0;
+    size_t i = 0;
+    while (i < in_len && o + 4 < out_cap) {
+        const unsigned char c = in[i];
+        if (c == '\n') { out[o++] = '\n'; ++i; continue; }
+        if (c == '\t') { out[o++] = ' '; ++i; continue; }
+        if (c < 0x20 || c == 0x7f) { out[o++] = '.'; ++i; continue; }
+        if (c < 0x80) { out[o++] = (char)c; ++i; continue; }
+        /* Multibyte: decode-or-replace; never classify continuation bytes
+         * as C1 controls (r13 codex P2). */
+        size_t need = 0;
+        if (c >= 0xC2 && c <= 0xDF) need = 2;
+        else if (c >= 0xE0 && c <= 0xEF) need = 3;
+        else if (c >= 0xF0 && c <= 0xF4) need = 4;
+        int valid = need > 0 && i + need <= in_len;
+        if (valid) {
+            for (size_t k = 1; k < need; ++k)
+                if ((in[i + k] & 0xC0) != 0x80) { valid = 0; break; }
+        }
+        if (valid) {
+            const unsigned char c1 = in[i + 1];
+            if (c == 0xE0 && c1 < 0xA0) valid = 0;
+            if (c == 0xED && c1 > 0x9F) valid = 0;
+            if (c == 0xF0 && c1 < 0x90) valid = 0;
+            if (c == 0xF4 && c1 > 0x8F) valid = 0;
+        }
+        if (!valid) { out[o++] = '.'; ++i; continue; }
+        /* The C1 control CODE POINT (U+0080..U+009F, 0xC2 0x80-0x9F) is a
+         * control, not text. */
+        if (c == 0xC2 && in[i + 1] <= 0x9F) { out[o++] = '.'; i += 2; continue; }
+        for (size_t k = 0; k < need; ++k) out[o++] = (char)in[i + k];
+        i += need;
+    }
+    out[o] = '\0';
+    return o;
+}
+
 int q27_tui_collapse_text(const char *text, size_t text_len, int max_lines,
                           int max_chars, char *buf, size_t buf_len) {
     if (!buf || buf_len == 0) return -1;
@@ -181,6 +221,18 @@ int q27_tui_collapse_text(const char *text, size_t text_len, int max_lines,
         return -1;
     }
 
+    /* Sanitize code-point-aware first (r13 codex P2); the rest of the
+     * collapse only sees terminal-safe text. */
+    char *clean = NULL;
+    if (text_len) {
+        clean = malloc(text_len + 1);
+        if (!clean) return -1;
+        text_len = q27_tui_sanitize_bytes((const unsigned char *)text,
+                                          text_len, clean, text_len + 1);
+        text = clean;
+    }
+
+    int result;
     size_t i = 0;
     int lines = 0;
     size_t out = 0;
@@ -191,12 +243,6 @@ int q27_tui_collapse_text(const char *text, size_t text_len, int max_lines,
             truncated = 1;
             break;
         }
-        /* Terminal-safe: never emit NULs, C0 (except newline), DEL, or C1. */
-        if (c == '\t')
-            c = ' ';
-        else if (c == '\0' || (c < 0x20 && c != '\n') || c == 0x7f ||
-                 (c >= 0x80 && c <= 0x9f))
-            c = '.';
         buf[out++] = (char)c;
         if (c == '\n') lines++;
     }
@@ -207,13 +253,18 @@ int q27_tui_collapse_text(const char *text, size_t text_len, int max_lines,
                              "%s… (%zu more bytes)\n",
                              (out && buf[out - 1] != '\n') ? "\n" : "",
                              rem);
-        if (extra < 0) return -1;
-        if ((size_t)extra >= buf_len - out) return -1;
-        out += (size_t)extra;
+        if (extra < 0 || (size_t)extra >= buf_len - out) {
+            result = -1;
+        } else {
+            out += (size_t)extra;
+            result = (int)out;
+        }
     } else {
         buf[out] = '\0';
+        result = (int)out;
     }
-    return (int)out;
+    free(clean);
+    return result;
 }
 
 void q27_tui_sanitize_display(const char *in, char *out, size_t out_len) {

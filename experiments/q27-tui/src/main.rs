@@ -296,14 +296,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     KeyBind::Quit => {
                         let _ = backend.quit();
-                        // Give the agent a moment to emit bye; then leave.
-                        let until = Instant::now() + Duration::from_millis(800);
-                        while Instant::now() < until {
+                        // Wait for the agent to drain (settle the turn, save
+                        // the session, run queued prompts) and emit bye — an
+                        // 800 ms budget force-killed mid-work (r13 codex P1).
+                        // The hard cap only guards a wedged child.
+                        const QUIT_DRAIN_CAP: Duration = Duration::from_secs(300);
+                        let start = Instant::now();
+                        while start.elapsed() < QUIT_DRAIN_CAP {
+                            model_state.status_line =
+                                "waiting for backend to finish…".into();
+                            let _ = terminal.draw(|f| {
+                                let _ =
+                                    ui::draw(f, &model_state, &input, scroll, session_start);
+                            });
                             match backend.try_recv() {
                                 Ok(BackendEvent::Server(ev)) => model_state.apply(&ev),
                                 Ok(BackendEvent::Exited(_)) => break,
                                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                    std::thread::sleep(Duration::from_millis(20));
+                                    std::thread::sleep(Duration::from_millis(50));
                                 }
                                 _ => break,
                             }

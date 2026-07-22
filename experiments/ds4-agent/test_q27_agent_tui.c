@@ -95,6 +95,35 @@ int main(void) {
     CHECK((unsigned char)clean[0] != 0x9b);
     CHECK(strchr(clean, 'p') != NULL);
 
+    /* Code-point sanitization (r13 codex P2): valid multibyte survives —
+     * U+0100 (C4 80) must NOT be corrupted by the old byte-wise C1 rule —
+     * while ESC, raw C1 bytes, and malformed sequences become '.'. */
+    {
+        const unsigned char mixed[] = {
+            'A', 0xC4, 0x80,        /* U+0100 — valid, keep */
+            0x1B,                   /* ESC — control, '.' */
+            0xC2, 0x85,             /* U+0085 (NEL) — C1 code point, '.' */
+            (unsigned char)0xFF,    /* invalid lead, '.' */
+            'z', 0
+        };
+        char sout[32];
+        const size_t sn = q27_tui_sanitize_bytes(mixed, sizeof(mixed) - 1,
+                                                 sout, sizeof(sout));
+        CHECK(sn > 0);
+        CHECK((unsigned char)sout[0] == 'A');
+        CHECK((unsigned char)sout[1] == 0xC4 &&
+              (unsigned char)sout[2] == 0x80);
+        CHECK(sout[3] == '.' && sout[4] == '.' && sout[5] == '.');
+        CHECK(sout[6] == 'z');
+        /* Collapse inherits the code-point rule. */
+        int cn = q27_tui_collapse_text((const char *)mixed,
+                                       sizeof(mixed) - 1, 4, 64, buf,
+                                       sizeof(buf));
+        CHECK(cn > 0);
+        CHECK(memchr(buf, 0xC4, (size_t)cn) != NULL);
+        CHECK(memchr(buf, 0x1B, (size_t)cn) == NULL);
+    }
+
     q27_tui_prompt_queue q;
     q27_tui_prompt_queue_init(&q, 2);
     CHECK(q27_tui_prompt_queue_push(&q, "one", 3));

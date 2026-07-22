@@ -72,6 +72,8 @@ pub struct Model {
     /// Prompts sent but not yet accepted-visible (id, preview) — reconciled
     /// on rejection or first correlated turn event (r12 codex P2).
     pub pending_prompts: Vec<(String, String)>,
+    /// client_req_ids from the latest authoritative queue event (r13 P2).
+    pub last_queue_ids: Vec<String>,
     pub bye_reason: Option<String>,
     pub saw_hello: bool,
     /// When false, thinking spans render as a one-line summary.
@@ -104,6 +106,7 @@ impl Default for Model {
             status_line: String::new(),
             input_enabled: false,
             pending_prompts: Vec::new(),
+            last_queue_ids: Vec::new(),
             bye_reason: None,
             saw_hello: false,
             show_thinking: false,
@@ -179,6 +182,27 @@ impl Model {
                 }
                 self.status_line = "idle".into();
                 self.finish_assistant_if_any();
+                // Queue reconciliation (r13 codex P2): at idle, a pending
+                // prompt that is neither queued nor started was cleared
+                // without a rejection — name it instead of leaving a
+                // phantom user block.
+                if !self.pending_prompts.is_empty() {
+                    let mut i = 0;
+                    while i < self.pending_prompts.len() {
+                        let id = self.pending_prompts[i].0.clone();
+                        if self.last_queue_ids.iter().any(|q| q == &id) {
+                            i += 1;
+                        } else {
+                            let (_, preview) = self.pending_prompts.remove(i);
+                            self.scrollback.push(Block::Notice {
+                                severity: "warning".into(),
+                                text: format!(
+                                    "queued prompt cleared: \u{201c}{preview}\u{201d}"
+                                ),
+                            });
+                        }
+                    }
+                }
             }
             "prefill_progress" => {
                 self.phase = Phase::Prefill;
@@ -320,10 +344,11 @@ impl Model {
             }
             "rejected" => {
                 let code = ev.code.as_deref().unwrap_or("");
-                let text = ev
+                // Server-supplied strings are sanitized before render (r13 P2).
+                let text = sanitize_terminal_text(&ev
                     .payload_text()
                     .or_else(|| ev.text.clone())
-                    .unwrap_or_default();
+                    .unwrap_or_default());
                 let msg = if code.is_empty() {
                     text
                 } else {
@@ -353,10 +378,10 @@ impl Model {
             }
             "notice" => {
                 let sev = ev.severity.clone().unwrap_or_else(|| "info".into());
-                let text = ev
+                let text = sanitize_terminal_text(&ev
                     .payload_text()
                     .or_else(|| ev.text.clone())
-                    .unwrap_or_default();
+                    .unwrap_or_default());
                 self.scrollback.push(Block::Notice {
                     severity: sev,
                     text,
@@ -369,10 +394,10 @@ impl Model {
                 }
             }
             "error" | "generation_stalled" => {
-                let text = ev
+                let text = sanitize_terminal_text(&ev
                     .payload_text()
                     .or_else(|| ev.text.clone())
-                    .unwrap_or_else(|| ev.type_name.clone());
+                    .unwrap_or_else(|| ev.type_name.clone()));
                 self.phase = Phase::Error;
                 self.last_error = Some(text.clone());
                 self.scrollback.push(Block::Notice {
@@ -397,7 +422,7 @@ impl Model {
                         let sev = if st == "ok" { "info" } else { "error" };
                         self.scrollback.push(Block::Notice {
                             severity: sev.into(),
-                            text: format!("{act}: {t}"),
+                            text: format!("{act}: {}", sanitize_terminal_text(&t)),
                         });
                     }
                 }
@@ -424,6 +449,14 @@ impl Model {
             "queue" => {
                 if let Some(q) = ev.queue_len {
                     self.queue_len = q;
+                }
+                // Authoritative queued-id snapshot for idle reconciliation
+                // (r13 codex P2).
+                if let Some(items) = &ev.items {
+                    self.last_queue_ids = items
+                        .iter()
+                        .filter_map(|i| i.client_req_id.clone())
+                        .collect();
                 }
                 self.status_line = format!("queue {}", self.queue_len);
                 if self.has_queue_feature() && self.phase != Phase::Stopped {

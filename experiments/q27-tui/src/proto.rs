@@ -93,13 +93,17 @@ pub struct ServerEvent {
     pub items: Option<Vec<HistoryItem>>,
 }
 
-/// One replayed transcript message in a `history` event (r11 codex P2).
+/// One replayed/queued item in a `history` or `queue` event (r11/r13).
 #[derive(Debug, Clone, Deserialize)]
 pub struct HistoryItem {
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub client_req_id: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
 }
 
 impl ServerEvent {

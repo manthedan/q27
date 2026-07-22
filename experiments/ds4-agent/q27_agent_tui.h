@@ -73,6 +73,14 @@ int q27_tui_format_tool_card_close(int exit_code, uint32_t output_bytes,
 int q27_tui_collapse_text(const char *text, size_t text_len, int max_lines,
                           int max_chars, char *buf, size_t buf_len);
 
+/* Code-point-aware terminal sanitization (r13 codex P2): C0 except \n,
+ * DEL, C1 code points, and malformed UTF-8 bytes become '.', \t becomes
+ * ' ', valid multibyte sequences pass through. Replaces the byte-wise
+ * 0x80-0x9F rule that corrupted UTF-8 continuation bytes. Returns the
+ * output length; always NUL-terminates when out_cap > 0. */
+size_t q27_tui_sanitize_bytes(const unsigned char *in, size_t in_len,
+                              char *out, size_t out_cap);
+
 /* Sanitize text for terminal chrome (tool cards / status). Strips ESC and
  * other C0 controls so model- or filesystem-controlled strings cannot inject
  * terminal sequences. Always NUL-terminates when out_len > 0. */

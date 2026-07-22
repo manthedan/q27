@@ -905,22 +905,15 @@ static int run_tool(q27_agent_worker *worker,
                         out_len = (size_t)cn;
                     }
                 } else if (event.data_len) {
-                    /* Small chunks were the hole: sanitize controls with the
-                     * collapse path's exact byte rules before the terminal
-                     * (r12 codex P2). Heap — output can be large. */
-                    clean = malloc(event.data_len);
+                    /* Small chunks were the hole: sanitize controls before
+                     * the terminal (r12/r13 codex P2 — code-point aware so
+                     * valid UTF-8 survives). Heap — output can be large. */
+                    clean = malloc(event.data_len + 1);
                     if (clean) {
-                        for (size_t bi = 0; bi < event.data_len; ++bi) {
-                            unsigned char c = event.data[bi];
-                            if (c == '\t')
-                                c = ' ';
-                            else if (c == '\0' || (c < 0x20 && c != '\n') ||
-                                     c == 0x7f || (c >= 0x80 && c <= 0x9f))
-                                c = '.';
-                            clean[bi] = c;
-                        }
+                        out_len = q27_tui_sanitize_bytes(
+                            event.data, event.data_len, (char *)clean,
+                            event.data_len + 1);
                         out_ptr = clean;
-                        out_len = event.data_len;
                     }
                 }
                 if (!tui_write_out(out_ptr, out_len))
