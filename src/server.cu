@@ -141,7 +141,12 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
-        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) {
+            ++i; // "auto" -> -1 (VRAM auto-size). atoi("auto") is 0, which would
+                 // SILENTLY start a ctx-0 server (issue #6); the docs advertise
+                 // --ctx auto, so honor it. (Omitting --ctx also auto-sizes.)
+            ctx = strcmp(argv[i], "auto") == 0 ? -1 : atoi(argv[i]);
+        }
         else if (!strcmp(argv[i], "--slots") && i + 1 < argc) n_slots = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) slot1_ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fast-head")) fast_flag = 1;
@@ -373,7 +378,14 @@ int main(int argc, char** argv) {
                                         (sampled_on ? 0.0 : kEngSampSave);
             long budget, c;
             if (n_slots <= 1) {
-                const double slack = 0.25e9;
+                // sm_86/89 carry a fatter, ctx-scaled graph zoo + a larger
+                // cudaGraphInstantiate transient than the fixed calibration
+                // constant captures; the old 0.25 GB margin got eaten during
+                // graph build and OOMed on 24GB cards that size below the 262144
+                // cap (issue #6, NHClimber87: sized 184320 -> OOM). Give
+                // Ampere/Ada ~1 GB of real headroom; sm_120 (32GB, cap usually
+                // binds) keeps the tight margin.
+                const double slack = cc_arch >= 120 ? 0.25e9 : 1.0e9;
                 budget = (long)((double)free_b - single_fixed - slack);
                 c = budget > 0 ? (long)(budget / per_tok) : 0;
             } else {
@@ -393,7 +405,7 @@ int main(int argc, char** argv) {
                             fit, n_slots, free_b / 1e9, per_slot / 1e9, fit);
                     n_slots = fit;
                 }
-                const double slack = 0.25e9 * n_slots;
+                const double slack = (cc_arch >= 120 ? 0.25e9 : 1.0e9) * n_slots; // arch margin (issue #6), per slot
                 budget = (long)((double)free_b - n_slots * per_slot - slack);
                 c = budget > 0 ? (long)(budget / (per_tok * n_slots)) : 0;
             }
@@ -1068,12 +1080,11 @@ int main(int argc, char** argv) {
                 }
                 msgs.push_back({role, content});
             }
-            // enable_thinking=false: top-level (Qwen-style clients) or nested
-            // chat_template_kwargs (llama.cpp/GLM-style) -> empty-think prefill
-            bool think = body.value("enable_thinking", true);
-            if (body.contains("chat_template_kwargs"))
-                think = body["chat_template_kwargs"].value("enable_thinking", think);
-            if (no_think_srv) think = false;
+            // Per-request thinking: the server profile is the default, an
+            // explicit enable_thinking / chat_template_kwargs / Anthropic
+            // thinking field overrides it either way (resolve_think in
+            // api_common.h). Silent request on a no-think server -> no-think.
+            bool think = q27::resolve_think(body, !no_think_srv);
             return tok.apply_chat_template(msgs, think);
         }
         return tok.encode(body.value("prompt", std::string()));
@@ -1083,7 +1094,12 @@ int main(int argc, char** argv) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
-        int n_max = body.value("max_tokens", 256);
+        // Default when the client omits max_tokens: a generous floor, unified
+        // across all three API shapes. Clamped to the context window below, so a
+        // big default can't over-reserve; 8192 covers a real answer plus a short
+        // think trace. A long *thinking* request should still set max_tokens
+        // explicitly (a grad-level trace wants 16K+).
+        int n_max = body.value("max_tokens", 8192);
         bool stream = body.value("stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the
@@ -1121,14 +1137,16 @@ int main(int argc, char** argv) {
         auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt;
         int stable_len = -1; // -1 = legacy tail snapshot (build_prompt's fallback path)
+        bool thinking = false; // request wants a real <think> block; seeds the splitter below
         if (routed_chat) {
-            bool think = body.value("enable_thinking", true);
-            if (body.contains("chat_template_kwargs"))
-                think = body["chat_template_kwargs"].value("enable_thinking", think);
-            if (no_think_srv) think = false;
+            thinking = q27::resolve_think(body, !no_think_srv);
+            // thinking and a FORCED tool call are mutually exclusive: FORCED
+            // injects <tool_call>\n into the tail (below), leaving no room for a
+            // think block, so suppress the opener when a tool is forced.
+            if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
             size_t stable_off = 0;
             std::string rendered =
-                q27::chatml_prompt(q27::openai_msgs(body), tools, think, &stable_off);
+                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off);
             // FORCED tool_choice: inject the opener into the volatile tail
             // (past stable_off, alongside the assistant-open/think-prefill --
             // P8 prefix-cache reuse is unaffected). The stream router below
@@ -1286,6 +1304,11 @@ int main(int argc, char** argv) {
             // so the splitter must start already inside the TOOL channel or
             // the call body would be read back as ordinary text.
             if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
+            // thinking: the <think> opener was prompt-injected (not generated), so
+            // start the splitter INSIDE the THINK channel -- the model's first
+            // generated token is already inside the block, and its </think> flips
+            // back to text (same mechanism as the FORCED TOOL pre-seed above).
+            else if (thinking) sp.chan = StreamSplitter::THINK;
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             if (tc.enabled)
@@ -1442,6 +1465,7 @@ int main(int argc, char** argv) {
                 tc.begin(tool_names_v);
                 StreamSplitter sp;
                 if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
+                else if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 q27::Utf8Gate ugate;
                 bool alive = true; // cleared when a write fails (client disconnected)
                 int tool_idx = 0;
@@ -1580,7 +1604,8 @@ int main(int argc, char** argv) {
             return;
         }
         std::string rendered = q27::chatml_prompt(
-            q27::anthropic_msgs(body), q27::anthropic_tools_json(body), !no_think_srv);
+            q27::anthropic_msgs(body), q27::anthropic_tools_json(body),
+            q27::resolve_think(body, !no_think_srv));
         json out = {{"input_tokens", (long)tok.encode(rendered).size()}};
         res.set_content(jdump(out), "application/json");
     });
@@ -1589,7 +1614,7 @@ int main(int argc, char** argv) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
-        int n_max = body.value("max_tokens", 1024);
+        int n_max = body.value("max_tokens", 8192); // unified default (see /v1/chat/completions)
         bool stream = body.value("stream", false);
         json tools = q27::anthropic_tools_json(body);
         std::vector<std::string> tool_names_v;
@@ -1599,8 +1624,9 @@ int main(int argc, char** argv) {
                     tool_names_v.push_back(t["function"]["name"].get<std::string>());
         auto tk0 = std::chrono::steady_clock::now();
         size_t stable_off = 0;
+        bool thinking = q27::resolve_think(body, !no_think_srv);
         std::string rendered =
-            q27::chatml_prompt(q27::anthropic_msgs(body), tools, !no_think_srv, &stable_off);
+            q27::chatml_prompt(q27::anthropic_msgs(body), tools, thinking, &stable_off);
         auto tk1 = std::chrono::steady_clock::now();
         // P8: split-encode at the stable boundary. Both turns encode the
         // shared history with the same split (the boundary always abuts the
@@ -1655,6 +1681,7 @@ int main(int argc, char** argv) {
             eng.on_round_gap = make_yield(eng);
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             StreamSplitter sp;
+            if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
@@ -1794,6 +1821,7 @@ int main(int argc, char** argv) {
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});
 
                 StreamSplitter sp;
+                if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 std::string tool_buf, text_accum;
                 q27::Utf8Gate ugate;
                 int idx = -1;       // open think/text block index, -1 = none
@@ -2040,10 +2068,11 @@ int main(int argc, char** argv) {
                 merged.push_back(m);
         }
 
-        int n_max = body.value("max_output_tokens", 4096);
+        int n_max = body.value("max_output_tokens", 8192); // unified default (see /v1/chat/completions)
         auto tk0 = std::chrono::steady_clock::now();
+        bool thinking = q27::resolve_think(body, !no_think_srv);
         std::vector<int> prompt =
-            tok.encode(q27::chatml_prompt(merged, tools, !no_think_srv));
+            tok.encode(q27::chatml_prompt(merged, tools, thinking));
         ReqTrace rt{rid, "resp", conv_fp(body), std::chrono::steady_clock::now(),
                     ms_since(tk0)};
         // review follow-up 2026-07-09 #3: the bound includes the spec-round
@@ -2146,6 +2175,7 @@ int main(int argc, char** argv) {
             auto& flush_text = std::get<2>(item_cbs);
             auto& flush_tool = std::get<3>(item_cbs);
             StreamSplitter sp;
+            if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) {
                     if (!ctx->think.empty()) flush_think();
@@ -2326,6 +2356,7 @@ int main(int argc, char** argv) {
                         {"output_index", msg_index}, {"content_index", 0}, {"delta", t}});
                 };
                 StreamSplitter sp;
+                if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 q27::Utf8Gate ugate;
                 auto on_tok = [&](int id) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);

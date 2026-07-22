@@ -7941,3 +7941,105 @@ test_kernels/ninv/fused_smoke/tool-drift/stream-split/drift-corpus PASS, tri-arc
 LICENSE, sha256 13a89d62) + SHA256SUMS-0.3.5. Driver floor r580+ unchanged.
 Residual: bare-call JSON still streams as text before post-hoc recovery (only
 wrapper tags stripped); un-fenced inline-prose calls still recover (rarer).
+
+## 2026-07-20 -- per-request thinking opt-in (all three API shapes)
+
+Thinking is now a per-request choice, not only a boot flag. The server profile
+sets the DEFAULT (no-think for CC, on for `--think`/ref); an explicit request
+field overrides it either direction. `resolve_think` (api_common.h) reads all
+three client conventions -- `enable_thinking:<bool>` (OpenAI/Qwen top-level),
+`chat_template_kwargs.enable_thinking` (llama.cpp/GLM), `thinking:{type:...}`
+(Anthropic, Claude Code's toggle) -- wired into every prompt-build site (both
+OpenAI, both Anthropic, Responses). Malformed fields are ignored, not thrown
+(Security #1).
+
+Mechanism: this checkpoint (q4s AND vanilla qwen36-27b-mtp) reasons INLINE and
+never opens `<think>` on its own, but given a prefilled OPEN `<think>` tag it
+fills a trace and closes with `</think>` (verified via raw /v1/completions). So
+`chatml_prompt`'s think=true branch now prefills `<think>\n` (mirror of
+think=false's empty `<think></think>`), and the generation paths pre-seed the
+StreamSplitter into the THINK channel (same trick as FORCED tool_choice's TOOL
+pre-seed) so the model's first generated token -- already inside the block --
+routes to `reasoning_content` (OpenAI) / a `thinking` block (Anthropic), and its
+`</think>` flips back to text for the answer. Both prefills sit in the volatile
+tail past `stable_off`, so P8 prefix reuse is untouched. FORCED tool_choice
+suppresses thinking (can't be inside a think block AND a forced `<tool_call>`).
+`apply_chat_template` (the legacy build_prompt fallback, not a real chat path)
+left unchanged, so test_tokenizer stays green.
+
+Verified live on the 5090 (default no-think server): `enable_thinking:true` ->
+reasoning_content 2147ch + answer (finish=stop); `thinking:{type:"enabled"}` ->
+a 2147ch thinking block + answer; silent request unchanged (inline reasoning,
+default preserved); no `<think>`/`</think>` leak into the answer on any path.
+Caveat: a thinking request needs enough `max_tokens` for BOTH the trace and the
+answer -- a tight budget is spent entirely on reasoning (empty content,
+finish=length). Tests: tools/test_think_resolve.cpp (16 cases) + 2 pre-seeded-
+THINK cases in test_stream_split.cpp (now 9). Server-only; canonicals (CLI path)
+unaffected by construction.
+
+## 2026-07-20 -- unified default max_tokens 8192 (was 256/1024/4096)
+
+The three API shapes defaulted max_tokens inconsistently and too low when a
+client omits it: /v1/chat/completions **256**, /v1/messages 1024, /v1/responses
+4096. 256 truncates even simple inline reasoning (~300 tokens) and mangles any
+thinking response (the trace alone blows the budget). Unified all three to
+**8192** -- a generous floor, clamped to the context window by the existing
+prompt.size()+n_max bound (server.cu:1176/1215), so a big default can't
+over-reserve a slot's budget or reject a prompt. Clients that set max_tokens
+(Claude Code always does -- Anthropic requires it) are unaffected; this fixes
+the omit-max_tokens case (curl, Kilo, OpenAI-compatible clients that leave it
+off). A long *thinking* request should still set max_tokens explicitly -- 8192
+is a floor, not enough for a grad-level trace (those want 16K+).
+
+## 2026-07-21 -- --ctx auto fixes + arch-aware safety margin (issue #6)
+
+Two auto-ctx bugs from a 3090 field report (issue #6, NHClimber87 -- otherwise
+glowing: flat depth curve, turbo3 12/12 needles @124K, temp-invariant spec,
+defaults-optimal, mode-12 drift recovery in live CC, all independently
+reproduced).
+
+(1) `--ctx auto` (the literal string, which the docs advertise) parsed via
+`atoi("auto")` = 0, which fails the `if (ctx < 0)` auto-size gate and SILENTLY
+starts a ctx-0 server (unusable). Auto-sizing only ever fired when `--ctx` was
+OMITTED (default -1). Fixed the parse to map "auto" -> -1.
+
+(2) Auto-sizing over-fills on 24GB cards. The single-slot `slack` was a flat
+0.25 GB, but the true non-KV stack (measured on our 3090: 4.175 GB at 262144,
+vs the 4.07 GB estimate) plus the transient `cudaGraphInstantiate` peak eats
+more than that. On cards that size BELOW the 262144 cap (the reporter's:
+184320 picked, then OOM at engine.cuh graph build) the thin margin is fatal;
+our card only survived because the 262144 cap accidentally left 0.80 GB.
+Fix: arch-scale the slack -- **sm_86/89 get 1.0 GB**, sm_120 (32GB, cap
+usually binds) keeps 0.25 GB. Same for the multi-slot slack. Verified on the
+3090: `--ctx auto` now sizes 253952 (was the 0.80 GB knife-edge at 262144)
+with 0.87 GB free at ready and serves cleanly; a tighter card (the reporter's
+~7 GB free) now lands ~135K instead of OOMing at 184320.
+
+P2 from the same report -- "102 t/s reads ~60 on a 3090" -- is a power
+artifact: our 3090 at full 420W does **126-150 t/s** decode on short code-gen
+(server `[gen-done]`: 149.8/147.5/130.6/126.0/128.0, median ~130); the
+reporter's card was 200W-capped, which roughly halves decode. README now
+states the full-power number + the power sensitivity.
+
+## 2026-07-21 -- v0.4.0 RELEASED (tag @ c244a73)
+
+github.com/signalnine/q27/releases/tag/v0.4.0. Two features + a behavior change
++ a 24GB fix since v0.3.5; NO kernel changes (decode/prefill bitwise EXACT).
+(1) opt-in API-key auth (PR #5, @chaudhryfaisal): --api-key / --api-key-file /
+Q27_API_KEY, x-api-key + Bearer, constant-time compare, /health exempt,
+pre-routing so a bad key never hits slot/token work. (2) per-request thinking
+across all 3 API shapes (resolve_think: top-level enable_thinking /
+chat_template_kwargs / Anthropic thinking:{type}); server profile = default,
+request overrides; <think>-opener prefill + generation-path StreamSplitter
+THINK-seed -> reasoning_content (OpenAI) / thinking block (Anthropic). (3)
+max_tokens default unified 256/1024/4096 -> 8192 (clamped to ctx). (4) --ctx
+auto fixes (issue #6, NHClimber87): atoi("auto")=0 silent-ctx-0 bug + arch-aware
+slack (1.0 GB sm_86/89, 0.25 sm_120) so 24GB auto-ctx leaves graph-zoo headroom
+instead of OOMing at cudaGraphInstantiate. GATES green at tag: canonical
+a2982c51 (vanilla) + f64e7c02 (q4s greedy) + sampled 900031e9 (q4s seed-42,
+-n64 t0.7 p0.95) EXACT; test_kernels / ninv / fused_smoke / tokenizer /
+toolconstrain / tool-drift / stream-split / drift-corpus / think-resolve / auth
+/ auth-integration PASS; tri-arch (sm_86/89/120) cuobjdump-confirmed on all 4
+binaries. Assets: tarball (4 binaries + MIT LICENSE, sha256 def23b70) +
+SHA256SUMS-0.4.0. Driver floor r580+ unchanged. Field-validated same day: 3090
+full-power decode 126-150 t/s (issue #6 P2, a power-cap not an engine limit).
