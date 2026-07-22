@@ -1327,9 +1327,13 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
             }
 
             // Whole-file tools may drop one unambiguous outer source fence
-            // when the language label matches the path extension. Edit
-            // replacements stay byte-exact (fences may be intentional content).
-            if ((call.request.kind == Q27_TOOL_WRITE ||
+            // when the language label matches the path extension — but ONLY
+            // for a minimal 3-tick transport: a longer transport fence means
+            // the model deliberately fenced around inner content (CommonMark),
+            // so a first-line fence is content, not a legacy double-wrap
+            // (codex branch-review P2). Edit replacements stay byte-exact.
+            if (call.body_fence_ticks <= 3 &&
+                (call.request.kind == Q27_TOOL_WRITE ||
                  call.request.kind == Q27_TOOL_OVERWRITE) &&
                 call.input && call.request.input_len) {
                 size_t body_len = call.request.input_len;

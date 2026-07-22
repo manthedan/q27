@@ -35,6 +35,12 @@ typedef struct {
     int missing_body;
     // Optional owned message for missing/unusable body (free with tool_call_free).
     char *body_error;
+    // Tick count of the transport fence that carried the body (0 = none).
+    // The legacy double-wrap repair (unwrap) may only run for a minimal
+    // 3-tick transport: a longer fence means the model deliberately fenced
+    // AROUND inner content (CommonMark), so a first-line fence is content
+    // and must survive (codex branch-review P2).
+    int body_fence_ticks;
 } q27_agent_tool_call;
 
 // Returns the fixed registry and instructions inserted into the system message
@@ -99,7 +105,7 @@ int q27_agent_unwrap_whole_file_source_fence(
 int q27_agent_extract_fenced_body(const unsigned char *bytes, size_t len,
                                   unsigned char **out, size_t *out_len,
                                   char *error, size_t error_cap,
-                                  int eos_reached);
+                                  int eos_reached, int *transport_ticks);
 
 #ifdef __cplusplus
 }

@@ -152,6 +152,51 @@ int main() {
           "longer outer fence preserves inner fence lines byte-exactly");
     q27_agent_tool_call_free(&call);
 
+    // Tick plumbing: the cycle's legacy double-wrap unwrap may only run for a
+    // minimal 3-tick transport; a longer fence marks inner fences as content
+    // (codex branch-review P2). Extract always preserves the body either way.
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "```python\nprint(1)\n```\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body && call.body_fence_ticks == 3,
+          "minimal transport reports 3 ticks (unwrap eligible)");
+    q27_agent_tool_call_free(&call);
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.py\"}}</tool_call>\n"
+                "````python\n```python\nprint(1)\n```\n````\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body && call.body_fence_ticks == 4 &&
+          std::string(reinterpret_cast<const char *>(call.request.input),
+                      call.request.input_len) == "```python\nprint(1)\n```\n",
+          "longer transport reports 4 ticks and keeps the inner wrapper");
+    q27_agent_tool_call_free(&call);
+
+    // Bare tool-call JSON as a body fails closed (re-emitted call as
+    // content); ordinary JSON like package.json stays legal (branch-review P2).
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.json\"}}</tool_call>\n"
+                "```json\n"
+                "{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n"
+                "```\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.missing_body == 1 && call.body_error &&
+          std::string(call.body_error).find("tool call") != std::string::npos,
+          "bare tool-call JSON body fails closed");
+    q27_agent_tool_call_free(&call);
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"package.json\"}}</tool_call>\n"
+                "```json\n"
+                "{\"name\":\"my-package\",\"version\":\"1.0.0\"}\n"
+                "```\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body &&
+          std::string(reinterpret_cast<const char *>(call.request.input),
+                      call.request.input_len) ==
+              "{\"name\":\"my-package\",\"version\":\"1.0.0\"}\n",
+          "package.json body stays legal");
+    q27_agent_tool_call_free(&call);
+
     // Second tool call after an unclosed fence must not land as file content.
     CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
                 "\"path\":\"x.py\"}}</tool_call>\n"

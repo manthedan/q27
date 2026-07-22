@@ -292,6 +292,31 @@ extern "C" int q27_agent_payload_rejected(const unsigned char *bytes, size_t len
                   "markdown fence after </tool_call>, not another tool call");
         return 1;
     }
+    // Bare tool-call JSON poisons just like the XML wrapper: a body that IS
+    // a tool-shaped object (registered "name" + object "arguments") means
+    // the model re-emitted the call as content (codex branch-review P2).
+    // Ordinary JSON stays legal — package.json has "name" but no "arguments".
+    if (bytes[i] == '{') {
+        const json candidate =
+            json::parse(bytes + i, bytes + len, nullptr, false);
+        if (!candidate.is_discarded() && candidate.is_object()) {
+            const auto name_it = candidate.find("name");
+            const auto args_it = candidate.find("arguments");
+            if (name_it != candidate.end() && name_it->is_string() &&
+                args_it != candidate.end() && args_it->is_object()) {
+                const std::string name = name_it->get<std::string>();
+                for (size_t t = 0; t < kToolNameCount; ++t) {
+                    if (name == kToolNames[t]) {
+                        set_error(error, error_cap,
+                                  "payload looks like a tool call; emit file "
+                                  "bytes in a markdown fence after "
+                                  "</tool_call>, not another tool call");
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
     // Reject pure-whitespace bodies that are not empty after trim when the
     // only non-ws content is more fencing without a closer — handled by
     // extract. Here reject control-character-only junk beyond common text.
@@ -330,7 +355,8 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
                                              size_t len, unsigned char **out,
                                              size_t *out_len, char *error,
                                              size_t error_cap,
-                                             int eos_reached) {
+                                             int eos_reached,
+                                             int *transport_ticks) {
     if (out) *out = nullptr;
     if (out_len) *out_len = 0;
     if (!bytes || !out || !out_len) {
@@ -351,6 +377,7 @@ extern "C" int q27_agent_extract_fenced_body(const unsigned char *bytes,
                   "body tools require a markdown-fenced body after </tool_call>");
         return 0;
     }
+    if (transport_ticks) *transport_ticks = (int)open_ticks;
     size_t opening_end = i + open_ticks;
     while (opening_end < len && bytes[opening_end] != '\n' &&
            bytes[opening_end] != '\r') {
@@ -795,6 +822,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         }
 
         int missing_body = 0;
+        int fence_ticks = 0;
         char *body_error = nullptr;
         if (expects_body) {
             const unsigned char *tail =
@@ -815,7 +843,8 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                     "</tool_call>; do not emit another tool call");
             } else if (!q27_agent_extract_fenced_body(tail, tail_len, &body,
                                                       &body_len, error,
-                                                      error_cap, eos_reached)) {
+                                                      error_cap, eos_reached,
+                                                      &fence_ticks)) {
                 missing_body = 1;
                 body_error = dup_error_message(
                     (error && error_cap && error[0]) ? error :
@@ -866,6 +895,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         call->selection = reinterpret_cast<char *>(selection);
         call->missing_body = missing_body;
         call->body_error = body_error;
+        call->body_fence_ticks = missing_body ? 0 : fence_ticks;
         path = input = replacement = selection = nullptr;
         return Q27_TOOL_CALL_VALID;
     } catch (const std::bad_alloc&) {
