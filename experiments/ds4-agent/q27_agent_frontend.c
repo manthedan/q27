@@ -828,6 +828,7 @@ static int json_structure_valid(const char *line, size_t len) {
     const char *p = line;
     const char *end = line + len;
     int depth = 0;
+    char stack[128];   /* bracket types must match, not just balance (r7 P2) */
     while (p < end) {
         const char c = *p;
         if (c == '"') {
@@ -842,9 +843,13 @@ static int json_structure_valid(const char *line, size_t len) {
             continue;
         }
         if (c == '{' || c == '[') {
-            ++depth;
+            if (depth >= (int)sizeof(stack)) return 0;
+            stack[depth++] = c;
         } else if (c == '}' || c == ']') {
-            if (--depth < 0) return 0;
+            if (depth == 0) return 0;
+            const char open = stack[--depth];
+            if ((c == '}' && open != '{') || (c == ']' && open != '['))
+                return 0;
             if (depth == 0) {
                 ++p;
                 while (p < end && (*p == ' ' || *p == '\t')) ++p;
@@ -1109,6 +1114,13 @@ static int ctl_push_locked(const q27_fp1_op *op) {
     g_ctl.len++;
     pthread_cond_broadcast(&g_ctl.cv);
     return 1;
+}
+
+int q27_fp1_control_pending(void) {
+    pthread_mutex_lock(&g_ctl.mu);
+    const int pending = g_ctl.len > 0;
+    pthread_mutex_unlock(&g_ctl.mu);
+    return pending;
 }
 
 static void ctl_note_drop_locked(const q27_fp1_op *op, const char *code) {

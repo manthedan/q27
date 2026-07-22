@@ -712,7 +712,8 @@ static uint64_t g_fp1_turn_terminals = 0;
 
 static int print_json_event(const q27_agent_event *event) {
     if (event->type == Q27_EVENT_TURN_DONE ||
-        event->type == Q27_EVENT_STALLED || event->type == Q27_EVENT_ERROR)
+        event->type == Q27_EVENT_STALLED || event->type == Q27_EVENT_ERROR ||
+        event->type == Q27_EVENT_REJECTED)
         ++g_fp1_turn_terminals;
     return q27_fp1_print_event(stdout, event, q27_fp1_protocol(),
                                g_fp1_active_req_id);
@@ -2354,7 +2355,14 @@ int main(int argc, char **argv) {
             ok = 0;
         }
         while (ok) {
-            if (interrupted || q27_fp1_control_quit_requested()) break;
+            /* Quit only when nothing remains to process: parsed control ops
+             * and queued prompts drain first — the documented
+             * prompt-then-quit pipe must not discard the prompt (r7 P1). */
+            if (interrupted) break;
+            if (q27_fp1_control_quit_requested() &&
+                !q27_fp1_control_pending() &&
+                q27_fp1_prompt_queue_len() == 0)
+                break;
 
             q27_fp1_set_session_report(
                 session_path, current_snapshot_name, context, last_ctx_used,
@@ -2873,7 +2881,10 @@ int main(int argc, char **argv) {
             }
             if (ok)
                 (void)emit_fp1_idle(worker, last_ctx_used, context, UINT32_MAX);
-            if (q27_fp1_control_quit_requested()) break;
+            if (q27_fp1_control_quit_requested() &&
+                !q27_fp1_control_pending() &&
+                q27_fp1_prompt_queue_len() == 0)
+                break;
         }
         if (q27_fp1_control_quit_requested()) {
             fp1_bye_reason = q27_fp1_control_quit_reason();

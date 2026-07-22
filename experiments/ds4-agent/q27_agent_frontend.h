@@ -124,6 +124,10 @@ void q27_fp1_control_clear_cancel(void);
 
 /* 1 if quit/EOF was requested. reason is "quit" or "stdin_eof". */
 int q27_fp1_control_quit_requested(void);
+
+/* 1 when parsed-but-undispatched control ops remain (quit must not skip
+ * them — r7 codex P1). */
+int q27_fp1_control_pending(void);
 const char *q27_fp1_control_quit_reason(void);
 
 /* Block until a non-flag op is available, or quit. Returns 1 with *out filled
