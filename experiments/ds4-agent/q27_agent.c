@@ -2418,8 +2418,7 @@ int main(int argc, char **argv) {
                     view[i].content = chat.items[i].content;
                     view[i].content_len = chat.items[i].content_len;
                 }
-                const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
-                if (!q27_fp1_emit_history(stdout, seq, view, chat.len)) {
+                if (!q27_fp1_emit_history(stdout, worker, view, chat.len)) {
                     tui_diagf( "q27-agent: failed to emit FP1 history\n");
                     ok = 0;
                 }

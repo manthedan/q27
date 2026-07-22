@@ -427,16 +427,13 @@ int q27_fp1_emit_idle(FILE *out, uint64_t seq, uint32_t ctx_used,
     return ok;
 }
 
-int q27_fp1_emit_history(FILE *out, uint64_t seq,
+int q27_fp1_emit_history(FILE *out, q27_agent_worker *worker,
                          const q27_agent_message *messages, size_t count) {
-    if (!out) return 0;
-    const uint64_t ts = q27_fp1_now_ms();
-    int ok = fprintf(out,
-        "{\"v\":1,\"seq\":%llu,\"type\":\"history\",\"ts_ms\":%llu,"
-        "\"command_id\":0,\"client_req_id\":null,"
-        "\"state\":\"idle\",\"status\":\"ok\",\"code\":null,\"items\":[",
-        (unsigned long long)seq, (unsigned long long)ts) >= 0;
-    size_t shown = 0;
+    if (!out || !worker) return 0;
+    const size_t CAP = 768 * 1024;   /* frame budget under the 1 MiB line cap */
+    size_t frame_bytes = 0;
+    int frame_open = 0;
+    int ok = 1;
     for (size_t i = 0; ok && messages && i < count; ++i) {
         const q27_agent_message *m = &messages[i];
         if (!m->role ||
@@ -463,14 +460,42 @@ int q27_fp1_emit_history(FILE *out, uint64_t seq,
         char *esc = q27_fp1_json_escape((const unsigned char *)m->content,
                                         len);
         if (!esc) { ok = 0; break; }
-        if (shown) ok = fputc(',', out) != EOF;
-        if (ok)
-            ok = fprintf(out, "{\"role\":\"%s\",\"text\":\"%s\"}",
-                         m->role, esc) >= 0;
+        const size_t item_bytes = strlen(esc) + strlen(m->role) + 24;
+        if (frame_open && frame_bytes + item_bytes > CAP) {
+            ok = fprintf(out, "],\"more\":true}\n") >= 0;
+            frame_open = 0;
+        }
+        if (ok && !frame_open) {
+            const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
+            const uint64_t ts = q27_fp1_now_ms();
+            ok = fprintf(out,
+                "{\"v\":1,\"seq\":%llu,\"type\":\"history\",\"ts_ms\":%llu,"
+                "\"command_id\":0,\"client_req_id\":null,"
+                "\"state\":\"idle\",\"status\":\"ok\",\"code\":null,\"items\":[",
+                (unsigned long long)seq, (unsigned long long)ts) >= 0;
+            frame_bytes = 160;
+            frame_open = 1;
+        }
+        if (ok) {
+            if (frame_bytes > 160) ok = fputc(',', out) != EOF;
+            if (ok)
+                ok = fprintf(out, "{\"role\":\"%s\",\"text\":\"%s\"}",
+                             m->role, esc) >= 0;
+            frame_bytes += item_bytes + 1;
+        }
         free(esc);
-        ++shown;
     }
-    if (ok) ok = fprintf(out, "]}\n") >= 0;
+    if (ok && !frame_open) {
+        const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
+        const uint64_t ts = q27_fp1_now_ms();
+        ok = fprintf(out,
+            "{\"v\":1,\"seq\":%llu,\"type\":\"history\",\"ts_ms\":%llu,"
+            "\"command_id\":0,\"client_req_id\":null,"
+            "\"state\":\"idle\",\"status\":\"ok\",\"code\":null,\"items\":[],\"more\":false}\n",
+            (unsigned long long)seq, (unsigned long long)ts) >= 0;
+    } else if (ok) {
+        ok = fprintf(out, "],\"more\":false}\n") >= 0;
+    }
     if (ok) ok = fflush(out) != EOF;
     return ok;
 }

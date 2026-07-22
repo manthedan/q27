@@ -45,8 +45,10 @@ int q27_fp1_emit_idle(FILE *out, uint64_t seq, uint32_t ctx_used,
 
 /* One-shot transcript replay for restored sessions (r11 codex P2): user and
  * assistant messages only, each text capped at 4000 bytes on a UTF-8
- * boundary. Emitted after hello+load, before the idle readiness event. */
-int q27_fp1_emit_history(FILE *out, uint64_t seq,
+ * boundary. Frames are chunked to 768 KiB with "more" continuation (r19
+ * codex P2 — one unbounded NDJSON line could exceed the 1 MiB cap).
+ * Emitted after hello+load, before the idle readiness event. */
+int q27_fp1_emit_history(FILE *out, q27_agent_worker *worker,
                          const q27_agent_message *messages, size_t count);
 
 int q27_fp1_emit_bye(FILE *out, uint64_t seq, const char *reason);

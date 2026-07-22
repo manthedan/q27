@@ -10,14 +10,20 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 UNAME_S   := $(shell uname -s)
 
-.PHONY: all clean test-cpu test-metal agent install-dev-q27
+.PHONY: all clean test-cpu test-metal agent tui agent-tui install-dev-q27
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
 
 # Friendly source-checkout entry point. The supervisor resolves the local B1
 # artifact/tokenizer, enables bounded tools, and roots them at the caller's cwd.
 # Prefers Ratatui q27-tui (FP1) when built and stdin/stdout are TTYs.
-agent: build/q27-agent build/q27-tui
+# The Rust TUI is OPTIONAL (r19 codex P2): `make agent` keeps the classic
+# path working on checkouts without Cargo; `make agent-tui` builds both.
+agent: build/q27-agent
 	Q27_BIN_DIR="$(CURDIR)/build" ./packaging/bin/q27 agent
+
+tui: build/q27-tui
+
+agent-tui: agent tui
 
 # Put this checkout's packaging/bin/q27 first on PATH via ~/.grok/bin (already
 # first in many Grok/dev shells). After this, `q27 agent b1` uses source TUI.

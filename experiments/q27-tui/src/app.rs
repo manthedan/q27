@@ -119,24 +119,30 @@ impl Default for Model {
 impl Model {
     pub fn apply(&mut self, ev: &ServerEvent) {
         if let Some(s) = ev.state.as_deref() {
-            self.phase = match s {
-                "starting" => Phase::Starting,
-                "idle" => Phase::Idle,
-                "generating" => {
-                    if self.phase == Phase::Tool {
-                        Phase::Tool
-                    } else {
-                        Phase::Generating
-                    }
-                }
-                "tool_running" => Phase::Tool,
-                "compacting" => Phase::Compacting,
-                "error" => Phase::Error,
-                "stopped" => Phase::Stopped,
-                "session_io" => Phase::Idle,
-                "stopping" => Phase::Stopped,
-                _ => self.phase,
+            // Envelope state="idle" means the WORKER is free for the next
+            // admitted command — control-plane readiness is only the
+            // type:idle EVENT (r15/r19 codex P2). Tool handoffs must not
+            // flip the UI to idle (Esc/cancel would be lost mid-loop).
+            let mapped = match s {
+                "starting" => Some(Phase::Starting),
+                "idle" if ev.type_name == "idle" => Some(Phase::Idle),
+                "idle" => None,
+                "generating" => Some(if self.phase == Phase::Tool {
+                    Phase::Tool
+                } else {
+                    Phase::Generating
+                }),
+                "tool_running" => Some(Phase::Tool),
+                "compacting" => Some(Phase::Compacting),
+                "error" => Some(Phase::Error),
+                "stopped" => Some(Phase::Stopped),
+                "session_io" => None,
+                "stopping" => Some(Phase::Stopped),
+                _ => None,
             };
+            if let Some(p) = mapped {
+                self.phase = p;
+            }
         }
 
         // A prompt that produces any correlated turn event was accepted —
