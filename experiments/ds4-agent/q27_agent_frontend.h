@@ -43,6 +43,12 @@ int q27_fp1_emit_hello(FILE *out, uint64_t seq, const char *model_path,
 int q27_fp1_emit_idle(FILE *out, uint64_t seq, uint32_t ctx_used,
                       uint32_t ctx_size, uint32_t queue_len);
 
+/* One-shot transcript replay for restored sessions (r11 codex P2): user and
+ * assistant messages only, each text capped at 4000 bytes on a UTF-8
+ * boundary. Emitted after hello+load, before the idle readiness event. */
+int q27_fp1_emit_history(FILE *out, uint64_t seq,
+                         const q27_agent_message *messages, size_t count);
+
 int q27_fp1_emit_bye(FILE *out, uint64_t seq, const char *reason);
 
 /* Control-plane rejected (always has code). */

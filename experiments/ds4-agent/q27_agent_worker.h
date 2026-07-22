@@ -71,6 +71,9 @@ typedef struct {
     unsigned char tool_file_sha256[32];
     uint32_t tool_selection_count;
     q27_agent_tool_selection tool_selections[Q27_TOOL_MAX_SELECTIONS];
+    // q27_agent_session_action value for SESSION_DONE events (0 = none).
+    // FP1 requires the action on every session_done terminal (r11 codex P2).
+    int session_action;
 } q27_agent_event;
 
 q27_agent_worker *q27_agent_worker_start(const char *model_path,
@@ -166,6 +169,7 @@ int q27_agent_worker_selection_event(q27_agent_worker *worker,
 int q27_agent_worker_session_result_event(q27_agent_worker *worker,
                                           int success,
                                           const char *message,
+                                          int action,
                                           q27_agent_event *event);
 
 // Allocate a monotonic sequence for control-plane synthetic events

@@ -397,6 +397,7 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
                              int tool_call_complete, int eos_reached,
                              const q27_agent_tool_result *tool_result,
                              q27_agent_tool_kind tool_kind,
+                             int session_action,
                              const char *error) {
     q27_agent_event event = {
         .type = terminal_type,
@@ -416,6 +417,7 @@ static void publish_terminal(q27_agent_worker *worker, uint64_t command_id,
         .tool_has_file_sha256 = tool_result ? tool_result->has_file_sha256 : 0,
         .tool_file_size = tool_result ? tool_result->file_size : 0,
         .tool_selection_count = tool_result ? tool_result->selection_count : 0,
+        .session_action = session_action,
         .data = (unsigned char *)(error ? error : ""),
         .data_len = error ? strlen(error) : 0
     };
@@ -590,7 +592,9 @@ static void *worker_main(void *opaque) {
                          cached_tokens, prefill_tokens, output_tokens,
                          tool_call_complete, eos_reached,
                          kind == REQUEST_TOOL ? &tool_result : NULL,
-                         completed_tool_kind, error);
+                         completed_tool_kind,
+                         kind == REQUEST_SESSION ? (int)session_action : 0,
+                         error);
     }
 
     q27_agent_engine_close(engine);
@@ -959,6 +963,7 @@ int q27_agent_worker_selection_event(q27_agent_worker *worker,
 int q27_agent_worker_session_result_event(q27_agent_worker *worker,
                                           int success,
                                           const char *message,
+                                          int action,
                                           q27_agent_event *event) {
     if (!worker || !event) return 0;
     *event = (q27_agent_event){0};
@@ -976,6 +981,7 @@ int q27_agent_worker_session_result_event(q27_agent_worker *worker,
     event->type = Q27_EVENT_SESSION_DONE;
     event->state = success ? Q27_WORKER_IDLE : Q27_WORKER_ERROR;
     event->status = success ? Q27_AGENT_OK : Q27_AGENT_ERROR;
+    event->session_action = action;
     event->data = copy;
     event->data_len = len;
     pthread_mutex_unlock(&worker->mu);

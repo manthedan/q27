@@ -89,6 +89,17 @@ pub struct ServerEvent {
     pub detail: Option<String>,
     #[serde(default)]
     pub preflight: Option<bool>,
+    #[serde(default)]
+    pub items: Option<Vec<HistoryItem>>,
+}
+
+/// One replayed transcript message in a `history` event (r11 codex P2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryItem {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 impl ServerEvent {
@@ -110,6 +121,20 @@ impl ServerEvent {
             .decode(b64)
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())
+    }
+
+    /// Decoded payload bytes regardless of UTF-8 validity — binary tool
+    /// chunks must be accounted for, not silently dropped (r11 codex P2).
+    pub fn payload_bytes(&self) -> Option<Vec<u8>> {
+        if let Some(t) = &self.text {
+            return Some(t.clone().into_bytes());
+        }
+        let b64 = self.data_b64.as_deref()?;
+        if b64.is_empty() {
+            return Some(Vec::new());
+        }
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(b64).ok()
     }
 
     pub fn has_feature(&self, name: &str) -> bool {

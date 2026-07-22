@@ -248,6 +248,21 @@ Emitted whenever the control plane is ready for the next user prompt (including 
 
 **Post-terminal dequeue (normative).** After any command terminal settles and the control plane reaches readiness for the next user prompt, the backend dequeues the next queued prompt (if any), emits `queue`, and starts that turn — unless `queue_clear` arrived. This covers normal completion, cancel, stall, and error. It matches today’s linenoise TUI (`interactive_queue` pop at the top of every main-loop iteration, including after SIGINT-ack). **Cancel while already idle** is a no-op (the queue is empty by construction when `type: "idle"` was last emitted with nothing pending).
 
+#### `history`
+
+Emitted once after a restored `--session` load (after `hello` and the load `session_done`, before the readiness `idle`): a replay of the loaded transcript so a frontend can hydrate its scrollback (r11 review). User and assistant messages only (system preamble and tool messages are not replayed); each `text` is capped at 4000 bytes on a UTF-8 boundary. Absent on a fresh session.
+
+```json
+{
+  "v": 1, "seq": 4, "type": "history", "command_id": 0,
+  "state": "idle", "status": "ok",
+  "items": [
+    {"role": "user", "text": "fix the wrapper test"},
+    {"role": "assistant", "text": "Done — the fixture now unsets ambient env."}
+  ]
+}
+```
+
 #### `queue`
 
 Required when `hello.features` contains `queue`: the **backend owns the prompt queue** (§13 decision 1), so a reconnecting or scripted client can observe it. Emitted on every queue mutation: enqueue, dequeue-to-start, `queue_clear`.

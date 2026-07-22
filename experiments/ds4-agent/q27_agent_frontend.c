@@ -308,6 +308,21 @@ int q27_fp1_print_event(FILE *out, const q27_agent_event *event, int mode,
             }
         }
 
+        /* FP1 requires action on every session_done (r11 codex P2). */
+        if (ok && event->type == Q27_EVENT_SESSION_DONE) {
+            const char *action = NULL;
+            switch (event->session_action) {
+            case Q27_SESSION_SAVE: action = "save"; break;
+            case Q27_SESSION_LOAD: action = "load"; break;
+            case Q27_SESSION_COUNT: action = "count"; break;
+            default: break;
+            }
+            if (action)
+                ok = fprintf(out, ",\"action\":\"%s\"", action) >= 0;
+            else
+                ok = fprintf(out, ",\"action\":null") >= 0;
+        }
+
         if (ok) {
             ok = fprintf(out,
                 ",\"data_b64\":\"%s\","
@@ -377,6 +392,54 @@ int q27_fp1_emit_idle(FILE *out, uint64_t seq, uint32_t ctx_used,
         "\"ctx_used\":%u,\"ctx_size\":%u,\"queue_len\":%u}\n",
         (unsigned long long)seq, (unsigned long long)ts,
         ctx_used, ctx_size, queue_len) >= 0;
+    if (ok) ok = fflush(out) != EOF;
+    return ok;
+}
+
+int q27_fp1_emit_history(FILE *out, uint64_t seq,
+                         const q27_agent_message *messages, size_t count) {
+    if (!out) return 0;
+    const uint64_t ts = q27_fp1_now_ms();
+    int ok = fprintf(out,
+        "{\"v\":1,\"seq\":%llu,\"type\":\"history\",\"ts_ms\":%llu,"
+        "\"command_id\":0,\"client_req_id\":null,"
+        "\"state\":\"idle\",\"status\":\"ok\",\"code\":null,\"items\":[",
+        (unsigned long long)seq, (unsigned long long)ts) >= 0;
+    size_t shown = 0;
+    for (size_t i = 0; ok && messages && i < count; ++i) {
+        const q27_agent_message *m = &messages[i];
+        if (!m->role ||
+            (strcmp(m->role, "user") && strcmp(m->role, "assistant")))
+            continue;   /* system preamble / tool messages are not replayed */
+        if (!m->content || !m->content_len) continue;
+        size_t len = m->content_len;
+        if (len > 4000) {
+            len = 4000;
+            /* UTF-8 boundary back-off (same rule as the queue preview). */
+            size_t k = len;
+            while (k > 0 &&
+                   ((unsigned char)m->content[k - 1] & 0xC0) == 0x80)
+                --k;
+            if (k > 0) {
+                const unsigned char lead = (unsigned char)m->content[k - 1];
+                size_t need = 1;
+                if (lead >= 0xF0) need = 4;
+                else if (lead >= 0xE0) need = 3;
+                else if (lead >= 0xC0) need = 2;
+                if (k - 1 + need > len) len = k - 1;
+            }
+        }
+        char *esc = q27_fp1_json_escape((const unsigned char *)m->content,
+                                        len);
+        if (!esc) { ok = 0; break; }
+        if (shown) ok = fputc(',', out) != EOF;
+        if (ok)
+            ok = fprintf(out, "{\"role\":\"%s\",\"text\":\"%s\"}",
+                         m->role, esc) >= 0;
+        free(esc);
+        ++shown;
+    }
+    if (ok) ok = fprintf(out, "]}\n") >= 0;
     if (ok) ok = fflush(out) != EOF;
     return ok;
 }

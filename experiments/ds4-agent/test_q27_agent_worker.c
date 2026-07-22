@@ -569,14 +569,16 @@ int main(void) {
           "session snapshot load reports restored ledger");
     q27_agent_event persistence_event;
     CHECK(q27_agent_worker_session_result_event(
-              worker, 1, NULL, &persistence_event) &&
+              worker, 1, NULL, Q27_SESSION_SAVE, &persistence_event) &&
           persistence_event.type == Q27_EVENT_SESSION_DONE &&
+          persistence_event.session_action == Q27_SESSION_SAVE &&
           persistence_event.status == Q27_AGENT_OK,
           "durable publication success terminal is machine-readable");
     uint64_t persistence_sequence = persistence_event.sequence;
     q27_agent_event_free(&persistence_event);
     CHECK(q27_agent_worker_session_result_event(
-              worker, 0, "publish failed", &persistence_event) &&
+              worker, 0, "publish failed", Q27_SESSION_SAVE,
+              &persistence_event) &&
           persistence_event.type == Q27_EVENT_SESSION_DONE &&
           persistence_event.status == Q27_AGENT_ERROR &&
           persistence_event.sequence > persistence_sequence &&

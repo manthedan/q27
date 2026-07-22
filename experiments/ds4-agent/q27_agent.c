@@ -1594,7 +1594,7 @@ static int save_session_ex(q27_agent_worker *worker, const char *manifest_path,
             const char *notice = ok ? "" : error[0] ? error :
                 "durable session publication failed";
             if (!q27_agent_worker_session_result_event(
-                    worker, ok, notice, &result_event) ||
+                    worker, ok, notice, Q27_SESSION_SAVE, &result_event) ||
                 !print_json_event(&result_event)) {
                 q27_agent_event_free(&result_event);
                 ok = 0;
@@ -2366,7 +2366,29 @@ int main(int argc, char **argv) {
     /* FP1: idle after worker + session are ready (hello already emitted
      * above, before any session-load events). */
     if (ok && q27_fp1_protocol()) {
-        if (!emit_fp1_idle(worker, last_ctx_used, context, 0)) {
+        /* Restored-session replay: hydrate the frontend scrollback before
+         * the readiness event (r11 codex P2). owned_message differs from
+         * the wire struct only in ownership — build a borrowed view. */
+        if (loaded_session) {
+            q27_agent_message *view =
+                chat.len ? malloc(chat.len * sizeof(*view)) : NULL;
+            if (chat.len && !view) {
+                ok = 0;
+            } else {
+                for (size_t i = 0; i < chat.len; ++i) {
+                    view[i].role = chat.items[i].role;
+                    view[i].content = chat.items[i].content;
+                    view[i].content_len = chat.items[i].content_len;
+                }
+                const uint64_t seq = q27_agent_worker_alloc_sequence(worker);
+                if (!q27_fp1_emit_history(stdout, seq, view, chat.len)) {
+                    tui_diagf( "q27-agent: failed to emit FP1 history\n");
+                    ok = 0;
+                }
+                free(view);
+            }
+        }
+        if (ok && !emit_fp1_idle(worker, last_ctx_used, context, 0)) {
             tui_diagf( "q27-agent: failed to emit FP1 idle\n");
             ok = 0;
         }
