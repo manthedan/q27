@@ -148,25 +148,33 @@ static void tui_soft_interrupt(void) {
  * the user can queue follow-up prompts. Returns the same codes as
  * q27_agent_worker_next_event_timeout (1 event, 0 stop, -1 error); never 2. */
 static int tui_next_event(q27_agent_worker *worker, q27_agent_event *event,
-                          char *error, size_t error_cap) {
+                          char *error, size_t error_cap, int quiet) {
     if (q27_fp1_protocol()) {
         for (;;) {
             (void)q27_fp1_control_reject_busy(stdout, worker, "generating");
-            int got = q27_agent_worker_next_event_timeout(
-                worker, event, error, error_cap, 40);
+            int got = quiet ? q27_agent_worker_next_event_quiet(
+                                  worker, event, error, error_cap, 40)
+                            : q27_agent_worker_next_event_timeout(
+                                  worker, event, error, error_cap, 40);
             if (got != 2) return got;
             if (q27_fp1_control_quit_requested() ||
                 q27_fp1_control_cancel_requested() || interrupted) {
                 /* Keep waiting for worker terminal after cancel; alive-check
                  * already failed the engine side. */
-                got = q27_agent_worker_next_event_timeout(
-                    worker, event, error, error_cap, 40);
+                got = quiet ? q27_agent_worker_next_event_quiet(
+                                  worker, event, error, error_cap, 40)
+                            : q27_agent_worker_next_event_timeout(
+                                  worker, event, error, error_cap, 40);
                 if (got != 2) return got;
             }
         }
     }
-    if (!tui_chrome_live())
+    if (!tui_chrome_live()) {
+        if (quiet)
+            return q27_agent_worker_next_event_quiet(worker, event, error,
+                                                     error_cap, -1);
         return q27_agent_worker_next_event(worker, event, error, error_cap);
+    }
     for (;;) {
         /* Always drain stdin even when events are ready, or queue-while-busy
          * only works on idle gaps between worker events. */
@@ -873,7 +881,8 @@ static int run_tool(q27_agent_worker *worker,
 
     while (!terminal) {
         q27_agent_event event;
-        int got = tui_next_event(worker, &event, error, sizeof(error));
+        int got = tui_next_event(worker, &event, error, sizeof(error),
+                                 !jsonl);
         if (got <= 0) {
             tui_diagf("q27-agent: tool event stream ended: %s\n",
                       got < 0 && error[0] ? error : "worker stopped");
@@ -1034,8 +1043,13 @@ static int run_session_command(q27_agent_worker *worker,
     int terminal = 0;
     while (!terminal) {
         q27_agent_event event;
-        int got = q27_agent_worker_next_event(worker, &event,
-                                               error, sizeof(error));
+        /* jsonl=0 consumption is internal: quiet dequeue so hidden session
+         * events never gap the visible FP1 sequence (r20 codex P2). */
+        int got = jsonl
+                      ? q27_agent_worker_next_event(worker, &event,
+                                                    error, sizeof(error))
+                      : q27_agent_worker_next_event_quiet(
+                            worker, &event, error, sizeof(error), -1);
         if (got <= 0) {
             tui_diagf( "q27-agent: session event stream ended: %s\n",
                     got < 0 && error[0] ? error : "worker stopped");
@@ -1120,7 +1134,8 @@ static int run_turn(q27_agent_worker *worker, transcript *chat, int think,
     const int chrome = tui_chrome_live() && !jsonl && display_text;
     while (!terminal) {
         q27_agent_event event;
-        int got = tui_next_event(worker, &event, error, sizeof(error));
+        int got = tui_next_event(worker, &event, error, sizeof(error),
+                                 !jsonl);
         if (got <= 0) {
             tui_diagf( "q27-agent: event stream ended before terminal: %s\n",
                     got < 0 && error[0] ? error : "worker stopped");
@@ -2676,6 +2691,12 @@ int main(int argc, char **argv) {
                                 ? (auto_tools ? 513u : 257u)
                                 : max_tokens,
                             compact_tokens, compact_keep);
+                        /* A compact killed by the FP1 cancel flag is a
+                         * CANCELLATION, not a failure (r20 codex P2). */
+                        const int compact_cancelled =
+                            !compacted && q27_fp1_control_cancel_requested();
+                        if (compact_cancelled)
+                            (void)q27_fp1_control_clear_cancel();
                         if (compacted) {
                             uint32_t counted = 0;
                             if (transcript_prompt_tokens(worker, &chat, think,
@@ -2694,9 +2715,13 @@ int main(int argc, char **argv) {
                                 q27_agent_worker_alloc_sequence(worker);
                             (void)q27_fp1_emit_session_done(
                                 stdout, seq, 0, op.client_req_id, "compact",
-                                compacted ? "ok" : "error",
+                                compacted ? "ok"
+                                          : compact_cancelled ? "cancelled"
+                                                              : "error",
                                 compacted ? "compacted older turns"
-                                          : "compaction failed",
+                                          : compact_cancelled
+                                                ? "compaction cancelled"
+                                                : "compaction failed",
                                 last_ctx_used, "idle");
                         }
                         /* Readiness after compact must not depend on the

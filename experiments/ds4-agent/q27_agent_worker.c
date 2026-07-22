@@ -838,10 +838,10 @@ q27_agent_status q27_agent_worker_submit_session(
     return Q27_AGENT_OK;
 }
 
-int q27_agent_worker_next_event_timeout(q27_agent_worker *worker,
-                                        q27_agent_event *event,
-                                        char *error, size_t error_cap,
-                                        int timeout_ms) {
+static int next_event_impl(q27_agent_worker *worker,
+                           q27_agent_event *event,
+                           char *error, size_t error_cap,
+                           int timeout_ms, int quiet) {
     if (!worker || !event) {
         copy_error(error, error_cap, "invalid event request");
         return -1;
@@ -891,8 +891,10 @@ int q27_agent_worker_next_event_timeout(q27_agent_worker *worker,
     *event = node->event;
     node->event.data = NULL;
     /* Publish-time sequence: same counter as alloc_sequence, stamped when the
-     * control plane takes the event (stream order == seq order). */
-    event->sequence = ++worker->next_sequence;
+     * control plane takes the event (stream order == seq order). Quiet
+     * (internal) consumption stamps 0 instead — hidden events must not gap
+     * the visible FP1 sequence (r20 codex P2). */
+    event->sequence = quiet ? 0 : ++worker->next_sequence;
     const int terminal = event->type == Q27_EVENT_TURN_DONE ||
                          event->type == Q27_EVENT_TOOL_DONE ||
                          event->type == Q27_EVENT_SESSION_DONE ||
@@ -911,6 +913,20 @@ int q27_agent_worker_next_event_timeout(q27_agent_worker *worker,
     pthread_mutex_unlock(&worker->mu);
     free(node);
     return 1;
+}
+
+int q27_agent_worker_next_event_timeout(q27_agent_worker *worker,
+                                        q27_agent_event *event,
+                                        char *error, size_t error_cap,
+                                        int timeout_ms) {
+    return next_event_impl(worker, event, error, error_cap, timeout_ms, 0);
+}
+
+int q27_agent_worker_next_event_quiet(q27_agent_worker *worker,
+                                      q27_agent_event *event,
+                                      char *error, size_t error_cap,
+                                      int timeout_ms) {
+    return next_event_impl(worker, event, error, error_cap, timeout_ms, 1);
 }
 
 int q27_agent_worker_next_event(q27_agent_worker *worker,

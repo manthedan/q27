@@ -440,7 +440,15 @@ impl Model {
                         });
                     }
                 }
-                if matches!(ev.state.as_deref(), Some("idle") | None) {
+                // Envelope idle ≠ control-plane readiness (r20 codex P2):
+                // auto-compaction's session_done mid-turn must not flip the
+                // UI idle — only re-enter idle when already there/starting.
+                if matches!(ev.state.as_deref(), Some("idle") | None)
+                    && matches!(
+                        self.phase,
+                        Phase::Idle | Phase::Stopped | Phase::Starting
+                    )
+                {
                     self.input_enabled = true;
                     self.phase = Phase::Idle;
                 }

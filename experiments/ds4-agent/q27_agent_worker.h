@@ -151,6 +151,14 @@ int q27_agent_worker_next_event_timeout(q27_agent_worker *worker,
                                         q27_agent_event *event,
                                         char *error, size_t error_cap,
                                         int timeout_ms);
+
+/* Quiet variant for INTERNAL consumption (session count/save/load with
+ * jsonl=0, compaction summaries): stamps sequence 0 and does NOT advance
+ * the visible FP1 sequence (r20 codex P2). */
+int q27_agent_worker_next_event_quiet(q27_agent_worker *worker,
+                                      q27_agent_event *event,
+                                      char *error, size_t error_cap,
+                                      int timeout_ms);
 void q27_agent_event_free(q27_agent_event *event);
 
 q27_agent_worker_state q27_agent_worker_get_state(q27_agent_worker *worker);

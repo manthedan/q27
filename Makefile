@@ -23,7 +23,10 @@ agent: build/q27-agent
 
 tui: build/q27-tui
 
-agent-tui: agent tui
+# Build BOTH binaries, then launch (r20 codex P2: depending on the `agent`
+# run target would start the blocking agent before the TUI ever builds).
+agent-tui: build/q27-agent build/q27-tui
+	Q27_BIN_DIR="$(CURDIR)/build" ./packaging/bin/q27 agent
 
 # Put this checkout's packaging/bin/q27 first on PATH via ~/.grok/bin (already
 # first in many Grok/dev shells). After this, `q27 agent b1` uses source TUI.
