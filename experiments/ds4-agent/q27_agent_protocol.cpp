@@ -156,6 +156,9 @@ const std::string& preamble() {
                  "fenced block (```lang then body then ```). Never put file content in JSON. "
                  "The block's final newline is part of the file; a file without a "
                  "trailing newline is not representable in this transport. "
+                 "If the content itself contains fence lines, open with more "
+                 "backticks than any fence inside (CommonMark), or the inner fence "
+                 "will be taken as the closer. "
                  "Fails if the path already exists; use overwrite for full rewrite or edit "
                  "for a small unique patch."},
                 {"parameters", {{"type", "object"},
@@ -170,7 +173,10 @@ const std::string& preamble() {
                  "file. JSON args: path only. Immediately after </tool_call>, emit the "
                  "complete file as a markdown fenced block. The block's final newline is "
                  "part of the file; a file without a trailing newline is not "
-                 "representable in this transport. Prefer overwrite for full-file "
+                 "representable in this transport. If the content itself contains "
+                 "fence lines, open with more backticks than any fence inside "
+                 "(CommonMark), or the inner fence will be taken as the closer. "
+                 "Prefer overwrite for full-file "
                  "rewrites; use edit only for short unique patches."},
                 {"parameters", {{"type", "object"},
                     {"properties", {
@@ -184,7 +190,10 @@ const std::string& preamble() {
                  "file. JSON args: path and old (old max 512 bytes). Immediately after "
                  "</tool_call>, emit the replacement as a markdown fenced block. Never put "
                  "replacement bytes in JSON. The block's final newline is transport only: "
-                 "it is dropped when your old match does not end with a newline. For "
+                 "it is dropped when your old match does not end with a newline. If the "
+                 "replacement itself contains fence lines, open with more backticks "
+                 "than any fence inside (CommonMark), or the inner fence will be "
+                 "taken as the closer. For "
                  "whole-file rewrites use overwrite."},
                 {"parameters", {{"type", "object"},
                     {"properties", {

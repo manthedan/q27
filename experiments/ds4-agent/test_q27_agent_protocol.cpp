@@ -132,6 +132,26 @@ int main() {
           "unclosed fence at max_tokens fails closed (no truncated publish)");
     q27_agent_tool_call_free(&call);
 
+    // CommonMark-length outer fence: content containing ``` lines stays
+    // byte-exact when the outer fence is longer (the documented escape for
+    // the inner-closer ambiguity, branch-review P2).
+    CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
+                "\"path\":\"x.md\"}}</tool_call>\n"
+                "````md\n"
+                "# Title\n"
+                "```python\n"
+                "code\n"
+                "```\n"
+                "tail\n"
+                "````\n",
+                call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          !call.missing_body &&
+          std::string(reinterpret_cast<const char *>(call.request.input),
+                      call.request.input_len) ==
+              "# Title\n```python\ncode\n```\ntail\n",
+          "longer outer fence preserves inner fence lines byte-exactly");
+    q27_agent_tool_call_free(&call);
+
     // Second tool call after an unclosed fence must not land as file content.
     CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
                 "\"path\":\"x.py\"}}</tool_call>\n"

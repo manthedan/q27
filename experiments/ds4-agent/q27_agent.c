@@ -167,6 +167,10 @@ static int parse_u32_allow_zero(const char *text, uint32_t *out) {
 }
 
 static int parse_u64(const char *text, uint64_t *out) {
+    // strtoull accepts a leading minus ("-1" -> UINT64_MAX); reject it so a
+    // typo cannot silently select an unexpected deterministic stream (codex
+    // branch-review P3; matches the Metal CLI/server seed contract).
+    if (!text || text[0] == '-') return 0;
     char *end = NULL;
     errno = 0;
     unsigned long long value = strtoull(text, &end, 10);
