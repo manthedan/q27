@@ -783,8 +783,34 @@ struct Runtime {
         }
         if(ctx==0) {
             // --ctx auto (upstream v0.4.0 parity; the default): size each
-            // slot's window to the device budget split across slots. The
-            // admission charge (KV reservation + fixed engine state +
+            // slot's window to what the DEVICE can actually serve. The
+            // budget is the SMALLER of the admission-policy ceiling
+            // (working_set/2 or --budget-mb) and the measured free envelope:
+            // recommended - allocated-after-weights + a bounded 2 GB
+            // overcommit allowance (macOS pages/compresses gracefully past
+            // recommended; every supported legacy config lives inside this)
+            // - a 1 GB activation/desktop reserve. Sizing to the raw policy
+            // ceiling OOMs the command queue on the 24 GB + official-tier
+            // reality: weights (17 GB) and KV share one working set.
+            const uint64_t recommended=shared->backend.recommended_working_set_size();
+            const uint64_t allocated=shared->backend.current_allocated_size();
+            // currentAllocatedSize does NOT price the mapped artifact (the
+            // weights ride the file mapping), so charge the artifact bytes
+            // explicitly — the OOM at the raw policy ceiling was weights
+            // (17 GB) and KV sharing one working set.
+            uint64_t artifact_bytes=0;
+            { std::error_code ec; artifact_bytes=(uint64_t)std::filesystem::file_size(model,ec); }
+            const uint64_t used=artifact_bytes+allocated;
+            const uint64_t measured=recommended>used?recommended-used:0;
+            const uint64_t envelope=measured+(3ull<<30);
+            const uint64_t policy_budget=budget;
+            uint64_t kv_budget=std::min(budget,envelope);
+            kv_budget=kv_budget>(1ull<<30)?kv_budget-(1ull<<30):0;
+            // The admission loop below shares the measured envelope when
+            // auto (policy budget stays for explicit --ctx): solver and
+            // admission must not disagree about what fits.
+            budget=kv_budget;
+            // The admission charge (KV reservation + fixed engine state +
             // per-entry snapshot capacity — a snapshot is KV CONTENT, so it
             // scales with ctx too) is exactly linear in ctx; two probe
             // constructions solve slope + intercept without re-deriving the
@@ -800,29 +826,36 @@ struct Runtime {
             const double slope=(double)(t2-t1)/(double)(p2-p1);
             const uint64_t intercept=t1-(uint64_t)(slope*p1);
             // Degrade like the admission loop promises: if the requested
-            // slot count cannot each hold the 1024-token floor, solve again
-            // for fewer slots — slot 0 always serves (r2 codex P2).
+            // slot count cannot each hold the floor, solve again for fewer
+            // slots — slot 0 always serves (r2 codex P2).
             uint64_t solved=0; uint32_t split=slot_count?slot_count:1;
             for(uint32_t n=split; ; --n) {
-                const uint64_t slot_budget=budget/n;
-                // Safety margin (upstream's arch-scaled margin twin): slope
-                // rounding and block-aligned snapshot sizing must never push
-                // the solved charge past the admission budget.
+                const uint64_t slot_budget=kv_budget/n;
+                // Safety margin: slope rounding and block-aligned snapshot
+                // sizing must never push the solved charge past budget.
                 const uint64_t margin=std::max<uint64_t>(64ull<<20,slot_budget/64);
                 const uint64_t usable=slot_budget>margin?slot_budget-margin:0;
                 solved=usable>intercept?(uint64_t)((usable-intercept)/slope):0;
-                if(solved>=1024 || n==1) { split=n; break; }
+                if(solved>=8192 || n==1) { split=n; break; }
             }
             if(solved>262144) solved=262144;   // model-family position cap
-            if(solved<1024)
-                throw std::runtime_error("--ctx auto: device budget fits only "+
-                    std::to_string(solved)+" tokens for one slot; raise --budget-mb or use --kv turbo3");
+            // The legacy default is the empirical floor: every supported
+            // pack/tier serves 8192/2-slot within the envelope, so auto
+            // never sizes BELOW what pre-auto releases shipped.
+            if(solved<8192) {
+                fprintf(stderr,"q27 Metal server: --ctx auto: envelope solves only %llu tokens; "
+                        "falling back to the legacy 8192 default\n",
+                        (unsigned long long)solved);
+                solved=8192;
+            }
             ctx=(uint32_t)solved;
             context=ctx;
             fprintf(stderr,"q27 Metal server: --ctx auto: %u tokens per slot "
                     "(%.0f charged bytes/token incl snapshot + %.1f MB fixed; "
-                    "budget %.0f MB sized for %u of %u requested slot%s)\n",
-                    ctx,slope,intercept/1048576.0,budget/1048576.0,
+                    "KV budget %.0f MB [policy %.0f MB, free %.0f MB + 3072 MB overcommit - 1024 MB reserve] "
+                    "sized for %u of %u requested slot%s)\n",
+                    ctx,slope,intercept/1048576.0,kv_budget/1048576.0,
+                    policy_budget/1048576.0,measured/1048576.0,
                     split,slot_count,slot_count==1?"":"s");
         }
         slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
