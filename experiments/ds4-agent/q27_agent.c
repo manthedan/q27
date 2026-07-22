@@ -2554,6 +2554,11 @@ int main(int argc, char **argv) {
             if (op.kind == Q27_FP1_OP_QUEUE_CLEAR) {
                 q27_fp1_prompt_queue_clear();
                 (void)q27_fp1_emit_queue_from_worker(stdout, worker, "idle");
+                /* Readiness after the clear: already-idle means no later
+                 * turn will emit one, and clients reconcile cleared prompts
+                 * on the idle EVENT (r14 codex P2). */
+                (void)emit_fp1_idle(worker, last_ctx_used, context,
+                                    UINT32_MAX);
                 q27_fp1_op_free(&op);
                 continue;
             }

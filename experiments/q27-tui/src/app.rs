@@ -313,9 +313,11 @@ impl Model {
                         match item.role.as_deref() {
                             Some("user") => self.push_user(&text),
                             Some("assistant") => {
+                                // Same thinking split as live turns (r14 P2).
+                                let (thinking, body) = split_thinking(&text);
                                 self.scrollback.push(Block::Assistant {
-                                    thinking: None,
-                                    body: text,
+                                    thinking,
+                                    body,
                                 })
                             }
                             _ => {}

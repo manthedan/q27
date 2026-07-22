@@ -237,14 +237,23 @@ int q27_tui_collapse_text(const char *text, size_t text_len, int max_lines,
     int lines = 0;
     size_t out = 0;
     int truncated = 0;
-    while (i < text_len && lines < max_lines && (int)out < max_chars) {
-        unsigned char c = (unsigned char)text[i++];
-        if (out + 1 >= buf_len) {
+    while (i < text_len && lines < max_lines) {
+        /* Whole code point per step — byte-wise truncation could split a
+         * multibyte character at max_chars (r14 codex P2). The input is
+         * already sanitized to valid UTF-8. */
+        const unsigned char c = (unsigned char)text[i];
+        size_t cp_len = 1;
+        if (c >= 0xC2 && c <= 0xDF) cp_len = 2;
+        else if (c >= 0xE0 && c <= 0xEF) cp_len = 3;
+        else if (c >= 0xF0 && c <= 0xF4) cp_len = 4;
+        if (i + cp_len > text_len) cp_len = 1;
+        if ((int)(out + cp_len) > max_chars || out + cp_len >= buf_len) {
             truncated = 1;
             break;
         }
-        buf[out++] = (char)c;
+        for (size_t k = 0; k < cp_len; ++k) buf[out++] = text[i + k];
         if (c == '\n') lines++;
+        i += cp_len;
     }
     if (i < text_len) truncated = 1;
     if (truncated) {
