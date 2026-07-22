@@ -281,6 +281,11 @@ static void test_parse_client(void) {
         CHECK(q27_fp1_parse_client_line(mismatch, strlen(mismatch), &op));
         CHECK(op.kind == Q27_FP1_OP_MALFORMED);
         q27_fp1_op_free(&op);
+        const char *nocomma =
+            "{\"v\":1,\"op\":\"quit\" \"ignored\":true}";
+        CHECK(q27_fp1_parse_client_line(nocomma, strlen(nocomma), &op));
+        CHECK(op.kind == Q27_FP1_OP_MALFORMED);
+        q27_fp1_op_free(&op);
     }
 
     /* Invalid UTF-8 in a client string is dropped, not emitted (r6 codex P2). */

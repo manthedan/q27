@@ -821,44 +821,92 @@ static int json_get_number_int(const char *line, size_t len, const char *key,
     return 1;
 }
 
-/* One complete JSON value: balanced brackets, no unterminated string, and
- * only whitespace after the top-level close (r6 codex P2). Scalars are not
- * syntax-checked; this guards framing, not grammar. */
-static int json_structure_valid(const char *line, size_t len) {
-    const char *p = line;
-    const char *end = line + len;
-    int depth = 0;
-    char stack[128];   /* bracket types must match, not just balance (r7 P2) */
-    while (p < end) {
-        const char c = *p;
-        if (c == '"') {
-            ++p;
-            while (p < end) {
-                if (*p == '\\') { p += 2; continue; }
-                if (*p == '"') break;
-                ++p;
-            }
-            if (p >= end) return 0;   /* unterminated string */
-            ++p;
-            continue;
+/* Strict JSON syntax validation (r8 codex P2): one complete value with
+ * correct separators and matching delimiters — framing alone accepted
+ * `{"v":1,"op":"quit" "ignored":true}` as a quit. */
+static size_t json_skip_ws(const char *s, size_t len, size_t i) {
+    while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' ||
+                       s[i] == '\n'))
+        ++i;
+    return i;
+}
+
+/* Index past the value, or (size_t)-1 on invalid. depth guards recursion. */
+static size_t json_skip_value(const char *s, size_t len, size_t i,
+                              int depth) {
+    if (depth > 64) return (size_t)-1;
+    i = json_skip_ws(s, len, i);
+    if (i >= len) return (size_t)-1;
+    const char c = s[i];
+    if (c == '"') {
+        ++i;
+        while (i < len) {
+            if (s[i] == '\\') { i += 2; continue; }
+            if (s[i] == '"') return i + 1;
+            ++i;
         }
-        if (c == '{' || c == '[') {
-            if (depth >= (int)sizeof(stack)) return 0;
-            stack[depth++] = c;
-        } else if (c == '}' || c == ']') {
-            if (depth == 0) return 0;
-            const char open = stack[--depth];
-            if ((c == '}' && open != '{') || (c == ']' && open != '['))
-                return 0;
-            if (depth == 0) {
-                ++p;
-                while (p < end && (*p == ' ' || *p == '\t')) ++p;
-                return p == end;      /* trailing garbage rejected */
-            }
-        }
-        ++p;
+        return (size_t)-1;
     }
-    return 0;                          /* unbalanced: never closed */
+    if (c == '{' || c == '[') {
+        const char open = c;
+        const char close = (c == '{') ? '}' : ']';
+        ++i;
+        i = json_skip_ws(s, len, i);
+        if (i < len && s[i] == close) return i + 1;
+        for (;;) {
+            if (open == '{') {
+                i = json_skip_ws(s, len, i);
+                if (i >= len || s[i] != '"') return (size_t)-1;
+                i = json_skip_value(s, len, i, depth + 1);   /* key */
+                if (i == (size_t)-1) return (size_t)-1;
+                i = json_skip_ws(s, len, i);
+                if (i >= len || s[i] != ':') return (size_t)-1;
+                ++i;
+            }
+            i = json_skip_value(s, len, i, depth + 1);
+            if (i == (size_t)-1) return (size_t)-1;
+            i = json_skip_ws(s, len, i);
+            if (i >= len) return (size_t)-1;
+            if (s[i] == ',') { ++i; continue; }
+            if (s[i] == close) return i + 1;
+            return (size_t)-1;
+        }
+    }
+    if (c == 't')
+        return (i + 4 <= len && !memcmp(s + i, "true", 4)) ? i + 4
+                                                            : (size_t)-1;
+    if (c == 'f')
+        return (i + 5 <= len && !memcmp(s + i, "false", 5)) ? i + 5
+                                                            : (size_t)-1;
+    if (c == 'n')
+        return (i + 4 <= len && !memcmp(s + i, "null", 4)) ? i + 4
+                                                           : (size_t)-1;
+    /* number: -?digits[.digits][(e|E)[+-]digits] — digits required */
+    size_t j = i;
+    if (j < len && s[j] == '-') ++j;
+    size_t digits = 0;
+    while (j < len && s[j] >= '0' && s[j] <= '9') { ++j; ++digits; }
+    if (!digits) return (size_t)-1;
+    if (j < len && s[j] == '.') {
+        ++j;
+        size_t frac = 0;
+        while (j < len && s[j] >= '0' && s[j] <= '9') { ++j; ++frac; }
+        if (!frac) return (size_t)-1;
+    }
+    if (j < len && (s[j] == 'e' || s[j] == 'E')) {
+        ++j;
+        if (j < len && (s[j] == '+' || s[j] == '-')) ++j;
+        size_t exp = 0;
+        while (j < len && s[j] >= '0' && s[j] <= '9') { ++j; ++exp; }
+        if (!exp) return (size_t)-1;
+    }
+    return j;
+}
+
+static int json_structure_valid(const char *line, size_t len) {
+    const size_t end_i = json_skip_value(line, len, 0, 0);
+    if (end_i == (size_t)-1) return 0;
+    return json_skip_ws(line, len, end_i) == len;
 }
 
 int q27_fp1_parse_client_line(const char *line, size_t len, q27_fp1_op *out) {
