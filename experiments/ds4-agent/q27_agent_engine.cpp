@@ -819,8 +819,13 @@ extern "C" q27_agent_status q27_agent_generate(
                 return -1;
             // Track thinking span after the sink publishes (bytes are
             // committed). Burst tokens pass through here too, so the think
-            // budget accounting covers the MTP path.
-            if (enable_thinking || max_think > 0)
+            // budget accounting covers the MTP path. Only BEFORE any tool
+            // engagement this turn: a literal <think> inside a constrained
+            // tool-call body is payload content, not a reasoning span —
+            // opening the tracker there would let the budget inject
+            // </think> into file bytes (r23 codex P2).
+            if ((enable_thinking || max_think > 0) &&
+                (!constrainer || constrainer->engaged == 0))
                 think_span.observe_token(bytes);
             ++produced;
             // The callback is irreversible: publish accounting before any
@@ -1023,10 +1028,12 @@ extern "C" q27_agent_status q27_agent_generate(
             // Think budget: force-close the span and keep decoding the answer
             // instead of abandoning the turn mid-reasoning. Checked per
             // published token here in the serial quantum; the can_mtp gate
-            // above keeps budget-armed thinking on this path.
+            // above keeps budget-armed thinking on this path. Never fire
+            // under active tool masks — injecting </think> into constrained
+            // call JSON would corrupt the request (r23 codex P2).
             const bool hit_think_budget =
                 max_think > 0 && think_span.in_think &&
-                think_span.think_tokens >= max_think;
+                think_span.think_tokens >= max_think && !tools_masking;
             if (hit_think_budget) {
                 const std::vector<uint32_t> force =
                     force_close_think_ids(engine->tokenizer.get());

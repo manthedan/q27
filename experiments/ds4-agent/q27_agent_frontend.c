@@ -441,17 +441,19 @@ int q27_fp1_emit_history(FILE *out, q27_agent_worker *worker,
             continue;   /* system preamble / tool messages are not replayed */
         if (!m->content || !m->content_len) continue;
         /* Harness protocol messages are not chat (r21 codex P2): tool
-         * responses ride role "user", tool calls role "assistant". */
+         * responses ride role "user", tool calls role "assistant". The
+         * assistant test is the full <tool_call>{ tag+JSON-header shape so
+         * prose merely MENTIONING the tag survives (r23 codex P3). */
         static const char tool_resp_open[] = "<tool_response>";
-        static const char tool_call_open[] = "<tool_call>";
+        static const char tool_call_json[] = "<tool_call>{";
         if (!strcmp(m->role, "user") &&
             m->content_len >= sizeof(tool_resp_open) - 1 &&
             !memcmp(m->content, tool_resp_open, sizeof(tool_resp_open) - 1))
             continue;
         if (!strcmp(m->role, "assistant") &&
-            m->content_len >= sizeof(tool_call_open) - 1 &&
+            m->content_len >= sizeof(tool_call_json) - 1 &&
             memmem(m->content, m->content_len,
-                   tool_call_open, sizeof(tool_call_open) - 1))
+                   tool_call_json, sizeof(tool_call_json) - 1))
             continue;
         size_t len = m->content_len;
         if (len > 4000) {
