@@ -799,24 +799,31 @@ struct Runtime {
                 +q27::MetalEngine::fixed_state_bytes(probe.chunked_prefill()); }
             const double slope=(double)(t2-t1)/(double)(p2-p1);
             const uint64_t intercept=t1-(uint64_t)(slope*p1);
-            const uint64_t slot_budget=slot_count?budget/slot_count:budget;
-            // Safety margin (upstream's arch-scaled margin twin): slope
-            // rounding and block-aligned snapshot sizing must never push
-            // the solved charge past the admission budget.
-            const uint64_t margin=std::max<uint64_t>(64ull<<20,slot_budget/64);
-            const uint64_t usable=slot_budget>margin?slot_budget-margin:0;
-            uint64_t solved=usable>intercept?(uint64_t)((usable-intercept)/slope):0;
+            // Degrade like the admission loop promises: if the requested
+            // slot count cannot each hold the 1024-token floor, solve again
+            // for fewer slots — slot 0 always serves (r2 codex P2).
+            uint64_t solved=0; uint32_t split=slot_count?slot_count:1;
+            for(uint32_t n=split; ; --n) {
+                const uint64_t slot_budget=budget/n;
+                // Safety margin (upstream's arch-scaled margin twin): slope
+                // rounding and block-aligned snapshot sizing must never push
+                // the solved charge past the admission budget.
+                const uint64_t margin=std::max<uint64_t>(64ull<<20,slot_budget/64);
+                const uint64_t usable=slot_budget>margin?slot_budget-margin:0;
+                solved=usable>intercept?(uint64_t)((usable-intercept)/slope):0;
+                if(solved>=1024 || n==1) { split=n; break; }
+            }
             if(solved>262144) solved=262144;   // model-family position cap
             if(solved<1024)
                 throw std::runtime_error("--ctx auto: device budget fits only "+
-                    std::to_string(solved)+" tokens per slot; reduce --slots, raise --budget-mb, or use --kv turbo3");
+                    std::to_string(solved)+" tokens for one slot; raise --budget-mb or use --kv turbo3");
             ctx=(uint32_t)solved;
             context=ctx;
             fprintf(stderr,"q27 Metal server: --ctx auto: %u tokens per slot "
                     "(%.0f charged bytes/token incl snapshot + %.1f MB fixed; "
-                    "budget %.0f MB across %u slot%s)\n",
+                    "budget %.0f MB sized for %u of %u requested slot%s)\n",
                     ctx,slope,intercept/1048576.0,budget/1048576.0,
-                    slot_count,slot_count==1?"":"s");
+                    split,slot_count,slot_count==1?"":"s");
         }
         slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
         // Snapshot v2 (2026-07-17-kv-except-snapshot-v2.md): exception
@@ -1788,7 +1795,16 @@ int main(int argc,char** argv) {
             else if(arg=="--port" && i+1<argc) port=parse_u32(argv[++i],"--port");
             else if(arg=="--ctx" && i+1<argc) {
                 const char* v=argv[++i];
-                context = !strcmp(v,"auto") ? 0u : parse_u32(v,"--ctx");
+                if(!strcmp(v,"auto")) context=0;   // sentinel: resolve in Runtime
+                else {
+                    context=parse_u32(v,"--ctx");
+                    // 0 is the auto sentinel, so a numeric 0 must be
+                    // rejected HERE — silently reinterpreting it as auto
+                    // would allocate a hardware-dependent window for an
+                    // invalid explicit configuration (r2 codex P2).
+                    if(!context || context>262144)
+                        throw std::runtime_error("--ctx must be 1..262144 or auto");
+                }
             }
             else if(arg=="--mtp" && i+1<argc) width=parse_u32(argv[++i],"--mtp");
             else if(arg=="--suffix" && i+1<argc) suffix_width=parse_u32(argv[++i],"--suffix");
@@ -1878,7 +1894,7 @@ int main(int argc,char** argv) {
                         !experimental_prefix_dir.empty());
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
-            runtime.trace.event({{"kind","boot"},{"ctx",context},{"kv",turbo3?"turbo3":"fp16"},
+            runtime.trace.event({{"kind","boot"},{"ctx",runtime.context},{"kv",turbo3?"turbo3":"fp16"},
                                  {"mtp",width},{"suffix",suffix_width},{"slots",runtime.slots.size()},
                                  {"model",runtime.model_name},{"artifact_sha1",runtime.resident_model_sha1()},
                                  {"runtime",runtime.serving_identity()},{"boot_id",runtime.boot_id}});
@@ -3574,7 +3590,7 @@ int main(int argc,char** argv) {
         }));
 
         fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u, slots=%zu)\n",
-                host.c_str(),port,context,turbo3?"turbo3":"fp16",width,runtime.slots.size());
+                host.c_str(),port,runtime.context,turbo3?"turbo3":"fp16",width,runtime.slots.size());
         // Operator-only: the admin credential goes to stderr (never HTTP).
         fprintf(stderr,"q27 Metal server admin token (X-Q27-Admin-Token): %s\n",runtime.admin_token.c_str());
         if(!server.listen(host.c_str(),(int)port)) throw std::runtime_error("server listen failed");
