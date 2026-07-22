@@ -279,6 +279,7 @@ char *q27_tui_prompt_queue_pop(q27_tui_prompt_queue *q) {
     if (!q || !q->len) return NULL;
     char *line = q->items[0];
     memmove(q->items, q->items + 1, (q->len - 1) * sizeof(q->items[0]));
+    q->items[q->len - 1] = NULL;   /* vacated duplicate alias (codex P3) */
     q->len--;
     return line;
 }

@@ -302,6 +302,34 @@ static void test_p4_queue_and_tool_start(void) {
     q27_fp1_prompt_queue_clear();
     CHECK(q27_fp1_prompt_queue_len() == 0);
 
+    /* Preview truncation never splits a UTF-8 codepoint (codex P1): 79 ASCII
+     * bytes + a 2-byte é straddling byte 80 must preview as the 79 ASCII
+     * bytes only, keeping the frame valid UTF-8. */
+    {
+        char longprompt[128];
+        memset(longprompt, 'a', 79);
+        longprompt[79] = (char)0xC3;
+        longprompt[80] = (char)0xA9;   /* é */
+        longprompt[81] = 'z';
+        longprompt[82] = '\0';
+        CHECK(q27_fp1_prompt_queue_push(longprompt, "ui-utf8") == 1);
+        f = tmpfile();
+        CHECK(f != NULL);
+        CHECK(q27_fp1_emit_queue(f, 51, "idle"));
+        out = slurp_tmp(f);
+        CHECK(out != NULL);
+        char expect[128];
+        memset(expect, 'a', 79);
+        expect[79] = '\0';
+        char needle[96];
+        snprintf(needle, sizeof(needle), "\"preview\":\"%s\"", expect);
+        CHECK(strstr(out, needle) != NULL);
+        CHECK(q27_fp1_utf8_valid((const unsigned char *)out, strlen(out)));
+        free(out);
+        fclose(f);
+        q27_fp1_prompt_queue_clear();
+    }
+
     /* Cap 8 */
     for (int i = 0; i < 8; ++i) {
         char buf[16];

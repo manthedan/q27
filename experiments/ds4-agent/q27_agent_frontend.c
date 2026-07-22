@@ -964,13 +964,30 @@ int q27_fp1_emit_queue(FILE *out, uint64_t seq, const char *state) {
     for (size_t i = 0; ok && i < n; ++i) {
         if (i) ok = fputc(',', out) != EOF;
         if (!ok) break;
-        /* preview: first ≤80 chars, whitespace flattened */
+        /* preview: first ≤80 bytes, whitespace flattened; never cut inside
+         * a UTF-8 codepoint — an invalid preview frame kills the Rust line
+         * reader and looks like a child exit (codex P1). */
         char preview[81];
         size_t j = 0;
-        for (const char *p = texts[i]; *p && j < 80; ++p) {
+        const char *p = texts[i];
+        for (; *p && j < 80; ++p) {
             char c = *p;
             if (c == '\n' || c == '\r' || c == '\t') c = ' ';
             preview[j++] = c;
+        }
+        if (*p && j) {
+            /* Truncated: back off an incomplete trailing multibyte sequence. */
+            size_t k = j;
+            while (k > 0 && ((unsigned char)preview[k - 1] & 0xC0) == 0x80)
+                --k;   /* k-1 = lead byte of the trailing sequence */
+            if (k > 0) {
+                const unsigned char lead = (unsigned char)preview[k - 1];
+                size_t need = 1;
+                if (lead >= 0xF0) need = 4;
+                else if (lead >= 0xE0) need = 3;
+                else if (lead >= 0xC0) need = 2;
+                if (k - 1 + need > j) j = k - 1;
+            }
         }
         preview[j] = '\0';
         char *esc_prev =

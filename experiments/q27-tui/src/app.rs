@@ -298,11 +298,14 @@ impl Model {
                 self.input_enabled = true;
             }
             "session_done" => {
-                if ev.action.as_deref() == Some("new") {
+                let st = ev.status.as_deref().unwrap_or("ok");
+                // Clear the visible transcript only after a SUCCESSFUL reset:
+                // a failed durable discard keeps the agent-side transcript,
+                // so wiping the UI here would lie about the state (codex P2).
+                if ev.action.as_deref() == Some("new") && st == "ok" {
                     self.scrollback.clear();
                     self.assistant_buf.clear();
                 }
-                let st = ev.status.as_deref().unwrap_or("ok");
                 let act = ev.action.as_deref().unwrap_or("session");
                 self.status_line = format!("{act} {st}");
                 if let Some(t) = ev.payload_text().or_else(|| ev.text.clone()) {
