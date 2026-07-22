@@ -88,7 +88,7 @@ std::vector<uint32_t> parse_tokens(const std::string& text) {
     return result;
 }
 
-std::vector<uint32_t> load_token_file(const std::string& path) {
+std::vector<uint32_t> load_token_file(const std::string& path, uint32_t vocab) {
     FILE* file = fopen(path.c_str(), "rb");
     if (!file) throw std::runtime_error("cannot open " + path);
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); throw std::runtime_error("cannot seek " + path); }
@@ -101,6 +101,14 @@ std::vector<uint32_t> load_token_file(const std::string& path) {
         throw std::runtime_error("short read on " + path);
     }
     fclose(file);
+    // Out-of-vocab ids index the embedding/logit rows out of bounds (the
+    // CUDA --nll guard's Metal twin, parity item 6): refuse with a
+    // diagnostic naming the first bad id.
+    for (size_t i = 0; i < tokens.size(); ++i)
+        if (tokens[i] >= vocab)
+            throw std::runtime_error(path + ": token id " + std::to_string(tokens[i]) +
+                                     " at offset " + std::to_string(i) +
+                                     " is outside the vocab (0.." + std::to_string(vocab) + ")");
     return tokens;
 }
 
@@ -426,7 +434,7 @@ int main(int argc, char** argv) {
         // agreement with the baseline margin at every flip (L3 of the
         // margin-aware contract), top-20 overlap, and per-arm NLL.
         if (chunk_parity) {
-            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            std::vector<uint32_t> tokens = load_token_file(nll_path, q27::MetalEngine::vocabulary_size());
             if (tokens.size() < 2) throw std::runtime_error("--chunk-parity needs at least two tokens");
             const uint32_t n = std::min<uint32_t>(chunk_parity, (uint32_t)tokens.size() - 1);
             if (n > context) throw std::runtime_error("--chunk-parity N exceeds --ctx; raise --ctx");
@@ -436,13 +444,8 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("--chunk-parity needs >= 96 positions to exercise widths {17,48,96}; "
                                          "token file/N gives " + std::to_string(n));
             // Targets tokens[1..n] index logits directly in nll_of below;
-            // the engines validate only the encoded tokens, so reject
-            // out-of-vocabulary ids up front.
+            // load_token_file has already refused out-of-vocabulary ids.
             const uint32_t vocab = q27::MetalEngine::vocabulary_size();
-            for (uint32_t i = 0; i <= n; i++)
-                if (tokens[i] >= vocab)
-                    throw std::runtime_error("token id " + std::to_string(tokens[i]) +
-                                             " out of vocabulary at position " + std::to_string(i));
             auto shared = q27::MetalEngine::open_shared(model_path);
             q27::MetalEngine baseline(shared, context, turbo3_kv);
             q27::MetalEngine subject(shared, context, turbo3_kv);
@@ -610,7 +613,7 @@ int main(int argc, char** argv) {
             // baseline margin, and the margin certificate rho over the union
             // of both top-64 sets (flip certified impossible when rho < 1, so
             // an observed flip below 1 is a self-contradiction alarm).
-            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            std::vector<uint32_t> tokens = load_token_file(nll_path, q27::MetalEngine::vocabulary_size());
             const uint32_t n_want = nll_long ? nll_long : 2048;
             if (tokens.size() > (size_t)n_want + 1) tokens.resize((size_t)n_want + 1);
             if (tokens.size() < 13) throw std::runtime_error("--envelope needs at least 13 tokens");
@@ -754,7 +757,7 @@ int main(int argc, char** argv) {
         }
 
         if (kl_kv) {
-            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            std::vector<uint32_t> tokens = load_token_file(nll_path, q27::MetalEngine::vocabulary_size());
             if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
             if (tokens.size() < 2) throw std::runtime_error("--kl-kv needs at least two tokens");
             // n-1 positions are encoded; the final token is only a target.
@@ -927,7 +930,7 @@ int main(int argc, char** argv) {
         // same token stream; per-position q27::forward_kl runs on CPU in
         // double precision exactly as --kl-kv does.
         if (!kl_pair_path.empty()) {
-            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            std::vector<uint32_t> tokens = load_token_file(nll_path, q27::MetalEngine::vocabulary_size());
             if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
             if (tokens.size() < 2) throw std::runtime_error("--kl-pair needs at least two tokens");
             if (tokens.size() - 1 > context)
@@ -1045,7 +1048,7 @@ int main(int argc, char** argv) {
         // the 17 GiB baseline runs alone within the M4's budget; candidates
         // replay against the dump via --kl-vs-dump below.
         if (!logits_dump.empty()) {
-            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            std::vector<uint32_t> tokens = load_token_file(nll_path, q27::MetalEngine::vocabulary_size());
             if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
             if (tokens.size() < 2) throw std::runtime_error("--logits-dump needs at least two tokens");
             if (tokens.size() - 1 > context)
@@ -1104,7 +1107,7 @@ int main(int argc, char** argv) {
         // buckets, tail, and runs reporting are identical to --kl-pair's, and
         // --kl-pair-out carries the per-position values for the bootstrap.
         if (!kl_vs_dump.empty()) {
-            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            std::vector<uint32_t> tokens = load_token_file(nll_path, q27::MetalEngine::vocabulary_size());
             if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
             if (tokens.size() < 2) throw std::runtime_error("--kl-vs-dump needs at least two tokens");
             if (tokens.size() - 1 > context)
@@ -1219,7 +1222,7 @@ int main(int argc, char** argv) {
         if (validate_only) { puts("artifacts and Metal architecture: OK"); return 0; }
 
         if (!nll_path.empty()) {
-            std::vector<uint32_t> tokens = load_token_file(nll_path);
+            std::vector<uint32_t> tokens = load_token_file(nll_path, q27::MetalEngine::vocabulary_size());
             if (nll_long > 0 && tokens.size() > nll_long) tokens.resize(nll_long);
             // n-1 positions are encoded; the final token is only a target.
             if (tokens.size() - 1 > context)

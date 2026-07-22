@@ -42,7 +42,7 @@ install-dev-q27: build/q27-agent build/q27-tui
 	@echo "installed $(HOME)/.grok/bin/q27 → source packaging (Q27_BIN_DIR=$(CURDIR)/build)"
 	@echo "try: q27 agent b1"
 
-test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui build/test_q27_agent_frontend
+test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui build/test_q27_agent_frontend build/test_tool_drift build/test_think_resolve build/test_stream_split
 	./build/test_artifacts
 	./build/test_depthctl
 	./build/test_toolconstrain
@@ -51,6 +51,12 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	./build/test_kl
 	./build/test_snapshot_evict
 	./build/test_snapshot_evict_store
+	@# Upstream shared-parser hardening tests (api_common.h / stream_split.h):
+	@# host-only, keep the Metal lane honest about the CUDA server's parser
+	@# fixes (drift modes, fence-skip, think resolution).
+	./build/test_tool_drift
+	./build/test_think_resolve
+	./build/test_stream_split
 	@# test_tokenizer needs the .tok for its chatml/toolmask/tool-call/streaming
 	@# gates (the vacuous-pass trap the handoff warned about: with NO args it
 	@# runs only the self-tests and exits 1). The exact-id cases file is a
@@ -280,6 +286,17 @@ build/test_artifacts: src/test_artifacts.cpp src/loader.cpp src/loader.h src/tok
 
 build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 	$(CXX) $(CXXFLAGS) tools/test_depthctl.cpp -o $@
+
+# Upstream shared-parser tests: keep the files pristine for future merges
+# (they include "api_common.h" path-less), hence -Isrc here.
+build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h | build
+	$(CXX) $(CXXFLAGS) -Isrc tools/test_tool_drift.cpp -o $@
+
+build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h | build
+	$(CXX) $(CXXFLAGS) -Isrc tools/test_think_resolve.cpp -o $@
+
+build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h | build
+	$(CXX) $(CXXFLAGS) -Isrc tools/test_stream_split.cpp -o $@
 
 build/test_toolconstrain: tools/test_toolconstrain.cpp src/toolconstrain.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_toolconstrain.cpp -o $@

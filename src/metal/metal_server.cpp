@@ -2060,24 +2060,21 @@ int main(int argc,char** argv) {
                         messages=openai_msgs(request);
                         if(request.contains("tools") && request["tools"].is_array())
                             tools=request["tools"];
-                        think=request.value("enable_thinking",true);
-                        if(request.contains("chat_template_kwargs") &&
-                           request["chat_template_kwargs"].is_object())
-                            think=request["chat_template_kwargs"].value(
-                                "enable_thinking",think);
+                        think=q27::resolve_think(request,true);
                     } else if(api=="responses") {
                         ResponsesPromptInput normalized=responses_prompt_input(request);
                         tools=std::move(normalized.tools);
                         messages=std::move(normalized.messages);
+                        think=q27::resolve_think(request,true);
                     } else if(api=="messages" || api=="anthropic") {
                         // Claude Code speaks Anthropic /v1/messages. Reuse the
                         // SAME canonicalizer as ordinary serving (line ~2388:
                         // chatml_prompt(anthropic_msgs(body), tools, true)) so
                         // the prewarmed prefix is byte-for-byte the prefix the
-                        // live request will prefill. think=true matches serving.
+                        // live request will prefill. Same resolver as serving.
                         messages=q27::anthropic_msgs(request);
                         tools=q27::anthropic_tools_json(request);
-                        think=true;
+                        think=q27::resolve_think(request,true);
                     } else throw std::runtime_error(
                         "api must be chat_completions, responses, or messages");
 
@@ -2143,7 +2140,7 @@ int main(int argc,char** argv) {
         // tool protocol) ----
         server.Post("/v1/completions",guarded("completions",[&](const json& body,httplib::Response& r,socket_t sock){
             auto ids=to_u32(runtime.tokenizer.encode(body.value("prompt","")));
-            uint32_t n=max_tokens(body,256);
+            uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop");
             const std::vector<std::string> tnames=tool_names_from(body);
@@ -2240,14 +2237,12 @@ int main(int argc,char** argv) {
         // "tool_calls"; <think> segments go to reasoning_content (llama.cpp
         // convention) instead of leaking raw into content.
         server.Post("/v1/chat/completions",guarded("chat",[&](const json& body,httplib::Response& r,socket_t sock){
-            bool think=body.value("enable_thinking",true);
-            if(body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
-                think=body["chat_template_kwargs"].value("enable_thinking",think);
+            bool think=q27::resolve_think(body,true);
             const json tools=body.contains("tools") && body["tools"].is_array()
                                  ?body["tools"]:json::array();
             const std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
-            uint32_t n=max_tokens(body,256);
+            uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop");
             const long rid=req_counter++;
@@ -2552,7 +2547,8 @@ int main(int argc,char** argv) {
                 return;
             }
             const std::string rendered=q27::chatml_prompt(
-                q27::anthropic_msgs(body),q27::anthropic_tools_json(body),true);
+                q27::anthropic_msgs(body),q27::anthropic_tools_json(body),
+                q27::resolve_think(body,true));
             const long input_tokens=(long)runtime.tokenizer.encode(rendered).size();
             if(runtime.trace.enabled())
                 runtime.trace.event({{"kind","request"},{"api","count_tokens"},{"id",id},
@@ -2564,9 +2560,10 @@ int main(int argc,char** argv) {
 
         server.Post("/v1/messages",anthropic_guarded("messages",[&](const json& body,httplib::Response& r,socket_t sock){
             const json tools=q27::anthropic_tools_json(body);
-            const std::string rendered=q27::chatml_prompt(q27::anthropic_msgs(body),tools,true);
+            const std::string rendered=q27::chatml_prompt(q27::anthropic_msgs(body),tools,
+                                                          q27::resolve_think(body,true));
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
-            uint32_t n=max_tokens(body,1024);
+            uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop_sequences");
             const long rid=req_counter++;
@@ -2926,9 +2923,10 @@ int main(int argc,char** argv) {
             json tools=std::move(normalized.tools);
             std::set<std::string> custom_names=std::move(normalized.custom_names);
             std::vector<q27::Msg> merged=std::move(normalized.messages);
-            const std::string rendered=q27::chatml_prompt(merged,tools,true);
+            const std::string rendered=q27::chatml_prompt(merged,tools,
+                                                          q27::resolve_think(body,true));
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
-            uint32_t n=max_tokens(body,4096);
+            uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop");
             if(ids.empty()) throw std::runtime_error("input is empty");
