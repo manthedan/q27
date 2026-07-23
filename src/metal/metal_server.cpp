@@ -652,7 +652,6 @@ struct Runtime {
     // traces a serving hazard; upstream's README documents the same
     // default for speed). --think flips the profile to prefilling an open
     // think tag. Either way, per-request fields override (resolve_think).
-    bool think_default=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
     DiskSnapshotStore snapstore{&snap_peek_adapter,&snap_hash_sha1};
@@ -666,6 +665,7 @@ struct Runtime {
     size_t prefix_entries_config=0;
     uint64_t snapshot_max_bytes_config=0;
     uint32_t max_tokens_default_config=0;
+    bool think_default=false;   // --think; see the profile comment above
     std::mutex model_identity_mu;
     // Auto-snapshot threshold in prompt tokens (0 = hint-only); set with
     // the snapshot store, meaningful only when snapstore.enabled().
