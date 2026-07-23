@@ -2341,10 +2341,10 @@ int main(int argc,char** argv) {
         // "tool_calls"; <think> segments go to reasoning_content (llama.cpp
         // convention) instead of leaking raw into content.
         server.Post("/v1/chat/completions",guarded("chat",[&](const json& body,httplib::Response& r,socket_t sock){
-            bool think=q27::resolve_think(body,think_default);
+            bool think_req=q27::resolve_think(body,think_default);
             const json tools=body.contains("tools") && body["tools"].is_array()
                                  ?body["tools"]:json::array();
-            const std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think);
+            const std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
@@ -2375,6 +2375,10 @@ int main(int argc,char** argv) {
                     {"snapshot",snap_hint},{"token_head",trace_token_head(ids)},{"rendered",trace_text(rendered)}});
             if(!wants_stream(body)) {
                 q27::StreamSplitter sp;
+                // think=true renders an OPEN think tag: the first generated
+                // token is already inside the block, so pre-seed the channel
+                // (upstream fee3b27; mirrors the FORCED tool_choice pre-seed).
+                if(think_req) sp.chan=q27::StreamSplitter::THINK;
                 std::string think_buf,text,tool_buf;
                 std::vector<q27::ToolCall> calls;
                 auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
@@ -2439,7 +2443,7 @@ int main(int argc,char** argv) {
             r.set_header("Content-Type","text/event-stream");
             auto stream_active=std::make_shared<Runtime::StreamScope>(runtime);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,id,rid,created,tools,has_tools,tnames,snap_hint,sock,stream_active](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,id,rid,created,tools,has_tools,tnames,snap_hint,sock,stream_active,think_req](size_t,httplib::DataSink& sink)->bool {
                     (void)stream_active;
                     bool alive=true;
                     auto last_wire=std::chrono::steady_clock::now();
@@ -2468,6 +2472,7 @@ int main(int argc,char** argv) {
                         // also the client-gone probe before generation starts.
                         if(!chunk({{"role","assistant"},{"content",""}},nullptr)) { sink.done(); return true; }
                         q27::StreamSplitter sp;
+                        if(think_req) sp.chan=q27::StreamSplitter::THINK;
                         std::string tool_buf,text_accum;
                         int tool_counter=0;
                         bool any_call=false,all_calls_clean=true;
@@ -2664,8 +2669,8 @@ int main(int argc,char** argv) {
 
         server.Post("/v1/messages",anthropic_guarded("messages",[&](const json& body,httplib::Response& r,socket_t sock){
             const json tools=q27::anthropic_tools_json(body);
-            const std::string rendered=q27::chatml_prompt(q27::anthropic_msgs(body),tools,
-                                                          q27::resolve_think(body,think_default));
+            const bool think_req=q27::resolve_think(body,think_default);
+            const std::string rendered=q27::chatml_prompt(q27::anthropic_msgs(body),tools,think_req);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
@@ -2697,6 +2702,7 @@ int main(int argc,char** argv) {
                     {"snapshot",snap_hint},{"token_head",trace_token_head(ids)},{"rendered",trace_text(rendered)}});
             if(!wants_stream(body)) {
                 q27::StreamSplitter sp;
+                if(think_req) sp.chan=q27::StreamSplitter::THINK;
                 std::string think,text,tool_buf;
                 std::vector<q27::ToolCall> calls;
                 auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
@@ -2763,7 +2769,7 @@ int main(int argc,char** argv) {
             r.set_header("Content-Type","text/event-stream");
             auto stream_active=std::make_shared<Runtime::StreamScope>(runtime);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,mid,rid,tools,has_tools,tnames,snap_hint,sock,stream_active](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,mid,rid,tools,has_tools,tnames,snap_hint,sock,stream_active,think_req](size_t,httplib::DataSink& sink)->bool {
                     (void)stream_active;
                     bool alive=true;
                     auto last_wire=std::chrono::steady_clock::now();
@@ -2780,6 +2786,7 @@ int main(int argc,char** argv) {
                     int block_counter=0,tool_counter=0,idx=-1,chan_open=-1;
                     bool any=false,any_call=false;
                     q27::StreamSplitter sp;
+                    if(think_req) sp.chan=q27::StreamSplitter::THINK;
                     std::string tool_buf,text_accum;
                     auto close_block=[&](){
                         if(idx<0) return;
@@ -3027,8 +3034,8 @@ int main(int argc,char** argv) {
             json tools=std::move(normalized.tools);
             std::set<std::string> custom_names=std::move(normalized.custom_names);
             std::vector<q27::Msg> merged=std::move(normalized.messages);
-            const std::string rendered=q27::chatml_prompt(merged,tools,
-                                                          q27::resolve_think(body,think_default));
+            const bool think_req=q27::resolve_think(body,think_default);
+            const std::string rendered=q27::chatml_prompt(merged,tools,think_req);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
@@ -3131,6 +3138,7 @@ int main(int argc,char** argv) {
                     push_call(c.name,c.arguments,incomplete_item);
                 };
                 q27::StreamSplitter sp;
+                if(think_req) sp.chan=q27::StreamSplitter::THINK;
                 auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                     if(ch==q27::StreamSplitter::TOOL) {
                         if(!think.empty()) flush_think();
@@ -3192,7 +3200,7 @@ int main(int argc,char** argv) {
             auto stream_active=std::make_shared<Runtime::StreamScope>(runtime);
             r.set_chunked_content_provider("text/event-stream",
                 [&runtime,ids,n,sampling,stops,rn,resp_id,msg_id,tools,custom_names,tnames,snap_hint,sock,
-                 test_force_error,test_malformed,stream_active](size_t,httplib::DataSink& sink)->bool {
+                 test_force_error,test_malformed,stream_active,think_req](size_t,httplib::DataSink& sink)->bool {
                     (void)stream_active;
                     bool alive=true;
                     auto last_wire=std::chrono::steady_clock::now();
@@ -3211,6 +3219,7 @@ int main(int argc,char** argv) {
                     std::string think,text,tool_buf,bare_pending,active_msg_id;
                     bool bare_holding=false;
                     q27::StreamSplitter sp;
+                    if(think_req) sp.chan=q27::StreamSplitter::THINK;
                         auto item_done=[&](const json& it){
                             ev({{"type","response.output_item.done"},{"output_index",out_index++},{"item",it}});
                             items.push_back(it);
