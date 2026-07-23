@@ -646,6 +646,13 @@ struct Runtime {
     // or serving burst-hostile traffic — either way it should be visible).
     std::atomic<uint64_t> suffix_burst_rounds_total{0}, suffix_fallback_rounds_total{0};
     bool constrain_tools=false;
+    // Server thinking profile (upstream v0.4.0 parity): the DEFAULT is
+    // no-think — prompts render the closed empty think block so the model
+    // answers directly (the qwen36 think-forever pathology makes forced
+    // traces a serving hazard; upstream's README documents the same
+    // default for speed). --think flips the profile to prefilling an open
+    // think tag. Either way, per-request fields override (resolve_think).
+    bool think_default=false;
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache mask_cache;
     DiskSnapshotStore snapstore{&snap_peek_adapter,&snap_hash_sha1};
@@ -702,6 +709,7 @@ struct Runtime {
                     {"snapshot_max_bytes",snapshot_max_bytes_config},
                     {"snapshot_spine_pin",snapshot_spine_pin_config},
                     {"max_tokens_default",max_tokens_default_config},
+                    {"think_default",think_default},
                     {"sampling_default",{{"temperature",sampling_default_temperature},
                         {"top_p",sampling_default_top_p},{"top_k",sampling_default_top_k}}},
                     {"kv_fp16_except",e.kv_fp16_except()},{"kv_fp16_cell_masks",cell_masks},
@@ -725,11 +733,11 @@ struct Runtime {
             uint32_t width,uint32_t sfx_width,size_t cache_entries,bool constrain,
             uint32_t slot_count,uint32_t budget_mb,const std::string& snapshot_dir,
             uint32_t snapshot_max_mb,long long snapshot_auto,uint32_t max_tokens_default,
-            int spine_pin,bool experimental_prefix)
+            int spine_pin,bool experimental_prefix,bool think_srv)
         :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
          constrain_tools(constrain),experimental_prefix_cache(experimental_prefix),
          turbo3_kv(turbo3),prefix_entries_config(cache_entries),
-         max_tokens_default_config(max_tokens_default) {
+         max_tokens_default_config(max_tokens_default),think_default(think_srv) {
         // Server identity (homebrew plan Q2): /health and the boot trace name
         // the resident artifact so wrapper/clients can tell what's loaded.
         model_name=std::filesystem::path(model).filename().string();
@@ -1798,7 +1806,7 @@ static int mark_supervisor_lock_close_on_exec() {
 int main(int argc,char** argv) {
     if (mark_supervisor_lock_close_on_exec() != 0) return 2;
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--slots N] [--trace path]\n"
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--think] [--slots N] [--trace path]\n"
                        "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
                        "       [--temperature-default T] [--top-p-default P] [--top-k-default K]\n"
                        "       [--experimental-prefix-cache path]\n"
@@ -1814,6 +1822,7 @@ int main(int argc,char** argv) {
         // snapshot_auto keeps a signed sentinel because 0 is meaningful
         // (hint-only saves).
         uint32_t budget_mb=0,snapshot_max_mb=0,max_tokens_default=0;
+        bool think_default=false;   // --think flips the server profile (default no-think)
         // Sampling-default sentinels double as "flag absent" (-1 / 0 /
         // UINT32_MAX are all outside the valid ranges); with neither flag
         // nor env the resolved values are the shipped greedy defaults.
@@ -1845,6 +1854,7 @@ int main(int argc,char** argv) {
             else if(arg=="--slots" && i+1<argc) slot_count=parse_u32(argv[++i],"--slots");
             else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
             else if(arg=="--constrain-tools") constrain_tools=true;
+            else if(arg=="--think") think_default=true;
             else if(arg=="--trace" && i+1<argc) trace_path=argv[++i];
             else if(arg=="--snapshot-dir" && i+1<argc) { snapshot_dir=argv[++i]; if(snapshot_dir.empty()) throw std::runtime_error("invalid --snapshot-dir"); }
             else if(arg=="--experimental-prefix-cache" && i+1<argc) {
@@ -1924,7 +1934,7 @@ int main(int argc,char** argv) {
                     (double)sampling_default_temperature);
         Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count,
                         budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto,max_tokens_default,spine_pin,
-                        !experimental_prefix_dir.empty());
+                        !experimental_prefix_dir.empty(),think_default);
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
             runtime.trace.event({{"kind","boot"},{"ctx",runtime.context},{"kv",turbo3?"turbo3":"fp16"},
@@ -2154,12 +2164,12 @@ int main(int argc,char** argv) {
                         messages=openai_msgs(request);
                         if(request.contains("tools") && request["tools"].is_array())
                             tools=request["tools"];
-                        think=q27::resolve_think(request,true);
+                        think=q27::resolve_think(request,think_default);
                     } else if(api=="responses") {
                         ResponsesPromptInput normalized=responses_prompt_input(request);
                         tools=std::move(normalized.tools);
                         messages=std::move(normalized.messages);
-                        think=q27::resolve_think(request,true);
+                        think=q27::resolve_think(request,think_default);
                     } else if(api=="messages" || api=="anthropic") {
                         // Claude Code speaks Anthropic /v1/messages. Reuse the
                         // SAME canonicalizer as ordinary serving (line ~2388:
@@ -2168,7 +2178,7 @@ int main(int argc,char** argv) {
                         // live request will prefill. Same resolver as serving.
                         messages=q27::anthropic_msgs(request);
                         tools=q27::anthropic_tools_json(request);
-                        think=q27::resolve_think(request,true);
+                        think=q27::resolve_think(request,think_default);
                     } else throw std::runtime_error(
                         "api must be chat_completions, responses, or messages");
 
@@ -2331,7 +2341,7 @@ int main(int argc,char** argv) {
         // "tool_calls"; <think> segments go to reasoning_content (llama.cpp
         // convention) instead of leaking raw into content.
         server.Post("/v1/chat/completions",guarded("chat",[&](const json& body,httplib::Response& r,socket_t sock){
-            bool think=q27::resolve_think(body,true);
+            bool think=q27::resolve_think(body,think_default);
             const json tools=body.contains("tools") && body["tools"].is_array()
                                  ?body["tools"]:json::array();
             const std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think);
@@ -2642,7 +2652,7 @@ int main(int argc,char** argv) {
             }
             const std::string rendered=q27::chatml_prompt(
                 q27::anthropic_msgs(body),q27::anthropic_tools_json(body),
-                q27::resolve_think(body,true));
+                q27::resolve_think(body,think_default));
             const long input_tokens=(long)runtime.tokenizer.encode(rendered).size();
             if(runtime.trace.enabled())
                 runtime.trace.event({{"kind","request"},{"api","count_tokens"},{"id",id},
@@ -2655,7 +2665,7 @@ int main(int argc,char** argv) {
         server.Post("/v1/messages",anthropic_guarded("messages",[&](const json& body,httplib::Response& r,socket_t sock){
             const json tools=q27::anthropic_tools_json(body);
             const std::string rendered=q27::chatml_prompt(q27::anthropic_msgs(body),tools,
-                                                          q27::resolve_think(body,true));
+                                                          q27::resolve_think(body,think_default));
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
@@ -3018,7 +3028,7 @@ int main(int argc,char** argv) {
             std::set<std::string> custom_names=std::move(normalized.custom_names);
             std::vector<q27::Msg> merged=std::move(normalized.messages);
             const std::string rendered=q27::chatml_prompt(merged,tools,
-                                                          q27::resolve_think(body,true));
+                                                          q27::resolve_think(body,think_default));
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);

@@ -56,7 +56,9 @@ print('ORDER-OK' if ok else 'ORDER-BAD:%s'%[(x.get('type'),x.get('output_index')
 printf '%s' "$SB" | grep -q '"response.completed"' && pass "G8b(i) response.completed terminator" || fail "G8b(i) no response.completed"
 
 # Reasoning-producing leg: every reasoning done must pair with its own added.
-B_REASON_BODY='{"model":"q27-metal","max_output_tokens":256,"input":"Think step by step about 17 times 19, then give the answer.","stream":true}'
+# Reasoning is opt-in under the no-think server default (2026-07-22 parity
+# with upstream v0.4.0): the lifecycle leg must ask for it explicitly.
+B_REASON_BODY='{"model":"q27-metal","max_output_tokens":256,"enable_thinking":true,"input":"Think step by step about 17 times 19, then give the answer.","stream":true}'
 SR=$(curl -s -H "Content-Type: application/json" --max-time 300 "$BASE/v1/responses" -d "$B_REASON_BODY")
 printf '%s' "$SR" | python3 -c "
 import sys,json
