@@ -211,10 +211,15 @@ std::vector<uint32_t> to_u32(const std::vector<int>& ids) {
 std::string text_content(const json& content) {
     if(content.is_string()) return content.get<std::string>();
     std::string out;
+    // jstr, not value(): inside a content ARRAY the established rule is
+    // skip-the-malformed-part (the is_object guard above), not reject the whole
+    // request. value() throws on a part whose "type"/"text" is present but
+    // null or non-string, which would 400 a request the is_object guard was
+    // written to tolerate. Upstream 1a15ff8 made the same swap on the CUDA arm.
     if(content.is_array()) for(const auto& part:content) {
         if(!part.is_object()) continue;
-        const std::string type=part.value("type","");
-        if(type=="text" || type=="input_text" || type=="output_text") out+=part.value("text","");
+        const std::string type=q27::jstr(part,"type");
+        if(type=="text" || type=="input_text" || type=="output_text") out+=q27::jstr(part,"text");
     }
     return out;
 }
@@ -237,7 +242,7 @@ std::vector<q27::Msg> openai_msgs(const json& body) {
         throw std::runtime_error("messages must be an array");
     for(const auto& message:body["messages"]) {
         if(!message.is_object()) continue;
-        std::string role=message.value("role","");
+        std::string role=q27::jstr(message,"role");
         if(role=="developer") role="system";
         std::string content=message.contains("content")?text_content(message["content"]):"";
         if(role.empty()) continue;
@@ -259,7 +264,7 @@ std::vector<q27::Msg> openai_msgs(const json& body) {
                     } else args=fn["arguments"];
                 }
                 if(!content.empty() && content.back()!='\n') content+="\n";
-                content+=q27::tool_call_text(fn.value("name",""),args);
+                content+=q27::tool_call_text(q27::jstr(fn,"name"),args);
             }
         }
         msgs.push_back({role,content});
@@ -291,20 +296,20 @@ ResponsesPromptInput responses_prompt_input(const json& body) {
     if(body.contains("tools") && body["tools"].is_array())
         for(const auto& t:body["tools"]) {
             if(!t.is_object()) continue;
-            const std::string ty=t.value("type","");
+            const std::string ty=q27::jstr(t,"type");
             if(t.contains("function") && t["function"].is_object()) out.tools.push_back(t);
             else if(ty=="function" && t.contains("name"))
                 out.tools.push_back({{"type","function"},
-                    {"function",{{"name",t.value("name","")},
-                                 {"description",t.value("description","")},
+                    {"function",{{"name",q27::jstr(t,"name")},
+                                 {"description",q27::jstr(t,"description")},
                                  {"parameters",t.contains("parameters")?t["parameters"]
                                                                        :json::object()}}}});
             else if(ty=="custom") {
-                const std::string name=t.value("name","");
+                const std::string name=q27::jstr(t,"name");
                 out.custom_names.insert(name);
                 out.tools.push_back({{"type","function"},
                     {"function",{{"name",name},
-                                 {"description",t.value("description","")},
+                                 {"description",q27::jstr(t,"description")},
                                  {"parameters",{{"type","object"},
                                      {"properties",{{"input",{{"type","string"},
                                          {"description","The complete raw input text for this tool."}}}}},
@@ -318,20 +323,20 @@ ResponsesPromptInput responses_prompt_input(const json& body) {
         else if(body["input"].is_array())
             for(const auto& item:body["input"]) {
                 if(!item.is_object()) continue;
-                const std::string type=item.value("type","message");
+                const std::string type=q27::jstr(item,"type","message");
                 if(type=="message") {
-                    std::string role=item.value("role","user");
+                    std::string role=q27::jstr(item,"role","user");
                     if(role=="developer") role="system";
                     out.messages.push_back({role,item.contains("content")?
                         text_content(item["content"]):""});
                 } else if(type=="function_call" || type=="custom_tool_call") {
                     json args;
                     if(type=="function_call") {
-                        try { args=json::parse(item.value("arguments","{}")); }
-                        catch(...) { args=item.value("arguments",""); }
-                    } else args={{"input",item.value("input","")}};
+                        try { args=json::parse(q27::jstr(item,"arguments","{}")); }
+                        catch(...) { args=q27::jstr(item,"arguments"); }
+                    } else args={{"input",q27::jstr(item,"input")}};
                     out.messages.push_back({"assistant",
-                        q27::tool_call_text(item.value("name",""),args)});
+                        q27::tool_call_text(q27::jstr(item,"name"),args)});
                 } else if(type=="function_call_output" || type=="custom_tool_call_output") {
                     std::string value;
                     if(item.contains("output"))
@@ -375,8 +380,8 @@ std::vector<std::string> tool_names_from(const json& body) {
     for(const auto& t:body["tools"]) {
         if(!t.is_object()) continue;
         if(t.contains("function") && t["function"].is_object() && t["function"].contains("name"))
-            names.push_back(t["function"].value("name",""));
-        else if(t.contains("name")) names.push_back(t.value("name",""));
+            names.push_back(q27::jstr(t["function"],"name"));
+        else if(t.contains("name")) names.push_back(q27::jstr(t,"name"));
     }
     names.erase(std::remove(names.begin(),names.end(),std::string()),names.end());
     return names;
@@ -1768,7 +1773,21 @@ uint32_t max_tokens(const json& body,long long dflt) {
     return (uint32_t)value;
 }
 
-bool wants_stream(const json& body) { return body.value("stream",false); }
+// jbool, not value(): `{"stream": null}` is how a large share of
+// OpenAI-compatible request builders (LangChain/LiteLLM class) spell "unset",
+// and value() throws type_error.302 on a present-but-null key -- which
+// guarded() turns into a 400 invalid_request_error for a request that was
+// fine on the wire. sampling_params/max_tokens already treated null as
+// absent; `stream` and `prompt` were the two scalars that missed the rule
+// (upstream 1a15ff8 fixed the same class on the CUDA arm).
+//
+// DELIBERATE DIVERGENCE from upstream's jnum/jint on temperature/top_p/top_k/
+// seed/max_tokens: those stay STRICT here (a wrong-typed value is rejected,
+// not silently replaced by the server default) per the codex branch-review P2
+// recorded at sampling_params. Null-tolerance is the fix; wrong-type-tolerance
+// is not, because it serves a request whose sampling settings the client
+// believes were honored.
+bool wants_stream(const json& body) { return q27::jbool(body,"stream",false); }
 
 long unix_now() { return (long)std::time(nullptr); }
 
@@ -1806,10 +1825,10 @@ static int mark_supervisor_lock_close_on_exec() {
 int main(int argc,char** argv) {
     if (mark_supervisor_lock_close_on_exec() != 0) return 2;
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--think] [--slots N] [--trace path]\n"
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--think] [--request-think] [--slots N] [--trace path]\n"
                        "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
                        "       [--temperature-default T] [--top-p-default P] [--top-k-default K]\n"
-                       "       [--experimental-prefix-cache path]\n"
+                       "       [--experimental-prefix-cache path] [--api-key KEY] [--api-key-file path]\n"
                        "       (the snapshot/max-tokens/budget/sampling-default flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,SNAPSHOT_SPINE_PIN,MAX_TOKENS_DEFAULT,BUDGET_MB,TEMPERATURE_DEFAULT,TOP_P_DEFAULT,TOP_K_DEFAULT}; an explicit flag wins)\n",argv[0]);
         return 1;
     }
@@ -1823,6 +1842,15 @@ int main(int argc,char** argv) {
         // (hint-only saves).
         uint32_t budget_mb=0,snapshot_max_mb=0,max_tokens_default=0;
         bool think_default=false;   // --think flips the server profile (default no-think)
+        // --request-think (upstream 0a1b21f parity): honor the request's
+        // thinking fields. OFF by default -- without it, enable_thinking /
+        // chat_template_kwargs / Anthropic `thinking` are IGNORED and the boot
+        // profile stands. Closes the footgun where a benchmark or client that
+        // sends enable_thinking:true (many do) silently flips a no-think
+        // server into thinking mode. NOTE: this is a behavior change for the
+        // Metal arm, which honored those fields unconditionally through
+        // v0.6.1; pass --request-think to keep the old behavior.
+        bool req_think=false;
         // Sampling-default sentinels double as "flag absent" (-1 / 0 /
         // UINT32_MAX are all outside the valid ranges); with neither flag
         // nor env the resolved values are the shipped greedy defaults.
@@ -1831,6 +1859,12 @@ int main(int argc,char** argv) {
         long long snapshot_auto=-1;
         int spine_pin=-1;   // -1 = unset (env/default); 0/1 explicit flag
         bool turbo3=false; bool constrain_tools=false;
+        // Opt-in Bearer/x-api-key auth on the SERVING endpoints (upstream
+        // v0.4.0 + 1a15ff8 parity; the long-standing Metal gap #4 in
+        // docs/metal/PARITY-2026-07-22.md). Distinct from admin_token, which
+        // covers only the mutating admin routes. Empty = auth off, and the
+        // 127.0.0.1 default binding stays the posture for that case.
+        std::vector<std::string> api_keys;
         for(int i=3;i<argc;i++) {
             std::string arg=argv[i];
             if(arg=="--host" && i+1<argc) host=argv[++i];
@@ -1855,6 +1889,7 @@ int main(int argc,char** argv) {
             else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
             else if(arg=="--constrain-tools") constrain_tools=true;
             else if(arg=="--think") think_default=true;
+            else if(arg=="--request-think") req_think=true;
             else if(arg=="--trace" && i+1<argc) trace_path=argv[++i];
             else if(arg=="--snapshot-dir" && i+1<argc) { snapshot_dir=argv[++i]; if(snapshot_dir.empty()) throw std::runtime_error("invalid --snapshot-dir"); }
             else if(arg=="--experimental-prefix-cache" && i+1<argc) {
@@ -1873,8 +1908,43 @@ int main(int argc,char** argv) {
             else if(arg=="--top-k-default" && i+1<argc) { top_k_default=parse_u32(argv[++i],"--top-k-default"); if(top_k_default==UINT32_MAX) throw std::runtime_error("invalid --top-k-default"); }
             else if(arg=="--budget-mb" && i+1<argc) { budget_mb=parse_u32(argv[++i],"--budget-mb"); if(!budget_mb||budget_mb>(1u<<24)) throw std::runtime_error("--budget-mb must be an integer 1..16777216"); }
             else if(arg=="--snapshot-spine-pin" && i+1<argc) { spine_pin=(int)parse_u32(argv[++i],"--snapshot-spine-pin"); if(spine_pin>1) throw std::runtime_error("--snapshot-spine-pin must be 0 or 1"); }
+            // Auth config is fail-LOUD in both directions (upstream 1a15ff8
+            // item 4). An empty key can never authenticate anything --
+            // api_key_valid rejects an empty `provided` before comparing --
+            // so accepting one stands up a server that 401s every request;
+            // and a key FILE that opens but yields nothing usable stands up a
+            // server with auth silently OFF, the opposite of what the
+            // operator asked for. Refuse both at boot rather than serve a
+            // configuration nobody wanted.
+            else if(arg=="--api-key" && i+1<argc) {
+                if(!argv[++i][0]) throw std::runtime_error("--api-key: empty key (an empty key can never match)");
+                api_keys.push_back(argv[i]);
+            }
+            else if(arg=="--api-key-file" && i+1<argc) {
+                const size_t before=api_keys.size();
+                if(!q27::load_api_key_file(argv[++i],&api_keys))
+                    throw std::runtime_error(std::string("--api-key-file ")+argv[i]+": could not open");
+                if(api_keys.size()==before)
+                    throw std::runtime_error(std::string("--api-key-file ")+argv[i]+
+                        ": no keys found (every line blank or a #comment) -- refusing to start "
+                        "with auth silently disabled");
+            }
             else throw std::runtime_error("unknown/incomplete argument: "+arg);
         }
+        // Q27_API_KEY: a second, additive source (not exclusive with the CLI
+        // flags -- all configured keys are valid simultaneously, matching
+        // --api-key-file's multi-key semantics). Preferred where CLI args are
+        // visible via `ps` but the orchestrator's secret store is not.
+        if(const char* envkey=getenv("Q27_API_KEY"); envkey && envkey[0]) api_keys.push_back(envkey);
+        // The loopback-by-default binding was this server's only safety net
+        // before auth existed. Warn loudly rather than refuse: some
+        // deployments front this with their own reverse-proxy auth, and
+        // silently breaking those on upgrade would be worse.
+        if(api_keys.empty() && host!="127.0.0.1" && host!="localhost" && host!="::1")
+            fprintf(stderr,
+                    "WARNING: binding %s with NO API key configured (--api-key / "
+                    "--api-key-file / Q27_API_KEY) -- this server will accept "
+                    "unauthenticated requests from anyone who can reach it.\n",host.c_str());
         if(port>65535) throw std::runtime_error("port out of range");
         if(width && (width<2 || width>12)) throw std::runtime_error("MTP width must be 2..12");
         if(suffix_width && (suffix_width<2 || suffix_width>q27::MetalEngine::VERIFY_CHUNK_MAX))
@@ -1952,6 +2022,36 @@ int main(int argc,char** argv) {
         // wait while one generated (G6 found this). The 32-connection accept
         // queue stays the outer bound.
         server.new_task_queue=[]{ return new httplib::ThreadPool(16,32); };
+        // Opt-in API key auth (upstream v0.4.0 parity). No-op with zero
+        // per-request cost when api_keys is empty -- the handler is only
+        // installed when at least one key is configured, so the loopback-only
+        // default posture is byte-identical to before. /health is exempt on
+        // purpose: infra health checks (launchd, load balancers, the deploy
+        // scripts under deploy/) need it reachable without distributing the
+        // secret to that infrastructure. Every other route -- including
+        // /stats, /admin/* and the experimental prewarmer -- requires a valid
+        // key. Runs BEFORE route dispatch, so an unauthenticated request never
+        // reaches RequestScope admission, tokenization, or slot claim.
+        if(!api_keys.empty()) {
+            server.set_pre_routing_handler([api_keys](const httplib::Request& req,httplib::Response& r){
+                if(req.path=="/health") return httplib::Server::HandlerResponse::Unhandled;
+                const std::string provided=q27::extract_api_key(req.get_header_value("Authorization"),
+                                                                req.get_header_value("x-api-key"));
+                if(q27::api_key_valid(provided,api_keys))
+                    return httplib::Server::HandlerResponse::Unhandled;
+                // Anthropic-shaped error for the Anthropic-shaped endpoint
+                // family (Claude Code's SDK reads error.message off that exact
+                // shape); OpenAI-shaped for everything else -- the same split
+                // anthropic_guarded/guarded already use for 400s.
+                const bool anthropic_shape=req.path.rfind("/v1/messages",0)==0;
+                r.status=401;
+                if(!anthropic_shape) r.set_header("WWW-Authenticate","Bearer");
+                r.set_content(q27::auth_error_json(anthropic_shape),"application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            });
+            fprintf(stderr,"API key authentication enabled (%zu key%s configured)\n",
+                    api_keys.size(),api_keys.size()==1?"":"s");
+        }
         server.Get("/health",[&runtime](const httplib::Request& req,httplib::Response& r){
             json body={{"status","ok"},{"model",runtime.model_name},{"boot_id",runtime.boot_id},
                        {"runtime",runtime.serving_identity()},
@@ -2156,7 +2256,7 @@ int main(int argc,char** argv) {
                     if(!envelope.contains("request") || !envelope["request"].is_object())
                         throw std::runtime_error("request must be an object");
                     const json& request=envelope["request"];
-                    const std::string api=envelope.value("api","");
+                    const std::string api=q27::jstr(envelope,"api");
                     json tools=json::array();
                     std::vector<q27::Msg> messages;
                     bool think=true;
@@ -2164,12 +2264,12 @@ int main(int argc,char** argv) {
                         messages=openai_msgs(request);
                         if(request.contains("tools") && request["tools"].is_array())
                             tools=request["tools"];
-                        think=q27::resolve_think(request,think_default);
+                        think=q27::resolve_think(request,think_default,req_think);
                     } else if(api=="responses") {
                         ResponsesPromptInput normalized=responses_prompt_input(request);
                         tools=std::move(normalized.tools);
                         messages=std::move(normalized.messages);
-                        think=q27::resolve_think(request,think_default);
+                        think=q27::resolve_think(request,think_default,req_think);
                     } else if(api=="messages" || api=="anthropic") {
                         // Claude Code speaks Anthropic /v1/messages. Reuse the
                         // SAME canonicalizer as ordinary serving (line ~2388:
@@ -2178,7 +2278,7 @@ int main(int argc,char** argv) {
                         // live request will prefill. Same resolver as serving.
                         messages=q27::anthropic_msgs(request);
                         tools=q27::anthropic_tools_json(request);
-                        think=q27::resolve_think(request,think_default);
+                        think=q27::resolve_think(request,think_default,req_think);
                     } else throw std::runtime_error(
                         "api must be chat_completions, responses, or messages");
 
@@ -2243,7 +2343,7 @@ int main(int argc,char** argv) {
         // ---- OpenAI /v1/completions (raw continuation; no template, no
         // tool protocol) ----
         server.Post("/v1/completions",guarded("completions",[&](const json& body,httplib::Response& r,socket_t sock){
-            auto ids=to_u32(runtime.tokenizer.encode(body.value("prompt","")));
+            auto ids=to_u32(runtime.tokenizer.encode(q27::jstr(body,"prompt")));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
             const std::vector<std::string> stops=parse_stops(body,"stop");
@@ -2262,23 +2362,25 @@ int main(int argc,char** argv) {
                 return;
             }
             if(runtime.trace.enabled())
-                // body.value("prompt","") repeats the encode line's identical
-                // accessor verbatim — a non-string prompt throws THERE first
-                // (guarded 400), so this event adds no new throw path (codex
-                // P2 on the trace round, rejected with this evidence).
+                // q27::jstr(body,"prompt") repeats the encode line's identical
+                // accessor verbatim, so this event adds no new throw path
+                // (codex P2 on the trace round, rejected with this evidence).
+                // jstr never throws at all: a null/non-string prompt reads as
+                // absent, the encode above yields no ids, and the empty-prompt
+                // check at the top of this handler has already 400'd.
                 runtime.trace.event({{"kind","request"},{"api","completions"},{"id",id},
                     {"stream",wants_stream(body)},{"prompt_tokens",(uint64_t)ids.size()},
                     {"max_tokens",n},{"sampling",{{"temperature",sampling.temperature},{"top_p",sampling.top_p},
                         {"top_k",sampling.top_k},{"seed",sampling.seed}}},{"stops",stops},{"tool_names",tnames},
-                    {"snapshot",body.value("snapshot",false)},
-                    {"token_head",trace_token_head(ids)},{"rendered",trace_text(body.value("prompt",""))}});
+                    {"snapshot",q27::jbool(body,"snapshot",false)},
+                    {"token_head",trace_token_head(ids)},{"rendered",trace_text(q27::jstr(body,"prompt"))}});
             if(!wants_stream(body)) {
                 std::string text; size_t probe=0;
                 auto outcome=traced_engine("completions",id,[&]{
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ text+=piece;
                             return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
-                        tnames,body.value("snapshot",false),socket_live(sock),id); });
+                        tnames,q27::jbool(body,"snapshot",false),socket_live(sock),id); });
                 if(outcome.finish==Runtime::Finish::Cancelled) { r.status=499; return; }
                 runtime.trace.event({{"kind","outcome"},{"api","completions"},{"id",id},
                     {"finish",openai_finish(outcome.finish)},{"terminal",trace_finish(outcome.finish)},
@@ -2292,7 +2394,7 @@ int main(int argc,char** argv) {
                 return;
             }
             r.set_header("Content-Type","text/event-stream");
-            const bool snap_hint=body.value("snapshot",false);
+            const bool snap_hint=q27::jbool(body,"snapshot",false);
             auto stream_active=std::make_shared<Runtime::StreamScope>(runtime);
             r.set_chunked_content_provider("text/event-stream",
                 [&runtime,ids,n,sampling,stops,id,created,tnames,snap_hint,sock,stream_active](size_t,httplib::DataSink& sink)->bool {
@@ -2341,7 +2443,7 @@ int main(int argc,char** argv) {
         // "tool_calls"; <think> segments go to reasoning_content (llama.cpp
         // convention) instead of leaking raw into content.
         server.Post("/v1/chat/completions",guarded("chat",[&](const json& body,httplib::Response& r,socket_t sock){
-            bool think_req=q27::resolve_think(body,think_default);
+            bool think_req=q27::resolve_think(body,think_default,req_think);
             const json tools=body.contains("tools") && body["tools"].is_array()
                                  ?body["tools"]:json::array();
             const std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req);
@@ -2365,7 +2467,7 @@ int main(int argc,char** argv) {
             }
             const bool has_tools=!tools.empty();
             const std::vector<std::string> tnames=tool_names_from(body);
-            const bool snap_hint=body.value("snapshot",false);
+            const bool snap_hint=q27::jbool(body,"snapshot",false);
             if(runtime.trace.enabled())
                 runtime.trace.event({{"kind","request"},{"api","chat"},{"id",id},
                     {"stream",wants_stream(body)},{"prompt_tokens",(uint64_t)ids.size()},
@@ -2657,7 +2759,7 @@ int main(int argc,char** argv) {
             }
             const std::string rendered=q27::chatml_prompt(
                 q27::anthropic_msgs(body),q27::anthropic_tools_json(body),
-                q27::resolve_think(body,think_default));
+                q27::resolve_think(body,think_default,req_think));
             const long input_tokens=(long)runtime.tokenizer.encode(rendered).size();
             if(runtime.trace.enabled())
                 runtime.trace.event({{"kind","request"},{"api","count_tokens"},{"id",id},
@@ -2669,7 +2771,7 @@ int main(int argc,char** argv) {
 
         server.Post("/v1/messages",anthropic_guarded("messages",[&](const json& body,httplib::Response& r,socket_t sock){
             const json tools=q27::anthropic_tools_json(body);
-            const bool think_req=q27::resolve_think(body,think_default);
+            const bool think_req=q27::resolve_think(body,think_default,req_think);
             const std::string rendered=q27::chatml_prompt(q27::anthropic_msgs(body),tools,think_req);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
@@ -2692,7 +2794,7 @@ int main(int argc,char** argv) {
             }
             const bool has_tools=tools.is_array() && !tools.empty();
             const std::vector<std::string> tnames=tool_names_from(body);
-            const bool snap_hint=body.value("snapshot",false);
+            const bool snap_hint=q27::jbool(body,"snapshot",false);
             if(runtime.trace.enabled())
                 runtime.trace.event({{"kind","request"},{"api","messages"},{"id",mid},
                     {"stream",wants_stream(body)},{"prompt_tokens",(uint64_t)ids.size()},
@@ -3034,7 +3136,7 @@ int main(int argc,char** argv) {
             json tools=std::move(normalized.tools);
             std::set<std::string> custom_names=std::move(normalized.custom_names);
             std::vector<q27::Msg> merged=std::move(normalized.messages);
-            const bool think_req=q27::resolve_think(body,think_default);
+            const bool think_req=q27::resolve_think(body,think_default,req_think);
             const std::string rendered=q27::chatml_prompt(merged,tools,think_req);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
@@ -3052,7 +3154,7 @@ int main(int argc,char** argv) {
                 return;
             }
             const std::vector<std::string> tnames=tool_names_from(body);
-            const bool snap_hint=body.value("snapshot",false);
+            const bool snap_hint=q27::jbool(body,"snapshot",false);
             if(runtime.trace.enabled())
                 runtime.trace.event({{"kind","request"},{"api","responses"},{"id",resp_id},
                     {"stream",wants_stream(body)},{"prompt_tokens",(uint64_t)ids.size()},
@@ -3195,8 +3297,8 @@ int main(int argc,char** argv) {
                 return;
             }
             r.set_header("Content-Type","text/event-stream");
-            const bool test_force_error=runtime.test_failpoints && body.value("q27_test_engine_error",false);
-            const bool test_malformed=runtime.test_failpoints && body.value("q27_test_malformed_wrapper",false);
+            const bool test_force_error=runtime.test_failpoints && q27::jbool(body,"q27_test_engine_error",false);
+            const bool test_malformed=runtime.test_failpoints && q27::jbool(body,"q27_test_malformed_wrapper",false);
             auto stream_active=std::make_shared<Runtime::StreamScope>(runtime);
             r.set_chunked_content_provider("text/event-stream",
                 [&runtime,ids,n,sampling,stops,rn,resp_id,msg_id,tools,custom_names,tnames,snap_hint,sock,
@@ -3641,11 +3743,35 @@ int main(int argc,char** argv) {
                 });
         }));
 
+        // SO_REUSEADDR only (upstream e0a1a39 parity; macOS defines
+        // SO_REUSEPORT, so httplib's default_socket_options picks it here
+        // exactly as it does on Linux). SO_REUSEPORT lets a SECOND Metal
+        // server co-bind this port and the kernel then load-balances
+        // connections across both. On this box that is worse than the CUDA
+        // arm's eval-integrity hazard: a second server also loads a second
+        // copy of a ~17 GiB artifact into 24 GiB of unified memory. REUSEADDR
+        // keeps fast rebind after TIME_WAIT without permitting live co-bind,
+        // so the second process fails into the FATAL below instead.
+        server.set_socket_options([](socket_t sock) {
+            int opt=1;
+            setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,reinterpret_cast<const void*>(&opt),sizeof(opt));
+        });
+        // Bind FIRST, announce only on success (upstream e0a1a39 parity).
+        // The old order printed "listening on ..." and the admin token before
+        // listen() had bound anything, so a port squatter produced a startup
+        // log that claimed success, leaked the admin token to stderr, and only
+        // then failed -- operators (and log scrapers) read the first line.
+        if(!server.bind_to_port(host.c_str(),(int)port)) {
+            fprintf(stderr,
+                    "FATAL: cannot bind %s:%u (port already in use? see "
+                    "`lsof -nP -iTCP:%u -sTCP:LISTEN`)\n",host.c_str(),port,port);
+            return 1;
+        }
         fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u, slots=%zu)\n",
                 host.c_str(),port,runtime.context,turbo3?"turbo3":"fp16",width,runtime.slots.size());
         // Operator-only: the admin credential goes to stderr (never HTTP).
         fprintf(stderr,"q27 Metal server admin token (X-Q27-Admin-Token): %s\n",runtime.admin_token.c_str());
-        if(!server.listen(host.c_str(),(int)port)) throw std::runtime_error("server listen failed");
+        if(!server.listen_after_bind()) throw std::runtime_error("server listen failed");
         return 0;
     } catch(const std::exception& e) { fprintf(stderr,"%s\n",e.what()); return 1; }
 }

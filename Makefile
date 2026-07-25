@@ -42,7 +42,7 @@ install-dev-q27: build/q27-agent build/q27-tui
 	@echo "installed $(HOME)/.grok/bin/q27 → source packaging (Q27_BIN_DIR=$(CURDIR)/build)"
 	@echo "try: q27 agent b1"
 
-test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui build/test_q27_agent_frontend build/test_tool_drift build/test_think_resolve build/test_stream_split
+test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui build/test_q27_agent_frontend build/test_tool_drift build/test_think_resolve build/test_stream_split build/test_openai_bridge build/test_auth build/test_prefix_cache
 	./build/test_artifacts
 	./build/test_depthctl
 	./build/test_toolconstrain
@@ -57,6 +57,14 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	./build/test_tool_drift
 	./build/test_think_resolve
 	./build/test_stream_split
+	@# test_openai_bridge covers the tolerant jnum/jint/jbool/jstr readers and
+	@# the CC billing-header normalizer the Metal serving path now shares;
+	@# test_auth covers the api_key helpers behind Metal's --api-key.
+	@# test_prefix_cache is CUDA-tier-only today but is host-portable and
+	@# guards the shared header against a Metal-arm merge breaking it.
+	./build/test_openai_bridge
+	./build/test_auth
+	./build/test_prefix_cache
 	@# test_tokenizer needs the .tok for its chatml/toolmask/tool-call/streaming
 	@# gates (the vacuous-pass trap the handoff warned about: with NO args it
 	@# runs only the self-tests and exits 1). The exact-id cases file is a
@@ -297,6 +305,12 @@ build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h | build
 
 build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h | build
 	$(CXX) $(CXXFLAGS) -Isrc tools/test_stream_split.cpp -o $@
+
+build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h | build
+	$(CXX) $(CXXFLAGS) -Isrc tools/test_openai_bridge.cpp -o $@
+
+build/test_auth: tools/test_auth.cpp src/api_common.h | build
+	$(CXX) $(CXXFLAGS) -Isrc tools/test_auth.cpp -o $@
 
 build/test_toolconstrain: tools/test_toolconstrain.cpp src/toolconstrain.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_toolconstrain.cpp -o $@
