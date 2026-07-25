@@ -1928,8 +1928,23 @@ int main(int argc,char** argv) {
             else if(arg=="--top-p-default" && i+1<argc) { top_p_default=parse_float(argv[++i],"--top-p-default"); if(top_p_default<=0.0f||top_p_default>1.0f) throw std::runtime_error("--top-p-default must be in (0,1]"); }
             else if(arg=="--top-k-default" && i+1<argc) { top_k_default=parse_u32(argv[++i],"--top-k-default"); if(top_k_default==UINT32_MAX) throw std::runtime_error("invalid --top-k-default"); }
             else if(arg=="--budget-mb" && i+1<argc) { budget_mb=parse_u32(argv[++i],"--budget-mb"); if(!budget_mb||budget_mb>(1u<<24)) throw std::runtime_error("--budget-mb must be an integer 1..16777216"); }
-            else if(arg=="--snapshot-spine-pin" && i+1<argc) { spine_pin=(int)parse_u32(argv[++i],"--snapshot-spine-pin"); if(spine_pin>1) throw std::runtime_error("--snapshot-spine-pin must be 0 or 1"); }
-            else if(arg=="--snapshot-prefetch" && i+1<argc) { snapshot_prefetch=(int)parse_u32(argv[++i],"--snapshot-prefetch"); if(snapshot_prefetch>64) throw std::runtime_error("--snapshot-prefetch must be 0..64"); }
+            // Range-check the UNSIGNED value BEFORE narrowing to int. The
+            // old `(int)parse_u32(...)` then `>N` order let anything in
+            // [2^31, 2^32) cast to a negative int and sail past the bound --
+            // so `--snapshot-spine-pin 3000000000` was silently accepted and
+            // then read as "unset", and `--snapshot-prefetch 3000000000`
+            // silently disabled the prefetch it was asking for. Both are
+            // meant to be fail-loud (codex autoreview of 22c4413).
+            else if(arg=="--snapshot-spine-pin" && i+1<argc) {
+                const uint32_t v=parse_u32(argv[++i],"--snapshot-spine-pin");
+                if(v>1) throw std::runtime_error("--snapshot-spine-pin must be 0 or 1");
+                spine_pin=(int)v;
+            }
+            else if(arg=="--snapshot-prefetch" && i+1<argc) {
+                const uint32_t v=parse_u32(argv[++i],"--snapshot-prefetch");
+                if(v>64) throw std::runtime_error("--snapshot-prefetch must be 0..64");
+                snapshot_prefetch=(int)v;
+            }
             // Auth config is fail-LOUD in both directions (upstream 1a15ff8
             // item 4). An empty key can never authenticate anything --
             // api_key_valid rejects an empty `provided` before comparing --

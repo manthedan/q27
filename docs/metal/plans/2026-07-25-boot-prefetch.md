@@ -80,8 +80,19 @@ at 2.
 ## Status
 
 - `DiskSnapshotStore::prefetch_recent(n)` — implemented.
-- `--snapshot-prefetch 0..64`, default **0 (off)**; surfaced on `/stats` as
-  `snapshot_prefetch`.
+- `--snapshot-prefetch 0..64`, default **0 (off)**; surfaced as
+  `snapshot_prefetch` in `serving_identity()`, i.e. on **`/health`** (and in
+  the boot trace) alongside `snapshot_spine_pin` / `snapshot_max_bytes`.
+  Deliberately not on `/stats`, which carries runtime *counters*, not
+  configuration — an earlier draft of this doc said `/stats`, which was
+  wrong (codex autoreview of 22c4413 flagged the mismatch; the doc was the
+  side that was wrong, not the code).
+- Flag parsing is fail-loud: the range check runs on the **unsigned** value
+  before it narrows to `int`. The first cut checked after the cast, so
+  anything in `[2^31, 2^32)` became negative and sailed past the bound --
+  `--snapshot-prefetch 3000000000` was silently accepted and then disabled
+  the prefetch it asked for. Its pre-existing twin `--snapshot-spine-pin`
+  had the identical defect and is fixed in the same commit.
 - Offline gate in `tools/test_snapshot_evict_store.cpp`: selects only
   tag-matching `.q27snap` files (a foreign/mis-tagged file in a shared
   directory must never be read), caps at `max_entries`, no-ops when disabled
