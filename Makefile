@@ -143,6 +143,16 @@ build/test_q27_agent_frontend: experiments/ds4-agent/test_q27_agent_frontend.c \
 	        experiments/ds4-agent/q27_agent_frontend.c -o $@
 
 ifeq ($(UNAME_S),Darwin)
+# GATE BLIND SPOT, closed 2026-07-25. api_common.h / stream_split.h /
+# tool_preamble.h compile into BOTH servers, but test-cpu builds NEITHER --
+# so an upstream signature change lands green here while the Metal server
+# does not compile. That is exactly what the v0.5.0-v0.6.2 merge did:
+# resolve_think gained a third parameter, all 7 Metal call sites broke, and
+# `make test-cpu` still passed at the merge commit. Compile-only (the link
+# is the check), so it needs no GPU and loads no model -- the model-loading
+# gates stay serialized under the exclusive slot as before.
+test-cpu: build/q27-metal-server
+
 test-metal: build/test_metal build/test_metal_ops build/test_metal_stream
 	./build/test_metal
 	./build/test_metal_ops
