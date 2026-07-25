@@ -1935,6 +1935,12 @@ int main(int argc,char** argv) {
         // flags -- all configured keys are valid simultaneously, matching
         // --api-key-file's multi-key semantics). Preferred where CLI args are
         // visible via `ps` but the orchestrator's secret store is not.
+        // The `envkey[0]` test is load-bearing, not defensive tidiness:
+        // api_key_valid's constant-time property documents "an empty KEY is
+        // never configured" as an INVARIANT its callers must uphold (it fast-
+        // paths an empty `provided` without comparing). An empty Q27_API_KEY
+        // must therefore be dropped here, exactly as --api-key refuses one
+        // above. Do not relax either check.
         if(const char* envkey=getenv("Q27_API_KEY"); envkey && envkey[0]) api_keys.push_back(envkey);
         // The loopback-by-default binding was this server's only safety net
         // before auth existed. Warn loudly rather than refuse: some
