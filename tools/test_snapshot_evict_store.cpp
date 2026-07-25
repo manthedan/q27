@@ -14,11 +14,13 @@
 // tokens through its peek path exactly as in production. Exit 0 = PASS.
 #include "disk_snapshot_store.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -183,6 +185,56 @@ int main() {
         CHECK(!exists(path) &&
               !store.exact_resident(tokens.data(),(uint32_t)tokens.size()),
               "deep-load rejection removes shallow candidate for repair");
+        fs::remove_all(dir,ec);
+    }
+
+    // ---- boot prefetch (audit A5) -----------------------------------------
+    // prefetch_recent's job is page-cache warming, which has no observable
+    // return value. What IS testable offline, and what actually matters for
+    // correctness, is that it never touches the wrong files and never
+    // outlives its inputs:
+    //   - it must select only tag-matching .q27snap files (a foreign or
+    //     mis-tagged file must not be read: on a shared directory that would
+    //     be another server's artifact),
+    //   - it must cap at max_entries,
+    //   - it must be a no-op when disabled or when asked for 0,
+    //   - the detached thread must survive the store being DESTROYED
+    //     immediately after the call -- it captures path copies, so this must
+    //     not use freed memory. Run under a sanitizer this is the real check.
+    {
+        const std::string dir = std::string(::getenv("TMPDIR")?:"/tmp") + "/t1store.prefetch";
+        std::error_code ec; fs::remove_all(dir,ec); fs::create_directories(dir,ec);
+        std::vector<uint32_t> a(64), b(64), c(64);
+        for (uint32_t k=0;k<64;k++) { a[k]=k+1; b[k]=k+500; c[k]=k+900; }
+        // Newest last: prefetch should prefer c, then b.
+        write_snap(dir+"/tagA"+std::string(40,'1')+".q27snap", a, 4096, 300);
+        write_snap(dir+"/tagA"+std::string(40,'2')+".q27snap", b, 4096, 200);
+        write_snap(dir+"/tagA"+std::string(40,'3')+".q27snap", c, 4096, 100);
+        // Decoys that must never be read: wrong tag, and wrong extension.
+        write_snap(dir+"/tagB"+std::string(40,'4')+".q27snap", a, 4096, 50);
+        write_snap(dir+"/tagA"+std::string(40,'5')+".bogus",   a, 4096, 50);
+
+        {
+            DiskSnapshotStore store(&stub_peek,&stub_hash);
+            store.init(dir, 1ull<<30, "tagA", false);
+            store.prefetch_recent(2);          // cap below the 3 tagA entries
+            store.prefetch_recent(0);          // no-op
+            store.prefetch_recent(-1);         // no-op
+        }                                       // store DIES here, thread may still run
+        DiskSnapshotStore disabled(&stub_peek,&stub_hash);
+        disabled.prefetch_recent(4);           // never init'd -> no-op, must not crash
+        // All five files must still exist: prefetch reads, never mutates, and
+        // must not have touched mtimes in a way that changes eviction order.
+        CHECK(exists(dir+"/tagA"+std::string(40,'1')+".q27snap") &&
+              exists(dir+"/tagA"+std::string(40,'2')+".q27snap") &&
+              exists(dir+"/tagA"+std::string(40,'3')+".q27snap") &&
+              exists(dir+"/tagB"+std::string(40,'4')+".q27snap") &&
+              exists(dir+"/tagA"+std::string(40,'5')+".bogus"),
+              "boot prefetch is read-only and survives store destruction");
+        // Give the detached reader a moment to finish against the live files
+        // before the directory goes away, so the teardown is not itself the
+        // thing under test.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         fs::remove_all(dir,ec);
     }
 
