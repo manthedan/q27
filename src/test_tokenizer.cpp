@@ -761,8 +761,19 @@ int main(int argc, char** argv) {
         q27::normalize_cc_billing_header(a);
         q27::normalize_cc_billing_header(b);
         bool ok = a == b && a.find("cch=fffff;") != std::string::npos;
-        // 2.1.200-era header carries no cch -> untouched
-        std::string c = "x-anthropic-billing-header: cc_version=2.1.200.77d; "
+        // CC 2.1.220 dropped `cch=` and moved the volatile stamp onto a 4th
+        // cc_version component (upstream 5a81225). Verbatim capture from two
+        // real sessions: the tail must pin or no prefix tier shares state.
+        std::string c1 = "x-anthropic-billing-header: cc_version=2.1.220.473; "
+                         "cc_entrypoint=sdk-cli;You are";
+        std::string c2 = "x-anthropic-billing-header: cc_version=2.1.220.c50; "
+                         "cc_entrypoint=sdk-cli;You are";
+        q27::normalize_cc_billing_header(c1);
+        q27::normalize_cc_billing_header(c2);
+        ok = ok && c1 == c2 &&
+             c1.find("cc_version=2.1.220.fff") != std::string::npos;
+        // three-component version has no volatile tail -> nothing to pin
+        std::string c = "x-anthropic-billing-header: cc_version=2.1.220; "
                         "cc_entrypoint=sdk-cli;You are a Claude agent.";
         std::string c0 = c;
         q27::normalize_cc_billing_header(c);

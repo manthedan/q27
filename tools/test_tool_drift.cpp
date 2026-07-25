@@ -33,7 +33,36 @@ static json tool(const char* name, std::vector<std::pair<std::string, bool>> par
               {"parameters", {{"type", "object"}, {"properties", props}, {"required", req}}}}}};
 }
 
+// Drift mode 13 (2026-07-24, found live by the grammar-engage probe): a
+// wrapper-less call truncated INSIDE an escape sequence. The repair used to
+// append the closing quote straight after a dangling backslash, which escaped
+// it -- string still open, object never parsed, call UN-RESCUED. The real
+// payload was a Write whose markdown content was cut while writing an escaped
+// JSON example (`\\"role\\": \\"assistant\\",\\`).
+static void test_mode13_truncated_mid_escape() {
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}}])");
+    // trailing dangling backslash
+    std::string t1 = "Let me write that.\n{\"name\": \"Write\", \"arguments\": {\"file_path\": \"g.md\", "
+                     "\"content\": \"# Guide\\n\\n```json\\n{\\n  \\\"role\\\": \\\"assistant\\\",\\";
+    std::string pre;
+    auto v1 = q27::parse_bare_tool_calls(t1, &pre, &tools);
+    ok(v1.size() == 1 && v1[0].ok && v1[0].name == "Write",
+       "mode13: truncated at a dangling backslash");
+    // partial \uXXXX at the cut
+    std::string t2 = "{\"name\": \"Write\", \"arguments\": {\"file_path\": \"g.md\", \"content\": \"caf\\u00";
+    auto v2 = q27::parse_bare_tool_calls(t2, &pre, &tools);
+    ok(v2.size() == 1 && v2[0].ok && v2[0].name == "Write",
+       "mode13: truncated inside a partial \\uXXXX");
+    // a COMPLETE escape at the cut must still round-trip (no over-trim)
+    std::string t3 = "{\"name\": \"Write\", \"arguments\": {\"file_path\": \"g.md\", \"content\": \"caf\\u00e9";
+    auto v3 = q27::parse_bare_tool_calls(t3, &pre, &tools);
+    ok(v3.size() == 1 && v3[0].ok &&
+           v3[0].arguments.value("content", std::string()) == "caf\u00e9",
+       "mode13: a COMPLETE escape at the cut is not over-trimmed");
+}
+
 int main() {
+    test_mode13_truncated_mid_escape();
     json tools = json::array();
     tools.push_back(tool("Write", {{"content", true}, {"file_path", true}}));
     tools.push_back(tool("Read", {{"file_path", true}}));

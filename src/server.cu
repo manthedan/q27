@@ -62,10 +62,13 @@ static q27k::SampleParams parse_sample(const json& body) {
     static std::atomic<unsigned long long> force_seed_ctr{0};
 
     q27k::SampleParams s{0.f, 1.f, 0ull};
-    double temp = body.value("temperature", force_temp);
+    // jnum/jint/jbool (api_common.h), not value(): a present-but-null field is
+    // how many OpenAI-compatible clients spell "unset", and value() throws on
+    // it -> httplib 500. Read null/wrong-typed as absent.
+    double temp = q27::jnum(body, "temperature", force_temp);
     if (temp > 0.0) {
         s.inv_temp = (float)(1.0 / temp);
-        double tp = body.value("top_p", force_tp);
+        double tp = q27::jnum(body, "top_p", force_tp);
         s.top_p = (float)((tp > 0.0 && tp <= 1.0) ? tp : 1.0);
         if (body.contains("seed") && body["seed"].is_number())
             s.seed = (unsigned long long)body["seed"].get<long long>();
@@ -111,7 +114,8 @@ int main(int argc, char** argv) {
                 "  (auto-ctx cap 262144 fp8/turbo3, 131072 fp16; single-slot). Escapes:\n"
                 "  Q27_PROFILE=ref (conservative\n"
                 "  reference: fp16/ungated/no-suffix/fd2), any individual Q27_* env,\n"
-                "  --kv-fp16 --no-fast-head --think. The CLI binary keeps reference\n"
+                "  --kv-fp16 --no-fast-head --think --request-think (honor per-\n"
+                "  request enable_thinking; off by default). The CLI keeps reference\n"
                 "  defaults (bitwise canonical).\n"
                 "  Auth: no API key is required by default (loopback-only is the\n"
                 "  safety net). --api-key KEY may repeat; --api-key-file PATH loads\n"
@@ -119,7 +123,16 @@ int main(int argc, char** argv) {
                 "  Any configured key is accepted via 'Authorization: Bearer <key>'\n"
                 "  (OpenAI/llama.cpp convention) or 'x-api-key: <key>' (Anthropic\n"
                 "  convention, what Claude Code sends) on every endpoint except\n"
-                "  /health.\n",
+                "  /health.\n"
+                "  Prefix cache (P16, opt-in, writes to disk): --prefix-cache DIR\n"
+                "  persists the P8 stable prefix so a RESTART or a fresh\n"
+                "  conversation restores instead of re-prefilling. Tuning:\n"
+                "  --prefix-cache-max-gb 20 --prefix-cache-min 4096\n"
+                "  --prefix-cache-max-tokens 32768 --prefix-cache-step 8192.\n"
+                "  max-tokens also sizes the pinned staging buffer.\n"
+                "  --prefix-cache-ram-gb 0 adds a pinned host-RAM tier above the\n"
+                "  disk; off by default (the boot prefetch already makes reads\n"
+                "  36-39 ms, so it saves little -- see the plan doc).\n",
                 argv[0]);
         return 1;
     }
@@ -137,7 +150,10 @@ int main(int argc, char** argv) {
     int think_flag = -1;
     bool kv_fp16 = false;
     bool constrain_tools = false;
+    bool req_think = false; // --request-think: honor per-request thinking fields (else ignored)
     std::vector<std::string> api_keys;
+    q27::PrefixCacheCfg pfx_cfg; // P16: root empty = off
+    double pfx_ram_gb = 0;       // P16c: host-RAM tier budget (0 = off)
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -153,12 +169,45 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-fast-head")) fast_flag = 0;
         else if (!strcmp(argv[i], "--no-think")) think_flag = 0;
         else if (!strcmp(argv[i], "--think")) think_flag = 1;
+        else if (!strcmp(argv[i], "--request-think")) req_think = true;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
-        else if (!strcmp(argv[i], "--api-key") && i + 1 < argc) api_keys.push_back(argv[++i]);
+        // P16 persistent prefix cache (opt-in: it writes to the user's disk)
+        else if (!strcmp(argv[i], "--prefix-cache") && i + 1 < argc) pfx_cfg.root = argv[++i];
+        else if (!strcmp(argv[i], "--prefix-cache-max-gb") && i + 1 < argc)
+            pfx_cfg.max_bytes = (size_t)(atof(argv[++i]) * 1e9);
+        else if (!strcmp(argv[i], "--prefix-cache-min") && i + 1 < argc)
+            pfx_cfg.min_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefix-cache-max-tokens") && i + 1 < argc)
+            pfx_cfg.max_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefix-cache-step") && i + 1 < argc)
+            pfx_cfg.step_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefix-cache-ram-gb") && i + 1 < argc)
+            pfx_ram_gb = atof(argv[++i]);
+        // Auth config is fail-LOUD in both directions: an empty key can never
+        // authenticate anything (api_key_valid rejects an empty `provided`
+        // before comparing), so accepting one would stand up a server that
+        // 401s every request; and a key FILE that opens but yields nothing
+        // usable would stand up a server with auth silently OFF, which is the
+        // opposite of what the operator asked for. Refuse both at boot.
+        else if (!strcmp(argv[i], "--api-key") && i + 1 < argc) {
+            if (!argv[++i][0]) {
+                fprintf(stderr, "error: --api-key: empty key (an empty key can never match)\n");
+                return 1;
+            }
+            api_keys.push_back(argv[i]);
+        }
         else if (!strcmp(argv[i], "--api-key-file") && i + 1 < argc) {
+            const size_t before = api_keys.size();
             if (!q27::load_api_key_file(argv[++i], &api_keys)) {
                 fprintf(stderr, "error: --api-key-file %s: could not open\n", argv[i]);
+                return 1;
+            }
+            if (api_keys.size() == before) {
+                fprintf(stderr,
+                        "error: --api-key-file %s: no keys found (every line blank or a "
+                        "#comment) -- refusing to start with auth silently disabled\n",
+                        argv[i]);
                 return 1;
             }
         }
@@ -452,6 +501,29 @@ int main(int argc, char** argv) {
         bool stamp_on_free = false;          // LRU-stamp when freed (not refused)
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
+    // P16 persistent prefix cache. Declared BEFORE `slots` so it outlives the
+    // engines: an engine's destructor joins its writer thread, and that thread
+    // calls into this object. Off unless --prefix-cache names a directory.
+    q27::PrefixCache pfx_cache;
+    q27::PrefixRam pfx_ram;
+    if (!pfx_cfg.root.empty()) {
+        const char* kve = getenv("Q27_KV");
+        const int kvk = kve && !strcmp(kve, "fp8")       ? KV_FP8
+                        : kve && !strcmp(kve, "turbo3")  ? KV_T3
+                        : kve && !strcmp(kve, "turbo3v") ? KV_T3V
+                                                         : KV_F16;
+        size_t model_bytes = 0;
+        { struct stat st; if (::stat(model.c_str(), &st) == 0) model_bytes = (size_t)st.st_size; }
+        const uint64_t compat =
+            q27::pfx_compat_hash(model, model_bytes, N_LAYER, N_KV, HEAD_DIM, GDN_HEADS, GDN_DIM,
+                                 GDN_CH, kvk, q27::PFX_VERSION);
+        if (pfx_cache.init(pfx_cfg, compat))
+            fprintf(stderr,
+                    "prefix-cache: %s (%zu entr%s indexed, %.2f/%.2f GB, min %d, max %d, step %d)\n",
+                    pfx_cfg.root.c_str(), pfx_cache.size(), pfx_cache.size() == 1 ? "y" : "ies",
+                    pfx_cache.bytes() / 1e9, pfx_cfg.max_bytes / 1e9, pfx_cfg.min_tokens,
+                    pfx_cfg.max_tokens, pfx_cfg.step_tokens);
+    }
     // n_slots already clamped to [1,8] above (before auto-ctx divided the
     // budget by it); the conductor's MAX_K/2 fusion ceiling is 8.
     n_slots = std::max(1, std::min(8, n_slots));
@@ -487,6 +559,10 @@ int main(int argc, char** argv) {
         s.id = si;
         s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx);
         s.eng->fast_head = fast;
+        if (pfx_cache.enabled()) {
+            s.eng->pcache = &pfx_cache;  // P16 disk tier
+            s.eng->pram = &pfx_ram;      // P16c host-RAM tier (no-op when 0 slots)
+        }
         // graph-zoo capture gate (issue #1): without --constrain-tools the
         // P11 monolithic draft/verify graphs are unreachable -- skip capture.
         s.eng->capture_constrained = constrain_tools;
@@ -495,6 +571,10 @@ int main(int argc, char** argv) {
         slots.push_back(std::move(s));
         fprintf(stderr, "slot %d ready: ctx=%d\n", si, sctx);
     }
+    // P16c sizing needs an engine: pfx_bytes() depends on the KV format and
+    // the layer geometry. Slots are built by now, so ask slot 0.
+    if (pfx_cache.enabled() && pfx_ram_gb > 0 && !slots.empty())
+        pfx_ram.init((size_t)(pfx_ram_gb * 1e9), slots[0].eng->pfx_bytes(pfx_cfg.max_tokens));
     {
         // headroom line (also the auto-ctx calibration probe: this minus the
         // post-weights line minus exact KV = the non-KV fixed stack)
@@ -552,6 +632,7 @@ int main(int argc, char** argv) {
         std::string out;
         if (v.is_array())
             for (auto& p : v) {
+                if (!p.is_object()) continue; // bare string in a content array
                 std::string ty = p.value("type", "");
                 if (ty == "text" || ty == "input_text" || ty == "output_text")
                     out += p.value("text", "");
@@ -615,7 +696,7 @@ int main(int argc, char** argv) {
                        const std::string& extra = std::string()) {
         const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
-        char p13buf[96], gatebuf[512], phbuf[352], sfxbuf[48];
+        char p13buf[96], gatebuf[512], phbuf[352], sfxbuf[48], pfxbuf[32];
         // Q27_SUFFIX: engine-cumulative suffix-round counters (fired, tokens
         // committed by suffix rounds), appended after end= like gch/glf.
         if (e.suffix_on)
@@ -640,10 +721,17 @@ int main(int argc, char** argv) {
                      g.vw_ms[8], g.sfx_ms, g.sfx_rounds);
         else
             phbuf[0] = '\0';
+        if (getenv("Q27_NJOINT")) {
+            fprintf(stderr, "[njoint] rid=%ld", rt.rid);
+            for (int c = 0; c < Q27_W_MAX; c++)
+                for (int n = 1; n <= Q27_W_MAX; n++)
+                    if (e.gate_joint[c][n]) fprintf(stderr, " %d:%d=%ld", c, n, e.gate_joint[c][n]);
+            fprintf(stderr, "\n");
+        }
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
-                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s%s%s%s\n",
+                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s%s%s%s%s\n",
                 rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
@@ -680,6 +768,10 @@ int main(int argc, char** argv) {
                                 e.gate_lane_acc[6], e.gate_lane_acc[7]),
                        gatebuf)
                     : "",
+                // P16: tokens restored from the disk prefix cache. Emitted only on
+                // an actual disk hit, so the line stays byte-identical when the
+                // feature is off (same rule as the md/gch/ph optionals above).
+                g.pfx > 0 ? (snprintf(pfxbuf, sizeof pfxbuf, " pfx=%d", g.pfx), pfxbuf) : "",
                 phbuf, sfxbuf, extra.c_str());
     };
     // R1b routing: claim a FREE engine (Slot::busy=false) that can take the
@@ -1066,16 +1158,20 @@ int main(int argc, char** argv) {
         if (body.contains("messages")) {
             std::vector<std::pair<std::string, std::string>> msgs;
             for (auto& m : body["messages"]) {
+                // is_object() BEFORE any value() call: value() on a non-object
+                // element throws 306 -> httplib 500 (same ordering fix as
+                // anthropic_msgs).
+                if (!m.is_object()) continue;
                 std::string role = m.value("role", "user");
                 std::string content;
                 // const operator[] on a missing key aborts (json.hpp assertion) --
                 // a content-less message must not kill the server (Security #1;
                 // mirrors the Anthropic-path guard in api_common.h).
-                if (m.is_object() && m.contains("content")) {
+                if (m.contains("content")) {
                     if (m["content"].is_string()) content = m["content"];
                     else if (m["content"].is_array())
                         for (auto& part : m["content"])
-                            if (part.value("type", "") == "text")
+                            if (part.is_object() && part.value("type", "") == "text")
                                 content += part.value("text", "");
                 }
                 msgs.push_back({role, content});
@@ -1084,10 +1180,10 @@ int main(int argc, char** argv) {
             // explicit enable_thinking / chat_template_kwargs / Anthropic
             // thinking field overrides it either way (resolve_think in
             // api_common.h). Silent request on a no-think server -> no-think.
-            bool think = q27::resolve_think(body, !no_think_srv);
+            bool think = q27::resolve_think(body, !no_think_srv, req_think);
             return tok.apply_chat_template(msgs, think);
         }
-        return tok.encode(body.value("prompt", std::string()));
+        return tok.encode(q27::jstr(body, "prompt"));
     };
 
     auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
@@ -1098,9 +1194,10 @@ int main(int argc, char** argv) {
         // across all three API shapes. Clamped to the context window below, so a
         // big default can't over-reserve; 8192 covers a real answer plus a short
         // think trace. A long *thinking* request should still set max_tokens
-        // explicitly (a grad-level trace wants 16K+).
-        int n_max = body.value("max_tokens", 8192);
-        bool stream = body.value("stream", false);
+        // explicitly (a grad-level trace wants 16K+). jint/jbool: a
+        // present-but-null field reads as absent (see parse_sample).
+        int n_max = (int)q27::jint(body, "max_tokens", 8192);
+        bool stream = q27::jbool(body, "stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the
         // usage totals -- goes out after the finish_reason chunk, before
@@ -1137,16 +1234,23 @@ int main(int argc, char** argv) {
         auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt;
         int stable_len = -1; // -1 = legacy tail snapshot (build_prompt's fallback path)
+        int sys_len = 0;     // P16b: system-block tokens (0 = none/feature off)
         bool thinking = false; // request wants a real <think> block; seeds the splitter below
         if (routed_chat) {
-            thinking = q27::resolve_think(body, !no_think_srv);
+            thinking = q27::resolve_think(body, !no_think_srv, req_think);
             // thinking and a FORCED tool call are mutually exclusive: FORCED
             // injects <tool_call>\n into the tail (below), leaving no room for a
             // think block, so suppress the opener when a tool is forced.
             if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
-            size_t stable_off = 0;
+            size_t stable_off = 0, sys_off = 0;
             std::string rendered =
-                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off);
+                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off);
+            // P16b: token length of the system+tools block. Measured with a
+            // THIRD encode used only for its length -- the prompt itself is
+            // still built from the same two pieces, so no request's bytes
+            // change when the cache is on.
+            if (pfx_cache.enabled() && sys_off > 0)
+                sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size();
             // FORCED tool_choice: inject the opener into the volatile tail
             // (past stable_off, alongside the assistant-open/think-prefill --
             // P8 prefix-cache reuse is unaffected). The stream router below
@@ -1195,7 +1299,7 @@ int main(int argc, char** argv) {
         // Q27_SAMPLED=0 preflight: the sampled graphs were never captured.
         // (Q27_FORCE_TEMP>0 is a boot-time FATAL on such boots, so the
         // request-absent default here is genuinely greedy.)
-        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+        if (!sampled_on && q27::jnum(body, "temperature", 0.0) > 0.0) {
             res.status = 400;
             res.set_content(json{{"error",
                                   {{"message", "sampling disabled: server booted with "
@@ -1221,6 +1325,7 @@ int main(int argc, char** argv) {
                                   // are never set on that path, so the clear
                                   // on scope-exit is a no-op (P15 M1 pattern)
             eng.samp = parse_sample(body);
+            eng.pfx_sys_len = sys_len; // P16b (0 on paths with no system boundary)
             // Q27_BATCH: solo keeps the whole-call lease; batch mode scopes
             // its prefill lease inside batch_generate (A7) and re-stamps qw.
             std::optional<q27::GpuGate::Lease> lk;
@@ -1382,13 +1487,21 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
+            // EVERY handler local this lambda reads must be captured BY VALUE:
+            // httplib runs the provider from write_response(), long after this
+            // handler's frame is dead (routing() and write_response() are
+            // sibling calls in Server::process_request). `thinking` shipped as
+            // a by-reference read of that dead frame from 2026-07-20 until the
+            // 07-24 audit -- benign only by stack-layout luck.
             [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
-             tools, tool_names_v, tchoice, stable_len, has_tools, rid](size_t, httplib::DataSink& sink) {
+             tools, tool_names_v, tchoice, stable_len, has_tools, rid,
+             thinking, sys_len](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // see the non-stream twin
                 eng.samp = samp;
+                eng.pfx_sys_len = sys_len; // P16b
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
@@ -1605,7 +1718,7 @@ int main(int argc, char** argv) {
         }
         std::string rendered = q27::chatml_prompt(
             q27::anthropic_msgs(body), q27::anthropic_tools_json(body),
-            q27::resolve_think(body, !no_think_srv));
+            q27::resolve_think(body, !no_think_srv, req_think));
         json out = {{"input_tokens", (long)tok.encode(rendered).size()}};
         res.set_content(jdump(out), "application/json");
     });
@@ -1614,8 +1727,8 @@ int main(int argc, char** argv) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
-        int n_max = body.value("max_tokens", 8192); // unified default (see /v1/chat/completions)
-        bool stream = body.value("stream", false);
+        int n_max = (int)q27::jint(body, "max_tokens", 8192); // unified default (see /v1/chat/completions)
+        bool stream = q27::jbool(body, "stream", false);
         json tools = q27::anthropic_tools_json(body);
         std::vector<std::string> tool_names_v;
         if (constrain_tools && tools.is_array())
@@ -1624,9 +1737,11 @@ int main(int argc, char** argv) {
                     tool_names_v.push_back(t["function"]["name"].get<std::string>());
         auto tk0 = std::chrono::steady_clock::now();
         size_t stable_off = 0;
-        bool thinking = q27::resolve_think(body, !no_think_srv);
-        std::string rendered =
-            q27::chatml_prompt(q27::anthropic_msgs(body), tools, thinking, &stable_off);
+        int sys_len = 0; // P16b: system-block tokens (0 = none/feature off)
+        bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
+        size_t sys_off = 0;
+        std::string rendered = q27::chatml_prompt(q27::anthropic_msgs(body), tools, thinking,
+                                                  &stable_off, &sys_off);
         auto tk1 = std::chrono::steady_clock::now();
         // P8: split-encode at the stable boundary. Both turns encode the
         // shared history with the same split (the boundary always abuts the
@@ -1638,6 +1753,14 @@ int main(int argc, char** argv) {
             std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
             prompt.insert(prompt.end(), tailv.begin(), tailv.end());
         }
+        if (pfx_cache.enabled() && sys_off > 0)
+            sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size(); // P16b, see twin
+        // Q27_SYSBLK=1: system-block geometry per request. The diagnostic for
+        // "why did cross-session prefix reuse miss" -- a client whose system
+        // block changes size between sessions cannot share a prefix at all.
+        if (sys_len && getenv("Q27_SYSBLK"))
+            fprintf(stderr, "[sysblk] sys_off=%zu chars sys_len=%d toks stable_off=%zu\n",
+                    sys_off, sys_len, stable_off);
         auto tk2 = std::chrono::steady_clock::now();
         fprintf(stderr, "[timing] render %.1fms encode %.1fms (%zu chars -> %zu toks)\n",
                 std::chrono::duration<double, std::milli>(tk1 - tk0).count(),
@@ -1656,7 +1779,7 @@ int main(int argc, char** argv) {
             return;
         }
         // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
-        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+        if (!sampled_on && q27::jnum(body, "temperature", 0.0) > 0.0) {
             anthropic_400(res,
                           "sampling disabled: server booted with Q27_SAMPLED=0 "
                           "(greedy-only)");
@@ -1675,6 +1798,7 @@ int main(int argc, char** argv) {
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
             eng.samp = parse_sample(body);
+            eng.pfx_sys_len = sys_len; // P16b (0 on paths with no system boundary)
             std::optional<q27::GpuGate::Lease> lk; // solo whole-call hold; batch
             if (!conductor) lk.emplace(gpu_gate);  // leases inside batch_generate
             double qw = ms_since(rt.t0);
@@ -1787,13 +1911,15 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, tools, stable_len, rt](
-                size_t, httplib::DataSink& sink) {
+            // by-value or dangling: see the /v1/chat/completions twin
+            [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v, tools, stable_len, rt,
+             thinking, sys_len](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
                 eng.samp = samp;
+                eng.pfx_sys_len = sys_len; // P16b
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
@@ -1995,8 +2121,9 @@ int main(int argc, char** argv) {
         // types (web_search etc.) are skipped, never rejected.
         json tools = json::array();
         std::set<std::string> custom_names;
-        if (body.contains("tools"))
+        if (body.contains("tools") && body["tools"].is_array())
             for (auto& t : body["tools"]) {
+                if (!t.is_object()) continue; // value() on a non-object throws 306
                 std::string ty = t.value("type", "");
                 if (ty == "function") {
                     tools.push_back({{"type", "function"},
@@ -2031,21 +2158,23 @@ int main(int argc, char** argv) {
                 msgs.push_back({"user", body["input"]});
             } else if (body["input"].is_array()) {
                 for (auto& it : body["input"]) {
-                    std::string ty = it.value("type", "message");
+                    if (!it.is_object()) continue; // value() on a non-object throws 306
+                    std::string ty = q27::jstr(it, "type", "message");
                     if (ty == "message") {
-                        std::string role = it.value("role", "user");
+                        std::string role = q27::jstr(it, "role", "user");
                         if (role == "developer") role = "system";
-                        msgs.push_back({role, text_of(it["content"])});
+                        msgs.push_back(
+                            {role, it.contains("content") ? text_of(it["content"]) : std::string()});
                     } else if (ty == "function_call" || ty == "custom_tool_call") {
                         json args;
                         if (ty == "function_call") {
-                            try { args = json::parse(it.value("arguments", "{}")); }
-                            catch (...) { args = it.value("arguments", ""); }
+                            try { args = json::parse(q27::jstr(it, "arguments", "{}")); }
+                            catch (...) { args = q27::jstr(it, "arguments"); }
                         } else {
-                            args = {{"input", it.value("input", "")}};
+                            args = {{"input", q27::jstr(it, "input")}};
                         }
                         msgs.push_back({"assistant",
-                                        q27::tool_call_text(it.value("name", ""), args)});
+                                        q27::tool_call_text(q27::jstr(it, "name"), args)});
                     } else if (ty == "function_call_output" || ty == "custom_tool_call_output") {
                         std::string out;
                         if (it.contains("output")) {
@@ -2068,11 +2197,21 @@ int main(int argc, char** argv) {
                 merged.push_back(m);
         }
 
-        int n_max = body.value("max_output_tokens", 8192); // unified default (see /v1/chat/completions)
+        int n_max = (int)q27::jint(body, "max_output_tokens", 8192); // unified default (see /v1/chat/completions)
+        // P16 does not apply to this shape (no stable_off / sys_off is computed
+        // here), but the engine field is per-engine state -- set it so a
+        // previous request's value cannot leak into this one.
+        int sys_len = 0; // P16b: set below if this request carries a system block
         auto tk0 = std::chrono::steady_clock::now();
-        bool thinking = q27::resolve_think(body, !no_think_srv);
-        std::vector<int> prompt =
-            tok.encode(q27::chatml_prompt(merged, tools, thinking));
+        bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
+        size_t sys_off = 0;
+        const std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off);
+        std::vector<int> prompt = tok.encode(rendered);
+        // P16b applies here even though P16a does not: this shape computes no
+        // stable_off (so it never persists a stable entry), but a system+tools
+        // block is a system+tools block, and codex re-sends one every session.
+        if (pfx_cache.enabled() && sys_off > 0)
+            sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size();
         ReqTrace rt{rid, "resp", conv_fp(body), std::chrono::steady_clock::now(),
                     ms_since(tk0)};
         // review follow-up 2026-07-09 #3: the bound includes the spec-round
@@ -2085,7 +2224,7 @@ int main(int argc, char** argv) {
             return;
         }
         // Q27_SAMPLED=0 preflight (see the OpenAI handler's twin)
-        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+        if (!sampled_on && q27::jnum(body, "temperature", 0.0) > 0.0) {
             res.status = 400;
             res.set_content("{\"error\":{\"code\":\"sampling_disabled\",\"message\":"
                             "\"sampling disabled: server booted with Q27_SAMPLED=0\"}}",
@@ -2094,7 +2233,7 @@ int main(int argc, char** argv) {
         }
         if ((int)prompt.size() + n_max > max_slot_ctx)
             n_max = max_slot_ctx - (int)prompt.size();
-        bool stream = body.value("stream", false);
+        bool stream = q27::jbool(body, "stream", false);
 
         // shared generation -> output items
         struct GenOut { json items = json::array(); int produced = 0; };
@@ -2159,6 +2298,7 @@ int main(int argc, char** argv) {
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             eng.samp = parse_sample(body);
+            eng.pfx_sys_len = sys_len; // P16b (0 on paths with no system boundary)
             std::optional<q27::GpuGate::Lease> lk; // solo whole-call hold; batch
             if (!conductor) lk.emplace(gpu_gate);  // leases inside batch_generate
             double qw = ms_since(rt.t0);
@@ -2231,11 +2371,14 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt](size_t, httplib::DataSink& sink) {
+            // by-value or dangling: see the /v1/chat/completions twin
+            [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt,
+             thinking, sys_len](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 eng.samp = samp;
+                eng.pfx_sys_len = sys_len; // P16b
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
@@ -2433,9 +2576,34 @@ int main(int argc, char** argv) {
     srv.Post("/v1/completions",
              [&](const httplib::Request& r, httplib::Response& s) { handle(r, s, false); });
 
+    // SO_REUSEADDR only (2026-07-22, thunderdome postmortem pt.2): httplib's
+    // Linux default socket option is SO_REUSEPORT, which lets a SECOND
+    // q27-server co-bind the same port -- the kernel then load-balances
+    // incoming connections across both, silently splitting an eval's traffic
+    // between two servers (potentially two different models). REUSEADDR keeps
+    // the fast rebind-after-TIME_WAIT behavior without permitting live
+    // co-binding, so a second bind fails and hits the FATAL below.
+    srv.set_socket_options([](socket_t sock) {
+        int opt = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&opt),
+                   sizeof(opt));
+    });
+    // Bind FIRST, print "listening" only on success (2026-07-22, thunderdome
+    // postmortem): the old unconditional print + listen() meant a bind failure
+    // (port squatter) logged "listening" and then CLEAN-EXITED 0 -- downstream
+    // clients saw ConnectionRefused mid-task and the failure masqueraded as
+    // harness infra. Fail loudly instead.
+    if (!srv.bind_to_port(host.c_str(), port)) {
+        fprintf(stderr,
+                "FATAL: cannot bind %s:%d (port already in use? see `ss -tlnp | grep %d`)\n",
+                host.c_str(), port, port);
+        if (conductor) conductor->request_stop();
+        conductor.reset();
+        return 1;
+    }
     fprintf(stderr, "q27-server listening on http://%s:%d (ctx %d, %s head)\n", host.c_str(),
             port, ctx, fast ? "fast" : "faithful");
-    srv.listen(host.c_str(), port);
+    srv.listen_after_bind();
     // P1 Task 10 shutdown: stop the conductor (its thread cancels + closes
     // any remaining members) and join it BEFORE the engines it drives tear
     // down with `slots` at scope exit.

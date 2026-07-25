@@ -313,3 +313,47 @@ it: bind `127.0.0.1`, and terminate auth/TLS/rate-limiting at an authenticated r
 proxy. That preserves the "fast, correct, cooperative-caller" design and re-scopes findings
 #3/#5 to the proxy where they belong. Only the memory-safety carve-outs (#4, #1) must be
 fixed in q27 itself regardless, because they are reachable by the operator today.
+
+## Addendum 2026-07-24: the persistent prefix cache writes conversation state to disk
+
+`--prefix-cache DIR` (P16, v0.6.0, **off by default**) is the first q27
+feature that persists anything derived from request content past the process
+lifetime. It does not change the tenancy row or the threat model above, but
+it does move data across a boundary this doc previously did not have to
+discuss, so state it plainly.
+
+**What lands on disk.** For each cached prefix, one file containing:
+- the **token IDs** of the prefix, verbatim (they are the verification
+  payload -- a hash alone cannot safely key a restore, see BUILDLOG
+  2026-07-24), and
+- the model's **KV rows and recurrent state** for those tokens.
+
+The tokens are the user's and operator's prompt text in tokenized form:
+system prompts, tool definitions, and the beginning of the conversation are
+recoverable from them with nothing more than the tokenizer. Treat a
+`--prefix-cache` directory as **conversation content in plaintext**, at the
+same sensitivity as a chat log. It is not encrypted and it is not obfuscated.
+
+**Consequences the operator owns:**
+- Files are created mode 0600 in a directory created 0700, so the default is
+  owner-only. That is the whole access control; anything more (full-disk
+  encryption, a tmpfs, a per-user directory) is the operator's to add.
+- Do NOT point `--prefix-cache` at a shared, world-readable, backed-up, or
+  synced location without deciding that a chat log belongs there.
+- The cache is keyed on prefix CONTENT, not on identity. If two principals
+  ever reach one q27 (which this doc already tells you not to do -- there is
+  one principal by design), an entry written by one is restorable by the
+  other, but only by a request that already contains the same tokens. It
+  leaks no content to a caller who cannot already produce that prefix; it is
+  a timing-observable shared cache, not a read primitive.
+- Entries survive until LRU eviction (`--prefix-cache-max-gb`) or manual
+  deletion. There is no TTL and no "forget this conversation" call.
+
+**What it does not weaken.** The restore path re-verifies the full token
+vector before loading state, and every entry carries a compat hash over the
+model bytes, buffer geometry, and KV format, so a stale, corrupt, foreign, or
+truncated file is refused rather than coerced (`tools/test_prefix_cache.cpp`
+forges each case). A malicious file in the cache directory cannot make the
+server continue a conversation whose tokens the requester did not supply --
+though anyone who can WRITE to that directory can already do far worse to the
+process, and is outside the model here as elsewhere.

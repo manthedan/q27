@@ -31,6 +31,45 @@ inline int64_t json_i64_or(const json& body, const char* key, int64_t dflt) {
     return it == body.end() || it->is_null() ? dflt : it->get<int64_t>();
 }
 
+// ---- tolerant request-field readers ---------------------------------------
+// json::value() THROWS type_error.302 when a key is PRESENT but null or
+// wrong-typed, and httplib turns any throw out of a handler into a 500 with an
+// EXCEPTION_WHAT header (the routing() try/catch in third_party/httplib.h).
+// "Present and null" is how a large share of OpenAI-compatible clients spell
+// "unset" -- {"max_tokens": null, "temperature": null, "stream": null} comes
+// straight out of LangChain/LiteLLM-class request builders. Answering those
+// with a 500 is wrong twice over: wrong actor (the request was fine), and
+// wrong status class (500 is retryable, so the client loops the same body).
+// These read null / wrong-typed exactly like ABSENT, which is what the field
+// means on the wire. Numbers are read through double so an integer field sent
+// as 8192.0 still works, and clamped to int range so a nonsense magnitude
+// can't overflow the int the callers assign into.
+inline double jnum(const json& b, const char* key, double dflt) {
+    if (!b.is_object()) return dflt;
+    const auto it = b.find(key);
+    return (it != b.end() && it->is_number()) ? it->get<double>() : dflt;
+}
+inline long jint(const json& b, const char* key, long dflt) {
+    if (!b.is_object()) return dflt;
+    const auto it = b.find(key);
+    if (it == b.end() || !it->is_number()) return dflt;
+    const double v = it->get<double>();
+    if (v >= 2147483647.0) return 2147483647L;
+    if (v <= -2147483648.0) return -2147483648L;
+    return (long)v;
+}
+inline bool jbool(const json& b, const char* key, bool dflt) {
+    if (!b.is_object()) return dflt;
+    const auto it = b.find(key);
+    return (it != b.end() && it->is_boolean()) ? it->get<bool>() : dflt;
+}
+inline std::string jstr(const json& b, const char* key,
+                        const std::string& dflt = std::string()) {
+    if (!b.is_object()) return dflt;
+    const auto it = b.find(key);
+    return (it != b.end() && it->is_string()) ? it->get<std::string>() : dflt;
+}
+
 // Incremental UTF-8 boundary gate for streaming token pieces. BPE token
 // boundaries can split a multi-byte character (em dash E2 80 94 is a Qwopus
 // favorite), the raw piece is then invalid UTF-8, and nlohmann json::dump
@@ -154,14 +193,44 @@ struct Msg {
 // (ggml-org/llama.cpp#21793), so both engines canonicalize to the same bytes.
 // Only a header at the very start of the system text is touched, and the stamp
 // is only looked for inside the short header segment.
+//
+// FORMAT DRIFT (measured 2026-07-24 against Claude Code 2.1.220): the `cch=`
+// field is GONE, and the volatile stamp moved onto the version itself --
+//   x-anthropic-billing-header: cc_version=2.1.220.473; cc_entrypoint=sdk-cli;
+//                                                  ^^^ changes between conversations
+// The old `cch=`-only normalizer returns early on that shape and does nothing,
+// so the first ~15 tokens of every CC system prompt differ between sessions.
+// That silently voids CROSS-SESSION reuse for all three tiers at once (P8
+// snapshot, P9 ring, P16 disk) -- captured live: two sessions differing ONLY in
+// their task text produced two distinct 21,504-token cache entries and never
+// hit each other. Within one conversation the stamp is stable, which is why
+// same-session warm turns kept working and this hid.
+// Both stamp forms are now pinned: the legacy `cch=` value, and any 4th+
+// dot-component of `cc_version=` (2.1.220 = the real version; .473 = the
+// volatile tail). Pinning is safe -- this is prompt text an engine only needs
+// to canonicalize, and llama.cpp does the same thing for the same reason.
 inline void normalize_cc_billing_header(std::string& sys) {
     static const char* PFX = "x-anthropic-billing-header:";
     if (sys.rfind(PFX, 0) != 0) return;
+    // legacy: cch=<stamp>;
     size_t cch = sys.find("cch=", 27);
-    if (cch == std::string::npos || cch > 160) return;  // header segment only
-    size_t v = cch + 4, end = sys.find(';', v);
-    if (end == std::string::npos || end == v || end - v > 16) return;
-    for (size_t i = v; i < end; ++i) sys[i] = 'f';
+    if (cch != std::string::npos && cch <= 160) {
+        size_t v = cch + 4, end = sys.find(';', v);
+        if (end != std::string::npos && end != v && end - v <= 16)
+            for (size_t i = v; i < end; ++i) sys[i] = 'f';
+    }
+    // 2.1.220+: cc_version=<a.b.c>.<volatile>;  -- pin everything past the 3rd dot
+    size_t cv = sys.find("cc_version=", 0);
+    if (cv == std::string::npos || cv > 160) return;
+    size_t v = cv + 11, end = sys.find(';', v);
+    if (end == std::string::npos || end <= v || end - v > 64) return;
+    int dots = 0;
+    for (size_t i = v; i < end; ++i) {
+        if (sys[i] == '.' && ++dots == 3) {
+            for (size_t j = i + 1; j < end; ++j) sys[j] = 'f';
+            return;
+        }
+    }
 }
 
 // strip_ctrl + tools_preamble moved to tool_preamble.h (shared with the
@@ -174,8 +243,15 @@ inline void normalize_cc_billing_header(std::string& sys) {
 // stable_off (P8): char offset where the trailing assistant-open begins.
 // Everything before it re-renders identically next turn (snapshot-safe);
 // everything after (assistant open + think prefill) is per-turn volatile.
+// sys_off (P16b): char offset just past the system+tools block, or 0 when the
+// request has neither. That block is the part MULTIPLE conversations share --
+// Claude Code re-sends the same 20-25K-token system + tool definitions every
+// session -- so it is the only boundary a cross-conversation cache entry can
+// usefully be cut at. Like stable_off it abuts an <|im_start|>, so the same
+// split-invariance argument applies.
 inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools,
-                                 bool think = true, size_t* stable_off = nullptr) {
+                                 bool think = true, size_t* stable_off = nullptr,
+                                 size_t* sys_off = nullptr) {
     std::string p;
     size_t start = 0;
     std::string sys;
@@ -196,6 +272,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     } else if (!sys.empty()) {
         p += "<|im_start|>system\n" + sys + "<|im_end|>\n";
     }
+    if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
     for (size_t i = start; i < msgs.size(); i++)
         p += "<|im_start|>" + strip_ctrl(msgs[i].role) + "\n" + strip_ctrl(msgs[i].content) +
              "<|im_end|>\n";
@@ -247,21 +324,28 @@ inline std::string tool_response_text(const std::string& out) {
     return "<tool_response>\n" + out + "\n</tool_response>";
 }
 
-// Per-request thinking resolution. `server_default` is the server profile's
-// stance (!no_think_srv): no-think serving passes false, --think / the ref
-// profile pass true. An explicit request field OVERRIDES that default in
-// either direction, so a no-think-default server can serve thinking on
-// request (and a --think server can suppress it) without a reboot. Three
-// client conventions, all honored -- a given client sends exactly one:
+// Per-request thinking resolution, GATED behind the server's --request-think
+// flag (`allow_request`). `server_default` is the server profile's stance
+// (!no_think_srv): no-think serving passes false, --think / the ref profile
+// pass true.
+//
+// Without --request-think (the default), the request's thinking fields are
+// IGNORED and the server default stands -- so a benchmark or client that sends
+// enable_thinking:True (many do) can't silently flip a no-think server into
+// thinking mode. Thinking is then purely a boot decision (--think).
+//
+// With --request-think, an explicit request field OVERRIDES the default in
+// either direction (a no-think server serves thinking on request; a --think
+// server suppresses it). Three client conventions, all honored -- a given
+// client sends exactly one:
 //   OpenAI / Qwen   : top-level  "enable_thinking": <bool>
 //   llama.cpp / GLM : "chat_template_kwargs": {"enable_thinking": <bool>}
-//   Anthropic       : "thinking": {"type": "enabled"|"disabled"}   (what
-//                     Claude Code's own thinking toggle emits; budget_tokens
-//                     is ignored -- q27 thinks until done, capped by max_tokens)
-// Malformed or wrong-typed fields are ignored rather than thrown out of the
-// handler (Security #1), leaving the server default in force. Later checks win
-// over earlier ones; in practice the conventions never co-occur on one request.
-inline bool resolve_think(const json& body, bool server_default) {
+//   Anthropic       : "thinking": {"type": "enabled"|"disabled"}   (Claude
+//                     Code's own thinking toggle; budget_tokens ignored)
+// Malformed/wrong-typed fields are ignored rather than thrown (Security #1).
+// Later checks win over earlier ones; the conventions never co-occur in practice.
+inline bool resolve_think(const json& body, bool server_default, bool allow_request) {
+    if (!allow_request) return server_default;
     bool think = server_default;
     if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean())
         think = body["enable_thinking"].get<bool>();
@@ -303,9 +387,9 @@ inline std::string ctx_limit_error_message(int n_prompt, int n_max_prompt) {
 // /v1/messages request mapping; count_tokens must count the same bytes).
 inline json anthropic_tools_json(const json& body) {
     json out = json::array();
-    if (body.contains("tools"))
+    if (body.contains("tools") && body["tools"].is_array())
         for (auto& t : body["tools"]) {
-            if (!t.contains("name")) continue;
+            if (!t.is_object() || !t.contains("name")) continue;
             out.push_back({{"type", "function"},
                            {"function", {{"name", t["name"]},
                                          {"description", t.value("description", "")},
@@ -325,7 +409,11 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
         if (body["system"].is_string()) sys = body["system"];
         else if (body["system"].is_array())
             for (auto& b : body["system"])
-                if (b.value("type", "") == "text") sys += b.value("text", "");
+                // is_object() FIRST: value() on a non-object throws 306, which
+                // httplib reports as a 500 -- a bare string in the array is a
+                // client-side shape error, not a server fault (same guard
+                // openai_msgs has always had on its content parts).
+                if (b.is_object() && b.value("type", "") == "text") sys += b.value("text", "");
         if (!sys.empty()) {
             normalize_cc_billing_header(sys);
             msgs.push_back({"system", sys});
@@ -333,13 +421,19 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
     }
     if (!body.contains("messages")) return msgs;
     for (auto& m : body["messages"]) {
+        // is_object() BEFORE the first value() call: value() on a non-object
+        // (messages:["hi"]) throws 306 -- which the old ordering did one line
+        // ahead of the guard meant to prevent exactly that. A non-object
+        // element is skipped, matching openai_msgs.
+        if (!m.is_object()) continue;
         std::string role = m.value("role", "user"), think, content;
         // guard: const operator[] on a missing key is an abort (json.hpp
         // assertion) -- a content-less message must not kill the server
-        if (!m.is_object() || !m.contains("content")) { msgs.push_back({role, content}); continue; }
+        if (!m.contains("content")) { msgs.push_back({role, content}); continue; }
         if (m["content"].is_string()) content = m["content"];
         else if (m["content"].is_array())
             for (auto& part : m["content"]) {
+                if (!part.is_object()) continue; // bare string in a content array
                 std::string ty = part.value("type", "");
                 if (ty == "text") content += part.value("text", "");
                 else if (ty == "thinking") think += part.value("thinking", "");
@@ -354,7 +448,8 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                         if (part["content"].is_string()) rc = part["content"];
                         else if (part["content"].is_array())
                             for (auto& b : part["content"])
-                                if (b.value("type", "") == "text") rc += b.value("text", "");
+                                if (b.is_object() && b.value("type", "") == "text")
+                                    rc += b.value("text", "");
                     }
                     if (!content.empty() && content.back() != '\n') content += "\n";
                     content += tool_response_text(rc);
@@ -1453,7 +1548,27 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 else if (ch == '{') d2++;
                 else if (ch == '}') d2--;
             }
-            if (s2) r += '"';
+            // Drift mode 13 (2026-07-24): the truncation can land INSIDE an
+            // escape sequence. A trailing "\\" swallows the quote we are about
+            // to append -- the string stays open, the object never parses, and
+            // the whole call goes UN-RESCUED. Observed live: a wrapper-less
+            // Write whose markdown `content` was cut mid-`\\"` while writing an
+            // escaped JSON example. Same for a partial \\uXXXX. Trim back to the
+            // last safe byte before closing.
+            if (s2) {
+                if (e2f) {
+                    r.pop_back();  // dangling backslash
+                } else {
+                    const size_t u = r.find_last_of('\\');
+                    // a COMPLETE \uXXXX is 6 bytes; anything shorter at the very
+                    // end is a partial one. Leading-backslash check avoids
+                    // trimming an escaped backslash that merely precedes a 'u'.
+                    if (u != std::string::npos && u + 1 < r.size() && r[u + 1] == 'u' &&
+                        r.size() - u < 6 && !(u > 0 && r[u - 1] == '\\'))
+                        r.resize(u);
+                }
+                r += '"';
+            }
             for (; d2 > 0; d2--) r += '}';
             bool shaped = false;
             try {
@@ -1795,8 +1910,9 @@ inline std::string extract_api_key(const std::string& authorization_header,
 // (no early return on the first match) so total compare time depends only
 // on key count/length, not on which key -- if any -- matched, or how far
 // into it a wrong guess got. An empty `provided` is always rejected without
-// comparing (an empty key is never configured -- see set_api_keys below --
-// so this is a fast path, not a security-relevant branch).
+// comparing; an empty KEY is never configured either (load_api_key_file drops
+// blank lines, and server.cu's arg parser refuses an empty --api-key /
+// Q27_API_KEY at boot), so this is a fast path, not a security-relevant branch.
 inline bool api_key_valid(const std::string& provided, const std::vector<std::string>& keys) {
     if (provided.empty()) return false;
     bool any = false;
@@ -1821,6 +1937,9 @@ inline std::string auth_error_json(bool anthropic_shape) {
 // ignored, surrounding whitespace trimmed). Returns false (and leaves `out`
 // untouched) if the file can't be opened, so the caller can fail loudly
 // with the actual path rather than silently starting with no auth.
+// A file that OPENS but yields no keys (all blank/comment) also returns true
+// with `out` unchanged -- the caller must compare sizes and refuse, or an
+// operator who asked for auth gets a server with none (server.cu does).
 inline bool load_api_key_file(const std::string& path, std::vector<std::string>* out) {
     std::ifstream f(path);
     if (!f.is_open()) return false;

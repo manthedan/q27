@@ -8043,3 +8043,768 @@ toolconstrain / tool-drift / stream-split / drift-corpus / think-resolve / auth
 binaries. Assets: tarball (4 binaries + MIT LICENSE, sha256 def23b70) +
 SHA256SUMS-0.4.0. Driver floor r580+ unchanged. Field-validated same day: 3090
 full-power decode 126-150 t/s (issue #6 P2, a power-cap not an engine limit).
+
+## 2026-07-22 -- q5f: new best-quality 24GB tier (quant ladder) + thinking gated behind --request-think
+
+**q5f tier.** A repack sweep for better PPL (tools/repack.py: --q4-head +
+--q8 REGEX) found a Pareto-better recipe family: on the q4s single-Q4 lm_head,
+promoting FFN tensors to Q8 STACKS the error cancellation, while promoting
+attn/ssm BREAKS it (that's why q4s already beat the default, which promoted
+attn/ssm). q5f = Q4-head + ffn_down->Q8, 5.30 bpw / 18.2 GB, wikitext PPL
+(--nll wiki.test.qwopus.i32 --nll-chunk 2048 --ctx 2048) **7.9491** -- beats
+q4s (8.0197), default (8.0409), q8 (7.9942); matches q6 (7.9460) at 2.3 GB
+less. FULL LADDER GREEN: canonical greedy 683f7f4450ca4c60837abdb603ee3237 /
+sampled 06451b011bc2acb335468085e69f2259 (repack repro EXACT); needle 6/6 all
+depths to 120K; --ctx auto = 69632 on a 24GB 3090 w/ 0.72 GB headroom, serves
+clean; task A/B vs q4s (no-think): HumanEval+ 30/30 == q4s, LiveCodeBench 23/30
+> q4s 20/30. Trades context for quality (q5f ~69K vs q4s ~315K on a 3090).
+Artifact qwen36-27b-mtp-q5f.q27; README tier row + sampling_gate anchor added;
+HF upload pending (Gabe). C6 (Q4-head + ffn_down + ffn_gate, 21 GB, PPL 7.9189,
+beats q6) being validated as a 32GB tier.
+
+**--request-think.** v0.4.0's per-request thinking (resolve_think honoring
+enable_thinking / chat_template_kwargs / Anthropic thinking:{type}) is now GATED
+behind a new `--request-think` flag, OFF by default. Without it, request thinking
+fields are IGNORED and thinking is a pure boot decision (--think). Fixes the
+v0.4.0 footgun found during the q5f task A/B: the club HumanEval+ pack sends
+chat_template_kwargs.enable_thinking:True, which v0.4.0 honored -> thinking-on ->
+model runaway -> ~50% verifier_fail (thinking-on is worse for this model, per the
+GPQA A/B). resolve_think gained an `allow_request` param; test_think_resolve +3
+gating cases. Server compiles, all CPU suites green.
+
+## 2026-07-22 -- q6f: the 32GB tier (full ladder green) + thunderdome resolved
+
+**q6f** = the q5f recipe + one more promotion (Q4-head + ffn_down + ffn_gate at
+Q8), 6.11 bpw / 21.0 GB. Displaces q6 as the 32GB pick: wikitext PPL **7.9189**
+vs q6 7.9460 at the same size (q6k 7.9127 still edges it at +2.25 GB). FULL
+LADDER GREEN: canonical greedy 2a4d22eafcde63e962bf2408605fe502 / sampled
+fc73f835adf3b457856c67fe1b5d6939 (final artifact repro EXACT = deterministic
+repack); needle 6/6 all depths to 120K (turbo3); --ctx auto = 184320 on the
+5090 (fp8/W12, 0.43 GB at ready), serves clean; code A/B vs q6 (no-think):
+HumanEval+ 30/30 vs 29/30, LCB 22/30 tied. Artifact qwen36-27b-mtp-q6f.q27;
+README tier rows (q6 marked superseded) + sampling_gate anchor. HF upload
+pending (Gabe), alongside q5f's.
+
+**Thunderdome "breakage" resolved -- it was never broken.** Every dome failure
+traced to port-8081 squatters: q27-server on an occupied port prints
+"listening" then CLEAN-EXITS (exit 0, ~2.5s CPU; the bind failure is silent),
+so the dome's claude sees ConnectionRefused mid-task and it reads as harness
+infra. Squatters included a leftover debug `python3 -m http.server 8081`. Also:
+run_task.sh requires ABSOLUTE outdir paths (it cd's into thunderdome; a
+relative outdir makes the harness.log redirect fail, which silently prevents
+`thunderdome run` from executing at all). q4s_dome/boot.sh now refuses up front
+if 8081 is occupied. Verified end-to-end: dome T2 against q5f = harness_exit 0,
+meta.json produced, score 0.631, q5f agentic 214 t/s aggregate / 195 median,
+4.33 tok/round, 0 errors. Follow-up candidate: q27-server should FAIL LOUDLY
+(nonzero exit + error line) when the listen bind fails, instead of the silent
+exit-0 -- that silence is what made this look like three different bugs.
+
+## 2026-07-22 -- loud bind failure + SO_REUSEADDR-only (thunderdome postmortem, shipped)
+
+Both halves of the silent-bind class fixed in server.cu:
+
+(1) **Bind-first, fail loudly.** The old flow printed "listening" then called
+srv.listen(); a bind failure returned false and main fell through to a CLEAN
+exit 0 -- the "listening" line was a lie and downstream clients saw
+ConnectionRefused with nothing in the server log. Now: bind_to_port() first;
+on failure print `FATAL: cannot bind host:port` and exit 1; print "listening"
+only after a successful bind; listen_after_bind(). PROVEN live: systemd-durable
+squatter on the port -> FATAL + exit code 1 (was: "listening" + exit 0).
+
+(2) **SO_REUSEADDR only.** httplib's Linux default socket option is
+SO_REUSEPORT, which allows a SECOND q27-server to co-bind the same port -- the
+kernel then load-balances connections across both, silently splitting traffic
+between two servers (potentially two different models: an eval-integrity
+hazard, and why port collisions produced inconsistent symptoms). Overridden via
+srv.set_socket_options() to SO_REUSEADDR alone: fast rebind after TIME_WAIT is
+kept, live co-binding is refused and hits the FATAL above. Normal-boot sanity:
+serves clean with the override.
+
+Also: HF uploads for q5f + q6f COMPLETE same day (weights + CHECKSUMS.md5 +
+model-card tier sections; xet dedup made the 39 GB transfer ~157 kB of new
+chunks). All six tiers now live on signalnine/Qwen3.6-27B-MTP-q27.
+
+## 2026-07-22 -- qxf family CLOSED (q7f negative) + Q4_K_M on the board
+
+**q7f (Q4-head + ffn_down + ffn_gate + ffn_up, 23.75 GB) = PPL 8.0703 --
+NO-GO.** Worse than q6f (7.9189), q5f (7.9491), and even plain q4s (8.0197):
+ffn_up promotion actively breaks the Q4-head cancellation, exactly as the q6k
+study predicted on the Q8 head (its Q4 noise cancels inside the SwiGLU
+product). The recipe family is now fully mapped: promotions that STACK with
+the Q4 head = ffn_down, ffn_gate; promotions that BREAK it = ffn_up, ssm_out,
+attn_output (C4, 8.1154). q4s -> q5f -> q6f is the complete Pareto set over
+the format's existing dtypes. Candidate artifact deleted; further points on
+the curve need a real intermediate dtype (Q6-granularity kernels) -- engine
+work, not a repack.
+
+**llama.cpp Q4_K_M measured on the matched protocol** (llama-perplexity,
+wiki.test.raw, c2048 -- same board as the Q5_K_M 7.9179 bar): **8.4205
++/- 0.067**. That flips the low-end story: K-quant bit-efficiency holds at
+Q5_K_M and above, but Q4_K_M collapses on this model -- q4s (15.5 GB,
+4.55 bpw) beats it by 4.2% PPL at 1.3 GB smaller (~6 sigma), q5f by 5.6%.
+Below 19.5 GB there is no GGUF on this model that competes with the q27
+low tiers.
+
+## 2026-07-22 -- v0.5.0 RELEASED (tag @ 5bedab3)
+
+github.com/signalnine/q27/releases/tag/v0.5.0. Since v0.4.0 (same day + 1):
+(1) q5f (5.30 bpw, PPL 7.9491, best 24GB quality) + q6f (6.11 bpw, 7.9189,
+the 32GB pick, supersedes q6) -- the Q4-head + FFN-promotion family, closed
+(ffn_up 8.0703 / attn+ssm 8.1154 both break cancellation); both tiers live on
+HF with checksums + card. Q4_K_M matched-protocol 8.4205 = q4s beats it 4.2%
+at 1.3GB smaller. (2) BEHAVIOR CHANGE: per-request thinking now requires
+--request-think (v0.4.0 honored request fields unconditionally; harnesses
+sending enable_thinking:true silently flipped no-think servers). (3) bind
+fixes: bind-first + FATAL exit-1 (was listening-then-exit-0) +
+SO_REUSEADDR-only (REUSEPORT allowed silent two-server co-bind). GATES at
+tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), 9 CPU suites + ninv + fused_smoke PASS, tri-arch on all 4
+binaries, live bind-fail proof. Assets: tarball sha256 ae684e1e +
+SHA256SUMS-0.5.0. Driver floor r580+ unchanged. NOTE (harness lesson): the
+q4s sampled anchor REQUIRES `--ctx 2048 --spec` -- sampled spec-vs-plain
+trajectories are different-but-both-valid, so omitting --spec yields a
+plausible-looking wrong md5.
+
+## 2026-07-24 -- serving audit: dangling `thinking` capture + 3 robustness fixes
+
+Post-v0.5.0 read-through of the serving layer, no new features. Four defects,
+all found by inspection, all fixed and verified live on the 5090.
+
+**#1 (the real one) `thinking` was a DANGLING REFERENCE in all three streaming
+handlers.** fee3b27 added `bool thinking` as a handler local and read it inside
+the SSE providers -- but every provider capture list enumerates its handler
+locals BY VALUE precisely because httplib runs the provider from
+`write_response()`, a sibling call of `routing()` in `Server::process_request`
+(third_party/httplib.h:7136 vs :6474): the handler frame is dead by then.
+`thinking` was the one local that missed all three lists (/v1/chat/completions,
+/v1/messages, /v1/responses), so every streamed request since 2026-07-20 read a
+byte of a dead stack frame. It has not visibly misbehaved -- a standalone
+repro against the same httplib shows the slot surviving intact both ways -- but
+that is stack-layout luck, not correctness, and the failure mode when it flips
+is the whole answer routing to the wrong channel (reasoning_content / a
+thinking block, empty content) on the CC path. Fixed by adding `thinking` to
+the three capture lists.
+
+**#2 present-but-null request fields 500'd.** `json::value()` throws
+type_error.302 when a key exists but is null or wrong-typed, and httplib turns
+a handler throw into a 500 -- yet `{"max_tokens": null, "temperature": null,
+"stream": null}` is how LangChain/LiteLLM-class clients spell "unset". New
+tolerant readers `jnum/jint/jbool/jstr` (api_common.h) read null/wrong-typed as
+ABSENT; all 11 request-field sites across the three API shapes converted.
+jint also reads 8192.0 correctly and clamps absurd magnitudes.
+
+**#3 two guards sat one line AFTER the call they were guarding.**
+anthropic_msgs read `m.value("role", ...)` before its own `!m.is_object()`
+check (same in server.cu's build_prompt), so `messages:["hi"]` threw 306 ->
+500. Also added the `is_object()` check openai_msgs always had to the Anthropic
+content-part loop, the `system:[...]` loop, the tool_result content loop,
+anthropic_tools_json, text_of, and the /v1/responses input+tools loops.
+
+**#4 `--api-key-file` could silently disable auth.** A file that opens but
+yields no usable key (all blank/#comment) returned true with zero keys added
+-> the pre-routing handler was never installed -> auth OFF while the operator
+believed it on. Now compares sizes and refuses to boot; `--api-key ""` (a key
+that can never match, so the server would 401 everything) refuses too.
+
+VERIFIED live (5090, vanilla a2982c51, port 8099): no-think server streams text
+blocks only; `--think --request-think` streams a real thinking block (1
+content_block_start + 96 thinking_deltas) and honors a request-level
+`thinking:{type:"disabled"}` (text only); zero `</think>` leakage into content;
+null-field bodies 200 (were 500); `messages:["bogus",7,{...}]` + bare-string
+content parts 200 with the malformed elements skipped; all three auth
+mis-config paths exit 1 with a specific message. CPU suites 8/8 PASS
+(test_openai_bridge +9 cases, test_auth +1). No kernel, prompt-construction or
+sampling change -- the CLI canonical gates are untouched by construction
+(build/q27 does not compile api_common.h or server.cu).
+
+## 2026-07-24 -- P16a: persistent stable-prefix cache (opt-in disk tier)
+
+Design note: docs/plans/2026-07-24-persistent-prefix-cache.md. Prompted by a
+read of fewtarius/CachyLLama (MIT llama.cpp fork) whose SSD-backed KV cache
+targets the same miss; upstream llama.cpp already ships the persistence
+primitives (--ctx-checkpoints in RAM, --slot-save-path manual save/restore,
+--cache-reuse), so what is actually missing everywhere is automatic
+conversation-keyed lookup. Their headline 23-144x is cold-vs-warm on a 7840U
+where cold prefill runs ~110 t/s, which is a statement about iGPU prefill, not
+about caching.
+
+**The gap.** P8's snapshot and P9's ring both die with the process, so every
+server restart re-prefills the whole conversation. MEASURED first (5090,
+vanilla a2982c51, fp8, --ctx 65536): prefill runs 3,578 t/s at 15.4K tokens and
+3,351 t/s at 30.7K, so a 25K-token Claude Code system prefix costs ~7.3 s that
+we have already paid once.
+
+**What ships.** `--prefix-cache DIR` (off by default; it writes to the user's
+disk). One file per entry, header + tokens + [GDN state | attention+MTP KV
+rows], published by rename so a torn write can never be indexed. The P8
+`stable_off` boundary is the key: everything before it re-renders identically
+next session. `src/prefix_cache.h` is host-only and unit-tested; the device
+copies are `Engine::pfx_export/pfx_import`; the disk tier is consulted only
+after both RAM tiers miss.
+
+**Verification is by exact tokens, never by hash.** The filename key only
+narrows candidates; every load reads the stored token vector back and compares
+it element by element, the rule ckpt_best() already applies in RAM. CachyLLama
+shipped hash-keyed SSD restore and spent 2026-07-23 patching it (outside PR
+fix/ssd-cache-prefix-verification); a collision there silently continues
+another conversation's state. test_prefix_cache.cpp forges that exact hazard
+and asserts the refusal.
+
+**RESULT: restart TTFT 8.15 s -> 1.20 s (6.8x, ~7.0 s saved) on a 26,700-token
+prompt, bitwise identical output (md5 ae23ddeb8ce9b350 across all five runs).**
+The 1.09 GB blob reads in 726 ms with the page cache COLD (1.5 GB/s, matching
+the drive) and 246 ms warm. Persisting costs 38 ms of D2H on the critical path
+plus a background write: 8.15 -> 8.33 s on the one turn that pays it.
+
+**Two defects found by implementing, both fixed and both invisible to a bitwise
+gate.** (1) MTP KV rows run one longer than the attention side -- mtp_warm_T
+stores at base+1, so [0,L) restores a stale row L; that decodes CORRECTLY
+because bad drafts are rejected by verify, it just costs acceptance silently.
+(2) The first gate run persisted a SECOND 1.09 GB entry at the NP-1 fallback
+boundary on every restore (a restored request has base == stable_len, so the
+stable branch does not fire). Blobs cut at NP-1 sit past the assistant-open and
+can never prefix-match a later turn -- permanently unhittable. Persist is now
+gated on the boundary actually being the stable one.
+
+**Scope correction to the note.** Pre-implementation it claimed cross-
+conversation reuse comes free from keying on the token prefix. It does not:
+an entry only helps if its L tokens are an exact prefix of the new prompt, and
+turn 1's stable prefix ends inside the first USER message. The shared win needs
+an entry cut inside the system block -- P16b, not claimed here. The
+per-token KV figure in the draft was also 2x low (fp8 is 36.0 KiB/token, not
+18.0); corrected in place.
+
+GATES: bitwise restore, forged-collision refusal, compat refusal, truncation
+refusal, no-solo-regression ([req] byte-identical when off), restart proof --
+all PASS. Full slate re-run because engine.cuh changed: tri-arch x4, 10 CPU
+suites + auth_integration, canonicals EXACT (a2982c51 / f64e7c02 / 900031e9 /
+683f7f44 / 2a4d22ea), ninv, fused_smoke. Harness note: the scratchpad gate
+script's sampled-anchor helper was still missing `--ctx 2048 --spec` and
+reported a false q4s mismatch -- the same v0.5.0 gotcha, now fixed there too.
+
+## 2026-07-24 -- P16b: the cross-conversation entry + multi-slot/batching proof
+
+P16a persisted the P8 stable prefix, which covers RESTART but not a new
+conversation: the stable boundary ends inside the first USER message, and an
+entry only helps if its L tokens are an exact prefix of the new prompt (a
+recurrent state cannot be partially restored at a shorter length). The shared
+part is the system+tools block -- Claude Code re-sends an identical 20-25K
+token system prompt every session -- so the entry has to be cut in there.
+
+**Implementation.** `chatml_prompt` now reports `sys_off`, the char offset past
+the system block (0 when there is none); the server sizes it in tokens with a
+third encode used ONLY for its length, so no request's prompt bytes change.
+The engine persists at the last prefill-CHUNK boundary at or before `sys_len`.
+Cutting on a chunk boundary is deliberate: stopping the loop at an arbitrary
+`sys_len` would re-chunk the prefill, and chunk size is not a free variable
+(PF_T is tuned, and a different reduction order could move results). At most
+PF_T-1 tokens get re-prefilled on a hit, ~0.3 s against the ~6 s an entry
+saves. Natural cadence falls out: turn 1 of a cold conversation writes the
+SYSTEM entry, turn 2+ writes the STABLE entry (one write in flight per engine,
+so they never contend).
+
+**RESULT (2 slots, batching on, 11,037-token prompts sharing an 11,029-token
+system block):** conversation A cold-prefilled and wrote the system entry at
+L=10240 (= floor(11029/1024)*1024, exactly the design). Conversation B --
+different user message, never seen before, routed to the OTHER slot -- restored
+A's entry: `hit=10240 pf=796`, `[pfx] restore L=10240`. A block cache would
+give a pure-attention model this for free; on hybrid GDN it took the state.
+Restart of the same 2-slot server: A 0.59 s, B 0.25 s, both from disk.
+
+**MULTI-SLOT + CONTINUOUS BATCHING (asked for explicitly, and the first run did
+not prove it).** The first concurrency attempt logged `bat=1.0,0` -- zero fused
+rounds, because 48-token decodes finish before they overlap. Re-ran with 400
+token decodes: `bat=2.0,65` and `bat=1.4,64/65`, i.e. real k>=2 fusion over
+64-65 rounds. Both slots restored from disk and decoded through fused rounds,
+and output was **bitwise identical to the cache-off reference** (A
+5eadd9c88df04ec2, B 8cf964b7ee52fb5b across all four runs) with an IDENTICAL
+fusion histogram in both legs -- restoring from disk perturbs neither the
+numerics nor the batching behavior. Tier order confirmed too: a second request
+on a warm slot took the in-RAM P9 ring (`hit=8192 ckpt=1`) rather than the
+disk, which is correct -- disk is consulted only after both RAM tiers miss.
+
+Docs: README serving section (both entry kinds, verification rule, costs,
+limits), the paged-KV section (P16 as the third tier under P8/P9), and
+docs/SECURITY-MODEL.md addendum -- this is the first q27 feature that persists
+request-derived content past process lifetime, and a cache directory is
+conversation content in plaintext (token IDs are the verification payload, so
+prompt text is recoverable with the tokenizer alone). "Cross-session checkpoint
+pool" retired from the parked-levers list in README/notes.md.
+
+## 2026-07-24 -- v0.6.0 RELEASED (tag @ 45c2cf4)
+
+github.com/signalnine/q27/releases/tag/v0.6.0. One feature since v0.5.0, plus
+the serving audit that preceded it.
+
+**P16 persistent prefix cache (`--prefix-cache DIR`, opt-in, off by default).**
+The first tier of prefix reuse that survives the process. P16a persists the P8
+stable prefix (restart case): 26,700-token prompt, restart TTFT **8.15 s ->
+1.20 s** with the page cache cold, bitwise identical output. P16b adds an entry
+cut inside the system+tools block, which a DIFFERENT conversation can restore:
+proven with two conversations sharing an 11,029-token system block on a 2-slot
+server, B restoring the entry A wrote (`hit=10240 pf=796`) on the other slot.
+Verification is by exact token comparison, never by hash. Multi-slot and
+continuous batching proven under real k>=2 fusion (`bat=2.0,65`), bitwise
+identical to the cache-off reference with an identical fusion histogram.
+
+**Serving audit fixes (2026-07-24, pre-P16).** A dangling `thinking` reference
+in ALL THREE streaming handlers (a handler local read from the SSE provider
+after the frame died -- benign only by stack-layout luck); present-but-null
+request fields 500ing instead of defaulting (`{"max_tokens": null}` is how many
+OpenAI-compatible clients spell "unset"); two `is_object()` guards sitting one
+line after the `value()` call they guarded; `--api-key-file` silently
+disabling auth when the file opened but yielded no usable key.
+
+GATES at tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), 11 CPU suites + auth_integration, tri-arch sm_86/89/120 on all 4
+binaries, ninv ALL PASS, fused_smoke PASS, plus the six P16-specific gates
+(bitwise restore, forged-collision refusal, compat refusal, truncation
+refusal, no-solo-regression, restart proof). Assets: tarball sha256
+aa7d94e0 + SHA256SUMS-0.6.0. Driver floor r580+ unchanged.
+
+NOTE: a cache directory holds conversation content in plaintext -- the token
+IDs are the verification payload, so prompt text is recoverable with the
+tokenizer alone. docs/SECURITY-MODEL.md addendum 2026-07-24 covers it.
+
+## 2026-07-24 -- P16c (host-RAM tier) + the loose ends: measure first, then decide
+
+Four follow-ons to v0.6.0. One is a real win, one is a near-NO-GO shipped
+off-by-default, and the instrumentation that told them apart was itself wrong
+at first.
+
+**Boot prefetch: the actual win, after a rewrite.** v1 called
+`posix_fadvise(POSIX_FADV_WILLNEED)` on the most recent entries at startup.
+MEASURED: it did nothing -- a cold restore still read for 681 ms. The call is
+advisory and the kernel declines a readahead that size. v2 does an explicit
+chunked read on a detached thread, which runs under the cover of the weight
+upload (10-40 s of free time). First read after a restart: **681 ms -> 36-39
+ms**, n=3, page cache evicted before each boot.
+
+**P16c host-RAM tier (`--prefix-cache-ram-gb`): built, measured, defaulted
+OFF.** Sizing the lever first was the whole story. A restore is alloc + read +
+import; import (H2D from pinned) is 38 ms/GB and is a floor no tier can beat,
+and the prefetch above already takes the read to 36-39 ms. Result, first
+restore after restart, n=3/leg:
+
+    RAM OFF   wall 0.47-0.48 s   alloc 75-84 ms    read 36-39 ms
+    RAM ON    wall 0.53-0.54 s   alloc 133-141 ms  read 36-39 ms
+
+The tier makes the FIRST restore slower -- its slot is sized for max_tokens, so
+the pinned allocation is bigger than the exact-fit staging buffer, and there is
+no read left to remove. It wins only on a repeat restore landing on a DIFFERENT
+slot: 18 ms (import only) vs 52-127 ms warm-page-cache read, i.e. 40-110 ms on
+a path already down to ~0.5 s from 8.15 s. Shipped opt-in, recommended only
+under page-cache pressure. Implementation is a fixed-slot pinned pool with
+shared_ptr entries (eviction cannot free a blob a restore is copying from) that
+doubles as the staging buffer, so a disk read lands straight in the tier at
+zero extra copy.
+
+**Two instrumentation lessons.** (1) The restore log folded a first-touch
+`cudaMallocHost` into what it called "read", which made a 140 ms allocation
+look like disk time; the log now splits alloc / read / import. (2) A single
+gate run showed two first-reads at 12.7 s and 17.9 s for a 0.51 GB file that
+reads at 3.3 GB/s with O_DIRECT moments later. Never reproduced (3/3 at
+36-39 ms). Both were first reads of a file written seconds earlier then
+evicted -- consistent with QLC garbage collection on a 77%-full drive, not with
+this code path. Recorded rather than dropped, because a 20 s stall on the
+feature's headline path would matter if it ever does reproduce.
+
+**Write amplification (flagged at v0.6.0) fixed.** A disk restore now sets
+`pfx_last_persist = L`, so a fresh process no longer restores L and then
+immediately writes a SECOND ~1 GB entry for the same conversation at
+stable_len on every boot. The step gate covers it from there.
+
+**`/v1/responses` now persists the system-block entry.** That shape computes no
+stable_off (so no P16a entry, unchanged), but a system+tools block is a
+system+tools block and codex re-sends one every session -- it gets P16b via the
+same length-only encode used elsewhere.
+
+GATES: full slate re-run (engine.cuh changed): tri-arch x4, 11 CPU suites +
+auth_integration, canonicals EXACT (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), ninv ALL PASS, fused_smoke PASS. RAM-tier restores are bitwise
+identical to the cache-off reference (A f7e71a5f4df7a4ad, B 9594eec95be70e7b
+across every leg).
+
+## 2026-07-24 -- v0.6.1 RELEASED (tag @ d465e0e)
+
+github.com/signalnine/q27/releases/tag/v0.6.1. Patch release on v0.6.0: one
+real perf fix, one opt-in flag, no change to any default behavior.
+
+**Boot prefetch (the perf fix).** The first read after a restart -- the exact
+request P16 exists to make fast -- went **681 ms -> 36-39 ms**. v0.6.0's
+`posix_fadvise(WILLNEED)` prefetch measured as doing nothing at 1 GB; the
+kernel declines an advisory readahead that size, so it now does a real chunked
+read on a detached thread under the cover of the weight upload.
+
+**P16c host-RAM tier (`--prefix-cache-ram-gb`, default 0 = OFF).** Built and
+measured, and the measurement says leave it off: import (H2D) is a 38 ms/GB
+floor, the prefetch already makes reads 36-39 ms, and the tier's larger pinned
+slot makes the FIRST restore slower (0.53 s vs 0.47 s, n=3/leg). It wins
+40-110 ms only on a repeat restore landing on a different slot. On record as a
+near-NO-GO rather than a feature.
+
+**Loose ends:** a disk restore now sets `pfx_last_persist`, ending the
+second-~1 GB-entry-per-boot write amplification flagged at v0.6.0;
+`/v1/responses` now persists the system-block entry; the restore log splits
+alloc / read / import (it had been folding a first-touch `cudaMallocHost` into
+"read").
+
+GATES at tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), 11 CPU suites + auth_integration, tri-arch sm_86/89/120 on all 4
+binaries, ninv ALL PASS, fused_smoke PASS, RAM-tier restores bitwise identical
+to the cache-off reference. Assets: tarball sha256 cd909131 + SHA256SUMS-0.6.1.
+Driver floor r580+ unchanged.
+
+## 2026-07-24 -- Saguaro/SSD off-path 3090 drafting: MEASURED NO-GO (the lever and the predictability are anti-correlated)
+
+The last uncommissioned engine idea from 07-10, and the one open item that
+needed a number rather than an argument. The 2026-07-13 note left it as a
+CONDITIONAL no-go with two pre-registered conditions: build only if "decode t/s
+becomes the headline AND gate_n_hist comes back peaked (it will not, on novel
+prose)." Both were tested today on the shipped engine.
+
+**Condition 1 (decode is the headline): NOW HOLDS.** It did not in July. P16
+took a warm/restored turn's prefill to 40-330 ms, so decode is what is left of
+an agentic turn's wall. This condition flipping is what made the probe worth
+running at all.
+
+**Condition 2 (accepted-count predictability): FAILS.** An off-path drafter
+cannot start round R+1's ladder until it knows how many tokens verify(R)
+accepted, so the whole scheme rests on predicting n before verify lands.
+Measured on the shipped engine, three legs, vanilla model:
+
+    leg     rounds  draft/round  verify/round  draft share  P(n) top-1  P(n|cap)
+    prose      275     2.04 ms      13.88 ms       12.8%       40.0%      50.2%
+    code       176     2.72 ms      14.49 ms       15.8%       30.7%      58.5%
+    echo        52     0.12 ms      (suffix)        0.6%      100.0%     100.0%
+
+The marginal (gate_n_hist) understates what an SSD-style speculation cache
+could do, since that cache gets to condition on the gate's confidence cap --
+so a joint (cap, n) probe was added (`gate_joint`, `Q27_NJOINT=1`; one host
+increment per round, no device work). Conditioning helps (+10pp prose, +28pp
+code) and still lands at **50-59%**, nowhere near the ~90% bonus-token
+prediction SSD reports from drafter logits.
+
+**THE FINDING: the lever and the predictability are anti-correlated.** Where
+the draft is expensive (prose/code, 2.0-2.7 ms/round, 0% suffix fires) n is
+unpredictable at 50-59%. Where n is perfectly predictable (echo, 100%) the
+draft is already FREE -- 96.2% of those rounds are suffix-drafter rounds that
+never run the MTP ladder, so the draft is 0.12 ms/round, a 0.6% share. There is
+no regime in which off-path drafting is both cheap to hide and worth hiding.
+
+**Arithmetic.** Amdahl ceiling with the draft perfectly hidden: +14.7% prose,
++18.8% code. With a 1-branch speculation cache at the measured hit rates:
+**+6.9% prose, +10.2% code**. With 2 branches (the ~14 ms verify window fits
+two ~4-5 ms sm_86 ladders): roughly +10% / +14%. That is the honest band for a
+weeks-long dual-GPU pipeline (speculation cache, branch selection, fallback
+path) on a 3090 that currently runs other work.
+
+**Opportunity cost settles it.** The same 3090 run as an independent second
+server adds ~90-130 t/s of AGGREGATE throughput. Off-path drafting adds +9 to
++20 t/s of single-stream. Off-path only wins if single-stream latency is the
+product goal and the second card is otherwise idle.
+
+**DECISION: do NOT build.** Recorded, with the probe left in-tree so a revisit
+starts with data. WHAT WOULD FLIP IT: a finer predictor. The gate's 6-bucket
+confidence cap gets 50-59%; q27 already computes per-step draft margins for
+pmin gating, and a margin-conditioned predictor is the natural P1 probe (cheap,
+host-side, no build). If it clears ~80%, the win reaches +12-16% and the
+tradeoff deserves re-pricing. Below that, the answer stays no.
+
+GATES after the probe instrumentation: tri-arch x4, 11 CPU suites +
+auth_integration, canonicals EXACT x5, ninv ALL PASS, fused_smoke PASS.
+
+## 2026-07-24 (cont.) -- margin-conditioned predictor probe: 59%, not 80%. Off-path stays closed, and now the reason is information-theoretic.
+
+The cap-conditioned probe earlier today closed off-path drafting at 50-59%
+predictability and named the one thing that could reopen it: "a
+margin-conditioned predictor clearing ~80%". q27 already computes per-step
+top1-top2 draft margins for pmin gating, and they are HOST-RESIDENT before
+verify launches -- exactly the signal, at exactly the right moment. So the
+probe was cheap and the bar was pre-registered. Ran it.
+
+**Data.** `Q27_MPROBE=<file>` logs (cap, n, md, margins[]) per gated round;
+run with `Q27_DEXIT=0` so every step's margin is real (dexit stops drafting at
+the first sub-theta margin, but an off-path drafter has no reason to stop --
+its steps are hidden -- so the full vector is what it would actually see).
+1863 rounds at md=4 over 8 prompts spanning prose, code, and technical Q&A.
+
+**Result: the margin does not carry the information.** Per-step AUC of the
+drafter's own margin for predicting whether that step gets accepted:
+
+    step 1: AUC 0.561    mean margin accepted 2.55 vs rejected 2.02
+    step 2: AUC 0.583    mean margin accepted 2.38 vs rejected 1.71
+    step 3: AUC 0.632    mean margin accepted 2.57 vs rejected 1.61
+
+0.56-0.63 is a weak classifier. That bounds every predictor built on this
+feature, no matter how it is modeled -- and the held-out numbers land where the
+AUC says they must (block split, train 1117 / test 746):
+
+    always-predict-mode (no signal)      36.2%  top-1
+    cap only (leading run @ theta=0.5)   47.1%  top-1   71.6% top-2
+    all margins, median-binned           52.5%  top-1   81.8% top-2
+    leading run @ theta=1.5              58.7%  top-1   77.2% top-2
+    run@1.5 + min-margin bin             58.7%  top-1   78.8% top-2
+
+**Best top-1 is 58.7%, against a pre-registered bar of 80%. The condition
+fails and off-path drafting stays closed.** Retuning the threshold from the
+shipped 0.5 to 1.5 is worth +8pp over the cap baseline; the full margin vector
+adds nothing on top of that for top-1 (52.5%, data-limited on the finer
+tables), though it is the best top-2 at 81.8%.
+
+**Why, structurally:** the margin measures the DRAFTER's certainty, and
+rejection is decided by disagreement with the FULL model. A confident drafter
+can be confidently wrong -- the very first logged rounds show `cap=4, n=2` with
+all four margins well above threshold. Self-reported confidence is simply not a
+proxy for agreement with a bigger model.
+
+**Sharpened payoff, for the record.** 1-branch at 58.7%: +8.1-10.2%. 2-branch
+at ~80% top-2 (two ~4-5 ms sm_86 ladders fit the ~14 ms verify window):
++11.4-14.5%. That is a better estimate than the 07-13 guess of +3-9%, and still
+not worth a weeks-long dual-GPU pipeline against ~90-130 t/s of aggregate from
+simply running the second card as another server.
+
+**Side finding worth its own line:** pmin gating is steering on AUC-0.56-0.63
+information. The shipped theta=0.5 is not even the best operating point for
+predicting acceptance (1.5 is, by 8pp on this corpus) -- though the gate's job
+is trimming cost, not predicting n, so this is not a bug. If depth policy is
+ever revisited, depthctl's realized-acceptance EMA is the stronger signal and
+already shipped.
+
+Probe kept in-tree: `Q27_MPROBE` + `tools/probes/margin_predictor_{analyze,auc}.py`.
+GATES after instrumentation: tri-arch x4, 11 CPU suites + auth_integration,
+canonicals EXACT x5, ninv ALL PASS, fused_smoke PASS.
+
+## 2026-07-24 (cont.) -- prefill async/mbarrier: the filed rewrite targets stalls that are already fixed. NO-GO as specified; the real wall is occupancy, and it is structural.
+
+Re-profiled prefill end to end before touching the last open engine item. Three
+things moved since the 07-07 attribution that filed this rewrite, and together
+they invalidate its premise.
+
+**1. Attention's share GREW, because the GEMM work landed.** nsys, 65,536-token
+prefill, fp8 KV, 5090 (22.40 s, 2925 t/s -- up from 2763 t/s at 07-13):
+
+    k_gemm_mma_ntx<1,96>   10.15 s   45.3%
+    k_attn_prefill_mma_pv8  5.68 s   25.4%   <- was 17.3% at 07-13
+    k_delta_wy (GDN)        1.70 s    7.6%
+    k_gemm_f16_T            1.32 s    5.9%
+    k_gemm_mma_ntx<0,96>    1.05 s    4.7%
+    quant/silu/add/rest     ~2.5 s   ~11%
+
+Attention did not get slower; the GEMM got faster (ntx), so the denominator
+shrank. Attention is O(N^2), so its share keeps climbing: ~40% at 131K.
+
+**2. The stalls the rewrite was filed against are already gone.** 07-07 measured
+14.23 warp-cycles per issued instruction, dominated by long_scoreboard (30%,
+global/L2 latency) and math_pipe_throttle (28%). cp.async prefetch (+5.4%),
+fp8 QK^T MMA (+11.8%) and fp8 PV (+2.4%) shipped against exactly those. TODAY:
+
+    warp cycles / issued instruction   7.77   (was 14.23)
+    Compute (SM) throughput           33.66%  (was 33.2%)
+    schedulers "no eligible"          80.68%
+    active warps / scheduler           1.50   (of 12)
+    eligible warps / scheduler         0.23
+
+Per-issue stalls halved; SoL did not move. The kernel is no longer stall-bound
+per issue, it is **starved of warps to issue from**.
+
+**3. The binding constraint is occupancy, and an mbarrier pipeline does not
+touch it.** 12.5% theoretical / 12.48% achieved, 1 block/SM, and ncu reports
+BOTH limits at 1: `Block Limit Registers = 1` AND `Block Limit Shared Mem = 1`.
+
+    smem  70.02 KB + 1.02 driver = 71.04 KB/block; 2 blocks need 142 KB against
+          a 102.4 KB carveout  ->  must reach <= 50.2 KB (a 28% cut)
+    regs  248/thread x 192 = 47,616; 65536/47616 = 1.38 blocks
+          ->  must reach <= 170 regs/thread (a 31% cut)
+
+A warp-specialized async producer/consumer pipeline wants MORE smem stages, not
+fewer -- it pushes the harder of the two limits the wrong way. And the two
+candidate smem cuts both give back shipped wins: the cp.async K/V ping-pong is
+16.25 KB of the 70 (undoing Phase 1's +5.4%), and s_q is 24.75 KB (halving TT
+halves the MMA tile's arithmetic intensity). On the register side the output
+accumulator `o[32][4]` is 128 registers by itself, so 170 total is not reachable
+without a smaller output tile -- the same structural bind that stopped the
+prefill GEMM at 1 block/SM, where the author already measured double-buffering
+and `__launch_bounds__` occupancy forcing as SLOWER ("local optimum, do not
+retry").
+
+**Amdahl, for whatever a future attempt is worth.** ncu prices full occupancy at
+"Est. Speedup 55.32%":
+
+    attn 25.4% @65K :  1.55x kernel -> +9.0% prefill ;  2.0x -> +12.7%
+    attn ~40% @131K :  1.55x kernel -> +14.2% prefill;  2.0x -> +20.0%
+
+At 65K that is ~+3% of median agentic request wall (prefill is 34% of it) and
+~+9% on the read-heavy class (prefill 88-96%). And P16 moved the denominator
+again: a restored prefix now costs 40-330 ms, so cold prefill only prices
+genuinely-new content.
+
+**DECISION: NO-GO on the async/mbarrier rewrite as filed.** It is aimed at a
+stall profile that three shipped phases already halved, and it cannot move the
+constraint that actually binds. If prefill is ever revisited the honest target
+is the occupancy wall -- a tile redesign hitting BOTH <=50 KB smem and <=170
+regs -- which is a larger, riskier rewrite of a bitwise-gated kernel with
+negative precedent from the GEMM. WHAT WOULD REOPEN IT: a product turn toward
+long-context prefill (131K+), where attention is ~40% of prefill and the same
+kernel win is worth +14-20% instead of +9%.
+
+Repro: `Q27_KV=fp8 Q27_PF_NOSERIAL=1 ./build/q27 <model> --tokens-file
+scratchpad/pf_toks.txt --pf 65536 --ctx 67584` under nsys; ncu with
+`-k k_attn_prefill_mma_pv8 --launch-skip 1000` (needs `sudo -n`, full path
+/usr/local/cuda/bin/ncu).
+
+## 2026-07-24 (cont.) -- strict-parser grammar engage: NO-GO (the config it unlocks is dominated) -- but the probe found DRIFT MODE 13, live, and it is fixed
+
+Last open engine item. The 07-08 A/B filed it as: "engage the constrain grammar
+on a bare `{"name"` opener too -- closes the wrapper-less bypass and would make
+strict+constrain the true zero-rescue configuration."
+
+**VERDICT: NO-GO, on the value side.** That A/B's own numbers price the target
+configuration: tolerant T8 **0.837** with 12 rescued calls; strict T8 **0.000**
+(first turn emits wrapper-less, CC one-shot-quits); strict+constrain T8
+**0.549**, where the grammar carried every wrapped call but one mid-session
+wrapper-less turn still bypassed it. So the lever's BEST case is lifting
+strict+constrain from 0.549 toward 0.837 -- parity with the default that
+already works -- while paying `--constrain-tools`' measured 3.1x in-call cost
+at depth. It buys an auditability property (no heuristic ever guesses), not
+quality and not speed, and it is the wrong trade for a default nobody should
+flip.
+
+**False-positive risk: NOT demonstrated, and honestly reported as such.** The
+probe generated the five output classes most likely to emit the trigger bytes
+without meaning a call (JSON Schema, JS object literals, REST docs, an
+explanation of function calling, package.json), all with tools registered. Two
+`{"name"` hits in the text: one inside a markdown fence (which the existing
+`inside_fence` guard already handles), and one that turned out to be a REAL
+wrapper-less call, not an example. Zero confirmed false engages. The structural
+ambiguity stands -- a bare call and a quoted example are byte-identical, and
+the model emitted a real bare call while being asked to *explain* bare calls --
+but it is a risk argument, not a measurement, and the NO-GO does not rest on it.
+
+**What the probe actually bought: DRIFT MODE 13.** The "explain function
+calling" leg came back `stop=max_tokens`, zero tool_use blocks, and
+`[drift] UN-RESCUED (ntools=2)` -- a live, reproducible miss. The model emitted
+a wrapper-less `Write` whose markdown `content` was writing an escaped JSON
+example, and the token cap cut it INSIDE an escape sequence, leaving a dangling
+`\`. The truncation repair then appended its closing quote directly after that
+backslash, which ESCAPED the quote: string still open, object never parsed,
+whole call lost. Confirmed by removing the dangling byte from the captured
+payload -- `recovered=0` -> `recovered=1 name=Write`.
+
+Fix (api_common.h, the mode-2 repair): before closing an open string, trim back
+past an incomplete escape -- a dangling `\`, or a partial `\uXXXX` (a complete
+one is 6 bytes, anything shorter at the cut is partial). The live payload now
+rescues unmodified. Three regression tests in tools/test_tool_drift.cpp,
+including an over-trim guard (a COMPLETE `é` at the cut must still
+round-trip to the right character).
+
+Note this is very likely the class of the pending report from @chaudhryfaisal
+(eos mid-arguments truncation, logged 07-18 as a possible "mode 13") -- we now
+have our own repro and fix, so that no longer waits on his payload.
+
+**Also worth recording from the probe:** 3 of 5 documentation-shaped prompts
+answered with a tool call rather than prose once tools were registered (asked to
+document a REST endpoint, the model called Write). Not a bug, but a reminder
+that tool-registration changes the response distribution, which is why drift
+telemetry has to come from tool-registered traffic.
+
+GATES: 8 CPU suites PASS (drift, drift-corpus, bridge, auth, think, split,
+prefix-cache, toolconstrain) + the full slate. `api_common.h` is not compiled
+into `build/q27`, so the CLI canonical anchors are untouched by construction.
+
+## 2026-07-24 -- v0.6.2 RELEASED (tag @ 465afaa)
+
+github.com/signalnine/q27/releases/tag/v0.6.2. Patch release on v0.6.1: one
+serving fix, two opt-in probes, and four measured NO-GOs that close the last
+open engine items. No default behavior changes.
+
+**Drift mode 13 (the fix).** A wrapper-less tool call truncated INSIDE an
+escape sequence was lost entirely: the mode-2 repair appended its closing quote
+straight after a dangling `\`, escaping it, so the string never closed and the
+object never parsed. Found live -- a `Write` whose markdown content was writing
+an escaped JSON example when the token cap hit. The repair now trims past an
+incomplete escape (dangling `\`, or a partial `\uXXXX`) before closing. Three
+regression tests including an over-trim guard.
+
+**Four NO-GOs, all measured, all closing README open items.**
+1. Saguaro/SSD off-path 3090 drafting: the lever and the predictability are
+   anti-correlated. Where the draft costs 2.0-2.7 ms/round the accepted count
+   is predictable 50-59%; where it is 100% predictable (echo) 96% of rounds are
+   suffix-drafted and the draft is already free at 0.12 ms/round.
+2. The margin-conditioned predictor that could have reopened it: 58.7%, not the
+   pre-registered 80%. The drafter's own margin separates accepted from
+   rejected steps at AUC 0.561/0.583/0.632 -- self-reported confidence is not a
+   proxy for agreement with the full model.
+3. Prefill async/mbarrier rewrite: filed against a stall profile that three
+   shipped phases already halved (14.23 -> 7.77 warp-cycles per issue). What
+   binds now is occupancy (1 block/SM, limited INDEPENDENTLY by 248 regs and
+   70 KB smem), which an async pipeline makes worse, not better.
+4. Strict-parser grammar engage: the configuration it unlocks is dominated --
+   tolerant 0.837 vs strict+constrain 0.549, at 3.1x in-call cost.
+
+**Probes kept in-tree** so any revisit starts with data: `Q27_NJOINT=1` (joint
+cap/accepted-count histogram) and `Q27_MPROBE=<file>` (per-round draft margins
+vs realized n), plus tools/probes/margin_predictor_{analyze,auc}.py. Both off
+by default; one host-side increment or fprintf per round when on.
+
+GATES at tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), 11 CPU suites + auth_integration, tri-arch sm_86/89/120 on all 4
+binaries, ninv ALL PASS, fused_smoke PASS. Assets: tarball sha256 d0b7bd5a +
+SHA256SUMS-0.6.2. Driver floor r580+ unchanged.
+
+## 2026-07-24 (cont.) -- P16 on REAL Claude Code: the disk tier works, and the run exposed a DEAD billing-header normalizer (CC 2.1.220 changed the format)
+
+Every P16 number until now came from synthetic prompts on a bench. Pointed
+headless Claude Code (2.1.220) at q27 via ANTHROPIC_BASE_URL against an isolated
+scratch repo and measured real traffic.
+
+**P16 works on real CC traffic.** Fresh process, fresh session, after a restart:
+
+    [pfx] restore L=20480 (0.87 GB, disk, alloc 151 ms + read 55 ms + import 31 ms)
+    [req] prompt=25750 hit=20480 ckpt=-1 pf=5270 pf_ms=1945  pfx=20480
+
+First turn: 25,750 tokens of cold prefill (~7.8 s) -> 5,270 tokens (1.95 s),
+restore 237 ms. The boot prefetch held (read 55 ms, not 681). CC's system+tools
+block measures ~21.4K tokens and P16b cut its entry there automatically. Warm
+turns run pf=327 pf_ms=169; same-process cross-conversation reuse goes through
+the P9 RAM ring (hit=20480 ckpt=4, 7.85 -> 2.02 s) with disk consulted only
+after RAM misses -- tier order confirmed on live traffic.
+
+**BUG FOUND AND FIXED: normalize_cc_billing_header was DEAD on CC 2.1.220.**
+Captured what CC actually sends (logging endpoint, tools+system diffed byte for
+byte). The `cch=` field the normalizer keys on IS GONE; the volatile stamp moved
+onto the version itself:
+
+    x-anthropic-billing-header: cc_version=2.1.220.473; cc_entrypoint=sdk-cli;
+    x-anthropic-billing-header: cc_version=2.1.220.c50; cc_entrypoint=sdk-cli;
+                                                  ^^^ differs between sessions
+
+`find("cch=")` returns npos, the function returns early, and nothing is pinned --
+so the first ~15 tokens of every CC system prompt differ and NO tier (P8, P9,
+P16) can share state across conversations. This has been silently degrading the
+prefix-cache story on current CC. Fix pins both forms: the legacy `cch=` value
+and any 4th+ dot-component of `cc_version=` (2.1.220 is the real version,
+.473 the volatile tail). Three regression tests carry the live-captured strings.
+
+**STILL BLOCKED, and it is upstream of q27:** CC's system block is not a
+constant across sessions. Two invocations differing ONLY in their prompt text
+produced system blocks of **90,466 vs 109,069 chars (21,416 vs 23,560 tokens)** --
+a 2,144-token difference, stable within each session (verified per-request via
+the new Q27_SYSBLK=1 diagnostic, mapped against conv= fingerprints). Against a
+passive logging endpoint the same two commands send byte-identical tools (27
+tools, 84,713 chars) and byte-identical system text, so the growth appears only
+when a real conversation proceeds; the mechanism is not yet identified. While
+this holds, cross-SESSION prefix reuse cannot work no matter what q27 does --
+the restart case (same conversation resumed) is unaffected and measured above.
+
+**Also reproduced live: the multi-second pinned allocation.** One restore logged
+`alloc 7016 ms` for a 0.87 GB cudaMallocHost first touch -- the same
+pathological allocation dismissed as an unreproduced outlier during the P16c
+work (3/3 repeats were 75-141 ms). It is real, it lands on the critical path,
+and the fix is to allocate the staging buffer at boot instead of lazily, or to
+route through the RAM tier's preallocated slots. Filed, not built.
+
+New diagnostic: `Q27_SYSBLK=1` logs sys_off / sys_len / stable_off per request --
+the tool for answering "why did cross-session reuse miss" on any client.
+GATES: 8 CPU suites PASS (bridge +3 header cases). api_common.h is not compiled
+into build/q27, so the CLI canonical anchors are untouched by construction.

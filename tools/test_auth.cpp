@@ -123,6 +123,24 @@ static void test_load_api_key_file_appends_not_replaces() {
     std::remove(path);
 }
 
+// A file that OPENS but carries no usable key returns true with `out`
+// UNCHANGED -- so "opened ok" alone does not mean auth is configured. The
+// caller (server.cu's --api-key-file branch) compares sizes and refuses to
+// boot, rather than silently serving with auth off.
+static void test_load_api_key_file_comments_only_adds_nothing() {
+    const char* path = "/tmp/q27_test_api_key_file3.txt";
+    {
+        std::ofstream f(path);
+        f << "# only comments\n";
+        f << "\n";
+        f << "   \n";
+    }
+    std::vector<std::string> out;
+    CHECK(q27::load_api_key_file(path, &out)); // opened fine
+    CHECK(out.empty());                        // ...and yielded nothing
+    std::remove(path);
+}
+
 int main() {
     test_secure_compare_basic();
     test_secure_compare_no_early_exit_timing_class();
@@ -134,6 +152,7 @@ int main() {
     test_load_api_key_file_missing_returns_false();
     test_load_api_key_file_parses_correctly();
     test_load_api_key_file_appends_not_replaces();
+    test_load_api_key_file_comments_only_adds_nothing();
     if (failures) { fprintf(stderr, "%d FAILURE(S)\n", failures); return 1; }
     fprintf(stderr, "all auth tests passed\n");
     return 0;
