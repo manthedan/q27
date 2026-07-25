@@ -189,7 +189,35 @@ void MetalEngine::validate_architecture() const {
     const DType vocab_dtype = ternary ? DType::T2_G128
                             : binary ? DType::B1_G128 : DType::Q8_G128;   // unused under mixed
     require_tier("token_embd.weight", vocab_dtype, {VOCAB, N_EMBD});
-    require_tier("output.weight", vocab_dtype, {VOCAB, N_EMBD});
+    // output.weight (the lm_head) is the ONE vocab tensor whose dtype varies
+    // across the official Q-tier ladder, so it cannot be pinned like
+    // token_embd. repack.py's --q4-head emits it at Q4_G64 and DROPS the
+    // output_q4.weight dupe (one head then serves draft/verify/plain); that
+    // is the defining move of q4s, and q5f/q6f inherit it and promote FFN
+    // tensors on top. Pinning it to Q8 rejected all three tiers -- including
+    // q5f, upstream's best-quality pack that fits a 24 GB card, i.e. this box.
+    //
+    // Widened only for the Q-tier family, and only for this tensor:
+    //   - ternary/binary/mixed packs stay pinned exactly (require_tier), so
+    //     a bonsai head cannot drift in;
+    //   - token_embd stays pinned Q8 -- no shipped tier moves it (it is a
+    //     row lookup, not a GEMV read), so it keeps its broken-repack check;
+    //   - Q4_G64 and Q8_G128 are the only accepted values, matching what
+    //     matrix() already allows for every layer weight.
+    // Both head consumers handle either dtype: project() routes Q4/Q8 to
+    // matvec_quantized (serial decode + MTP draft), and matmul_quantized
+    // accepts Q4_G64 with its own q4 pipeline and group/divisor (batched
+    // verify + chunked prefill). The MTP draft head already REQUIRES Q4_G64
+    // at this exact shape when output_q4.weight is present, so a Q4
+    // vocab-sized head is a path this engine has always exercised.
+    if (ternary || binary || mixed) {
+        require_tier("output.weight", vocab_dtype, {VOCAB, N_EMBD});
+    } else {
+        const Tensor* head = model_.find("output.weight");
+        if (!head || (head->dtype != DType::Q4_G64 && head->dtype != DType::Q8_G128) ||
+            head->shape != std::vector<uint64_t>{VOCAB, N_EMBD})
+            throw std::runtime_error("q27 Metal: required tensor mismatch: output.weight");
+    }
     require("output_norm.weight", DType::F32, {N_EMBD});
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         const std::string p = "blk." + std::to_string(layer) + ".";

@@ -26,8 +26,10 @@ with its trained MTP head.
 | **t2** | Bonsai-27B ternary | 2.25 | 6.7 GiB | 16 GB | float GEMV | supported |
 | **m1** | Bonsai-27B mixed B1/T2 graft | ~1.13 | 3.6 GiB | 8 GB | float GEMV | **experimental** |
 | **default** | Qwen3.6-27B-MTP | 5.25 | 16.5 GiB | 24 GB | int8 GEMV + MTP | supported |
-| **q4s** | Qwen3.6-27B-MTP | ~4.6 | 14.4 GiB | 20 GB | int8 GEMV + MTP | supported |
+| **q4s** | Qwen3.6-27B-MTP | ~4.6 | 14.4 GiB | 20 GB | int8 GEMV + MTP | **loads, UNVALIDATED on Metal** |
+| **q5f** | Qwen3.6-27B-MTP | 5.30 | 18.2 GiB | 24 GB | int8 GEMV + MTP | **loads, UNVALIDATED on Metal** |
 | **q6** | Qwen3.6-27B-MTP | 6.0 | 19.1 GiB | 28 GB | int8 GEMV + MTP | supported |
+| **q6f** | Qwen3.6-27B-MTP | 6.11 | 19.4 GiB | 28 GB | int8 GEMV + MTP | **loads, UNVALIDATED on Metal** |
 | **q6k** | Qwen3.6-27B-MTP | 6.8 | 21.7 GiB | 32 GB | int8 GEMV + MTP | supported |
 | **q8** | Qwen3.6-27B-MTP | 8.1 | 26.5 GiB | 36 GB | int8 GEMV + MTP | **experimental / UNVALIDATED** |
 
@@ -42,8 +44,22 @@ with its trained MTP head.
   experiment; it is not a supported tier. Install with `q27 pull m1` after
   building it locally (`tools/q27_mix.py`).
 - **default** is the max-speed official tier with the trained MTP head and
-  the only official tier that fits 24 GB (borderline — wants an idle
-  machine). **q4s** is the more comfortable 20 GB choice.
+  the only *validated* official tier that fits 24 GB (borderline — wants an
+  idle machine).
+- **q4s / q5f / q6f are the single-Q4-lm_head family.** `repack.py --q4-head`
+  emits `output.weight` itself at Q4_G64 and drops the `output_q4.weight`
+  dupe; q5f and q6f then promote FFN tensors (`ffn_down`, and `ffn_gate`
+  for q6f) to Q8 on top. **Correction (2026-07-25): this doc previously
+  listed q4s as "supported" on Metal, which was never true** — the Metal
+  loader pinned `output.weight` to Q8_G128 and rejected all three tiers at
+  load. That gate is now widened for this one tensor (audit A1,
+  [metal/PARITY-2026-07-25.md](metal/PARITY-2026-07-25.md)), so they load;
+  the change is strictly additive and cannot affect the tiers above.
+  **They are not yet validated on Metal**: no canonical/NLL/task ladder has
+  been run against any of them here. Upstream measures q5f as the best
+  quality that fits a 24 GB card (wikitext PPL 7.9491, beating q4s, default
+  and q8), which makes it the most interesting tier for a 24 GB Mac and the
+  first one to gate.
 - **q8** is the high-fidelity tier. **It is UNVALIDATED upstream pending
   48GB-class hardware** — which is exactly why we need your report. If you
   have a 36–48 GB+ machine, `q27 pull q8 && q27 report --full` and send us
@@ -122,7 +138,7 @@ Worked examples:
 |---|---|---|---|
 | 16 GB | **t2** | 32 K fp16 / 131 K turbo3 | best quality that fits comfortably |
 | 16 GB (fastest) | **b1** | 65 K fp16 / 262 K turbo3 | smallest + fastest, still a real 27B |
-| 20–24 GB | **q4s** or **default** | turbo3 to 131 K | official model + MTP; default only if idle |
+| 20–24 GB | **default** | turbo3 to 131 K | official model + MTP; wants an idle machine. q4s/q5f load but are UNVALIDATED here — do not recommend them until the ladder is run |
 | 28–32 GB | **q6** / **q6k** | fp16 to 32 K, turbo3 far | higher official fidelity |
 | 36–48 GB+ | **q8** | fp16 to 16 K, turbo3 to 131 K | max fidelity — **please send a report** |
 
