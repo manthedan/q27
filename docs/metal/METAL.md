@@ -8,27 +8,38 @@ The backend boundary is `src/backend.h`. It deliberately exposes model operation
 
 ## Current status
 
-Implemented:
+The Metal arm is the **serving stack and the active development backend**,
+not a port-in-progress. It serves two slots on a base M4 with:
 
-- startup validation for `.q27` and `.tok` artifacts before backend upload;
-- Metal device, command queue, runtime shader compilation, shared buffers, and mmap-backed weight views;
-- F32, F16, Q8_G128, and Q4_G64 matrix-vector multiplication;
-- decode primitives, one-token Gated DeltaNet, FP16 GQA attention, and state snapshots;
-- complete 64-layer greedy decode plus the layer-64 MTP draft path;
-- command-batched teacher-forced prefill;
-- opt-in turbo3 KV (`--kv turbo3`) with WHT/codec/attention tests;
-- CPU-reference and synthetic Metal tests that do not load the 17 GiB model.
+- full 64-layer decode, the layer-64 MTP draft path, and batched MTP;
+- layer-major chunked prefill to width 96, factor-2 tiled GQA attention;
+- suffix-burst speculation and batched verification to width 48;
+- F32 / F16 / Q8_G128 / Q4_G64 matvec plus the ternary (T2) and binary (B1)
+  bonsai tiers;
+- opt-in turbo3 KV (`--kv turbo3`), with per-cell fp16 exception cells;
+- disk prefix snapshots with token-exact verification, LRU + spine-pin
+  eviction, and a fair two-slot scheduler with full memory admission
+  accounting;
+- an OpenAI/Anthropic/Responses-compatible server with tool-call streaming,
+  optional API-key auth, and `--ctx auto` device-budget sizing.
+
+Measured status, gates and the numbers behind each of those live in
+[BUILDLOG.md](BUILDLOG.md); what was tried and rejected is in
+[DECISIONS.md](DECISIONS.md).
 
 Run on macOS from the repository root:
 
 ```sh
-make test-cpu
-make test-metal
+make test-cpu     # host suites + (on Darwin) the Metal server build
+make test-metal   # Metal device tests
 ```
 
-`Q27_METAL_SOURCE=/path/to/q27_kernels.metal` overrides the runtime shader path.
+`Q27_METAL_SOURCE=/path/to/q27_kernels.metal` overrides the runtime shader
+path.
 
-`build/q27-metal` is the baseline Metal inference executable. It is functionally correct on the official artifact but not performance-competitive yet. The existing CUDA executable remains unchanged and is the production/reference backend. See `docs/metal/METAL_PROGRESS.md` for checkpoint gates and measured status.
+`build/q27-metal` is the CLI; `build/q27-metal-server` is the serving
+binary. The CUDA executable is unchanged and remains the numeric reference —
+the 16-token canonical gate is byte-exact across CUDA and Metal.
 
 ## Implementation order
 

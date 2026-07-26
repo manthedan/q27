@@ -53,7 +53,7 @@ Box legend: **M4** = the 24 GB serving Mac (this repo's metal lane),
       (logs/q4port-20260717/COORDINATION.md — two OOM crashes proved why:
       never two 17 GB residents; pgrep+curl health-check before any
       server launch).
-- [ ] `docs/metal/METAL_PROGRESS.md` chronicle current through HEAD (grep-count
+- [ ] `docs/metal/BUILDLOG.md` chronicle current through HEAD (grep-count
       each new entry's headline == 1 after any merge).
 
 ## 1. Build + unit (M4, ~5 min)
@@ -137,7 +137,7 @@ remains, and run them strictly serially under the same coordinated slot:
 - [ ] Docs consistency sweep: README endpoint/env-knob list matches
       `metal_server.cpp` reality; shipped-semantics knobs promoted to
       documented flags (triage note: snapshot auto, KV fp16 cells,
-      max-tokens default); METAL_PROGRESS risk register current.
+      max-tokens default); BUILDLOG risk register current.
 - [ ] LICENSE: inherited terms from upstream `signalnine/q27` and the
       Bonsai/PrismML artifacts verified compatible for distribution
       (homebrew plan B-blockers; record the resolution).
