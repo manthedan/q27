@@ -1,0 +1,131 @@
+# Merge-back plan (2026-07-25)
+
+Supersedes [plans/2026-07-16-upstream-prs.md](plans/2026-07-16-upstream-prs.md),
+whose queue is folded in below and whose scope numbers are stale.
+
+**Status.** The maintainer approved the *idea* in principle on 2026-07-16
+(operator-relayed). The hold has always been ours: "do not open PRs yet —
+wait until our project is further along." The unhold criteria recorded then
+are now essentially met (suffix-burst gate 6 PASS, official-tier multislot
+run, Homebrew formula tagged at metal-v0.6.1). Decision 2026-07-25: **prepare
+everything, then ask** — stage every branch locally, then send the issue.
+
+## Blocking prerequisite — CLEARED
+
+`src/engine.cuh` had silently reverted 162 lines of the maintainer's own
+CUDA work (`splitk_ws`, `sampled_graphs`, `capture_constrained`,
+`pf_batch_min`, `Q27_PF_T/PF_SB`), dropped by the resolution in `df34c67`
+and carried forward by two later merges. **Any PR opened from this branch
+would have read as deleting his features.** Restored byte-identical to
+upstream and audited every other shared file for the same failure — no other
+drops (audit A9). This is why nothing ships before a clean-diff check.
+
+## Hard constraint: we cannot build CUDA
+
+There is no `nvcc` on either of our machines (both Apple Silicon). Every
+CUDA-touching PR below is **untestable by us** and must be labelled as such
+in its description, with the reasoning and the evidence we do have. This is
+a reason to keep our CUDA surface *small and obviously-correct*, not to
+hide it.
+
+## Real scope (measured, not estimated)
+
+`git diff upstream/master..HEAD` is 973 files / 164,932 insertions, which
+overstates the review burden badly:
+
+| area | insertions | files | goes upstream? |
+|---|---|---|---|
+| `logs/` | 86,882 | 708 | **no** — never in a path-scoped PR |
+| `experiments/` | 23,413 | 48 | probably not (agent harness, TUI) |
+| `src/metal/` | 20,563 | 13 | **yes** — the actual port |
+| `docs/` | 16,852 | 97 | condensed subset |
+| `tools/` | 11,707 | 67 | selective (gates worth having) |
+| `packaging/` | 1,811 | 10 | no (our Homebrew tap) |
+| shared `src/*` | ~2,900 | 20 | **yes** — the seam + hardening |
+
+So the genuinely proposed surface is roughly **24k lines**, not 165k, and
+the single biggest reviewable chunk is `src/metal/` at 20.5k.
+
+`LICENSE` carries our fork-additions copyright line. Already acknowledged by
+the maintainer in the 07-16 exchange; it must **not** appear in any PR.
+
+## Stages
+
+Each stage is a branch off `upstream/master`, not off `metal`, so its diff
+contains only that stage.
+
+### PR 1 — `server.cu` CUDA 12.0 compat  *(smallest, safest, send first)*
+Lambda-captured structured bindings are rejected by CUDA 12.0's nvcc;
+behavior-identical rewrite to named tuple references. ~10 lines.
+*Untestable by us* — but it is a compile fix for a toolchain he may not
+have, and the failure mode is a build error, not a behavior change.
+
+### PR 2 — README note: `Q27_W_MAX=12` does not fit a 24 GB card
+The default graph zoo is ~2.7 GB and dies in `cudaGraphInstantiate` next to
+17.7 GB of weights; `-DQ27_W_MAX=8` fits with ~0.9 GB headroom. One
+paragraph. Evidence: [plans/2026-07-16-3090-graph-oom.md](plans/2026-07-16-3090-graph-oom.md)
+(per-family attribution, both widths measured on a 3090). Docs only.
+
+### PR 3 — argmax tie-break parity  *(offer, flag the risk)*
+`blocks.cu` + `test_kernels.cu`: exact-value ties resolve to the **lowest**
+index, so CUDA agrees with Metal argmax and CPU `max_element`. This is the
+single most valuable thing we have for him *if* he ever wants a second
+backend — but it **changes CUDA kernel behavior**, and his canonical
+anchors are byte-exact hashes. Ties are rare, and our 16-token canonical
+gate is byte-exact across both arms, but he must re-bless anchors himself.
+Send with that caveat stated up front, or hold until after PR 5.
+
+### PR 4 — `Q27_GRAPH_TRACE=1` instrument  *(offer, not push)*
+Per-family graph-memory attribution in `build_spec_graphs`; prints the table
+on instantiate failure so an OOM report self-attributes. Measured:
+`verify_w` dominates at 855 MB/w8, sampled family 577 MB. Preserved at
+`patches/0001-cuda-graph-trace-ORIGINAL.patch`; **needs re-applying onto his
+current `engine.cuh`**, which has moved since (the graph-zoo capture gates
+landed in that same function).
+
+### PR 5 — the backend seam  *(the real conversation)*
+`src/backend.h` plus the `loader` / `tokenizer` / `sampling.h` / `kl.h`
+generalizations that let a non-CUDA backend exist at all. No Metal code.
+This is where he decides whether q27 is CUDA-only or multi-backend.
+Everything after is additive; if he declines, we stop here and stay a
+labelled downstream port.
+
+Includes the `strip_ctrl` / `tools_preamble` extraction out of
+`api_common.h` into their own headers so both arms share one definition —
+worth calling out as a refactor of *his* file, since it is the one place we
+restructured upstream code rather than adding to it.
+
+### PR 6 — Metal core
+`metal_backend.{h,mm}`, `q27_kernels.metal`, `metal_engine.{h,cpp}`,
+`metal_cli.cpp`, `test_metal*`. ~14k lines, self-contained, touches no CUDA.
+Fully testable by us.
+
+### PR 7 — Metal serving
+`metal_server.cpp`, `stream_format.h`, `disk_snapshot_store.h`,
+`snapshot_evict.h` and their gates. Separable from core: it is the HTTP
+layer, and he may want the engine without our serving opinions.
+
+### PR 8 — shared serving hardening
+Our `api_common.h` / `stream_split.h` additions that benefit both arms.
+Note much of this file already flows the other way (his tolerant readers,
+drift modes, billing-header fix came to us) — so this PR is small and should
+be diffed carefully against what he already has.
+
+### Probably never
+`experiments/` (ds4-agent, q27-tui), `packaging/` (our tap), `logs/`,
+`docs/metal/` beyond a short pointer. Fine — they are ours.
+
+## Sequencing note
+
+PRs 1–2 are free goodwill and cost him minutes. PR 5 is the decision point;
+there is no value in preparing 6–8 for review until he answers it, though
+having them *staged* is exactly what "prepare everything, then ask" means.
+
+## Before sending anything
+
+- [x] A9 clean-diff check (`engine.cuh` restored, all shared files audited)
+- [ ] Each stage branched off `upstream/master` and its diff eyeballed for
+      unintended carry-over
+- [ ] Refresh the 07-16 issue draft: scope numbers are stale (it says
+      "~160 commits / +30k lines")
+- [ ] Every CUDA-touching PR body states we could not compile it
