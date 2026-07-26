@@ -110,11 +110,19 @@ behavior-identical rewrite to named tuple references. ~10 lines.
 *Untestable by us* — but it is a compile fix for a toolchain he may not
 have, and the failure mode is a build error, not a behavior change.
 
-### PR 2 — README note: `Q27_W_MAX=12` does not fit a 24 GB card
-The default graph zoo is ~2.7 GB and dies in `cudaGraphInstantiate` next to
-17.7 GB of weights; `-DQ27_W_MAX=8` fits with ~0.9 GB headroom. One
-paragraph. Evidence: [plans/2026-07-16-3090-graph-oom.md](plans/2026-07-16-3090-graph-oom.md)
-(per-family attribution, both widths measured on a 3090). Docs only.
+### PR 2 — README note for 24 GB cards  — **DROPPED, already upstream**
+
+The 07-16 queue listed this as ready-to-send. It is now redundant and must
+not be proposed: `upstream/master`'s README already documents
+`make build/q27-server-w8` / `Q27_W_MAX=8`, that the default width-12 build
+"OOMs at graph setup on 24GB", turbo3-by-default on Ampere, the q4s
+recommendation, and further `Q27_MAXD=4` / `Q27_SAMPLED=0` knobs with
+field measurements from a 22.6 GiB A10 (issue #1). That is more complete
+than our note would have been.
+
+Lesson recorded rather than just fixed: the queue was nine days stale and
+one of its three ready-to-send items had been overtaken. **Re-check each
+remaining item against current upstream immediately before sending.**
 
 ### PR 3 — argmax tie-break parity  *(offer, flag the risk)*
 `blocks.cu` + `test_kernels.cu`: exact-value ties resolve to the **lowest**
@@ -125,10 +133,15 @@ anchors are byte-exact hashes. Ties are rare, and our 16-token canonical
 gate is byte-exact across both arms, but he must re-bless anchors himself.
 Send with that caveat stated up front, or hold until after PR 5.
 
-### PR 4 — `Q27_GRAPH_TRACE=1` instrument  *(offer, not push)*
+### PR 4 — `Q27_GRAPH_TRACE=1` instrument  *(offer, not push; value reduced)*
 Per-family graph-memory attribution in `build_spec_graphs`; prints the table
 on instantiate failure so an OOM report self-attributes. Measured:
-`verify_w` dominates at 855 MB/w8, sampled family 577 MB. Preserved at
+`verify_w` dominates at 855 MB/w8, sampled family 577 MB. Value is LOWER
+than when this was queued: upstream has since done its own attribution and
+now documents the zoo's cost in the README (~600 MB sampled set on sm_86,
+~280 MB for `Q27_MAXD=4`). What the instrument still adds is
+self-attribution *on failure*, which a documented constant cannot do.
+Preserved at
 `patches/0001-cuda-graph-trace-ORIGINAL.patch`; **needs re-applying onto his
 current `engine.cuh`**, which has moved since (the graph-zoo capture gates
 landed in that same function).
@@ -164,6 +177,31 @@ be diffed carefully against what he already has.
 ### Probably never
 `experiments/` (ds4-agent, q27-tui), `packaging/` (our tap), `logs/`,
 `docs/metal/` beyond a short pointer. Fine — they are ours.
+
+## Staged branches (local, not pushed)
+
+| branch | stage | diff vs `upstream/master` | state |
+|---|---|---|---|
+| `pr1-cuda12-compat` | PR 1 | `server.cu` +8/−2 | ready |
+| `pr3-argmax-tiebreak` | PR 3 | `blocks.cu` +15/−3, `test_kernels.cu` +11/−1 | ready, carries the anchor-reblessing caveat |
+| `pr5-backend-seam` | PR 5 | 3 new headers + 15 added lines across `loader.{h,cpp}` / `tokenizer.h`; **1 deletion total** (the DType enum line, extended in place) | ready |
+
+Each is a worktree off `upstream/master`, so its diff contains only that
+stage. Verified for PR 5: every new header is self-contained, and
+`loader.cpp` / `tokenizer.cpp` still build clean at `-Wall -Wextra`.
+
+Two things the staging turned up:
+
+**Extending `DType` is not free.** It makes `dtype_name()`'s switch
+non-exhaustive and adds a `-Wswitch` warning to *his* build. Three case
+labels fix it; caught by compiling his sources against the new header rather
+than assuming additive meant safe.
+
+**A separate bug worth its own PR.** Upstream's `Tokenizer` owns a raw
+`Impl*` with **no destructor and no deleted copy constructor** — it leaks,
+and copying it would double-free. Our fork fixed this incidentally; it
+should be offered on its own merits, independent of any Metal work, rather
+than smuggled in as part of the seam.
 
 ## Sequencing note
 
