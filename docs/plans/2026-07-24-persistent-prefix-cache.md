@@ -324,13 +324,45 @@ reason the restore timing log now splits alloc / read / import instead of
 reporting one number, since the original single number had folded a
 first-touch `cudaMallocHost` into what it called "read".
 
+## 2026-07-25 follow-up: the outlier came back, and it was not an allocation
+
+The `alloc` column above is now 0 on every restore, and the reason is worth
+recording because the first diagnosis was wrong.
+
+A live CC restore logged `alloc 7016 ms`, filed as the pathological
+`cudaMallocHost` reproducing. It was not: the persist three log lines earlier
+had already grown `pfx_stage` to 0.98 GB and the entry needed 0.87 GB, so
+`pfx_stage_ensure` returned at its size check without allocating. The remaining
+statement in that call was `pfx_wait_writer()`, joining the 0.98 GB background
+write -- the restore and the writer shared one buffer, so a restore could not
+start until the write finished. The bucket introduced here to stop folding an
+allocation into "read" had started folding a thread join into "alloc".
+
+Fixed by giving the writer its own buffer (`pfx_wstage`) and pinning both at
+boot. Measured with the write duration set by a probe rather than waited for,
+since a healthy 1.16 GB fsync finishes faster than the gap to the next request:
+
+| leg | restore `alloc` | request wall |
+|---|---|---|
+| shared buffer, writer held 6000 ms | 6358 / 6456 ms | 6.73 / 6.83 s |
+| split buffers, writer held 6000 ms | 0 / 0 ms | 0.38 / 0.38 s |
+| shared buffer, no write in flight | 79 ms | 0.45 s |
+| split + preallocated, no write in flight | 0 ms | 0.37 s |
+
+Cost: two pinned buffers per slot instead of one, ~1.23 GB each at
+`--prefix-cache-max-tokens 30720` / fp8, pinned in ~350 ms at boot.
+`PrefixRam`'s slots are preallocated now too -- they were lazy as well, despite
+being the thing the original filing suggested routing through.
+
 ## Known limits of P16a
 
 - A write is lost if the process dies inside the ~1-2 s background write.
   Nothing partial can be indexed (publish is a rename) and the leftover .tmp is
   swept on the next boot, so the cost is one re-prefill, not corruption.
-- The staging buffer is pinned host memory sized by `--prefix-cache-max-tokens`
-  (32768 default = ~1.3 GB at fp8), allocated lazily on first use.
+- The staging buffers are pinned host memory sized by
+  `--prefix-cache-max-tokens` (32768 default = ~1.3 GB at fp8). There are TWO
+  per slot -- one for restores, one owned by the persist writer -- and both are
+  pinned at boot, not on first use (2026-07-25; see below).
 - One write in flight per engine; a persist that arrives while the previous is
   still writing is skipped, not queued.
 

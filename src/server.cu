@@ -129,7 +129,9 @@ int main(int argc, char** argv) {
                 "  conversation restores instead of re-prefilling. Tuning:\n"
                 "  --prefix-cache-max-gb 20 --prefix-cache-min 4096\n"
                 "  --prefix-cache-max-tokens 32768 --prefix-cache-step 8192.\n"
-                "  max-tokens also sizes the pinned staging buffer.\n"
+                "  max-tokens also sizes the staging buffers: TWO per slot\n"
+                "  (restore and persist, so a restore never waits on a write),\n"
+                "  both pinned at boot rather than on the first request.\n"
                 "  --prefix-cache-ram-gb 0 adds a pinned host-RAM tier above the\n"
                 "  disk; off by default (the boot prefetch already makes reads\n"
                 "  36-39 ms, so it saves little -- see the plan doc).\n",
@@ -575,6 +577,20 @@ int main(int argc, char** argv) {
     // the layer geometry. Slots are built by now, so ask slot 0.
     if (pfx_cache.enabled() && pfx_ram_gb > 0 && !slots.empty())
         pfx_ram.init((size_t)(pfx_ram_gb * 1e9), slots[0].eng->pfx_bytes(pfx_cfg.max_tokens));
+    // Pin every prefix-cache buffer HERE, before listen(): each one is sized by
+    // --prefix-cache-max-tokens, which is known now, and a lazy cudaMallocHost
+    // costs ~190 ms (staging) or ~135 ms (RAM slot) on whichever request first
+    // needs it -- the post-restart request this feature exists to make fast.
+    //
+    // Synchronous on purpose. Boot has no cover left to hide it under (the
+    // weight upload finished long before the slots were built), and a
+    // background thread would race the graph zoo: engine.cuh captures with
+    // cudaStreamCaptureModeGlobal, under which an allocation from ANY thread
+    // is an illegal call, and P3 re-captures on new shapes during serving too.
+    if (pfx_cache.enabled()) {
+        pfx_ram.prealloc();
+        for (auto& s : slots) s.eng->pfx_prealloc(pfx_cfg.max_tokens);
+    }
     {
         // headroom line (also the auto-ctx calibration probe: this minus the
         // post-weights line minus exact KV = the non-KV fixed stack)

@@ -490,6 +490,7 @@ struct Engine {
     ~Engine() {
         if (pfx_thr.joinable()) pfx_thr.join();
         if (pfx_stage) cudaFreeHost(pfx_stage);
+        if (pfx_wstage) cudaFreeHost(pfx_wstage);
     }
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
@@ -2990,8 +2991,19 @@ struct Engine {
     //           drafts are rejected by verify) but silently costs acceptance
     //           -- a bitwise gate would never catch it.
     q27::PrefixCache* pcache = nullptr;  // borrowed, server-owned; null = feature off
-    char* pfx_stage = nullptr;      // pinned staging: [gdn | attn+mtp kv]
+    // TWO pinned staging buffers, not one (2026-07-25). The writer thread owns
+    // its buffer for the whole ~1-8 s file write, so a restore that shared it
+    // had to join that thread first -- and did: a live CC restore logged
+    // `alloc 7016 ms` with NO allocation in the call at all. The buffer was
+    // already 0.98 GB from the previous persist and the entry needed 0.87 GB,
+    // so pfx_stage_ensure returned at its size check; all 7 s was
+    // pfx_wait_writer() joining a 0.98 GB write, charged to a bucket labelled
+    // "alloc". Separate buffers decouple the paths: a restore never waits on a
+    // write, whatever the drive is doing.
+    char* pfx_stage = nullptr;       // pinned restore staging: [gdn | attn+mtp kv]
     size_t pfx_stage_bytes = 0;
+    char* pfx_wstage = nullptr;      // pinned persist staging; writer-owned while busy
+    size_t pfx_wstage_bytes = 0;
     std::thread pfx_thr;
     std::atomic<bool> pfx_busy{false};
     int pfx_last_persist = 0;  // step gate: last L this engine wrote (0 = none)
@@ -3018,28 +3030,55 @@ struct Engine {
     }
     size_t pfx_bytes(int L) const { return pfx_gdn_bytes() + pfx_kv_bytes(L); }
 
-    // The writer owns pfx_stage while it runs; anything that touches the
-    // buffer waits for it first. Writes are rare (first turn of a
-    // conversation), so blocking here beats skipping a restore.
+    // The writer owns pfx_wstage while it runs, so the PERSIST path joins it
+    // before reusing that buffer. Writes are rare (first turn of a conversation
+    // and each step boundary after), and pfx_should_persist already declines
+    // while one is in flight, so this join is normally free. The RESTORE path
+    // deliberately does NOT call this -- that coupling is what the two-buffer
+    // split removes.
     void pfx_wait_writer() {
         if (pfx_thr.joinable()) pfx_thr.join();
         pfx_busy.store(false);
     }
-    bool pfx_stage_ensure(int L) {
-        pfx_wait_writer();
-        const size_t need = pfx_bytes(L);
-        if (pfx_stage_bytes >= need) return true;
-        if (pfx_stage) CUDA_CHECK(cudaFreeHost(pfx_stage));
-        pfx_stage = nullptr;
-        pfx_stage_bytes = 0;
-        if (cudaMallocHost((void**)&pfx_stage, need) != cudaSuccess) {
-            fprintf(stderr, "[pfx] staging alloc %.2f GB FAILED -- prefix cache idle\n",
+    // Grow-only pinned buffer. On failure the buffer is left released and the
+    // tier idles for this request rather than aborting the server.
+    static bool pfx_pin(char** buf, size_t* have, size_t need, const char* what) {
+        if (*have >= need) return true;
+        if (*buf) CUDA_CHECK(cudaFreeHost(*buf));
+        *buf = nullptr;
+        *have = 0;
+        if (cudaMallocHost((void**)buf, need) != cudaSuccess) {
+            fprintf(stderr, "[pfx] %s alloc %.2f GB FAILED -- prefix cache idle\n", what,
                     need / 1e9);
-            pfx_stage = nullptr;
+            *buf = nullptr;
             return false;
         }
-        pfx_stage_bytes = need;
+        *have = need;
         return true;
+    }
+    bool pfx_stage_ensure(int L) {
+        return pfx_pin(&pfx_stage, &pfx_stage_bytes, pfx_bytes(L), "restore staging");
+    }
+    bool pfx_wstage_ensure(int L) {
+        pfx_wait_writer();  // the writer is still reading this buffer
+        return pfx_pin(&pfx_wstage, &pfx_wstage_bytes, pfx_bytes(L), "persist staging");
+    }
+    // Pin both buffers at boot, sized for the largest entry the cache can hold
+    // (--prefix-cache-max-tokens). Allocating them lazily put a ~190 ms
+    // cudaMallocHost on the first restore and a free+realloc on every persist
+    // that crossed a step boundary, both on the request critical path -- for a
+    // buffer whose maximum size is known before the first request arrives.
+    void pfx_prealloc(int max_tokens) {
+        const size_t need = pfx_bytes(max_tokens);
+        auto t0 = std::chrono::steady_clock::now();
+        // Both attempted even if the first fails, so the log names every buffer
+        // that could not be pinned rather than only the first.
+        const bool rd = pfx_stage_ensure(max_tokens);
+        const bool ok = pfx_wstage_ensure(max_tokens) && rd;
+        fprintf(stderr, "[pfx] pinned 2 x %.2f GB staging at boot (%s, %.0f ms)\n", need / 1e9,
+                ok ? "restore + persist" : "INCOMPLETE",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                    .count());
     }
     // Device -> host. Ordered on stm, so it observes exactly the state the
     // prefill has written at the call site.
@@ -3123,7 +3162,7 @@ struct Engine {
         // eviction that happens mid-write.
         q27::PrefixRam::BlobPtr slot;
         if (pram && pram->enabled()) slot = pram->acquire(pfx_bytes(L));
-        char* dst = slot ? slot->p : (pfx_stage_ensure(L) ? pfx_stage : nullptr);
+        char* dst = slot ? slot->p : (pfx_wstage_ensure(L) ? pfx_wstage : nullptr);
         if (!dst) return;
         auto t0 = std::chrono::steady_clock::now();
         pfx_export(L, dst);
@@ -3540,11 +3579,14 @@ struct Engine {
             }
             if (!pfx_hit && base == 0 && ck < 0 && pcache && pcache->enabled() &&
                 pcache->find(prompt, &pe)) {
-                // Time the ALLOCATION separately from the read. Folding them
-                // together made a first-touch cudaMallocHost look like a
-                // 12-20 s disk read (2026-07-24) -- pinned host allocation of
-                // ~1 GB is not free, and it is a one-time cost per buffer, not
-                // per restore.
+                // Time the buffer acquisition separately from the read.
+                // Folding them together made this look like a 12-20 s disk
+                // read (2026-07-24). The split then mislabelled the successor:
+                // with the writer sharing this buffer, `alloc` was really the
+                // writer join, and it logged 7016 ms for a call that allocated
+                // nothing (2026-07-25). Nothing on this path blocks any more --
+                // the buffers are pinned at boot and the writer has its own --
+                // so a non-zero number here now means exactly what it says.
                 auto ta = std::chrono::steady_clock::now();
                 // Read STRAIGHT into a RAM-tier slot when one is free: the blob
                 // is then already resident for the next restore at zero extra

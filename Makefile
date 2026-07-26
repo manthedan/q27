@@ -279,7 +279,7 @@ test-metal:
 endif
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
-           src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h | build
+           src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
 
 build:
@@ -357,7 +357,7 @@ build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks
 build/q27-server: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                   src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/tool_preamble.h src/stream_split.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
-                  src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h | build
+                  src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
 
@@ -397,7 +397,7 @@ build/turbo3_test: tools/turbo3_test.cu src/turbo3.cuh | build
 build/q27-server-w8: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/tool_preamble.h src/stream_split.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
-                     src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h | build
+                     src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
 
@@ -413,7 +413,7 @@ build/ninv_test: tools/ninv_test.cu src/vgemm.cuh src/kernels.cuh src/blocks.cuh
 build/test_conductor: tools/test_conductor.cpp src/conductor.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_conductor.cpp -o $@
 
-build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu \
+build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/conductor.h src/prefix_cache.h src/prefix_ram.h src/blocks.cu src/prefill.cu \
                    src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/fused_smoke.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
@@ -422,6 +422,6 @@ build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/conductor.h src/block
 build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                       src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/tool_preamble.h src/stream_split.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
-                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h | build
+                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@

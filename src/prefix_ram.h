@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -48,14 +49,44 @@ class PrefixRam {
         slot_bytes_ = slot_bytes;
         max_slots_ = slot_bytes ? (int)(budget_bytes / slot_bytes) : 0;
         if (max_slots_ > 0)
-            fprintf(stderr, "prefix-cache RAM tier: %d slot%s x %.2f GB pinned (lazy)\n",
-                    max_slots_, max_slots_ == 1 ? "" : "s", slot_bytes / 1e9);
+            fprintf(stderr, "prefix-cache RAM tier: %d slot%s x %.2f GB\n", max_slots_,
+                    max_slots_ == 1 ? "" : "s", slot_bytes / 1e9);
         else if (budget_bytes)
             fprintf(stderr,
                     "prefix-cache RAM tier: budget %.2f GB < one %.2f GB slot -- disabled\n",
                     budget_bytes / 1e9, slot_bytes / 1e9);
     }
     bool enabled() const { return max_slots_ > 0; }
+
+    // Pin every slot at boot. acquire() would otherwise call cudaMallocHost on
+    // the first restore that lands in a fresh slot -- measured 133-141 ms at
+    // 1.3 GB during P16c, on the request critical path, for a size that is
+    // known before the first request arrives. Slots go in with empty toks, so
+    // find() skips them and acquire() treats them as evictable.
+    void prealloc() {
+        if (!enabled()) return;
+        auto t0 = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(m_);
+        while ((int)lru_.size() < max_slots_) {
+            BlobPtr b = std::make_shared<Blob>();
+            if (cudaMallocHost((void**)&b->p, slot_bytes_) != cudaSuccess) {
+                b->p = nullptr;
+                fprintf(stderr,
+                        "prefix-cache RAM tier: pinned alloc %.2f GB FAILED at boot -- "
+                        "tier capped at %d slot%s\n",
+                        slot_bytes_ / 1e9, (int)lru_.size(), lru_.size() == 1 ? "" : "s");
+                max_slots_ = (int)lru_.size();
+                break;
+            }
+            b->cap = slot_bytes_;
+            lru_.push_back(b);
+        }
+        if (max_slots_ > 0)
+            fprintf(stderr, "prefix-cache RAM tier: %d slot%s pinned at boot (%.0f ms)\n",
+                    max_slots_, max_slots_ == 1 ? "" : "s",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+    }
 
     // Longest published blob that is an exact prefix of `prompt` and leaves at
     // least one token to decode from. Returned by shared_ptr, so eviction by
@@ -75,7 +106,8 @@ class PrefixRam {
 
     // A slot to fill. Reuses an evictable allocation (refcount 1 = only the LRU
     // holds it) before allocating, so the pinned malloc happens at most
-    // max_slots_ times over the server's life and never on a hot path twice.
+    // max_slots_ times over the server's life -- and zero times once prealloc()
+    // has run, which is the serving path.
     BlobPtr acquire(size_t need) {
         if (!enabled() || need > slot_bytes_) return nullptr;
         std::lock_guard<std::mutex> lk(m_);

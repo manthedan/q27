@@ -8808,3 +8808,126 @@ New diagnostic: `Q27_SYSBLK=1` logs sys_off / sys_len / stable_off per request -
 the tool for answering "why did cross-session reuse miss" on any client.
 GATES: 8 CPU suites PASS (bridge +3 header cases). api_common.h is not compiled
 into build/q27, so the CLI canonical anchors are untouched by construction.
+
+## 2026-07-25 -- the `alloc 7016 ms` was not an allocation. It was the restore joining the persist writer, and the filed fix would not have touched it
+
+Yesterday's live-CC run logged one pathological restore:
+
+    [pfx] persisting L=23552 (0.98 GB, export 34 ms)
+    ...
+    [pfx] restore L=20480 (0.87 GB, disk, alloc 7016 ms + read 57 ms + import 30 ms)
+
+Filed as "a 0.87 GB cudaMallocHost first touch taking 7 seconds", with the fix
+recorded as "allocate the staging buffer at boot instead of lazily". Both halves
+were wrong, and the arithmetic in the two log lines says so without needing a
+repro: the persist three lines earlier had already grown `pfx_stage` to
+0.98 GB, the restore needed 0.87 GB, so `pfx_stage_ensure` returned at its
+`pfx_stage_bytes >= need` check. **That call allocated nothing.** The only other
+statement in it was `pfx_wait_writer()` -- joining the 0.98 GB background write
+the persist had just started. All 7016 ms was the join, charged to a bucket
+labelled "alloc".
+
+This is the exact instrumentation failure the split was introduced to fix,
+committed one generation later: 07-24 stopped folding an allocation into "read"
+and started folding a thread join into "alloc".
+
+**The allocation was never a plausible suspect.** `scratchpad/pin_alloc_bench.cu`,
+1.3 GB pinned, this box:
+
+| leg | alloc |
+|---|---|
+| clean | ~190 ms |
+| after touching 20 GB of pageable heap (forces reclaim) | ~190 ms |
+| with the device saturated by a concurrent kernel stream | ~200 ms |
+
+Flat and boring under every condition that could plausibly stall it. Nothing
+here produces 7 seconds.
+
+### The fix: the restore path and the writer stop sharing a buffer
+
+Three changes, `src/engine.cuh` + `src/prefix_ram.h` + `src/server.cu`:
+
+1. **Two staging buffers per slot, not one.** `pfx_stage` serves restores;
+   `pfx_wstage` is what `pfx_export` fills and the writer thread owns for the
+   duration of the write. `pfx_stage_ensure` no longer calls
+   `pfx_wait_writer()` -- there is nothing to wait for. The persist path keeps
+   the join, where it is correct and where `pfx_should_persist`'s busy check
+   already makes it free.
+2. **Both pinned at boot**, sized `pfx_bytes(--prefix-cache-max-tokens)`, next
+   to the P16c RAM-tier init. `PrefixRam::prealloc()` does the same for its
+   slots, which were also lazy despite the filing assuming otherwise (the boot
+   line literally said `(lazy)`). Synchronous on purpose: boot has no cover left
+   to hide it under, and a background allocation would race the graph zoo --
+   engine.cuh captures with `cudaStreamCaptureModeGlobal`, under which an
+   allocation from any thread is illegal, and P3 re-captures during serving too.
+3. **The `alloc` bucket now measures only allocation**, so a number in it means
+   what it says.
+
+### Measured (5090, fp8, 1 slot, 30720 max-tokens, entry 0.51 GB)
+
+`scratchpad/pfx_alloc_ab.sh` -- restore with no write in flight, which isolates
+the allocation:
+
+| leg | restore `alloc` | request wall |
+|---|---|---|
+| before | 79 ms | 0.45 s |
+| after | **0 ms** | 0.37 s |
+
+`scratchpad/pfx_overlap_ab.sh` -- restore issued while a persist writer is
+still open. The first attempt at this leg **failed to reproduce anything**: a
+1.16 GB fsync finished inside the ~0.3 s gap before the next request, so the
+join was free. That is the healthy drive, and it is why the stall reads as an
+outlier. Rather than wait for the drive to misbehave again -- or spend ~1 TB of
+writes inducing contention for one number -- the write duration was *set*, with
+a `Q27_PFX_WDELAY` probe compiled into both binaries and committed to neither:
+
+| leg | restore `alloc` | request wall |
+|---|---|---|
+| before, writer held 6000 ms | 6358 / 6456 ms | 6.73 / 6.83 s |
+| after, writer held 6000 ms | **0 / 0 ms** | 0.38 / 0.38 s |
+
+The whole write duration lands on the next restore before the change, and none
+of it after. Read back onto the live log, `alloc 7016 ms` says that 0.98 GB
+write was still running seven seconds after the request that started it had
+finished responding -- entirely consistent with the drive behaviour P16c
+already recorded and could not explain (12.7 s and 17.9 s first-reads of a
+0.51 GB file on a 77%-full QLC volume).
+
+### Cost
+
+Two pinned buffers per slot instead of one, both resident from boot:
+~1.23 GB each at `--prefix-cache-max-tokens 30720` / fp8, so ~2.5 GB per slot,
+pinned in 340-357 ms at startup. On a 123 GB box behind an opt-in flag that is
+the right side of the trade; `--prefix-cache-max-tokens` is the knob if it ever
+is not.
+
+### Lesson
+
+A timing bucket is a claim about *what* it contains, and it decays as the code
+under it changes. Both P16 misattributions were one statement drifting into a
+bucket named after its neighbour. The split introduced on 07-24 was correct and
+still ended up lying within a day -- so the useful discipline is not "split the
+timer" but "re-derive what is inside the bucket before believing the number",
+which here took two log lines and no GPU at all.
+
+**GATES:** tri-arch (sm_86/89/120) on all 4 binaries; 13 CPU suites PASS;
+canonicals EXACT (vanilla a2982c51, q4s greedy f64e7c02 + sampled 900031e9,
+q5f 683f7f44, q6f 2a4d22ea); ninv ALL PASS; fused_smoke PASS. P16 gate 1
+(bitwise restore) PASS -- cache-off, cache-on-cold and disk-restored
+continuations all md5 f7e71a5f, and the same md5 the PRE-fix binary produces,
+so moving the persist to its own buffer changed no bytes. Boot now logs
+`[pfx] pinned 2 x 1.23 GB staging at boot (restore + persist, 372 ms)` and the
+restore logs `alloc 0 ms`.
+
+**OPS trap banked:** building a probe variant leaves `build/q27-server` holding
+whichever binary was compiled last, and the standing gate slate rebuilds
+`q27`/`w8`/`w16`/`fused_smoke`/`ninv_test` but NOT `q27-server`. The first gate
+pass therefore ran the P16 leg against the base+probe build and reported
+`alloc 84 ms` with no prealloc line -- the gate was right, the binary was
+stale. Check `strings build/<bin>` for the marker you just added before
+believing a serving-path gate.
+
+**Known gap, not fixed here:** `src/prefix_ram.h` is included by `engine.cuh`
+but appears in no Makefile prerequisite list, so a change confined to that
+header produces a silently stale build. Editing the Makefile needs its own
+approval; filed, not built.
