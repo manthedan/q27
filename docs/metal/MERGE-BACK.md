@@ -140,10 +140,10 @@ This is where he decides whether q27 is CUDA-only or multi-backend.
 Everything after is additive; if he declines, we stop here and stay a
 labelled downstream port.
 
-Includes the `strip_ctrl` / `tools_preamble` extraction out of
-`api_common.h` into their own headers so both arms share one definition —
-worth calling out as a refactor of *his* file, since it is the one place we
-restructured upstream code rather than adding to it.
+Additive only. Does **not** include the `strip_ctrl` / `tools_preamble`
+extraction — see the section above: his `api_common.h` already defines both,
+so Metal uses his and the extraction stays a fork-local convenience. That
+keeps this PR free of any restructuring of upstream code.
 
 ### PR 6 — Metal core
 `metal_backend.{h,mm}`, `q27_kernels.metal`, `metal_engine.{h,cpp}`,
