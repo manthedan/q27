@@ -664,8 +664,6 @@ struct Runtime {
     std::string model_name,model_sha1_cache,boot_id,server_sha1,tokenizer_name,tokenizer_sha1;
     std::string admin_token;   // separate from boot_id: never served over HTTP (autoreview P2)
     bool snapshot_spine_pin_config=false;
-    // Boot prefetch entry count (audit A5): 0 = off (the default).
-    int snapshot_prefetch_config=0;
     bool experimental_prefix_cache=false;
     std::string os_sysname,os_release,os_machine;
     bool turbo3_kv=false, test_failpoints=false;
@@ -715,7 +713,6 @@ struct Runtime {
                     {"experimental_prefix_cache",experimental_prefix_cache},
                     {"snapshot_max_bytes",snapshot_max_bytes_config},
                     {"snapshot_spine_pin",snapshot_spine_pin_config},
-                    {"snapshot_prefetch",snapshot_prefetch_config},
                     {"max_tokens_default",max_tokens_default_config},
                     {"think_default",think_default},
                     {"sampling_default",{{"temperature",sampling_default_temperature},
@@ -741,16 +738,11 @@ struct Runtime {
             uint32_t width,uint32_t sfx_width,size_t cache_entries,bool constrain,
             uint32_t slot_count,uint32_t budget_mb,const std::string& snapshot_dir,
             uint32_t snapshot_max_mb,long long snapshot_auto,uint32_t max_tokens_default,
-            int spine_pin,bool experimental_prefix,bool think_srv,int snapshot_prefetch)
+            int spine_pin,bool experimental_prefix,bool think_srv)
         :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
          constrain_tools(constrain),experimental_prefix_cache(experimental_prefix),
          turbo3_kv(turbo3),prefix_entries_config(cache_entries),
          max_tokens_default_config(max_tokens_default),think_default(think_srv) {
-        // Assigned in the body, not the init list: the member is declared up
-        // with the other snapshot knobs, so initializing it here would need
-        // an init-list position that trips -Wreorder (the release bar is
-        // zero warnings; see 5189172 for the same fix on think_default).
-        snapshot_prefetch_config=snapshot_prefetch;
         // Server identity (homebrew plan Q2): /health and the boot trace name
         // the resident artifact so wrapper/clients can tell what's loaded.
         model_name=std::filesystem::path(model).filename().string();
@@ -994,14 +986,6 @@ struct Runtime {
             // A restart over an oversized directory must come back under
             // budget without waiting for the next save (codex P2 on 607160e).
             snapstore.evict_past_budget();
-            // Boot prefetch (audit A5), OFF unless asked for. Deliberately
-            // AFTER evict_past_budget so it never warms an entry that is
-            // about to be deleted, and after the engines exist so the disk is
-            // idle -- see the long note on prefetch_recent for why Metal must
-            // not prefetch under cover of the weight upload the way the CUDA
-            // arm does.
-            if(snapshot_prefetch_config>0)
-                snapstore.prefetch_recent(snapshot_prefetch_config);
             if(!slots[0]->engine.chunked_prefill())
                 fprintf(stderr,"prefix-snapshots: WARNING — no chunked prefill on this device; "
                         "\"snapshot\" hints are ignored (loads still served)\n");
@@ -1781,10 +1765,30 @@ q27::SamplingParams sampling_params(const json& body) {
 // Set once in main (before the server accepts) from --max-tokens-default;
 // 0 = flag absent.
 long long max_tokens_default_flag=0;
+// Null/absent -> default; wrong-typed -> a CALLER-NAMED error. json_i64_or
+// lets nlohmann's raw exception text escape, so a wrong-typed max_tokens
+// answered the client with
+//   "[json.exception.type_error.302] type must be number, but is string"
+// inside the invalid_request_error envelope -- library internals leaking into
+// a public API error, and inconsistent with the sibling fields resolved two
+// functions up, which already say "invalid temperature" / "invalid top_k"
+// (found by the 2026-07-25 serving gate). Floats are still accepted and
+// truncated, as json_i64_or did: clients do send max_tokens: 4096.0.
+long long int_field_or(const json& body,const char* key,long long dflt) {
+    const auto it=body.find(key);
+    if(it==body.end() || it->is_null()) return dflt;
+    if(!it->is_number()) throw std::runtime_error(std::string("invalid ")+key);
+    const double v=it->get<double>();
+    // Range-check as a double BEFORE narrowing: a value past long long is UB
+    // to convert, so it cannot be left to the caller's check.
+    if(!(v>=0.0) || v>(double)UINT32_MAX) throw std::runtime_error(std::string("invalid ")+key);
+    return (long long)v;
+}
+
 uint32_t max_tokens(const json& body,long long dflt) {
     if(max_tokens_default_flag>0) dflt=max_tokens_default_flag; // resolved flag/env value
-    long long value=q27::json_i64_or(body,"max_output_tokens",dflt);
-    value=q27::json_i64_or(body,"max_tokens",value);
+    long long value=int_field_or(body,"max_output_tokens",dflt);
+    value=int_field_or(body,"max_tokens",value);
     if(value<0 || value>UINT32_MAX) throw std::runtime_error("invalid max_tokens");
     return (uint32_t)value;
 }
@@ -1842,7 +1846,7 @@ int main(int argc,char** argv) {
     if (mark_supervisor_lock_close_on_exec() != 0) return 2;
     if(argc<3) {
         fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--think] [--request-think] [--slots N] [--trace path]\n"
-                       "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--snapshot-prefetch 0..64] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
+                       "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
                        "       [--temperature-default T] [--top-p-default P] [--top-k-default K]\n"
                        "       [--experimental-prefix-cache path] [--api-key KEY] [--api-key-file path]\n"
                        "       (the snapshot/max-tokens/budget/sampling-default flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,SNAPSHOT_SPINE_PIN,MAX_TOKENS_DEFAULT,BUDGET_MB,TEMPERATURE_DEFAULT,TOP_P_DEFAULT,TOP_K_DEFAULT}; an explicit flag wins)\n",argv[0]);
@@ -1874,11 +1878,6 @@ int main(int argc,char** argv) {
         uint32_t top_k_default=UINT32_MAX;
         long long snapshot_auto=-1;
         int spine_pin=-1;   // -1 = unset (env/default); 0/1 explicit flag
-        // --snapshot-prefetch N: warm the N most recent snapshot entries at
-        // boot so the first restore after a restart skips a cold disk read.
-        // 0 = off, the default -- the lever is measured on this box (~320 ms
-        // per GiB) but UNVALIDATED on the real restore path (audit A5).
-        int snapshot_prefetch=0;
         bool turbo3=false; bool constrain_tools=false;
         // Opt-in Bearer/x-api-key auth on the SERVING endpoints (upstream
         // v0.4.0 + 1a15ff8 parity; the long-standing Metal gap #4 in
@@ -1930,20 +1929,14 @@ int main(int argc,char** argv) {
             else if(arg=="--budget-mb" && i+1<argc) { budget_mb=parse_u32(argv[++i],"--budget-mb"); if(!budget_mb||budget_mb>(1u<<24)) throw std::runtime_error("--budget-mb must be an integer 1..16777216"); }
             // Range-check the UNSIGNED value BEFORE narrowing to int. The
             // old `(int)parse_u32(...)` then `>N` order let anything in
-            // [2^31, 2^32) cast to a negative int and sail past the bound --
-            // so `--snapshot-spine-pin 3000000000` was silently accepted and
-            // then read as "unset", and `--snapshot-prefetch 3000000000`
-            // silently disabled the prefetch it was asking for. Both are
-            // meant to be fail-loud (codex autoreview of 22c4413).
+            // [2^31, 2^32) cast to a negative int and sail past the bound, so
+            // `--snapshot-spine-pin 3000000000` was silently accepted and then
+            // read as "unset" -- an operator pinning the spine could get the
+            // opposite of what they asked for, with no diagnostic.
             else if(arg=="--snapshot-spine-pin" && i+1<argc) {
                 const uint32_t v=parse_u32(argv[++i],"--snapshot-spine-pin");
                 if(v>1) throw std::runtime_error("--snapshot-spine-pin must be 0 or 1");
                 spine_pin=(int)v;
-            }
-            else if(arg=="--snapshot-prefetch" && i+1<argc) {
-                const uint32_t v=parse_u32(argv[++i],"--snapshot-prefetch");
-                if(v>64) throw std::runtime_error("--snapshot-prefetch must be 0..64");
-                snapshot_prefetch=(int)v;
             }
             // Auth config is fail-LOUD in both directions (upstream 1a15ff8
             // item 4). An empty key can never authenticate anything --
@@ -2047,7 +2040,7 @@ int main(int argc,char** argv) {
                     (double)sampling_default_temperature);
         Runtime runtime(model,tok,context,turbo3,width,suffix_width,prefix_entries,constrain_tools,slot_count,
                         budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto,max_tokens_default,spine_pin,
-                        !experimental_prefix_dir.empty(),think_default,snapshot_prefetch);
+                        !experimental_prefix_dir.empty(),think_default);
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
             runtime.trace.event({{"kind","boot"},{"ctx",runtime.context},{"kv",turbo3?"turbo3":"fp16"},

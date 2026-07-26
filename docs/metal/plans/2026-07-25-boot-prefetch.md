@@ -1,102 +1,94 @@
-# Boot prefetch for the disk snapshot store — pre-registered experiment
+# Boot prefetch for the disk snapshot store — **NO-GO** (measured 2026-07-25)
 
 Audit item A5 ([../PARITY-2026-07-25.md](../PARITY-2026-07-25.md)), Metal
-counterpart of upstream P16c (`d465e0e`). **Built, opt-in, default OFF.
-Not yet measured on the real restore path — that is what this document
-pre-registers, with its kill line, before the run.**
+counterpart of upstream P16c (`d465e0e`). Built, pre-registered with a kill
+line, **measured, killed, and removed.** The flag and
+`DiskSnapshotStore::prefetch_recent` no longer exist; this document is the
+record.
 
 ## The claim under test
 
-A server restart leaves the page cache cold, so the first snapshot restore
-pays a full disk read. Reading the most recent entries at boot moves that
-cost off the first request.
+A restart leaves the page cache cold, so the first snapshot restore pays a
+full disk read. Reading recent entries at boot moves that cost off the first
+request. Upstream measured 681 → 36–39 ms on the 5090 box and shipped it.
 
-## Host-side lever, measured (2026-07-25, no GPU, no model)
+## Kill line (pre-registered, before the run)
 
-Sequential read throughput on this box's SSD, via `F_NOCACHE` (uncached)
-versus a fully page-cached re-read:
+> **SHIP** if first-restore wall time drops by **≥150 ms** and boot does not
+> regress >50 ms. **KILL** if boot regresses >100 ms, or the restore win is
+> **<75 ms** — record it as a NO-GO with the mechanism, and delete the flag.
 
-| read | measurement |
+## Result: KILL
+
+A/B, n=3 per arm, real 610 MB snapshot, 7007-token prompt, base M4. Each
+boot's own 17 GB artifact read is what evicts the snapshot from the page
+cache, so the no-prefetch arm is genuinely cold.
+
+| arm | first-restore request | boot→health |
+|---|---|---|
+| no prefetch | 17107, 16866, 15721 ms (mean 16565) | mean 35486 ms |
+| `--snapshot-prefetch 2` | 18466, 15241, 15267 ms (mean 16325) | mean 34572 ms |
+
+Mean delta **+240 ms**, against a within-arm spread of **1386 ms** and
+**3225 ms**. The effect is not resolvable; boot did not regress either.
+Restore win is not ≥150 ms → **KILL**.
+
+## Mechanism — why it could never have worked here
+
+The trace breaks the matching request down (`tms` = ms since boot):
+
+| phase | time | share |
+|---|---|---|
+| disk restore (`request` → `prefix` event) | **230 ms** | **1.6 %** |
+| post-restore work (95 residual tokens + 1 output) | **14570 ms** | **98.4 %** |
+| total | 14800 ms | |
+
+The 230 ms restore matches the host-side prediction exactly (610 MB at the
+measured ~2.8 GB/s uncached = ~218 ms), so the model of the read was right —
+**the read was simply never the bottleneck.** Prefetch can remove at most
+`230 − 36 = 194 ms`, i.e. **1.3 % of the request it exists to speed up**,
+which is an order of magnitude below the run-to-run noise.
+
+This conclusion generalises off this box. Even on a disk 10× slower the read
+would be ~2.3 s against ~14.6 s of post-restore work — still not the
+dominant term, and prefetch would still be attacking the smaller one.
+
+Upstream's number is not contradicted; their premise differs. Their restore
+was ~245 ms end to end, so a 475 ms read *was* the whole cost. On Metal the
+restore is 1.6 % of a path dominated by residual prefill.
+
+## What the measurement DID establish (both worth keeping)
+
+**1. The disk snapshot tier is enormously valuable on Metal — far more than
+on CUDA.** Same-length prompt, snapshot hit vs no hit:
+
+| | time |
 |---|---|
-| uncached, 17 GB artifact | 6072 ms, 6090 ms → **~2.8 GB/s** |
-| page-cached, 1 GiB file | 57–64 ms → ~17 GB/s |
+| 6912 of 7007 tokens restored from disk | **14.8 s** |
+| non-matching, 5606 tokens, full prefill | **322.2 s** (57.5 ms/token) |
 
-So a **1 GiB entry costs ~380 ms cold and ~60 ms warm: a ~320 ms lever**,
-once, on the first restore after a restart. Upstream measured 681 → 206 ms
-for a 1.09 GB entry on the 5090 box; this SSD is simply faster, and the
-lever is correspondingly smaller but the same order.
+**~21.8× on this shape.** Prefill is brutally memory-wall-bound on a base
+M4 (every chunk re-reads a 17 GB model over 120 GB/s), which is exactly why
+the tier matters more here than on a 5090. Worth stating plainly in the
+serving docs.
 
-An earlier attempt to measure this by `dd`-ing a 1 GiB file and reading it
-back was **discarded as contaminated** — `dd`'s own writes leave the file in
-the page cache, so the "cold" read was partly served from RAM (it reported
-201 ms, i.e. optimistic by ~2×). The artifact read above is trustworthy
-because that file had not been touched this session.
+**2. New finding — residual prefill after a restore is the real lever.**
+Handling the **95** tokens the snapshot did not cover cost **14.57 s**. At
+the measured bulk rate of 57.5 ms/token those 95 tokens should cost ~5.5 s,
+so roughly 9 s is chunk-granularity overhead: a 95-token tail still pays
+close to a full chunk's weight traffic.
 
-## Why the Metal design diverges from upstream's
+That is ~60× the lever boot prefetch was chasing, and it is attackable
+without new I/O machinery — e.g. bank snapshots at the exact prompt boundary
+rather than a chunk multiple (6912 = 27×256), or make the final partial
+chunk cheaper. **Filed as the next A5 successor; not yet investigated.**
 
-Upstream prefetches **under cover of the weight upload**, arguing it is free
-time. That reasoning is discrete-GPU reasoning: their upload is a PCIe H2D
-transfer, which leaves the disk idle.
+## Reproduction
 
-**Metal has no such window.** On unified memory the "upload" is mmap +
-page-in of the artifact — the same disk, at the same ~2.8 GB/s measured
-above. The artifact is 17 GB, so boot is ~6 s of disk-bound work.
-Prefetching 1 GiB concurrently would add ~380 ms of demand to that, i.e.
-**contend with boot rather than hide in it** — plausibly spending more than
-the 320 ms it saves, and spending it on every boot including the ones where
-the snapshot is never used.
-
-So the Metal version runs **after** the engines exist (`Runtime` setup, just
-after `evict_past_budget()`), where the disk is genuinely idle and the
-server is waiting on its first request. Ordering after eviction also means
-it can never warm an entry that is about to be deleted.
-
-Second divergence: the detached thread captures **copies** of the selected
-paths and touches no member of the store, so it cannot outlive the store
-into freed memory. Upstream's thread reads store state.
-
-Both use explicit chunked reads, not `posix_fadvise(WILLNEED)` — upstream
-measured fadvise doing nothing at this size (it is advisory and the kernel
-declines a readahead that large).
-
-## Ship line / kill line
-
-Run with `--snapshot-prefetch 2` against a real conversation whose snapshot
-is already on disk, page cache evicted between boots, n≥3:
-
-- **SHIP** if first-restore wall time drops by **≥150 ms** (roughly half the
-  measured 320 ms/GiB lever, allowing for entries smaller than 1 GiB) **and**
-  boot-to-first-token does not regress by more than 50 ms.
-- **KILL** if boot regresses by **>100 ms**, or if the restore win is
-  **<75 ms**. Either means the idle-disk premise does not hold on unified
-  memory and the feature is not worth its complexity. Record it as a NO-GO
-  with the mechanism, and delete the flag.
-
-Prefetching more than the working set is the obvious failure mode: with
-`--snapshot-prefetch N` the cost scales with N while the benefit is capped
-by how many entries the next request actually touches (usually one). Start
-at 2.
-
-## Status
-
-- `DiskSnapshotStore::prefetch_recent(n)` — implemented.
-- `--snapshot-prefetch 0..64`, default **0 (off)**; surfaced as
-  `snapshot_prefetch` in `serving_identity()`, i.e. on **`/health`** (and in
-  the boot trace) alongside `snapshot_spine_pin` / `snapshot_max_bytes`.
-  Deliberately not on `/stats`, which carries runtime *counters*, not
-  configuration — an earlier draft of this doc said `/stats`, which was
-  wrong (codex autoreview of 22c4413 flagged the mismatch; the doc was the
-  side that was wrong, not the code).
-- Flag parsing is fail-loud: the range check runs on the **unsigned** value
-  before it narrows to `int`. The first cut checked after the cast, so
-  anything in `[2^31, 2^32)` became negative and sailed past the bound --
-  `--snapshot-prefetch 3000000000` was silently accepted and then disabled
-  the prefetch it asked for. Its pre-existing twin `--snapshot-spine-pin`
-  had the identical defect and is fixed in the same commit.
-- Offline gate in `tools/test_snapshot_evict_store.cpp`: selects only
-  tag-matching `.q27snap` files (a foreign/mis-tagged file in a shared
-  directory must never be read), caps at `max_entries`, no-ops when disabled
-  or asked for ≤0, is read-only, and survives the store being destroyed
-  immediately after the call. Runs in `make test-cpu`; **G3 PASS**.
-- **Unmeasured:** everything above the host-side lever. Needs the
-  serialized GPU-exclusive slot.
+```
+./build/q27-metal-server MODEL TOK --port 8231 --ctx 16384 --slots 1 \
+    --snapshot-dir DIR --snapshot-auto 512 --trace trace.jsonl
+# bank:  POST /v1/completions {"prompt": <~7000 tok>, "max_tokens":4, "snapshot":true}
+# restart, then re-POST the same prompt; read `request`/`prefix`/`outcome` tms
+# deltas out of trace.jsonl.
+```
