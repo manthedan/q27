@@ -49,6 +49,56 @@ the single biggest reviewable chunk is `src/metal/` at 20.5k.
 `LICENSE` carries our fork-additions copyright line. Already acknowledged by
 the maintainer in the 07-16 exchange; it must **not** appear in any PR.
 
+## Can the Metal PRs avoid CUDA entirely? — YES, measured
+
+Tested rather than assumed: a worktree at pristine `upstream/master`, with
+**only our new files** copied in (`src/metal/*`, `backend.h`, `sampling.h`,
+`kl.h`, `strip_ctrl.h`, `tool_preamble.h`) and every shared file left
+untouched, then compiled.
+
+Result: 48 errors, and **every one is a missing addition — not a single CUDA
+dependency.** `blocks.cu`, `server.cu`, `test_kernels.cu` and `inspect.cpp`
+are not required by Metal at all; they are independent optional
+contributions that can be held back or dropped without affecting the port.
+
+The shared-file surface Metal genuinely needs is small, and almost all of it
+is *additive* (nothing existing is changed, so his CUDA build is unaffected
+by construction):
+
+| file | what Metal needs | shape |
+|---|---|---|
+| `src/loader.h` | `DType` values T2_G128/T3_G128/B1_G128 for the bonsai tiers, `Model::mapping_base()` | +6/-1 — existing enum values untouched |
+| `src/tokenizer.h` | `vocab_size()` | +10/-1 |
+| `src/stream_split.h` | streaming split additions | +19/-2 |
+| `src/api_common.h` | `initial_harness_prefix`, `ToolCallStreamer` | +461/-73 — **the one to split up** |
+| `third_party/httplib.h` | `Request::sock`, so a handler doing long GPU work before its first write can probe client liveness | +7/-0 |
+| `Makefile` | metal build rules | additive rules only |
+
+Two consequences worth acting on:
+
+**The `-73` in `api_common.h` is avoidable.** It is our extraction of
+`strip_ctrl` / `tools_preamble` into their own headers. Upstream's
+`api_common.h` *already defines both* — so Metal can simply use his, the
+extraction drops out of the merge-back entirely, and with it the only place
+we restructure his code rather than adding to it. (It also causes the
+redefinition errors in the test above.) Keep the extraction in our fork if
+we want; do not propose it.
+
+**`api_common.h`'s +461 is not one thing.** It bundles what Metal *needs*
+(`initial_harness_prefix`) with an independent feature that benefits both
+arms (`ToolCallStreamer`, the incremental tool-call argument streamer). Split
+it: the streamer is its own PR with its own motivation, and the Metal
+dependency shrinks to a few functions.
+
+**The `httplib.h` patch needs an explicit conversation** — patching a
+vendored dependency is a maintainer-preference call, not a technical one.
+Options: propose it, upstream it to yhirose/cpp-httplib first, or find a
+liveness probe that does not need the fd.
+
+So the achievable shape is: **Metal lands as new files plus roughly a dozen
+additive lines across four shared headers**, touching zero `.cu` files and
+restructuring nothing.
+
 ## Stages
 
 Each stage is a branch off `upstream/master`, not off `metal`, so its diff
