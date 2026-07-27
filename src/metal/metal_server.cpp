@@ -202,6 +202,43 @@ float sampling_default_temperature=0.0f;
 float sampling_default_top_p=1.0f;
 uint32_t sampling_default_top_k=0;
 
+// Client-liveness probe. Deliberately self-contained rather than calling
+// httplib::detail::is_socket_alive: that lives in an INTERNAL namespace, and
+// depending on it would make the q27 httplib patch a two-part ask (a field
+// plus a promise about internals). This way the only thing we need from
+// httplib is the borrowed fd on Request -- if upstream ever reshuffles
+// detail::, nothing here breaks.
+//
+// Same semantics as httplib 0.18.3's version, which is also what
+// DataSink::is_writable resolves to (SocketStream::is_writable is
+// select_write && is_socket_alive), so the streaming and pre-write paths
+// agree by construction:
+//   nothing readable            -> alive (the normal mid-request state)
+//   EBADF                       -> dead
+//   readable                    -> alive only if a 1-byte MSG_PEEK returns >0;
+//                                  a readable socket with 0 bytes is EOF.
+// POSIX only, which is the whole target surface for a Metal server.
+//
+// Edge cases, both intended: a half-closed peer (shutdown(SHUT_WR), still
+// reading) reads as dead -- no real HTTP client does that; and a pipelined
+// follow-up request makes MSG_PEEK return >0, i.e. alive, which is correct.
+bool socket_alive(socket_t sock) {
+    if (sock == INVALID_SOCKET) return true;   // unset fd: never cancel on it
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    timeval tv{0, 0};
+    int r;
+    do { r = select(static_cast<int>(sock + 1), &fds, nullptr, nullptr, &tv); }
+    while (r < 0 && errno == EINTR);
+    if (r == 0) return true;                    // not readable -> still open
+    if (r < 0) return errno != EBADF;           // EBADF is a closed fd
+    char b[1];
+    ssize_t n;
+    do { n = recv(sock, b, sizeof(b), MSG_PEEK); } while (n < 0 && errno == EINTR);
+    return n > 0;
+}
+
 std::vector<uint32_t> to_u32(const std::vector<int>& ids) {
     std::vector<uint32_t> result; result.reserve(ids.size());
     for(int id:ids) { if(id<0) throw std::runtime_error("tokenizer returned a negative id"); result.push_back((uint32_t)id); }
@@ -2183,10 +2220,11 @@ int main(int argc,char** argv) {
             };
         };
         // Liveness probe for phases with no response writes yet (queue wait,
-        // prefill) and for non-streaming generation. The socket fd rides
-        // the q27 httplib patch (Request::sock).
+        // prefill) and for non-streaming generation. The socket fd rides the
+        // q27 httplib patch (Request::sock); the probe itself is ours (see
+        // socket_alive above), so httplib internals are not a dependency.
         auto socket_live=[](socket_t sock){
-            return [sock]{ return httplib::detail::is_socket_alive(sock); };
+            return [sock]{ return socket_alive(sock); };
         };
         // Wraps ONLY a handler's run() call: engine failures reclassify as
         // EngineError (api_error 500); the cancellation and overload types
@@ -2415,7 +2453,7 @@ int main(int argc,char** argv) {
                 auto outcome=traced_engine("completions",id,[&]{
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ text+=piece;
-                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                            return (++probe&15)?true:socket_alive(sock); },
                         tnames,q27::jbool(body,"snapshot",false),socket_live(sock),id); });
                 if(outcome.finish==Runtime::Finish::Cancelled) { r.status=499; return; }
                 runtime.trace.event({{"kind","outcome"},{"api","completions"},{"id",id},
@@ -2442,7 +2480,7 @@ int main(int argc,char** argv) {
                             return sink.write(s.data(),s.size());
                         };
                         auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
-                            [sock]{ return httplib::detail::is_socket_alive(sock); },id);
+                            [sock]{ return socket_alive(sock); },id);
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         // Terminal chunk with a real finish_reason before [DONE]
                         // (parity with server.cu security-review fix #7).
@@ -2531,7 +2569,7 @@ int main(int argc,char** argv) {
                 auto outcome=traced_engine("chat",id,[&]{
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
-                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                            return (++probe&15)?true:socket_alive(sock); },
                         tnames,snap_hint,socket_live(sock),id); });
                 if(outcome.finish==Runtime::Finish::Cancelled) { r.status=499; return; }
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
@@ -2721,7 +2759,7 @@ int main(int argc,char** argv) {
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
                             [&,sock]{ keepalive();
-                                      return httplib::detail::is_socket_alive(sock); },id);
+                                      return socket_alive(sock); },id);
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         close_tool();               // wrapper never closed: finalize
@@ -2855,7 +2893,7 @@ int main(int argc,char** argv) {
                 auto outcome=traced_engine("messages",mid,[&]{
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
-                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                            return (++probe&15)?true:socket_alive(sock); },
                         tnames,snap_hint,socket_live(sock),mid); });
                 if(outcome.finish==Runtime::Finish::Cancelled) { r.status=499; return; }
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
@@ -3085,7 +3123,7 @@ int main(int argc,char** argv) {
                                 return alive && sink.is_writable();
                             },tnames,snap_hint,
                             [&,sock]{ keepalive();
-                                      return httplib::detail::is_socket_alive(sock); },mid);
+                                      return socket_alive(sock); },mid);
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         close_tool();   // close any in-flight streamed call (finalize + trail recovery)
@@ -3297,7 +3335,7 @@ int main(int argc,char** argv) {
                 auto outcome=traced_engine("responses",resp_id,[&]{
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
-                            return (++probe&15)?true:httplib::detail::is_socket_alive(sock); },
+                            return (++probe&15)?true:socket_alive(sock); },
                         tnames,snap_hint,socket_live(sock),resp_id); });
                 if(outcome.finish==Runtime::Finish::Cancelled) {
                     runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},
@@ -3698,7 +3736,7 @@ int main(int argc,char** argv) {
                                     return alive && sink.is_writable();
                                 },tnames,snap_hint,
                                 [&,sock]{ keepalive();
-                                          return httplib::detail::is_socket_alive(sock); },resp_id);
+                                          return socket_alive(sock); },resp_id);
                         }
                         if(outcome.finish==Runtime::Finish::Cancelled) {
                             runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},

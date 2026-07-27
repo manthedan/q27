@@ -160,14 +160,99 @@ arms (`ToolCallStreamer`, the incremental tool-call argument streamer). Split
 it: the streamer is its own PR with its own motivation, and the Metal
 dependency shrinks to a few functions.
 
-**The `httplib.h` patch needs an explicit conversation** — patching a
-vendored dependency is a maintainer-preference call, not a technical one.
-Options: propose it, upstream it to yhirose/cpp-httplib first, or find a
-liveness probe that does not need the fd.
+**The `httplib.h` patch needs an explicit conversation** — see the dedicated
+section below; the ask has since been shrunk to a 7-line field with no
+dependency on httplib internals.
 
 So the achievable shape is: **Metal lands as new files plus roughly a dozen
 additive lines across four shared headers**, touching zero `.cu` files and
 restructuring nothing.
+
+## The `third_party/httplib.h` patch — disclose, do not smuggle
+
+`diff` against stock cpp-httplib **0.18.3** is exactly **7 insertions, 0
+deletions**: a `socket_t sock = INVALID_SOCKET` field on `Request`, and
+`req.sock = strm.socket()` in `Server::process_request`. Everything else in
+the header is stock.
+
+**Why.** The Metal server does minutes of GPU work before it writes
+anything — queue wait, then prefill (measured 322 s for an 8 K prompt on a
+base M4). Without a liveness probe it holds a slot and burns the GPU
+producing output for a client that already hung up. With the fd: 2 s kill of
+a ~90 s prefill, follow-up answered in 1.15 s instead of waiting the dead
+request out.
+
+**The gap is real and checkable in three sentences.** `DataSink::is_writable`
+exists only *after* headers are written. `Stream&` never leaves
+`process_request`. `set_socket_options` fires at accept with no per-request
+correlation. There is no supported path to the fd before the first write.
+
+### Two corrections to an earlier draft of this section
+
+*Both were wrong and are worth recording, because the wrong versions would
+have weakened the ask.*
+
+1. It claimed `is_writable` "may not detect a half-closed socket as reliably
+   as `is_socket_alive`." **False** — in 0.18.3 `SocketStream::is_writable()`
+   is `select_write(...) > 0 && is_socket_alive(sock_)` (`httplib.h:5886`),
+   and `DataSink::is_writable` is wired straight to `strm.is_writable()`
+   (`:4479, :4525, :4577`). They are the same probe, which is exactly why our
+   streaming path already cancels correctly.
+   **The real reason restructuring fails**: `write_response_core` emits the
+   status line and headers *before* invoking the content provider (status at
+   relative line 45, provider at 60). Moving queue-wait and prefill inside a
+   provider commits to `200` before the work starts, so overload `429`/`503`
+   and `EngineError`→`500` become in-band errors no OpenAI/Anthropic client
+   parses. That argument survives a maintainer who knows the header.
+
+2. It claimed the patch "fails silently" on an httplib upgrade. **False, and
+   this is our best defense.** All **12** call sites are unguarded — 0
+   `#ifdef`s. Drop the patch and the build fails at those exact lines:
+   loud, self-localizing, 7 lines to repair. **Discipline to state and keep:
+   never wrap these in `#ifdef` for vanilla-httplib compatibility — that is
+   the only thing that would make the failure silent.**
+
+### The ask has been shrunk (`socket_alive`, this round)
+
+We no longer touch httplib internals at all. `httplib::detail::is_socket_alive`
+was an internal-namespace dependency, so the ask was really "a field *plus* a
+promise about `detail::`". Replaced with a self-contained ~20-line POSIX probe
+in `metal_server.cpp`; all 9 internal call sites repointed.
+
+Verified identical, not assumed: `tools/socket_alive_diff_test.cpp` runs both
+implementations over six socket states — idle, peer-wrote, peer-closed-with-
+buffered-data, drained EOF, EBADF, and peer half-close — and they **agree on
+all six**. The two intended edge cases are covered there: a half-closed peer
+reads dead (no real HTTP client does that), and a pipelined follow-up reads
+alive (correct).
+
+So the ask is now precisely: *7 lines, one borrowed fd, no use of your
+internals.*
+
+### Upstream in parallel, not as a fallback
+
+`Request` already carries `remote_addr` / `remote_port` / `local_addr` /
+`local_port` (`httplib.h:619-622`), so a borrowed server-side fd defaulting
+to `INVALID_SOCKET` sits squarely inside the struct's existing idiom —
+upstream acceptance at yhirose/cpp-httplib is plausible. **File that issue
+the same week we talk to Gabe**, not after he answers: if he declines, the
+clock is already running; if upstream accepts later, our vendored patch
+becomes a dated backport with a deletion ticket. It also strengthens the ask
+— "upstream path started, this is the bridge."
+
+### What goes in the message
+
+Numbers first (322 s prefill, 2 s kill vs ~90 s wait-out, 1.15 s follow-up)
+— the justification is the behavior, not the patch. Then the three-sentence
+gap proof. Then the compile-loud failure mode. Then the edge cases, which
+show the semantics were reasoned about rather than bolted on. Then explicit
+deference: *if you'd rather carry this differently — a different accessor
+shape, a per-request hook — say so; the diff is 7 lines precisely so any
+alternative is cheap to adopt.*
+
+And ask **before** PR 7 lands, plainly preferring a "no" now. A disclosed
+7-line patch with a compile-loud failure mode is a minor governance
+question; the same patch found during review reads as a smuggled fork.
 
 ## Stages
 
