@@ -58,7 +58,42 @@ in seconds), and ran it on the 3090 against both arms:
 
 Upstream fails 3 of 8; PR 3 passes 8 of 8 (`worst |idx − lowest| = 0`).
 
-**This largely answers the canonical-anchor question.** The three non-tie
+### The canonical anchor does NOT move (measured 2026-07-27)
+
+The artifact fetch on yukon finished and verified bit-identical to ours
+(md5 `39fd7244…` for the `.q27`, `bb95b3ca…` for the `.tok` — matching
+`models/qwen36-27b-mtp/CHECKSUMS.md5` despite a resumed, retried download).
+That unblocked the two gates that actually settle PR 3:
+
+**Full CUDA kernel battery**, `build/test_kernels` against the real artifact,
+both arms: **ALL PASS**, with every reported error value identical between
+them (`h16 vs fd2 rel t3 ntok=8 seq=4096` → `2.297e-03` on both, and so on
+down the list). PR 3 perturbs no other kernel. Upstream passes its own
+battery because the tie assertion is precisely what PR 3 adds.
+
+**The canonical bitwise gate** — upstream's own, from
+`tools/constrain_gate.sh:89`:
+`./build/q27 $MODEL --tokens "760,6511,314,9338,369" --ctx 2048 -n 128 --spec`
+
+| arm | canonical md5 |
+|---|---|
+| `upstream/master` (`c2d2116`) | `a2982c5197c627551b27d76a0a94b220` |
+| `pr3-argmax-tiebreak` (`dc05889`) | `a2982c5197c627551b27d76a0a94b220` |
+| upstream's **published** anchor | `a2982c5197c627551b27d76a0a94b220` |
+
+**Identical, and equal to the published anchor.** So PR 3 is not a
+"behavior change that may require re-blessing" — on the reference tier's
+canonical sequence it is bit-for-bit inert, and it only differs where the
+old code was demonstrably wrong.
+
+Stated precisely, because it is one sequence and not a proof: this shows the
+*published* anchor is unaffected — which is the one he would have had to
+re-bless. It does not prove no prompt anywhere can hit an argmax tie; the
+128-token greedy canonical simply does not. Combined with the non-tie cases
+being bit-identical, the residual risk is confined to a generation landing on
+exact float equality at the argmax.
+
+**Earlier framing of the anchor question.** The three non-tie
 cases are bit-identical between arms, so the change is confined to exact
 float-equality ties. An anchor can only shift if a real generation hits an
 exact logit tie at the argmax — rare enough that we did not observe one, but
@@ -280,14 +315,14 @@ Lesson recorded rather than just fixed: the queue was nine days stale and
 one of its three ready-to-send items had been overtaken. **Re-check each
 remaining item against current upstream immediately before sending.**
 
-### PR 3 — argmax tie-break parity  *(offer, flag the risk)*
+### PR 3 — argmax tie-break parity  *(risk measured away)*
 `blocks.cu` + `test_kernels.cu`: exact-value ties resolve to the **lowest**
 index, so CUDA agrees with Metal argmax and CPU `max_element`. This is the
 single most valuable thing we have for him *if* he ever wants a second
-backend — but it **changes CUDA kernel behavior**, and his canonical
-anchors are byte-exact hashes. Ties are rare, and our 16-token canonical
-gate is byte-exact across both arms, but he must re-bless anchors himself.
-Send with that caveat stated up front, or hold until after PR 5.
+backend. It changes CUDA kernel behavior in principle — but **measured on
+his own canonical gate, the anchor does not move** (see above), and the full
+kernel battery is identical. Send it with the evidence table, not with a
+warning.
 Compile-verified AND gate-verified on the 3090 — see the table above.
 
 ### PR 4 — `Q27_GRAPH_TRACE=1` instrument  *(offer, not push; value reduced)*
