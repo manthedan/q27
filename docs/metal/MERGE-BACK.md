@@ -325,18 +325,25 @@ kernel battery is identical. Send it with the evidence table, not with a
 warning.
 Compile-verified AND gate-verified on the 3090 — see the table above.
 
-### PR 4 — `Q27_GRAPH_TRACE=1` instrument  *(offer, not push; value reduced)*
-Per-family graph-memory attribution in `build_spec_graphs`; prints the table
-on instantiate failure so an OOM report self-attributes. Measured:
-`verify_w` dominates at 855 MB/w8, sampled family 577 MB. Value is LOWER
-than when this was queued: upstream has since done its own attribution and
-now documents the zoo's cost in the README (~600 MB sampled set on sm_86,
-~280 MB for `Q27_MAXD=4`). What the instrument still adds is
-self-attribution *on failure*, which a documented constant cannot do.
-Preserved at
-`patches/0001-cuda-graph-trace-ORIGINAL.patch`; **needs re-applying onto his
-current `engine.cuh`**, which has moved since (the graph-zoo capture gates
-landed in that same function).
+### PR 4 — `Q27_GRAPH_TRACE=1` instrument — **DROPPED, overtaken upstream**
+
+Upstream added `inst_or_advise()` to `engine.cuh` on 2026-07-18 for the same
+issue #1 / A10 case, and it is **better than our instrument for the person
+who hits the problem**: a graph-zoo OOM now produces an actionable refusal
+naming the exact levers (`--ctx`, `Q27_MAXD=4`, `Q27_SAMPLED=0`,
+`build/q27-server-w8`) plus free-VRAM, instead of a raw CUDA abort.
+
+`Q27_GRAPH_TRACE` prints per-family byte attribution. That is a developer's
+view, and he has already published the numbers it would produce (~600 MB
+sampled set on sm_86, ~280 MB for `Q27_MAXD=4`). Proposing ~79 lines of
+diagnostic into his boot path to re-derive documented constants is not a
+good trade. Keep it fork-local.
+
+**That is two of the three items in the 07-16 ready-to-send queue now
+overtaken** (PR 2 by his README, PR 4 by `inst_or_advise`). Only the
+CUDA-12.0 compat fix survived — and it survived *because* it is a
+toolchain-compat bug he has no way to hit. Re-checking each item against
+current upstream immediately before sending is not optional.
 
 ### PR 5 — the backend seam  *(the real conversation)*
 `src/backend.h` plus the `loader` / `tokenizer` / `sampling.h` / `kl.h`
