@@ -20,13 +20,54 @@ would have read as deleting his features.** Restored byte-identical to
 upstream and audited every other shared file for the same failure — no other
 drops (audit A9). This is why nothing ships before a clean-diff check.
 
-## Hard constraint: we cannot build CUDA
+## CUDA verification: yukon (RTX 3090, CUDA 12.0)
 
-There is no `nvcc` on either of our machines (both Apple Silicon). Every
-CUDA-touching PR below is **untestable by us** and must be labelled as such
-in its description, with the reasoning and the evidence we do have. This is
-a reason to keep our CUDA surface *small and obviously-correct*, not to
-hide it.
+**Correction (2026-07-27).** An earlier revision of this doc asserted "we
+cannot build CUDA." That was wrong — `yukon` (RTX 3090, nvcc 12.0.140) is
+reachable over Tailscale and is already the repo's CUDA oracle
+(`tools/yukon_regate_2026-07-16.sh`, `metal_cuda_gate.py --cuda-ssh yukon`).
+The claim should have been checked against the repo before being written
+into a plan.
+
+What that changes: **compiling needs no GPU**, so every CUDA-touching PR can
+be compile-verified at effectively zero contention. All three staged PRs
+were verified on nvcc 12.0 (sm_86; note nvcc 12.0 predates sm_120, so drop
+that `-gencode` when building there):
+
+| PR | result |
+|---|---|
+| PR 1 | `upstream/master` **FAILS**: `src/server.cu(2331): error: structured binding cannot be captured` ×3. With the patch: **compiles**. The bug is real and reproduced on the exact toolchain. |
+| PR 3 | `blocks.cu` and `test_kernels.cu` both compile |
+| PR 5 | upstream's own `loader.cpp`, `tokenizer.cpp` and `engine.cu` all build clean against the new headers, `-Wall -Wextra`, no new warnings |
+
+### What is still blocked: runtime gates
+
+**yukon has no model artifacts** (`/mnt/ai/models` is gone; no `.q27`
+anywhere). `build/test_kernels` loads a real artifact, so PR 3's tie-break
+assertion — the one PR that changes kernel behavior — **cannot be run**
+until an artifact is provisioned there (~17 GB transfer or re-download).
+Until then PR 3 ships compile-verified but not gate-verified, and the
+anchor-reblessing caveat stands.
+
+### Shared-machine etiquette
+
+yukon is used by other projects. Rules, mirroring the local
+GPU-exclusive-slot rule:
+
+- **Query before running anything**: `nvidia-smi --query-compute-apps=...`;
+  if non-empty, do not start GPU work.
+- Re-check immediately before launch, not just at plan time.
+- Builds are CPU-only — `nice` them and cap `-j`; they do not touch the GPU.
+- **Never disturb `~/projects/q27`** on yukon. It sits on an unrelated
+  branch (`audit/fable-codebase-review`) with uncommitted changes, last
+  touched 2026-07-13. Work in a throwaway clone instead; the verification
+  clone is at `/tmp/q27-prverify`.
+
+### Incidental portability find
+
+The Makefile hardcodes `NVCC ?= /usr/local/cuda/bin/nvcc`, which misses a
+distro-packaged CUDA (yukon's is `/usr/bin/nvcc`). Falling back to `nvcc`
+from `PATH` when that path is absent is a one-line courtesy PR.
 
 ## Real scope (measured, not estimated)
 
@@ -107,8 +148,9 @@ contains only that stage.
 ### PR 1 — `server.cu` CUDA 12.0 compat  *(smallest, safest, send first)*
 Lambda-captured structured bindings are rejected by CUDA 12.0's nvcc;
 behavior-identical rewrite to named tuple references. ~10 lines.
-*Untestable by us* — but it is a compile fix for a toolchain he may not
-have, and the failure mode is a build error, not a behavior change.
+**Verified on nvcc 12.0**: upstream fails with three `structured binding
+cannot be captured` errors at `server.cu(2331-2332)`; with the patch it
+compiles. Lead the PR with that reproduction.
 
 ### PR 2 — README note for 24 GB cards  — **DROPPED, already upstream**
 
@@ -132,6 +174,8 @@ backend — but it **changes CUDA kernel behavior**, and his canonical
 anchors are byte-exact hashes. Ties are rare, and our 16-token canonical
 gate is byte-exact across both arms, but he must re-bless anchors himself.
 Send with that caveat stated up front, or hold until after PR 5.
+Compile-verified on nvcc 12.0; **not** gate-verified — yukon currently has
+no model artifact, so `test_kernels` cannot run there (see above).
 
 ### PR 4 — `Q27_GRAPH_TRACE=1` instrument  *(offer, not push; value reduced)*
 Per-family graph-memory attribution in `build_spec_graphs`; prints the table
