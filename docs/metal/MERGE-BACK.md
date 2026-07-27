@@ -377,30 +377,44 @@ be diffed carefully against what he already has.
 `experiments/` (ds4-agent, q27-tui), `packaging/` (our tap), `logs/`,
 `docs/metal/` beyond a short pointer. Fine — they are ours.
 
-## Staged branches (local, not pushed)
+## Staged branches (all pushed to `origin`)
 
-| branch | stage | diff vs `upstream/master` | state |
+Each branch is a worktree; the Metal ones stack so every diff carries only
+its own stage.
+
+| branch | base | diff vs base | verified |
 |---|---|---|---|
-| `pr1-cuda12-compat` | PR 1 | `server.cu` +8/−2 | ready |
-| `pr3-argmax-tiebreak` | PR 3 | `blocks.cu` +15/−3, `test_kernels.cu` +11/−1 | ready, carries the anchor-reblessing caveat |
-| `pr5-backend-seam` | PR 5 | 3 new headers + 15 added lines across `loader.{h,cpp}` / `tokenizer.h`; **1 deletion total** (the DType enum line, extended in place) | ready |
+| `pr1-cuda12-compat` | upstream | +8/−2 | upstream **fails** on nvcc 12.0, patch compiles |
+| `pr-tokenizer-lifetime` | upstream | +9/−1 | compiles clean; fixes a leak + latent double-free |
+| `pr3-argmax-tiebreak` | upstream | +22/−4 | 8/8 tie cases, full CUDA battery, **canonical anchor unchanged** |
+| `pr5-backend-seam` | upstream | +730/−1 | his `loader.cpp`/`tokenizer.cpp`/`engine.cu` build clean against it |
+| `pr8-toolcall-streamer` | upstream | +268/−2 | `test_openai_bridge` passes; adjacent-call boundary fix |
+| `pr6-metal-core` | pr5 | +16136/−0 | `q27-metal`, `test_metal`, `test_metal_ops` build + pass on M4 |
+| `pr7-metal-serving` | pr6 + pr8 | +4826/−0 | `q27-metal-server` builds; all device + stream gates pass |
 
-Each is a worktree off `upstream/master`, so its diff contains only that
-stage. Verified for PR 5: every new header is self-contained, and
-`loader.cpp` / `tokenizer.cpp` still build clean at `-Wall -Wextra`.
+**The whole stack against `upstream/master`: 23 files, 21,692 insertions,
+3 deletions.** The three deletions are `loader.h` −1 (the `DType` enum line,
+extended in place) and `stream_split.h` −2 (`emit_head` gains a `bool`
+return so the adjacent-call boundary can clear correctly). **Zero `.cu`
+files touched.**
 
-Two things the staging turned up:
+That is the number to lead the issue with. It is the difference between "a
+20k-line fork wants merging" and "a 20k-line addition that removes three
+lines of your code."
 
-**Extending `DType` is not free.** It makes `dtype_name()`'s switch
-non-exhaustive and adds a `-Wswitch` warning to *his* build. Three case
-labels fix it; caught by compiling his sources against the new header rather
-than assuming additive meant safe.
+### What PR 7 actually needs from shared files
 
-**A separate bug worth its own PR.** Upstream's `Tokenizer` owns a raw
-`Impl*` with **no destructor and no deleted copy constructor** — it leaks,
-and copying it would double-free. Our fork fixed this incidentally; it
-should be offered on its own merits, independent of any Metal work, rather
-than smuggled in as part of the seam.
+Building it standalone reduced the dependency to exactly two things, which
+is the honest scope of the ask:
+
+- `api_common.h` + `initial_harness_prefix` (23 lines, additive)
+- `third_party/httplib.h` + the 7-line `Request::sock` patch — the open
+  governance question
+
+The `strip_ctrl` / `tools_preamble` extraction our fork carries is
+**deliberately excluded**: upstream defines both already, so PR 7 uses his.
+Dropping it cost one vestigial `#include` in `metal_server.cpp` and nothing
+else.
 
 ## Sequencing note
 
