@@ -40,14 +40,43 @@ that `-gencode` when building there):
 | PR 3 | `blocks.cu` and `test_kernels.cu` both compile |
 | PR 5 | upstream's own `loader.cpp`, `tokenizer.cpp` and `engine.cu` all build clean against the new headers, `-Wall -Wextra`, no new warnings |
 
+### PR 3 gate-verified on hardware (2026-07-27)
+
+The tie-break needed no weights after all: `test_kernels` loads a model for
+its GEMV/attention cases, but the argmax cases are synthetic (`rand_vec`).
+Extracted them into a standalone model-free harness,
+`tools/argmax_tie_gate.cu` (43 lines, builds against `blocks.cu` alone, runs
+in seconds), and ran it on the 3090 against both arms:
+
+| case | `upstream/master` | PR 3 | CPU truth |
+|---|---|---|---|
+| random ×3 (no ties) | 86094 / 224571 / 160077 | **identical** | same |
+| all-equal ties | 32767 ✗ | **0** ✓ | 0 |
+| max@0, max@last | ok | ok | — |
+| dup max (far apart) | 200000 ✗ | **100** ✓ | 100 |
+| triple tie, adjacent | 248318 ✗ | **7** ✓ | 7 |
+
+Upstream fails 3 of 8; PR 3 passes 8 of 8 (`worst |idx − lowest| = 0`).
+
+**This largely answers the canonical-anchor question.** The three non-tie
+cases are bit-identical between arms, so the change is confined to exact
+float-equality ties. An anchor can only shift if a real generation hits an
+exact logit tie at the argmax — rare enough that we did not observe one, but
+still his call to re-bless. Lead the PR with this table: it shows both that
+the bug is real and that the blast radius is bounded.
+
+Ship the harness with the PR. It gives him a model-free reproduction, which
+`test_kernels` cannot be for someone without the artifact.
+
 ### What is still blocked: runtime gates
 
-**yukon has no model artifacts** (`/mnt/ai/models` is gone; no `.q27`
-anywhere). `build/test_kernels` loads a real artifact, so PR 3's tie-break
-assertion — the one PR that changes kernel behavior — **cannot be run**
-until an artifact is provisioned there (~17 GB transfer or re-download).
-Until then PR 3 ships compile-verified but not gate-verified, and the
-anchor-reblessing caveat stands.
+**yukon had no model artifacts** (`/mnt/ai/models` is gone; no `.q27`
+anywhere). An authorized fetch of the official artifact is in
+progress there (`~/q27-artifacts/`, resumable `fetch.sh`; the Tailscale path
+from the Mac measured ~1 MB/s, so pulling from HF on the box is the faster
+route). PR 3 no longer needs it — the model-free harness above covers it —
+but the **canonical/NLL gates still do**, which is what would settle anchor
+drift end-to-end rather than by argument.
 
 ### Shared-machine etiquette
 
@@ -174,8 +203,7 @@ backend — but it **changes CUDA kernel behavior**, and his canonical
 anchors are byte-exact hashes. Ties are rare, and our 16-token canonical
 gate is byte-exact across both arms, but he must re-bless anchors himself.
 Send with that caveat stated up front, or hold until after PR 5.
-Compile-verified on nvcc 12.0; **not** gate-verified — yukon currently has
-no model artifact, so `test_kernels` cannot run there (see above).
+Compile-verified AND gate-verified on the 3090 — see the table above.
 
 ### PR 4 — `Q27_GRAPH_TRACE=1` instrument  *(offer, not push; value reduced)*
 Per-family graph-memory attribution in `build_spec_graphs`; prints the table
