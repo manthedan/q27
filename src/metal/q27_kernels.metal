@@ -5362,8 +5362,9 @@ kernel void q27_attention_f16_causal_gqa_t2(device const float *q [[buffer(0)]],
 struct TopkArgs { uint n; uint k; uint capacity; };
 
 inline uint topk_sortable(float value) {
-    // Monotonic float -> uint map: larger float == larger key. NaN maps
-    // high or low deterministically; logits are finite in practice.
+    // Monotonic finite-float -> uint map: larger float == larger key.
+    // NaNs never enter the radix set; q27_topk_logits emits a fallback
+    // sentinel so the host reads and validates the complete row instead.
     uint u = as_type<uint>(value);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
@@ -5376,14 +5377,21 @@ kernel void q27_topk_logits(device const float *logits [[buffer(0)]],
                              uint tid [[thread_position_in_threadgroup]],
                              uint threads [[threads_per_threadgroup]]) {
     threadgroup atomic_uint hist[256];
+    threadgroup atomic_uint nan_seen;
     threadgroup uint tg_b1, tg_above, tg_threshold;
 
     // Pass 1: histogram of the top key byte; find the bin where the
     // descending cumulative count crosses k, and the count strictly above it.
     for (uint b = tid; b < 256; b += threads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+    if (tid == 0) atomic_store_explicit(&nan_seen, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < args.n; i += threads)
-        atomic_fetch_add_explicit(&hist[topk_sortable(logits[i]) >> 24], 1u, memory_order_relaxed);
+    for (uint i = tid; i < args.n; i += threads) {
+        const float value = logits[i];
+        if (isnan(value))
+            atomic_store_explicit(&nan_seen, 1u, memory_order_relaxed);
+        else
+            atomic_fetch_add_explicit(&hist[topk_sortable(value) >> 24], 1u, memory_order_relaxed);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         uint cumulative = 0, bin = 255;
@@ -5403,7 +5411,9 @@ kernel void q27_topk_logits(device const float *logits [[buffer(0)]],
     for (uint b = tid; b < 256; b += threads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < args.n; i += threads) {
-        const uint key = topk_sortable(logits[i]);
+        const float value = logits[i];
+        if (isnan(value)) continue;
+        const uint key = topk_sortable(value);
         if ((key >> 24) == b1)
             atomic_fetch_add_explicit(&hist[(key >> 16) & 255u], 1u, memory_order_relaxed);
     }
@@ -5420,12 +5430,19 @@ kernel void q27_topk_logits(device const float *logits [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint threshold = tg_threshold;
 
-    // Pass 3: compact every candidate at or above the 16-bit threshold.
+    // Pass 3: compact every finite candidate at or above the 16-bit
+    // threshold. Any NaN replaces the final count with a fallback sentinel
+    // after all compaction writes have completed.
     for (uint i = tid; i < args.n; i += threads) {
-        const uint key16 = topk_sortable(logits[i]) >> 16;
+        const float value = logits[i];
+        if (isnan(value)) continue;
+        const uint key16 = topk_sortable(value) >> 16;
         if (key16 >= threshold) {
             const uint slot = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-            if (slot < args.capacity) { out_values[slot] = logits[i]; out_indices[slot] = i; }
+            if (slot < args.capacity) { out_values[slot] = value; out_indices[slot] = i; }
         }
     }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (tid == 0 && atomic_load_explicit(&nan_seen, memory_order_relaxed))
+        atomic_store_explicit(out_count, args.capacity + 1u, memory_order_relaxed);
 }

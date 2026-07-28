@@ -1119,6 +1119,19 @@ int test_topk(q27::MetalBackend& backend) {
     std::vector<float> boundary(n, -50.0f);
     for (uint32_t i = 0; i < 40; i++) boundary[(i * 3797u + 11u) % n] = 100.0f + (float)i;
     check(boundary, 40, "boundary-exact");
+    // Either NaN sign must force a full-row fallback. Otherwise a negative
+    // NaN sorts below the radix threshold and bypasses host validation.
+    for (uint32_t nan_bits : {0x7fc00000u, 0xffc00000u}) {
+        std::vector<float> with_nan = boundary;
+        std::memcpy(&with_nan.back(), &nan_bits, sizeof(nan_bits));
+        auto nan_buffer = upload_buffer(backend, with_nan);
+        backend.topk(*nan_buffer, n, 40, *values_buffer, *indices_buffer, *count_buffer);
+        backend.read(*count_buffer, 0, &count, 4);
+        if (count <= capacity) {
+            fprintf(stderr, "topk NaN 0x%08x: count %u did not signal fallback\n", nan_bits, count);
+            failures++;
+        }
+    }
 
     // Multi-row offset: two packed vocab rows; top-k on row 1 via byte offset
     // must match a standalone top-k on that row alone (sampled-MTP clogits path).

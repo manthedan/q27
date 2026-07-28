@@ -390,6 +390,7 @@ class MetalEngine {
     // engine. Passed into every backend attention call.
     std::shared_ptr<BackendBuffer> gqa_partials_;
     uint32_t position_ = 0;
+    bool logits_resident_ = false;
     SpecStats last_spec_stats_;
     SuffixStats last_suffix_stats_;
     std::unordered_map<std::string, BackendTensor>& weights_;

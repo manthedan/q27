@@ -56,6 +56,7 @@ struct MetalEngine::Snapshot {
     };
     const MetalEngine* owner = nullptr;
     uint32_t position = 0;
+    bool logits_resident = false;
     std::vector<StoredLayer> layers;
     std::shared_ptr<BackendBuffer> mtp_k_cache, mtp_v_cache, hidden, logits;
     // KV fp16 exception side rows (snapshot v2): flat, in kv_fp16_side_
@@ -636,6 +637,7 @@ void MetalEngine::set_kv_attrib_except(const uint32_t* cells, size_t n) {
 
 void MetalEngine::reset() {
     position_ = 0;
+    logits_resident_ = false;
     for (LayerState& layer : layers_) {
         if (layer.recurrent) backend_.zero(*layer.recurrent);
         if (layer.ring) backend_.zero(*layer.ring);
@@ -713,7 +715,8 @@ uint64_t MetalEngine::gqa_partial_peak(uint32_t context, uint32_t block, bool ch
 std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
     backend_.synchronize();
     auto snapshot = std::make_shared<Snapshot>();
-    snapshot->owner = this; snapshot->position = position_; snapshot->layers.resize(N_LAYER);
+    snapshot->owner = this; snapshot->position = position_;
+    snapshot->logits_resident = logits_resident_; snapshot->layers.resize(N_LAYER);
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
     const uint64_t active_cache = (uint64_t)position_ * cache_row;
@@ -785,6 +788,7 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
     }
     batch.finish();
     position_=snapshot.position;
+    logits_resident_ = snapshot.logits_resident;
 }
 
 // ---- Prefix snapshots to disk (docs/metal/plans/2026-07-16-prefix-snapshots.md).
@@ -850,6 +854,8 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
                              uint32_t token_count, bool logits_resident) {
     if (token_count && !tokens)
         throw std::runtime_error("q27 Metal: snapshot token metadata is null");
+    if (logits_resident && !logits_resident_)
+        throw std::runtime_error("q27 Metal: cannot save snapshot with stale logits marked resident");
     backend_.synchronize();
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
@@ -1156,6 +1162,7 @@ uint32_t MetalEngine::load_state_fd(int source_fd, const std::string& path) {
         }
         fclose(f);
         position_ = h.position;
+        logits_resident_ = !(h.reserved & 1u);
         return position_;
     } catch (...) {
         fclose(f);
@@ -1221,6 +1228,8 @@ MetalEngine::SnapshotInfo MetalEngine::peek_snapshot_fd(
 }
 
 uint32_t MetalEngine::pending_from_logits() {
+    if (!logits_resident_)
+        throw std::runtime_error("q27 Metal: snapshot has no resident logits; continue prefill before generation");
     CommandBatch batch(backend_);
     backend_.argmax(*logits_, VOCAB, *token_out_);
     batch.finish();
@@ -1553,6 +1562,7 @@ uint32_t MetalEngine::decode_resident(uint32_t pending, uint32_t* out, uint32_t 
         }
         batch.finish();
         position_ += k;
+        logits_resident_ = true;
     }
     backend_.read(*token_ring_, 0, out, (uint64_t)k * sizeof(uint32_t));
     return out[k - 1];
@@ -1565,6 +1575,7 @@ uint32_t MetalEngine::step(uint32_t token) {
     encode_token(token, true);
     batch.finish();
     position_++;
+    logits_resident_ = true;
     uint32_t next = 0;
     backend_.read(*token_out_, 0, &next, sizeof(next));
     return next;
@@ -1656,6 +1667,7 @@ uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp
         batch.finish();
         position_ += (uint32_t)(end - begin);
     }
+    logits_resident_ = true;
     uint32_t next = 0;
     backend_.read(*token_out_, 0, &next, sizeof(next));
     return next;
@@ -2097,6 +2109,8 @@ uint32_t MetalEngine::ingest_prompt(const std::vector<uint32_t>& tokens, bool wa
 }
 
 std::vector<float> MetalEngine::read_logits() {
+    if (!logits_resident_)
+        throw std::runtime_error("q27 Metal: snapshot has no resident logits; continue prefill before reading logits");
     std::vector<float> result(VOCAB);
     backend_.synchronize();
     backend_.read(*logits_,0,result.data(),result.size()*sizeof(float));
@@ -2175,6 +2189,7 @@ std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& t
             batch.finish();
         }
         position_++;
+        logits_resident_ = true;
         if (chunked_prefill_) {
             // The leftover row rides the same float GPU reduction as the
             // chunked rows — a CPU double tail would be a third regime
@@ -2229,6 +2244,7 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
             batch.finish();
         }
         position_ += count;
+        logits_resident_ = true;
         backend_.read(*clogits_, 0, out.data(), out.size() * sizeof(float));
         return;
     }
@@ -2239,6 +2255,7 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
             batch.finish();
         }
         position_++;
+        logits_resident_ = true;
         backend_.read(*logits_, 0, out.data() + (size_t)i * VOCAB,
                       (uint64_t)VOCAB * sizeof(float));
     }
@@ -2299,16 +2316,19 @@ void MetalEngine::teacher_force_logits_wide(const uint32_t* tokens, uint32_t cou
         throw;
     }
     position_ += count;
+    logits_resident_ = true;
 }
 
 // GPU-assisted sampling: when top-k is active and within the radix-select
 // range, extract the candidate over-set on the GPU and read back ~k pairs
-// instead of the full 600 KB logits vector. A candidate count above
-// capacity signals degenerate ties — fall back to the exact full-readback
-// path, which is also the Q27_METAL_GPU_SAMPLE=0 opt-out and the
+// A candidate count above capacity signals degenerate ties or a NaN
+// sentinel — fall back to the exact full-readback path, which validates
+// every logit and is also the Q27_METAL_GPU_SAMPLE=0 opt-out and the
 // temperature-0 / no-top-k route. Same-seed token sequences match the
 // full path exactly (one uniform draw either way; real logits don't tie).
 uint32_t MetalEngine::sample_next(const SamplingParams& params, std::mt19937_64& random) {
+    if (!logits_resident_)
+        throw std::runtime_error("q27 Metal: snapshot has no resident logits; continue prefill before sampling");
     if (gpu_sample_ && params.temperature != 0.0f && params.top_k >= 1 && params.top_k <= 256) {
         backend_.topk(*logits_, VOCAB, params.top_k, *topk_values_, *topk_indices_, *topk_count_);
         uint32_t count = 0;

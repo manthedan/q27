@@ -45,6 +45,11 @@ int test_mmap_upload(q27::MetalBackend& backend) {
         q27::Model model = q27::Model::open(path);
         unlink(path);
         q27::BackendTensor weight = backend.upload(model, model.get("m"));
+        if (weight.data->size() < file.size() || weight.data->size() % (uint64_t)getpagesize() != 0) {
+            fprintf(stderr, "mmap upload: wrapped length %llu is not a page-aligned cover of %zu bytes\n",
+                    (unsigned long long)weight.data->size(), file.size());
+            return 1;
+        }
         const float x[4] = {2, -1, 0.5f, 3};
         auto device_x = backend.allocate(sizeof(x));
         auto device_y = backend.allocate(3 * sizeof(float));

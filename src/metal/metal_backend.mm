@@ -854,6 +854,14 @@ BackendTensor MetalBackend::upload(const Tensor& tensor) {
 }
 
 BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
+    impl_->require_healthy();
+    if (!model.mapping_base() || !model.mapping_size())
+        throw std::runtime_error("q27 Metal: invalid model view");
+    const uint64_t logical_size = model.mapping_size();
+    const uint64_t page_size = (uint64_t)getpagesize();
+    if (logical_size > UINT64_MAX - (page_size - 1))
+        throw std::runtime_error("q27 Metal: model mapping size overflow");
+    const uint64_t mapped_size = (logical_size + page_size - 1) / page_size * page_size;
     // Preferred form: one MTLBuffer wraps the whole mapping and every tensor
     // binds at an offset. One buffer instead of two per tensor keeps the
     // per-commit residency/tracking work constant in model size, and gives
@@ -862,12 +870,11 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
     // and stay unwired -- they do not fit in memory either way.
     auto wrap_mapping = [&]() -> std::shared_ptr<MetalBuffer> {
         void* base = (void*)model.mapping_base();
-        const uint64_t size = model.mapping_size();
         auto& slot = impl_->model_wraps[base];
         if (auto held = slot.lock()) return held;
-        madvise(base, (size_t)size, MADV_WILLNEED);
+        madvise(base, (size_t)mapped_size, MADV_WILLNEED);
         id<MTLBuffer> buffer = [impl_->device newBufferWithBytesNoCopy:base
-                                                                length:(NSUInteger)size
+                                                                length:(NSUInteger)mapped_size
                                                                options:MTLResourceStorageModeShared
                                                            deallocator:nil];
         if (!buffer) throw std::runtime_error("q27 Metal: cannot wrap model mmap");
@@ -902,14 +909,12 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
         const uintptr_t address = (uintptr_t)ptr;
         if (address < base) throw std::runtime_error("q27 Metal: tensor precedes model mapping");
         const uint64_t offset = (uint64_t)(address - base);
-        if (offset > model.mapping_size() || bytes > model.mapping_size() - offset)
+        if (offset > logical_size || bytes > logical_size - offset)
             throw std::runtime_error("q27 Metal: tensor outside model mapping");
         return offset;
     };
 
-    if (!model.mapping_base() || !model.mapping_size())
-        throw std::runtime_error("q27 Metal: invalid model view");
-    if (model.mapping_size() <= (uint64_t)impl_->device.maxBufferLength) {
+    if (mapped_size <= (uint64_t)impl_->device.maxBufferLength) {
         BackendTensor result;
         result.dtype = tensor.dtype;
         result.rows = tensor.rows();
@@ -926,17 +931,16 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
     }
 
     auto wrap = [&](const uint8_t* ptr, uint64_t bytes, uint64_t& inner) {
-        if (!ptr || !bytes || !model.mapping_base() || !model.mapping_size())
+        if (!ptr || !bytes)
             throw std::runtime_error("q27 Metal: invalid model view");
         const uintptr_t base = (uintptr_t)model.mapping_base();
         const uintptr_t address = (uintptr_t)ptr;
         if (address < base) throw std::runtime_error("q27 Metal: tensor precedes model mapping");
         const uint64_t offset = (uint64_t)(address - base);
-        const uint64_t model_size = model.mapping_size();
-        if (offset > model_size || bytes > model_size - offset)
+        if (offset > logical_size || bytes > logical_size - offset)
             throw std::runtime_error("q27 Metal: tensor outside model mapping");
 
-        const uint64_t page = (uint64_t)getpagesize();
+        const uint64_t page = page_size;
         const uint64_t page_offset = offset - offset % page;
         inner = offset - page_offset;
         if (bytes > UINT64_MAX - inner)
@@ -945,8 +949,8 @@ BackendTensor MetalBackend::upload(const Model& model, const Tensor& tensor) {
         if (view_bytes > UINT64_MAX - (page - 1))
             throw std::runtime_error("q27 Metal: model view alignment overflow");
         view_bytes = (view_bytes + page - 1) / page * page;
-        if (view_bytes > model_size - page_offset) view_bytes = model_size - page_offset;
-        if (inner + bytes > view_bytes || view_bytes > (uint64_t)impl_->device.maxBufferLength)
+        if (view_bytes > mapped_size - page_offset || inner + bytes > view_bytes ||
+            view_bytes > (uint64_t)impl_->device.maxBufferLength)
             throw std::runtime_error("q27 Metal: model view exceeds Metal buffer limits");
 
         void* view_base = (void*)(base + page_offset);
