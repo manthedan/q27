@@ -2506,6 +2506,8 @@ std::vector<uint32_t> MetalEngine::generate(const std::vector<uint32_t>& prompt,
 std::vector<uint32_t> MetalEngine::generate_mtp(const std::vector<uint32_t>& prompt,
                                                  uint32_t count, uint32_t width) {
     if (prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (!has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if ((uint64_t)prompt.size() + count > max_context_ + 1)
@@ -2519,6 +2521,8 @@ std::vector<uint32_t> MetalEngine::generate_mtp_sampled(const std::vector<uint32
                                                           const SamplingParams& params) {
     validate_sampling(params);
     if (prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: sampled MTP is unmasked; tool constraints require serial decode");
     if (!has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use plain sampling");
     if (!chunked_prefill_)
