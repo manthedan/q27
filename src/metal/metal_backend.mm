@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -323,10 +324,10 @@ struct MetalBackend::Impl {
     // A failed committed command may already have mutated device state. The
     // shared backend is then unrecoverable: every attached engine must be
     // discarded and rebuilt from a fresh model mapping.
-    bool poisoned = false;
+    std::atomic<bool> poisoned{false};
 
     void require_healthy() const {
-        if (poisoned)
+        if (poisoned.load(std::memory_order_acquire))
             throw std::runtime_error("q27 Metal: backend is poisoned after a command failure; recreate the engine");
     }
 
@@ -775,6 +776,10 @@ MetalBackend::~MetalBackend() {
 
 std::string MetalBackend::name() const {
     return std::string(impl_->device.name.UTF8String);
+}
+
+bool MetalBackend::healthy() const noexcept {
+    return !impl_->poisoned.load(std::memory_order_acquire);
 }
 
 const char* MetalBackend::shader_abi_tag() { return kShaderAbiTag; }

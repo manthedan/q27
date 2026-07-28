@@ -58,6 +58,19 @@ std::string file_sha1(const std::string& path) {
     return out;
 }
 
+void mapping_sha1(const q27::Model& model,unsigned char digest[CC_SHA1_DIGEST_LENGTH]) {
+    CC_SHA1_CTX ctx;
+    CC_SHA1_Init(&ctx);
+    const auto* bytes=static_cast<const unsigned char*>(model.mapping_base());
+    const uint64_t size=model.mapping_size();
+    for(uint64_t offset=0;offset<size;) {
+        const CC_LONG chunk=(CC_LONG)std::min<uint64_t>(256u<<20,size-offset);
+        CC_SHA1_Update(&ctx,bytes+offset,chunk);
+        offset+=chunk;
+    }
+    CC_SHA1_Final(digest,&ctx);
+}
+
 std::string executable_sha1() {
     uint32_t n=0;
     _NSGetExecutablePath(nullptr,&n);
@@ -559,6 +572,7 @@ inline json trace_token_head(const std::vector<uint32_t>& ids) {
 
 struct Runtime {
     q27::Tokenizer tokenizer;
+    std::string model_path;
     std::shared_ptr<q27::MetalEngine::Shared> shared;
     // One request slot = one engine on the shared mapping plus its private
     // prefix cache, scheduling phase, and constraint device-pool map (each
@@ -618,6 +632,12 @@ struct Runtime {
     std::mutex route_;
     std::condition_variable slot_free_;
     Lease lease_;
+    // Serializes poison recovery. recovering_ is guarded by route_ and keeps
+    // queued requests from claiming an engine while the shared backend and
+    // every attached slot are replaced.
+    std::mutex recovery_;
+    bool recovering_=false;
+    std::string recovery_failure_;
     // Slot admission is ticketed too: a bare condition_variable lets a
     // newly arriving handler barge past an awakened waiter and starve it
     // (codex P2 on d243f92); tickets hand slots out in arrival order, and
@@ -699,6 +719,7 @@ struct Runtime {
     DiskSnapshotStore snapstore{&snap_peek_adapter,&snap_hash_sha1};
     TraceLog trace;
     std::string model_name,model_sha1_cache,boot_id,server_sha1,tokenizer_name,tokenizer_sha1;
+    json serving_identity_cache;
     std::string admin_token;   // separate from boot_id: never served over HTTP (autoreview P2)
     bool snapshot_spine_pin_config=false;
     bool experimental_prefix_cache=false;
@@ -717,20 +738,27 @@ struct Runtime {
     // SHA1 over the resident mmap itself (snapshot identity), so an atomic
     // pathname replacement cannot relabel outputs from the old inode.
     std::string resident_model_sha1() {
+        std::shared_ptr<q27::MetalEngine::Shared> resident;
+        {
+            std::lock_guard<std::mutex> route_lock(route_);
+            if(!recovery_failure_.empty()) throw std::runtime_error(recovery_failure_);
+            resident=shared;
+        }
         std::lock_guard<std::mutex> lock(model_identity_mu);
         if(model_sha1_cache.empty()) {
-            const unsigned char* p=slots.front()->engine.snapshot_identity();
+            unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+            mapping_sha1(resident->model,digest);
             static const char hex[]="0123456789abcdef";
             model_sha1_cache.resize(40);
             for(int i=0;i<20;i++) {
-                model_sha1_cache[2*i]=hex[p[i]>>4];
-                model_sha1_cache[2*i+1]=hex[p[i]&15];
+                model_sha1_cache[2*i]=hex[digest[i]>>4];
+                model_sha1_cache[2*i+1]=hex[digest[i]&15];
             }
         }
         return model_sha1_cache;
     }
 
-    json serving_identity() const {
+    json build_serving_identity() {
         const auto& e=slots.front()->engine;
         std::string cell_masks;
         static const char hex[]="0123456789abcdef";
@@ -766,6 +794,20 @@ struct Runtime {
                     {"tokenizer",tokenizer_name},{"tokenizer_sha1",tokenizer_sha1}}}};
     }
 
+    std::string health_status() {
+        std::lock_guard<std::mutex> route_lock(route_);
+        if(!recovery_failure_.empty()) return "error";
+        return recovering_?"recovering":"ok";
+    }
+
+    json serving_identity() {
+        std::lock_guard<std::mutex> route_lock(route_);
+        json out=serving_identity_cache;
+        out["backend_state"]=recovery_failure_.empty()?
+            (recovering_?"recovering":"ok"):"error";
+        return out;
+    }
+
     // Serving knobs promoted to CLI flags (homebrew Phase-2 pre-tag):
     // budget_mb / snapshot_dir / snapshot_max_mb / snapshot_auto carry the
     // parsed flag values, already range-validated in main; the sentinel
@@ -776,7 +818,7 @@ struct Runtime {
             uint32_t slot_count,uint32_t budget_mb,const std::string& snapshot_dir,
             uint32_t snapshot_max_mb,long long snapshot_auto,uint32_t max_tokens_default,
             int spine_pin,bool experimental_prefix,bool think_srv)
-        :tokenizer(tok),mtp_width(width),suffix_width(sfx_width),context(ctx),
+        :tokenizer(tok),model_path(model),mtp_width(width),suffix_width(sfx_width),context(ctx),
          constrain_tools(constrain),experimental_prefix_cache(experimental_prefix),
          turbo3_kv(turbo3),prefix_entries_config(cache_entries),
          max_tokens_default_config(max_tokens_default),think_default(think_srv) {
@@ -1057,6 +1099,125 @@ struct Runtime {
             fprintf(stderr,"constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
                     tokenizer.token_id("<tool_call>"),tokenizer.token_id("</tool_call>"));
         }
+        serving_identity_cache=build_serving_identity();
+    }
+
+    // A committed Metal failure poisons the shared command queue and every
+    // engine attached to it. Stop admissions, let in-flight requests unwind,
+    // then replace the mapping/backend and all slots as one generation.
+    // Recovery validates the reopened pathname against the resident mapping:
+    // an atomic deployment must never switch a live boot to different weights.
+    bool recover_backend_if_poisoned() {
+        std::unique_lock<std::mutex> recovery_lock(recovery_);
+        if(shared->backend.healthy()) return false;
+
+        size_t slot_count=0;
+        {
+            std::unique_lock<std::mutex> route_lock(route_);
+            recovering_=true;
+            slot_free_.wait(route_lock,[&]{
+                for(const auto& slot:slots) if(slot->busy) return false;
+                return true;
+            });
+            slot_count=slots.size();
+        }
+
+        std::shared_ptr<q27::MetalEngine::Shared> replacement_shared;
+        std::vector<std::unique_ptr<Slot>> old_slots,replacement_slots;
+        try {
+            unsigned char resident_sha1[CC_SHA1_DIGEST_LENGTH];
+            unsigned char replacement_sha1[CC_SHA1_DIGEST_LENGTH];
+            mapping_sha1(shared->model,resident_sha1);
+            replacement_shared=q27::MetalEngine::open_shared(model_path);
+            mapping_sha1(replacement_shared->model,replacement_sha1);
+            if(std::memcmp(resident_sha1,replacement_sha1,sizeof resident_sha1)!=0)
+                throw std::runtime_error(
+                    "model artifact changed on disk; refusing in-process Metal recovery");
+            // One boot must retain both its model and shader identities.
+            if(replacement_shared->backend.shader_source_sha1()!=
+               shared->backend.shader_source_sha1())
+                throw std::runtime_error(
+                    "Metal shader source changed on disk; refusing in-process recovery");
+            // Reserve before moving the live vector; allocation failure leaves it intact.
+            replacement_slots.reserve(slot_count);
+        } catch(const std::exception& error) {
+            fprintf(stderr,"Metal backend recovery failed before rebuild: %s\n",error.what());
+            {
+                std::lock_guard<std::mutex> route_lock(route_);
+                recovery_failure_="Metal backend recovery failed before rebuild: ";
+                recovery_failure_+=error.what();
+                recovering_=false;
+                draining.store(true,std::memory_order_seq_cst);
+            }
+            slot_free_.notify_all();
+            throw;
+        }
+
+        {
+            std::lock_guard<std::mutex> route_lock(route_);
+            old_slots=std::move(slots);
+            shared=replacement_shared;
+        }
+        // Poisoned engines cannot be a rollback target. Release every old
+        // slot and the old shared backend before allocating the replacement
+        // generation, preserving the startup admission memory envelope.
+        old_slots.clear();
+        try {
+            for(size_t i=0;i<slot_count;i++) {
+                replacement_slots.push_back(std::make_unique<Slot>(
+                    replacement_shared,context,turbo3_kv,prefix_entries_config));
+            }
+        } catch(const std::exception& error) {
+            fprintf(stderr,"Metal backend recovery: slot rebuild stopped after %zu/%zu (%s)\n",
+                    replacement_slots.size(),slot_count,error.what());
+            if(replacement_slots.empty()) {
+                {
+                    std::lock_guard<std::mutex> route_lock(route_);
+                    recovery_failure_="Metal backend recovery could not allocate a serving slot: ";
+                    recovery_failure_+=error.what();
+                    recovering_=false;
+                    draining.store(true,std::memory_order_seq_cst);
+                }
+                slot_free_.notify_all();
+                throw;
+            }
+            // A partial rebuild is healthy and preferable to taking the
+            // process down. Capacity is reduced until the next restart.
+        }
+        const size_t rebuilt_count=replacement_slots.size();
+        {
+            std::lock_guard<std::mutex> route_lock(route_);
+            shared=std::move(replacement_shared);
+            slots=std::move(replacement_slots);
+            serving_identity_cache["protocol"]["slots"]=slots.size();
+            recovery_failure_.clear();
+            recovering_=false;
+        }
+        slot_free_.notify_all();
+        fprintf(stderr,"Metal backend recovery: rebuilt %zu slot%s after command failure\n",
+                rebuilt_count,rebuilt_count==1?"":"s");
+        trace.event({{"kind","backend_recovery"},{"slots",rebuilt_count}});
+        return true;
+    }
+
+    template<class Fn>
+    decltype(auto) guard_engine(Fn&& fn) {
+        try { return std::forward<Fn>(fn)(); }
+        catch(const ClientGone&) {
+            try { recover_backend_if_poisoned(); } catch(...) {}
+            throw;
+        }
+        catch(const ServerOverloaded&) { throw; }
+        catch(const EngineError&) { throw; }
+        catch(const std::exception& error) {
+            std::string message=error.what();
+            try { recover_backend_if_poisoned(); }
+            catch(const std::exception& recovery) {
+                message+="; Metal backend recovery failed: ";
+                message+=recovery.what();
+            }
+            throw EngineError(message);
+        }
     }
 
     static const char* phase_name(Slot::Phase p) {
@@ -1153,6 +1314,7 @@ struct Runtime {
         const char* arrival="idle";
         {
             std::unique_lock<std::mutex> lk(route_);
+            if(!recovery_failure_.empty()) throw EngineError(recovery_failure_);
             for(const auto& s:slots) if(s->busy) arrival=phase_name(s->phase);
             // A cancelled ticket may sit at the front with no waiter left to
             // skip it: fast-forward before the capacity check (and again in
@@ -1187,7 +1349,9 @@ struct Runtime {
                 const bool admitted_now=slot_free_.wait_for(lk,
                     std::chrono::milliseconds(250),[&]{
                         drain_cancelled();
+                        if(recovering_) return false;
                         if(slot_serving_!=ticket) return false;
+                        if(!recovery_failure_.empty()) return true;
                         for(const auto& s:slots) if(!s->busy) return true;
                         return false;
                     });
@@ -1217,6 +1381,10 @@ struct Runtime {
                     throw ClientGone{};
                 }
             }
+            if(!recovery_failure_.empty()) {
+                queue_waiters--;
+                throw EngineError(recovery_failure_);
+            }
             queue_waiters--;
             for(const auto& s:slots) if(!s->busy) { slot=s.get(); break; }
             slot->busy=true;
@@ -1225,7 +1393,12 @@ struct Runtime {
         struct SlotRelease {
             Runtime& rt; Slot& s;
             ~SlotRelease() {
-                { std::lock_guard<std::mutex> lk(rt.route_); s.busy=false; s.phase=Slot::Phase::Idle; }
+                {
+                    std::lock_guard<std::mutex> lk(rt.route_);
+                    s.busy=false;
+                    s.phase=Slot::Phase::Idle;
+                    if(!rt.shared->backend.healthy()) rt.recovering_=true;
+                }
                 // notify_all, not notify_one: only the serving ticket's
                 // waiter can proceed, and notify_one may wake a different
                 // ticket that just re-sleeps — wedging the queue while a
@@ -2126,7 +2299,7 @@ int main(int argc,char** argv) {
                     api_keys.size(),api_keys.size()==1?"":"s");
         }
         server.Get("/health",[&runtime](const httplib::Request& req,httplib::Response& r){
-            json body={{"status","ok"},{"model",runtime.model_name},{"boot_id",runtime.boot_id},
+            json body={{"status",runtime.health_status()},{"model",runtime.model_name},{"boot_id",runtime.boot_id},
                        {"runtime",runtime.serving_identity()},
                        {"serving",{{"draining",runtime.draining.load()},
                                    {"active_requests",runtime.active_requests.load()}}},
@@ -2166,12 +2339,15 @@ int main(int argc,char** argv) {
                 return out;
             };
             json gate,queue;
+            size_t slot_count=0;
             {
-                std::lock_guard<std::mutex> lk(runtime.route_);
+                std::unique_lock<std::mutex> lk(runtime.route_);
+                runtime.slot_free_.wait(lk,[&]{ return !runtime.recovering_; });
                 gate=bucket(runtime.gate_wait_stats);
                 queue=bucket(runtime.queue_wait_stats);
+                slot_count=runtime.slots.size();
             }
-            json_response(r,{{"slots",runtime.slots.size()},
+            json_response(r,{{"slots",slot_count},
                              {"gate_wait_by_arrival",gate},
                              {"queue_wait_by_arrival",queue},
                              {"speculation",{{"rounds",(uint64_t)runtime.spec_rounds_total},
@@ -2229,12 +2405,8 @@ int main(int argc,char** argv) {
         // Wraps ONLY a handler's run() call: engine failures reclassify as
         // EngineError (api_error 500); the cancellation and overload types
         // pass through untouched.
-        auto engine_guard=[](auto&& fn)->decltype(fn()) {
-            try { return fn(); }
-            catch(const Runtime::ClientGone&) { throw; }
-            catch(const Runtime::ServerOverloaded&) { throw; }
-            catch(const Runtime::EngineError&) { throw; }
-            catch(const std::exception& e) { throw Runtime::EngineError(e.what()); }
+        auto engine_guard=[&](auto&& fn)->decltype(fn()) {
+            return runtime.guard_engine(std::forward<decltype(fn)>(fn));
         };
         auto traced_engine=[&](const char* api,const std::string& id,auto&& fn)->decltype(fn()) {
             try { return engine_guard(std::forward<decltype(fn)>(fn)); }
@@ -2479,8 +2651,10 @@ int main(int argc,char** argv) {
                                 q27::openai_stream_chunk(false,id,"text_completion",created,"q27-metal",piece));
                             return sink.write(s.data(),s.size());
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
-                            [sock]{ return socket_alive(sock); },id);
+                        auto outcome=runtime.guard_engine([&]{
+                            return runtime.run(ids,n,sampling,stops,emit,tnames,snap_hint,
+                                [sock]{ return socket_alive(sock); },id);
+                        });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         // Terminal chunk with a real finish_reason before [DONE]
                         // (parity with server.cu security-review fix #7).
@@ -2752,14 +2926,16 @@ int main(int argc,char** argv) {
                             if(ch==q27::StreamSplitter::THINK) chunk({{"reasoning_content",t}},nullptr);
                             else { text_accum+=t; chunk({{"content",t}},nullptr); }
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,
-                            [&](const std::string& piece)->bool {
-                                for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
-                                keepalive();
-                                return alive && sink.is_writable();
-                            },tnames,snap_hint,
-                            [&,sock]{ keepalive();
-                                      return socket_alive(sock); },id);
+                        auto outcome=runtime.guard_engine([&]{
+                            return runtime.run(ids,n,sampling,stops,
+                                [&](const std::string& piece)->bool {
+                                    for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
+                                    keepalive();
+                                    return alive && sink.is_writable();
+                                },tnames,snap_hint,
+                                [&,sock]{ keepalive();
+                                          return socket_alive(sock); },id);
+                        });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         close_tool();               // wrapper never closed: finalize
@@ -3116,14 +3292,16 @@ int main(int argc,char** argv) {
                             if(alive && std::chrono::steady_clock::now()-last_wire>std::chrono::seconds(5))
                                 ev("ping",{{"type","ping"}});
                         };
-                        auto outcome=runtime.run(ids,n,sampling,stops,
-                            [&](const std::string& piece)->bool {
-                                for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
-                                keepalive();
-                                return alive && sink.is_writable();
-                            },tnames,snap_hint,
-                            [&,sock]{ keepalive();
-                                      return socket_alive(sock); },mid);
+                        auto outcome=runtime.guard_engine([&]{
+                            return runtime.run(ids,n,sampling,stops,
+                                [&](const std::string& piece)->bool {
+                                    for(auto& [ch,t]:sp.feed(piece)) emit_seg(ch,t);
+                                    keepalive();
+                                    return alive && sink.is_writable();
+                                },tnames,snap_hint,
+                                [&,sock]{ keepalive();
+                                          return socket_alive(sock); },mid);
+                        });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         close_tool();   // close any in-flight streamed call (finalize + trail recovery)
@@ -3729,14 +3907,16 @@ int main(int argc,char** argv) {
                             outcome.output_tokens=1;
                             outcome.finish=Runtime::Finish::Stop;
                         } else {
-                            outcome=runtime.run(ids,n,sampling,stops,
-                                [&](const std::string& piece)->bool {
-                                    for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
-                                    keepalive();
-                                    return alive && sink.is_writable();
-                                },tnames,snap_hint,
-                                [&,sock]{ keepalive();
-                                          return socket_alive(sock); },resp_id);
+                            outcome=runtime.guard_engine([&]{
+                                return runtime.run(ids,n,sampling,stops,
+                                    [&](const std::string& piece)->bool {
+                                        for(auto& [ch,t]:sp.feed(piece)) route(ch,t);
+                                        keepalive();
+                                        return alive && sink.is_writable();
+                                    },tnames,snap_hint,
+                                    [&,sock]{ keepalive();
+                                              return socket_alive(sock); },resp_id);
+                            });
                         }
                         if(outcome.finish==Runtime::Finish::Cancelled) {
                             runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},

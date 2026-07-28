@@ -22,6 +22,7 @@ class MetalBackend final : public ComputeBackend {
     uint32_t gqa_tile() const;
     uint32_t gqa_block() const;
     uint32_t gqa_threshold() const;
+    bool healthy() const noexcept;
     std::shared_ptr<BackendBuffer> allocate(uint64_t bytes) override;
     // GPU-private allocation (never host-read/written): used for the
     // engines' blocked-GQA partials scratch.

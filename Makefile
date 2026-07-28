@@ -10,7 +10,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 UNAME_S   := $(shell uname -s)
 
-.PHONY: all clean test-cpu test-metal agent tui agent-tui install-dev-q27
+.PHONY: all clean test-cpu test-metal test-metal-contracts test-metal-recovery agent tui agent-tui install-dev-q27
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
 
 # Friendly source-checkout entry point. The supervisor resolves the local B1
@@ -185,6 +185,19 @@ build/test_metal_engine_contracts: src/metal/test_metal_engine_contracts.cpp \
 	        src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
 	        src/tokenizer.cpp -framework Foundation -framework Metal -o $@
 
+build/test_metal_model_contracts: src/metal/test_metal_model_contracts.cpp \
+                                  src/metal/metal_engine.cpp src/metal/metal_backend.mm \
+                                  src/metal/metal_engine.h src/metal/metal_backend.h \
+                                  src/metal/q27_kernels.metal src/backend.h src/loader.cpp \
+                                  src/tokenizer.cpp | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal src/metal/test_metal_model_contracts.cpp \
+	        src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
+	        src/tokenizer.cpp -framework Foundation -framework Metal -o $@
+
+test-metal-contracts: build/test_metal_model_contracts
+	@test -n "$(MODEL)" || { echo "set MODEL=..." >&2; exit 2; }
+	./build/test_metal_model_contracts "$(MODEL)"
+
 build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h src/kl.h \
                  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
@@ -199,6 +212,11 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp sr
 	$(CXX) $(CXXFLAGS) -fobjc-arc -pthread -I src/metal src/metal/metal_server.cpp src/metal/metal_engine.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
+
+test-metal-recovery: build/q27-metal-server src/metal/test_server_recovery.py
+	@test -n "$(MODEL)" || { echo "set MODEL=..." >&2; exit 2; }
+	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=..." >&2; exit 2; }
+	python3 src/metal/test_server_recovery.py ./build/q27-metal-server "$(MODEL)" "$(TOKENIZER)"
 
 build/q27_agent_c.o: experiments/ds4-agent/q27_agent.c experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_protocol.h experiments/ds4-agent/q27_agent_persistence.h experiments/ds4-agent/q27_agent_selections.h experiments/ds4-agent/q27_agent_tui.h experiments/ds4-agent/q27_agent_editor.h experiments/ds4-agent/q27_agent_commands.h experiments/ds4-agent/q27_agent_frontend.h | build
 	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent.c -o $@
@@ -289,6 +307,7 @@ else
 test-metal:
 	@echo "test-metal requires macOS"; exit 1
 endif
+
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
@@ -437,5 +456,6 @@ build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+
 
 
