@@ -42,8 +42,9 @@ install-dev-q27: build/q27-agent build/q27-tui
 	@echo "installed $(HOME)/.grok/bin/q27 → source packaging (Q27_BIN_DIR=$(CURDIR)/build)"
 	@echo "try: q27 agent b1"
 
-test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui build/test_q27_agent_frontend build/test_tool_drift build/test_think_resolve build/test_stream_split build/test_openai_bridge build/test_auth build/test_prefix_cache
+test-cpu: build/inspect build/test_artifacts build/test_depthctl build/test_toolconstrain build/test_suffixdraft build/test_sampling build/test_kl build/test_snapshot_evict build/test_snapshot_evict_store build/test_tokenizer build/test_q27_agent_session build/test_q27_agent_protocol build/test_q27_agent_tools build/test_q27_agent_selections build/test_q27_agent_stall build/test_q27_agent_persistence build/test_q27_agent_worker build/test_q27_agent_tui build/test_q27_agent_frontend build/test_tool_drift build/test_think_resolve build/test_stream_split build/test_openai_bridge build/test_auth build/test_prefix_cache
 	./build/test_artifacts
+	./tools/test_inspect.py ./build/inspect
 	./build/test_depthctl
 	./build/test_toolconstrain
 	./build/test_suffixdraft

@@ -4,13 +4,12 @@
 // TEXT / TOOL channels, holding back any tail that could be a partial marker.
 // Markers do not nest; tool_calls can appear only outside think blocks in
 // well-formed output, but we tolerate them inside by scanning TEXT only.
-// Adjacent calls (</tool_call><tool_call>, the multi-call batch shape) emit
-// an empty {TEXT,""} boundary segment between them: consumers buffer one
-// TOOL segment at a time and flush on any non-TOOL segment, so without the
-// boundary two calls fold into one buffer, the combined parse fails, and a
-// well-formed call followed by a malformed one silently loses the malformed
-// raw (codex P2, 2026-07-17). Empty TEXT segments are no-ops for consumers
-// that do not buffer tools.
+// A closed tool followed by another structural channel with no intervening
+// payload emits an empty non-TOOL boundary segment. Consumers buffer one TOOL
+// segment at a time and flush on any non-TOOL segment, so without the boundary
+// adjacent calls fold into one buffer. An empty think block must also preserve
+// this separation. Empty boundary segments are no-ops for consumers that do
+// not buffer tools.
 #pragma once
 #include <algorithm>
 #include <cstring>
@@ -24,9 +23,9 @@ struct StreamSplitter {
     enum Chan { TEXT, THINK, TOOL };
     Chan chan = TEXT;
     std::string hold;
-    // Set when a TOOL closer returned us to TEXT and nothing has been emitted
-    // since; a <tool_call> opener at position 0 then means ADJACENT calls and
-    // gets an empty {TEXT,""} boundary segment (file-header comment).
+    // Set when a TOOL closer returned us to TEXT and no non-TOOL segment has
+    // been emitted since. The next structural opener may need an empty segment
+    // to flush consumers' pending tool buffer.
     bool tool_boundary = false;
 
     static constexpr const char* T_OPEN = "<think>";
@@ -49,8 +48,10 @@ struct StreamSplitter {
                 size_t e = std::min(pt, std::min(pc, sc));
                 if (e != std::string::npos) {
                     if (e == pt) {
-                        if (pt > 0) out.push_back({TEXT, hold.substr(0, pt)});
-                        tool_boundary = false; // think content flushes a pending tool
+                        if (pt > 0) {
+                            out.push_back({TEXT, hold.substr(0, pt)});
+                            tool_boundary = false;
+                        }
                         hold.erase(0, pt + strlen(T_OPEN));
                         chan = THINK;
                         continue;
@@ -77,13 +78,18 @@ struct StreamSplitter {
             const char* closer = chan == THINK ? T_CLOSE : C_CLOSE;
             size_t p = hold.find(closer);
             if (p != std::string::npos) {
-                if (p > 0) out.push_back({chan, hold.substr(0, p)});
+                if (p > 0) {
+                    out.push_back({chan, hold.substr(0, p)});
+                    tool_boundary = false;
+                } else if (chan == THINK && tool_boundary) {
+                    out.push_back({THINK, ""});
+                }
                 hold.erase(0, p + strlen(closer));
                 tool_boundary = (chan == TOOL);
                 chan = TEXT;
                 continue;
             }
-            emit_head(out, tail_keep(closer));
+            if (emit_head(out, tail_keep(closer))) tool_boundary = false;
             break;
         }
         return out;
@@ -91,7 +97,10 @@ struct StreamSplitter {
 
     std::vector<std::pair<Chan, std::string>> flush() {
         std::vector<std::pair<Chan, std::string>> out;
-        if (!hold.empty()) { out.push_back({chan, hold}); hold.clear(); }
+        if (!hold.empty()) out.push_back({chan, hold});
+        else if (chan == THINK && tool_boundary) out.push_back({THINK, ""});
+        hold.clear();
+        tool_boundary = false;
         return out;
     }
 
