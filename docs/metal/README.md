@@ -31,8 +31,8 @@ and [docs/MODELS.md](../MODELS.md) instead.
   code reviews, the original upstream scratch NOTEBOOK, and superseded
   parity docs. Kept verbatim for provenance; none of it is maintained.
 - [upstream-issue-draft.md](upstream-issue-draft.md) — unsent draft of the
-  merge-back issue. Rewritten 2026-07-27; the earlier revision was
-  materially wrong and must not be sent.
+  merge-back issue. Audited and rewritten 2026-07-27; superseded revisions
+  contain incorrect branch scope and must not be sent.
 
 ## The rule this directory follows
 

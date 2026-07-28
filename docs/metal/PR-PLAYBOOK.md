@@ -1,75 +1,52 @@
-# PR playbook (2026-07-27)
+# PR playbook (audited 2026-07-27)
 
-How to actually send the merge-back. [MERGE-BACK.md](MERGE-BACK.md) is the
-*plan and its evidence*; this is the **runbook** — order, gates, copy-paste
-commands, prepared answers, and abort conditions.
+Runbook for the prepared merge-back branches. The evidence and architecture
+rationale live in [MERGE-BACK.md](MERGE-BACK.md). Everything named here is
+pushed to `origin` (`manthedan/q27`). Nothing has been sent upstream.
 
-Everything named here is staged and pushed to `origin` (`manthedan/q27`).
-Nothing has been sent. The first send is the issue, not a PR.
+## Rule 0: refresh before every send
 
----
-
-## Rule 0 — re-check every item against upstream immediately before sending
-
-The 2026-07-16 queue had three ready-to-send items. Nine days later **two of
-the three had been overtaken** by the maintainer's own work (PR 2 by his
-README, PR 4 by `inst_or_advise`). Sending either would have cost credibility
-on the ones that matter.
-
-So before *every* send, not once per campaign:
+The old queue proved that a prepared PR can become obsolete within days.
+Before every issue or PR:
 
 ```bash
 git fetch upstream
-git log --oneline metal..upstream/master          # what landed since we staged
-git diff upstream/master..<pr-branch>              # does our diff still apply cleanly?
+git log --oneline metal..upstream/master
+git diff --check upstream/master..<branch>
+git diff --stat upstream/master..<branch>
 ```
 
-If upstream moved under a branch, rebase it and re-run its gate before
-sending. A stale diff is worse than a late one.
+If upstream moved under the branch, rebase and rerun the branch's own gate.
+Record the exact tip tested. A result from an earlier tip is evidence, not a
+substitute for the final pre-send run.
 
----
+## Rule 1: serialize the Metal stack
 
-## Rule 1 — GitHub cannot express this stack
+Cross-fork PRs cannot use a contributor branch as the base in the upstream
+repository. The prepared stack is therefore serialized:
 
-The branches stack locally (`pr6` off `pr5`, `pr7` off `pr6`+`pr8`). A
-cross-fork PR's base **must be a branch in the base repo**, so there is no
-way to open `pr6` against `pr5` on `signalnine/q27`. Opening PR 6 early would
-show PR 5's 730 lines *inside* it.
-
-**Therefore the stack is serialized, not parallel.** Each Metal PR opens only
-after its parent has landed on `upstream/master`, and is rebased onto master
-first:
-
-```bash
-git fetch upstream
-git rebase upstream/master pr6-metal-core     # after PR 5 merges
-git push --force-with-lease origin pr6-metal-core
+```text
+wave 1 PR 9 -> upstream/master
+upstream/master -> PR 5 -> PR 6 -> PR 7
 ```
 
-This is not a preference — it is the reason the waves below exist.
+Open PR 6 only after PR 5 and PR 9 merge, then rebase PR 6 onto upstream so
+its temporary PR 9 dependency disappears. Open PR 7 only after PR 6 merges,
+then rebase PR 7 onto upstream. Never open a stacked branch early and ask the
+maintainer to mentally subtract its parent.
 
----
+## Waves
 
-## The waves
-
-| wave | contents | gate to open it |
+| wave | contents | gate |
 |---|---|---|
-| **0** | the issue | none — send first |
-| **1** | PR 1, tokenizer, PR 3, boundary fix | none — these stand on their own merit; send whether or not he wants Metal |
-| **2** | PR 5 — the backend seam | he answered the issue with interest |
-| **3** | PR 6 → streamer → PR 7 | PR 5 **merged**, and the httplib question answered |
+| 0 | upstream issue | first send |
+| 1 | CUDA 12 compat, tokenizer ownership, argmax ties, stream boundary | independent of Metal answer |
+| 2 | backend seam | maintainer expresses interest in a multi-backend q27 |
+| 3 | Metal core, then Metal serving | parent merged; httplib question answered before serving |
 
-Wave 1 is deliberately independent of the answer. Four small fixes to his own
-code, each with a reproduction, is also the most honest possible cover letter:
-it demonstrates the fork found real bugs before it asks him for anything.
+## Wave 0: issue
 
----
-
-## Wave 0 — the issue
-
-Send [upstream-issue-draft.md](upstream-issue-draft.md) (rewritten
-2026-07-27; the pre-07-25 version asserted "I cannot compile CUDA" and still
-listed the two dropped PRs — **do not send that text**).
+Send [upstream-issue-draft.md](upstream-issue-draft.md), not an older copy.
 
 ```bash
 gh issue create --repo signalnine/q27 \
@@ -77,279 +54,305 @@ gh issue create --repo signalnine/q27 \
   --body-file docs/metal/upstream-issue-draft.md
 ```
 
-Lead with **23 files, 21,692 insertions, 3 deletions, zero `.cu` files**.
-That single line is the whole argument: it is the difference between "a 20k
-fork wants merging" and "a 20k addition that deletes three lines of your
-code."
+The measured Metal-only stack, excluding standalone PR 9, is **36 files,
++25,293/-91**. Do not repeat the old "zero `.cu` files" claim: PR 6 core
+touches no CUDA, but PR 7 serving includes a deliberate `src/server.cu`
+OpenAI-parity change.
 
-Then stop. Wave 2 does not move until he answers.
+## Wave 1: four standalone fixes
 
----
-
-## Wave 1 — four standalone fixes
-
-Open all four; they are independent of each other and of the Metal question.
+Create each PR against `master` from the named branch.
 
 ```bash
 gh pr create --repo signalnine/q27 --base master \
   --head manthedan:<branch> --title "<title>" --body-file <file>
 ```
 
-### 1a. `pr1-cuda12-compat` — +8/−2, `src/server.cu`
+### `pr1-cuda12-compat` (`7c45d7c`)
 
-**Title:** `fix: CUDA 12.0 compat — nvcc rejects lambda-captured structured bindings`
+Scope: 1 file, +8/-2, `src/server.cu`.
 
-Body must open with the reproduction, because it is the only thing he cannot
-check himself on a modern toolchain:
+Title:
 
-> On CUDA 12.0.140 (`nvcc` from the Ubuntu package, RTX 3090, `sm_86`),
-> `master` fails to build:
-> ```
-> src/server.cu(2331): error: structured binding cannot be captured  (×3)
-> ```
-> C++20 relaxed this; 12.0's nvcc predates the relaxation. The fix binds
-> `make_item_cbs`'s results as named tuple references instead. Behaviour-
-> identical — no codegen change, just names the lambda can capture.
-> With the patch applied the same toolchain compiles clean.
+```text
+fix: CUDA 12.0 compat — nvcc rejects lambda-captured structured bindings
+```
 
-Re-verify before sending: `ssh yukon`, throwaway clone, `NVCC=/usr/bin/nvcc`,
-drop the `sm_120` gencode (12.0 predates it).
+Lead with the reproduction: nvcc 12.0.140 on RTX 3090 / `sm_86` rejects three
+lambda captures of structured bindings in pristine upstream; named tuple
+references compile on the same toolchain without changing behavior.
 
-### 1b. `pr-tokenizer-lifetime` — +9/−1, `src/tokenizer.{h,cpp}`
+Pre-send gate: throwaway clone on yukon, `NVCC=/usr/bin/nvcc`, remove the
+unsupported `sm_120` gencode, compile pristine upstream and final branch tip.
 
-**Title:** `tokenizer: add a destructor and delete copies (Impl* was leaked)`
+### `pr-tokenizer-lifetime` (`380d56c`)
 
-The commit message is already the PR body — use it verbatim. The argument is
-in one line: `impl_` is an owning raw pointer with no destructor, and the
-implicit copy would double-free it once a destructor exists, which is why the
-`= delete`s ship *with* the destructor rather than after.
+Scope: 3 files, +113/-15.
 
-Expect "it's a single long-lived instance, so who cares." Prepared answer is
-in the objection handbook below.
+Title:
 
-### 1c. `pr3-argmax-tiebreak` — +22/−4, `src/blocks.cu`, `src/test_kernels.cu`
+```text
+tokenizer: make PImpl ownership construction-failure-safe
+```
 
-**Title:** `argmax: resolve exact-value ties to the lowest index`
+The destructor, deleted copies, and constructor-local RAII are one fix. The
+important regression is not only the normal lifetime leak: a parse exception
+must free the partially built `Impl` too.
 
-This is the highest-value item we have and the only one that touches kernel
-behaviour. **Send it with the evidence table, not with a warning.** The old
-issue draft's "you'd want to re-bless your anchors yourself" framing is now
-obsolete — we measured it, and the anchor does not move:
+Gate:
 
-| arm | canonical md5 |
-|---|---|
-| `upstream/master` (`c2d2116`) | `a2982c5197c627551b27d76a0a94b220` |
-| `pr3-argmax-tiebreak` (`dc05889`) | `a2982c5197c627551b27d76a0a94b220` |
-| your published anchor | `a2982c5197c627551b27d76a0a94b220` |
+```bash
+make build/test_tokenizer
+./build/test_tokenizer --selftest
+```
 
-Paste in the PR body, in this order:
+Required output includes `tokenizer failure lifetime: PASS`.
 
-1. The tie table (upstream fails 3/8, PR 3 passes 8/8, `worst |idx − lowest| = 0`).
-2. The anchor table above — run on a 3090 against the official artifact,
-   md5-verified against `CHECKSUMS.md5`.
-3. Full `build/test_kernels` battery: **all pass on both arms, every reported
-   error value identical** (`h16 vs fd2 rel t3 ntok=8 seq=4096` → `2.297e-03`
-   on both).
-4. The honest limit, stated by us before he asks: this shows the *published*
-   anchor is unaffected; it does not prove no prompt can ever hit a tie. The
-   three non-tie cases being bit-identical bounds the residual risk to a
-   generation landing on exact float equality at the argmax.
+### `pr3-argmax-tiebreak` (`eefd494`)
 
-**Ship `tools/argmax_tie_gate.cu` with it** (43 lines, builds against
-`blocks.cu` alone, no model needed). `test_kernels` cannot be a reproduction
-for anyone without the 17 GB artifact; this can.
+Scope: 4 files, +86/-7.
 
-> ⚠ `tools/argmax_tie_gate.cu` is not currently on the `pr3` branch — it
-> lives on `metal`. Cherry-pick it before sending, or the PR claims a
-> reproduction it does not ship.
+Title:
 
-### 1d. the adjacent-tool-call boundary fix — `src/stream_split.h`, +21/−2
+```text
+argmax: resolve exact and signed-zero ties to the lowest index
+```
 
-**Currently bundled** into `pr8-toolcall-streamer` with the 268-line
-`ToolCallStreamer`. Recommend splitting:
+The PR body should contain:
 
-- The boundary fix is **a bug in his code today** — `</tool_call><tool_call>`
-  emits no separating segment, so a consumer buffering one TOOL segment at a
-  time folds two calls into one buffer and silently loses a malformed second
-  call. Same consumer pattern exists CUDA-side. It belongs in wave 1.
-- `ToolCallStreamer` is 268 lines that **nothing upstream calls**. On its own
-  merits it is speculative; alongside PR 7, which uses it, it is motivated.
-  Move it to wave 3.
+1. Exact-value tie behavior: lowest index, matching CPU and Metal.
+2. Signed-zero contract: `-0.0f` and `+0.0f` are IEEE-equal and must not be
+   ordered by their sign bit.
+3. Earlier hardware evidence from `dc05889`: upstream failed 3/8 synthetic tie
+   cases, patched tip passed 8/8; full `test_kernels` numerical output matched;
+   canonical md5 stayed `a2982c5197c627551b27d76a0a94b220`.
+4. Final-tip evidence from `eefd494` on nvcc 12.0.140, `sm_86`, RTX 3090:
+   both signed-zero orders pass in plain and fused paths, `test_kernels`
+   reports `ALL PASS`, and the same canonical md5 is preserved.
 
-Cost of splitting: one rebase of `pr7`, which merges `pr8` today. Do it before
-sending, not after.
+Ship `tools/test_argmax_tie.cu`. The final tip is gated; rerun its model-free
+harness, full kernel battery, and canonical anchor only if Rule 0 changes the
+tip before sending.
 
----
+### `pr9-stream-boundary` (`2b2b74d`)
 
-## Wave 2 — PR 5, the backend seam
+Scope: 3 files, +109/-34.
 
-**Do not open until the issue is answered.** This is the decision point: it is
-where he decides whether q27 is CUDA-only or multi-backend. Everything after
-it is additive; if he declines here, we stop and stay a labelled downstream
-port. That outcome is fine and should be said out loud in the PR body.
+Title:
 
-`pr5-backend-seam` — +730/−1 across `backend.h` (new, 312), `sampling.h`
-(new, 370), `kl.h` (+34), and 15 additive lines in `loader.{h,cpp}` /
-`tokenizer.h`. **The single deletion is the `DType` enum line, extended in
-place.** No Metal code. No `.cu` file touched.
+```text
+stream_split: emit a boundary between adjacent tool calls
+```
 
-Evidence for the body: his own `loader.cpp`, `tokenizer.cpp` and `engine.cu`
-build clean against these headers under `-Wall -Wextra` with no new warnings,
-verified on nvcc 12.0.
+Explain the observable failure: `</tool_call><tool_call>` emits no separator,
+so a consumer buffering one TOOL segment can merge two calls or lose the raw
+text of a malformed second call.
 
-Explicitly **not** included: our `strip_ctrl` / `tools_preamble` extraction.
-His `api_common.h` already defines both, so Metal uses his and the extraction
-stays fork-local. That is what keeps this PR free of any restructuring of his
-code — say so in the body, because "additive only" is the whole ask.
+Gate:
 
----
+```bash
+make build/test_stream_split
+./build/test_stream_split
+```
 
-## Wave 3 — Metal
+All full, bytewise, empty-think, text-between, and flush cases must pass.
 
-Gate: **PR 5 merged** (not just approved — Rule 1 means PR 6 needs master to
-contain it), and the httplib question answered.
+## Wave 2: backend seam
 
-### 3a. The httplib conversation — before PR 7, not during review
+Branch: `pr5-backend-seam` (`3e43d4b`).
 
-Ask in the issue thread, not in the PR. A disclosed 7-line patch with a
-compile-loud failure mode is a minor governance question; the same patch
-*found during review* reads as a smuggled fork.
+Measured scope: 11 files, +1,145/-19. No Metal implementation and no `.cu`
+change. The branch adds `backend.h`, sampling and packed-model contracts,
+format documentation, and validation fixtures in `inspect`, `loader`, and
+sampling tests. It also adds the required four-line `engine.cuh` guard that
+rejects non-Q8 token embeddings before CUDA's Q8-only row lookup can launch.
 
-Order the message this way — the justification is the behaviour, not the patch:
+This is the decision point. If the maintainer wants q27 to remain CUDA-only,
+accept the answer and stop the Metal stack.
 
-1. **Numbers first.** 322 s prefill for an 8 K prompt on a base M4. Without a
-   liveness probe the server holds a slot and burns GPU producing output for a
-   client that already hung up. With it: 2 s kill of a ~90 s prefill,
-   follow-up answered in 1.15 s instead of waiting the dead request out.
-2. **The gap, in three sentences.** `DataSink::is_writable` exists only
-   *after* headers are written. `Stream&` never leaves `process_request`.
-   `set_socket_options` fires at accept with no per-request correlation.
-   There is no supported path to the fd before the first write.
-3. **Why restructuring doesn't fix it.** `write_response_core` emits the
-   status line and headers *before* invoking the content provider. Moving
-   queue-wait and prefill inside a provider commits to `200` before the work
-   starts, so overload `429`/`503` and `EngineError`→`500` become in-band
-   errors no OpenAI or Anthropic client parses.
-4. **The failure mode is loud.** All 12 call sites are unguarded — zero
-   `#ifdef`s. Drop the patch on an httplib upgrade and the build fails at
-   those exact lines: self-localizing, 7 lines to repair.
-5. **The ask is now smaller than it was.** We no longer touch httplib
-   internals at all — `httplib::detail::is_socket_alive` was replaced by a
-   self-contained ~20-line POSIX probe in `metal_server.cpp`, verified
-   identical over six socket states by `tools/socket_alive_diff_test.cpp`.
-   So: *7 lines, one borrowed fd, no use of your internals.*
-6. **Deference, explicitly.** "If you'd rather carry this differently — a
-   different accessor shape, a per-request hook — say so; the diff is 7 lines
-   precisely so any alternative is cheap to adopt."
+Local gates:
 
-Prefer a "no" now over a surprise later. And **file the parallel issue at
-yhirose/cpp-httplib the same week**, not after he answers: `Request` already
-carries `remote_addr`/`remote_port`/`local_addr`/`local_port`, so a borrowed
-server-side fd defaulting to `INVALID_SOCKET` sits inside the struct's
-existing idiom. If he declines, the clock is already running; if upstream
-accepts, our vendored patch becomes a dated backport with a deletion ticket.
+```bash
+make build/inspect build/test_sampling build/test_tokenizer
+./build/test_sampling
+make test-inspect
+```
 
-**Standing discipline: never `#ifdef` those call sites for vanilla-httplib
-compatibility.** That is the only change that would make the failure silent,
-and the loud failure is our best defense of the patch.
+The tokenizer binary's artifact-backed suite currently inherits an upstream
+`billing-header cch normalize` failure with the available model fixture; do
+not misreport that baseline failure as a PR 5 regression or as a green gate.
+The PR-specific sampling and packed-format gates pass. Sampling coverage rejects
+NaN, positive infinity, and fully masked rows across full/candidate paths while
+preserving mixed negative-infinity masks.
 
-### 3b. `pr6-metal-core` — +16,136/−0
+On the prepared tip, nvcc 12.0.140 compiled `build/q27` and
+`build/test_kernels`; the host-built inspect fixtures passed, and the invalid
+embedding fixture hit the new CUDA guard before launch. Re-run that exact gate
+if Rule 0 changes the tip.
 
-`metal_backend.{h,mm}`, `q27_kernels.metal`, `metal_engine.{h,cpp}`,
-`metal_cli.cpp`, `test_metal{,_ops}.cpp`, plus additive `Makefile` rules.
-Zero deletions. Self-contained; touches no CUDA. Builds and passes on an M4.
+## Wave 3a: Metal core
 
-> ⚠ **Gap: no documentation is staged.** Every PR branch is code-only — no
-> README, no `docs/`. Metal would land invisible. Write a short README
-> section (how to build, what tiers work, what the M4 numbers are) and add it
-> to this PR before sending. Not our lab notebook — a paragraph and a table.
+Branch: `pr6-metal-core` (`36ff230`), currently stacked on PR 5 and carrying
+PR 9 as a temporary test dependency.
 
-### 3c. `ToolCallStreamer` — +268/−0 in `api_common.h`
+The prepared ancestry is 15 files, +16,809/-35. After PR 9 merges and PR 6 is
+rebased, its intended review scope returns to 13 files, +16,701/-2: the
+Objective-C++ backend, shaders, engine, CLI, README, KL support, device tests,
+and real-artifact engine-contract gate. It touches no `.cu` file.
 
-Split out of `pr8` per 1d. Purely additive, nothing existing calls it, so it
-changes no behaviour on its own. Motivate it by what it enables: agent clients
-render tool calls incrementally, and buffering means the user watches nothing
-happen for the whole argument-generation window. `JsonQuoteContext` is the
-part that makes it safe — a fragment boundary landing mid-escape would
-otherwise put invalid JSON on the wire.
+After PR 5 and PR 9 merge:
 
-Verified: `api_common.h` compiles standalone; his own
-`tools/test_openai_bridge.cpp` passes unchanged.
+```bash
+git fetch upstream
+git rebase -i --onto upstream/master 3e43d4b pr6-metal-core
+# In the rebase todo, drop 3fe89c7 (the temporary PR 9 commit).
+git diff --exit-code upstream/master..pr6-metal-core -- src/stream_split.h tools/test_stream_split.cpp
+git diff upstream/master..pr6-metal-core -- Makefile # inspect: only Metal targets remain
+git push --force-with-lease origin pr6-metal-core
+make test-metal build/q27-metal build/test_metal_engine_contracts
+./build/q27-metal /path/to/official.q27 /path/to/model.tok --validate-only
+./build/q27-metal /path/to/bonsai.q27 /path/to/model.tok --validate-only
+./build/test_metal_engine_contracts /path/to/official.q27 /path/to/bonsai.q27
+```
 
-### 3d. `pr7-metal-serving` — +4,826/−0 of new files
+Required evidence on Apple Silicon:
 
-`metal_server.cpp`, `stream_format.h`, `disk_snapshot_store.h`,
-`snapshot_evict.h`, `test_metal_stream.cpp`.
+- `build/q27-metal` compiles and `--validate-only` accepts both official and
+  Bonsai artifacts
+- Bonsai stays on serial float-activation prefill; forced chunking rejects
+- cancelled batched MTP clears speculative position and resident logits
+- Metal matvec and post-commit poison PASS
+- decode, FP16/turbo3 attention, GQA KV reuse, GDN, and chunked prefill PASS
+- installed shader-path precedence and exact ABI-line validation PASS
+- profiled explicit-batch overflow rejects before the 2049th operation
 
-Its entire dependency on shared files is **two things** — worth stating in the
-body, because it is much smaller than the raw diff suggests:
+## Wave 3b: httplib decision
 
-- `api_common.h` + `initial_harness_prefix` (23 additive lines)
-- `third_party/httplib.h` + the 7-line `Request::sock` patch
+Ask in the issue thread before opening PR 7. The vendored change is seven
+additive lines exposing a borrowed request socket before the first response
+write. The behavior argument comes first:
 
-Separable from PR 6 on purpose: it is the HTTP layer, and he may want the
-engine without our serving opinions.
+- queue wait and prefill can take minutes before headers
+- a disconnected client otherwise burns a slot and GPU work
+- moving work into a content provider commits HTTP 200 before overload or
+  engine errors are known
+- call sites are intentionally unguarded, so removal fails loudly at compile
+  time rather than silently disabling cancellation
+- the server uses its own POSIX liveness probe, not httplib internals
 
----
+If the maintainer declines, ship PR 6 alone and hold PR 7.
+
+## Wave 3c: Metal serving
+
+Branch: `pr7-metal-serving` (`779ef04`), stacked directly on PR 6.
+
+Measured stage scope: 18 files, +7,462/-85. There is no standalone streamer PR:
+`ToolCallStreamer` is integrated here because this server is its caller.
+
+The branch intentionally includes shared serving changes:
+
+- `src/metal/metal_backend.h` / `.mm`
+
+- `src/api_common.h`
+- `src/server.cu`
+- `third_party/httplib.h`
+- bridge/integration tests
+
+Do not describe it as new-files-only or zero-CUDA. Its architectural boundary
+is HTTP serving, not file novelty.
+
+PR 7 contains no stream-boundary delta relative to PR 6. After PR 6 lands,
+run `git rebase --onto upstream/master 36ff230 pr7-metal-serving`, then verify
+that remains true.
+
+Required Apple Silicon and host gates:
+
+```bash
+make test-metal \
+  build/q27-metal-server \
+  build/test_openai_bridge \
+  build/test_stream_split \
+  build/test_sampling \
+  build/inspect
+./build/test_openai_bridge
+./build/test_stream_split
+./build/test_sampling
+make test-inspect
+bash tools/build_chat_completions_integration.sh
+make test-metal-contracts MODEL=/path/to/model.q27
+make test-metal-recovery MODEL=/path/to/model.q27 TOKENIZER=/path/to/model.tok
+```
+
+Observed on the prepared tip: every command above passes on Apple M4. The
+chat-completions extraction check reports byte-for-byte matches for
+`build_prompt()` and `handle()` and all integration cases pass. Live Anthropic
+smoke requests also prove 400s for missing/empty/wrong-typed messages and bad
+tool choices, named-tool forcing, `none` suppression, and single-call
+enforcement for `disable_parallel_tool_use`.
+The recovery gate requires an oversized body to return HTTP 413, reconstructs
+the backend after a committed command failure, streams a split noncanonical
+tool-call head through the Responses route, and requires a completed
+structured function call. It also prewarms an Anthropic `tool_choice:none`
+prefix and requires the corresponding live request to report a nonzero exact
+prefix hit. The model contract gate proves scheduler chunk prefill invalidates
+stale logits until a forward pass refreshes them.
+The final review additions also prove that forced tool choices cannot disappear
+at the exact token limit, externally replaced snapshot metadata is re-peeked,
+hosted Responses shell tools receive model-facing `exec_command` /
+`write_stdin` schemas, and fractional token limits return HTTP 400 while
+integral JSON floats remain valid. Final branch autoreview reports no
+accepted/actionable findings.
+
+Required final-tip CUDA gate on yukon, because this stage changes
+`src/server.cu`:
+
+```bash
+NVCC=/usr/bin/nvcc \
+NVCCFLAGS='-O2 -std=c++17 -gencode arch=compute_86,code=sm_86 -Xcompiler -Wall' \
+make build/q27-server
+```
+
+The current `779ef04` tree compiles on nvcc 12.0.140, `sm_86` after applying
+the planned PR 1 compatibility prerequisite. Run the command again after the
+final upstream rebase and record that exact tip. The host extraction gate
+supplements this compile; it does not replace compiling the shipped CUDA
+server.
 
 ## Objection handbook
 
-Prepared answers, each backed by something already measured. Do not improvise
-these — the evidence exists precisely so we don't have to.
-
-| he says | answer |
+| objection | answer |
 |---|---|
-| "The tie-break changes kernel behaviour; I'd have to re-bless anchors." | Measured: the published canonical md5 is identical across both arms and equal to your published value. The full kernel battery reports the same error values on both. It only differs where the old code was demonstrably wrong. |
-| "The tokenizer leak doesn't matter — one long-lived instance." | Correct today, which is why it hides. Anything constructing tokenizers repeatedly leaks the vocab + merge table + special-token list each time. The copy-delete is the load-bearing half: without it, adding the destructor introduces a double-free. Three lines and a `delete`. |
-| "20k lines is too much to review." | The seam is 730 lines and that's the only decision. 16k of the rest is a self-contained directory that cannot affect your build — it compiles only under a Darwin branch in the Makefile, and touches zero `.cu` files. Review the seam; the port is take-it-or-leave-it. |
-| "I don't want to maintain a backend I can't test." | Say yes plainly: we maintain it, we run the gates, we carry the on-call. Offer a `CODEOWNERS` entry for `src/metal/` and a stated policy that a Metal break never blocks a CUDA release. |
-| "Why is there a patched httplib in third_party?" | Use the wave-3a script. Never let this be discovered — ask first. |
-| "Can you split the Metal PR further?" | Yes, and offer it before he asks: engine / shaders / tests are separable inside PR 6. |
-| "Does this slow down or complicate the CUDA path?" | Measured, not asserted: built Metal against pristine `upstream/master` and every one of the 48 errors was a missing addition — zero CUDA dependencies. `blocks.cu`, `server.cu`, `test_kernels.cu`, `inspect.cpp` are not required by Metal at all. |
-
----
+| "The argmax change moves anchors." | The final signed-zero tip preserved the published canonical md5 and full kernel numerics on nvcc 12.0.140. Repeat only if Rule 0 changes the tip. |
+| "One tokenizer lives for the process lifetime." | Normal lifetime is only half the bug. A throwing constructor leaked its partially built PImpl; the regression repeats malformed construction and checks resource stability. |
+| "The Metal diff is too large." | The decision is staged: +1,145/-19 seam, +16,701/-2 core after PR 9 lands, +7,462/-85 serving. Review or decline each layer independently. |
+| "I cannot maintain Metal." | We own the Metal path and gates; a Metal break should not block a CUDA release. Offer `CODEOWNERS` for `src/metal/`. |
+| "Why patch httplib?" | Seven additive lines expose the only pre-header liveness signal. Ask before review; if declined, hold serving and land core alone. |
+| "Does Metal complicate CUDA?" | PR 6 core does not touch `.cu`. PR 7 does touch `server.cu` for shared OpenAI parity; it is disclosed and can be declined independently. |
 
 ## Abort protocol
 
-Each wave has a defined stop, and stopping is a normal outcome — not a
-failure to argue harder.
+- Issue declined: wave 1 may still proceed; stop the Metal stack.
+- PR 5 declined: stop. Do not repackage the seam inside Metal code.
+- httplib declined: hold PR 7; PR 6 may still land.
+- Any individual PR declined: record the reason in `DECISIONS.md`; do not
+  resubmit the same change under another title.
 
-- **Issue declined** → send wave 1 anyway (the four fixes stand alone), then
-  stop. Keep the fork clearly labelled a downstream Metal port, keep pulling
-  from him. Say this in the issue itself so the no is easy to give.
-- **PR 5 declined** → stop at wave 2. Waves 3's branches stay staged; they
-  cost nothing parked. Do not re-litigate the seam in a Metal PR.
-- **httplib patch declined** → PR 7 does not ship as-is. Fallback is not
-  "restructure into a content provider" (that breaks error status codes — see
-  3a.3). Fallback is: hold PR 7, ship PR 6 alone, and wait on the
-  cpp-httplib upstream issue.
-- **Any single PR declined on its merits** → close it, record the reason in
-  [DECISIONS.md](DECISIONS.md), and do not resubmit in another shape.
+## Invariants before `gh pr create`
 
----
-
-## Invariants — check before every `gh pr create`
-
-- [ ] `LICENSE` appears in no PR. It carries our fork-additions copyright
-      line, acknowledged in the 07-16 exchange, and must never be in a diff.
-- [ ] No `logs/`, `experiments/`, `packaging/`, or `docs/metal/` in any PR.
-- [ ] `git diff --name-only upstream/master..<branch>` matches the file list
-      this playbook states for that branch. Anything extra is carry-over.
-- [ ] Deletion count matches: 3 across the entire stack, and every one is
-      accounted for (`loader.h` −1 enum line extended in place, `stream_split.h`
-      −2 for `emit_head`'s new `bool` return).
-- [ ] Every CUDA-touching PR names the toolchain it was verified on
-      (nvcc 12.0.140, sm_86, RTX 3090) — and no longer claims we cannot
-      compile CUDA, which was wrong.
-- [ ] yukon etiquette if re-verifying: `nvidia-smi --query-compute-apps=pid
-      --format=csv,noheader` immediately before launch, not at plan time; work
-      in a throwaway clone; **never touch `~/projects/q27` on yukon**.
-
----
+- [ ] Fetch upstream and inspect new commits immediately before the send.
+- [ ] `LICENSE`, logs, experiments, packaging, and `docs/metal/` are absent.
+- [ ] Branch tip, diff stat, and file list match this playbook after rebase.
+- [ ] The exact tip named in the PR body is the tip that passed its gate.
+- [ ] CUDA-touching PRs name nvcc 12.0.140, `sm_86`, RTX 3090.
+- [x] PR 3 final signed-zero tip has fresh CUDA evidence; reset if rebased.
+- [ ] PR 7 final tip compiles `build/q27-server` on yukon and passes the
+      byte-for-byte extracted chat-completions integration gate.
+- [ ] PR 6 opens only after PR 5 and PR 9 merged; its rebased diff contains no
+      stream-boundary patch.
+- [ ] PR 7 parent is merged upstream, httplib is agreed, and its diff contains
+      no duplicate boundary patch.
 
 ## After each send
 
-Update the status table in [MERGE-BACK.md](MERGE-BACK.md) with the PR number
-and outcome, and add a row to [DECISIONS.md](DECISIONS.md) for anything
-declined — including *why*, because a parked item with a recorded mechanism is
-what stops it coming back.
+Update the status table in [MERGE-BACK.md](MERGE-BACK.md). Record declined
+items and reasons in [DECISIONS.md](DECISIONS.md).
