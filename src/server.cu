@@ -1494,7 +1494,8 @@ int main(int argc, char** argv) {
                     tx += (tx.empty() ? "" : "\n") + c.raw;
             }
             const bool any_call = !eligible_calls.empty();
-            if (tchoice.mode == q27::ToolChoice::FORCED && !any_call) {
+            if (q27::forced_tool_choice_missing_is_error(
+                    tchoice, any_call, n >= n_max)) {
                 res.status = 500;
                 res.set_content(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
                                                  {"type","api_error"}}}}.dump(),
@@ -1712,7 +1713,8 @@ int main(int argc, char** argv) {
                 // above); end=error lands in the [req] line, [req-error]
                 // carries the what() (batch_generate logs it unconditionally
                 // when err_out is null, same as that leg's nullptr err_out).
-                if (tchoice.mode == q27::ToolChoice::FORCED && !any_call) {
+                if (q27::forced_tool_choice_missing_is_error(
+                        tchoice, any_call, produced >= nm)) {
                     send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
                                          {"type","api_error"}}}});
                     std::string done = "data: [DONE]\n\n";

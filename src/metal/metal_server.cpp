@@ -3757,9 +3757,16 @@ int main(int argc,char** argv) {
                         {"status",incomplete_item?"incomplete":"completed"},{"summary",json::array({{{"type","summary_text"},{"text",th}}})},
                         {"encrypted_content",nullptr}});
                 };
+                auto push_message=[&](const std::string& tx,bool incomplete_item=false){
+                    if(tx.empty()) return;
+                    items.push_back({{"type","message"},{"id",msg_id+"_"+std::to_string(message_counter++)},{"role","assistant"},
+                        {"status",incomplete_item?"incomplete":"completed"},
+                        {"content",json::array({{{"type","output_text"},{"text",tx},
+                                                 {"annotations",json::array()}}})}});
+                };
                 auto push_call=[&](const std::string& name,const json& args,bool incomplete_item=false){
                     if(!responses_tool_allowed(name,allowed_tool_names,allowed_hosted_names) ||
-                       (tchoice.disable_parallel_tool_use && tool_counter)) return;
+                       (tchoice.disable_parallel_tool_use && tool_counter)) return false;
                     const int call_index=tool_counter++;
                     const std::string cid="call_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
                     const std::string iid="fc_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
@@ -3773,6 +3780,7 @@ int main(int argc,char** argv) {
                         items.push_back({{"type","function_call"},{"id",iid},{"call_id",cid},
                                          {"status",incomplete_item?"incomplete":"completed"},
                                          {"name",name},{"arguments",args.dump()}});
+                    return true;
                 };
                 auto flush_text=[&](bool final_turn,bool incomplete_item=false){
                     std::string tx=q27::strip_ws2(text); text.clear();
@@ -3799,12 +3807,10 @@ int main(int argc,char** argv) {
                             runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},{"stream",false},{"count",eligible_calls.size()}});
                         }
                     }
-                    if(!tx.empty())
-                        items.push_back({{"type","message"},{"id",msg_id+"_"+std::to_string(message_counter++)},{"role","assistant"},
-                            {"status",incomplete_item?"incomplete":"completed"},
-                            {"content",json::array({{{"type","output_text"},{"text",tx},
-                                                     {"annotations",json::array()}}})}});
-                    for(auto& bc:eligible_calls) push_call(bc.name,bc.arguments,incomplete_item);
+                    push_message(tx,incomplete_item);
+                    for(auto& bc:eligible_calls)
+                        if(!push_call(bc.name,bc.arguments,incomplete_item))
+                            push_message(bc.raw,incomplete_item);
                 };
                 auto flush_tool=[&](bool final_turn,bool incomplete_item=false){
                     auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
@@ -3818,7 +3824,10 @@ int main(int argc,char** argv) {
                         text+=(text.empty()?"":"\n")+c.raw;
                         flush_text(final_turn,incomplete_item); return;
                     }
-                    push_call(c.name,c.arguments,incomplete_item);
+                    if(!push_call(c.name,c.arguments,incomplete_item)) {
+                        text+=(text.empty()?"":"\n")+c.raw;
+                        flush_text(final_turn,incomplete_item);
+                    }
                 };
                 q27::StreamSplitter sp;
                 if(tchoice.mode==q27::ToolChoice::FORCED) sp.chan=q27::StreamSplitter::TOOL;
@@ -3960,7 +3969,7 @@ int main(int argc,char** argv) {
                         };
                         auto push_call=[&](const std::string& name,const json& args,bool incomplete_item=false){
                             if(!responses_tool_allowed(name,allowed_tool_names,allowed_hosted_names) ||
-                               (tchoice.disable_parallel_tool_use && tool_counter)) return;
+                               (tchoice.disable_parallel_tool_use && tool_counter)) return false;
                             const int call_index=tool_counter++;
                             const std::string cid="call_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
                             const std::string iid="fc_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
@@ -3981,6 +3990,7 @@ int main(int argc,char** argv) {
                             else added["input"]="";
                             ev({{"type","response.output_item.added"},{"output_index",out_index},{"item",added}});
                             item_done(item);
+                            return true;
                         };
                         auto push_message_done=[&](const std::string& tx,bool incomplete_item=false){
                             if(tx.empty()) return;
@@ -4021,7 +4031,9 @@ int main(int argc,char** argv) {
                                         fprintf(stderr,"[tool-fallback] %zu truncated wrapped call(s) recovered (resp stream)\n",bcs.size());
                                         runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},{"stream",true},{"truncated_wrapper",true},{"count",bcs.size()}});
                                         push_message_done(pre,incomplete_item);
-                                        for(auto& bc:bcs) push_call(bc.name,bc.arguments,false);
+                                        for(auto& bc:bcs)
+                                            if(!push_call(bc.name,bc.arguments,false))
+                                                push_message_done(bc.raw,incomplete_item);
                                         return;
                                     }
                                 }
@@ -4033,7 +4045,8 @@ int main(int argc,char** argv) {
                                 push_message_done(c.raw,incomplete_item);
                                 return;
                             }
-                            push_call(c.name,c.arguments,incomplete_item);
+                            if(!push_call(c.name,c.arguments,incomplete_item))
+                                push_message_done(c.raw,incomplete_item);
                         };
                         auto emit_text=[&](const std::string& t){
                             if(msg_index<0 && text.empty() && q27::strip_ws2(t).empty()) return;
@@ -4056,7 +4069,9 @@ int main(int argc,char** argv) {
                                 if(all_eligible) {
                                     if(!pre.empty()) emit_text(pre);
                                     flush_text();
-                                    for(auto& bc:bcs) push_call(bc.name,bc.arguments,incomplete_item);
+                                    for(auto& bc:bcs)
+                                        if(!push_call(bc.name,bc.arguments,incomplete_item))
+                                            push_message_done(bc.raw,incomplete_item);
                                     fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",bcs.size());
                                     runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},{"stream",true},{"count",bcs.size()}});
                                 } else emit_text(bare_pending);
@@ -4097,7 +4112,8 @@ int main(int argc,char** argv) {
                                     if(!pre.empty()) flush_text();
                                     for(auto& bc:bcs) {
                                         if(msg_index>=0) flush_text();
-                                        push_call(bc.name,bc.arguments,false);
+                                        if(!push_call(bc.name,bc.arguments,false))
+                                            push_message_done(bc.raw,false);
                                     }
                                     fprintf(stderr,"[tool-stream] %zu trailing call(s) recovered after streamed call (resp)\n",bcs.size());
                                     runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},
@@ -4261,7 +4277,10 @@ int main(int argc,char** argv) {
                         Runtime::Outcome outcome;
                         if(test_tool_fallback) {
                             route(q27::StreamSplitter::TOOL,"{\"arguments\":");
-                            route(q27::StreamSplitter::TOOL,"{},\"name\":\"fallback_tool\"}");
+                            std::string fixture="{},\"name\":\"fallback_tool\"}";
+                            if(tchoice.disable_parallel_tool_use)
+                                fixture+="{\"arguments\":{},\"name\":\"fallback_tool\"}";
+                            route(q27::StreamSplitter::TOOL,fixture);
                             outcome.prompt_tokens=(uint32_t)ids.size();
                             outcome.output_tokens=1;
                             outcome.finish=Runtime::Finish::Stop;

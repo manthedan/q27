@@ -113,10 +113,11 @@ def main():
         except urllib.error.HTTPError as error:
             return error.code
 
-    def request_tool_fallback():
+    def request_tool_fallback(parallel=True):
         payload = json.dumps({
             "model": "q27", "input": "Run the fallback tool", "stream": True,
             "max_output_tokens": 8, "q27_test_tool_fallback": True,
+            "parallel_tool_calls": parallel,
             "tools": [{
                 "type": "function", "name": "fallback_tool",
                 "description": "fallback regression fixture",
@@ -213,6 +214,22 @@ def main():
         fail(f"buffered tool fallback failed: {fallback_status} {fallback_events}", process, stderr_lines)
     if not any(event.get("type") == "response.completed" for event in fallback_events):
         fail(f"buffered tool fallback did not complete: {fallback_events}", process, stderr_lines)
+
+    single_status, single_events = request_tool_fallback(False)
+    single_items = [
+        event.get("item", {}) for event in single_events
+        if event.get("type") == "response.output_item.done"
+    ]
+    single_calls = [item for item in single_items if item.get("type") == "function_call"]
+    preserved = [
+        part.get("text", "")
+        for item in single_items if item.get("type") == "message"
+        for part in item.get("content", []) if part.get("type") == "output_text"
+    ]
+    if (single_status != 200 or len(single_calls) != 1 or
+            not any("fallback_tool" in text for text in preserved)):
+        fail(f"single-call fallback discarded extra output: "
+             f"{single_status} {single_events}", process, stderr_lines)
 
     stop_process()
     atexit.unregister(stop_process)
