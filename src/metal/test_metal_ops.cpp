@@ -128,6 +128,16 @@ int test_primitives(q27::MetalBackend& backend) {
     backend.rope_neox(*ropeb,1,8,4,8,3,10000.0f); auto rg=read_f32(backend,*ropeb,8);
     for(uint32_t d=0;d<2;d++){float theta=3*std::pow(10000.0f,-2.0f*d/4.0f);float c=std::cos(theta),s=std::sin(theta);float a=rope[d],b=rope[d+2];if(!near(rg[d],a*c-b*s))fail("rope",d,rg[d],a*c-b*s);if(!near(rg[d+2],a*s+b*c))fail("rope",d+2,rg[d+2],a*s+b*c);}
 
+    // Reject 32-bit concatenation count overflow before any buffer-range or
+    // dispatch arithmetic can observe different wrapped totals.
+    auto concat_one=backend.allocate(sizeof(float));
+    bool concat_overflow=false;
+    try { backend.concat(*concat_one,UINT32_MAX,*concat_one,1,*concat_one); }
+    catch(const std::runtime_error& e) {
+        concat_overflow=std::string(e.what()).find("concat element count overflow")!=std::string::npos;
+    }
+    if(!concat_overflow) { fprintf(stderr,"concat overflow was not rejected\n"); failures++; }
+
     // Stable lower-index tie break.
     std::vector<float> logits={-1,7,3,7,2}; auto lb=upload_buffer(backend,logits); auto ib=backend.allocate(4); backend.argmax(*lb,5,*ib); uint32_t index=99; backend.read(*ib,0,&index,4); if(index!=1){fprintf(stderr,"argmax: got %u want 1\n",index);failures++;}
     return failures;

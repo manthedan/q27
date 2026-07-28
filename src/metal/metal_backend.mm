@@ -1873,14 +1873,16 @@ void MetalBackend::add_inplace(BackendBuffer& x, const BackendBuffer& y, uint32_
 void MetalBackend::concat(const BackendBuffer& a, uint32_t a_count,
                            const BackendBuffer& b, uint32_t b_count,
                            BackendBuffer& out) {
+    const uint64_t total=(uint64_t)a_count+b_count;
+    if(total>UINT32_MAX) throw std::runtime_error("concat element count overflow");
     const MetalBuffer& ab=metal_buffer(a); const MetalBuffer& bb=metal_buffer(b); MetalBuffer& ob=metal_buffer(out);
     check_range(ab.size(),0,(uint64_t)a_count*4,"concat a"); check_range(bb.size(),0,(uint64_t)b_count*4,"concat b");
-    check_range(ob.size(),0,(uint64_t)(a_count+b_count)*4,"concat output"); ConcatArgs args{a_count,b_count};
+    check_range(ob.size(),0,total*4,"concat output"); ConcatArgs args{a_count,b_count};
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_concat"); [enc setComputePipelineState:impl_->concat];
         [enc setBuffer:ab.handle() offset:0 atIndex:0]; [enc setBuffer:bb.handle() offset:0 atIndex:1]; [enc setBuffer:ob.handle() offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof(args) atIndex:3];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)a_count+b_count,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)total,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if(own) impl_->finish_command("concat");
     }
 }
