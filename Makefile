@@ -315,6 +315,10 @@ build/metal_attn_bench: tools/metal_attn_bench.cpp src/metal/metal_backend.mm sr
 else
 test-metal:
 	@echo "test-metal requires macOS"; exit 1
+test-metal-contracts:
+	@echo "test-metal-contracts requires macOS"; exit 1
+test-metal-recovery:
+	@echo "test-metal-recovery requires macOS"; exit 1
 endif
 
 
