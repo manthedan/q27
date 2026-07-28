@@ -596,8 +596,8 @@ static void test_margin() {
 // P14: fused draft argmax+margin. The single pass must reproduce, EXACTLY:
 //  - argmax()'s token (same tie semantics, since the grid partition matches), and
 //  - margin()'s value == CPU top1-top2 (pure selection, no fp reassociation).
-// Cases: random logits, all-equal (ties everywhere), max@0, max@last, and a
-// duplicated max value at two indices (pins margin==0 and the higher-index win).
+// Cases: random logits, all-equal (ties everywhere), max@0, max@last,
+// duplicated maxima, and both signed-zero orders across reduction blocks.
 static void test_argmax_top2() {
     const int N = 248320;
     float *d_x, *d_margin, *d_margin2, *d_blk2;
@@ -650,6 +650,8 @@ static void test_argmax_top2() {
       run_case(l); }
     { std::vector<float> l = rand_vec(N, 29); l[7] = 5e3f; l[8] = 5e3f; l[N - 2] = 5e3f;
       run_case(l); }                                                // triple tie, adjacent pair
+    { std::vector<float> l(N, -1.0f); l[0] = -0.0f; l[256] = +0.0f; run_case(l); }
+    { std::vector<float> l(N, -1.0f); l[0] = +0.0f; l[256] = -0.0f; run_case(l); }
     CUDA_CHECK(cudaFree(d_x));
     CUDA_CHECK(cudaFree(d_margin));
     CUDA_CHECK(cudaFree(d_margin2));

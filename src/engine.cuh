@@ -527,6 +527,10 @@ struct Engine {
 
   private:
     void init(int ctx, bool own_weights) {
+        const q27::Tensor& embedding = model.get("token_embd.weight");
+        if (embedding.dtype != q27::DType::Q8_G128)
+            throw std::runtime_error("q27 CUDA: token_embd.weight must be Q8_G128");
+
         CUDA_CHECK(cudaStreamCreate(&stm));
         const char* kve = getenv("Q27_KV");
         kv_fp8 = kve && !strcmp(kve, "fp8");

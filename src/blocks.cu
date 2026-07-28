@@ -401,6 +401,9 @@ void add_inplace(float* x, const float* y, int n, cudaStream_t st) {
 // Multi-block argmax: pack (orderable float bits, index) into u64, atomicMax.
 __device__ __forceinline__ unsigned long long am_pack(float v, int idx) {
     unsigned u = __float_as_uint(v);
+    // IEEE equality treats both zero signs as one value. Canonicalize their
+    // bit patterns before the order transform so the index tie-break decides.
+    if ((u & 0x7fffffffu) == 0) u = 0;
     u = (u & 0x80000000u) ? ~u : (u | 0x80000000u); // monotonic float->uint map
     // Low 32 bits carry the BITWISE-INVERTED index: under the max/atomicMax
     // reductions, exact value ties then resolve to the LOWEST index — the

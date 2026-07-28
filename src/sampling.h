@@ -23,10 +23,24 @@ inline void validate_sampling(const SamplingParams& p) {
         throw std::runtime_error("q27: top_p must be in (0,1]");
 }
 
+inline void validate_logits(const float* values,size_t count) {
+    bool any_finite=false;
+    for(size_t i=0;i<count;i++) {
+        if(std::isnan(values[i]))
+            throw std::runtime_error("q27: logits contain NaN");
+        if(values[i]==std::numeric_limits<float>::infinity())
+            throw std::runtime_error("q27: logits contain positive infinity");
+        any_finite=any_finite || std::isfinite(values[i]);
+    }
+    if(!any_finite)
+        throw std::runtime_error("q27: logits contain no finite values");
+}
+
 inline uint32_t sample_logits_cpu(const std::vector<float>& logits,const SamplingParams& p,
                                   std::mt19937_64& random) {
     validate_sampling(p);
     if(logits.empty()) throw std::runtime_error("q27: logits are empty");
+    validate_logits(logits.data(),logits.size());
     auto argmax=[&] {
         return (uint32_t)std::distance(logits.begin(),std::max_element(logits.begin(),logits.end()));
     };
@@ -86,6 +100,7 @@ inline uint32_t sample_candidates_cpu(const std::vector<float>& values,
     if(!count) throw std::runtime_error("q27: candidate list is empty");
     if(values.size()<count || indices.size()<count)
         throw std::runtime_error("q27: candidate list shorter than count");
+    validate_logits(values.data(),count);
     std::vector<uint32_t> order(count);
     for(uint32_t i=0;i<count;i++) order[i]=i;
     auto before=[&](uint32_t a,uint32_t b) {
@@ -144,6 +159,7 @@ inline ServedDistribution build_served_distribution(const float* logits,uint32_t
                                                     const SamplingParams& p) {
     validate_sampling(p);
     if(!logits || !vocab) throw std::runtime_error("q27: logits/vocab empty for served dist");
+    validate_logits(logits,vocab);
     ServedDistribution d;
     uint32_t argmax = 0;
     float best = logits[0];
@@ -210,6 +226,7 @@ inline ServedDistribution build_served_from_candidates(const float* values,
     validate_sampling(p);
     if(!values || !indices || !count)
         throw std::runtime_error("q27: empty candidates for served dist");
+    validate_logits(values,count);
     ServedDistribution d;
     std::vector<uint32_t> order(count);
     for(uint32_t i=0;i<count;i++) order[i]=i;

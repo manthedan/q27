@@ -37,6 +37,8 @@ int main(){
     { auto l=rand_vec(N,17); l[N-1]=1e4f; run(l,"max@last"); }
     { auto l=rand_vec(N,23); l[100]=5e3f; l[200000]=5e3f; run(l,"dup max (far apart)"); }
     { auto l=rand_vec(N,29); l[7]=5e3f; l[8]=5e3f; l[N-2]=5e3f; run(l,"triple tie, adjacent"); }
+    { std::vector<float> l(N,-1.0f); l[0]=-0.0f; l[256]=+0.0f; run(l,"-0 then +0"); }
+    { std::vector<float> l(N,-1.0f); l[0]=+0.0f; l[256]=-0.0f; run(l,"+0 then -0"); }
     printf("%d cases, worst |idx - lowest| = %.0f -> %s\n", cases, worst_tie,
            worst_tie==0.0?"PASS":"FAIL");
     return worst_tie==0.0?0:1;
