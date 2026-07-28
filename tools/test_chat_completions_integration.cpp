@@ -66,6 +66,7 @@ struct FakeEngine {
     };
     q27k::SampleParams samp;
     int max_ctx = 100000;
+    int pfx_sys_len = 0;
     int ctx_round_reserve() const { return 8; }
     std::function<bool()> on_round_gap;
     std::function<void(int)> on_pending;
@@ -144,6 +145,8 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
     std::mutex route_m;
     void* conductor = nullptr; // always null: only the non-conductor branches execute
     q27::GpuGate gpu_gate; // real type (api_common.h, CUDA-free) -- Lease is RAII-only here
+    const bool req_think = true;
+    struct DisabledPrefixCache { bool enabled() const { return false; } } pfx_cache;
 
     auto ms_since = [](std::chrono::steady_clock::time_point t) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t)
@@ -193,37 +196,46 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
         if (body.contains("messages")) {
             std::vector<std::pair<std::string, std::string>> msgs;
             for (auto& m : body["messages"]) {
+                // is_object() BEFORE any value() call: value() on a non-object
+                // element throws 306 -> httplib 500 (same ordering fix as
+                // anthropic_msgs).
+                if (!m.is_object()) continue;
                 std::string role = m.value("role", "user");
                 std::string content;
                 // const operator[] on a missing key aborts (json.hpp assertion) --
                 // a content-less message must not kill the server (Security #1;
                 // mirrors the Anthropic-path guard in api_common.h).
-                if (m.is_object() && m.contains("content")) {
+                if (m.contains("content")) {
                     if (m["content"].is_string()) content = m["content"];
                     else if (m["content"].is_array())
                         for (auto& part : m["content"])
-                            if (part.value("type", "") == "text")
+                            if (part.is_object() && part.value("type", "") == "text")
                                 content += part.value("text", "");
                 }
                 msgs.push_back({role, content});
             }
-            // enable_thinking=false: top-level (Qwen-style clients) or nested
-            // chat_template_kwargs (llama.cpp/GLM-style) -> empty-think prefill
-            bool think = body.value("enable_thinking", true);
-            if (body.contains("chat_template_kwargs"))
-                think = body["chat_template_kwargs"].value("enable_thinking", think);
-            if (no_think_srv) think = false;
+            // Per-request thinking: the server profile is the default, an
+            // explicit enable_thinking / chat_template_kwargs / Anthropic
+            // thinking field overrides it either way (resolve_think in
+            // api_common.h). Silent request on a no-think server -> no-think.
+            bool think = q27::resolve_think(body, !no_think_srv, req_think);
             return tok.apply_chat_template(msgs, think);
         }
-        return tok.encode(body.value("prompt", std::string()));
+        return tok.encode(q27::jstr(body, "prompt"));
     };
 
     auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
-        int n_max = body.value("max_tokens", 256);
-        bool stream = body.value("stream", false);
+        // Default when the client omits max_tokens: a generous floor, unified
+        // across all three API shapes. Clamped to the context window below, so a
+        // big default can't over-reserve; 8192 covers a real answer plus a short
+        // think trace. A long *thinking* request should still set max_tokens
+        // explicitly (a grad-level trace wants 16K+). jint/jbool: a
+        // present-but-null field reads as absent (see parse_sample).
+        int n_max = (int)q27::jint(body, "max_tokens", 8192);
+        bool stream = q27::jbool(body, "stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the
         // usage totals -- goes out after the finish_reason chunk, before
@@ -245,29 +257,41 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
         q27::ToolChoice tchoice;
         std::vector<std::string> tool_names_v;
         if (routed_chat) {
-            tchoice = q27::parse_tool_choice(body);
-            tools = tchoice.mode == q27::ToolChoice::NONE ? json::array() : q27::openai_tools_json(body);
-            if (constrain_tools && tools.is_array())
-                for (auto& t : tools)
-                    if (t.contains("function") && t["function"].contains("name"))
-                        tool_names_v.push_back(t["function"]["name"].get<std::string>());
-            // named-forced tool_choice restricts the grammar to that one name;
-            // "required" (no name) leaves every registered tool eligible.
-            if (tchoice.mode == q27::ToolChoice::FORCED && !tchoice.forced_name.empty())
-                tool_names_v = {tchoice.forced_name};
+            try {
+                tchoice = q27::parse_tool_choice(body);
+                q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
+                tools=std::move(selected.tools);
+                tool_names_v=std::move(selected.names);
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(json{{"error",{{"message",e.what()},
+                                                 {"type","invalid_request_error"}}}}.dump(),
+                                "application/json");
+                return;
+            }
         }
+        const std::set<std::string> allowed_tool_names(tool_names_v.begin(),tool_names_v.end());
         long rid = req_counter++;
         auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt;
         int stable_len = -1; // -1 = legacy tail snapshot (build_prompt's fallback path)
+        int sys_len = 0;     // P16b: system-block tokens (0 = none/feature off)
+        bool thinking = false; // request wants a real <think> block; seeds the splitter below
         if (routed_chat) {
-            bool think = body.value("enable_thinking", true);
-            if (body.contains("chat_template_kwargs"))
-                think = body["chat_template_kwargs"].value("enable_thinking", think);
-            if (no_think_srv) think = false;
-            size_t stable_off = 0;
+            thinking = q27::resolve_think(body, !no_think_srv, req_think);
+            // thinking and a FORCED tool call are mutually exclusive: FORCED
+            // injects <tool_call>\n into the tail (below), leaving no room for a
+            // think block, so suppress the opener when a tool is forced.
+            if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
+            size_t stable_off = 0, sys_off = 0;
             std::string rendered =
-                q27::chatml_prompt(q27::openai_msgs(body), tools, think, &stable_off);
+                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off);
+            // P16b: token length of the system+tools block. Measured with a
+            // THIRD encode used only for its length -- the prompt itself is
+            // still built from the same two pieces, so no request's bytes
+            // change when the cache is on.
+            if (pfx_cache.enabled() && sys_off > 0)
+                sys_len = (int)tok.encode(rendered.substr(0, sys_off)).size();
             // FORCED tool_choice: inject the opener into the volatile tail
             // (past stable_off, alongside the assistant-open/think-prefill --
             // P8 prefix-cache reuse is unaffected). The stream router below
@@ -316,7 +340,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
         // Q27_SAMPLED=0 preflight: the sampled graphs were never captured.
         // (Q27_FORCE_TEMP>0 is a boot-time FATAL on such boots, so the
         // request-absent default here is genuinely greedy.)
-        if (!sampled_on && body.value("temperature", 0.0) > 0.0) {
+        if (!sampled_on && q27::jnum(body, "temperature", 0.0) > 0.0) {
             res.status = 400;
             res.set_content(json{{"error",
                                   {{"message", "sampling disabled: server booted with "
@@ -342,6 +366,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                                   // are never set on that path, so the clear
                                   // on scope-exit is a no-op (P15 M1 pattern)
             eng.samp = parse_sample(body);
+            eng.pfx_sys_len = sys_len; // P16b (0 on paths with no system boundary)
             // Q27_BATCH: solo keeps the whole-call lease; batch mode scopes
             // its prefill lease inside batch_generate (A7) and re-stamps qw.
             std::optional<q27::GpuGate::Lease> lk;
@@ -425,6 +450,11 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
             // so the splitter must start already inside the TOOL channel or
             // the call body would be read back as ordinary text.
             if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
+            // thinking: the <think> opener was prompt-injected (not generated), so
+            // start the splitter INSIDE the THINK channel -- the model's first
+            // generated token is already inside the block, and its </think> flips
+            // back to text (same mechanism as the FORCED TOOL pre-seed above).
+            else if (thinking) sp.chan = StreamSplitter::THINK;
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             if (tc.enabled)
@@ -476,10 +506,23 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                     for (auto& bc : bcs) calls.push_back(bc);
                 }
             }
-            bool any_call = false;
-            for (auto& c : calls)
-                if (c.ok) any_call = true;
-            json msg = q27::openai_chat_message_json(tx, calls, rid, q27::strip_ws2(think));
+            std::vector<q27::ToolCall> eligible_calls;
+            for (auto& c : calls) {
+                if (c.ok && allowed_tool_names.count(c.name))
+                    eligible_calls.push_back(std::move(c));
+                else if (c.ok)
+                    tx += (tx.empty() ? "" : "\n") + c.raw;
+            }
+            const bool any_call = !eligible_calls.empty();
+            if (tchoice.mode == q27::ToolChoice::FORCED && !any_call && n < n_max) {
+                res.status = 500;
+                res.set_content(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
+                                                 {"type","api_error"}}}}.dump(),
+                                "application/json");
+                return;
+            }
+            json msg = q27::openai_chat_message_json(tx, eligible_calls, rid,
+                                                      q27::strip_ws2(think));
             json choice = {{"index", 0},
                           {"finish_reason", any_call ? "tool_calls" : (n >= n_max ? "length" : "stop")},
                           {"message", msg}};
@@ -498,13 +541,21 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
+            // EVERY handler local this lambda reads must be captured BY VALUE:
+            // httplib runs the provider from write_response(), long after this
+            // handler's frame is dead (routing() and write_response() are
+            // sibling calls in Server::process_request). `thinking` shipped as
+            // a by-reference read of that dead frame from 2026-07-20 until the
+            // 07-24 audit -- benign only by stack-layout luck.
             [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
-             tools, tool_names_v, tchoice, stable_len, has_tools, rid](size_t, httplib::DataSink& sink) {
+             tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
+             thinking, sys_len](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // see the non-stream twin
                 eng.samp = samp;
+                eng.pfx_sys_len = sys_len; // P16b
                 std::optional<q27::GpuGate::Lease> lk; // see the non-stream twin
                 if (!conductor) lk.emplace(gpu_gate);
                 double qw = ms_since(rt.t0);
@@ -581,6 +632,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                 tc.begin(tool_names_v);
                 StreamSplitter sp;
                 if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
+                else if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 q27::Utf8Gate ugate;
                 bool alive = true; // cleared when a write fails (client disconnected)
                 int tool_idx = 0;
@@ -589,7 +641,8 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                 auto emit_tool = [&]() {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
-                    if (!c.ok) { // malformed: surface as text so nothing is lost
+                    if (!c.ok || !allowed_tool_names.count(c.name)) {
+                        // Malformed or undeclared calls remain ordinary model text.
                         if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                            json{{"content", c.raw}})))
                             alive = false;
@@ -659,8 +712,9 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                         fprintf(stderr,
                                 "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
                                 bcs.size());
-                        any_call = true;
                         for (auto& bc : bcs) {
+                            if (!allowed_tool_names.count(bc.name)) continue;
+                            any_call = true;
                             std::string tid = "call_q27_" + std::to_string(rid) + "_" +
                                               std::to_string(tool_idx);
                             bool ok = send(q27::openai_stream_chunk(
@@ -676,6 +730,14 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                 // above); end=error lands in the [req] line, [req-error]
                 // carries the what() (batch_generate logs it unconditionally
                 // when err_out is null, same as that leg's nullptr err_out).
+                if (tchoice.mode == q27::ToolChoice::FORCED && !any_call && produced < nm) {
+                    send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
+                                         {"type","api_error"}}}});
+                    std::string done = "data: [DONE]\n\n";
+                    sink.write(done.data(), done.size());
+                    sink.done();
+                    return true;
+                }
                 {
                     const char* fr = any_call ? "tool_calls" : (produced >= nm ? "length" : "stop");
                     send(q27::openai_stream_chunk(cid, objd, created, served_name,
@@ -809,7 +871,7 @@ int main() {
         std::vector<std::string> vb = tok.pieces;
         auto cache = fresh_cache(vb);
         auto slots = fresh_slots();
-        slots[0].eng->script = {1, 2, 3, 4};
+        slots[0].eng->script = {2, 3, 4}; // prompt already injected <think>
         std::atomic<long> rc{0};
         json body = {
             {"tools", json::array({
@@ -1008,7 +1070,7 @@ int main() {
         std::vector<std::string> vb = tok.pieces;
         auto cache = fresh_cache(vb);
         auto slots = fresh_slots();
-        slots[0].eng->script = {1, 2, 3, 4};
+        slots[0].eng->script = {2, 3, 4}; // prompt already injected <think>
         std::atomic<long> rc{0};
         json body = {
             {"stream", true},
@@ -1063,6 +1125,67 @@ int main() {
         CHECK(!msg.contains("tool_calls"));
         CHECK(msg["content"].get<std::string>().find("not valid json at all") != std::string::npos);
         CHECK(g_last_response["choices"][0]["finish_reason"] == "stop");
+    }
+
+    // ---- Test 10: allowed_tools filters streamed wrapped calls. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            /*0*/ "<eos>",
+            /*1*/ "<tool_call>\n{\"name\":\"privileged\",\"arguments\":{}}\n</tool_call>",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1};
+        std::atomic<long> rc{0};
+        json declared=json::array({
+            {{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","privileged"},{"parameters",json::object()}}}}
+        });
+        json allowed=json::array({
+            {{"type","function"},{"function",{{"name","safe"}}}}
+        });
+        json body = {
+            {"stream",true}, {"tools",declared},
+            {"tool_choice",{{"type","allowed_tools"},
+                {"allowed_tools",{{"mode","auto"},{"tools",allowed}}}}},
+            {"messages",json::array({{{"role","user"},{"content","run safe"}}})},
+        };
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        bool saw_tool=false, saw_raw=false, saw_stop=false;
+        for (auto& ev : g_sse_events) {
+            if (!ev.contains("choices") || ev["choices"].empty()) continue;
+            auto& choice=ev["choices"][0];
+            if (choice["delta"].contains("tool_calls")) saw_tool=true;
+            if (choice["delta"].contains("content") &&
+                choice["delta"]["content"].get<std::string>().find("privileged")!=std::string::npos)
+                saw_raw=true;
+            if (choice["finish_reason"] == "stop") saw_stop=true;
+        }
+        CHECK(!saw_tool);
+        CHECK(saw_raw);
+        CHECK(saw_stop);
+    }
+
+    // ---- Test 11: invalid named choice is a non-retryable client error. ----
+    {
+        FakeTok tok;
+        tok.pieces = {"<eos>"};
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        std::atomic<long> rc{0};
+        json body = {
+            {"tools",json::array({
+                {{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}}
+            })},
+            {"tool_choice",{{"type","function"},{"function",{{"name","missing"}}}}},
+            {"messages",json::array({{{"role","user"},{"content","run"}}})},
+        };
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        CHECK(g_last_response["__status"] == 400);
+        CHECK(g_last_response["error"]["type"] == "invalid_request_error");
     }
 
     fprintf(stderr, failures ? "%d FAILURE(S)\n" : "all integration tests passed\n", failures);

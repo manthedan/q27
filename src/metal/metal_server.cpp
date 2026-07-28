@@ -424,10 +424,10 @@ uint32_t max_prompt_tokens(uint32_t context,uint32_t mtp_width,uint32_t suffix_w
 
 // Tool names for constrained decoding: OpenAI shape (tools[].function.name)
 // and Anthropic shape (tools[].name) both accepted.
-std::vector<std::string> tool_names_from(const json& body) {
+std::vector<std::string> tool_names_from_array(const json& tools) {
     std::vector<std::string> names;
-    if(!body.contains("tools") || !body["tools"].is_array()) return names;
-    for(const auto& t:body["tools"]) {
+    if(!tools.is_array()) return names;
+    for(const auto& t:tools) {
         if(!t.is_object()) continue;
         if(t.contains("function") && t["function"].is_object() && t["function"].contains("name"))
             names.push_back(q27::jstr(t["function"],"name"));
@@ -436,6 +436,12 @@ std::vector<std::string> tool_names_from(const json& body) {
     names.erase(std::remove(names.begin(),names.end(),std::string()),names.end());
     return names;
 }
+
+std::vector<std::string> tool_names_from(const json& body) {
+    if(!body.contains("tools")) return {};
+    return tool_names_from_array(body["tools"]);
+}
+
 
 // OpenAI `stop` (string or array of strings) / Anthropic `stop_sequences`
 // (array). Empty strings are dropped -- they would match at every position.
@@ -1458,6 +1464,10 @@ struct Runtime {
                     if(hit==prompt.size()) { pending=engine.pending_from_logits(); restored=true; }
                     snapstore.hits++;
                 } catch(const std::exception&) {
+                    // Command failures poison the shared backend, not the
+                    // snapshot. Let guard_engine rebuild the backend and keep
+                    // the valid disk entry for the retry.
+                    if(!shared->backend.healthy()) throw;
                     // A shallow-header candidate that fails the engine's full
                     // load is unusable. Remove it so the same token key can
                     // self-heal instead of failing every request or blocking
@@ -2505,12 +2515,15 @@ int main(int argc,char** argv) {
                     const std::string api=q27::jstr(envelope,"api");
                     json tools=json::array();
                     std::vector<q27::Msg> messages;
-                    bool think=true;
+                    bool think=true,force_tool=false;
                     if(api=="chat" || api=="chat_completions") {
                         messages=openai_msgs(request);
-                        if(request.contains("tools") && request["tools"].is_array())
-                            tools=request["tools"];
+                        const q27::ToolChoice tchoice=q27::parse_tool_choice(request);
+                        q27::OpenAIToolSelection selected=q27::select_openai_tools(request,tchoice);
+                        tools=std::move(selected.tools);
+                        force_tool=tchoice.mode==q27::ToolChoice::FORCED;
                         think=q27::resolve_think(request,think_default,req_think);
+                        if(force_tool) think=false;
                     } else if(api=="responses") {
                         ResponsesPromptInput normalized=responses_prompt_input(request);
                         tools=std::move(normalized.tools);
@@ -2531,6 +2544,7 @@ int main(int argc,char** argv) {
                     std::string full_rendered;
                     const std::string prefix_rendered=q27::initial_harness_prefix(
                         messages,tools,think,&full_rendered);
+                    if(force_tool) full_rendered+="<tool_call>\n";
                     auto prefix_ids=to_u32(runtime.tokenizer.encode(prefix_rendered));
                     const auto full_ids=to_u32(runtime.tokenizer.encode(full_rendered));
                     if(prefix_ids.empty() || prefix_ids.size()>=full_ids.size() ||
@@ -2692,9 +2706,16 @@ int main(int argc,char** argv) {
         // convention) instead of leaking raw into content.
         server.Post("/v1/chat/completions",guarded("chat",[&](const json& body,httplib::Response& r,socket_t sock){
             bool think_req=q27::resolve_think(body,think_default,req_think);
-            const json tools=body.contains("tools") && body["tools"].is_array()
-                                 ?body["tools"]:json::array();
-            const std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req);
+            const q27::ToolChoice tchoice=q27::parse_tool_choice(body);
+            q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
+            const json tools=std::move(selected.tools);
+            const std::vector<std::string> declared_tool_names=std::move(selected.names);
+            const std::unordered_set<std::string> allowed_tool_names(
+                declared_tool_names.begin(),declared_tool_names.end());
+            const bool has_tools=!tools.empty();
+            if(tchoice.mode==q27::ToolChoice::FORCED) think_req=false;
+            std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req);
+            if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
@@ -2713,8 +2734,7 @@ int main(int argc,char** argv) {
                     {"type","invalid_request_error"},{"code","context_length_exceeded"}}}},400);
                 return;
             }
-            const bool has_tools=!tools.empty();
-            const std::vector<std::string> tnames=tool_names_from(body);
+            const std::vector<std::string> tnames=declared_tool_names;
             const bool snap_hint=q27::jbool(body,"snapshot",false);
             if(runtime.trace.enabled())
                 runtime.trace.event({{"kind","request"},{"api","chat"},{"id",id},
@@ -2725,14 +2745,16 @@ int main(int argc,char** argv) {
                     {"snapshot",snap_hint},{"token_head",trace_token_head(ids)},{"rendered",trace_text(rendered)}});
             if(!wants_stream(body)) {
                 q27::StreamSplitter sp;
-                // think=true renders an OPEN think tag: the first generated
-                // token is already inside the block, so pre-seed the channel
-                // (upstream fee3b27; mirrors the FORCED tool_choice pre-seed).
-                if(think_req) sp.chan=q27::StreamSplitter::THINK;
+                if(tchoice.mode==q27::ToolChoice::FORCED) sp.chan=q27::StreamSplitter::TOOL;
+                else if(think_req) sp.chan=q27::StreamSplitter::THINK;
                 std::string think_buf,text,tool_buf;
                 std::vector<q27::ToolCall> calls;
                 auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
-                    if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
+                    if(ch==q27::StreamSplitter::TOOL) {
+                        if(tchoice.mode==q27::ToolChoice::NONE) text+=t;
+                        else tool_buf+=t;
+                        return;
+                    }
                     if(!tool_buf.empty()) {
                         calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
                         tool_buf.clear();
@@ -2753,7 +2775,9 @@ int main(int argc,char** argv) {
                 // then the wrapper-less recovery chain runs over the text.
                 std::vector<q27::ToolCall> good;
                 for(auto& c:calls) {
-                    if(c.ok) good.push_back(std::move(c));
+                    if(c.ok && allowed_tool_names.count(c.name) &&
+                       (tchoice.forced_name.empty() || c.name==tchoice.forced_name))
+                        good.push_back(std::move(c));
                     else tx+=(tx.empty()?"":"\n")+c.raw;
                 }
                 if(has_tools) {
@@ -2761,10 +2785,21 @@ int main(int argc,char** argv) {
                     auto bcs=q27::parse_bare_tool_calls(
                         tx,&pre,&tools,outcome.finish!=Runtime::Finish::Length);
                     if(!bcs.empty()) {
-                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",bcs.size());
-                        runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",false},{"count",bcs.size()}});
                         tx=pre;
-                        for(auto& bc:bcs) good.push_back(std::move(bc));
+                        size_t recovered=0;
+                        for(auto& bc:bcs) {
+                            if(allowed_tool_names.count(bc.name) &&
+                               (tchoice.forced_name.empty() || bc.name==tchoice.forced_name)) {
+                                good.push_back(std::move(bc));
+                                recovered++;
+                            } else {
+                                tx+=(tx.empty()?"":"\n")+bc.raw;
+                            }
+                        }
+                        if(recovered) {
+                            fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",recovered);
+                            runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",false},{"count",recovered}});
+                        }
                     }
                 }
                 json tcs=json::array();
@@ -2777,6 +2812,9 @@ int main(int argc,char** argv) {
                               {"content",(!tcs.empty() && tx.empty())?json(nullptr):json(tx)}};
                 if(!th.empty()) message["reasoning_content"]=th;
                 if(!tcs.empty()) message["tool_calls"]=tcs;
+                if(tchoice.mode==q27::ToolChoice::FORCED && tcs.empty() &&
+                   outcome.finish!=Runtime::Finish::Length)
+                    throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                 const bool calls_complete=!tcs.empty() && outcome.finish!=Runtime::Finish::Length;
                 runtime.trace.event({{"kind","outcome"},{"api","chat"},{"id",id},
                     {"finish",calls_complete?"tool_calls":openai_finish(outcome.finish)},
@@ -2793,7 +2831,7 @@ int main(int argc,char** argv) {
             r.set_header("Content-Type","text/event-stream");
             auto stream_active=std::make_shared<Runtime::StreamScope>(runtime);
             r.set_chunked_content_provider("text/event-stream",
-                [&runtime,ids,n,sampling,stops,id,rid,created,tools,has_tools,tnames,snap_hint,sock,stream_active,think_req](size_t,httplib::DataSink& sink)->bool {
+                [&runtime,ids,n,sampling,stops,id,rid,created,tools,has_tools,tnames,allowed_tool_names,snap_hint,sock,stream_active,think_req,tchoice](size_t,httplib::DataSink& sink)->bool {
                     (void)stream_active;
                     bool alive=true;
                     auto last_wire=std::chrono::steady_clock::now();
@@ -2822,16 +2860,15 @@ int main(int argc,char** argv) {
                         // also the client-gone probe before generation starts.
                         if(!chunk({{"role","assistant"},{"content",""}},nullptr)) { sink.done(); return true; }
                         q27::StreamSplitter sp;
-                        if(think_req) sp.chan=q27::StreamSplitter::THINK;
+                        if(tchoice.mode==q27::ToolChoice::FORCED) sp.chan=q27::StreamSplitter::TOOL;
+                        else if(think_req) sp.chan=q27::StreamSplitter::THINK;
                         std::string tool_buf,text_accum;
                         int tool_counter=0;
-                        bool any_call=false,all_calls_clean=true;
-                        auto emit_tool=[&](){
-                            auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf));
-                            tool_buf.clear();
-                            if(!c.ok) { // malformed: surface as text so nothing is lost
-                                text_accum+=c.raw;
-                                chunk({{"content",c.raw}},nullptr);
+                        bool any_call=false,all_calls_clean=true,reject_stream_call=false;
+                        auto emit_call=[&](const q27::ToolCall& c,bool raw_already_streamed=false){
+                            if(!allowed_tool_names.count(c.name) ||
+                               (!tchoice.forced_name.empty() && c.name!=tchoice.forced_name)) {
+                                if(!raw_already_streamed) chunk({{"content",c.raw}},nullptr);
                                 return;
                             }
                             any_call=true;
@@ -2840,6 +2877,16 @@ int main(int argc,char** argv) {
                                 {"type","function"},
                                 {"function",{{"name",c.name},{"arguments",c.arguments.dump()}}}}})}},nullptr);
                             tool_counter++;
+                        };
+                        auto emit_tool=[&](){
+                            auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                            tool_buf.clear();
+                            if(!c.ok) { // malformed: surface as text so nothing is lost
+                                text_accum+=c.raw;
+                                chunk({{"content",c.raw}},nullptr);
+                                return;
+                            }
+                            emit_call(c);
                         };
                         // Incremental argument streaming (pre-registered
                         // 2026-07-17-incremental-tool-call-streaming.md):
@@ -2862,13 +2909,7 @@ int main(int argc,char** argv) {
                                 fprintf(stderr,"[tool-stream] %zu trailing call(s) recovered after streamed call\n",bcs.size());
                                 runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},
                                     {"stream",true},{"trailing",true},{"count",bcs.size()}});
-                                for(auto& bc:bcs) {
-                                    chunk({{"tool_calls",json::array({{{"index",tool_counter},
-                                        {"id","call_metal_"+runtime.boot_id+"_"+std::to_string(rid)+"_"+std::to_string(tool_counter)},
-                                        {"type","function"},
-                                        {"function",{{"name",bc.name},{"arguments",bc.arguments.dump()}}}}})}},nullptr);
-                                    tool_counter++;
-                                }
+                                for(const auto& bc:bcs) emit_call(bc);
                             } else if(pre.empty() && tr.find_first_not_of("}] \t\r\n")!=std::string::npos) {
                                 text_accum+=tr; chunk({{"content",tr}},nullptr);
                             }
@@ -2877,6 +2918,18 @@ int main(int argc,char** argv) {
                             if(!ts.active()) return;
                             std::string tail;
                             const bool clean=ts.finalize(&tail);
+                            if(reject_stream_call) {
+                                std::string rejected=ts.raw;
+                                const std::string trailing=ts.trail();
+                                if(!trailing.empty() && trailing.size()<=rejected.size() &&
+                                   rejected.compare(rejected.size()-trailing.size(),trailing.size(),trailing)==0)
+                                    rejected.resize(rejected.size()-trailing.size());
+                                if(!rejected.empty()) chunk({{"content",rejected}},nullptr);
+                                recover_trail(trailing,true);
+                                reject_stream_call=false;
+                                ts.reset();
+                                return;
+                            }
                             if(ts.invalid()) {
                                 // Streaming is irreversible: the opener and
                                 // prior argument deltas are already on wire.
@@ -2909,18 +2962,31 @@ int main(int argc,char** argv) {
                         };
                         auto emit_seg=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                             if(ch==q27::StreamSplitter::TOOL) {
+                                if(tchoice.mode==q27::ToolChoice::NONE) {
+                                    text_accum+=t;
+                                    chunk({{"content",t}},nullptr);
+                                    return;
+                                }
+                                if(!tchoice.forced_name.empty()) {
+                                    tool_buf+=t;
+                                    return;
+                                }
                                 bool opened=false;
                                 const std::string frag=ts.feed(t,&opened);
                                 if(opened) {
-                                    any_call=true;
-                                    chunk({{"tool_calls",json::array({{{"index",tool_counter},
-                                        {"id","call_metal_"+runtime.boot_id+"_"+std::to_string(rid)+"_"+std::to_string(tool_counter)},
-                                        {"type","function"},
-                                        {"function",{{"name",ts.name},{"arguments",""}}}}})}},nullptr);
+                                    reject_stream_call=!allowed_tool_names.count(ts.name);
+                                    if(!reject_stream_call) {
+                                        any_call=true;
+                                        chunk({{"tool_calls",json::array({{{"index",tool_counter},
+                                            {"id","call_metal_"+runtime.boot_id+"_"+std::to_string(rid)+"_"+std::to_string(tool_counter)},
+                                            {"type","function"},
+                                            {"function",{{"name",ts.name},{"arguments",""}}}}})}},nullptr);
+                                    }
                                 }
-                                tool_frag_chunk(frag);
+                                if(!reject_stream_call) tool_frag_chunk(frag);
                                 return;
                             }
+                            if(!tool_buf.empty()) emit_tool();
                             close_tool();
                             if(t.empty()) return;
                             if(ch==q27::StreamSplitter::THINK) chunk({{"reasoning_content",t}},nullptr);
@@ -2939,6 +3005,7 @@ int main(int argc,char** argv) {
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         for(auto& [ch,t]:sp.flush()) emit_seg(ch,t);
                         close_tool();               // wrapper never closed: finalize
+                        if(!tool_buf.empty()) emit_tool();
                         if(has_tools) {
                             // Wrapper-less recovery: the text already streamed
                             // as content deltas (cosmetic); the tool_calls
@@ -2950,15 +3017,13 @@ int main(int argc,char** argv) {
                                 fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat stream)\n",bcs.size());
                                 runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",true},{"count",bcs.size()}});
                             }
-                            for(auto& bc:bcs) {
-                                any_call=true;
-                                chunk({{"tool_calls",json::array({{{"index",tool_counter},
-                                    {"id","call_metal_"+runtime.boot_id+"_"+std::to_string(rid)+"_"+std::to_string(tool_counter)},
-                                    {"type","function"},
-                                    {"function",{{"name",bc.name},{"arguments",bc.arguments.dump()}}}}})}},nullptr);
-                                tool_counter++;
-                            }
+                            for(const auto& bc:bcs) emit_call(bc,true);
                         }
+                        if(tchoice.mode==q27::ToolChoice::FORCED &&
+                           (!any_call || !all_calls_clean) &&
+                           outcome.finish!=Runtime::Finish::Length)
+                            throw Runtime::EngineError(
+                                "model produced no eligible tool call for forced tool_choice");
                         const bool calls_complete=any_call && all_calls_clean &&
                             outcome.finish!=Runtime::Finish::Length;
                         chunk(json::object(),calls_complete?"tool_calls":openai_finish(outcome.finish));
@@ -3136,7 +3201,7 @@ int main(int argc,char** argv) {
                     // whole (start + one input_json_delta + stop) when a tool
                     // segment closes.
                     int block_counter=0,tool_counter=0,idx=-1,chan_open=-1;
-                    bool any=false,any_call=false;
+                    bool any=false,any_call=false,all_calls_clean=true;
                     q27::StreamSplitter sp;
                     if(think_req) sp.chan=q27::StreamSplitter::THINK;
                     std::string tool_buf,text_accum;
@@ -3225,6 +3290,7 @@ int main(int argc,char** argv) {
                         std::string tail;
                         const bool clean=ts.finalize(&tail);
                         if(ts.invalid()) {
+                            all_calls_clean=false;
                             // Streaming is irreversible: opener + prior arg
                             // deltas are already on wire; recover packed trail.
                             close_stream_block();
@@ -3233,8 +3299,10 @@ int main(int argc,char** argv) {
                             if(!tail.empty() && cur_tool_idx>=0)
                                 ev("content_block_delta",{{"type","content_block_delta"},{"index",cur_tool_idx},
                                     {"delta",{{"type","input_json_delta"},{"partial_json",tail}}}});
-                            if(!clean)
+                            if(!clean) {
+                                all_calls_clean=false;
                                 fprintf(stderr,"[tool-stream] streamed call closed unbalanced (production semantics, sent as-is)\n");
+                            }
                             close_stream_block();
                             recover_trail(ts.trail(),true);
                         } else {
@@ -3326,7 +3394,8 @@ int main(int argc,char** argv) {
                                 {"content_block",{{"type","text"},{"text",""}}}});
                         }
                         close_block();
-                        const bool calls_complete=any_call && outcome.finish!=Runtime::Finish::Length;
+                        const bool calls_complete=any_call && all_calls_clean &&
+                            outcome.finish!=Runtime::Finish::Length;
                         ev("message_delta",{{"type","message_delta"},
                             {"delta",{{"stop_reason",calls_complete?"tool_use":anthropic_stop(outcome.finish)},
                                       {"stop_sequence",outcome.finish==Runtime::Finish::StopSequence?json(outcome.stop_sequence):json(nullptr)}}},
@@ -3571,7 +3640,7 @@ int main(int argc,char** argv) {
                     int tool_counter=0,out_index=0,msg_index=-1;
                     int message_counter=0,reason_counter=0;
                     std::string think,text,tool_buf,bare_pending,active_msg_id;
-                    bool bare_holding=false;
+                    bool bare_holding=false,tool_calls_clean=true;
                     q27::StreamSplitter sp;
                     if(think_req) sp.chan=q27::StreamSplitter::THINK;
                         auto item_done=[&](const json& it){
@@ -3606,7 +3675,7 @@ int main(int argc,char** argv) {
                         };
                         auto flush_text=[&](bool incomplete_item=false){
                             if(msg_index<0) { text.clear(); return; }
-                            std::string tx=q27::strip_ws2(text); text.clear();
+                            std::string tx; tx.swap(text);
                             ev({{"type","response.output_text.done"},{"item_id",active_msg_id},
                                 {"output_index",msg_index},{"content_index",0},{"text",tx}});
                             ev({{"type","response.content_part.done"},{"item_id",active_msg_id},
@@ -3776,6 +3845,7 @@ int main(int argc,char** argv) {
                             std::string tail;
                             const bool clean=ts.finalize(&tail);
                             if(ts.invalid()) {
+                                tool_calls_clean=false;
                                 // Streaming is irreversible: added + arg deltas
                                 // already on wire. Close the item done with the
                                 // accumulated args so the lifecycle pairs, then
@@ -3790,10 +3860,12 @@ int main(int argc,char** argv) {
                                 recover_trail(ts.trail(),false);
                             } else if(ts.opened) {
                                 st_arg_delta(tail);
-                                if(!clean)
+                                if(!clean) {
+                                    tool_calls_clean=false;
                                     fprintf(stderr,"[tool-stream] streamed call closed unbalanced (production semantics, sent as-is)\n");
+                                }
                                 json it={{"type","function_call"},{"id",st_iid},{"call_id",st_cid},
-                                    {"status",incomplete_item?"incomplete":"completed"},
+                                    {"status",(incomplete_item || !clean)?"incomplete":"completed"},
                                     {"name",ts.name},{"arguments",st_acc}};
                                 ev({{"type","response.output_item.done"},{"output_index",st_idx},{"item",it}});
                                 items.push_back(it);
@@ -3932,22 +4004,32 @@ int main(int argc,char** argv) {
                         flush_think(incomplete);
                         flush_bare(true,incomplete);
                         flush_text(incomplete);
-                        const char* status=incomplete?"incomplete":"completed";
-                        runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},
-                            {"finish",status},{"terminal",trace_finish(outcome.finish)},
-                            {"prompt_tokens",outcome.prompt_tokens},
-                            {"output_tokens",outcome.output_tokens},{"prefix_hit",outcome.prefix_hit}});
-                        json response={{"id",resp_id},{"object","response"},{"status",status},
-                            {"output",items},
-                            {"usage",{{"input_tokens",outcome.prompt_tokens},
-                                      {"input_tokens_details",{{"cached_tokens",0}}},
-                                      {"output_tokens",outcome.output_tokens},
-                                      {"output_tokens_details",{{"reasoning_tokens",0}}},
-                                      {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}}};
-                        if(incomplete)
-                            response["incomplete_details"]={{"reason","max_output_tokens"}};
-                        ev({{"type",incomplete?"response.incomplete":"response.completed"},
-                            {"response",response}});
+                        if(!tool_calls_clean && !incomplete) {
+                            const char* message="model produced an incomplete tool call";
+                            runtime.trace.event({{"kind","error"},{"api","responses"},{"id",resp_id},
+                                {"status",500},{"type","invalid_model_output"},{"error",message}});
+                            ev({{"type","response.failed"},
+                                {"response",{{"id",resp_id},{"object","response"},{"status","failed"},
+                                    {"error",{{"code","invalid_model_output"},{"message",message}}},
+                                    {"output",items}}}});
+                        } else {
+                            const char* status=incomplete?"incomplete":"completed";
+                            runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},
+                                {"finish",status},{"terminal",trace_finish(outcome.finish)},
+                                {"prompt_tokens",outcome.prompt_tokens},
+                                {"output_tokens",outcome.output_tokens},{"prefix_hit",outcome.prefix_hit}});
+                            json response={{"id",resp_id},{"object","response"},{"status",status},
+                                {"output",items},
+                                {"usage",{{"input_tokens",outcome.prompt_tokens},
+                                          {"input_tokens_details",{{"cached_tokens",0}}},
+                                          {"output_tokens",outcome.output_tokens},
+                                          {"output_tokens_details",{{"reasoning_tokens",0}}},
+                                          {"total_tokens",outcome.prompt_tokens+outcome.output_tokens}}}};
+                            if(incomplete)
+                                response["incomplete_details"]={{"reason","max_output_tokens"}};
+                            ev({{"type",incomplete?"response.incomplete":"response.completed"},
+                                {"response",response}});
+                        }
                     } catch(const Runtime::ClientGone&) {
                         return false;
                     } catch(const Runtime::ServerOverloaded& e) {
@@ -3956,7 +4038,7 @@ int main(int argc,char** argv) {
                         ev({{"type","error"},{"error",{{"type","overloaded_error"},{"message",e.what()}}}});
                         ev({{"type","response.failed"},
                             {"response",{{"id",resp_id},{"object","response"},{"status","failed"},
-                                {"last_error",{{"code","overloaded_error"},{"message",e.what()}}},
+                                {"error",{{"code","overloaded_error"},{"message",e.what()}}},
                                 {"output",items}}}});
                     } catch(const std::exception& e) {
                         runtime.trace.event({{"kind","error"},{"api","responses"},{"id",resp_id},
@@ -3989,7 +4071,7 @@ int main(int argc,char** argv) {
                         ev({{"type","error"},{"error",{{"type","api_error"},{"message",e.what()}}}});
                         ev({{"type","response.failed"},
                             {"response",{{"id",resp_id},{"object","response"},{"status","failed"},
-                                {"last_error",{{"code","server_error"},{"message",e.what()}}},
+                                {"error",{{"code","server_error"},{"message",e.what()}}},
                                 {"output",items}}}});
                     }
                     sink.done();

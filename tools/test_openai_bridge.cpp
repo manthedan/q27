@@ -28,6 +28,12 @@ static void test_tools_passthrough() {
         {{"type", "web_search"}},                      // hosted type, not "function"
         {{"type", "function"}},                         // missing "function" key
         {{"type", "function"}, {"function", json::object()}}, // missing name
+        {{"type", nullptr}, {"function", {{"name", "null_type"}}}},
+        {{"type", "function"}, {"function", {{"name", "null_description"},
+            {"description", nullptr}}}},
+        {{"type", "function"}, {"function", {{"name", "bad_parameters"},
+            {"parameters", json::array()}}}},
+        {{"type", "function"}, {"function", {{"name", ""}}}},
     })}};
     json tools = q27::openai_tools_json(body);
     CHECK(tools.is_array());
@@ -290,6 +296,51 @@ static void test_tool_choice_named_function() {
     CHECK(tc.forced_name == "get_weather");
 }
 
+static void test_tool_choice_malformed_named_is_invalid() {
+    for (const json& value : json::array({
+             json{{"type","function"},{"function",json::object()}},
+             json{{"type","function"},{"function",{{"name",""}}}},
+             json{{"type",nullptr},{"function",{{"name","get_weather"}}}}
+         })) {
+        auto tc = q27::parse_tool_choice(json{{"tool_choice",value}});
+        CHECK(tc.mode == q27::ToolChoice::AUTO);
+        CHECK(tc.invalid);
+    }
+}
+
+static void test_tool_choice_allowed_tools() {
+    json tools=json::array({
+        {{"type","function"},{"function",{{"name","get_weather"}}}},
+        {{"type","function"},{"function",{{"name","get_time"}}}}
+    });
+    auto automatic=q27::parse_tool_choice({{"tool_choice",{{"type","allowed_tools"},
+        {"allowed_tools",{{"mode","auto"},{"tools",tools}}}}}});
+    CHECK(automatic.mode == q27::ToolChoice::AUTO);
+    CHECK(!automatic.invalid);
+    CHECK(automatic.allowed_names.size() == 2);
+    auto required=q27::parse_tool_choice({{"tool_choice",{{"type","allowed_tools"},
+        {"allowed_tools",{{"mode","required"},{"tools",tools}}}}}});
+    CHECK(required.mode == q27::ToolChoice::FORCED);
+    CHECK(!required.invalid);
+    CHECK(required.allowed_names.size() == 2);
+    json body={{"tools",json::array({
+        {{"type","function"},{"function",{{"name","get_weather"}}}},
+        {{"type","function"},{"function",{{"name","privileged"}}}},
+        {{"type","function"},{"function",{{"name","get_time"}}}}
+    })}};
+    auto selected=q27::select_openai_tools(body,required);
+    CHECK(selected.names.size() == 2);
+    CHECK(selected.names[0] == "get_weather");
+    CHECK(selected.names[1] == "get_time");
+    CHECK(selected.tools.size() == 2);
+    auto missing=q27::parse_tool_choice({{"tool_choice",{{"type","function"},
+        {"function",{{"name","missing"}}}}}});
+    bool threw=false;
+    try { (void)q27::select_openai_tools(body,missing); }
+    catch (const std::runtime_error&) { threw=true; }
+    CHECK(threw);
+}
+
 static void test_tool_choice_unknown_string_is_auto() {
     json body = {{"tool_choice", "auto"}};
     auto tc = q27::parse_tool_choice(body);
@@ -448,6 +499,8 @@ int main() {
     test_tool_choice_required();
     test_tool_choice_named_function();
     test_tool_choice_unknown_string_is_auto();
+    test_tool_choice_malformed_named_is_invalid();
+    test_tool_choice_allowed_tools();
     test_end_to_end_chatml_prompt();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();

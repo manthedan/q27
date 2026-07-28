@@ -472,14 +472,19 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
 inline json openai_tools_json(const json& body) {
     json out = json::array();
     if (body.contains("tools") && body["tools"].is_array())
-        for (auto& t : body["tools"]) {
-            if (!t.is_object() || t.value("type", "") != "function") continue;
+        for (const auto& t : body["tools"]) {
+            if (!t.is_object() || !t.contains("type") || !t["type"].is_string() ||
+                t["type"] != "function") continue;
             if (!t.contains("function") || !t["function"].is_object()) continue;
             const json& fn = t["function"];
-            if (!fn.contains("name") || !fn["name"].is_string()) continue;
+            if (!fn.contains("name") || !fn["name"].is_string() ||
+                fn["name"].get_ref<const std::string&>().empty()) continue;
+            if (fn.contains("description") && !fn["description"].is_string()) continue;
+            if (fn.contains("parameters") && !fn["parameters"].is_object()) continue;
             out.push_back({{"type", "function"},
                            {"function", {{"name", fn["name"]},
-                                         {"description", fn.value("description", "")},
+                                         {"description", fn.contains("description")
+                                                             ? fn["description"] : json("")},
                                          {"parameters", fn.contains("parameters")
                                                             ? fn["parameters"]
                                                             : json::object()}}}});
@@ -547,18 +552,14 @@ inline std::vector<Msg> openai_msgs(const json& body) {
     return msgs;
 }
 
-// tool_choice (OpenAI shape): "auto"/absent -> AUTO (unchanged behavior);
-// "none" -> NONE (tools stripped from the prompt entirely -- the model gets
-// no tool definitions and cannot call anything this turn); "required" or a
-// named {"type":"function","function":{"name":...}} -> FORCED. FORCED is a
-// soft force (prompt-injected <tool_call> opener + pre-seeded stream router,
-// see server.cu) -- it is NOT combined with --constrain-tools grammar
-// masking (documented limitation: the grammar's engage trigger scans
-// GENERATED text for the <tool_call> marker, which never appears in the
-// output when it was injected into the PROMPT instead).
+// tool_choice (OpenAI shape): "auto"/absent -> AUTO; "none" -> NONE;
+// "required", a named function, or allowed_tools mode:"required" -> FORCED.
+// allowed_tools mode:"auto" keeps AUTO while narrowing the eligible registry.
 struct ToolChoice {
     enum Mode { AUTO, NONE, FORCED } mode = AUTO;
-    std::string forced_name; // empty = any registered tool eligible
+    std::string forced_name; // non-empty only for a named function choice
+    std::vector<std::string> allowed_names; // empty = every declared tool
+    bool invalid = false;
 };
 inline ToolChoice parse_tool_choice(const json& body) {
     ToolChoice tc;
@@ -568,12 +569,89 @@ inline ToolChoice parse_tool_choice(const json& body) {
         if (v == "none") tc.mode = ToolChoice::NONE;
         else if (v == "required") tc.mode = ToolChoice::FORCED;
         // "auto" or any other/unknown string: default AUTO
-    } else if (v.is_object() && v.value("type", "") == "function" && v.contains("function") &&
-               v["function"].is_object()) {
-        tc.mode = ToolChoice::FORCED;
-        tc.forced_name = v["function"].value("name", std::string());
+        return tc;
     }
+    if (v.is_null()) return tc;
+    if (!v.is_object() || !v.contains("type") || !v["type"].is_string()) {
+        tc.invalid = true;
+        return tc;
+    }
+    if (v["type"] == "function") {
+        if (!v.contains("function") || !v["function"].is_object() ||
+            !v["function"].contains("name") || !v["function"]["name"].is_string() ||
+            v["function"]["name"].get_ref<const std::string&>().empty()) {
+            tc.invalid = true;
+            return tc;
+        }
+        tc.mode = ToolChoice::FORCED;
+        tc.forced_name = v["function"]["name"].get<std::string>();
+        tc.allowed_names.push_back(tc.forced_name);
+        return tc;
+    }
+    if (v["type"] == "allowed_tools") {
+        if (!v.contains("allowed_tools") || !v["allowed_tools"].is_object()) {
+            tc.invalid = true;
+            return tc;
+        }
+        const json& allowed = v["allowed_tools"];
+        if (!allowed.contains("mode") || !allowed["mode"].is_string() ||
+            (allowed["mode"] != "auto" && allowed["mode"] != "required") ||
+            !allowed.contains("tools") || !allowed["tools"].is_array()) {
+            tc.invalid = true;
+            return tc;
+        }
+        tc.mode = allowed["mode"] == "required" ? ToolChoice::FORCED : ToolChoice::AUTO;
+        for (const auto& tool : allowed["tools"]) {
+            if (!tool.is_object() || !tool.contains("type") || !tool["type"].is_string() ||
+                tool["type"] != "function" || !tool.contains("function") ||
+                !tool["function"].is_object() || !tool["function"].contains("name") ||
+                !tool["function"]["name"].is_string() ||
+                tool["function"]["name"].get_ref<const std::string&>().empty()) {
+                tc.invalid = true;
+                return tc;
+            }
+            const std::string name=tool["function"]["name"].get<std::string>();
+            if (std::find(tc.allowed_names.begin(),tc.allowed_names.end(),name)==tc.allowed_names.end())
+                tc.allowed_names.push_back(name);
+        }
+        if (tc.allowed_names.empty()) tc.invalid = true;
+        return tc;
+    }
+    tc.invalid = true;
     return tc;
+}
+
+struct OpenAIToolSelection {
+    json tools=json::array();
+    std::vector<std::string> names;
+};
+
+// Normalize the declared registry once, then apply tool_choice's eligible
+// subset. Both backends use this helper so prompt injection, grammar names,
+// fallback parsing, and output validation all share the same registry.
+inline OpenAIToolSelection select_openai_tools(const json& body,const ToolChoice& choice) {
+    if (choice.invalid) throw std::runtime_error("invalid object-form tool_choice");
+    OpenAIToolSelection selected;
+    if (choice.mode == ToolChoice::NONE) return selected;
+    selected.tools=openai_tools_json(body);
+    for (const auto& tool : selected.tools)
+        selected.names.push_back(tool["function"]["name"].get<std::string>());
+    if (!choice.allowed_names.empty()) {
+        const std::set<std::string> declared(selected.names.begin(),selected.names.end());
+        for (const auto& name : choice.allowed_names)
+            if (!declared.count(name))
+                throw std::runtime_error("tool_choice names a function not present in tools");
+        const std::set<std::string> allowed(choice.allowed_names.begin(),choice.allowed_names.end());
+        json filtered=json::array();
+        for (auto& tool : selected.tools)
+            if (allowed.count(tool["function"]["name"].get<std::string>()))
+                filtered.push_back(std::move(tool));
+        selected.tools=std::move(filtered);
+        selected.names=choice.allowed_names;
+    }
+    if (choice.mode == ToolChoice::FORCED && selected.names.empty())
+        throw std::runtime_error("tool_choice requires at least one valid function tool");
+    return selected;
 }
 
 // Parsed model tool call. `ok` false if the JSON was malformed (raw kept).

@@ -1235,17 +1235,20 @@ int main(int argc, char** argv) {
         q27::ToolChoice tchoice;
         std::vector<std::string> tool_names_v;
         if (routed_chat) {
-            tchoice = q27::parse_tool_choice(body);
-            tools = tchoice.mode == q27::ToolChoice::NONE ? json::array() : q27::openai_tools_json(body);
-            if (constrain_tools && tools.is_array())
-                for (auto& t : tools)
-                    if (t.contains("function") && t["function"].contains("name"))
-                        tool_names_v.push_back(t["function"]["name"].get<std::string>());
-            // named-forced tool_choice restricts the grammar to that one name;
-            // "required" (no name) leaves every registered tool eligible.
-            if (tchoice.mode == q27::ToolChoice::FORCED && !tchoice.forced_name.empty())
-                tool_names_v = {tchoice.forced_name};
+            try {
+                tchoice = q27::parse_tool_choice(body);
+                q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
+                tools=std::move(selected.tools);
+                tool_names_v=std::move(selected.names);
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(json{{"error",{{"message",e.what()},
+                                                 {"type","invalid_request_error"}}}}.dump(),
+                                "application/json");
+                return;
+            }
         }
+        const std::set<std::string> allowed_tool_names(tool_names_v.begin(),tool_names_v.end());
         long rid = req_counter++;
         auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt;
@@ -1481,10 +1484,23 @@ int main(int argc, char** argv) {
                     for (auto& bc : bcs) calls.push_back(bc);
                 }
             }
-            bool any_call = false;
-            for (auto& c : calls)
-                if (c.ok) any_call = true;
-            json msg = q27::openai_chat_message_json(tx, calls, rid, q27::strip_ws2(think));
+            std::vector<q27::ToolCall> eligible_calls;
+            for (auto& c : calls) {
+                if (c.ok && allowed_tool_names.count(c.name))
+                    eligible_calls.push_back(std::move(c));
+                else if (c.ok)
+                    tx += (tx.empty() ? "" : "\n") + c.raw;
+            }
+            const bool any_call = !eligible_calls.empty();
+            if (tchoice.mode == q27::ToolChoice::FORCED && !any_call && n < n_max) {
+                res.status = 500;
+                res.set_content(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
+                                                 {"type","api_error"}}}}.dump(),
+                                "application/json");
+                return;
+            }
+            json msg = q27::openai_chat_message_json(tx, eligible_calls, rid,
+                                                      q27::strip_ws2(think));
             json choice = {{"index", 0},
                           {"finish_reason", any_call ? "tool_calls" : (n >= n_max ? "length" : "stop")},
                           {"message", msg}};
@@ -1510,7 +1526,7 @@ int main(int argc, char** argv) {
             // a by-reference read of that dead frame from 2026-07-20 until the
             // 07-24 audit -- benign only by stack-layout luck.
             [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
-             tools, tool_names_v, tchoice, stable_len, has_tools, rid,
+             tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
              thinking, sys_len](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
@@ -1603,7 +1619,8 @@ int main(int argc, char** argv) {
                 auto emit_tool = [&]() {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
-                    if (!c.ok) { // malformed: surface as text so nothing is lost
+                    if (!c.ok || !allowed_tool_names.count(c.name)) {
+                        // Malformed or undeclared calls remain ordinary model text.
                         if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                            json{{"content", c.raw}})))
                             alive = false;
@@ -1673,8 +1690,9 @@ int main(int argc, char** argv) {
                         fprintf(stderr,
                                 "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
                                 bcs.size());
-                        any_call = true;
                         for (auto& bc : bcs) {
+                            if (!allowed_tool_names.count(bc.name)) continue;
+                            any_call = true;
                             std::string tid = "call_q27_" + std::to_string(rid) + "_" +
                                               std::to_string(tool_idx);
                             bool ok = send(q27::openai_stream_chunk(
@@ -1690,6 +1708,14 @@ int main(int argc, char** argv) {
                 // above); end=error lands in the [req] line, [req-error]
                 // carries the what() (batch_generate logs it unconditionally
                 // when err_out is null, same as that leg's nullptr err_out).
+                if (tchoice.mode == q27::ToolChoice::FORCED && !any_call && produced < nm) {
+                    send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
+                                         {"type","api_error"}}}});
+                    std::string done = "data: [DONE]\n\n";
+                    sink.write(done.data(), done.size());
+                    sink.done();
+                    return true;
+                }
                 {
                     const char* fr = any_call ? "tool_calls" : (produced >= nm ? "length" : "stop");
                     send(q27::openai_stream_chunk(cid, objd, created, served_name,
