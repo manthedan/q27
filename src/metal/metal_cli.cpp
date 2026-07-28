@@ -1429,10 +1429,12 @@ int main(int argc, char** argv) {
         if (!dump_token_ids.empty()) {
             FILE *f = fopen(dump_token_ids.c_str(), "w");
             if (!f) throw std::runtime_error("cannot open --dump-token-ids output file");
+            bool ok = true;
             for (size_t i = 0; i < generated.size(); i++)
-                fprintf(f, "%s%u", i ? " " : "", generated[i]);
-            fprintf(f, "\n");
-            fclose(f);
+                if (fprintf(f, "%s%u", i ? " " : "", generated[i]) < 0) { ok = false; break; }
+            if (ok && fprintf(f, "\n") < 0) ok = false;
+            if (fclose(f) != 0) ok = false;
+            if (!ok) throw std::runtime_error("cannot write --dump-token-ids output file");
         }
         std::vector<int> ids(generated.begin(), generated.end());
         printf("generated:%s\n", tokenizer.decode(ids).c_str());

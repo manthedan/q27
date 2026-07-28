@@ -992,6 +992,10 @@ void MetalBackend::abort_commands() noexcept {
     }
 }
 
+void MetalBackend::poison() noexcept {
+    impl_->poisoned = true;
+}
+
 void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
                           BackendBuffer& y) {
     if (!weight.data) throw std::runtime_error("q27 Metal: matvec weight has no data");

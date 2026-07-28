@@ -38,6 +38,9 @@ class MetalBackend final : public ComputeBackend {
     void begin_commands() override;
     void end_commands() override;
     void abort_commands() noexcept override;
+    // Mark the shared command queue unusable after host-side work fails
+    // following an already committed state mutation.
+    void poison() noexcept;
     void matvec(const BackendTensor& weight, const BackendBuffer& x,
                 BackendBuffer& y) override;
     void matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
