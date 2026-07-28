@@ -320,6 +320,15 @@ struct MetalBackend::Impl {
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
     bool batching = false;
+    // A failed committed command may already have mutated device state. The
+    // shared backend is then unrecoverable: every attached engine must be
+    // discarded and rebuilt from a fresh model mapping.
+    bool poisoned = false;
+
+    void require_healthy() const {
+        if (poisoned)
+            throw std::runtime_error("q27 Metal: backend is poisoned after a command failure; recreate the engine");
+    }
 
     // Model mappings that fit maxBufferLength are wrapped as a single
     // MTLBuffer (tensors bind at offsets), and on macOS 15+ that buffer joins
@@ -446,6 +455,7 @@ struct MetalBackend::Impl {
     MTLTimestamp calibration_cpu = 0, calibration_gpu = 0;
 
     void start_command(bool explicit_batch) {
+        require_healthy();
         if (encoder) throw std::runtime_error("q27 Metal: command batch already active");
         command = [queue commandBuffer];
         if (!command) throw std::runtime_error("q27 Metal: command creation failed");
@@ -493,6 +503,7 @@ struct MetalBackend::Impl {
         [command waitUntilCompleted];
         cpu_wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_start).count();
         if (command.status == MTLCommandBufferStatusError) {
+            poisoned = true;
             std::string message = std::string("q27 Metal: ") + label + " failed";
             if (command.error) message += ": " + std::string(command.error.localizedDescription.UTF8String);
             command = nil;
@@ -508,6 +519,7 @@ struct MetalBackend::Impl {
             return env && *env ? (long)strtoul(env, nullptr, 10) : 0;
         }();
         if (fail_finish > 0 && --fail_finish == 0) {
+            poisoned = true;
             std::string message = std::string("q27 Metal: ") + label + " failed (injected)";
             command = nil;
             batching = false;
@@ -775,6 +787,7 @@ uint32_t MetalBackend::gqa_block() const { return impl_->gqa_block; }
 uint32_t MetalBackend::gqa_threshold() const { return impl_->gqa_threshold; }
 
 std::shared_ptr<BackendBuffer> MetalBackend::allocate(uint64_t bytes) {
+    impl_->require_healthy();
     if (!bytes || bytes > (uint64_t)impl_->device.maxBufferLength ||
         bytes > (uint64_t)std::numeric_limits<NSUInteger>::max())
         throw std::runtime_error("q27 Metal: invalid buffer length");
@@ -785,6 +798,7 @@ std::shared_ptr<BackendBuffer> MetalBackend::allocate(uint64_t bytes) {
 }
 
 std::shared_ptr<BackendBuffer> MetalBackend::allocate_private(uint64_t bytes) {
+    impl_->require_healthy();
     if (!bytes || bytes > (uint64_t)impl_->device.maxBufferLength ||
         bytes > (uint64_t)std::numeric_limits<NSUInteger>::max())
         throw std::runtime_error("q27 Metal: invalid buffer length");
@@ -795,6 +809,7 @@ std::shared_ptr<BackendBuffer> MetalBackend::allocate_private(uint64_t bytes) {
 }
 
 void MetalBackend::write(BackendBuffer& dst, uint64_t offset, const void* src, uint64_t bytes) {
+    impl_->require_healthy();
     MetalBuffer& buffer = metal_buffer(dst);
     check_range(buffer.size(), offset, bytes, "write");
     if (bytes && !src) throw std::runtime_error("q27 Metal: null write source");
@@ -813,6 +828,7 @@ void MetalBackend::read(const BackendBuffer& src, uint64_t offset, void* dst, ui
 }
 
 void MetalBackend::zero(BackendBuffer& dst) {
+    impl_->require_healthy();
     MetalBuffer& buffer = metal_buffer(dst);
     if (impl_->batching) throw std::runtime_error("q27 Metal: cannot CPU-clear during command batch");
     std::memset(buffer.handle().contents, 0, (size_t)buffer.size());
@@ -2905,6 +2921,7 @@ void MetalBackend::nll_rows(const BackendBuffer& logits, const BackendBuffer& ta
 }
 
 void MetalBackend::synchronize() {
+    impl_->require_healthy();
     @autoreleasepool {
         if (impl_->batching)
             throw std::runtime_error("q27 Metal: end command batch before synchronizing");
@@ -2912,8 +2929,10 @@ void MetalBackend::synchronize() {
         if (!command) throw std::runtime_error("q27 Metal: command creation failed");
         [command commit];
         [command waitUntilCompleted];
-        if (command.status == MTLCommandBufferStatusError)
-            throw std::runtime_error("q27 Metal: synchronization failed");
+        if (command.status == MTLCommandBufferStatusError) {
+            impl_->poisoned = true;
+            throw std::runtime_error("q27 Metal: synchronization failed; recreate the engine");
+        }
     }
 }
 

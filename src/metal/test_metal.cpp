@@ -980,7 +980,7 @@ int test_profile_batch_overflow() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--postcommit-failure")
             return test_postcommit_failure();
