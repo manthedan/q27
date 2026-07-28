@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 int main(int argc, char** argv) {
@@ -50,7 +51,35 @@ int main(int argc, char** argv) {
         if (engine.position() != 1)
             throw std::runtime_error("serial constrained prefill did not advance");
 
-        std::puts("Metal constrained MTP contract: PASS");
+        // A mid-prefill snapshot deliberately marks its logits row stale.
+        // Loading it may resume ingestion, but must not derive a token until
+        // a successful forward pass replaces that row.
+        struct SnapshotFile {
+            std::string path;
+            ~SnapshotFile() { unlink(path.c_str()); }
+        } snapshot{"/private/tmp/q27-metal-stale-logits-" +
+                   std::to_string((long long)getpid()) + ".snap"};
+        unlink(snapshot.path.c_str());
+        const uint32_t snapshot_token = 1;
+        engine.save_state(snapshot.path, &snapshot_token, 1, false);
+        engine.reset();
+        (void)engine.load_state(snapshot.path);
+        bool stale_rejected = false;
+        try {
+            (void)engine.pending_from_logits();
+        } catch (const std::runtime_error& error) {
+            stale_rejected = std::string(error.what()).find("no resident logits") !=
+                             std::string::npos;
+        }
+        if (!stale_rejected) {
+            throw std::runtime_error("stale snapshot logits were accepted");
+        }
+        (void)engine.step(1);
+        if (engine.pending_from_logits() >= vocab) {
+            throw std::runtime_error("refreshed snapshot logits produced an invalid token");
+        }
+
+        std::puts("Metal constrained MTP and stale-snapshot contracts: PASS");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
