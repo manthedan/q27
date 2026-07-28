@@ -210,10 +210,15 @@ class DiskSnapshotStore {
     void reclaim_stale_temporaries_locked() {
         if(dir_.empty()) return;
         std::error_code ec;
+        const auto stale_before=std::filesystem::file_time_type::clock::now()-
+                                std::chrono::seconds(60);
         for(const auto& e:std::filesystem::directory_iterator(dir_,ec)) {
             const std::string name=e.path().filename().string();
             if(name.find(".q27snap.tmp.")==std::string::npos)
                 continue;
+            std::error_code time_ec;
+            const auto write_time=e.last_write_time(time_ec);
+            if(time_ec || write_time>stale_before) continue;
             const std::string path=e.path().string();
             const int fd=::open(path.c_str(),O_RDWR|O_NOFOLLOW|O_CLOEXEC);
             if(fd<0) continue;

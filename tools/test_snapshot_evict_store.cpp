@@ -199,15 +199,26 @@ int main() {
         { std::ofstream o(stale); o << "partial"; }
         const std::string old_tag=dir+"/old-artifact.q27snap.tmp.CCCCCC";
         { std::ofstream o(old_tag); o << "partial"; }
+        fs::last_write_time(stale,fs::file_time_type::clock::now()-std::chrono::seconds(120),ec);
+        fs::last_write_time(old_tag,fs::file_time_type::clock::now()-std::chrono::seconds(120),ec);
         DiskSnapshotStore store(&stub_peek,&stub_hash);
         store.init(dir,1024*1024,"t-",false);
         CHECK(!exists(stale),"crash-left snapshot temporary is reclaimed at startup");
         CHECK(!exists(old_tag),"stale temporary from an old artifact tag is reclaimed");
 
+        const std::string fresh=dir+"/t-fresh.q27snap.tmp.DDDDDD";
+        { std::ofstream o(fresh); o << "partial"; }
+        store.init(dir,1024*1024,"t-",false);
+        CHECK(exists(fresh),"fresh pre-lock snapshot temporary survives grace period");
+        fs::last_write_time(fresh,fs::file_time_type::clock::now()-std::chrono::seconds(120),ec);
+        (void)store.evict_past_budget();
+        CHECK(!exists(fresh),"aged pre-lock snapshot temporary is reclaimed");
+
         const std::string active=dir+"/t-active.q27snap.tmp.BBBBBB";
         const int fd=::open(active.c_str(),O_CREAT|O_RDWR|O_CLOEXEC,0600);
-        CHECK(fd>=0 && ::flock(fd,LOCK_EX|LOCK_NB)==0,
-              "active snapshot temporary fixture holds writer lock");
+        const bool locked=fd>=0 && ::flock(fd,LOCK_EX|LOCK_NB)==0;
+        fs::last_write_time(active,fs::file_time_type::clock::now()-std::chrono::seconds(120),ec);
+        CHECK(locked,"active snapshot temporary fixture holds writer lock");
         store.init(dir,1024*1024,"t-",false);
         CHECK(exists(active),"active snapshot temporary survives cleanup");
         if(fd>=0) { (void)::flock(fd,LOCK_UN); ::close(fd); }
