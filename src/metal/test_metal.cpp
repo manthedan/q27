@@ -896,10 +896,96 @@ int test_mixed_pair(q27::MetalBackend& backend) {
     return 0;
 }
 
+int test_postcommit_failure() {
+    setenv("Q27_METAL_FAIL_FINISH", "1", 1);
+    bool injected = false, refused_reuse = false;
+    {
+        q27::MetalBackend backend;
+        const uint32_t value = 0x12345678;
+        auto source = backend.allocate(sizeof(value));
+        auto destination = backend.allocate(sizeof(value));
+        backend.write(*source, 0, &value, sizeof(value));
+        try {
+            backend.begin_commands();
+            backend.copy(*source, 0, *destination, 0, sizeof(value));
+            backend.end_commands();
+        } catch (const std::runtime_error& error) {
+            injected = std::string(error.what()).find("failed (injected)") != std::string::npos;
+        }
+        try {
+            uint32_t ignored = 0;
+            backend.read(*destination, 0, &ignored, sizeof(ignored));
+        } catch (const std::runtime_error& error) {
+            refused_reuse = std::string(error.what()).find("recreate the engine") != std::string::npos;
+        }
+    }
+    unsetenv("Q27_METAL_FAIL_FINISH");
+    if (!injected || !refused_reuse) {
+        std::fprintf(stderr, "post-commit failure did not poison the backend\n");
+        return 1;
+    }
+
+    // Reconstructing the backend is the only recovery path.
+    q27::MetalBackend replacement;
+    const uint32_t value = 0x89abcdef, zero = 0;
+    auto source = replacement.allocate(sizeof(value));
+    auto destination = replacement.allocate(sizeof(value));
+    replacement.write(*source, 0, &value, sizeof(value));
+    replacement.write(*destination, 0, &zero, sizeof(zero));
+    replacement.copy(*source, 0, *destination, 0, sizeof(value));
+    uint32_t got = 0;
+    replacement.read(*destination, 0, &got, sizeof(got));
+    if (got != value) return 1;
+    std::puts("Metal post-commit poison: PASS");
+    return 0;
+}
+
+int test_profile_batch_overflow() {
+    setenv("Q27_METAL_PROFILE", "1", 1);
+    bool rejected = false;
+    {
+        q27::MetalBackend backend;
+        const uint32_t value = 0x13579bdf, zero = 0;
+        auto source = backend.allocate(sizeof(value));
+        auto destination = backend.allocate(sizeof(value));
+        backend.write(*source, 0, &value, sizeof(value));
+        backend.write(*destination, 0, &zero, sizeof(zero));
+        try {
+            backend.begin_commands();
+            for (uint32_t i = 0; i < 2049; i++)
+                backend.copy(*source, 0, *destination, 0, sizeof(value));
+            backend.end_commands();
+        } catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()).find("exceeds 2048 operations") !=
+                       std::string::npos;
+            backend.abort_commands();
+        }
+        uint32_t got = value;
+        backend.read(*destination, 0, &got, sizeof(got));
+        if (!rejected || got != zero) {
+            unsetenv("Q27_METAL_PROFILE");
+            std::fprintf(stderr, "profile overflow committed a partial explicit batch\n");
+            return 1;
+        }
+        backend.copy(*source, 0, *destination, 0, sizeof(value));
+        backend.read(*destination, 0, &got, sizeof(got));
+        if (got != value) {
+            unsetenv("Q27_METAL_PROFILE");
+            return 1;
+        }
+    }
+    unsetenv("Q27_METAL_PROFILE");
+    std::puts("Metal profiling batch overflow: PASS");
+    return 0;
+}
 } // namespace
 
 int main() {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--postcommit-failure")
+            return test_postcommit_failure();
+        if (argc == 2 && std::string(argv[1]) == "--profile-batch-overflow")
+            return test_profile_batch_overflow();
         q27::MetalBackend backend;
         printf("Metal device: %s\n", backend.name().c_str());
         printf("working set %.1f GiB, max buffer %.1f GiB, threadgroup memory %.1f KiB\n",

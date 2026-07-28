@@ -83,14 +83,15 @@ NSString* load_kernel_source() {
     NSMutableArray<NSString*>* candidates = [NSMutableArray array];
     if (const char* override_path = getenv("Q27_METAL_SOURCE"))
         [candidates addObject:[NSString stringWithUTF8String:override_path]];
-    [candidates addObject:@"src/metal/q27_kernels.metal"];
-    [candidates addObject:@"./src/metal/q27_kernels.metal"];
 #ifdef Q27_SHADER_PATH
-    // Installed-binary fallback (Homebrew packaging): the formula bakes its
-    // share-dir shader path at build time, so binaries work from any cwd.
-    // The relative candidates above still win inside a source checkout, and
-    // the ABI tag check below applies to every candidate equally.
+    // Installed binaries trust the share-dir shader baked in at build time.
+    // A source file in the process working directory must not override it;
+    // intentional overrides remain explicit through Q27_METAL_SOURCE.
     [candidates addObject:@Q27_SHADER_PATH];
+#else
+    // Source-tree builds have no installed path, so resolve beside the
+    // checkout they are normally launched from.
+    [candidates addObject:@"src/metal/q27_kernels.metal"];
 #endif
 
     for (NSString* path in candidates) {
@@ -115,8 +116,7 @@ NSString* load_kernel_source() {
                                      "\"; rebuild this binary against the current shader source");
         return source;
     }
-    throw std::runtime_error("q27 Metal: src/metal/q27_kernels.metal not found "
-                             "(set Q27_METAL_SOURCE)");
+    throw std::runtime_error("q27 Metal: shader source not found (set Q27_METAL_SOURCE)");
 }
 
 id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device, id<MTLLibrary> library,
@@ -463,11 +463,13 @@ struct MetalBackend::Impl {
         if (own_command) start_command(false);
         if (profile) {
             if (op_labels.size() >= kMaxProfiledOps) {
-                // Split the batch so the sample buffer never overflows; the
-                // queue preserves ordering across the two command buffers.
-                const bool was_batching = batching;
+                // Never partially commit a caller-owned explicit batch: its
+                // abort contract relies on every encoded mutation remaining
+                // uncommitted. Standalone commands may roll over safely.
+                if (batching)
+                    throw std::runtime_error("q27 Metal: profiled command batch exceeds 2048 operations");
                 finish_command("profiling split");
-                start_command(was_batching);
+                start_command(false);
             }
             if (encoder) { [encoder endEncoding]; encoder = nil; }
             MTLComputePassDescriptor* pass = [MTLComputePassDescriptor computePassDescriptor];

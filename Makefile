@@ -156,6 +156,8 @@ test-cpu: build/q27-metal-server
 
 test-metal: build/test_metal build/test_metal_ops build/test_metal_stream
 	./build/test_metal
+	./build/test_metal --postcommit-failure
+	./build/test_metal --profile-batch-overflow
 	./build/test_metal_ops
 	./build/test_metal_stream
 
@@ -426,3 +428,4 @@ build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+

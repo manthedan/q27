@@ -1630,6 +1630,7 @@ void MetalEngine::prefill_chunk(const uint32_t* tokens, uint32_t count) {
     chunk_forward(tokens, count);
     batch.finish();
     position_ += count;
+    logits_resident_ = false;
 }
 
 uint32_t MetalEngine::prefill(const std::vector<uint32_t>& prompt, bool warm_mtp) {
