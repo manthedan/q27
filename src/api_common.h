@@ -621,6 +621,72 @@ inline ToolChoice parse_tool_choice(const json& body) {
     return tc;
 }
 
+// Responses API names function/custom tools directly in object-form
+// tool_choice, unlike Chat Completions' nested `function.name` shape.
+// Normalize that wire form into ToolChoice so both APIs share selection and
+// output-validation semantics.
+inline ToolChoice parse_responses_tool_choice(const json& body) {
+    if (body.contains("tool_choice") && body["tool_choice"].is_string() &&
+        body["tool_choice"] != "auto" && body["tool_choice"] != "none" &&
+        body["tool_choice"] != "required") {
+        ToolChoice invalid;
+        invalid.invalid = true;
+        return invalid;
+    }
+    if (!body.contains("tool_choice") || !body["tool_choice"].is_object())
+        return parse_tool_choice(body);
+    json normalized = body;
+    const json& source = body["tool_choice"];
+    const std::string type = source.value("type", std::string());
+    if ((type == "function" || type == "custom") && source.contains("name")) {
+        normalized["tool_choice"] = {{"type","function"},
+                                     {"function",{{"name",source["name"]}}}};
+    } else if (type == "shell") {
+        // Shell is the one hosted Responses tool this bridge can represent:
+        // Codex's model-facing exec_command/write_stdin calls are mapped by
+        // the serving layer. Other hosted tools require dedicated output item
+        // types, so explicit selection remains invalid rather than degrading
+        // them into unusable function_call items.
+        normalized["tool_choice"] = {{"type","function"},
+                                     {"function",{{"name",type}}}};
+    } else if (type == "allowed_tools") {
+        json allowed;
+        if (source.contains("allowed_tools") && source["allowed_tools"].is_object())
+            allowed=source["allowed_tools"];
+        else {
+            if (source.contains("mode")) allowed["mode"]=source["mode"];
+            if (source.contains("tools")) allowed["tools"]=source["tools"];
+        }
+        if (allowed.contains("tools") && allowed["tools"].is_array()) {
+            json tools = json::array();
+            for (const auto& tool : allowed["tools"]) {
+                const std::string tool_type = tool.is_object()
+                    ? tool.value("type",std::string()) : std::string();
+                if (tool.is_object() && tool.contains("name") &&
+                    (tool_type == "function" || tool_type == "custom"))
+                    tools.push_back({{"type","function"},
+                                     {"function",{{"name",tool["name"]}}}});
+                else if (tool_type == "shell")
+                    tools.push_back({{"type","function"},
+                                     {"function",{{"name",tool_type}}}});
+                else tools.push_back(tool);
+            }
+            allowed["tools"] = std::move(tools);
+        }
+        normalized["tool_choice"] = {{"type","allowed_tools"},
+                                     {"allowed_tools",std::move(allowed)}};
+    }
+    return parse_tool_choice(normalized);
+}
+
+inline bool openai_stream_includes_usage(const json& body) {
+    if (!jbool(body,"stream",false) || !body.contains("stream_options") ||
+        !body["stream_options"].is_object()) return false;
+    const json& options=body["stream_options"];
+    return options.contains("include_usage") && options["include_usage"].is_boolean() &&
+           options["include_usage"].get<bool>();
+}
+
 struct OpenAIToolSelection {
     json tools=json::array();
     std::vector<std::string> names;

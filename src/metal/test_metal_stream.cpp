@@ -129,6 +129,15 @@ int test_sse_framing() {
     check(ftxt["choices"][0]["finish_reason"] == "length", "sse: final text finish_reason");
     check(ftxt["choices"][0]["text"] == "", "sse: final text empty");
 
+    json usage = q27::openai_stream_usage_chunk("chatcmpl-metal","chat.completion.chunk",
+                                                1700000000,"q27-metal",7,3);
+    check(usage["choices"].is_array() && usage["choices"].empty(),
+          "sse: usage chunk has empty choices");
+    check(usage["usage"]["prompt_tokens"] == 7 &&
+          usage["usage"]["completion_tokens"] == 3 &&
+          usage["usage"]["total_tokens"] == 10,
+          "sse: usage chunk totals");
+
     // Invalid UTF-8 must not throw through the serializer (replace backstop).
     std::string bad = q27::sse_data(q27::openai_stream_chunk(true, "id", "chat.completion.chunk",
                                                              0, "m", std::string("\xE2\x80")));

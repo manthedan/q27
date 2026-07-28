@@ -144,4 +144,17 @@ inline nlohmann::json openai_stream_final_chunk(bool chat, const std::string& id
                 {"model", model}, {"choices", json::array({choice})}};
 }
 
+inline nlohmann::json openai_stream_usage_chunk(const std::string& id,
+                                                const char* object,long created,
+                                                const std::string& model,
+                                                uint32_t prompt_tokens,
+                                                uint32_t completion_tokens) {
+    using nlohmann::json;
+    return json{{"id",id},{"object",object},{"created",created},{"model",model},
+                {"choices",json::array()},
+                {"usage",{{"prompt_tokens",prompt_tokens},
+                          {"completion_tokens",completion_tokens},
+                          {"total_tokens",prompt_tokens+completion_tokens}}}};
+}
+
 } // namespace q27

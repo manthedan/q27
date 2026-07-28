@@ -341,6 +341,65 @@ static void test_tool_choice_allowed_tools() {
     CHECK(threw);
 }
 
+static void test_responses_tool_choice_shapes() {
+    auto named=q27::parse_responses_tool_choice({{"tool_choice",{{"type","function"},{"name","get_weather"}}}});
+    CHECK(named.mode == q27::ToolChoice::FORCED);
+    CHECK(named.forced_name == "get_weather");
+    auto custom=q27::parse_responses_tool_choice({{"tool_choice",{{"type","custom"},{"name","shell"}}}});
+    CHECK(custom.mode == q27::ToolChoice::FORCED);
+    CHECK(custom.forced_name == "shell");
+    auto allowed=q27::parse_responses_tool_choice({{"tool_choice",{{"type","allowed_tools"},
+        {"mode","auto"},{"tools",json::array({
+            {{"type","function"},{"name","get_weather"}},
+            {{"type","custom"},{"name","shell"}}
+        })}}}});
+    CHECK(!allowed.invalid);
+    CHECK(allowed.mode == q27::ToolChoice::AUTO);
+    CHECK(allowed.allowed_names.size() == 2);
+    CHECK(allowed.allowed_names[0] == "get_weather");
+    CHECK(allowed.allowed_names[1] == "shell");
+    auto hosted=q27::parse_responses_tool_choice({{"tool_choice",{{"type","shell"}}}});
+    CHECK(!hosted.invalid);
+    CHECK(hosted.mode == q27::ToolChoice::FORCED);
+    CHECK(hosted.forced_name == "shell");
+    auto hosted_allowed=q27::parse_responses_tool_choice({{"tool_choice",{{"type","allowed_tools"},
+        {"mode","required"},{"tools",json::array({{{"type","shell"}}})}}}});
+    CHECK(!hosted_allowed.invalid);
+    CHECK(hosted_allowed.mode == q27::ToolChoice::FORCED);
+    CHECK(hosted_allowed.allowed_names.size() == 1);
+    CHECK(hosted_allowed.allowed_names[0] == "shell");
+    auto empty=q27::parse_responses_tool_choice({{"tool_choice",json::object()}});
+    CHECK(empty.invalid);
+    auto mcp=q27::parse_responses_tool_choice({{"tool_choice",{{"type","mcp"},
+        {"server_label","filesystem"},{"name","read_file"}}}});
+    CHECK(mcp.invalid);
+    auto mcp_allowed=q27::parse_responses_tool_choice({{"tool_choice",{{"type","allowed_tools"},
+        {"mode","auto"},{"tools",json::array({{{"type","mcp"},
+            {"server_label","filesystem"}}})}}}});
+    CHECK(mcp_allowed.invalid);
+    auto web_search=q27::parse_responses_tool_choice(
+        {{"tool_choice",{{"type","web_search_preview"}}}});
+    CHECK(web_search.invalid);
+    auto web_search_allowed=q27::parse_responses_tool_choice({{"tool_choice",{{"type","allowed_tools"},
+        {"mode","auto"},{"tools",json::array({{{"type","web_search_preview"}}})}}}});
+    CHECK(web_search_allowed.invalid);
+    auto unknown_string=q27::parse_responses_tool_choice({{"tool_choice","none "}});
+    CHECK(unknown_string.invalid);
+    auto malformed=q27::parse_responses_tool_choice({{"tool_choice",{{"type","function"},{"name",3}}}});
+    CHECK(malformed.invalid);
+}
+
+static void test_stream_options_include_usage() {
+    CHECK(q27::openai_stream_includes_usage({{"stream",true},
+        {"stream_options",{{"include_usage",true}}}}));
+    CHECK(!q27::openai_stream_includes_usage({{"stream",false},
+        {"stream_options",{{"include_usage",true}}}}));
+    CHECK(!q27::openai_stream_includes_usage({{"stream",true},
+        {"stream_options",{{"include_usage","yes"}}}}));
+    CHECK(!q27::openai_stream_includes_usage({{"stream",true},
+        {"stream_options",json::array()}}));
+}
+
 static void test_tool_choice_unknown_string_is_auto() {
     json body = {{"tool_choice", "auto"}};
     auto tc = q27::parse_tool_choice(body);
@@ -501,6 +560,8 @@ int main() {
     test_tool_choice_unknown_string_is_auto();
     test_tool_choice_malformed_named_is_invalid();
     test_tool_choice_allowed_tools();
+    test_responses_tool_choice_shapes();
+    test_stream_options_include_usage();
     test_end_to_end_chatml_prompt();
     test_chat_message_plain_text_no_calls();
     test_chat_message_empty_text_no_calls_is_empty_string_not_null();
