@@ -1794,6 +1794,8 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
                                 uint32_t width, uint32_t& live_width,
                                 std::vector<uint32_t>& committed) {
     if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (!has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (width < 2 || width > CHUNK_MAX)
@@ -1900,6 +1902,8 @@ uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uin
                                        std::vector<uint32_t>& committed) {
     validate_sampling(params);
     if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: sampled MTP is unmasked; tool constraints require serial decode");
     if (!has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use plain sampling");
     if (width < 2 || width > CHUNK_MAX)
@@ -2098,6 +2102,8 @@ void MetalEngine::oracle_round(const uint32_t* lanes, uint32_t live, bool last,
 
 uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint32_t width,
                                          uint32_t eos, const TokenSink& sink, StopCause& cause) {
+    if (active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     uint32_t emitted = 0;
     cause = StopCause::MaxTokens;
     // commit() streams one token through the sink, stopping on EOS or cancel.
@@ -2429,6 +2435,8 @@ uint32_t MetalEngine::stream_from_pending(uint32_t pending, uint32_t count, uint
                                           StopCause& cause) {
     last_spec_stats_={};
     if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (mtp_width && active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (mtp_width && !has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (mtp_width && (mtp_width < 2 || mtp_width > 12))
@@ -2456,6 +2464,8 @@ std::vector<uint32_t> MetalEngine::generate_from_pending(uint32_t pending, uint3
                                                           uint32_t mtp_width) {
     last_spec_stats_={};
     if (pending >= VOCAB) throw std::runtime_error("q27 Metal: pending token out of range");
+    if (mtp_width && active_mask_ >= 0)
+        throw std::runtime_error("q27 Metal: MTP is unmasked; tool constraints require serial decode");
     if (mtp_width && !has_mtp_)
         throw std::runtime_error("q27 Metal: artifact has no MTP layer; use --suffix drafting");
     if (mtp_width && (mtp_width < 2 || mtp_width > 12))
