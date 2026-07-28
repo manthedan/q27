@@ -461,10 +461,22 @@ static void test_responses_tool_choice_shapes() {
     CHECK(allowed.allowed_names[0] == "get_weather");
     CHECK(allowed.allowed_names[1] == "shell");
     auto hosted=q27::parse_responses_tool_choice({{"tool_choice",{{"type","shell"}}}});
-    CHECK(hosted.invalid);
+    CHECK(!hosted.invalid);
+    CHECK(hosted.mode == q27::ToolChoice::FORCED);
+    CHECK(hosted.forced_name == "shell");
+    const json shell_tools=q27::responses_shell_prompt_tools();
+    CHECK(shell_tools.is_array() && shell_tools.size()==2);
+    CHECK(shell_tools[0]["function"]["name"]=="exec_command");
+    CHECK(shell_tools[0]["function"]["parameters"]["required"]==json::array({"cmd"}));
+    CHECK(shell_tools[0]["function"]["parameters"]["properties"].contains("yield_time_ms"));
+    CHECK(shell_tools[1]["function"]["name"]=="write_stdin");
+    CHECK(shell_tools[1]["function"]["parameters"]["required"]==json::array({"session_id"}));
     auto hosted_allowed=q27::parse_responses_tool_choice({{"tool_choice",{{"type","allowed_tools"},
         {"mode","required"},{"tools",json::array({{{"type","shell"}}})}}}});
-    CHECK(hosted_allowed.invalid);
+    CHECK(!hosted_allowed.invalid);
+    CHECK(hosted_allowed.mode == q27::ToolChoice::FORCED);
+    CHECK(hosted_allowed.allowed_names.size() == 1);
+    CHECK(hosted_allowed.allowed_names[0] == "shell");
     auto empty=q27::parse_responses_tool_choice({{"tool_choice",json::object()}});
     CHECK(empty.invalid);
     auto mcp=q27::parse_responses_tool_choice({{"tool_choice",{{"type","mcp"},

@@ -692,6 +692,38 @@ inline ToolChoice parse_anthropic_tool_choice(const json& body) {
     return tc;
 }
 
+// Legacy Codex clients can advertise their locally executed shell capability
+// as the hosted Responses type `shell`, while still consuming ordinary
+// function_call items. Translate that compatibility form into the two
+// model-facing functions the client executes; true hosted execution remains
+// the client's responsibility, not this inference server's.
+inline json responses_shell_prompt_tools() {
+    return json::array({
+        {{"type","function"},{"function",{
+            {"name","exec_command"},
+            {"description","Runs a shell command and returns output or a session ID for ongoing interaction."},
+            {"parameters",{{"type","object"},{"properties",{
+                {"cmd",{{"type","string"},{"description","Shell command to execute."}}},
+                {"workdir",{{"type","string"},{"description","Working directory for the command."}}},
+                {"tty",{{"type","boolean"},{"description","Whether to allocate a PTY."}}},
+                {"yield_time_ms",{{"type","number"},{"description","Wait before yielding output."}}},
+                {"max_output_tokens",{{"type","number"},{"description","Output token budget."}}},
+                {"shell",{{"type","string"},{"description","Shell binary to launch."}}}
+            }},{"required",json::array({"cmd"})},{"additionalProperties",false}}}
+        }}},
+        {{"type","function"},{"function",{
+            {"name","write_stdin"},
+            {"description","Writes characters to an existing command session and returns recent output."},
+            {"parameters",{{"type","object"},{"properties",{
+                {"session_id",{{"type","number"},{"description","Identifier of the running command session."}}},
+                {"chars",{{"type","string"},{"description","Bytes to write; empty polls without writing."}}},
+                {"yield_time_ms",{{"type","number"},{"description","Wait before yielding output."}}},
+                {"max_output_tokens",{{"type","number"},{"description","Output token budget."}}}
+            }},{"required",json::array({"session_id"})},{"additionalProperties",false}}}
+        }}}
+    });
+}
+
 
 // Responses API names function/custom tools directly in object-form
 // tool_choice, unlike Chat Completions' nested `function.name` shape.
@@ -713,6 +745,9 @@ inline ToolChoice parse_responses_tool_choice(const json& body) {
     if ((type == "function" || type == "custom") && source.contains("name")) {
         normalized["tool_choice"] = {{"type","function"},
                                      {"function",{{"name",source["name"]}}}};
+    } else if (type == "shell") {
+        normalized["tool_choice"] = {{"type","function"},
+                                     {"function",{{"name",type}}}};
     } else if (type == "allowed_tools") {
         json allowed;
         if (source.contains("allowed_tools") && source["allowed_tools"].is_object())
@@ -730,6 +765,9 @@ inline ToolChoice parse_responses_tool_choice(const json& body) {
                     (tool_type == "function" || tool_type == "custom"))
                     tools.push_back({{"type","function"},
                                      {"function",{{"name",tool["name"]}}}});
+                else if (tool_type == "shell")
+                    tools.push_back({{"type","function"},
+                                     {"function",{{"name",tool_type}}}});
                 else tools.push_back(tool);
             }
             allowed["tools"] = std::move(tools);

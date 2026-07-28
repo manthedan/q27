@@ -348,11 +348,9 @@ bool responses_tool_allowed(const std::string& name,
 
 void add_responses_hosted_call_names(std::set<std::string>& names,
                                      const std::string& hosted_type) {
-    // Hosted Responses tools need dedicated input/output item types. None are
-    // currently serialized by this bridge; keep their names only for request
-    // validation until a complete wire implementation exists.
-    (void)names;
-    (void)hosted_type;
+    if(hosted_type!="shell") return;
+    names.insert("exec_command");
+    names.insert("write_stdin");
 }
 
 // Normalize the Responses request once for both ordinary serving and the
@@ -396,9 +394,10 @@ ResponsesPromptInput responses_prompt_input(const json& body) {
                                          {"required",json::array({"input"})}}}}}});
                 }
             } else if(!ty.empty()) {
-                if(ty=="shell")
-                    throw std::runtime_error("Responses hosted shell tools are unsupported");
                 hosted_names.insert(ty);
+                if(ty=="shell")
+                    for(auto tool:q27::responses_shell_prompt_tools())
+                        out.tools.push_back(std::move(tool));
             }
         }
     std::set<std::string> hosted_call_names;

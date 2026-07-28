@@ -138,6 +138,21 @@ def main():
         except urllib.error.HTTPError as error:
             return error.code, [json.loads(error.read())]
 
+    def request_hosted_shell():
+        payload = json.dumps({
+            "model": "q27", "input": "No output needed", "stream": False,
+            "max_output_tokens": 0, "tool_choice": "none",
+            "tools": [{"type": "shell"}],
+        }).encode()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/responses", data=payload,
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
     def request_anthropic_prewarm():
         anthropic_request = {
             "model": "q27", "system": "Stable system prompt",
@@ -199,6 +214,11 @@ def main():
             live_status != 200 or not live.get("q27_prefix_hit")):
         fail(f"Anthropic tool_choice prewarm mismatch: "
              f"{prewarm_status} {prewarm} / {live_status} {live}",
+             process, stderr_lines)
+
+    shell_status, shell_response = request_hosted_shell()
+    if shell_status != 200:
+        fail(f"hosted shell compatibility request failed: {shell_status} {shell_response}",
              process, stderr_lines)
 
     fallback_status, fallback_events = request_tool_fallback()
