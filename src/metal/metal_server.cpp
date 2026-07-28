@@ -348,13 +348,11 @@ bool responses_tool_allowed(const std::string& name,
 
 void add_responses_hosted_call_names(std::set<std::string>& names,
                                      const std::string& hosted_type) {
-    if(hosted_type!="shell") return;
-    // Codex exposes its hosted shell capability to the Responses server as
-    // type `shell`, while the model emits the client-side function names.
-    if(hosted_type=="shell") {
-        names.insert("exec_command");
-        names.insert("write_stdin");
-    }
+    // Hosted Responses tools need dedicated input/output item types. None are
+    // currently serialized by this bridge; keep their names only for request
+    // validation until a complete wire implementation exists.
+    (void)names;
+    (void)hosted_type;
 }
 
 // Normalize the Responses request once for both ordinary serving and the
@@ -398,10 +396,9 @@ ResponsesPromptInput responses_prompt_input(const json& body) {
                                          {"required",json::array({"input"})}}}}}});
                 }
             } else if(!ty.empty()) {
-                hosted_names.insert(ty);
                 if(ty=="shell")
-                    for(auto tool:q27::responses_shell_prompt_tools())
-                        out.tools.push_back(std::move(tool));
+                    throw std::runtime_error("Responses hosted shell tools are unsupported");
+                hosted_names.insert(ty);
             }
         }
     std::set<std::string> hosted_call_names;
@@ -2978,7 +2975,8 @@ int main(int argc,char** argv) {
                               {"content",(!tcs.empty() && tx.empty())?json(nullptr):json(tx)}};
                 if(!th.empty()) message["reasoning_content"]=th;
                 if(!tcs.empty()) message["tool_calls"]=tcs;
-                if(tchoice.mode==q27::ToolChoice::FORCED && tcs.empty())
+                if(q27::forced_tool_choice_missing_is_error(
+                       tchoice,!tcs.empty(),outcome.finish==Runtime::Finish::Length))
                     throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                 const bool calls_complete=!tcs.empty() && outcome.finish!=Runtime::Finish::Length;
                 runtime.trace.event({{"kind","outcome"},{"api","chat"},{"id",id},
@@ -3187,8 +3185,9 @@ int main(int argc,char** argv) {
                             }
                             for(const auto& bc:bcs) emit_call(bc,true);
                         }
-                        if(tchoice.mode==q27::ToolChoice::FORCED &&
-                           (!any_call || !all_calls_clean))
+                        if(q27::forced_tool_choice_missing_is_error(
+                               tchoice,any_call && all_calls_clean,
+                               outcome.finish==Runtime::Finish::Length))
                             throw Runtime::EngineError(
                                 "model produced no eligible tool call for forced tool_choice");
                         const bool calls_complete=any_call && all_calls_clean &&
@@ -3378,7 +3377,8 @@ int main(int argc,char** argv) {
                     content.push_back({{"type","tool_use"},
                         {"id","toolu_metal_"+runtime.boot_id+"_"+std::to_string(rid)+"_"+std::to_string(ci++)},
                         {"name",c.name},{"input",c.arguments}});
-                if(tchoice.mode==q27::ToolChoice::FORCED && !any_call)
+                if(q27::forced_tool_choice_missing_is_error(
+                       tchoice,any_call,outcome.finish==Runtime::Finish::Length))
                     throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                 const bool calls_complete=any_call && outcome.finish!=Runtime::Finish::Length;
                 json out={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
@@ -3636,8 +3636,9 @@ int main(int argc,char** argv) {
                                 }
                             }
                         }
-                        if(tchoice.mode==q27::ToolChoice::FORCED &&
-                           (!any_call || !all_calls_clean))
+                        if(q27::forced_tool_choice_missing_is_error(
+                               tchoice,any_call && all_calls_clean,
+                               outcome.finish==Runtime::Finish::Length))
                             throw Runtime::EngineError(
                                 "model produced no eligible tool call for forced tool_choice");
                         if(idx<0 && !any && !any_call) { // nothing at all: empty text block for validity
@@ -3859,7 +3860,8 @@ int main(int argc,char** argv) {
                 if(!tool_buf.empty()) flush_tool(true,incomplete);
                 flush_think(incomplete);
                 flush_text(true,incomplete);
-                if(tchoice.mode==q27::ToolChoice::FORCED && tool_counter==0)
+                if(q27::forced_tool_choice_missing_is_error(
+                       tchoice,tool_counter!=0,incomplete))
                     throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                 std::string all_text;
                 for(const auto& it:items)
@@ -4294,7 +4296,8 @@ int main(int argc,char** argv) {
                         flush_think(incomplete);
                         flush_bare(true,incomplete);
                         flush_text(incomplete);
-                        if(tchoice.mode==q27::ToolChoice::FORCED && tool_counter==0)
+                        if(q27::forced_tool_choice_missing_is_error(
+                               tchoice,tool_counter!=0,incomplete))
                             throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                         if(!tool_calls_clean && !incomplete) {
                             const char* message="model produced an incomplete tool call";

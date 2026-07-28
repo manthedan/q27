@@ -195,9 +195,11 @@ build/test_metal_model_contracts: src/metal/test_metal_model_contracts.cpp \
 	        src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
 	        src/tokenizer.cpp -framework Foundation -framework Metal -o $@
 
-test-metal-contracts: build/test_metal_model_contracts
+test-metal-contracts: build/test_metal_model_contracts build/test_metal_engine_contracts
 	@test -n "$(MODEL)" || { echo "set MODEL=..." >&2; exit 2; }
+	@test -n "$(BONSAI_MODEL)" || { echo "set BONSAI_MODEL=..." >&2; exit 2; }
 	./build/test_metal_model_contracts "$(MODEL)"
+	./build/test_metal_engine_contracts "$(MODEL)" "$(BONSAI_MODEL)"
 
 build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h src/kl.h \
                  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \

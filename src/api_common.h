@@ -563,6 +563,13 @@ struct ToolChoice {
     bool invalid = false;
 };
 
+inline bool forced_tool_choice_missing_is_error(const ToolChoice& choice,
+                                                bool has_eligible_call,
+                                                bool generation_truncated) {
+    return choice.mode == ToolChoice::FORCED && !has_eligible_call &&
+           !generation_truncated;
+}
+
 // OpenAI's top-level parallel_tool_calls=false has the same output
 // multiplicity contract as Anthropic's disable_parallel_tool_use=true.
 // Keep it on ToolChoice so wrapped, recovered, streaming, and non-streaming
@@ -685,36 +692,6 @@ inline ToolChoice parse_anthropic_tool_choice(const json& body) {
     return tc;
 }
 
-// OpenAI's hosted Responses shell is presented to Codex-family models as two
-// ordinary function tools. The client still executes them and returns
-// function_call_output items; the hosted type only changes request/response
-// normalization at this server boundary.
-inline json responses_shell_prompt_tools() {
-    return json::array({
-        {{"type","function"},{"function",{
-            {"name","exec_command"},
-            {"description","Runs a shell command and returns output or a session ID for ongoing interaction."},
-            {"parameters",{{"type","object"},{"properties",{
-                {"cmd",{{"type","string"},{"description","Shell command to execute."}}},
-                {"workdir",{{"type","string"},{"description","Working directory for the command."}}},
-                {"tty",{{"type","boolean"},{"description","Whether to allocate a PTY."}}},
-                {"yield_time_ms",{{"type","number"},{"description","Wait before yielding output."}}},
-                {"max_output_tokens",{{"type","number"},{"description","Output token budget."}}},
-                {"shell",{{"type","string"},{"description","Shell binary to launch."}}}
-            }},{"required",json::array({"cmd"})},{"additionalProperties",false}}}
-        }}},
-        {{"type","function"},{"function",{
-            {"name","write_stdin"},
-            {"description","Writes characters to an existing command session and returns recent output."},
-            {"parameters",{{"type","object"},{"properties",{
-                {"session_id",{{"type","number"},{"description","Identifier of the running command session."}}},
-                {"chars",{{"type","string"},{"description","Bytes to write; empty polls without writing."}}},
-                {"yield_time_ms",{{"type","number"},{"description","Wait before yielding output."}}},
-                {"max_output_tokens",{{"type","number"},{"description","Output token budget."}}}
-            }},{"required",json::array({"session_id"})},{"additionalProperties",false}}}
-        }}}
-    });
-}
 
 // Responses API names function/custom tools directly in object-form
 // tool_choice, unlike Chat Completions' nested `function.name` shape.
@@ -736,14 +713,6 @@ inline ToolChoice parse_responses_tool_choice(const json& body) {
     if ((type == "function" || type == "custom") && source.contains("name")) {
         normalized["tool_choice"] = {{"type","function"},
                                      {"function",{{"name",source["name"]}}}};
-    } else if (type == "shell") {
-        // Shell is the one hosted Responses tool this bridge can represent:
-        // Codex's model-facing exec_command/write_stdin calls are mapped by
-        // the serving layer. Other hosted tools require dedicated output item
-        // types, so explicit selection remains invalid rather than degrading
-        // them into unusable function_call items.
-        normalized["tool_choice"] = {{"type","function"},
-                                     {"function",{{"name",type}}}};
     } else if (type == "allowed_tools") {
         json allowed;
         if (source.contains("allowed_tools") && source["allowed_tools"].is_object())
@@ -761,9 +730,6 @@ inline ToolChoice parse_responses_tool_choice(const json& body) {
                     (tool_type == "function" || tool_type == "custom"))
                     tools.push_back({{"type","function"},
                                      {"function",{{"name",tool["name"]}}}});
-                else if (tool_type == "shell")
-                    tools.push_back({{"type","function"},
-                                     {"function",{{"name",tool_type}}}});
                 else tools.push_back(tool);
             }
             allowed["tools"] = std::move(tools);
