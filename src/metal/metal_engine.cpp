@@ -342,7 +342,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     // ctx-scaled allocation. Sizing deliberately ignores the GQA threshold:
     // the envelope instrument flips it at runtime, which must only change
     // routing, never invalidate the buffer.
-    const bool chunk_capable = backend_.supports_quantized_matmul();
+    const bool chunk_capable = backend_.supports_quantized_matmul() && has_mtp_;
     const uint64_t partial_bytes =
         gqa_partial_peak(max_context_, backend_.gqa_block_size(), chunk_capable);
     // Production KV fp16 exception cells
@@ -490,7 +490,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     // contract; Bonsai T2/B1/mixed serial projection deliberately keeps
     // float activations, so it must remain serial until an equivalent
     // batched float-activation path exists.
-    chunked_prefill_ = chunk_capable && has_mtp_;
+    chunked_prefill_ = chunk_capable;
     if (chunked_prefill_) {
         ch_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
         cx1_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);

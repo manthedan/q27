@@ -499,12 +499,18 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                 // wrapper-less call recovery (see parse_bare_tool_calls)
                 std::string pre;
                 auto bcs = q27::parse_bare_tool_calls(tx, &pre, &tools);
-                if (!bcs.empty()) {
+                size_t accepted_calls = 0;
+                for (const auto& call : calls)
+                    if (call.ok && q27::tool_choice_allows_call(
+                            tchoice, allowed_tool_names, call.name, accepted_calls))
+                        accepted_calls++;
+                if (q27::tool_choice_allows_all_calls(
+                        tchoice, allowed_tool_names, bcs, accepted_calls)) {
                     fprintf(stderr,
                             "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
                             bcs.size());
                     tx = pre;
-                    for (auto& bc : bcs) calls.push_back(bc);
+                    for (auto& bc : bcs) calls.push_back(std::move(bc));
                 }
             }
             std::vector<q27::ToolCall> eligible_calls;
@@ -516,7 +522,8 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                     tx += (tx.empty() ? "" : "\n") + c.raw;
             }
             const bool any_call = !eligible_calls.empty();
-            if (tchoice.mode == q27::ToolChoice::FORCED && !any_call) {
+            if (q27::forced_tool_choice_missing_is_error(
+                    tchoice, any_call, n >= n_max)) {
                 res.status = 500;
                 res.set_content(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
                                                  {"type","api_error"}}}}.dump(),
@@ -734,7 +741,8 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                 // above); end=error lands in the [req] line, [req-error]
                 // carries the what() (batch_generate logs it unconditionally
                 // when err_out is null, same as that leg's nullptr err_out).
-                if (tchoice.mode == q27::ToolChoice::FORCED && !any_call) {
+                if (q27::forced_tool_choice_missing_is_error(
+                        tchoice, any_call, produced >= nm)) {
                     send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
                                          {"type","api_error"}}}});
                     std::string done = "data: [DONE]\n\n";
@@ -1271,7 +1279,7 @@ int main() {
         CHECK(g_last_response["error"]["type"]=="invalid_request_error");
     }
 
-    // ---- Test 15: forced non-stream calls fail even at max_tokens. ----
+    // ---- Test 15: forced non-stream truncation preserves partial output. ----
     {
         FakeTok tok;
         tok.pieces={"<eos>","not a tool call"};
@@ -1284,11 +1292,13 @@ int main() {
                    {"tools",json::array({{{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}}})},
                    {"messages",json::array({{{"role","user"},{"content","run"}}})}};
         run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
-        CHECK(g_last_response["__status"]==500);
-        CHECK(g_last_response["error"]["type"]=="api_error");
+        CHECK(g_last_response["__status"]==200);
+        CHECK(g_last_response["choices"][0]["finish_reason"]=="length");
+        CHECK(g_last_response["choices"][0]["message"]["content"]=="not a tool call");
+        CHECK(!g_last_response["choices"][0]["message"].contains("tool_calls"));
     }
 
-    // ---- Test 16: forced SSE calls fail at the same token boundary. ----
+    // ---- Test 16: forced SSE truncation terminates with length, not error. ----
     {
         FakeTok tok;
         tok.pieces={"<eos>","not a tool call"};
@@ -1301,10 +1311,18 @@ int main() {
                    {"tools",json::array({{{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}}})},
                    {"messages",json::array({{{"role","user"},{"content","run"}}})}};
         run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
-        bool saw_error=false;
-        for(const auto& ev:g_sse_events)
-            if(ev.contains("error") && ev["error"]["type"]=="api_error") saw_error=true;
-        CHECK(saw_error);
+        bool saw_error=false,saw_length=false,saw_partial=false;
+        for(const auto& ev:g_sse_events) {
+            if(ev.contains("error")) saw_error=true;
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& choice=ev["choices"][0];
+            if(choice["finish_reason"]=="length") saw_length=true;
+            if(choice.contains("delta") && choice["delta"].contains("content") &&
+               choice["delta"]["content"]=="not a tool call") saw_partial=true;
+        }
+        CHECK(!saw_error);
+        CHECK(saw_length);
+        CHECK(saw_partial);
     }
 
     fprintf(stderr, failures ? "%d FAILURE(S)\n" : "all integration tests passed\n", failures);
