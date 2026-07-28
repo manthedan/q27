@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <fcntl.h>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -35,6 +36,8 @@
 #include <vector>
 
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 struct SnapPeekInfo {
     uint32_t position = 0;
@@ -59,7 +62,9 @@ class DiskSnapshotStore {
     // cross-matches or overwrites incompatible snapshots (codex P2 on
     // 607160e); the deep header identity check at load stays underneath.
     void init(std::string dir, uint64_t max_bytes, std::string tag, bool spine_pin=false) {
+        std::lock_guard<std::mutex> lk(m_);
         dir_=std::move(dir); max_bytes_=max_bytes; tag_=std::move(tag); spine_pin_=spine_pin;
+        reclaim_stale_temporaries_locked();
     }
     bool enabled() const { return !dir_.empty(); }
 
@@ -161,6 +166,7 @@ class DiskSnapshotStore {
     std::pair<size_t,uint64_t> evict_past_budget() {
         if(!enabled() || !max_bytes_) return {0,0};
         std::lock_guard<std::mutex> lk(m_);
+        reclaim_stale_temporaries_locked();
         // mtime folds to an opaque ordering key for the shared ordering
         // function (snapshot_evict.h — header-only so the T1 ordering is
         // unit-testable offline without a resident model).
@@ -201,6 +207,25 @@ class DiskSnapshotStore {
 
     std::atomic<uint64_t> hits{0}, saves{0}, evicted_spine{0}, evicted_leaf{0};
   private:
+    void reclaim_stale_temporaries_locked() {
+        if(dir_.empty()) return;
+        std::error_code ec;
+        for(const auto& e:std::filesystem::directory_iterator(dir_,ec)) {
+            const std::string name=e.path().filename().string();
+            if(name.find(".q27snap.tmp.")==std::string::npos)
+                continue;
+            const std::string path=e.path().string();
+            const int fd=::open(path.c_str(),O_RDWR|O_NOFOLLOW|O_CLOEXEC);
+            if(fd<0) continue;
+            struct stat opened{},current{};
+            const bool removable=::fstat(fd,&opened)==0 && S_ISREG(opened.st_mode) &&
+                ::flock(fd,LOCK_EX|LOCK_NB)==0 && ::lstat(path.c_str(),&current)==0 &&
+                opened.st_dev==current.st_dev && opened.st_ino==current.st_ino;
+            if(removable) (void)::unlink(path.c_str());
+            ::close(fd);
+        }
+    }
+
     struct CachedMeta {
         SnapPeekInfo info;
         uint64_t device=0;

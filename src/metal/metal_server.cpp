@@ -2947,22 +2947,12 @@ int main(int argc,char** argv) {
                     std::string pre;
                     auto bcs=q27::parse_bare_tool_calls(
                         tx,&pre,&tools,outcome.finish!=Runtime::Finish::Length);
-                    if(!bcs.empty()) {
+                    if(q27::tool_choice_allows_all_calls(
+                           tchoice,allowed_tool_names,bcs,good.size())) {
                         tx=pre;
-                        size_t recovered=0;
-                        for(auto& bc:bcs) {
-                            if(q27::tool_choice_allows_call(
-                                tchoice,allowed_tool_names,bc.name,good.size())) {
-                                good.push_back(std::move(bc));
-                                recovered++;
-                            } else {
-                                tx+=(tx.empty()?"":"\n")+bc.raw;
-                            }
-                        }
-                        if(recovered) {
-                            fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",recovered);
-                            runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",false},{"count",recovered}});
-                        }
+                        for(auto& bc:bcs) good.push_back(std::move(bc));
+                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",bcs.size());
+                        runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",false},{"count",bcs.size()}});
                     }
                 }
                 json tcs=json::array();
@@ -3351,22 +3341,12 @@ int main(int argc,char** argv) {
                     std::string pre;
                     auto bcs=q27::parse_bare_tool_calls(
                         tx,&pre,&tools,outcome.finish!=Runtime::Finish::Length);
-                    if(!bcs.empty()) {
+                    if(q27::tool_choice_allows_all_calls(
+                           tchoice,allowed_tool_names,bcs,good.size())) {
                         tx=pre;
-                        size_t recovered=0;
-                        for(auto& bc:bcs) {
-                            if(q27::tool_choice_allows_call(
-                                   tchoice,allowed_tool_names,bc.name,good.size())) {
-                                good.push_back(std::move(bc));
-                                recovered++;
-                            } else {
-                                tx+=(tx.empty()?"":"\n")+bc.raw;
-                            }
-                        }
-                        if(recovered) {
-                            fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (nonstream)\n",recovered);
-                            runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},{"stream",false},{"count",recovered}});
-                        }
+                        for(auto& bc:bcs) good.push_back(std::move(bc));
+                        fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (nonstream)\n",bcs.size());
+                        runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},{"stream",false},{"count",bcs.size()}});
                     }
                 }
                 const bool any_call=!good.empty();

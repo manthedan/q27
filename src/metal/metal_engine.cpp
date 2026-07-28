@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -877,8 +878,18 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         (void)unlink(tmp.c_str());
         throw std::runtime_error("q27 Metal: cannot create private snapshot: " + tmp);
     }
+    int lock_fd = -1;
+    if (flock(tmp_fd, LOCK_EX | LOCK_NB) != 0 ||
+        (lock_fd = dup(tmp_fd)) < 0 ||
+        fcntl(lock_fd, F_SETFD, FD_CLOEXEC) != 0) {
+        if (lock_fd >= 0) close(lock_fd);
+        close(tmp_fd);
+        (void)unlink(tmp.c_str());
+        throw std::runtime_error("q27 Metal: cannot lock private snapshot: " + tmp);
+    }
     FILE* f = fdopen(tmp_fd, "wb");
     if (!f) {
+        close(lock_fd);
         close(tmp_fd);
         (void)unlink(tmp.c_str());
         throw std::runtime_error("q27 Metal: cannot create snapshot: " + tmp);
@@ -994,9 +1005,12 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
             throw std::runtime_error("q27 Metal: cannot sync snapshot directory: " + dir);
         }
         close(dfd);
+        close(lock_fd);
+        lock_fd = -1;
         if (snap_crash && strcmp(snap_crash, "after-rename") == 0) _exit(42);
     } catch (...) {
         if (f) fclose(f);
+        if (lock_fd >= 0) close(lock_fd);
         remove(tmp.c_str());
         throw;
     }

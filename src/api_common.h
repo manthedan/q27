@@ -789,6 +789,21 @@ struct ToolCall {
     std::string raw;
 };
 
+template<class NameSet>
+inline bool tool_choice_allows_all_calls(const ToolChoice& choice,
+                                         const NameSet& allowed,
+                                         const std::vector<ToolCall>& calls,
+                                         size_t accepted_calls=0) {
+    if (calls.empty()) return false;
+    for (const auto& call : calls) {
+        if (!call.ok || !tool_choice_allows_call(
+                choice, allowed, call.name, accepted_calls))
+            return false;
+        accepted_calls++;
+    }
+    return true;
+}
+
 inline std::string escape_content_tags(const std::string& text);
 
 // Q27_TOOL_STRICT=1: disable EVERY tolerant-parser rescue (the strict-parser

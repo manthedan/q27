@@ -15,12 +15,15 @@
 #include "disk_snapshot_store.h"
 
 #include <chrono>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 static int fails = 0;
@@ -184,6 +187,32 @@ int main() {
         CHECK(!exists(path) &&
               !store.exact_resident(tokens.data(),(uint32_t)tokens.size()),
               "deep-load rejection removes shallow candidate for repair");
+        fs::remove_all(dir,ec);
+    }
+
+    {   // Crash-left private temporaries are reclaimed, but an active writer's
+        // advisory lock prevents another server from deleting its inode.
+        const std::string dir = std::string(::getenv("TMPDIR")?:"/tmp") +
+                                "/t1store.temporary";
+        std::error_code ec; fs::remove_all(dir,ec); fs::create_directories(dir,ec);
+        const std::string stale=dir+"/t-stale.q27snap.tmp.AAAAAA";
+        { std::ofstream o(stale); o << "partial"; }
+        const std::string old_tag=dir+"/old-artifact.q27snap.tmp.CCCCCC";
+        { std::ofstream o(old_tag); o << "partial"; }
+        DiskSnapshotStore store(&stub_peek,&stub_hash);
+        store.init(dir,1024*1024,"t-",false);
+        CHECK(!exists(stale),"crash-left snapshot temporary is reclaimed at startup");
+        CHECK(!exists(old_tag),"stale temporary from an old artifact tag is reclaimed");
+
+        const std::string active=dir+"/t-active.q27snap.tmp.BBBBBB";
+        const int fd=::open(active.c_str(),O_CREAT|O_RDWR|O_CLOEXEC,0600);
+        CHECK(fd>=0 && ::flock(fd,LOCK_EX|LOCK_NB)==0,
+              "active snapshot temporary fixture holds writer lock");
+        store.init(dir,1024*1024,"t-",false);
+        CHECK(exists(active),"active snapshot temporary survives cleanup");
+        if(fd>=0) { (void)::flock(fd,LOCK_UN); ::close(fd); }
+        (void)store.evict_past_budget();
+        CHECK(!exists(active),"unlocked snapshot temporary is reclaimed during eviction");
         fs::remove_all(dir,ec);
     }
 

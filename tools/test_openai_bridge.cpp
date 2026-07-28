@@ -369,6 +369,26 @@ static void test_openai_parallel_tool_calls() {
     CHECK(malformed.invalid);
 }
 
+static void test_recovered_call_batch_eligibility() {
+    const std::set<std::string> declared={"first","second"};
+    q27::ToolCall first; first.ok=true; first.name="first";
+    q27::ToolCall second; second.ok=true; second.name="second";
+    std::vector<q27::ToolCall> calls={first,second};
+
+    q27::ToolChoice parallel=q27::parse_tool_choice(json::object());
+    CHECK(q27::tool_choice_allows_all_calls(parallel,declared,calls));
+
+    q27::ToolChoice single=q27::parse_tool_choice(json::object());
+    q27::apply_openai_parallel_tool_calls({{"parallel_tool_calls",false}},single);
+    CHECK(!q27::tool_choice_allows_all_calls(single,declared,calls));
+    CHECK(q27::tool_choice_allows_all_calls(single,declared,{first}));
+    CHECK(!q27::tool_choice_allows_all_calls(single,declared,{first},1));
+
+    q27::ToolChoice named=q27::parse_tool_choice({{"tool_choice",{{"type","function"},
+        {"function",{{"name","first"}}}}}});
+    CHECK(!q27::tool_choice_allows_all_calls(named,declared,{second}));
+}
+
 static void test_anthropic_tool_choice_shapes() {
     auto absent=q27::parse_anthropic_tool_choice(json::object());
     CHECK(absent.mode == q27::ToolChoice::AUTO);
@@ -639,6 +659,7 @@ int main() {
     test_tool_choice_malformed_named_is_invalid();
     test_tool_choice_allowed_tools();
     test_openai_parallel_tool_calls();
+    test_recovered_call_batch_eligibility();
     test_anthropic_tool_choice_shapes();
     test_responses_tool_choice_shapes();
     test_stream_options_include_usage();

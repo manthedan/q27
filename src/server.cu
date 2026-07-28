@@ -1477,12 +1477,18 @@ int main(int argc, char** argv) {
                 // wrapper-less call recovery (see parse_bare_tool_calls)
                 std::string pre;
                 auto bcs = q27::parse_bare_tool_calls(tx, &pre, &tools);
-                if (!bcs.empty()) {
+                size_t accepted_calls = 0;
+                for (const auto& call : calls)
+                    if (call.ok && q27::tool_choice_allows_call(
+                            tchoice, allowed_tool_names, call.name, accepted_calls))
+                        accepted_calls++;
+                if (q27::tool_choice_allows_all_calls(
+                        tchoice, allowed_tool_names, bcs, accepted_calls)) {
                     fprintf(stderr,
                             "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
                             bcs.size());
                     tx = pre;
-                    for (auto& bc : bcs) calls.push_back(bc);
+                    for (auto& bc : bcs) calls.push_back(std::move(bc));
                 }
             }
             std::vector<q27::ToolCall> eligible_calls;
