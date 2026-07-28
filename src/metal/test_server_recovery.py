@@ -48,7 +48,7 @@ def main():
     })
     process = subprocess.Popen(
         [server, model, tokenizer, "--host", "127.0.0.1", "--port", str(port),
-         "--ctx", "32", "--slots", "1", "--max-tokens-default", "1"],
+         "--ctx", "256", "--slots", "1", "--max-tokens-default", "1"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env,
     )
 
@@ -100,6 +100,30 @@ def main():
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
 
+    def request_tool_fallback():
+        payload = json.dumps({
+            "model": "q27", "input": "Run the fallback tool", "stream": True,
+            "max_output_tokens": 8, "q27_test_tool_fallback": True,
+            "tools": [{
+                "type": "function", "name": "fallback_tool",
+                "description": "fallback regression fixture",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            "tool_choice": {"type": "function", "name": "fallback_tool"},
+        }).encode()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/responses", data=payload,
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                events = []
+                for line in response.read().decode().splitlines():
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        events.append(json.loads(line[6:]))
+                return response.status, events
+        except urllib.error.HTTPError as error:
+            return error.code, [json.loads(error.read())]
+
     first_status, first = request_once(True)
     second_status, second = request_once(False)
     if first_status != 200:
@@ -112,6 +136,19 @@ def main():
         fail("server exited during recovery", process, stderr_lines)
     if not any("Metal backend recovery: rebuilt 1 slot" in line for line in stderr_lines):
         fail("server did not report backend reconstruction", process, stderr_lines)
+    fallback_status, fallback_events = request_tool_fallback()
+    fallback_items = [
+        event.get("item", {}) for event in fallback_events
+        if event.get("type") == "response.output_item.done"
+    ]
+    if fallback_status != 200 or not any(
+            item.get("type") == "function_call" and
+            item.get("name") == "fallback_tool" and
+            item.get("arguments") == "{}"
+            for item in fallback_items):
+        fail(f"buffered tool fallback failed: {fallback_status} {fallback_events}", process, stderr_lines)
+    if not any(event.get("type") == "response.completed" for event in fallback_events):
+        fail(f"buffered tool fallback did not complete: {fallback_events}", process, stderr_lines)
 
     stop_process()
     atexit.unregister(stop_process)

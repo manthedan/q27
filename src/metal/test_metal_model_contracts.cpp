@@ -64,22 +64,33 @@ int main(int argc, char** argv) {
         engine.save_state(snapshot.path, &snapshot_token, 1, false);
         engine.reset();
         (void)engine.load_state(snapshot.path);
-        bool stale_rejected = false;
-        try {
-            (void)engine.pending_from_logits();
-        } catch (const std::runtime_error& error) {
-            stale_rejected = std::string(error.what()).find("no resident logits") !=
-                             std::string::npos;
-        }
-        if (!stale_rejected) {
-            throw std::runtime_error("stale snapshot logits were accepted");
-        }
+        auto require_stale_rejection = [&](const char* label) {
+            bool rejected = false;
+            try {
+                (void)engine.pending_from_logits();
+            } catch (const std::runtime_error& error) {
+                rejected = std::string(error.what()).find("no resident logits") !=
+                           std::string::npos;
+            }
+            if (!rejected)
+                throw std::runtime_error(std::string(label) + " stale logits were accepted");
+        };
+        require_stale_rejection("snapshot");
         (void)engine.step(1);
         if (engine.pending_from_logits() >= vocab) {
             throw std::runtime_error("refreshed snapshot logits produced an invalid token");
         }
 
-        std::puts("Metal constrained MTP and stale-snapshot contracts: PASS");
+        // Scheduler chunk quanta advance recurrent/KV state without an
+        // output-head pass, so they must invalidate a previously resident row.
+        const uint32_t chunk_tokens[2] = {1, 1};
+        engine.prefill_chunk(chunk_tokens, 2);
+        require_stale_rejection("chunk prefill");
+        (void)engine.step(1);
+        if (engine.pending_from_logits() >= vocab)
+            throw std::runtime_error("post-chunk forward produced an invalid token");
+
+        std::puts("Metal constrained MTP, stale-snapshot, and chunk-logit contracts: PASS");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

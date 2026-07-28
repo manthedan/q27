@@ -3856,10 +3856,11 @@ int main(int argc,char** argv) {
             r.set_header("Content-Type","text/event-stream");
             const bool test_force_error=runtime.test_failpoints && q27::jbool(body,"q27_test_engine_error",false);
             const bool test_malformed=runtime.test_failpoints && q27::jbool(body,"q27_test_malformed_wrapper",false);
+            const bool test_tool_fallback=runtime.test_failpoints && q27::jbool(body,"q27_test_tool_fallback",false);
             auto stream_active=std::make_shared<Runtime::StreamScope>(runtime);
             r.set_chunked_content_provider("text/event-stream",
                 [&runtime,ids,n,sampling,stops,rn,resp_id,msg_id,tools,custom_names,grammar_tool_names,allowed_tool_names,allowed_hosted_names,
-                 snap_hint,sock,test_force_error,test_malformed,stream_active,think_req,tchoice](size_t,httplib::DataSink& sink)->bool {
+                 snap_hint,sock,test_force_error,test_malformed,test_tool_fallback,stream_active,think_req,tchoice](size_t,httplib::DataSink& sink)->bool {
                     (void)stream_active;
                     bool alive=true;
                     auto last_wire=std::chrono::steady_clock::now();
@@ -4151,7 +4152,7 @@ int main(int argc,char** argv) {
                                 if(!text.empty()) flush_text();
                                 // Intercept with the streamer: on a clean head,
                                 // open a function_call item and stream arg deltas;
-                                // on FALLBACK the raw is handed to flush_tool.
+                                // FALLBACK remains buffered until TOOL closes.
                                 bool opened=false;
                                 const std::string frag=ts.feed(t,&opened);
                                 if(opened) {
@@ -4171,14 +4172,6 @@ int main(int argc,char** argv) {
                                     }
                                 }
                                 if(!frag.empty() && !st_custom && !st_rejected) st_arg_delta(frag);
-                                // FALLBACK: not yet open and head deviated — hand
-                                // the verbatim raw to the buffered path.
-                                if(!ts.opened && ts.active() && frag.empty() && !opened) {
-                                    if(ts.state==q27::ToolCallStreamer::FALLBACK) {
-                                        tool_buf=ts.raw; ts.reset();
-                                        flush_tool(false);
-                                    }
-                                }
                                 return;
                             }
                             close_stream_tool(false);
@@ -4233,7 +4226,13 @@ int main(int argc,char** argv) {
                             throw Runtime::EngineError("forced Responses stream engine error");
                         }
                         Runtime::Outcome outcome;
-                        if(test_malformed) {
+                        if(test_tool_fallback) {
+                            route(q27::StreamSplitter::TOOL,"{\"arguments\":");
+                            route(q27::StreamSplitter::TOOL,"{},\"name\":\"fallback_tool\"}");
+                            outcome.prompt_tokens=(uint32_t)ids.size();
+                            outcome.output_tokens=1;
+                            outcome.finish=Runtime::Finish::Stop;
+                        } else if(test_malformed) {
                             tool_buf="{malformed-wrapper";
                             outcome.prompt_tokens=(uint32_t)ids.size();
                             outcome.output_tokens=1;
