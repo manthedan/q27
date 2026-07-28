@@ -397,7 +397,12 @@ ResponsesPromptInput responses_prompt_input(const json& body) {
                                              {"description","The complete raw input text for this tool."}}}}},
                                          {"required",json::array({"input"})}}}}}});
                 }
-            } else if(!ty.empty()) hosted_names.insert(ty);
+            } else if(!ty.empty()) {
+                hosted_names.insert(ty);
+                if(ty=="shell")
+                    for(auto tool:q27::responses_shell_prompt_tools())
+                        out.tools.push_back(std::move(tool));
+            }
         }
     std::set<std::string> hosted_call_names;
     for(const auto& type:hosted_names)
@@ -437,7 +442,8 @@ ResponsesPromptInput responses_prompt_input(const json& body) {
     json selection_body=body;
     selection_body["tools"]=out.tools;
     out.choice=q27::parse_responses_tool_choice(selection_body);
-    if(out.choice.invalid) throw std::runtime_error("invalid object-form tool_choice");
+    q27::apply_openai_parallel_tool_calls(body,out.choice);
+    if(out.choice.invalid) throw std::runtime_error("invalid tool_choice or parallel_tool_calls");
 
     std::set<std::string> registered_names;
     for(const auto& tool:out.tools)
@@ -467,13 +473,25 @@ ResponsesPromptInput responses_prompt_input(const json& body) {
     }
     if(!registered_choice.forced_name.empty() &&
        hosted_names.count(registered_choice.forced_name)) {
-        registered_choice.mode=q27::ToolChoice::NONE;
+        const std::string hosted_type=registered_choice.forced_name;
         registered_choice.forced_name.clear();
         registered_choice.allowed_names.clear();
+        std::set<std::string> mapped;
+        add_responses_hosted_call_names(mapped,hosted_type);
+        registered_choice.allowed_names.assign(mapped.begin(),mapped.end());
     } else if(!registered_choice.allowed_names.empty()) {
         std::vector<std::string> allowed_registered;
-        for(const auto& name:registered_choice.allowed_names)
+        for(const auto& name:registered_choice.allowed_names) {
             if(registered_names.count(name)) allowed_registered.push_back(name);
+            else if(hosted_names.count(name)) {
+                std::set<std::string> mapped;
+                add_responses_hosted_call_names(mapped,name);
+                allowed_registered.insert(allowed_registered.end(),mapped.begin(),mapped.end());
+            }
+        }
+        std::sort(allowed_registered.begin(),allowed_registered.end());
+        allowed_registered.erase(std::unique(allowed_registered.begin(),allowed_registered.end()),
+                                 allowed_registered.end());
         registered_choice.allowed_names=std::move(allowed_registered);
         if(registered_choice.allowed_names.empty())
             registered_choice.mode=q27::ToolChoice::NONE;
@@ -1791,8 +1809,8 @@ struct Runtime {
             bool stopped=false;
             std::string safe=stopbuf.feed(ugate.feed(tokenizer.decode_one((int)token)),stopped);
             if(!emit(safe)) { client_gone=true; cause=q27::MetalEngine::StopCause::Cancelled; return false; }
-            if(stopped) { stop_hit=true; cause=q27::MetalEngine::StopCause::Cancelled; return false; }
             produced++;
+            if(stopped) { stop_hit=true; cause=q27::MetalEngine::StopCause::Cancelled; return false; }
             return true;
         };
         // Constrained tool decoding: trigger detection + grammar feeding on
@@ -2112,8 +2130,9 @@ long long max_tokens_default_flag=0;
 // inside the invalid_request_error envelope -- library internals leaking into
 // a public API error, and inconsistent with the sibling fields resolved two
 // functions up, which already say "invalid temperature" / "invalid top_k"
-// (found by the 2026-07-25 serving gate). Floats are still accepted and
-// truncated, as json_i64_or did: clients do send max_tokens: 4096.0.
+// (found by the 2026-07-25 serving gate). Numerically integral JSON floats
+// such as 4096.0 remain valid, but fractional token counts are rejected
+// rather than silently truncated.
 long long int_field_or(const json& body,const char* key,long long dflt) {
     const auto it=body.find(key);
     if(it==body.end() || it->is_null()) return dflt;
@@ -2122,7 +2141,9 @@ long long int_field_or(const json& body,const char* key,long long dflt) {
     // Range-check as a double BEFORE narrowing: a value past long long is UB
     // to convert, so it cannot be left to the caller's check.
     if(!(v>=0.0) || v>(double)UINT32_MAX) throw std::runtime_error(std::string("invalid ")+key);
-    return (long long)v;
+    const long long integral=(long long)v;
+    if((double)integral!=v) throw std::runtime_error(std::string("invalid ")+key);
+    return integral;
 }
 
 uint32_t max_tokens(const json& body,long long dflt) {
@@ -2321,7 +2342,7 @@ int main(int argc,char** argv) {
                     "WARNING: binding %s with NO API key configured (--api-key / "
                     "--api-key-file / Q27_API_KEY) -- this server will accept "
                     "unauthenticated requests from anyone who can reach it.\n",host.c_str());
-        if(port>65535) throw std::runtime_error("port out of range");
+        if(port<=0 || port>65535) throw std::runtime_error("--port must be between 1 and 65535");
         if(width && (width<2 || width>12)) throw std::runtime_error("MTP width must be 2..12");
         if(suffix_width && (suffix_width<2 || suffix_width>q27::MetalEngine::VERIFY_CHUNK_MAX))
             throw std::runtime_error("suffix width must be 2..48");
@@ -2645,7 +2666,8 @@ int main(int argc,char** argv) {
                     bool think=true,force_tool=false;
                     if(api=="chat" || api=="chat_completions") {
                         messages=openai_msgs(request);
-                        const q27::ToolChoice tchoice=q27::parse_tool_choice(request);
+                        q27::ToolChoice tchoice=q27::parse_tool_choice(request);
+                        q27::apply_openai_parallel_tool_calls(request,tchoice);
                         q27::OpenAIToolSelection selected=q27::select_openai_tools(request,tchoice);
                         tools=std::move(selected.tools);
                         force_tool=tchoice.mode==q27::ToolChoice::FORCED;
@@ -2848,7 +2870,8 @@ int main(int argc,char** argv) {
         // convention) instead of leaking raw into content.
         server.Post("/v1/chat/completions",guarded("chat",[&](const json& body,httplib::Response& r,socket_t sock){
             bool think_req=q27::resolve_think(body,think_default,req_think);
-            const q27::ToolChoice tchoice=q27::parse_tool_choice(body);
+            q27::ToolChoice tchoice=q27::parse_tool_choice(body);
+            q27::apply_openai_parallel_tool_calls(body,tchoice);
             q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
             const json tools=std::move(selected.tools);
             const std::vector<std::string> declared_tool_names=std::move(selected.names);
@@ -2918,8 +2941,8 @@ int main(int argc,char** argv) {
                 // then the wrapper-less recovery chain runs over the text.
                 std::vector<q27::ToolCall> good;
                 for(auto& c:calls) {
-                    if(c.ok && allowed_tool_names.count(c.name) &&
-                       (tchoice.forced_name.empty() || c.name==tchoice.forced_name))
+                    if(c.ok && q27::tool_choice_allows_call(
+                        tchoice,allowed_tool_names,c.name,good.size()))
                         good.push_back(std::move(c));
                     else tx+=(tx.empty()?"":"\n")+c.raw;
                 }
@@ -2931,8 +2954,8 @@ int main(int argc,char** argv) {
                         tx=pre;
                         size_t recovered=0;
                         for(auto& bc:bcs) {
-                            if(allowed_tool_names.count(bc.name) &&
-                               (tchoice.forced_name.empty() || bc.name==tchoice.forced_name)) {
+                            if(q27::tool_choice_allows_call(
+                                tchoice,allowed_tool_names,bc.name,good.size())) {
                                 good.push_back(std::move(bc));
                                 recovered++;
                             } else {
@@ -2955,8 +2978,7 @@ int main(int argc,char** argv) {
                               {"content",(!tcs.empty() && tx.empty())?json(nullptr):json(tx)}};
                 if(!th.empty()) message["reasoning_content"]=th;
                 if(!tcs.empty()) message["tool_calls"]=tcs;
-                if(tchoice.mode==q27::ToolChoice::FORCED && tcs.empty() &&
-                   outcome.finish!=Runtime::Finish::Length)
+                if(tchoice.mode==q27::ToolChoice::FORCED && tcs.empty())
                     throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                 const bool calls_complete=!tcs.empty() && outcome.finish!=Runtime::Finish::Length;
                 runtime.trace.event({{"kind","outcome"},{"api","chat"},{"id",id},
@@ -3011,8 +3033,8 @@ int main(int argc,char** argv) {
                         int tool_counter=0;
                         bool any_call=false,all_calls_clean=true,reject_stream_call=false;
                         auto emit_call=[&](const q27::ToolCall& c,bool raw_already_streamed=false){
-                            if(!allowed_tool_names.count(c.name) ||
-                               (!tchoice.forced_name.empty() && c.name!=tchoice.forced_name)) {
+                if(!q27::tool_choice_allows_call(
+                    tchoice,allowed_tool_names,c.name,any_call?1u:0u)) {
                                 if(!raw_already_streamed) chunk({{"content",c.raw}},nullptr);
                                 return;
                             }
@@ -3119,7 +3141,8 @@ int main(int argc,char** argv) {
                                 bool opened=false;
                                 const std::string frag=ts.feed(t,&opened);
                                 if(opened) {
-                                    reject_stream_call=!allowed_tool_names.count(ts.name);
+                                    reject_stream_call=!q27::tool_choice_allows_call(
+                                        tchoice,allowed_tool_names,ts.name,any_call?1u:0u);
                                     if(!reject_stream_call) {
                                         any_call=true;
                                         chunk({{"tool_calls",json::array({{{"index",tool_counter},
@@ -3165,8 +3188,7 @@ int main(int argc,char** argv) {
                             for(const auto& bc:bcs) emit_call(bc,true);
                         }
                         if(tchoice.mode==q27::ToolChoice::FORCED &&
-                           (!any_call || !all_calls_clean) &&
-                           outcome.finish!=Runtime::Finish::Length)
+                           (!any_call || !all_calls_clean))
                             throw Runtime::EngineError(
                                 "model produced no eligible tool call for forced tool_choice");
                         const bool calls_complete=any_call && all_calls_clean &&
@@ -3356,8 +3378,7 @@ int main(int argc,char** argv) {
                     content.push_back({{"type","tool_use"},
                         {"id","toolu_metal_"+runtime.boot_id+"_"+std::to_string(rid)+"_"+std::to_string(ci++)},
                         {"name",c.name},{"input",c.arguments}});
-                if(tchoice.mode==q27::ToolChoice::FORCED && !any_call &&
-                   outcome.finish!=Runtime::Finish::Length)
+                if(tchoice.mode==q27::ToolChoice::FORCED && !any_call)
                     throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                 const bool calls_complete=any_call && outcome.finish!=Runtime::Finish::Length;
                 json out={{"id",mid},{"type","message"},{"role","assistant"},{"model","q27-metal"},
@@ -3616,8 +3637,7 @@ int main(int argc,char** argv) {
                             }
                         }
                         if(tchoice.mode==q27::ToolChoice::FORCED &&
-                           (!any_call || !all_calls_clean) &&
-                           outcome.finish!=Runtime::Finish::Length)
+                           (!any_call || !all_calls_clean))
                             throw Runtime::EngineError(
                                 "model produced no eligible tool call for forced tool_choice");
                         if(idx<0 && !any && !any_call) { // nothing at all: empty text block for validity
@@ -3737,7 +3757,8 @@ int main(int argc,char** argv) {
                         {"encrypted_content",nullptr}});
                 };
                 auto push_call=[&](const std::string& name,const json& args,bool incomplete_item=false){
-                    if(!responses_tool_allowed(name,allowed_tool_names,allowed_hosted_names)) return;
+                    if(!responses_tool_allowed(name,allowed_tool_names,allowed_hosted_names) ||
+                       (tchoice.disable_parallel_tool_use && tool_counter)) return;
                     const int call_index=tool_counter++;
                     const std::string cid="call_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
                     const std::string iid="fc_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
@@ -3838,7 +3859,7 @@ int main(int argc,char** argv) {
                 if(!tool_buf.empty()) flush_tool(true,incomplete);
                 flush_think(incomplete);
                 flush_text(true,incomplete);
-                if(tchoice.mode==q27::ToolChoice::FORCED && tool_counter==0 && !incomplete)
+                if(tchoice.mode==q27::ToolChoice::FORCED && tool_counter==0)
                     throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                 std::string all_text;
                 for(const auto& it:items)
@@ -3936,7 +3957,8 @@ int main(int argc,char** argv) {
                             out_index=msg_index+1; msg_index=-1; active_msg_id.clear();
                         };
                         auto push_call=[&](const std::string& name,const json& args,bool incomplete_item=false){
-                            if(!responses_tool_allowed(name,allowed_tool_names,allowed_hosted_names)) return;
+                            if(!responses_tool_allowed(name,allowed_tool_names,allowed_hosted_names) ||
+                               (tchoice.disable_parallel_tool_use && tool_counter)) return;
                             const int call_index=tool_counter++;
                             const std::string cid="call_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
                             const std::string iid="fc_metal_"+runtime.boot_id+"_"+std::to_string(rn)+"_"+std::to_string(call_index);
@@ -4165,7 +4187,8 @@ int main(int argc,char** argv) {
                                 const std::string frag=ts.feed(t,&opened);
                                 if(opened) {
                                     if(!responses_tool_allowed(ts.name,allowed_tool_names,
-                                                               allowed_hosted_names)) {
+                                                               allowed_hosted_names) ||
+                                       (tchoice.disable_parallel_tool_use && tool_counter)) {
                                         st_rejected=true;
                                     } else if(custom_names.count(ts.name)) {
                                         st_custom=true;
@@ -4271,7 +4294,7 @@ int main(int argc,char** argv) {
                         flush_think(incomplete);
                         flush_bare(true,incomplete);
                         flush_text(incomplete);
-                        if(tchoice.mode==q27::ToolChoice::FORCED && tool_counter==0 && !incomplete)
+                        if(tchoice.mode==q27::ToolChoice::FORCED && tool_counter==0)
                             throw Runtime::EngineError("model produced no eligible tool call for forced tool_choice");
                         if(!tool_calls_clean && !incomplete) {
                             const char* message="model produced an incomplete tool call";

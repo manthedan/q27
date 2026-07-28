@@ -563,6 +563,19 @@ struct ToolChoice {
     bool invalid = false;
 };
 
+// OpenAI's top-level parallel_tool_calls=false has the same output
+// multiplicity contract as Anthropic's disable_parallel_tool_use=true.
+// Keep it on ToolChoice so wrapped, recovered, streaming, and non-streaming
+// calls all pass through one eligibility rule.
+inline void apply_openai_parallel_tool_calls(const json& body,ToolChoice& choice) {
+    if(!body.contains("parallel_tool_calls")) return;
+    if(!body["parallel_tool_calls"].is_boolean()) {
+        choice.invalid=true;
+        return;
+    }
+    choice.disable_parallel_tool_use=!body["parallel_tool_calls"].get<bool>();
+}
+
 template<class NameSet>
 inline bool tool_choice_allows_call(const ToolChoice& choice,const NameSet& allowed,
                                     const std::string& name,size_t accepted_calls) {
@@ -672,6 +685,37 @@ inline ToolChoice parse_anthropic_tool_choice(const json& body) {
     return tc;
 }
 
+// OpenAI's hosted Responses shell is presented to Codex-family models as two
+// ordinary function tools. The client still executes them and returns
+// function_call_output items; the hosted type only changes request/response
+// normalization at this server boundary.
+inline json responses_shell_prompt_tools() {
+    return json::array({
+        {{"type","function"},{"function",{
+            {"name","exec_command"},
+            {"description","Runs a shell command and returns output or a session ID for ongoing interaction."},
+            {"parameters",{{"type","object"},{"properties",{
+                {"cmd",{{"type","string"},{"description","Shell command to execute."}}},
+                {"workdir",{{"type","string"},{"description","Working directory for the command."}}},
+                {"tty",{{"type","boolean"},{"description","Whether to allocate a PTY."}}},
+                {"yield_time_ms",{{"type","number"},{"description","Wait before yielding output."}}},
+                {"max_output_tokens",{{"type","number"},{"description","Output token budget."}}},
+                {"shell",{{"type","string"},{"description","Shell binary to launch."}}}
+            }},{"required",json::array({"cmd"})},{"additionalProperties",false}}}
+        }}},
+        {{"type","function"},{"function",{
+            {"name","write_stdin"},
+            {"description","Writes characters to an existing command session and returns recent output."},
+            {"parameters",{{"type","object"},{"properties",{
+                {"session_id",{{"type","number"},{"description","Identifier of the running command session."}}},
+                {"chars",{{"type","string"},{"description","Bytes to write; empty polls without writing."}}},
+                {"yield_time_ms",{{"type","number"},{"description","Wait before yielding output."}}},
+                {"max_output_tokens",{{"type","number"},{"description","Output token budget."}}}
+            }},{"required",json::array({"session_id"})},{"additionalProperties",false}}}
+        }}}
+    });
+}
+
 // Responses API names function/custom tools directly in object-form
 // tool_choice, unlike Chat Completions' nested `function.name` shape.
 // Normalize that wire form into ToolChoice so both APIs share selection and
@@ -747,7 +791,7 @@ struct OpenAIToolSelection {
 // subset. Both backends use this helper so prompt injection, grammar names,
 // fallback parsing, and output validation all share the same registry.
 inline OpenAIToolSelection select_openai_tools(const json& body,const ToolChoice& choice) {
-    if (choice.invalid) throw std::runtime_error("invalid object-form tool_choice");
+    if (choice.invalid) throw std::runtime_error("invalid tool_choice or parallel_tool_calls");
     OpenAIToolSelection selected;
     if (choice.mode == ToolChoice::NONE) return selected;
     selected.tools=openai_tools_json(body);

@@ -259,6 +259,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
         if (routed_chat) {
             try {
                 tchoice = q27::parse_tool_choice(body);
+                q27::apply_openai_parallel_tool_calls(body,tchoice);
                 q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
                 tools=std::move(selected.tools);
                 tool_names_v=std::move(selected.names);
@@ -508,13 +509,14 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
             }
             std::vector<q27::ToolCall> eligible_calls;
             for (auto& c : calls) {
-                if (c.ok && allowed_tool_names.count(c.name))
+                if (c.ok && q27::tool_choice_allows_call(
+                    tchoice,allowed_tool_names,c.name,eligible_calls.size()))
                     eligible_calls.push_back(std::move(c));
                 else if (c.ok)
                     tx += (tx.empty() ? "" : "\n") + c.raw;
             }
             const bool any_call = !eligible_calls.empty();
-            if (tchoice.mode == q27::ToolChoice::FORCED && !any_call && n < n_max) {
+            if (tchoice.mode == q27::ToolChoice::FORCED && !any_call) {
                 res.status = 500;
                 res.set_content(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
                                                  {"type","api_error"}}}}.dump(),
@@ -641,7 +643,8 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                 auto emit_tool = [&]() {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
-                    if (!c.ok || !allowed_tool_names.count(c.name)) {
+                    if (!c.ok || !q27::tool_choice_allows_call(
+                        tchoice,allowed_tool_names,c.name,any_call?1u:0u)) {
                         // Malformed or undeclared calls remain ordinary model text.
                         if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                            json{{"content", c.raw}})))
@@ -713,7 +716,8 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                                 "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
                                 bcs.size());
                         for (auto& bc : bcs) {
-                            if (!allowed_tool_names.count(bc.name)) continue;
+                            if (!q27::tool_choice_allows_call(
+                                tchoice,allowed_tool_names,bc.name,any_call?1u:0u)) continue;
                             any_call = true;
                             std::string tid = "call_q27_" + std::to_string(rid) + "_" +
                                               std::to_string(tool_idx);
@@ -730,7 +734,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
                 // above); end=error lands in the [req] line, [req-error]
                 // carries the what() (batch_generate logs it unconditionally
                 // when err_out is null, same as that leg's nullptr err_out).
-                if (tchoice.mode == q27::ToolChoice::FORCED && !any_call && produced < nm) {
+                if (tchoice.mode == q27::ToolChoice::FORCED && !any_call) {
                     send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
                                          {"type","api_error"}}}});
                     std::string done = "data: [DONE]\n\n";
@@ -1186,6 +1190,121 @@ int main() {
         run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
         CHECK(g_last_response["__status"] == 400);
         CHECK(g_last_response["error"]["type"] == "invalid_request_error");
+    }
+
+    // ---- Test 12: parallel_tool_calls=false keeps only the first wrapped call. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            "<eos>",
+            "<tool_call>\n{\"name\":\"first\",\"arguments\":{}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"second\",\"arguments\":{}}\n</tool_call>",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1,2};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","second"},{"parameters",json::object()}}}},
+        });
+        json body={{"tools",tools},{"parallel_tool_calls",false},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        auto& msg=g_last_response["choices"][0]["message"];
+        CHECK(msg["tool_calls"].size()==1);
+        CHECK(msg["tool_calls"][0]["function"]["name"]=="first");
+        CHECK(msg["content"].get<std::string>().find("second")!=std::string::npos);
+    }
+
+    // ---- Test 13: the same single-call contract holds for SSE output. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            "<eos>",
+            "<tool_call>\n{\"name\":\"first\",\"arguments\":{}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"second\",\"arguments\":{}}\n</tool_call>",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1,2};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","second"},{"parameters",json::object()}}}},
+        });
+        json body={{"stream",true},{"tools",tools},{"parallel_tool_calls",false},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        int call_count=0;
+        bool saw_first=false,saw_second_raw=false;
+        for(auto& ev:g_sse_events) {
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& delta=ev["choices"][0]["delta"];
+            if(delta.contains("tool_calls")) {
+                call_count++;
+                saw_first=delta["tool_calls"][0]["function"]["name"]=="first";
+            }
+            if(delta.contains("content") &&
+               delta["content"].get<std::string>().find("second")!=std::string::npos)
+                saw_second_raw=true;
+        }
+        CHECK(call_count==1);
+        CHECK(saw_first);
+        CHECK(saw_second_raw);
+    }
+
+    // ---- Test 14: malformed parallel_tool_calls is a client error. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        std::atomic<long> rc{0};
+        json body={{"parallel_tool_calls","no"},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        CHECK(g_last_response["__status"]==400);
+        CHECK(g_last_response["error"]["type"]=="invalid_request_error");
+    }
+
+    // ---- Test 15: forced non-stream calls fail even at max_tokens. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>","not a tool call"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json body={{"max_tokens",1},{"tool_choice","required"},
+                   {"tools",json::array({{{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}}})},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        CHECK(g_last_response["__status"]==500);
+        CHECK(g_last_response["error"]["type"]=="api_error");
+    }
+
+    // ---- Test 16: forced SSE calls fail at the same token boundary. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>","not a tool call"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json body={{"stream",true},{"max_tokens",1},{"tool_choice","required"},
+                   {"tools",json::array({{{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}}})},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        bool saw_error=false;
+        for(const auto& ev:g_sse_events)
+            if(ev.contains("error") && ev["error"]["type"]=="api_error") saw_error=true;
+        CHECK(saw_error);
     }
 
     fprintf(stderr, failures ? "%d FAILURE(S)\n" : "all integration tests passed\n", failures);

@@ -341,6 +341,24 @@ static void test_tool_choice_allowed_tools() {
     CHECK(threw);
 }
 
+static void test_openai_parallel_tool_calls() {
+    const std::set<std::string> declared={"first","second"};
+    q27::ToolChoice single=q27::parse_tool_choice(json::object());
+    q27::apply_openai_parallel_tool_calls({{"parallel_tool_calls",false}},single);
+    CHECK(single.disable_parallel_tool_use);
+    CHECK(q27::tool_choice_allows_call(single,declared,"first",0));
+    CHECK(!q27::tool_choice_allows_call(single,declared,"second",1));
+
+    q27::ToolChoice parallel=q27::parse_responses_tool_choice(json::object());
+    q27::apply_openai_parallel_tool_calls({{"parallel_tool_calls",true}},parallel);
+    CHECK(!parallel.disable_parallel_tool_use);
+    CHECK(q27::tool_choice_allows_call(parallel,declared,"second",1));
+
+    q27::ToolChoice malformed=q27::parse_tool_choice(json::object());
+    q27::apply_openai_parallel_tool_calls({{"parallel_tool_calls","no"}},malformed);
+    CHECK(malformed.invalid);
+}
+
 static void test_anthropic_tool_choice_shapes() {
     auto absent=q27::parse_anthropic_tool_choice(json::object());
     CHECK(absent.mode == q27::ToolChoice::AUTO);
@@ -416,6 +434,13 @@ static void test_responses_tool_choice_shapes() {
     CHECK(!hosted.invalid);
     CHECK(hosted.mode == q27::ToolChoice::FORCED);
     CHECK(hosted.forced_name == "shell");
+    const json shell_tools=q27::responses_shell_prompt_tools();
+    CHECK(shell_tools.is_array() && shell_tools.size()==2);
+    CHECK(shell_tools[0]["function"]["name"]=="exec_command");
+    CHECK(shell_tools[0]["function"]["parameters"]["required"]==json::array({"cmd"}));
+    CHECK(shell_tools[0]["function"]["parameters"]["properties"].contains("yield_time_ms"));
+    CHECK(shell_tools[1]["function"]["name"]=="write_stdin");
+    CHECK(shell_tools[1]["function"]["parameters"]["required"]==json::array({"session_id"}));
     auto hosted_allowed=q27::parse_responses_tool_choice({{"tool_choice",{{"type","allowed_tools"},
         {"mode","required"},{"tools",json::array({{{"type","shell"}}})}}}});
     CHECK(!hosted_allowed.invalid);
@@ -614,6 +639,7 @@ int main() {
     test_tool_choice_unknown_string_is_auto();
     test_tool_choice_malformed_named_is_invalid();
     test_tool_choice_allowed_tools();
+    test_openai_parallel_tool_calls();
     test_anthropic_tool_choice_shapes();
     test_responses_tool_choice_shapes();
     test_stream_options_include_usage();

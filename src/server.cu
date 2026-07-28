@@ -1237,6 +1237,7 @@ int main(int argc, char** argv) {
         if (routed_chat) {
             try {
                 tchoice = q27::parse_tool_choice(body);
+                q27::apply_openai_parallel_tool_calls(body,tchoice);
                 q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
                 tools=std::move(selected.tools);
                 tool_names_v=std::move(selected.names);
@@ -1486,13 +1487,14 @@ int main(int argc, char** argv) {
             }
             std::vector<q27::ToolCall> eligible_calls;
             for (auto& c : calls) {
-                if (c.ok && allowed_tool_names.count(c.name))
+                if (c.ok && q27::tool_choice_allows_call(
+                    tchoice,allowed_tool_names,c.name,eligible_calls.size()))
                     eligible_calls.push_back(std::move(c));
                 else if (c.ok)
                     tx += (tx.empty() ? "" : "\n") + c.raw;
             }
             const bool any_call = !eligible_calls.empty();
-            if (tchoice.mode == q27::ToolChoice::FORCED && !any_call && n < n_max) {
+            if (tchoice.mode == q27::ToolChoice::FORCED && !any_call) {
                 res.status = 500;
                 res.set_content(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
                                                  {"type","api_error"}}}}.dump(),
@@ -1619,7 +1621,8 @@ int main(int argc, char** argv) {
                 auto emit_tool = [&]() {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
-                    if (!c.ok || !allowed_tool_names.count(c.name)) {
+                    if (!c.ok || !q27::tool_choice_allows_call(
+                        tchoice,allowed_tool_names,c.name,any_call?1u:0u)) {
                         // Malformed or undeclared calls remain ordinary model text.
                         if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                            json{{"content", c.raw}})))
@@ -1691,7 +1694,8 @@ int main(int argc, char** argv) {
                                 "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
                                 bcs.size());
                         for (auto& bc : bcs) {
-                            if (!allowed_tool_names.count(bc.name)) continue;
+                            if (!q27::tool_choice_allows_call(
+                                tchoice,allowed_tool_names,bc.name,any_call?1u:0u)) continue;
                             any_call = true;
                             std::string tid = "call_q27_" + std::to_string(rid) + "_" +
                                               std::to_string(tool_idx);
@@ -1708,7 +1712,7 @@ int main(int argc, char** argv) {
                 // above); end=error lands in the [req] line, [req-error]
                 // carries the what() (batch_generate logs it unconditionally
                 // when err_out is null, same as that leg's nullptr err_out).
-                if (tchoice.mode == q27::ToolChoice::FORCED && !any_call && produced < nm) {
+                if (tchoice.mode == q27::ToolChoice::FORCED && !any_call) {
                     send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
                                          {"type","api_error"}}}});
                     std::string done = "data: [DONE]\n\n";

@@ -863,14 +863,16 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
     const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
                                           : (uint64_t)N_KV * HEAD_DIM * 2;
     const uint64_t active_cache = (uint64_t)position_ * cache_row;
-    const std::string tmp = path + ".tmp";
-    // Snapshot payloads contain private conversation state. Remove a stale
-    // crash temporary, then use O_EXCL|O_NOFOLLOW so a hostile symlink can
-    // only cause a loud denial, never redirect or expose the write.
-    (void)unlink(tmp.c_str());
-    const int tmp_fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL |
-                            O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (tmp_fd < 0 || fchmod(tmp_fd, 0600) != 0) {
+    std::string tmp_pattern = path + ".tmp.XXXXXX";
+    std::vector<char> tmp_name(tmp_pattern.begin(), tmp_pattern.end());
+    tmp_name.push_back('\0');
+    // Each writer gets a private same-directory inode. mkstemp's O_EXCL
+    // creation prevents symlink redirection and avoids the old shared `.tmp`
+    // unlink race when two server processes publish the same snapshot key.
+    const int tmp_fd = mkstemp(tmp_name.data());
+    const std::string tmp = tmp_fd >= 0 ? tmp_name.data() : tmp_pattern;
+    if (tmp_fd < 0 || fcntl(tmp_fd, F_SETFD, FD_CLOEXEC) != 0 ||
+        fchmod(tmp_fd, 0600) != 0) {
         if (tmp_fd >= 0) close(tmp_fd);
         (void)unlink(tmp.c_str());
         throw std::runtime_error("q27 Metal: cannot create private snapshot: " + tmp);

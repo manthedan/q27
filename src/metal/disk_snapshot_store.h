@@ -34,6 +34,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/stat.h>
+
 struct SnapPeekInfo {
     uint32_t position = 0;
     bool logits_resident = true;
@@ -74,19 +76,7 @@ class DiskSnapshotStore {
             if(e.path().filename().string().rfind(tag_,0)!=0) continue;
             const std::string pstr=e.path().string();
             SnapPeekInfo info;
-            auto tc=meta_.find(pstr);
-            if(tc!=meta_.end()) { info=tc->second; }
-            else {
-                try { info=peek_(pstr); }
-                catch(...) { continue; }   // corrupt/foreign file: never a hit
-                // Cache the FULL peek (position + logits_resident + tokens):
-                // caching only tokens would fabricate logits_resident=true
-                // for a mid-prefill (stale-logits) banked snapshot, letting a
-                // later exact-length request resume from non-existent pending
-                // logits (autoreview P2). The metadata checks below depend on
-                // the real values.
-                meta_[pstr]=info;
-            }
+            if(!peek_current(pstr,info)) continue;
             // Saves record exactly the encoded prefix; anything else is not
             // resumable by token matching.
             if(info.position!=info.tokens.size()) continue;
@@ -128,13 +118,7 @@ class DiskSnapshotStore {
         std::error_code ec;
         if(!std::filesystem::is_regular_file(path,ec)) return false;
         SnapPeekInfo info;
-        auto cached=meta_.find(path);
-        if(cached!=meta_.end()) info=cached->second;
-        else {
-            try { info=peek_(path); }
-            catch(...) { return false; }
-            meta_[path]=info;
-        }
+        if(!peek_current(path,info)) return false;
         return info.logits_resident && info.position==count &&
                info.tokens.size()==count &&
                std::equal(info.tokens.begin(),info.tokens.end(),tokens);
@@ -184,6 +168,7 @@ class DiskSnapshotStore {
         std::error_code ec;
         for(const auto& e:std::filesystem::directory_iterator(dir_,ec)) {
             if(!e.is_regular_file() || e.path().extension()!=".q27snap") continue;
+            if(e.path().filename().string().rfind(tag_,0)!=0) continue;
             const uint64_t sz=(uint64_t)e.file_size(ec);
             const auto mt=std::chrono::duration_cast<std::chrono::nanoseconds>(
                               e.last_write_time(ec).time_since_epoch()).count();
@@ -216,10 +201,31 @@ class DiskSnapshotStore {
 
     std::atomic<uint64_t> hits{0}, saves{0}, evicted_spine{0}, evicted_leaf{0};
   private:
+    struct CachedMeta {
+        SnapPeekInfo info;
+        uint64_t device=0;
+        uint64_t inode=0;
+    };
+    bool peek_current(const std::string& path,SnapPeekInfo& info) {
+        struct stat st{};
+        if(::stat(path.c_str(),&st)!=0) return false;
+        auto cached=meta_.find(path);
+        if(cached!=meta_.end() && cached->second.device==(uint64_t)st.st_dev &&
+           cached->second.inode==(uint64_t)st.st_ino) {
+            info=cached->second.info;
+            return true;
+        }
+        try { info=peek_(path); }
+        catch(...) { return false; }
+        meta_[path]={info,(uint64_t)st.st_dev,(uint64_t)st.st_ino};
+        return true;
+    }
     PeekFn peek_;
     HashFn hash_;
     std::string dir_; uint64_t max_bytes_=0; std::string tag_; std::mutex m_;
     bool spine_pin_=false;
     std::map<std::string,std::vector<uint32_t>> tokens_;   // path -> token ids (eviction spine check)
-    std::map<std::string,SnapPeekInfo> meta_;              // path -> full peek (best_match; real values only)
+    // Atomic replacement changes inode, forcing a fresh peek even when a
+    // different server process publishes the same token-key pathname.
+    std::map<std::string,CachedMeta> meta_;
 };
