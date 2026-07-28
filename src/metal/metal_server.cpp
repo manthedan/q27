@@ -1017,8 +1017,7 @@ struct Runtime {
             // weights ride the file mapping), so charge the artifact bytes
             // explicitly — the OOM at the raw policy ceiling was weights
             // (17 GB) and KV sharing one working set.
-            uint64_t artifact_bytes=0;
-            { std::error_code ec; artifact_bytes=(uint64_t)std::filesystem::file_size(model,ec); }
+            const uint64_t artifact_bytes=(uint64_t)shared->model.mapping_size();
             const uint64_t used=artifact_bytes+allocated;
             const uint64_t measured=recommended>used?recommended-used:0;
             const uint64_t envelope=measured+(3ull<<30);
@@ -2390,6 +2389,13 @@ int main(int argc,char** argv) {
                                  {"runtime",runtime.serving_identity()},{"boot_id",runtime.boot_id}});
         }
         httplib::Server server;
+        // cpp-httplib otherwise buffers an unbounded POST body before route
+        // admission or JSON parsing. Scale the allowance with the served
+        // context, but cap aggregate damage from the 16 request workers.
+        const uint64_t context_payload=(uint64_t)runtime.context*256ull;
+        const size_t payload_limit=(size_t)std::min<uint64_t>(
+            64ull<<20,std::max<uint64_t>(1ull<<20,context_payload));
+        server.set_payload_max_length(payload_limit);
         // Bound the accept-side queue (codex P1 on d243f92): the default
         // task queue holds accepted connections without limit, so the
         // in-run admission bound alone could never engage — excess requests
@@ -2653,14 +2659,16 @@ int main(int argc,char** argv) {
                         think=q27::resolve_think(request,think_default,req_think);
                         if(force_tool) think=false;
                     } else if(api=="messages" || api=="anthropic") {
-                        // Claude Code speaks Anthropic /v1/messages. Reuse the
-                        // SAME canonicalizer as ordinary serving (line ~2388:
-                        // chatml_prompt(anthropic_msgs(body), tools, true)) so
-                        // the prewarmed prefix is byte-for-byte the prefix the
-                        // live request will prefill. Same resolver as serving.
                         messages=q27::anthropic_msgs(request);
-                        tools=q27::anthropic_tools_json(request);
+                        const q27::ToolChoice tchoice=
+                            q27::parse_anthropic_tool_choice(request);
+                        json normalized={{"tools",q27::anthropic_tools_json(request)}};
+                        q27::OpenAIToolSelection selected=
+                            q27::select_openai_tools(normalized,tchoice);
+                        tools=std::move(selected.tools);
+                        force_tool=tchoice.mode==q27::ToolChoice::FORCED;
                         think=q27::resolve_think(request,think_default,req_think);
+                        if(force_tool) think=false;
                     } else throw std::runtime_error(
                         "api must be chat_completions, responses, or messages");
 

@@ -13,6 +13,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+import tempfile
 
 
 def fail(message, process=None, stderr_lines=None):
@@ -39,6 +40,7 @@ def main():
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
 
+    cache_dir = tempfile.TemporaryDirectory(prefix="q27-prefix-prewarm-")
     env = os.environ.copy()
     env.pop("Q27_API_KEY", None)
     env.update({
@@ -48,7 +50,8 @@ def main():
     })
     process = subprocess.Popen(
         [server, model, tokenizer, "--host", "127.0.0.1", "--port", str(port),
-         "--ctx", "256", "--slots", "1", "--max-tokens-default", "1"],
+         "--ctx", "256", "--slots", "1", "--max-tokens-default", "1",
+         "--experimental-prefix-cache", cache_dir.name, "--snapshot-max-mb", "256"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env,
     )
 
@@ -100,6 +103,16 @@ def main():
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
 
+    def request_oversized_body():
+        payload = b' ' * (2 << 20)
+        request = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
     def request_tool_fallback():
         payload = json.dumps({
             "model": "q27", "input": "Run the fallback tool", "stream": True,
@@ -124,6 +137,49 @@ def main():
         except urllib.error.HTTPError as error:
             return error.code, [json.loads(error.read())]
 
+    def request_anthropic_prewarm():
+        anthropic_request = {
+            "model": "q27", "system": "Stable system prompt",
+            "messages": [
+                {"role": "user", "content": "Live request"},
+            ],
+            "max_tokens": 1,
+            "tool_choice": {"type": "none"},
+            "tools": [
+                {"name": "alpha", "description": "first",
+                 "input_schema": {"type": "object", "properties": {}}},
+                {"name": "beta", "description": "second",
+                 "input_schema": {"type": "object", "properties": {}}},
+            ],
+        }
+        envelope = json.dumps({"api": "messages", "request": anthropic_request}).encode()
+        prewarm = urllib.request.Request(
+            f"http://127.0.0.1:{port}/experimental/prefix-cache/prewarm",
+            data=envelope, headers={"Content-Type": "application/json",
+                                    "X-Q27-Admin-Token": "recovery-gate"})
+        try:
+            with urllib.request.urlopen(prewarm, timeout=300) as response:
+                prewarm_body = json.loads(response.read())
+                prewarm_status = response.status
+        except urllib.error.HTTPError as error:
+            prewarm_status, prewarm_body = error.code, json.loads(error.read())
+        live = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/messages",
+            data=json.dumps(anthropic_request).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(live, timeout=300) as response:
+                live_body = json.loads(response.read())
+                live_status = response.status
+        except urllib.error.HTTPError as error:
+            live_status, live_body = error.code, json.loads(error.read())
+        return prewarm_status, prewarm_body, live_status, live_body
+
+    oversized_status = request_oversized_body()
+    if oversized_status != 413:
+        fail(f"oversized request returned HTTP {oversized_status}, expected 413",
+             process, stderr_lines)
+
     first_status, first = request_once(True)
     second_status, second = request_once(False)
     if first_status != 200:
@@ -136,6 +192,14 @@ def main():
         fail("server exited during recovery", process, stderr_lines)
     if not any("Metal backend recovery: rebuilt 1 slot" in line for line in stderr_lines):
         fail("server did not report backend reconstruction", process, stderr_lines)
+    prewarm_status, prewarm, live_status, live = request_anthropic_prewarm()
+    if (prewarm_status != 200 or prewarm.get("status") != "ok" or
+            not (prewarm.get("snapshot_written") or prewarm.get("already_cached")) or
+            live_status != 200 or not live.get("q27_prefix_hit")):
+        fail(f"Anthropic tool_choice prewarm mismatch: "
+             f"{prewarm_status} {prewarm} / {live_status} {live}",
+             process, stderr_lines)
+
     fallback_status, fallback_events = request_tool_fallback()
     fallback_items = [
         event.get("item", {}) for event in fallback_events
@@ -152,6 +216,7 @@ def main():
 
     stop_process()
     atexit.unregister(stop_process)
+    cache_dir.cleanup()
     print("Metal server recovery: PASS")
 
 
