@@ -16,7 +16,8 @@ and [docs/MODELS.md](../MODELS.md) instead.
 | [DECISIONS.md](DECISIONS.md) | one line per experiment: what was tried, what the measurement said, and the number that decided it. The fastest way to find out whether something was already ruled out. |
 | [METAL.md](METAL.md) | the backend's scope, the `src/backend.h` boundary, and implementation order. |
 | [PARITY-2026-07-25.md](PARITY-2026-07-25.md) | current CUDA↔Metal parity plus the standing audit findings (A1–A9). |
-| [MERGE-BACK.md](MERGE-BACK.md) | the staged plan for contributing back upstream, and what blocks it. |
+| [MERGE-BACK.md](MERGE-BACK.md) | the staged plan for contributing back upstream, and the evidence behind each stage. |
+| [PR-PLAYBOOK.md](PR-PLAYBOOK.md) | the runbook for actually sending it — send order, gates, commands, prepared answers, abort conditions. |
 
 ## Also here
 
@@ -30,7 +31,8 @@ and [docs/MODELS.md](../MODELS.md) instead.
   code reviews, the original upstream scratch NOTEBOOK, and superseded
   parity docs. Kept verbatim for provenance; none of it is maintained.
 - [upstream-issue-draft.md](upstream-issue-draft.md) — unsent draft of the
-  merge-back issue.
+  merge-back issue. Rewritten 2026-07-27; the earlier revision was
+  materially wrong and must not be sent.
 
 ## The rule this directory follows
 

@@ -422,11 +422,24 @@ PRs 1–2 are free goodwill and cost him minutes. PR 5 is the decision point;
 there is no value in preparing 6–8 for review until he answers it, though
 having them *staged* is exactly what "prepare everything, then ask" means.
 
+**The execution runbook is [PR-PLAYBOOK.md](PR-PLAYBOOK.md)** — waves, gates,
+`gh` commands, the objection handbook, and the abort protocol. This document
+is the plan and its evidence; that one is how to send it.
+
 ## Before sending anything
 
 - [x] A9 clean-diff check (`engine.cuh` restored, all shared files audited)
-- [ ] Each stage branched off `upstream/master` and its diff eyeballed for
-      unintended carry-over
-- [ ] Refresh the 07-16 issue draft: scope numbers are stale (it says
-      "~160 commits / +30k lines")
-- [ ] Every CUDA-touching PR body states we could not compile it
+- [x] Each stage branched off `upstream/master` and its diff eyeballed for
+      unintended carry-over — file lists recorded in the playbook's invariants
+- [x] Issue draft refreshed (2026-07-27). The old one claimed we could not
+      compile CUDA and still listed the two dropped PRs
+- [x] Every CUDA-touching PR body names the toolchain it *was* verified on
+      (nvcc 12.0.140, sm_86, RTX 3090) — the "we cannot compile CUDA"
+      disclosure is retired, because it was wrong
+- [ ] Cherry-pick `tools/argmax_tie_gate.cu` onto `pr3-argmax-tiebreak` — the
+      PR claims a model-free reproduction it does not currently ship
+- [ ] Split `pr8-toolcall-streamer`: the `stream_split.h` boundary fix is a
+      bug in his code today (wave 1); `ToolCallStreamer` is 268 lines nothing
+      upstream calls (wave 3, alongside PR 7 which uses it)
+- [ ] Write a short README section for PR 6 — every branch is code-only, so
+      Metal would currently land undocumented
