@@ -176,6 +176,15 @@ build/test_metal_ops: src/metal/test_metal_ops.cpp src/metal/metal_backend.mm sr
 	        src/metal/metal_backend.mm src/loader.cpp \
 	        -framework Foundation -framework Metal -o $@
 
+build/test_metal_engine_contracts: src/metal/test_metal_engine_contracts.cpp \
+                                   src/metal/metal_engine.cpp src/metal/metal_backend.mm \
+                                   src/metal/metal_engine.h src/metal/metal_backend.h \
+                                   src/metal/q27_kernels.metal src/backend.h src/loader.cpp \
+                                   src/tokenizer.cpp | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc -I src/metal src/metal/test_metal_engine_contracts.cpp \
+	        src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
+	        src/tokenizer.cpp -framework Foundation -framework Metal -o $@
+
 build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h src/kl.h \
                  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
@@ -428,4 +437,5 @@ build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+
 

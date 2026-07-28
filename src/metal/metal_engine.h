@@ -169,9 +169,11 @@ class MetalEngine {
     // disconnect). Generation stops at EOS (StopCause::Eos, the EOS token is
     // not passed to the sink), when `count` tokens have been emitted
     // (StopCause::MaxTokens), or when the sink returns false
-    // (StopCause::Cancelled). Returns the number of tokens passed to the sink.
-    // These mirror the CUDA server's generate(prompt, n_max, eos, on_token)
-    // contract so the two servers report finish_reason identically.
+    // (StopCause::Cancelled). A cancelled batched-MTP stream resets the
+    // engine because a speculative round may already have committed tokens
+    // not accepted by the sink; ingest or restore state before reuse.
+    // Returns the number of tokens accepted by the sink. These mirror the
+    // CUDA server's generate(prompt, n_max, eos, on_token) result semantics.
     enum class StopCause { MaxTokens, Eos, Cancelled };
     using TokenSink = std::function<bool(uint32_t)>;
     uint32_t stream_from_pending(uint32_t pending, uint32_t count, uint32_t eos,

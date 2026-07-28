@@ -484,11 +484,12 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
                         backend_.allocate_private((uint64_t)max_context_ * HEAD_DIM * 2),
                         backend_.allocate_private((uint64_t)max_context_ * HEAD_DIM * 2)});
 
-    // Layer-major chunked prefill routes projections through the simdgroup
-    // GEMM, so it requires the same device family. The per-chunk activation
-    // buffers total a few MiB. Every attention kernel is online-softmax now,
-    // so no probability scratch exists on any path at any context length.
-    chunked_prefill_ = chunk_capable;
+    // Layer-major chunked prefill routes every projection through
+    // activation-quantized simdgroup GEMM. Official Q4/Q8 models use that
+    // contract; Bonsai T2/B1/mixed serial projection deliberately keeps
+    // float activations, so it must remain serial until an equivalent
+    // batched float-activation path exists.
+    chunked_prefill_ = chunk_capable && has_mtp_;
     if (chunked_prefill_) {
         ch_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
         cx1_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
@@ -539,6 +540,8 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
 }
 
 void MetalEngine::set_chunked_prefill(bool enabled) {
+    if (enabled && !has_mtp_)
+        throw std::runtime_error("q27 Metal: Bonsai models require serial float-activation prefill");
     if (enabled && !ch_)
         throw std::runtime_error("q27 Metal: chunked prefill requires quantized matmul support");
     chunked_prefill_ = enabled;
@@ -2084,7 +2087,17 @@ uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint3
     // commit() streams one token through the sink, stopping on EOS or cancel.
     auto commit = [&](uint32_t token) -> bool {
         if (token == eos) { cause = StopCause::Eos; return true; }
-        if (!sink(token)) { cause = StopCause::Cancelled; return true; }
+        if (!sink(token)) {
+            // mtp_round commits a whole accepted prefix before delivery. A
+            // cancelled sink owns none of the current token and may own only
+            // part of that prefix, so the speculative engine state cannot be
+            // reused. Reset explicitly; the server already cached prompt
+            // state before generation and cancelled requests never cache
+            // post-generation state.
+            reset();
+            cause = StopCause::Cancelled;
+            return true;
+        }
         emitted++;
         return false;
     };
