@@ -559,8 +559,17 @@ struct ToolChoice {
     enum Mode { AUTO, NONE, FORCED } mode = AUTO;
     std::string forced_name; // non-empty only for a named function choice
     std::vector<std::string> allowed_names; // empty = every declared tool
+    bool disable_parallel_tool_use = false;
     bool invalid = false;
 };
+
+template<class NameSet>
+inline bool tool_choice_allows_call(const ToolChoice& choice,const NameSet& allowed,
+                                    const std::string& name,size_t accepted_calls) {
+    return choice.mode != ToolChoice::NONE && allowed.count(name) &&
+        (choice.forced_name.empty() || name == choice.forced_name) &&
+        (!choice.disable_parallel_tool_use || accepted_calls == 0);
+}
 inline ToolChoice parse_tool_choice(const json& body) {
     ToolChoice tc;
     if (!body.contains("tool_choice")) return tc;
@@ -615,6 +624,48 @@ inline ToolChoice parse_tool_choice(const json& body) {
                 tc.allowed_names.push_back(name);
         }
         if (tc.allowed_names.empty()) tc.invalid = true;
+        return tc;
+    }
+    tc.invalid = true;
+    return tc;
+}
+
+// Anthropic tool_choice: absent/auto -> AUTO, none -> NONE, any -> FORCED
+// across the declared registry, and tool{name} -> FORCED for that one tool.
+inline ToolChoice parse_anthropic_tool_choice(const json& body) {
+    ToolChoice tc;
+    if (!body.contains("tool_choice") || body["tool_choice"].is_null()) return tc;
+    const json& v = body["tool_choice"];
+    if (!v.is_object() || !v.contains("type") || !v["type"].is_string()) {
+        tc.invalid = true;
+        return tc;
+    }
+    if (v.contains("disable_parallel_tool_use")) {
+        if (!v["disable_parallel_tool_use"].is_boolean()) {
+            tc.invalid = true;
+            return tc;
+        }
+        tc.disable_parallel_tool_use = v["disable_parallel_tool_use"].get<bool>();
+    }
+    const std::string type = v["type"].get<std::string>();
+    if (type == "auto") return tc;
+    if (type == "none") {
+        tc.mode = ToolChoice::NONE;
+        return tc;
+    }
+    if (type == "any") {
+        tc.mode = ToolChoice::FORCED;
+        return tc;
+    }
+    if (type == "tool") {
+        if (!v.contains("name") || !v["name"].is_string() ||
+            v["name"].get_ref<const std::string&>().empty()) {
+            tc.invalid = true;
+            return tc;
+        }
+        tc.mode = ToolChoice::FORCED;
+        tc.forced_name = v["name"].get<std::string>();
+        tc.allowed_names.push_back(tc.forced_name);
         return tc;
     }
     tc.invalid = true;

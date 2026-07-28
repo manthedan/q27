@@ -341,6 +341,60 @@ static void test_tool_choice_allowed_tools() {
     CHECK(threw);
 }
 
+static void test_anthropic_tool_choice_shapes() {
+    auto absent=q27::parse_anthropic_tool_choice(json::object());
+    CHECK(absent.mode == q27::ToolChoice::AUTO);
+    CHECK(!absent.invalid);
+    auto automatic=q27::parse_anthropic_tool_choice(
+        {{"tool_choice",{{"type","auto"},{"disable_parallel_tool_use",true}}}});
+    CHECK(automatic.mode == q27::ToolChoice::AUTO);
+    CHECK(!automatic.invalid);
+    CHECK(automatic.disable_parallel_tool_use);
+    auto none=q27::parse_anthropic_tool_choice({{"tool_choice",{{"type","none"}}}});
+    CHECK(none.mode == q27::ToolChoice::NONE);
+    auto any=q27::parse_anthropic_tool_choice({{"tool_choice",{{"type","any"}}}});
+    CHECK(any.mode == q27::ToolChoice::FORCED);
+    CHECK(any.forced_name.empty());
+    auto named=q27::parse_anthropic_tool_choice(
+        {{"tool_choice",{{"type","tool"},{"name","get_weather"}}}});
+    CHECK(named.mode == q27::ToolChoice::FORCED);
+    CHECK(named.forced_name == "get_weather");
+    CHECK(named.allowed_names.size() == 1);
+    json body={{"tools",json::array({
+        {{"name","get_weather"},{"description","weather"},
+         {"input_schema",{{"type","object"}}}},
+        {{"name","get_time"},{"input_schema",{{"type","object"}}}}
+    })}};
+    json normalized={{"tools",q27::anthropic_tools_json(body)}};
+    auto selected=q27::select_openai_tools(normalized,named);
+    CHECK(selected.names.size() == 1);
+    CHECK(selected.names[0] == "get_weather");
+    const std::set<std::string> declared={"get_weather","get_time"};
+    CHECK(q27::tool_choice_allows_call(named,declared,"get_weather",0));
+    CHECK(!q27::tool_choice_allows_call(named,declared,"get_time",0));
+    CHECK(!q27::tool_choice_allows_call(none,declared,"get_weather",0));
+    CHECK(q27::tool_choice_allows_call(automatic,declared,"get_weather",0));
+    CHECK(!q27::tool_choice_allows_call(automatic,declared,"get_time",1));
+    CHECK(!q27::tool_choice_allows_call(automatic,declared,"undeclared",0));
+    bool missing_threw=false;
+    try {
+        auto missing=q27::parse_anthropic_tool_choice(
+            {{"tool_choice",{{"type","tool"},{"name","missing"}}}});
+        (void)q27::select_openai_tools(normalized,missing);
+    } catch(const std::runtime_error&) { missing_threw=true; }
+    CHECK(missing_threw);
+    for(const json& value:json::array({
+            json("auto"), json::object(), json{{"type","tool"}},
+            json{{"type","tool"},{"name",""}}, json{{"type","unknown"}}
+        })) {
+        auto malformed=q27::parse_anthropic_tool_choice({{"tool_choice",value}});
+        CHECK(malformed.invalid);
+    }
+    auto bad_parallel=q27::parse_anthropic_tool_choice(
+        {{"tool_choice",{{"type","auto"},{"disable_parallel_tool_use","yes"}}}});
+    CHECK(bad_parallel.invalid);
+}
+
 static void test_responses_tool_choice_shapes() {
     auto named=q27::parse_responses_tool_choice({{"tool_choice",{{"type","function"},{"name","get_weather"}}}});
     CHECK(named.mode == q27::ToolChoice::FORCED);
@@ -560,6 +614,7 @@ int main() {
     test_tool_choice_unknown_string_is_auto();
     test_tool_choice_malformed_named_is_invalid();
     test_tool_choice_allowed_tools();
+    test_anthropic_tool_choice_shapes();
     test_responses_tool_choice_shapes();
     test_stream_options_include_usage();
     test_end_to_end_chatml_prompt();
