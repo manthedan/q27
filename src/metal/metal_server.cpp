@@ -4276,11 +4276,14 @@ int main(int argc,char** argv) {
                         }
                         Runtime::Outcome outcome;
                         if(test_tool_fallback) {
-                            route(q27::StreamSplitter::TOOL,"{\"arguments\":");
-                            std::string fixture="{},\"name\":\"fallback_tool\"}";
-                            if(tchoice.disable_parallel_tool_use)
-                                fixture+="{\"arguments\":{},\"name\":\"fallback_tool\"}";
-                            route(q27::StreamSplitter::TOOL,fixture);
+                            if(tchoice.disable_parallel_tool_use) {
+                                route(q27::StreamSplitter::TOOL,
+                                    "{\"name\":\"fallback_tool\",\"arguments\":{}}"
+                                    "{\"name\":\"fallback_tool\",\"arguments\":{}}");
+                            } else {
+                                route(q27::StreamSplitter::TOOL,"{\"arguments\":");
+                                route(q27::StreamSplitter::TOOL,"{},\"name\":\"fallback_tool\"}");
+                            }
                             outcome.prompt_tokens=(uint32_t)ids.size();
                             outcome.output_tokens=1;
                             outcome.finish=Runtime::Finish::Stop;
