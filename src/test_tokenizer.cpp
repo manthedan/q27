@@ -3,6 +3,8 @@
 // cases.txt: alternating lines — text line, then space-separated reference ids.
 #include <algorithm>
 #include <atomic>
+#include <dirent.h>
+#include <unistd.h>
 #include <cstdio>
 #include <fstream>
 #include <chrono>
@@ -247,11 +249,87 @@ static int anthropic_api_selftest() {
     printf("anthropic api shapes: %s\n", fail ? "FAIL" : "PASS");
     return fail;
 }
+static int count_open_fds() {
+    for (const char* root : {"/proc/self/fd", "/dev/fd"}) {
+        DIR* dir = opendir(root);
+        if (!dir) continue;
+        int count = 0;
+        while (dirent* ent = readdir(dir))
+            if (ent->d_name[0] != '.') count++;
+        closedir(dir);
+        return count;
+    }
+    return -1;
+}
+
+static int tokenizer_failure_selftest() {
+    char path[] = "/tmp/q27-tokenizer-failure-XXXXXX";
+    int raw_fd = mkstemp(path);
+    if (raw_fd < 0) {
+        perror("mkstemp");
+        return 1;
+    }
+    close(raw_fd);
+
+    auto append_u32 = [](std::string& out, uint32_t value) {
+        out.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+    auto expect_fail = [&](const std::string& bytes, const char* name) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), (std::streamsize)bytes.size());
+        out.close();
+        try {
+            q27::Tokenizer tokenizer(path);
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        printf("tokenizer lifetime FAIL %s: construction succeeded\n", name);
+        return false;
+    };
+
+    std::string bad_magic;
+    for (int i = 0; i < 5; i++) append_u32(bad_magic, 0);
+    std::string short_header("Q27", 3);
+    std::string short_token;
+    append_u32(short_token, 0x54373251);
+    append_u32(short_token, 1);
+    append_u32(short_token, 1);
+    append_u32(short_token, 0);
+    append_u32(short_token, 0);
+    const uint16_t token_len = 4;
+    short_token.append(reinterpret_cast<const char*>(&token_len), sizeof(token_len));
+    short_token.push_back('x');
+
+    const int before = count_open_fds();
+    bool ok = true;
+    for (int i = 0; i < 100; i++) {
+        ok = expect_fail(bad_magic, "bad magic") && ok;
+        ok = expect_fail(short_header, "short header") && ok;
+        ok = expect_fail(short_token, "short token") && ok;
+        try {
+            q27::Tokenizer tokenizer(std::string(path) + ".missing");
+            printf("tokenizer lifetime FAIL nonexistent: construction succeeded\n");
+            ok = false;
+        } catch (const std::runtime_error&) {
+        }
+    }
+    const int after = count_open_fds();
+    if (before >= 0 && after != before) {
+        printf("tokenizer lifetime FAIL descriptors: before=%d after=%d\n", before, after);
+        ok = false;
+    }
+    std::remove(path);
+    printf("tokenizer failure lifetime: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 
 int main(int argc, char** argv) {
     if (utf8gate_selftest()) return 2;
     if (gpu_gate_selftest()) return 3;
     if (anthropic_api_selftest()) return 4;
+    if (tokenizer_failure_selftest()) return 5;
+    if (argc == 2 && std::string(argv[1]) == "--selftest") return 0;
     if (argc != 3) { fprintf(stderr, "usage: %s q27.tok cases.txt\n", argv[0]); return 1; }
     q27::Tokenizer tok(argv[1]);
     std::ifstream in(argv[2]);

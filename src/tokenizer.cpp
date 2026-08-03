@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdint>
 #include <unordered_map>
+#include <memory>
 
 namespace q27 {
 
@@ -44,30 +45,42 @@ struct Tokenizer::Impl {
     std::vector<std::pair<std::string, int>> specials; // control tokens, longest first
 };
 
+struct FileCloser {
+    void operator()(FILE* f) const { if (f) fclose(f); }
+};
+
+template <typename T>
+static void read_exact(FILE* f, T* out, size_t count) {
+    if (count && fread(out, sizeof(T), count, f) != count)
+        throw std::runtime_error("tok: truncated");
+}
+
 static std::string read_lp(FILE* f) {
-    uint16_t n;
-    if (fread(&n, 2, 1, f) != 1) throw std::runtime_error("tok: truncated");
+    uint16_t n = 0;
+    read_exact(f, &n, 1);
     std::string s(n, 0);
-    if (n && fread(s.data(), 1, n, f) != n) throw std::runtime_error("tok: truncated");
+    read_exact(f, s.data(), n);
     return s;
 }
 
-Tokenizer::Tokenizer(const std::string& path) : impl_(new Impl) {
-    FILE* f = fopen(path.c_str(), "rb");
+Tokenizer::Tokenizer(const std::string& path) : impl_(std::make_unique<Impl>()) {
+    std::unique_ptr<FILE, FileCloser> f(fopen(path.c_str(), "rb"));
     if (!f) throw std::runtime_error("tok: cannot open " + path);
-    uint32_t magic, ver, n, bos, eos;
-    fread(&magic, 4, 1, f); fread(&ver, 4, 1, f); fread(&n, 4, 1, f);
-    fread(&bos, 4, 1, f); fread(&eos, 4, 1, f);
+    uint32_t magic = 0, ver = 0, n = 0, bos = 0, eos = 0;
+    read_exact(f.get(), &magic, 1);
+    read_exact(f.get(), &ver, 1);
+    read_exact(f.get(), &n, 1);
+    read_exact(f.get(), &bos, 1);
+    read_exact(f.get(), &eos, 1);
     if (magic != 0x54373251) throw std::runtime_error("tok: bad magic");
     bos_ = (int)bos; eos_ = (int)eos;
     tokens_.reserve(n);
-    for (uint32_t i = 0; i < n; i++) tokens_.push_back(read_lp(f));
+    for (uint32_t i = 0; i < n; i++) tokens_.push_back(read_lp(f.get()));
     types_.resize(n);
-    fread(types_.data(), 1, n, f);
-    uint32_t nm;
-    fread(&nm, 4, 1, f);
-    for (uint32_t i = 0; i < nm; i++) impl_->merge_rank.emplace(read_lp(f), (int)i);
-    fclose(f);
+    read_exact(f.get(), types_.data(), n);
+    uint32_t nm = 0;
+    read_exact(f.get(), &nm, 1);
+    for (uint32_t i = 0; i < nm; i++) impl_->merge_rank.emplace(read_lp(f.get()), (int)i);
 
     for (uint32_t i = 0; i < n; i++) impl_->tok2id.emplace(tokens_[i], (int)i);
     build_byte_maps(impl_->b2u, impl_->u2b);
@@ -230,6 +243,9 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& t) const {
     }
     return out;
 }
+
+
+Tokenizer::~Tokenizer() = default;
 
 std::vector<int> Tokenizer::encode(const std::string& text) const {
     std::vector<int> out;

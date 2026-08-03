@@ -4,6 +4,7 @@
 // against llama-tokenize on an English/code corpus (see test_tokenizer).
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,9 @@ namespace q27 {
 class Tokenizer {
   public:
     explicit Tokenizer(const std::string& tok_path);
+    ~Tokenizer();
+    Tokenizer(const Tokenizer&) = delete;
+    Tokenizer& operator=(const Tokenizer&) = delete;
 
     std::vector<int> encode(const std::string& text) const; // handles special tokens
     std::string decode(const std::vector<int>& ids) const;
@@ -44,7 +48,7 @@ class Tokenizer {
     int bos_ = 0, eos_ = 0;
     // lookup structures built at load
     struct Impl;
-    Impl* impl_;
+    std::unique_ptr<Impl> impl_;
 
     std::vector<int> bpe_word(const std::string& word) const;
     std::vector<std::string> pretokenize(const std::string& text) const;
