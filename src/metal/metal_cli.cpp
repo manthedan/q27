@@ -1217,8 +1217,10 @@ int main(int argc, char** argv) {
         q27::MetalEngine engine(model_path, context, turbo3_kv);
         if (serial_prefill) engine.set_chunked_prefill(false);
         auto loaded = std::chrono::steady_clock::now();
-        fprintf(stderr, "Metal model ready on %s in %.2f s\n", engine.backend().name().c_str(),
-                std::chrono::duration<double>(loaded - start).count());
+        fprintf(stderr, "Metal model ready on %s in %.2f s (shader sha1 %s)\n",
+                engine.backend().name().c_str(),
+                std::chrono::duration<double>(loaded - start).count(),
+                engine.backend().shader_source_sha1().c_str());
         if (validate_only) { puts("artifacts and Metal architecture: OK"); return 0; }
 
         if (!nll_path.empty()) {
