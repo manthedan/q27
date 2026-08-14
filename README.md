@@ -32,6 +32,15 @@ MTP head and a zero-cost suffix drafter, KV state snapshots and restores
 byte-exactly, and the measurement discipline described below kills
 attractive ideas before they ship.
 
+**Metal model preference:** when a locally repacked Qwen3.8-27B artifact is
+available, use `qwen38-27b-mtp-q4s.q27` as the 24 GB Apple Silicon default.
+Qwen3.6 remains the published download and benchmark baseline. This is a Metal
+fit/throughput choice, not a transfer of the Qwen3.6 q4s quality claim:
+Qwen3.8 q4s measures 0.73% worse PPL than its own default tier, but the larger
+tiers lose substantial Metal throughput and memory headroom. Run
+`make test-metal-qwen38` and `make test-metal-qwen38-serving`; measured evidence
+is recorded in `docs/metal/BUILDLOG.md`.
+
 ## Acknowledgements
 
 - [antirez/ds4](https://github.com/antirez/ds4): the model for what this
