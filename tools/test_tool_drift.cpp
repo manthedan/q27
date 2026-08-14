@@ -39,6 +39,91 @@ static json tool(const char* name, std::vector<std::pair<std::string, bool>> par
 // it -- string still open, object never parsed, call UN-RESCUED. The real
 // payload was a Write whose markdown content was cut while writing an escaped
 // JSON example (`\\"role\\": \\"assistant\\",\\`).
+// Drift mode 14 (2026-08-14, captured live from a thunderdome run on the
+// Qwen3.8-27B q5f repack, bench-time-tracker trial-1). The model was told to
+// emit `<tool_call>\n{"name":..., "arguments":{...}}\n</tool_call>` by
+// tools_preamble and DID so correctly on turn 1, then drifted on turn 2 into
+// its chat-template's XML dialect with no <tool_call> wrapper at all:
+//
+//   <tool_name>Read</tool_name>
+//   <parameter=file_path>/workspace/tests/index.test.ts</parameter>
+//   <tool_name>Bash</tool_name>
+//   <parameter=arguments>
+//   {"command":"...","description":"..."}}
+//
+// Three things make this its own mode rather than a variant of 10/11:
+//   1. TWO calls are concatenated in one assistant block.
+//   2. The conventions DISAGREE between them -- Read uses a scalar
+//      <parameter=KEY>VALUE</parameter>, Bash uses <parameter=arguments>
+//      wrapping a whole JSON object and never closes the tag.
+//   3. The Bash payload carries one unbalanced trailing brace.
+//
+// Claude Code saw plain text, made no tool call, and the trial ended at
+// num_turns=2 scoring 0.000 -- the same shape as the pre-fix 3.6 agentic
+// ceiling, which was parser-bound rather than quality-bound.
+//
+// NOT YET RESCUED. This fixture pins the observed bytes and the CURRENT
+// behaviour so a future parser change has a real target and a regression
+// witness. Flip `expect_rescued` to true in the same commit that teaches
+// parse_bare_tool_calls this dialect.
+// Drift mode 15 (2026-08-14, Qwen3.8-27B): surfaced by re-running the same
+// thunderdome task once mode 14 stopped the earlier stall. An unclosed <name>
+// pseudo-tag, then a bare identifier and JSON args with no opening brace or
+// quote, plus the same trailing unbalanced brace seen in mode 14.
+static void test_mode15_name_tag_bare_args() {
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}])");
+    // Verbatim bytes from the captured transcript.
+    std::string t =
+        "<name>Bash, \"arguments\": {\"command\":\"ls /workspace/tests /workspace/src && cat "
+        "/workspace/.eslintrc.cjs /workspace/vitest.config.ts\",\"description\":\"List tests "
+        "and src, show eslint and vitest config\"}}";
+    std::string pre;
+    auto v = q27::parse_bare_tool_calls(t, &pre, &tools);
+    ok(v.size() == 1 && v[0].ok && v[0].name == "Bash",
+       "mode15: <name> pseudo-tag with bare args recovered");
+    if (v.size() == 1)
+        ok(v[0].arguments.value("description", std::string()) ==
+               "List tests and src, show eslint and vitest config",
+           "mode15: trailing unbalanced brace tolerated, args intact");
+    // An undeclared name must NOT be rescued.
+    std::string bad = "<name>NotATool, \"arguments\": {\"x\":1}}";
+    auto v2 = q27::parse_bare_tool_calls(bad, &pre, &tools);
+    ok(v2.empty(), "mode15: undeclared name is rejected");
+}
+
+static void test_mode14_tool_name_xml_dialect() {
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}])");
+    // Verbatim bytes from the captured transcript.
+    std::string t =
+        "<tool_name>Read</tool_name>\n"
+        "<parameter=file_path>/workspace/tests/index.test.ts</parameter>\n"
+        "<tool_name>Bash</tool_name>\n"
+        "<parameter=arguments>\n"
+        "{\"command\":\"ls /workspace/src /workspace/tests && cat /workspace/.eslintrc.cjs "
+        "/workspace/vitest.config.ts\",\"description\":\"List src/tests and show eslint and "
+        "vitest configs\"}}";
+    const bool expect_rescued = true;    // rescued as of the mode-14 parser path
+    std::string pre;
+    auto v = q27::parse_bare_tool_calls(t, &pre, &tools);
+    ok((!v.empty()) == expect_rescued,
+       expect_rescued ? "mode14: <tool_name>/<parameter=> dialect rescued"
+                      : "mode14: <tool_name>/<parameter=> dialect UN-RESCUED (documented)");
+    // Both calls must come back, with the scalar parameter AND the JSON-object
+    // parameter each mapped correctly, and the trailing brace tolerated.
+    ok(v.size() == 2, "mode14: both concatenated calls recovered");
+    if (v.size() == 2) {
+        ok(v[0].ok && v[0].name == "Read" &&
+               v[0].arguments.value("file_path", std::string()) ==
+                   "/workspace/tests/index.test.ts",
+           "mode14: scalar <parameter=file_path> mapped");
+        ok(v[1].ok && v[1].name == "Bash" &&
+               v[1].arguments.value("command", std::string()).rfind("ls /workspace/src", 0) == 0 &&
+               v[1].arguments.value("description", std::string()) ==
+                   "List src/tests and show eslint and vitest configs",
+           "mode14: <parameter=arguments> JSON object merged, trailing brace tolerated");
+    }
+}
+
 static void test_mode13_truncated_mid_escape() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}}])");
     // trailing dangling backslash
@@ -63,6 +148,8 @@ static void test_mode13_truncated_mid_escape() {
 
 int main() {
     test_mode13_truncated_mid_escape();
+    test_mode14_tool_name_xml_dialect();
+    test_mode15_name_tag_bare_args();
     json tools = json::array();
     tools.push_back(tool("Write", {{"content", true}, {"file_path", true}}));
     tools.push_back(tool("Read", {{"file_path", true}}));

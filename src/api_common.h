@@ -1422,6 +1422,167 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     text_in.c_str());
         return out;
     }
+    // DRIFT MODE 14 (2026-08-14, Qwen3.8-27B): the model abandons the
+    // <tool_call>{json}</tool_call> form it was instructed to use and emits its
+    // chat-template's XML dialect instead, with no wrapper at all:
+    //
+    //   <tool_name>Read</tool_name>
+    //   <parameter=file_path>/w/x.ts</parameter>
+    //   <tool_name>Bash</tool_name>
+    //   <parameter=arguments>\n{"command":"...","description":"..."}}
+    //
+    // Note the conventions disagree WITHIN one block: a scalar parameter with a
+    // proper closer, then <parameter=arguments> carrying a whole JSON object,
+    // unterminated, with a trailing unbalanced brace. Both must be recovered or
+    // the turn is lost -- Claude Code sees plain text and the session ends.
+    //
+    // Engages ONLY when <tool_name> is present AND names a declared tool, so no
+    // input that lacks this dialect can reach it.
+    {
+        static const std::string TN_OPEN = "<tool_name>", TN_CLOSE = "</tool_name>";
+        static const std::string PM_OPEN = "<parameter=", PM_CLOSE = "</parameter>";
+        size_t first = text_in.find(TN_OPEN);
+        if (first != std::string::npos && tools && tools->is_array()) {
+            auto declared = [&](const std::string& nm) {
+                for (const auto& t : *tools)
+                    if (t.contains("function") &&
+                        t["function"].value("name", std::string()) == nm) return true;
+                return false;
+            };
+            auto trim = [](std::string v) {
+                size_t b = v.find_first_not_of(" \t\r\n");
+                if (b == std::string::npos) return std::string();
+                size_t e = v.find_last_not_of(" \t\r\n");
+                return v.substr(b, e - b + 1);
+            };
+            // Tolerate a trailing unbalanced brace on the JSON payload.
+            auto parse_relaxed = [&](std::string v) -> json {
+                v = trim(std::move(v));
+                for (int drop = 0; drop < 4 && !v.empty(); drop++) {
+                    try { json j = json::parse(v); if (j.is_object()) return j; }
+                    catch (...) {}
+                    if (v.back() == '}' || isspace((unsigned char)v.back()))
+                        { v.pop_back(); v = trim(std::move(v)); }
+                    else break;
+                }
+                return json();
+            };
+            std::vector<ToolCall> xml_calls;
+            size_t p = first;
+            while ((p = text_in.find(TN_OPEN, p)) != std::string::npos) {
+                size_t ns = p + TN_OPEN.size();
+                size_t ne = text_in.find(TN_CLOSE, ns);
+                if (ne == std::string::npos) break;
+                const std::string nm = trim(text_in.substr(ns, ne - ns));
+                size_t next_call = text_in.find(TN_OPEN, ne);
+                size_t span_end = next_call == std::string::npos ? text_in.size() : next_call;
+                if (!declared(nm)) { p = ne + TN_CLOSE.size(); continue; }
+                ToolCall tc;
+                tc.name = nm;
+                tc.arguments = json::object();
+                tc.source_begin = p;
+                tc.source_end = span_end;
+                size_t q = ne + TN_CLOSE.size();
+                while (true) {
+                    size_t ps = text_in.find(PM_OPEN, q);
+                    if (ps == std::string::npos || ps >= span_end) break;
+                    size_t ks = ps + PM_OPEN.size();
+                    size_t kend = text_in.find('>', ks);
+                    if (kend == std::string::npos || kend >= span_end) break;
+                    const std::string key = trim(text_in.substr(ks, kend - ks));
+                    size_t vs = kend + 1;
+                    size_t ve = text_in.find(PM_CLOSE, vs);
+                    if (ve == std::string::npos || ve > span_end) ve = span_end;  // missing closer
+                    const std::string val = text_in.substr(vs, ve - vs);
+                    if (key == "arguments") {
+                        json j = parse_relaxed(val);
+                        if (j.is_object())
+                            for (auto it = j.begin(); it != j.end(); ++it)
+                                tc.arguments[it.key()] = it.value();
+                    } else if (!key.empty()) {
+                        tc.arguments[key] = trim(val);
+                    }
+                    q = ve == span_end ? span_end : ve + PM_CLOSE.size();
+                    if (q >= span_end) break;
+                }
+                if (!tc.arguments.empty()) { tc.ok = true; xml_calls.push_back(std::move(tc)); }
+                p = span_end;
+            }
+            if (!xml_calls.empty()) {
+                if (prefix) *prefix = text_in.substr(0, first);
+                if (remaining_text) *remaining_text = "";
+                fprintf(stderr, "[q27] drift mode 14: recovered %zu <tool_name> call(s)\n",
+                        xml_calls.size());
+                return xml_calls;
+            }
+        }
+    }
+
+    // DRIFT MODE 15 (2026-08-14, Qwen3.8-27B, found by re-running the same
+    // thunderdome task after mode 14 landed). One drift deeper than 14: the
+    // model drops the XML parameter form but still prefixes an unclosed pseudo
+    // tag, then falls back toward JSON without the opening brace or quote:
+    //
+    //   <name>Bash, "arguments": {"command":"...","description":"..."}}
+    //
+    // This is mode 10 (dropped `{"name": "` opener) wearing an XML hat: mode 10
+    // does not fire because the leading `<name>` prevents the bare-identifier
+    // match, and mode 14 does not fire because there is no </tool_name> and no
+    // <parameter=. Same trailing unbalanced brace as 14.
+    //
+    // Engages ONLY when the identifier after <name> is a declared tool.
+    {
+        static const std::string NM_OPEN = "<name>";
+        size_t p = text_in.find(NM_OPEN);
+        if (p != std::string::npos && tools && tools->is_array()) {
+            size_t ns = p + NM_OPEN.size();
+            while (ns < text_in.size() && isspace((unsigned char)text_in[ns])) ns++;
+            size_t ne = ns;
+            while (ne < text_in.size() &&
+                   (isalnum((unsigned char)text_in[ne]) || text_in[ne] == '_' ||
+                    text_in[ne] == '-' || text_in[ne] == '.')) ne++;
+            const std::string nm = text_in.substr(ns, ne - ns);
+            bool declared = false;
+            for (const auto& t : *tools)
+                if (t.contains("function") &&
+                    t["function"].value("name", std::string()) == nm) declared = true;
+            if (declared && !nm.empty()) {
+                size_t ab = text_in.find("\"arguments\"", ne);
+                json args = json::object();
+                bool have = false;
+                if (ab != std::string::npos) {
+                    size_t ob = text_in.find('{', ab);
+                    if (ob != std::string::npos) {
+                        std::string body = text_in.substr(ob);
+                        for (int drop = 0; drop < 4 && !body.empty(); drop++) {
+                            try {
+                                json j = json::parse(body);
+                                if (j.is_object()) { args = j; have = true; break; }
+                            } catch (...) {}
+                            while (!body.empty() && isspace((unsigned char)body.back()))
+                                body.pop_back();
+                            if (!body.empty() && body.back() == '}') body.pop_back();
+                            else break;
+                        }
+                    }
+                }
+                if (have) {
+                    ToolCall tc;
+                    tc.ok = true;
+                    tc.name = nm;
+                    tc.arguments = std::move(args);
+                    tc.source_begin = p;
+                    tc.source_end = text_in.size();
+                    if (prefix) *prefix = text_in.substr(0, p);
+                    if (remaining_text) *remaining_text = "";
+                    fprintf(stderr, "[q27] drift mode 15: recovered <name>%s bare-args call\n",
+                            nm.c_str());
+                    return std::vector<ToolCall>{std::move(tc)};
+                }
+            }
+        }
+    }
+
     bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
     bool m10 = false;                                    // mode 10: in-string quote re-escaped
     // drift mode 9 (2026-07-11, codex-harnessed traffic): the model drops the
