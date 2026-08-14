@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Repack a BF16 GGUF into the q27 v1 format (see docs/FORMAT.md).
+"""Repack BF16 GGUF weights into the q27 v1 format (see docs/FORMAT.md).
 
 Usage:
-  repack.py input.gguf output.q27 [--only REGEX] [--report N]
+  repack.py input.gguf output.q27 [--mtp mtp.gguf] [--only REGEX] [--report N]
 
+--mtp joins the companion MTP GGUF emitted by current llama.cpp conversions;
+the primary GGUF supplies blocks 0..63 and the companion supplies block 64.
 --only limits to tensors matching REGEX (smoke tests).
 --report prints the N worst tensors by relative RMSE after quantization.
 
@@ -210,11 +212,76 @@ def repack_b1(t):
 
     return qs.tobytes(), scales.tobytes()
 
+def _field_value(reader, name):
+    field = reader.fields.get(name)
+    if field is None:
+        return None
+    value = field.contents()
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
+
+
+def _tensor_signature(tensor):
+    return tensor.tensor_type.name, tuple(int(d) for d in tensor.shape)
+
+def _tensor_data_equal(left, right):
+    left_bytes = np.asarray(left.data).view(np.uint8).reshape(-1)
+    right_bytes = np.asarray(right.data).view(np.uint8).reshape(-1)
+    if left_bytes.size != right_bytes.size:
+        return False
+    chunk = 64 * 1024 * 1024
+    return all(np.array_equal(left_bytes[off:off + chunk], right_bytes[off:off + chunk])
+               for off in range(0, left_bytes.size, chunk))
+
+
+def merge_mtp_tensors(primary, companion):
+    """Join llama.cpp's --no-mtp and --mtp GGUF views without duplicates."""
+    if _field_value(primary, "general.architecture") != "qwen35":
+        raise ValueError("--mtp requires a qwen35 primary GGUF")
+    if _field_value(companion, "general.architecture") != "qwen35":
+        raise ValueError("--mtp companion is not a qwen35 GGUF")
+    primary_name = _field_value(primary, "general.name")
+    companion_name = _field_value(companion, "general.name")
+    if primary_name and companion_name and primary_name != companion_name:
+        raise ValueError(f"--mtp checkpoint mismatch: {primary_name!r} != {companion_name!r}")
+    if _field_value(primary, "qwen35.block_count") != 64:
+        raise ValueError("--mtp primary must contain the 64 base blocks")
+    if (_field_value(companion, "qwen35.block_count") != 65
+            or _field_value(companion, "qwen35.nextn_predict_layers") != 1):
+        raise ValueError("--mtp companion must describe one MTP layer (block_count=65)")
+
+    primary_by_name = {t.name: t for t in primary.tensors}
+    if len(primary_by_name) != len(primary.tensors):
+        raise ValueError("primary GGUF contains duplicate tensor names")
+    companion_by_name = {t.name: t for t in companion.tensors}
+    if len(companion_by_name) != len(companion.tensors):
+        raise ValueError("MTP GGUF contains duplicate tensor names")
+
+    allowed_shared = {"token_embd.weight", "output_norm.weight", "output.weight"}
+    shared = set(primary_by_name) & set(companion_by_name)
+    unexpected = shared - allowed_shared
+    if unexpected:
+        raise ValueError("--mtp companion overlaps primary tensors: "
+                         + ", ".join(sorted(unexpected)))
+    for name in shared:
+        if _tensor_signature(primary_by_name[name]) != _tensor_signature(companion_by_name[name]):
+            raise ValueError(f"--mtp shared tensor shape/type mismatch: {name}")
+        if not _tensor_data_equal(primary_by_name[name], companion_by_name[name]):
+            raise ValueError(f"--mtp shared tensor contents differ: {name}")
+
+    mtp_only = [t for t in companion.tensors if t.name not in primary_by_name]
+    if not mtp_only or any(not t.name.startswith("blk.64.") for t in mtp_only):
+        raise ValueError("--mtp companion must add only blk.64 tensors")
+    return list(primary.tensors) + mtp_only
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
     ap.add_argument("output")
+    ap.add_argument("--mtp", default=None,
+                    help="companion BF16 MTP GGUF (llama.cpp --mtp output)")
     ap.add_argument("--only", default=None)
     ap.add_argument("--report", type=int, default=15)
     ap.add_argument("--q8", default=None,
@@ -232,10 +299,18 @@ def main():
 
     t0 = time.time()
     r = GGUFReader(args.input)
-    ternary = any(t.tensor_type.name == "Q2_0" for t in r.tensors)
-    binary = any(t.tensor_type.name == "Q1_0" for t in r.tensors)
+    mtp_reader = GGUFReader(args.mtp) if args.mtp else None
+    source_tensors = merge_mtp_tensors(r, mtp_reader) if mtp_reader else list(r.tensors)
+    ternary = any(t.tensor_type.name == "Q2_0" for t in source_tensors)
+    binary = any(t.tensor_type.name == "Q1_0" for t in source_tensors)
+    if mtp_reader and (ternary or binary):
+        raise ValueError("--mtp is only supported for BF16/F16/F32 source GGUFs")
     if binary and ternary:
         raise ValueError("pack unexpectedly contains both binary (Q1_0) and ternary (Q2_0) tensors")
+    if (not mtp_reader and not ternary and not binary
+            and _field_value(r, "general.architecture") == "qwen35"
+            and _field_value(r, "qwen35.block_count") == 64):
+        raise ValueError("base-only qwen35 GGUF: supply its companion with --mtp")
 
     meta = {"q27_version": VERSION,
             "quant_policy": args.tag or ("bonsai-t2-v1" if ternary
@@ -256,18 +331,20 @@ def main():
         meta["q8_extra"] = args.q8
     if args.q4_head:
         meta["q4_head"] = True
-    for f in r.fields.values():
-        if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
-            try:
-                v = f.contents()
-                if isinstance(v, bytes):
-                    v = v.decode()
-                meta[f.name] = v
-            except Exception:
-                pass
+    metadata_readers = (r, mtp_reader) if mtp_reader else (r,)
+    for metadata_reader in metadata_readers:
+        for f in metadata_reader.fields.values():
+            if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
+                try:
+                    v = f.contents()
+                    if isinstance(v, bytes):
+                        v = v.decode()
+                    meta[f.name] = v
+                except Exception:
+                    pass
     # layer map
     attn_layers, ssm_layers = set(), set()
-    for t in r.tensors:
+    for t in source_tensors:
         if t.name.startswith("blk."):
             n = int(t.name.split(".")[1])
             leaf = t.name.split(".", 2)[2]
@@ -285,7 +362,7 @@ def main():
     n_bytes_in = n_bytes_out = 0
 
     extra = []
-    for t in r.tensors:
+    for t in source_tensors:
         # MTP draft head copy: only for non-quantized-head packs and pack
         # types that carry MTP (no MTP in ternary/binary packs).
         if t.name == "output.weight" and not args.q4_head \
@@ -294,7 +371,7 @@ def main():
     class _Alias:
         def __init__(self, name, t):
             self.name, self.tensor_type, self.data, self.shape = name, t.tensor_type, t.data, t.shape
-    tensor_iter = list(r.tensors) + [_Alias(n, t) for n, t in extra]
+    tensor_iter = source_tensors + [_Alias(n, t) for n, t in extra]
     zero_fracs = []
     for t in tensor_iter:
         if only and not only.search(t.name):

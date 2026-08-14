@@ -187,49 +187,40 @@ for k in sorted(set(a) | set(b)):
 
 ## Recon log
 
-### Qwen3.8 (2026-08-05, pre-release)
+### Qwen3.8-27B release
 
-Announced 2026-08-03 alongside Qwen3.8-Max (2.4T total / 95B active), open
-weights promised "next week". No architecture disclosed: dense vs MoE, context
-length and layer shape are all unstated. Recon at the time of writing, ordered
-by strength of evidence.
+The released `Qwen/Qwen3.8-27B` checkpoint is a repack, not an engine port.
+`tools/check_checkpoint.py Qwen/Qwen3.8-27B` passes every CUDA and Metal
+constant plus the non-constant shape gates. The config still declares
+`Qwen3_5ForConditionalGeneration` / `qwen3_5`; compared with
+`Qwen/Qwen3.6-27B`, the only flattened config difference is the recorded
+`transformers_version`.
 
-**vLLM already loads a Qwen3.8 checkpoint through the Qwen3.5 class.**
-[vllm-project/vllm#50068](https://github.com/vllm-project/vllm/pull/50068)
-touches only `models/qwen3_5.py` and exposes Gated DeltaNet cache metadata
-"so text-only Qwen3.5-compatible checkpoints such as Qwen3.8 Max FP8 can
-initialize through the causal LM path". The diff reads
-`linear_num_key_heads`, `linear_num_value_heads`, `linear_key_head_dim`,
-`linear_value_head_dim` and `linear_conv_kernel_dim` -- the same config
-surface as the table above. The author reports validating it on a two-node
-ROCm TP=8/PP=2 deployment, so real weights were involved. This is Max, not
-the 27B, but it dates the generation's architecture.
+The Hugging Face safetensor indexes have the same 1,199 tensor names and the
+same aggregate byte count. The released GGUF layout is different, however:
+`ggml-org/Qwen3.8-27B-GGUF` publishes the 64 base blocks and the MTP block as
+separate standalone files rather than GGUF split shards. The base BF16 has 851
+tensors and `qwen35.block_count=64`; the MTP BF16 has 18 tensors and
+`qwen35.block_count=65`. Three MTP-file tensors duplicate the base embedding,
+normalization, and output head; the other 15 are `blk.64.*`.
 
-**The last point release changed nothing structural at the 27B slot.**
-Diffing `Qwen3.5-27B` against `Qwen3.6-27B` with the script above: every
-shape in the checklist is identical, both still declare
-`architectures: ["Qwen3_5ForConditionalGeneration"]` and
-`model_type: qwen3_5`, and the only diffs are serialization
-(`bos_token_id` and `pad_token_id` written out, `mlp_only_layers` dropped,
-`output_gate_type: swish` and `partial_rotary_factor` hoisted to explicit,
-newer `transformers_version`). A 3.x point release in this family has been a
-retrain rather than a re-architecture.
+`tools/repack.py --mtp` joins those views, rejects mixed checkpoints and
+unexpected overlaps, keeps the primary copy of the three shared tensors, and
+takes the MTP architecture metadata so the output validates as 65 blocks:
 
-**Nobody is building a new class.** `transformers/main` carries `qwen3_5`,
-`qwen3_5_moe` and `qwen3_next`, with no `qwen3_6` or `qwen3_8` directory;
-3.6 rode `qwen3_5` and recent commits on it are generic refactors. llama.cpp
-has no Qwen3.8 issue or PR.
+```sh
+tools/repack.py Qwen3.8-27B-BF16.gguf qwen38-27b-mtp-q4s.q27 \
+  --mtp mtp-Qwen3.8-27B-BF16.gguf --q4-head --tag q4s-v1
+tools/export_tokenizer.py Qwen3.8-27B-BF16.gguf qwen38-27b-mtp.tok
+```
 
-**Nothing on the Hub yet.** The two `Qwen3.8-27B` repos that exist
-(`huginnfork/...-FP8` and `...-NVFP4A16`, created 2026-08-05) contain
-`.gitattributes` and `README.md` and nothing else; the card says so itself.
-No config to read.
+The vision encoder remains out of scope. It is published as a separate
+`mmproj` GGUF and does not change the text graph q27 implements. Qwen3.8 adds
+chat-template controls such as `reasoning_effort`; the token inventory and
+ChatML control IDs used by q27 remain compatible, while those optional template
+features are not exposed by q27's hand-written prompt renderer.
 
-Weakest signal, noted for completeness: Unsloth's claim that it runs on 17 GB
-is what a 27B dense at 4 bits costs, and lands between the q4s (15.46 GB) and
-default (17.73 GB) tiers.
-
-**Conclusion.** Convergent evidence that Qwen3.8 stays on the `qwen3_5` graph,
-and no evidence either way on whether the 27B slot stays dense. Treat the
-checklist as unverified until the real config lands, then run the diff before
-downloading weights.
+No runtime or kernel source changes are required. The remaining work for any
+new Qwen3.8 artifact is checkpoint-specific: repack it, export its tokenizer,
+derive a new canonical, and run the normal numerical and serving gates rather
+than reusing Qwen3.6 quality claims.
