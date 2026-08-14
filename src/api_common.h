@@ -1480,8 +1480,6 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 ToolCall tc;
                 tc.name = nm;
                 tc.arguments = json::object();
-                tc.source_begin = p;
-                tc.source_end = span_end;
                 size_t q = ne + TN_CLOSE.size();
                 while (true) {
                     size_t ps = text_in.find(PM_OPEN, q);
@@ -1510,7 +1508,6 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             }
             if (!xml_calls.empty()) {
                 if (prefix) *prefix = text_in.substr(0, first);
-                if (remaining_text) *remaining_text = "";
                 fprintf(stderr, "[q27] drift mode 14: recovered %zu <tool_name> call(s)\n",
                         xml_calls.size());
                 return xml_calls;
@@ -1577,10 +1574,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     tc.ok = true;
                     tc.name = nm;
                     tc.arguments = std::move(args);
-                    tc.source_begin = p;
-                    tc.source_end = text_in.size();
                     if (prefix) *prefix = text_in.substr(0, p);
-                    if (remaining_text) *remaining_text = "";
                     fprintf(stderr, "[q27] drift mode 15: recovered <name>%s bare-args call\n",
                             nm.c_str());
                     return std::vector<ToolCall>{std::move(tc)};
@@ -1632,10 +1626,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                             tc.name = nm;
                             tc.arguments = j.contains("arguments") && j["arguments"].is_object()
                                                ? j["arguments"] : json::object();
-                            tc.source_begin = p;
-                            tc.source_end = text_in.size();
                             if (prefix) *prefix = text_in.substr(0, p);
-                            if (remaining_text) *remaining_text = "";
                             fprintf(stderr, "[q27] drift mode 16: recovered <function>-wrapped %s\n",
                                     nm.c_str());
                             return std::vector<ToolCall>{std::move(tc)};

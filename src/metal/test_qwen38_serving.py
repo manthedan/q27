@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -165,7 +166,7 @@ def main():
     process = subprocess.Popen(
         [server, model, tokenizer, "--host", "127.0.0.1", "--port", str(port),
          "--ctx", "2048", "--slots", "1", "--mtp", "4",
-         "--max-tokens-default", "256", "--think-budget", "0"],
+         "--max-tokens-default", "256"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -182,8 +183,13 @@ def main():
     thread = threading.Thread(target=drain_stderr, daemon=True)
     thread.start()
     try:
-        if not ready.wait(300):
-            raise AssertionError("Qwen3.8 Metal server did not become ready")
+        deadline = time.monotonic() + 300
+        while not ready.wait(0.1):
+            if process.poll() is not None:
+                raise AssertionError(
+                    f"Qwen3.8 Metal server exited before readiness: {process.returncode}")
+            if time.monotonic() >= deadline:
+                raise AssertionError("Qwen3.8 Metal server did not become ready")
         exercise(port)
     except Exception:
         sys.stderr.write("".join(stderr_lines))
