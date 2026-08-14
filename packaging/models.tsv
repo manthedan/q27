@@ -10,11 +10,11 @@
 #   5 artifact_md5  expected md5 of the artifact (empty if unverified/unknown)
 #   6 weights_gb    artifact size in GiB (bytes/2^30), for fit checks
 #   7 min_ram_gb    practical minimum unified memory (GiB) to run + starter ctx
-#   8 hf_repo       Hugging Face repo hosting the artifact/source
+#   8 hf_repo       Hugging Face repo hosting the artifact/source, or local-only
 #   9 source_kind   direct = download .q27 (md5-checked);
 #                   repack = download GGUF, repack locally (sha256-checked);
-#                   local  = produced on this machine, not downloadable
-#  10 tokenizer     direct = download the .tok; gguf = export from source GGUF
+#                   local  = user-provided artifact, not downloadable
+#  10 tokenizer     direct = download/provide the .tok; gguf = export from source GGUF
 #  11 experimental  yes = opt-in research pack; no = supported
 #  12 notes         one-line guidance shown by `q27 pull <name>`
 #
@@ -32,6 +32,7 @@ name	display	quant_policy	artifact_file	artifact_md5	weights_gb	min_ram_gb	hf_re
 b1	Bonsai-27B binary (1.125 bpw)	bonsai-b1-v1	bonsai-27b-b1.q27	3b9545dc8b723342c98ee148ca1c8e72	3.53	8	manthedan/q27-bonsai-packs	direct	direct	no	Smallest fully-resident 27B; fastest decode on 16 GB; passed the full quality/probe battery.
 t2	Bonsai-27B ternary (2.25 bpw)	bonsai-t2-v1	ternary-bonsai-27b-t2.q27	8babb56d67b63f2308f883912a272bb3	6.66	16	manthedan/q27-bonsai-packs	direct	direct	no	The 16 GB answer; task quality holds, ~2.1-2.3x official PPL.
 m1	Bonsai-27B mixed B1/T2 graft (EXPERIMENTAL)	bonsai-mixed-v1	bonsai-27b-m1.q27		3.57	8	local-only	local	direct	yes	EXPERIMENTAL: mixed-graft thesis is closed (A5 KILL on both corpora) but the pack is kept for users who want to try it; not a supported tier. Built locally via tools/q27_mix.py.
+q38-q4s	Qwen3.8-27B-MTP q4s (local pre-release)	q4s-v1	qwen38-27b-mtp-q4s.q27	bd2eca11d7aefdec00cb58b0d8e8eb8e	14.40	24	local-only	local	direct	yes	Locally repacked Qwen3.8 Metal default; validated on 24 GB Apple Silicon, but not hosted or auto-recommended.
 default	Qwen3.6-27B-MTP official (5.25 bpw)	v1.4	qwen36-27b-mtp.q27	39fd724426088abaef6e0bad66d6dac6	16.51	24	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	Max speed + trained MTP head; the only official tier that fits 24 GB (borderline, needs an idle machine).
 q4s	Qwen3.6-27B-MTP q4s (15.5 GB)	v1.4	qwen36-27b-mtp-q4s.q27	7e5454e0c0ded717136ad3e42634ba25	14.44	20	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	Official 15.5 GB tier; fits 20 GB+ with headroom the 17 GB default lacks.
 q6	Qwen3.6-27B-MTP q6 (6.0 bpw)	q6-v1	qwen36-27b-mtp-q6.q27	7a0d21b4e44254e1820ca4fd75ea8fee	19.09	28	signalnine/Qwen3.6-27B-MTP-q27	direct	direct	no	+0.35% PPL over Q5_K_M; 28 GB+ machines.

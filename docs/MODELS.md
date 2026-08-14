@@ -14,7 +14,8 @@ A note on honesty: the **B1 / T2 / M1 packs are a different model**
 (Bonsai-27B, a QAT distillation of Qwen3.6-27B), not a quantization of the
 official checkpoint. "Smaller" there trades model, not just bits. The
 **default / q4s / q6 / q6k / q8** packs are the official Qwen3.6-27B-MTP
-with its trained MTP head.
+with its trained MTP head. **q38-q4s** is a local pre-release repack of the
+newer Qwen3.8-27B-MTP checkpoint; it is not hosted or auto-recommended.
 
 ---
 
@@ -32,6 +33,7 @@ with its trained MTP head.
 | **q6f** | Qwen3.6-27B-MTP | 6.11 | 19.4 GiB | 28 GB | int8 GEMV + MTP | **loads, UNVALIDATED on Metal** |
 | **q6k** | Qwen3.6-27B-MTP | 6.8 | 21.7 GiB | 32 GB | int8 GEMV + MTP | supported |
 | **q8** | Qwen3.6-27B-MTP | 8.1 | 26.5 GiB | 36 GB | int8 GEMV + MTP | **experimental / UNVALIDATED** |
+| **q38-q4s** | Qwen3.8-27B-MTP | ~4.6 | 14.4 GiB | 24 GB | int8 GEMV + MTP | **validated locally; artifact not hosted** |
 
 - **b1** is the smallest fully-resident 27B and the fastest decode on a
   16 GB machine. It passed the full quality/probe battery.
@@ -60,6 +62,13 @@ with its trained MTP head.
   quality that fits a 24 GB card (wikitext PPL 7.9491, beating q4s, default
   and q8), which makes it the most interesting tier for a 24 GB Mac and the
   first one to gate.
+- **q38-q4s** is the preferred 24 GB Metal artifact when the locally repacked
+  checkpoint is available. Its 128-token canonical and OpenAI/Anthropic tool
+  workflows pass; PPL is 0.73% worse than the Qwen3.8 default tier, while the
+  larger q5f/default artifacts leave less memory headroom and decode much more
+  slowly on base M4. `q27 pull q38-q4s` prints the exact local installation
+  paths. Because the artifact is not hosted, the wrapper does not select it
+  automatically.
 - **q8** is the high-fidelity tier. **It is UNVALIDATED upstream pending
   48GB-class hardware** — which is exactly why we need your report. If you
   have a 36–48 GB+ machine, `q27 pull q8 && q27 report --full` and send us
@@ -138,7 +147,7 @@ Worked examples:
 |---|---|---|---|
 | 16 GB | **t2** | 32 K fp16 / 131 K turbo3 | best quality that fits comfortably |
 | 16 GB (fastest) | **b1** | 65 K fp16 / 262 K turbo3 | smallest + fastest, still a real 27B |
-| 20–24 GB | **default** | turbo3 to 131 K | official model + MTP; wants an idle machine. q4s/q5f load but are UNVALIDATED here — do not recommend them until the ladder is run |
+| 20–24 GB | **default** (automatic) / **q38-q4s** (local opt-in) | turbo3 to 131 K | `q27 recommend` stays on the published Qwen3.6 artifact; use q38-q4s when the validated local repack is installed |
 | 28–32 GB | **q6** / **q6k** | fp16 to 32 K, turbo3 far | higher official fidelity |
 | 36–48 GB+ | **q8** | fp16 to 16 K, turbo3 to 131 K | max fidelity — **please send a report** |
 

@@ -390,6 +390,39 @@ if PATH="$TMP/bin:/usr/bin:/bin" "$ROOT/packaging/bin/q27" agent missing \
 fi
 grep -q 'unknown pack missing' "$TMP/missing.err"
 
+# Local pre-release packs are registered but never downloaded or selected by
+# recommendation. `pull` must print exact placement guidance and succeed without
+# inventing a remote source.
+Q27_HOME="$TMP/q38-home" PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" pull q38-q4s \
+    >"$TMP/q38-pull.out" 2>"$TMP/q38-pull.err"
+grep -q 'q38-q4s is EXPERIMENTAL' "$TMP/q38-pull.out"
+grep -q 'q38-q4s is a LOCAL artifact, not downloadable' "$TMP/q38-pull.out"
+grep -Fq "$TMP/q38-home/q38-q4s/qwen38-27b-mtp-q4s.q27" "$TMP/q38-pull.out"
+grep -q 'Expected artifact MD5: bd2eca11d7aefdec00cb58b0d8e8eb8e' "$TMP/q38-pull.out"
+grep -Fq "$TMP/q38-home/q38-q4s/" "$TMP/q38-pull.out"
+touch "$TMP/q38-home/q38-q4s/qwen38-27b-mtp-q4s.q27" \
+      "$TMP/q38-home/q38-q4s/qwen38-27b-mtp.tok"
+if Q27_HOME="$TMP/q38-home" PATH="$TMP/bin:/usr/bin:/bin" \
+       "$ROOT/packaging/bin/q27" pull q38-q4s \
+       >"$TMP/q38-bad.out" 2>"$TMP/q38-bad.err"; then
+    echo "FAIL: mismatched local q38 artifact was accepted" >&2
+    exit 1
+fi
+grep -q 'md5 MISMATCH' "$TMP/q38-bad.err"
+Q27_HOME="$TMP/q38-home" Q27_SERVER_CAPTURE="$TMP/q38-server-args" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" serve q38-q4s >/dev/null
+sed -n '1,2p' "$TMP/q38-server-args" >"$TMP/q38-server-paths"
+printf '%s\n%s\n' \
+    "$TMP/q38-home/q38-q4s/qwen38-27b-mtp-q4s.q27" \
+    "$TMP/q38-home/q38-q4s/qwen38-27b-mtp.tok" \
+    >"$TMP/q38-server-paths-expected"
+diff -u "$TMP/q38-server-paths-expected" "$TMP/q38-server-paths"
+wait_lock_clear || {
+    echo "FAIL: q38 serve consumer flock remained held" >&2; exit 1; }
+
+
 PATH="$TMP/bin:/usr/bin:/bin" "$ROOT/packaging/bin/q27" help >"$TMP/help"
 grep -q 'q27 agent \[name\]' "$TMP/help"
 

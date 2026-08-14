@@ -504,3 +504,40 @@ Q27_METAL_KV_FP16_CELLS=8,9,10,11,12,13,14,15 \
 # A/B the layer-major chunked prompt ingestion against the token-serial path
 ./build/q27-metal MODEL TOKENIZER --prompt TEXT -n 1 --prefill serial
 ```
+
+## Qwen3.8-27B Metal promotion (2026-08-14)
+
+Local Qwen3.8 repacks now have a checkpoint-aware qualification lane. No model
+artifact was uploaded, pushed, or added to the Homebrew formula; the q38-q4s
+registry entry is experimental/local-only and therefore excluded from
+`q27 recommend`.
+
+Artifacts exercised on the 24 GB base Apple M4:
+
+| tier | artifact MD5 | mapped weights | result |
+|---|---|---:|---|
+| q4s | `bd2eca11d7aefdec00cb58b0d8e8eb8e` | 14.40 GiB | promoted local Metal default |
+| q5f | `af8f2a1ee6708b83a227e2163cd7f21c` | 16.97 GiB | quality opt-in; less headroom and slower |
+
+Measured gates:
+
+- q4s 128-token canonical: 3.12 tok/s, MD5
+  `b1a4a2802150081507a9b7cf8bad7a73`; reproduced against the checkpoint-aware
+  `metal-m4/qwen38-27b-mtp/q4s` registry entry.
+- q4s matched 16-token speculative run: 1.02 tok/s. q5f under the same prompt,
+  context, MTP width, and token count: 0.80 tok/s.
+- q4s PPL is 7.3917 versus 7.3384 for the Qwen3.8 default artifact, a 0.73%
+  regression. The speed and 2.57 GiB mapped-weight headroom win decide the
+  supported 24 GB deployment choice.
+- MTP/plain 16-token prefixes are byte-identical.
+- OpenAI forced tool call, tool-result continuation, final answer, and Anthropic
+  forced `tool_use` all pass against the real Metal server.
+- Drift modes 14, 15, and 16 pass their captured Qwen3.8 fixtures; the
+  hallucinated `<result>/<output>` form remains deliberately unrescued.
+
+Release boundary: the currently published Homebrew `metal-v0.6.1` binary
+rejects q38-q4s with `required tensor mismatch: output.weight`. The current
+fork `metal` head accepts the same artifact, and this promotion branch adds the
+parser, canonical, serving, and packaging gates needed for the next release.
+Do not update the tap until an immutable prebuilt release asset exists and its
+SHA-256 can be pinned in both formula copies.

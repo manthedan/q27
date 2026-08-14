@@ -17,10 +17,8 @@ multi-GB weight lifecycle:
     q27 bench --fast   # quick synthetic ceiling + a real decode
     q27 report --full  # build a send-back diagnostic bundle (see below)
 
-The current source checkout adds the native-agent supervisor planned for the
-next tagged release. Friends testing it before that release should build from
-source, place the B1 artifact/tokenizer under `models/` (or `q27 pull b1`),
-and run:
+The package also ships the native-agent supervisor. From a source checkout,
+build or install the development binaries with:
 
     make agent
     # or one-time PATH shim (uses ~/.grok/bin when first on PATH):
@@ -89,6 +87,14 @@ they are multi-GB and carry their own licenses. `q27 pull` fetches and
 checksum-verifies them per `packaging/models.tsv`. See
 [docs/MODELS.md](../docs/MODELS.md) for the pack/context/speed tables.
 
+Qwen3.8 q4s is currently a local pre-release pack, not a hosted download and
+not an automatic recommendation. Register the installation directory and see
+the exact expected paths with:
+
+    q27 pull q38-q4s
+    # copy qwen38-27b-mtp-q4s.q27 and a matching .tok to the printed directory
+    q27 serve q38-q4s
+
 ### Developing the big tiers remotely
 
 The maintainer's laptop tops out at 24 GB, so **q6 / q6k / q8 and the
@@ -121,10 +127,14 @@ Model artifacts (`.q27`) and tokenizers (`.tok`) are deliberately not
 packaged — they are multi-GB and carry their own model licenses. See the
 top-level README for repack instructions.
 
-Release flow: tag (`vX.Y.Z`), push the tag, then update `url`/`sha256` in
-`packaging/homebrew/q27.rb`:
+Release flow for the prebuilt formula: tag `metal-vX.Y.Z`, build and run the
+Metal qualification gates on the release machine, attach the immutable
+`q27-metal-vX.Y.Z-macos-arm64.tar.gz` asset, then update `url`, `version`, and
+`sha256` in both `packaging/homebrew/q27.rb` and the tap's `Formula/q27.rb`.
+The two formula files must remain byte-identical. Compute the digest from the
+published asset, not a source archive:
 
-    curl -sL https://github.com/manthedan/q27/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+    curl -sL https://github.com/manthedan/q27/releases/download/metal-vX.Y.Z/q27-metal-vX.Y.Z-macos-arm64.tar.gz | shasum -a 256
 
 ## Weights (not packaged)
 
