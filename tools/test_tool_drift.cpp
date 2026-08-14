@@ -91,6 +91,42 @@ static void test_mode15_name_tag_bare_args() {
     ok(v2.empty(), "mode15: undeclared name is rejected");
 }
 
+// Drift mode 16 and the mode-15 attribute variant (2026-08-14), both harvested
+// from the same batch of Qwen3.8 thunderdome runs. Also pins the one form that
+// must NEVER be rescued.
+static void test_mode16_and_15_variants() {
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}},{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}])");
+    std::string pre;
+
+    // mode 15 variant: attribute spelling <name="Read", ...
+    std::string attr = "<name=\"Read\", \"arguments\": {\"file_path\": \"/workspace/tests/tracker.test.ts\"}}";
+    auto v1 = q27::parse_bare_tool_calls(attr, &pre, &tools);
+    ok(v1.size() == 1 && v1[0].ok && v1[0].name == "Read" &&
+           v1[0].arguments.value("file_path", std::string()) ==
+               "/workspace/tests/tracker.test.ts",
+       "mode15-attr: <name=\"X\" spelling recovered");
+
+    // mode 16: correct JSON, wrong wrapper.
+    std::string fn = "I'll start by exploring the workspace.\n\n<function>\n"
+        "{\"name\": \"Bash\", \"arguments\": {\"command\": \"ls -la /workspace\", "
+        "\"description\": \"List workspace\"}}";
+    auto v2 = q27::parse_bare_tool_calls(fn, &pre, &tools);
+    ok(v2.size() == 1 && v2[0].ok && v2[0].name == "Bash" &&
+           v2[0].arguments.value("command", std::string()) == "ls -la /workspace",
+       "mode16: <function>-wrapped JSON recovered");
+    ok(pre.find("exploring the workspace") != std::string::npos,
+       "mode16: prose before the wrapper is preserved as prefix");
+
+    // MUST NOT RESCUE: a hallucinated tool RESULT, not a call. Rescuing this
+    // would feed invented command output back as though a tool had run.
+    std::string halluc =
+        "I'll start by exploring the codebase.\n\n<tool_calls>\n<result>\n"
+        "<name>Bash</name>\n<output>total 40\ndrwxr-xr-x 1 node node 4096 .\n</output>\n"
+        "</result>\n</tool_calls>";
+    auto v3 = q27::parse_bare_tool_calls(halluc, &pre, &tools);
+    ok(v3.empty(), "hallucinated <result>/<output> block is NOT rescued as a call");
+}
+
 static void test_mode14_tool_name_xml_dialect() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}])");
     // Verbatim bytes from the captured transcript.
@@ -150,6 +186,7 @@ int main() {
     test_mode13_truncated_mid_escape();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();
+    test_mode16_and_15_variants();
     json tools = json::array();
     tools.push_back(tool("Write", {{"content", true}, {"file_path", true}}));
     tools.push_back(tool("Read", {{"file_path", true}}));

@@ -1532,10 +1532,16 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     //
     // Engages ONLY when the identifier after <name> is a declared tool.
     {
-        static const std::string NM_OPEN = "<name>";
+        static const std::string NM_OPEN = "<name>", NM_ATTR = "<name=";
         size_t p = text_in.find(NM_OPEN);
+        size_t pa = text_in.find(NM_ATTR);
+        if (pa != std::string::npos && (p == std::string::npos || pa < p)) p = pa;
         if (p != std::string::npos && tools && tools->is_array()) {
-            size_t ns = p + NM_OPEN.size();
+            size_t ns = p + (text_in.compare(p, NM_ATTR.size(), NM_ATTR) == 0
+                                 ? NM_ATTR.size() : NM_OPEN.size());
+            // Variant seen in the same session: <name="Read", "arguments": {...}
+            // i.e. an attribute-style spelling instead of a closed tag.
+            if (ns < text_in.size() && text_in[ns] == '"') ns++;
             while (ns < text_in.size() && isspace((unsigned char)text_in[ns])) ns++;
             size_t ne = ns;
             while (ne < text_in.size() &&
@@ -1578,6 +1584,66 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     fprintf(stderr, "[q27] drift mode 15: recovered <name>%s bare-args call\n",
                             nm.c_str());
                     return std::vector<ToolCall>{std::move(tc)};
+                }
+            }
+        }
+    }
+
+    // DRIFT MODE 16 (2026-08-14, Qwen3.8-27B): the call JSON is CORRECT and
+    // complete, but wrapped in <function> instead of <tool_call>:
+    //
+    //   I'll start by exploring the workspace.
+    //
+    //   <function>
+    //   {"name": "Bash", "arguments": {"command": "ls -la /workspace", ...}}
+    //
+    // Nothing is malformed except the wrapper, so this is the cheapest of the
+    // 3.8 dialects to recover and the safest: the payload must still parse as a
+    // complete object AND name a declared tool.
+    //
+    // DELIBERATELY NOT RESCUED, and pinned by a negative fixture: the model also
+    // emits <tool_calls><result><name>X</name><output>...</output> blocks, which
+    // are HALLUCINATED TOOL RESULTS, not calls. Treating those as calls would
+    // feed invented command output back as if a tool had produced it.
+    {
+        static const std::string FN_OPEN = "<function>";
+        size_t p = text_in.find(FN_OPEN);
+        if (p != std::string::npos && tools && tools->is_array() &&
+            text_in.find("<result>") == std::string::npos &&
+            text_in.find("<output>") == std::string::npos) {
+            size_t ob = text_in.find('{', p + FN_OPEN.size());
+            if (ob != std::string::npos) {
+                std::string body = text_in.substr(ob);
+                size_t close = body.rfind("</function>");
+                if (close != std::string::npos) body = body.substr(0, close);
+                for (int drop = 0; drop < 4 && !body.empty(); drop++) {
+                    json j;
+                    bool okp = false;
+                    try { j = json::parse(body); okp = j.is_object(); } catch (...) {}
+                    if (okp && j.contains("name")) {
+                        const std::string nm = j.value("name", std::string());
+                        bool declared = false;
+                        for (const auto& t : *tools)
+                            if (t.contains("function") &&
+                                t["function"].value("name", std::string()) == nm) declared = true;
+                        if (declared) {
+                            ToolCall tc;
+                            tc.ok = true;
+                            tc.name = nm;
+                            tc.arguments = j.contains("arguments") && j["arguments"].is_object()
+                                               ? j["arguments"] : json::object();
+                            tc.source_begin = p;
+                            tc.source_end = text_in.size();
+                            if (prefix) *prefix = text_in.substr(0, p);
+                            if (remaining_text) *remaining_text = "";
+                            fprintf(stderr, "[q27] drift mode 16: recovered <function>-wrapped %s\n",
+                                    nm.c_str());
+                            return std::vector<ToolCall>{std::move(tc)};
+                        }
+                        break;
+                    }
+                    while (!body.empty() && isspace((unsigned char)body.back())) body.pop_back();
+                    if (!body.empty() && body.back() == '}') body.pop_back(); else break;
                 }
             }
         }
