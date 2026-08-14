@@ -10,7 +10,8 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 UNAME_S   := $(shell uname -s)
 
-.PHONY: all clean test-cpu test-metal agent tui agent-tui install-dev-q27
+.PHONY: all clean test-cpu test-metal test-metal-qwen38 test-metal-qwen38-serving \
+	test-canonical-registry agent tui agent-tui install-dev-q27
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_artifacts build/test_depthctl build/test_toolconstrain
 
 # Friendly source-checkout entry point. The supervisor resolves the local B1
@@ -142,6 +143,11 @@ build/test_q27_agent_frontend: experiments/ds4-agent/test_q27_agent_frontend.c \
 	        experiments/ds4-agent/test_q27_agent_frontend.c \
 	        experiments/ds4-agent/q27_agent_frontend.c -o $@
 
+QWEN38_TIER ?= q4s
+
+test-canonical-registry:
+	tools/test_canonical_md5.sh
+
 ifeq ($(UNAME_S),Darwin)
 # GATE BLIND SPOT, closed 2026-07-25. api_common.h / stream_split.h /
 # tool_preamble.h compile into BOTH servers, but test-cpu builds NEITHER --
@@ -187,6 +193,19 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp sr
 	$(CXX) $(CXXFLAGS) -fobjc-arc -pthread -I src/metal src/metal/metal_server.cpp src/metal/metal_engine.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
 	        -framework Foundation -framework Metal -o $@
+
+test-metal-qwen38: test-canonical-registry build/q27-metal
+	@test -n "$(QWEN38_MODEL)" || { echo "set QWEN38_MODEL=...q27" >&2; exit 2; }
+	@test -n "$(QWEN38_TOKENIZER)" || { echo "set QWEN38_TOKENIZER=...tok" >&2; exit 2; }
+	./build/q27-metal "$(QWEN38_MODEL)" "$(QWEN38_TOKENIZER)" --validate-only
+	CANON_MODEL=qwen38-27b-mtp CANON_TIER="$(QWEN38_TIER)" \
+		tools/metal_canonical_gate.sh "$(QWEN38_MODEL)" "$(QWEN38_TOKENIZER)"
+
+test-metal-qwen38-serving: build/q27-metal-server src/metal/test_qwen38_serving.py
+	@test -n "$(QWEN38_MODEL)" || { echo "set QWEN38_MODEL=...q27" >&2; exit 2; }
+	@test -n "$(QWEN38_TOKENIZER)" || { echo "set QWEN38_TOKENIZER=...tok" >&2; exit 2; }
+	python3 src/metal/test_qwen38_serving.py ./build/q27-metal-server \
+		"$(QWEN38_MODEL)" "$(QWEN38_TOKENIZER)"
 
 build/q27_agent_c.o: experiments/ds4-agent/q27_agent.c experiments/ds4-agent/q27_agent_worker.h experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_protocol.h experiments/ds4-agent/q27_agent_persistence.h experiments/ds4-agent/q27_agent_selections.h experiments/ds4-agent/q27_agent_tui.h experiments/ds4-agent/q27_agent_editor.h experiments/ds4-agent/q27_agent_commands.h experiments/ds4-agent/q27_agent_frontend.h | build
 	$(CC) $(CFLAGS) -I experiments/ds4-agent -c experiments/ds4-agent/q27_agent.c -o $@
@@ -276,6 +295,10 @@ build/metal_attn_bench: tools/metal_attn_bench.cpp src/metal/metal_backend.mm sr
 else
 test-metal:
 	@echo "test-metal requires macOS"; exit 1
+test-metal-qwen38:
+	@echo "test-metal-qwen38 requires macOS"; exit 1
+test-metal-qwen38-serving:
+	@echo "test-metal-qwen38-serving requires macOS"; exit 1
 endif
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
@@ -425,3 +448,4 @@ build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+

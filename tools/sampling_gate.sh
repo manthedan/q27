@@ -8,13 +8,30 @@
 set -u
 MODEL="${1:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}"
 BIN="$(dirname "$0")/../build/q27"
-# baseline greedy canonical: vanilla qwen36-27b-mtp (benchmark standard
-# 2026-07-09); other tiers/fine-tunes override via CANON_MD5= env --
-#   q4s: f64e7c02252ca4c40cea62db662205e0
-#   q5f: 683f7f4450ca4c60837abdb603ee3237  (Q4-head + ffn_down, 5.30bpw)
-#   q6f: 2a4d22eafcde63e962bf2408605fe502  (Q4-head + ffn_down + ffn_gate, 6.11bpw)
-#   Qwopus: 4c4120c7...
-CANON_MD5="${CANON_MD5:-a2982c5197c627551b27d76a0a94b220}"
+# Canonicals are keyed by architecture, checkpoint, and artifact tier. A digest
+# from another checkpoint must never silently gate a same-shaped artifact.
+# CANON_MD5 remains the explicit escape hatch for a locally derived canonical.
+CANON_ARCH="${CANON_ARCH:-sm120}"
+CANON_TIER="${CANON_TIER:-default}"
+# shellcheck source=canonical_md5.sh
+source "$(dirname "$0")/canonical_md5.sh"
+if [[ -z "${CANON_MODEL:-}" ]]; then
+  if ! CANON_MODEL="$(canonical_model_for_path "$MODEL")"; then
+    if [[ -n "${CANON_MD5:-}" ]]; then
+      CANON_MODEL=custom
+    else
+      echo "cannot infer checkpoint from '$MODEL'; set CANON_MODEL explicitly" >&2
+      exit 2
+    fi
+  fi
+fi
+if [[ -z "${CANON_MD5:-}" ]]; then
+  if ! CANON_MD5="$(canonical_md5_for "$CANON_ARCH" "$CANON_MODEL" "$CANON_TIER")"; then
+    echo "no published canonical for architecture=$CANON_ARCH model=$CANON_MODEL tier=$CANON_TIER" >&2
+    echo "run a same-device upstream/candidate differential or set CANON_MD5 explicitly" >&2
+    exit 2
+  fi
+fi
 CANON_IDS="760,6511,314,9338,369"
 export CUDA_VISIBLE_DEVICES=0
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
