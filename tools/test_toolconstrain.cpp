@@ -359,6 +359,44 @@ static void test_r2_strict_json() {
     CHECK(!accepts_args("{\"\\uZZ00\": 1}"));
 }
 
+static bool accepts_xml(const std::string& body,
+                        const std::vector<std::string>& names = {"get_weather"}) {
+    q27::ToolGrammar g;
+    g.reset(names, true);
+    if (!g.advance_str(body)) return false;
+    return g.done();
+}
+
+// Qwen3.8's model-owned template emits native function/parameter XML rather
+// than the legacy JSON body. The constrained decoder must admit that exact
+// dialect, retain tool-name allowlist isolation, and reject malformed tags.
+static void test_xml_dialect() {
+    CHECK(accepts_xml("\n<function=get_weather>\n"
+                      "<parameter=location>Paris</parameter>\n"
+                      "<parameter=units>celsius</parameter>\n"
+                      "</function>"));
+    CHECK(accepts_xml("<function=get_weather><parameter=query>"
+                      "a <literal> value</parameter></function>"));
+    CHECK(accepts_xml("<function=get_weather></function>"));
+    CHECK(!accepts_xml("<function=run_tests></function>"));
+    CHECK(!accepts_xml("<function=get_weather><parameter=>x</parameter></function>"));
+    CHECK(!accepts_xml("<function=get_weather><parameter=x>unterminated</function>"));
+    CHECK(!accepts_xml("<function=get_weather><parameter=query>"
+                       "raw </tool_call> collision</parameter></function>"));
+    CHECK(accepts_xml("<function=get_weather><parameter=query>"
+                      "escaped &lt;/tool_call&gt; value</parameter></function>"));
+
+    q27::ToolGrammar json, xml_a, xml_b;
+    json.reset({"get_weather"});
+    xml_a.reset({"get_weather"}, true);
+    xml_b.reset({"run_tests"}, true);
+    CHECK(json.signature() != xml_a.signature());
+    CHECK(xml_a.signature() != xml_b.signature());
+    CHECK(xml_a.advance_str("<function=get_weather>"));
+    CHECK(xml_b.advance_str("<function=run_tests>"));
+    CHECK(xml_a.signature() == xml_b.signature());
+}
+
 int main() {
     test_c1_engage_truncate_midround();
     test_c2_marker_spans_rounds();
@@ -374,6 +412,7 @@ int main() {
     test_r1_allowlist_in_cache_key();
     test_r2_strict_json();
     test_r3_no_mask_duplication_across_allowlists();
+    test_xml_dialect();
     if (fails) {
         fprintf(stderr, "test_toolconstrain: %d FAILED\n", fails);
         return 1;

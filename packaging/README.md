@@ -95,6 +95,10 @@ the exact expected paths with:
     # copy qwen38-27b-mtp-q4s.q27 and a matching .tok to the printed directory
     q27 serve q38-q4s
 
+That serving profile enables thinking and selects Qwen3.8's trained XML tool
+dialect from model metadata. Set `Q27_TOOL_DIALECT=json` only when a client
+requires the legacy JSON tool-call prompt.
+
 ### Developing the big tiers remotely
 
 The maintainer's laptop tops out at 24 GB, so **q6 / q6k / q8 and the

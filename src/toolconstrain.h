@@ -31,6 +31,7 @@ struct BasicToolConstrainer {
     ToolMaskCache* cache = nullptr;
     std::vector<int>* host2dev = nullptr;
     bool enabled = false, active = false;
+    bool xml_dialect = false;
     bool pool_dead = false; // sticky: mask pool filled up this request
     ToolGrammar tg;
     ToolGrammar staged_state; // grammar state whose mask is in verify slot 0
@@ -39,8 +40,9 @@ struct BasicToolConstrainer {
     int skip_feed = 0; // round tokens already consumed by scan_round
     long engaged = 0, disengaged = 0, pool_drops = 0, rebinds = 0;
 
-    void begin(std::vector<std::string> n) {
+    void begin(std::vector<std::string> n, bool xml = false) {
         active = false;
+        xml_dialect = xml;
         pool_dead = false;
         skip_feed = 0;
         tail.clear();
@@ -140,7 +142,7 @@ struct BasicToolConstrainer {
             // remainder bytes after it already belong to the call body
             if (pos == std::string::npos || pos + 11 <= tail.size() - bytes.size()) continue;
             std::string rem = tail.substr(pos + 11);
-            tg.reset(names);
+            tg.reset(names, xml_dialect);
             active = true;
             engaged++;
             fprintf(stderr, "[toolgram] engaged (rem=%zu)\n", rem.size());

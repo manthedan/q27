@@ -532,8 +532,25 @@ Measured gates:
 - MTP/plain 16-token prefixes are byte-identical.
 - OpenAI forced tool call, tool-result continuation, final answer, and Anthropic
   forced `tool_use` all pass against the real Metal server.
-- Drift modes 14, 15, and 16 pass their captured Qwen3.8 fixtures; the
-  hallucinated `<result>/<output>` form remains deliberately unrescued.
+- Model metadata selects Qwen3.8's trained
+  `<function=NAME><parameter=KEY>...</parameter></function>` tool dialect in
+  both the Metal server and native agent. Qwen3.6 and Qwopus remain on the JSON
+  dialect; `Q27_TOOL_DIALECT` provides an explicit override.
+- `q27 serve q38-q4s` enables thinking by default. The live serving gate now
+  asserts both that profile and the metadata-selected XML dialect.
+- Drift modes 14 through 17 pass their captured Qwen3.8 fixtures, including
+  thinking-mode bare XML and JSON-head/XML-parameter chimeras; the hallucinated
+  `<result>/<output>` form remains deliberately unrescued.
+- Constrained serial decode uses the same metadata-selected dialect: the XML
+  grammar accepted three live Qwen3.8 tool calls, closed each call cleanly,
+  and served the full OpenAI two-tool continuation plus Anthropic workflow.
+- Final branch verification: `make test-cpu` passed (including native XML
+  parser, drift, grammar, agent protocol, wrapper, and Metal server tests),
+  `make build/q27-agent` linked cleanly, and
+  `make test-metal-qwen38-serving` passed against the q4s artifact with MTP 4.
+  A second real-model run without MTP and with `--constrain-tools` also passed
+  the complete OpenAI and Anthropic serving workflow.
+
 
 Release boundary: the currently published Homebrew `metal-v0.6.1` binary
 rejects q38-q4s with `required tensor mismatch: output.weight`. The current

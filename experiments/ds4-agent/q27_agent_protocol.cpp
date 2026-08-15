@@ -129,9 +129,8 @@ bool source_fence_label_allowed(const char *path, std::string_view label) {
     return false;
 }
 
-const std::string& preamble() {
-    static const std::string value = [] {
-        json tools = json::array({
+const json& tool_registry() {
+    static const json tools = json::array({
             {{"type", "function"}, {"function", {
                 {"name", kToolNames[0]},
                 {"description", "Read one workspace-relative regular file as exact bytes. Successful output includes short edit-selection handles for line content."},
@@ -224,26 +223,39 @@ const std::string& preamble() {
                     {"required", json::array({"command"})},
                     {"additionalProperties", false}}}}}}
         });
-        // Extra protocol note outside the JSON schema list: same-turn fence body.
-        std::string base = q27::tools_preamble(tools);
-        base +=
-            "\nBody tools (write, overwrite, edit, edit_selection): after the "
-            "closed </tool_call>, emit exactly one markdown fenced body and end "
-            "the turn. Example:\n"
-            "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"hello.py\"}}"
-            "</tool_call>\n"
-            "```python\nprint(f\"hi {name}\")\n```\n"
-            "Do not emit another tool call as the body. Do not put source code "
-            "inside JSON arguments.\n";
-        return base;
-    }();
-    return value;
+    return tools;
+}
+
+std::string build_preamble(bool xml_dialect) {
+    // Extra protocol note outside the schema list: same-turn fence body.
+    std::string base = q27::tools_preamble(tool_registry(), xml_dialect);
+    base +=
+        "\nBody tools (write, overwrite, edit, edit_selection): after the "
+        "closed </tool_call>, emit exactly one markdown fenced body and end "
+        "the turn. Example:\n";
+    if (xml_dialect)
+        base += "<tool_call>\n<function=write>\n<parameter=path>\nhello.py\n"
+                "</parameter>\n</function>\n</tool_call>\n";
+    else
+        base += "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"hello.py\"}}"
+                "</tool_call>\n";
+    base +=
+        "```python\nprint(f\"hi {name}\")\n```\n"
+        "Do not emit another tool call as the body. Do not put source code "
+        "inside tool-call arguments.\n";
+    return base;
+}
+
+const std::string& preamble(bool xml_dialect) {
+    static const std::string xml_value = build_preamble(true);
+    static const std::string json_value = build_preamble(false);
+    return xml_dialect ? xml_value : json_value;
 }
 
 } // namespace
 
-extern "C" const char *q27_agent_tool_preamble(void) {
-    try { return preamble().c_str(); }
+extern "C" const char *q27_agent_tool_preamble(int xml_dialect) {
+    try { return preamble(xml_dialect != 0).c_str(); }
     catch (...) { return nullptr; }
 }
 
@@ -682,7 +694,7 @@ extern "C" int q27_agent_unwrap_whole_file_source_fence(
 
 extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
     const unsigned char *bytes, size_t len, q27_agent_tool_call *call,
-    char *error, size_t error_cap, int eos_reached) {
+    char *error, size_t error_cap, int eos_reached, int xml_dialect) {
     if (call) *call = q27_agent_tool_call{};
     // Same-turn bodies can approach the filesystem tool's 8 MiB file cap; leave
     // headroom for ChatML prose, the JSON header, and outer fence lines.
@@ -693,27 +705,84 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         return Q27_TOOL_CALL_INVALID;
     }
     try {
-        const std::string text(reinterpret_cast<const char *>(bytes), len);
+        std::string text(reinterpret_cast<const char *>(bytes), len);
         static const std::string open = "<tool_call>";
         static const std::string close = "</tool_call>";
-        const size_t begin = text.find(open);
-        if (begin == std::string::npos) return Q27_TOOL_CALL_NONE;
-        const size_t json_start = begin + open.size();
-        const size_t end = text.find(close, json_start);
+        size_t begin = text.find(open);
+        if (begin == std::string::npos) {
+            if (!xml_dialect) return Q27_TOOL_CALL_NONE;
+            bool saw_top_level_candidate = false;
+            size_t native_scope = 0;
+            const size_t think_close = text.rfind("</think>");
+            if (think_close != std::string::npos) native_scope = think_close + 8;
+            size_t native_begin = text.find("<function=", native_scope);
+            size_t native_end = std::string::npos;
+            while (native_begin != std::string::npos) {
+                const bool fenced =
+                    q27::inside_markdown_fence(text, native_begin, native_scope);
+                const bool boundary = q27::unambiguous_native_xml_boundary(
+                    text, native_begin, native_scope);
+                const bool nested = q27::nested_native_xml_candidate(
+                    text, native_begin, native_scope);
+                if (!fenced && boundary && !nested) {
+                    saw_top_level_candidate = true;
+                    const size_t native_close =
+                        text.find("</function>", native_begin);
+                    if (native_close != std::string::npos) {
+                        const size_t candidate_end = native_close + 11;
+                        std::string native_name;
+                        json native_arguments;
+                        bool declared = false;
+                        if (q27::parse_native_xml_call_body(
+                                text.substr(native_begin, candidate_end - native_begin),
+                                native_name, native_arguments, &tool_registry())) {
+                            for (size_t i = 0; i < kToolNameCount; ++i)
+                                if (native_name == kToolNames[i]) {
+                                    declared = true;
+                                    break;
+                                }
+                        }
+                        if (declared) {
+                            native_end = candidate_end;
+                            break;
+                        }
+                    }
+                }
+                native_begin = text.find("<function=", native_begin + 10);
+            }
+            if (native_end == std::string::npos) {
+                if (!saw_top_level_candidate) return Q27_TOOL_CALL_NONE;
+                set_error(error, error_cap, "invalid native XML tool call");
+                return Q27_TOOL_CALL_INVALID;
+            }
+            text.insert(native_end, close);
+            text.insert(native_begin, open);
+            begin = native_begin;
+        }
+        const size_t call_start = begin + open.size();
+        const size_t end = text.find(close, call_start);
         if (end == std::string::npos) {
             set_error(error, error_cap, "tool call is not closed exactly once");
             return Q27_TOOL_CALL_INVALID;
         }
         // A second opener before the first closer is a second call inside the
-        // JSON header region. Openers after the closer are body text (allowed
-        // only for body tools, and rejected later if they form the body).
+        // tool-call body. Openers after the closer are body text (allowed only
+        // for body tools, and rejected later if they form the body).
         const size_t second_open = text.find(open, begin + open.size());
         if (second_open != std::string::npos && second_open < end) {
             set_error(error, error_cap, "multiple tool calls are not allowed in one turn");
             return Q27_TOOL_CALL_INVALID;
         }
         const size_t after = end + close.size();
-        const json outer = json::parse(text.substr(json_start, end - json_start));
+        const std::string call_body = text.substr(call_start, end - call_start);
+        std::string native_name;
+        json native_arguments;
+        json outer;
+        if (q27::parse_native_xml_call_body(call_body, native_name, native_arguments,
+                                            &tool_registry()))
+            outer = {{"name", native_name}, {"arguments", std::move(native_arguments)}};
+        else
+            outer = json::parse(call_body);
         if (!only_keys(outer, {"name", "arguments"}) ||
             !outer["name"].is_string() || !outer["arguments"].is_object()) {
             set_error(error, error_cap, "tool call must contain only name and object arguments");

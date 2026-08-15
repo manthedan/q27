@@ -251,7 +251,7 @@ inline void normalize_cc_billing_header(std::string& sys) {
 // split-invariance argument applies.
 inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools,
                                  bool think = true, size_t* stable_off = nullptr,
-                                 size_t* sys_off = nullptr) {
+                                 size_t* sys_off = nullptr, bool xml_dialect = false) {
     std::string p;
     size_t start = 0;
     std::string sys;
@@ -266,7 +266,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     // this never fires there). Q27_BARE=1 restores the no-default behavior.
     if (sys.empty() && !getenv("Q27_BARE")) sys = "You are a helpful assistant.";
     if (tools.is_array() && !tools.empty()) {
-        p += "<|im_start|>system\n" + tools_preamble(tools);
+        p += "<|im_start|>system\n" + tools_preamble(tools, xml_dialect);
         if (!sys.empty()) p += "\n\n" + sys;
         p += "<|im_end|>\n";
     } else if (!sys.empty()) {
@@ -299,7 +299,8 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
 // the former is an exact prefix of encoding the latter before any side effect.
 inline std::string initial_harness_prefix(const std::vector<Msg>& messages,
                                           const json& tools, bool think,
-                                          std::string* full_prompt = nullptr) {
+                                          std::string* full_prompt = nullptr,
+                                          bool xml_dialect = false) {
     if (messages.empty() || messages.back().role != "user")
         throw std::runtime_error(
             "prewarm requires an initial request ending in one user message");
@@ -308,16 +309,39 @@ inline std::string initial_harness_prefix(const std::vector<Msg>& messages,
         if (message.role != "system")
             throw std::runtime_error(
                 "prewarm accepts initial requests only (system plus final user)");
-    if (full_prompt) *full_prompt = chatml_prompt(messages, tools, think);
+    if (full_prompt) *full_prompt = chatml_prompt(
+        messages, tools, think, nullptr, nullptr, xml_dialect);
     size_t stable_bytes = 0;
-    std::string prefix = chatml_prompt(prefix_messages, tools, think, &stable_bytes);
+    std::string prefix = chatml_prompt(
+        prefix_messages, tools, think, &stable_bytes, nullptr, xml_dialect);
     prefix.resize(stable_bytes);
     return prefix;
 }
 
-inline std::string tool_call_text(const std::string& name, const json& args) {
-    return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + args.dump() +
-           "}\n</tool_call>";
+inline std::string tool_call_text(const std::string& name, const json& args,
+                                  bool xml_dialect = false) {
+    if (!xml_dialect)
+        return "<tool_call>\n{\"name\": \"" + name + "\", \"arguments\": " + args.dump() +
+               "}\n</tool_call>";
+
+    std::string out = "<tool_call>\n<function=" + xml_parameter_escape(name) + ">\n";
+    auto append_parameter = [&](const std::string& key, const json& value) {
+        out += "<parameter=" + xml_parameter_escape(key) + ">\n";
+        out += xml_parameter_escape(value.is_string() ? value.get<std::string>()
+                                                       : value.dump());
+        out += "\n</parameter>\n";
+    };
+    if (args.is_object()) {
+        for (auto it = args.begin(); it != args.end(); ++it)
+            append_parameter(it.key(), it.value());
+    } else {
+        // Malformed/non-object client history still stays lossless. Valid tool
+        // calls always take the object branch and render one trained-format
+        // parameter per schema argument.
+        append_parameter("arguments", args);
+    }
+    out += "</function>\n</tool_call>";
+    return out;
 }
 
 inline std::string tool_response_text(const std::string& out) {
@@ -402,7 +426,7 @@ inline json anthropic_tools_json(const json& body) {
 
 // Anthropic messages -> Msg list (thinking + tool_use reconstructed to
 // model markers, tool_result wrapped in <tool_response>)
-inline std::vector<Msg> anthropic_msgs(const json& body) {
+inline std::vector<Msg> anthropic_msgs(const json& body, bool xml_dialect = false) {
     std::vector<Msg> msgs;
     if (body.contains("system")) {
         std::string sys;
@@ -441,7 +465,8 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
                     if (!content.empty() && content.back() != '\n') content += "\n";
                     content += tool_call_text(part.value("name", ""),
                                               part.contains("input") ? part["input"]
-                                                                     : json::object());
+                                                                     : json::object(),
+                                              xml_dialect);
                 } else if (ty == "tool_result") {
                     std::string rc;
                     if (part.contains("content")) {
@@ -502,7 +527,7 @@ inline json openai_tools_json(const json& body) {
 //     a result with the immediately preceding call by POSITION.
 //   - role:"developer" (the newer OpenAI system-role alias) -> "system",
 //     matching the /v1/responses bridge.
-inline std::vector<Msg> openai_msgs(const json& body) {
+inline std::vector<Msg> openai_msgs(const json& body, bool xml_dialect = false) {
     std::vector<Msg> msgs;
     if (!body.contains("messages") || !body["messages"].is_array()) return msgs;
     for (auto& m : body["messages"]) {
@@ -539,7 +564,7 @@ inline std::vector<Msg> openai_msgs(const json& body) {
                     } else args = fn["arguments"];
                 }
                 if (!content.empty() && content.back() != '\n') content += "\n";
-                content += tool_call_text(name, args);
+                content += tool_call_text(name, args, xml_dialect);
             }
         }
         msgs.push_back({role, content});
@@ -598,9 +623,21 @@ inline bool tool_strict() {
     return v == 1;
 }
 
-inline ToolCall parse_tool_call(const std::string& seg) {
+// Qwen3.8's trained tool dialect wraps a native XML function body inside
+// <tool_call>. Parse that body first-class rather than relying on drift rescue.
+inline bool parse_native_xml_call(const std::string& segment, ToolCall& call,
+                                  const json* tools = nullptr) {
+    if (!parse_native_xml_call_body(segment, call.name, call.arguments, tools))
+        return false;
+    call.ok = true;
+    return true;
+}
+
+inline ToolCall parse_tool_call(const std::string& seg, const json* tools = nullptr,
+                                bool xml_dialect = false) {
     ToolCall tc;
     tc.raw = seg;
+    if (xml_dialect && parse_native_xml_call(seg, tc, tools)) return tc;
     if (tool_strict()) {
         // strict: the wrapped segment must parse as-is, with a JSON-object
         // arguments value. Anything else stays text (rescue suppressed).
@@ -608,8 +645,11 @@ inline ToolCall parse_tool_call(const std::string& seg) {
             json j = json::parse(seg);
             tc.name = j.value("name", std::string());
             tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
-            if (tc.arguments.is_string()) {
-                fprintf(stderr, "[q27-strict] rejected double-encoded arguments (tool=%s)\n",
+            if (!tc.arguments.is_object()) {
+                fprintf(stderr,
+                        tc.arguments.is_string()
+                            ? "[q27-strict] rejected double-encoded arguments (tool=%s)\n"
+                            : "[q27-strict] rejected non-object arguments (tool=%s)\n",
                         tc.name.c_str());
                 tc.ok = false;
                 return tc;
@@ -623,13 +663,14 @@ inline ToolCall parse_tool_call(const std::string& seg) {
         }
         return tc;
     }
+    if (parse_native_xml_call(seg, tc, tools)) return tc;
     try {
         json j = json::parse(escape_content_tags(seg));
         tc.name = j.value("name", std::string());
         tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
         if (tc.arguments.is_string()) // some models double-encode
             tc.arguments = json::parse(tc.arguments.get<std::string>());
-        tc.ok = !tc.name.empty();
+        tc.ok = !tc.name.empty() && tc.arguments.is_object();
     } catch (...) { tc.ok = false; }
     return tc;
 }
@@ -1319,18 +1360,27 @@ inline std::string first_balanced_object(const std::string& s) {
     return "";
 }
 
-// True if `pos` sits inside an open ```...``` fenced code block (an odd number
-// of ``` precede it). A tool call the model INTENDS to emit is never markdown-
-// fenced; a call shown as an example, or echoed from an injected file/page, is.
-// We look ONLY before `pos`, so a write whose VALUE contains fences (its ``` are
-// after the call's opener) is not mistaken for a fenced call.
+// True when `pos` is inside a line-delimited Markdown backtick or tilde fence.
+// The shared parser tracks the full opener run, so six-backtick examples are
+// not mistaken for two adjacent three-backtick fences.
 inline bool inside_fence(const std::string& s, size_t pos) {
-    size_t f = 0, count = 0;
-    while ((f = s.find("```", f)) != std::string::npos && f < pos) {
-        count++;
-        f += 3;
-    }
-    return (count & 1) != 0;
+    return inside_markdown_fence(s, pos);
+}
+
+// Wrapperless native XML has no protocol wrapper to distinguish it from
+// echoed content. Execute it only when it is the first non-whitespace output
+// and begins at Markdown top level; prose/examples stay ordinary text.
+inline bool native_xml_call_boundary(const std::string& s, size_t pos) {
+    return unambiguous_native_xml_boundary(s, pos);
+}
+
+inline bool inside_xml_block(const std::string& s, size_t pos,
+                             const std::string& open,
+                             const std::string& close) {
+    const size_t opened = s.rfind(open, pos);
+    if (opened == std::string::npos) return false;
+    const size_t closed = s.rfind(close, pos);
+    return closed == std::string::npos || closed < opened;
 }
 
 inline bool recover_raw_value_call(const std::string& text, const json& tools,
@@ -1408,7 +1458,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr,
                                                    bool allow_trunc_repair = true,
-                                                   bool allow_o10 = true) {
+                                                   bool allow_o10 = true,
+                                                   bool xml_dialect = false) {
     std::vector<ToolCall> out;
     if (tool_strict()) {
         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
@@ -1640,6 +1691,104 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         }
     }
 
+    // DRIFT MODE 17 + bare native dialect (Qwen3.8 thinking mode). Recover a
+    // wrapper-less trained-format call or the observed JSON-head/XML-parameter
+    // chimera. Both paths require a declared tool and never consume result or
+    // output blocks, which may be hallucinated tool results rather than calls.
+    if (xml_dialect && tools && tools->is_array()) {
+        auto declared = [&](const std::string& name) {
+            for (const auto& tool : *tools)
+                if (tool.contains("function") &&
+                    tool["function"].value("name", std::string()) == name)
+                    return true;
+            return false;
+        };
+
+        for (size_t function_begin = text_in.find("<function=");
+             function_begin != std::string::npos;
+             function_begin = text_in.find("<function=", function_begin + 10)) {
+            if (!native_xml_call_boundary(text_in, function_begin) ||
+                inside_fence(text_in, function_begin) ||
+                nested_native_xml_candidate(text_in, function_begin) ||
+                inside_xml_block(text_in, function_begin, "<result>", "</result>") ||
+                inside_xml_block(text_in, function_begin, "<output>", "</output>"))
+                continue;
+            std::vector<ToolCall> native_calls;
+            size_t cursor = function_begin;
+            while (cursor != std::string::npos &&
+                   top_level_markup_boundary(text_in, cursor) &&
+                   !inside_fence(text_in, cursor) &&
+                   !nested_native_xml_candidate(text_in, cursor) &&
+                   !inside_xml_block(text_in, cursor, "<result>", "</result>") &&
+                   !inside_xml_block(text_in, cursor, "<output>", "</output>")) {
+                const size_t function_end = text_in.find("</function>", cursor);
+                if (function_end == std::string::npos) break;
+                ToolCall call;
+                const std::string span = text_in.substr(
+                    cursor, function_end + 11 - cursor);
+                if (!parse_native_xml_call(span, call, tools) ||
+                    !declared(call.name)) break;
+                native_calls.push_back(std::move(call));
+                size_t next = text_in.find_first_not_of(
+                    " \t\r\n", function_end + 11);
+                if (next == std::string::npos ||
+                    text_in.compare(next, 10, "<function=") != 0) break;
+                cursor = next;
+            }
+            if (!native_calls.empty()) {
+                if (prefix) *prefix = text_in.substr(0, function_begin);
+                fprintf(stderr,
+                        "[q27] %zu bare native-dialect call(s) recovered\n",
+                        native_calls.size());
+                return native_calls;
+            }
+        }
+
+        size_t json_begin = text_in.find("{\"name\"");
+        if (json_begin != std::string::npos &&
+            !inside_fence(text_in, json_begin) &&
+            !inside_xml_block(text_in, json_begin, "<result>", "</result>") &&
+            !inside_xml_block(text_in, json_begin, "<output>", "</output>")) {
+            size_t parameter = text_in.find("<parameter=", json_begin);
+            if (parameter != std::string::npos) {
+                size_t colon = text_in.find(':', json_begin);
+                size_t quote_begin = colon == std::string::npos
+                                         ? std::string::npos
+                                         : text_in.find('"', colon + 1);
+                size_t quote_end = quote_begin == std::string::npos
+                                       ? std::string::npos
+                                       : text_in.find('"', quote_begin + 1);
+                if (quote_end != std::string::npos && quote_end < parameter) {
+                    const std::string name =
+                        text_in.substr(quote_begin + 1, quote_end - quote_begin - 1);
+                    if (declared(name)) {
+                        std::string span =
+                            "<function=" + name + ">\n" + text_in.substr(parameter);
+                        const size_t last_parameter = span.rfind("<parameter=");
+                        const bool parameter_open =
+                            last_parameter != std::string::npos &&
+                            span.find("</parameter>", last_parameter) == std::string::npos;
+                        const bool function_open =
+                            span.find("</function>") == std::string::npos;
+                        if (!((parameter_open || function_open) &&
+                              !allow_trunc_repair)) {
+                            if (parameter_open) span += "\n</parameter>";
+                            if (function_open) span += "\n</function>";
+                            ToolCall call;
+                            if (parse_native_xml_call(span, call, tools)) {
+                            if (prefix) *prefix = text_in.substr(0, json_begin);
+                            fprintf(stderr,
+                                    "[q27] drift mode 17: chimera json-head/xml-params %s\n",
+                                    name.c_str());
+                            return std::vector<ToolCall>{std::move(call)};
+                        }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
     bool m10 = false;                                    // mode 10: in-string quote re-escaped
     // drift mode 9 (2026-07-11, codex-harnessed traffic): the model drops the
@@ -1795,7 +1944,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             } catch (...) {}
             bool recovered_here = false;
             if (shaped) {
-                ToolCall tc = parse_tool_call(r);
+                ToolCall tc = parse_tool_call(r, tools);
                 if (tc.ok) {
                     if (first == std::string::npos) first = i;
                     out.push_back(tc);
@@ -1825,7 +1974,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             }
         } catch (...) {}
         if (shaped) {
-            ToolCall tc = parse_tool_call(seg);
+            ToolCall tc = parse_tool_call(seg, tools);
             if (tc.ok) {
                 if (first == std::string::npos) first = i;
                 out.push_back(tc);
@@ -1925,7 +2074,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             if (synth.find('}') == std::string::npos) synth += "}";
             std::string pre2;
             auto rec = parse_bare_tool_calls(synth, &pre2, tools,
-                                             allow_trunc_repair, /*allow_o10=*/false);
+                                             allow_trunc_repair, /*allow_o10=*/false,
+                                             xml_dialect);
             if (!rec.empty()) {
                 out = std::move(rec);
                 if (prefix) *prefix = pre2;

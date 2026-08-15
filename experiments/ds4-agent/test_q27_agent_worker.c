@@ -52,6 +52,10 @@ uint32_t q27_agent_engine_mtp_width(const q27_agent_engine *engine) {
     return 0;
 }
 
+int q27_agent_engine_tool_dialect_xml(const q27_agent_engine *engine) {
+    return engine && engine->marker == 38;
+}
+
 q27_agent_status q27_agent_engine_tokenizer_sha1(
     q27_agent_engine *engine, unsigned char out_sha1[20],
     char *error, size_t error_cap) {

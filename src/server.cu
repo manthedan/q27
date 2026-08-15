@@ -370,6 +370,7 @@ int main(int argc, char** argv) {
     // Upload once; borrowing engines skip the 17.7 GB weight copy. (Multi-slot
     // will construct N engines from this same pair.)
     q27::Model shared_model = q27::Model::open(model);
+    const bool xml_dialect = q27::select_tool_dialect_for_model(shared_model.meta_json);
     q27::DeviceModel shared_dm(shared_model);
     fprintf(stderr, "uploading weights...\n");
     shared_dm.upload_all();
@@ -1259,8 +1260,9 @@ int main(int argc, char** argv) {
             // think block, so suppress the opener when a tool is forced.
             if (tchoice.mode == q27::ToolChoice::FORCED) thinking = false;
             size_t stable_off = 0, sys_off = 0;
-            std::string rendered =
-                q27::chatml_prompt(q27::openai_msgs(body), tools, thinking, &stable_off, &sys_off);
+            std::string rendered = q27::chatml_prompt(
+                q27::openai_msgs(body, xml_dialect), tools, thinking,
+                &stable_off, &sys_off, xml_dialect);
             // P16b: token length of the system+tools block. Measured with a
             // THIRD encode used only for its length -- the prompt itself is
             // still built from the same two pieces, so no request's bytes
@@ -1399,13 +1401,15 @@ int main(int argc, char** argv) {
             // routed_chat: think/tool-aware path, an exact mechanical twin of
             // the /v1/messages non-stream handler above, OpenAI-shaped output.
             StreamSplitter sp;
+            sp.native_xml = xml_dialect;
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
                 if (!tool_buf.empty()) { // tool segment closed
-                    calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                    calls.push_back(q27::parse_tool_call(
+                        q27::strip_ws2(tool_buf), &tools, xml_dialect));
                     tool_buf.clear();
                 }
                 (ch == StreamSplitter::THINK ? think : text) += t;
@@ -1420,7 +1424,7 @@ int main(int argc, char** argv) {
             // comment); AUTO (the default) and NONE are unaffected.
             tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                         eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-            tc.begin(tool_names_v);
+            tc.begin(tool_names_v, xml_dialect);
             // FORCED: the opener was injected into the PROMPT, not generated,
             // so the splitter must start already inside the TOOL channel or
             // the call body would be read back as ordinary text.
@@ -1464,7 +1468,8 @@ int main(int argc, char** argv) {
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
-                calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                calls.push_back(q27::parse_tool_call(
+                    q27::strip_ws2(tool_buf), &tools, xml_dialect));
 
             std::string tx = q27::strip_ws2(text);
             for (auto& c : calls)
@@ -1472,7 +1477,8 @@ int main(int argc, char** argv) {
             if (tools.is_array() && !tools.empty()) {
                 // wrapper-less call recovery (see parse_bare_tool_calls)
                 std::string pre;
-                auto bcs = q27::parse_bare_tool_calls(tx, &pre, &tools);
+                auto bcs = q27::parse_bare_tool_calls(
+                    tx, &pre, &tools, n < n_max, true, xml_dialect);
                 if (!bcs.empty()) {
                     fprintf(stderr,
                             "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
@@ -1591,9 +1597,13 @@ int main(int argc, char** argv) {
                 tc.host2dev = &sl.tool_mask_host2dev;
                 tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                             eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-                tc.begin(tool_names_v);
+                tc.begin(tool_names_v, xml_dialect);
                 StreamSplitter sp;
-                if (tchoice.mode == q27::ToolChoice::FORCED) sp.chan = StreamSplitter::TOOL;
+                sp.native_xml = xml_dialect;
+                if (tchoice.mode == q27::ToolChoice::FORCED) {
+                    sp.chan = StreamSplitter::TOOL;
+                    sp.native_tool = xml_dialect;
+                }
                 else if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 q27::Utf8Gate ugate;
                 bool alive = true; // cleared when a write fails (client disconnected)
@@ -1601,7 +1611,8 @@ int main(int argc, char** argv) {
                 bool any_call = false;
                 std::string tool_buf, text_accum;
                 auto emit_tool = [&]() {
-                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    auto c = q27::parse_tool_call(
+                        q27::strip_ws2(tool_buf), &tools, xml_dialect);
                     tool_buf.clear();
                     if (!c.ok) { // malformed: surface as text so nothing is lost
                         if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
@@ -1668,7 +1679,8 @@ int main(int argc, char** argv) {
                     // wrapper-less call recovery: text already streamed as a
                     // content delta (cosmetic); the tool_calls delta still fires
                     std::string pre;
-                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre, &tools);
+                    auto bcs = q27::parse_bare_tool_calls(
+                        text_accum, &pre, &tools, produced < nm, true, xml_dialect);
                     if (!bcs.empty()) {
                         fprintf(stderr,
                                 "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
@@ -1733,8 +1745,9 @@ int main(int argc, char** argv) {
             return;
         }
         std::string rendered = q27::chatml_prompt(
-            q27::anthropic_msgs(body), q27::anthropic_tools_json(body),
-            q27::resolve_think(body, !no_think_srv, req_think));
+            q27::anthropic_msgs(body, xml_dialect), q27::anthropic_tools_json(body),
+            q27::resolve_think(body, !no_think_srv, req_think),
+            nullptr, nullptr, xml_dialect);
         json out = {{"input_tokens", (long)tok.encode(rendered).size()}};
         res.set_content(jdump(out), "application/json");
     });
@@ -1756,8 +1769,9 @@ int main(int argc, char** argv) {
         int sys_len = 0; // P16b: system-block tokens (0 = none/feature off)
         bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
         size_t sys_off = 0;
-        std::string rendered = q27::chatml_prompt(q27::anthropic_msgs(body), tools, thinking,
-                                                  &stable_off, &sys_off);
+        std::string rendered = q27::chatml_prompt(
+            q27::anthropic_msgs(body, xml_dialect), tools, thinking,
+            &stable_off, &sys_off, xml_dialect);
         auto tk1 = std::chrono::steady_clock::now();
         // P8: split-encode at the stable boundary. Both turns encode the
         // shared history with the same split (the boundary always abuts the
@@ -1821,6 +1835,7 @@ int main(int argc, char** argv) {
             eng.on_round_gap = make_yield(eng);
             n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             StreamSplitter sp;
+            sp.native_xml = xml_dialect;
             if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
@@ -1828,7 +1843,8 @@ int main(int argc, char** argv) {
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
                 if (!tool_buf.empty()) { // tool segment closed
-                    calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                    calls.push_back(q27::parse_tool_call(
+                        q27::strip_ws2(tool_buf), &tools, xml_dialect));
                     tool_buf.clear();
                 }
                 (ch == StreamSplitter::THINK ? think : text) += t;
@@ -1837,7 +1853,7 @@ int main(int argc, char** argv) {
             tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
             tc.host2dev = &sl.tool_mask_host2dev;
             tc.enabled = constrain_tools && eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-            tc.begin(tool_names_v);
+            tc.begin(tool_names_v, xml_dialect);
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             if (tc.enabled)
@@ -1878,7 +1894,8 @@ int main(int argc, char** argv) {
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
-                calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                calls.push_back(q27::parse_tool_call(
+                    q27::strip_ws2(tool_buf), &tools, xml_dialect));
 
             json content = json::array();
             std::string th = q27::strip_ws2(think), tx = q27::strip_ws2(text);
@@ -1895,7 +1912,8 @@ int main(int argc, char** argv) {
             if (tools.is_array() && !tools.empty()) {
                 // wrapper-less call recovery (see parse_bare_tool_calls)
                 std::string pre;
-                auto bcs = q27::parse_bare_tool_calls(tx, &pre, &tools);
+                auto bcs = q27::parse_bare_tool_calls(
+                    tx, &pre, &tools, n < n_max, true, xml_dialect);
                 if (!bcs.empty()) {
                     fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (nonstream)\n",
                             bcs.size());
@@ -1946,7 +1964,7 @@ int main(int argc, char** argv) {
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
                 tc.host2dev = &sl.tool_mask_host2dev;
                 tc.enabled = constrain_tools && eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-                tc.begin(tool_names_v);
+                tc.begin(tool_names_v, xml_dialect);
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
                 bool alive = true; // cleared when a write fails (client disconnected)
@@ -1963,6 +1981,7 @@ int main(int argc, char** argv) {
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});
 
                 StreamSplitter sp;
+                sp.native_xml = xml_dialect;
                 if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 std::string tool_buf, text_accum;
                 q27::Utf8Gate ugate;
@@ -1990,7 +2009,8 @@ int main(int argc, char** argv) {
                     }
                 };
                 auto emit_tool = [&]() {
-                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    auto c = q27::parse_tool_call(
+                        q27::strip_ws2(tool_buf), &tools, xml_dialect);
                     tool_buf.clear();
                     if (!c.ok) { // malformed: surface as text so nothing is lost
                         open_block(0);
@@ -2063,7 +2083,8 @@ int main(int argc, char** argv) {
                     // wrapper-less call recovery: text already streamed as
                     // text_delta (cosmetic); the tool_use blocks still fire
                     std::string pre;
-                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre, &tools);
+                    auto bcs = q27::parse_bare_tool_calls(
+                        text_accum, &pre, &tools, produced < nm, true, xml_dialect);
                     if (!bcs.empty()) {
                         fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (stream)\n",
                                 bcs.size());
@@ -2189,8 +2210,8 @@ int main(int argc, char** argv) {
                         } else {
                             args = {{"input", q27::jstr(it, "input")}};
                         }
-                        msgs.push_back({"assistant",
-                                        q27::tool_call_text(q27::jstr(it, "name"), args)});
+                        msgs.push_back({"assistant", q27::tool_call_text(
+                            q27::jstr(it, "name"), args, xml_dialect)});
                     } else if (ty == "function_call_output" || ty == "custom_tool_call_output") {
                         std::string out;
                         if (it.contains("output")) {
@@ -2221,7 +2242,8 @@ int main(int argc, char** argv) {
         auto tk0 = std::chrono::steady_clock::now();
         bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
         size_t sys_off = 0;
-        const std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off);
+        const std::string rendered = q27::chatml_prompt(
+            merged, tools, thinking, nullptr, &sys_off, xml_dialect);
         std::vector<int> prompt = tok.encode(rendered);
         // P16b applies here even though P16a does not: this shape computes no
         // stable_off (so it never persists a stable entry), but a system+tools
@@ -2282,8 +2304,10 @@ int main(int argc, char** argv) {
                 items.push_back(m);
                 return m;
             };
-            auto flush_tool = [&items, ctx, rid, &tool_counter, &custom_names]() {
-                auto c = q27::parse_tool_call(q27::strip_ws2(ctx->tool_buf));
+            auto flush_tool = [&items, ctx, rid, &tool_counter, &custom_names, &tools,
+                               xml_dialect]() {
+                auto c = q27::parse_tool_call(
+                    q27::strip_ws2(ctx->tool_buf), &tools, xml_dialect);
                 ctx->tool_buf.clear();
                 std::string cid = "call_q27_" + std::to_string(rid) + "_" +
                                   std::to_string(tool_counter++);
@@ -2331,6 +2355,7 @@ int main(int argc, char** argv) {
             auto& flush_text = std::get<2>(item_cbs);
             auto& flush_tool = std::get<3>(item_cbs);
             StreamSplitter sp;
+            sp.native_xml = xml_dialect;
             if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
                 if (ch == StreamSplitter::TOOL) {
@@ -2474,7 +2499,8 @@ int main(int argc, char** argv) {
                     msg_index = -1;
                 };
                 auto flush_tool = [&]() {
-                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    auto c = q27::parse_tool_call(
+                        q27::strip_ws2(tool_buf), &tools, xml_dialect);
                     tool_buf.clear();
                     std::string cid = "call_q27_" + std::to_string(rid) + "_" +
                                       std::to_string(tool_counter++);
@@ -2515,6 +2541,7 @@ int main(int argc, char** argv) {
                         {"output_index", msg_index}, {"content_index", 0}, {"delta", t}});
                 };
                 StreamSplitter sp;
+                sp.native_xml = xml_dialect;
                 if (thinking) sp.chan = StreamSplitter::THINK; // prompt-injected <think> opener -> start in THINK
                 q27::Utf8Gate ugate;
                 auto on_tok = [&](int id) {
@@ -2552,8 +2579,9 @@ int main(int argc, char** argv) {
                 // tool set, so a spurious recovery is harmless.
                 {
                     std::string pre;
-                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre,
-                                                          tools.empty() ? nullptr : &tools);
+                    auto bcs = q27::parse_bare_tool_calls(
+                        text_accum, &pre, tools.empty() ? nullptr : &tools,
+                        produced < nm, true, xml_dialect);
                     if (!bcs.empty())
                         fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (resp)\n",
                                 bcs.size());

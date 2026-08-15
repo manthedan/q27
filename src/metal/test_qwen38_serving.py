@@ -123,7 +123,7 @@ def exercise(port):
         "tools": [weather, forecast],
         "tool_choice": "none",
         "temperature": 0,
-        "max_tokens": 96,
+        "max_tokens": 256,
     }
     final_status, final_body = request_json(port, "/v1/chat/completions", final_payload)
     require(final_status == 200, f"final OpenAI turn returned {final_status}: {final_body}")
@@ -147,10 +147,12 @@ def exercise(port):
     anthropic_status, anthropic_body = request_json(
         port, "/v1/messages", anthropic_payload)
     blocks = anthropic_body.get("content") or []
+    tool_blocks = [block for block in blocks if block.get("type") == "tool_use"]
     require(anthropic_status == 200 and anthropic_body.get("stop_reason") == "tool_use" and
-            len(blocks) == 1 and blocks[0].get("type") == "tool_use" and
-            blocks[0].get("name") == "get_weather" and
-            blocks[0].get("input", {}).get("location") == "Paris",
+            len(tool_blocks) == 1 and
+            all(block.get("type") in ("thinking", "tool_use") for block in blocks) and
+            tool_blocks[0].get("name") == "get_weather" and
+            tool_blocks[0].get("input", {}).get("location") == "Paris",
             f"Anthropic turn did not return the requested tool call: {anthropic_body}")
 
 
@@ -165,7 +167,7 @@ def main():
     port = available_port()
     process = subprocess.Popen(
         [server, model, tokenizer, "--host", "127.0.0.1", "--port", str(port),
-         "--ctx", "2048", "--slots", "1", "--mtp", "4",
+         "--ctx", "2048", "--slots", "1", "--mtp", "4", "--think",
          "--max-tokens-default", "256"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -190,6 +192,8 @@ def main():
                     f"Qwen3.8 Metal server exited before readiness: {process.returncode}")
             if time.monotonic() >= deadline:
                 raise AssertionError("Qwen3.8 Metal server did not become ready")
+        require(any("tool dialect: xml" in line for line in stderr_lines),
+                "Qwen3.8 metadata did not select the trained XML tool dialect")
         exercise(port)
     except Exception:
         sys.stderr.write("".join(stderr_lines))

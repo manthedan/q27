@@ -9,6 +9,7 @@
 // Build + run (no CUDA needed):
 //   g++ -std=c++17 -I src tools/test_tool_drift.cpp -o build/test_tool_drift && ./build/test_tool_drift
 #include "api_common.h"
+#include "toolgram.h"
 #include <cstdio>
 #include <string>
 
@@ -127,6 +128,271 @@ static void test_mode16_and_15_variants() {
     ok(v3.empty(), "hallucinated <result>/<output> block is NOT rescued as a call");
 }
 
+static void test_think_mode_drift() {
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}},{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}])");
+    std::string prefix;
+    auto bare = q27::parse_bare_tool_calls(
+        "\n<function=Read>\n<parameter=file_path>\n/workspace/tests/phase-06.test.ts\n</parameter>\n</function>\n",
+        &prefix, &tools, true, true, true);
+    ok(bare.size() == 1 && bare[0].ok && bare[0].name == "Read" &&
+           bare[0].arguments.value("file_path", std::string()) ==
+               "/workspace/tests/phase-06.test.ts",
+       "bare native dialect without wrapper recovered");
+    auto bare_multi = q27::parse_bare_tool_calls(
+        "<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n"
+        "<function=Read>\n<parameter=file_path>\n/b\n</parameter>\n</function>",
+        &prefix, &tools, true, true, true);
+    ok(bare_multi.size() == 2 && bare_multi[0].name == "Read" &&
+           bare_multi[1].name == "Read" &&
+           bare_multi[0].arguments.value("file_path", std::string()) == "/a" &&
+           bare_multi[1].arguments.value("file_path", std::string()) == "/b",
+       "bare native XML preserves consecutive multi-call turns");
+    auto json_dialect_xml = q27::parse_bare_tool_calls(
+        "<function=Read>\n<parameter=file_path>\n/workspace/tests/phase-06.test.ts\n"
+        "</parameter>\n</function>", &prefix, &tools);
+    ok(json_dialect_xml.empty(),
+       "bare native XML is not executable outside the selected XML dialect");
+    auto quoted_xml = q27::parse_bare_tool_calls(
+        "{\"example\":\"<function=Read><parameter=file_path>/tmp/x"
+        "</parameter></function>\"}", &prefix, &tools, true, true, true);
+    ok(quoted_xml.empty(),
+       "bare native XML embedded in a quoted example is not executed");
+    auto long_fenced_xml = q27::parse_bare_tool_calls(
+        "Example:\n``````xml\n<function=Read><parameter=file_path>/unsafe"
+        "</parameter></function>\n``````", &prefix, &tools, true, true, true);
+    ok(long_fenced_xml.empty(),
+       "six-backtick native XML examples are not executed");
+    auto tilde_fenced_xml = q27::parse_bare_tool_calls(
+        "Example:\n~~~~xml\n<function=Read><parameter=file_path>/unsafe"
+        "</parameter></function>\n~~~~", &prefix, &tools, true, true, true);
+    ok(tilde_fenced_xml.empty(),
+       "tilde-fenced native XML examples are not executed");
+    auto indented_xml = q27::parse_bare_tool_calls(
+        "    <function=Read><parameter=file_path>/unsafe</parameter></function>",
+        &prefix, &tools, true, true, true);
+    ok(indented_xml.empty(),
+       "four-space indented native XML examples are not executed");
+    auto nested_xml = q27::parse_bare_tool_calls(
+        "<function=Fixture><parameter=value>\n"
+        "<function=Read><parameter=file_path>/unsafe</parameter></function>\n"
+        "</parameter></function>",
+        &prefix, &tools, true, true, true);
+    ok(nested_xml.empty(),
+       "native XML nested in another parameter is not executed");
+    auto example_then_call = q27::parse_bare_tool_calls(
+        "Example:\n```xml\n<function=Read><parameter=file_path>/ignored"
+        "</parameter></function>\n```\nNow inspect:\n"
+        "<function=Read><parameter=file_path>/later</parameter></function>",
+        &prefix, &tools, true, true, true);
+    ok(example_then_call.empty(),
+       "bare recovery never executes a later call after displayed prose/examples");
+    auto multiline_quoted_xml = q27::parse_bare_tool_calls(
+        "Quoted output:\n\"\n<function=Read><parameter=file_path>/unsafe"
+        "</parameter></function>\n\"",
+        &prefix, &tools, true, true, true);
+    ok(multiline_quoted_xml.empty(),
+       "multiline quoted native XML examples are not executed");
+    auto literal_result = q27::parse_bare_tool_calls(
+        "<function=Write>\n<parameter=file_path>\n/out\n</parameter>\n"
+        "<parameter=content>\n<output>literal</output>\n</parameter>\n</function>",
+        &prefix, &tools, true, true, true);
+    ok(literal_result.size() == 1 &&
+           literal_result[0].arguments.value("content", std::string()) ==
+               "<output>literal</output>",
+       "native XML arguments may contain literal result/output tags");
+
+    auto chimera = q27::parse_bare_tool_calls(
+        "The test suite is clear. Writing the implementation:\n\n"
+        "{\"name\": \"Write\",\n<parameter=file_path>\n/workspace/src/index.ts\n</parameter>\n"
+        "<parameter=content>\nimport { existsSync, mkdirSync } from 'fs';\nconst x = 1;\n</parameter>",
+        &prefix, &tools, true, true, true);
+    ok(chimera.size() == 1 && chimera[0].ok && chimera[0].name == "Write" &&
+           chimera[0].arguments.value("file_path", std::string()) ==
+               "/workspace/src/index.ts" &&
+           chimera[0].arguments.value("content", std::string()).rfind(
+               "import { existsSync", 0) == 0,
+       "mode17: json-head/xml-params chimera recovered");
+    ok(prefix.find("Writing the implementation") != std::string::npos,
+       "mode17: prose before the chimera preserved as prefix");
+
+    auto truncated_chimera = q27::parse_bare_tool_calls(
+        "{\"name\": \"Write\",\n<parameter=file_path>\n/workspace/src/index.ts\n</parameter>\n"
+        "<parameter=content>\npartial",
+        &prefix, &tools, false, true, true);
+    ok(truncated_chimera.empty(),
+       "mode17: truncation repair disabled rejects incomplete XML parameters");
+    auto complete_chimera = q27::parse_bare_tool_calls(
+        "{\"name\": \"Write\",\n<parameter=file_path>\n/workspace/src/index.ts\n</parameter>\n"
+        "<parameter=content>\ncomplete\n</parameter>\n</function>",
+        &prefix, &tools, false, true, true);
+    ok(complete_chimera.size() == 1 && complete_chimera[0].ok &&
+           complete_chimera[0].arguments.value("content", std::string()) == "complete",
+       "mode17: complete XML chimera survives fail-closed mode");
+
+    auto undeclared = q27::parse_bare_tool_calls(
+        "{\"name\": \"NotATool\",\n<parameter=x>\n1\n</parameter>",
+        &prefix, &tools, true, true, true);
+    ok(undeclared.empty(), "mode17: undeclared chimera name is not rescued");
+    auto fenced = q27::parse_bare_tool_calls(
+        "Example only:\n```xml\n<function=Read>\n<parameter=file_path>\n/etc/passwd\n"
+        "</parameter>\n</function>\n```",
+        &prefix, &tools, true, true, true);
+    ok(fenced.empty(), "mode17: fenced native XML example is not executed");
+}
+
+static void test_dialect_default_keying() {
+    unsetenv("Q27_TOOL_DIALECT");
+    auto metadata = [](const char* name) {
+        return std::string("{\"general.name\": \"") + name + "\"}";
+    };
+    ok(q27::select_tool_dialect_for_model(metadata("Qwen38 27b Hf")),
+       "dialect: mangled 3.8 name selects xml");
+    const bool clean_xml = q27::select_tool_dialect_for_model(metadata("Qwen3.8-27B"));
+    ok(clean_xml, "dialect: clean 3.8 name selects xml");
+    json tools = json::array({tool("Read", {{"file_path", true}})});
+    const std::string xml_preamble = q27::tools_preamble(tools, clean_xml);
+    ok(xml_preamble.find("<function=example_function_name>") != std::string::npos &&
+           xml_preamble.find("{\"name\": <function-name>") == std::string::npos,
+       "dialect: qwen3.8 preamble uses trained XML format");
+    ok(!q27::select_tool_dialect_for_model(metadata("Qwen3.6-27B")),
+       "dialect: 3.6 stays json");
+    ok(!q27::select_tool_dialect_for_model(metadata("Qwopus3.6 27B v2")),
+       "dialect: qwopus fine-tune stays json");
+    setenv("Q27_TOOL_DIALECT", "json", 1);
+    ok(!q27::select_tool_dialect_for_model(metadata("Qwen3.8-27B")),
+       "dialect: env json overrides a 3.8 model");
+    setenv("Q27_TOOL_DIALECT", "xml", 1);
+    ok(q27::select_tool_dialect_for_model(metadata("Qwen3.6-27B")),
+       "dialect: env xml overrides a 3.6 model");
+    unsetenv("Q27_TOOL_DIALECT");
+}
+
+static void test_native_xml_dialect() {
+    const json xml_tools = json::parse(R"([
+        {"type":"function","function":{"name":"get_weather","parameters":{
+            "type":"object","properties":{"city":{"type":"string"},
+            "units":{"type":"string"},"count":{"type":"integer"},
+            "notes":{"type":"string"}}}}},
+        {"type":"function","function":{"name":"Write","parameters":{
+            "type":"object","properties":{"content":{"type":"string"},
+            "count":{"type":"integer"},"force":{"type":"boolean"}}}}}
+    ])");
+    q27::ToolCall first;
+    ok(q27::parse_native_xml_call(
+           "\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+           "<parameter=units>\nmetric\n</parameter>\n</function>\n", first, &xml_tools) &&
+           first.ok && first.name == "get_weather" &&
+           first.arguments.value("city", std::string()) == "Paris" &&
+           first.arguments.value("units", std::string()) == "metric",
+       "native-xml: two scalar parameters round-trip");
+    q27::ToolCall typed;
+    ok(q27::parse_native_xml_call(
+           "<function=Write>\n<parameter=content>\n123\n</parameter>\n"
+           "<parameter=count>\n3\n</parameter>\n<parameter=force>\ntrue\n</parameter>\n"
+           "</function>", typed, &xml_tools) &&
+           typed.arguments.value("content", std::string()) == "123" &&
+           typed.arguments.value("count", 0) == 3 &&
+           typed.arguments.value("force", false),
+       "native-xml: schema preserves JSON-looking strings and types declared scalars");
+    const json union_tools = json::parse(R"([
+        {"type":"function","function":{"name":"typed","parameters":{
+            "type":"object","properties":{
+                "nullable_count":{"type":["integer","null"]},
+                "choice":{"anyOf":[{"type":"integer"},{"type":"boolean"}]},
+                "mode":{"enum":["safe","fast"]}}}}}
+    ])");
+    q27::ToolCall union_typed;
+    ok(q27::parse_native_xml_call(
+           "<function=typed>\n<parameter=nullable_count>\n3\n</parameter>\n"
+           "<parameter=choice>\nfalse\n</parameter>\n"
+           "<parameter=mode>\nsafe\n</parameter>\n</function>",
+           union_typed, &union_tools) &&
+           union_typed.arguments.value("nullable_count", 0) == 3 &&
+           !union_typed.arguments.value("choice", true) &&
+           union_typed.arguments.value("mode", std::string()) == "safe",
+       "native-xml: union, anyOf, and enum schemas preserve declared types");
+    q27::ToolCall invalid_typed;
+    ok(!q27::parse_native_xml_call(
+           "<function=typed>\n<parameter=nullable_count>\nnot-a-number\n"
+           "</parameter>\n</function>", invalid_typed, &union_tools),
+       "native-xml: schema-invalid typed values are rejected");
+    std::string bare_prefix;
+    const auto bare = q27::parse_bare_tool_calls(
+        "<function=Write>\n<parameter=content>\n123\n</parameter>\n"
+        "<parameter=count>\n8\n</parameter>\n<parameter=force>\nfalse\n</parameter>\n"
+        "</function>", &bare_prefix, &xml_tools, true, true, true);
+    ok(bare.size() == 1 && bare[0].arguments.value("content", std::string()) == "123" &&
+           bare[0].arguments.value("count", 0) == 8 &&
+           !bare[0].arguments.value("force", true) && bare_prefix.empty(),
+       "native-xml: bare recovery preserves schema-declared argument types");
+    q27::ToolCall empty;
+    ok(q27::parse_native_xml_call("<function=list_files>\n</function>", empty) &&
+           empty.ok && empty.arguments.empty(),
+       "native-xml: zero-parameter call is legal");
+    q27::ToolCall truncated;
+    ok(!q27::parse_native_xml_call(
+           "<function=Write>\n<parameter=content>\ntruncated with no closer", truncated),
+       "native-xml: truncated parameter is refused, not guessed");
+    q27::ToolCall missing_function_close;
+    ok(!q27::parse_native_xml_call(
+           "<function=Write><parameter=content>x</parameter>",
+           missing_function_close),
+       "native-xml: missing function closer is refused");
+    q27::ToolCall trailing;
+    ok(!q27::parse_native_xml_call(
+           "<function=Write></function> ignored suffix", trailing),
+       "native-xml: trailing body text is refused");
+    q27::ToolCall prose;
+    ok(!q27::parse_native_xml_call("plain text, no dialect", prose),
+       "native-xml: non-dialect text is not consumed");
+    const json history_args = {
+        {"city", "Paris"}, {"count", 3},
+        {"notes", "line one\nliteral </parameter> & <x>"}};
+    const std::string history = q27::tool_call_text("get_weather", history_args, true);
+    const size_t body_begin = history.find('\n') + 1;
+    const size_t body_end = history.rfind("\n</tool_call>");
+    q27::ToolCall replayed;
+    ok(history.find("<function=get_weather>") != std::string::npos &&
+           history.find("{\"name\"") == std::string::npos &&
+           history.find("&lt;/parameter&gt; &amp; &lt;x&gt;") != std::string::npos &&
+           body_begin > 0 && body_end != std::string::npos &&
+           q27::parse_native_xml_call(
+               history.substr(body_begin, body_end - body_begin), replayed, &xml_tools) &&
+           replayed.arguments == history_args,
+       "native-xml: escaped assistant tool history round-trips losslessly");
+    ok(q27::tool_call_text("get_weather", history_args, false).find(
+           "<tool_call>\n{\"name\": \"get_weather\"") == 0,
+       "native-json: assistant tool history remains legacy JSON");
+    const json unusual_tools = json::parse(R"([{"type":"function","function":{
+        "name":"f>x","parameters":{"type":"object","properties":{"a>b":{"type":"string"}}}}}])");
+    const json unusual_args = {{"a>b", "literal <tag> & bytes"}};
+    const std::string unusual_history = q27::tool_call_text("f>x", unusual_args, true);
+    q27::ToolCall unusual_call;
+    const size_t unusual_begin = unusual_history.find('\n') + 1;
+    const size_t unusual_end = unusual_history.rfind("\n</tool_call>");
+    q27::ToolGrammar grammar;
+    grammar.reset({"f>x"}, true);
+    ok(unusual_history.find("<function=f&gt;x>") != std::string::npos &&
+           unusual_history.find("<parameter=a&gt;b>") != std::string::npos &&
+           q27::parse_native_xml_call(
+               unusual_history.substr(unusual_begin, unusual_end - unusual_begin),
+               unusual_call, &unusual_tools) && unusual_call.name == "f>x" &&
+           unusual_call.arguments == unusual_args &&
+           grammar.advance_str("<function=f&gt;x>\n</function>\n</tool_call>") &&
+           grammar.closed(),
+       "native-xml: function and parameter tag names escape losslessly");
+}
+
+static void test_strict_native_xml_dialect() {
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"count",
+        "parameters":{"type":"object","properties":{"value":{"type":"integer"}}}}}])");
+    const q27::ToolCall call = q27::parse_tool_call(
+        "<function=count>\n<parameter=value>\n7\n</parameter>\n</function>",
+        &tools, true);
+    ok(call.ok && call.name == "count" && call.arguments.value("value", 0) == 7,
+       "native-xml: strict mode accepts the selected trained dialect");
+}
+
 static void test_mode14_tool_name_xml_dialect() {
     json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}])");
     // Verbatim bytes from the captured transcript.
@@ -183,10 +449,17 @@ static void test_mode13_truncated_mid_escape() {
 }
 
 int main() {
+    if (std::getenv("Q27_TEST_STRICT_XML")) {
+        test_strict_native_xml_dialect();
+        return failures ? 1 : 0;
+    }
     test_mode13_truncated_mid_escape();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();
     test_mode16_and_15_variants();
+    test_think_mode_drift();
+    test_dialect_default_keying();
+    test_native_xml_dialect();
     json tools = json::array();
     tools.push_back(tool("Write", {{"content", true}, {"file_path", true}}));
     tools.push_back(tool("Read", {{"file_path", true}}));

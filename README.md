@@ -37,9 +37,12 @@ available, use `qwen38-27b-mtp-q4s.q27` as the 24 GB Apple Silicon default.
 Qwen3.6 remains the published download and benchmark baseline. This is a Metal
 fit/throughput choice, not a transfer of the Qwen3.6 q4s quality claim:
 Qwen3.8 q4s measures 0.73% worse PPL than its own default tier, but the larger
-tiers lose substantial Metal throughput and memory headroom. Run
-`make test-metal-qwen38` and `make test-metal-qwen38-serving`; measured evidence
-is recorded in `docs/metal/BUILDLOG.md`.
+tiers lose substantial Metal throughput and memory headroom. The Qwen3.8
+serving profile enables thinking and selects the checkpoint's trained XML tool
+dialect from `general.name`; `Q27_TOOL_DIALECT=json` remains an explicit
+compatibility override. Run `make test-metal-qwen38` and
+`make test-metal-qwen38-serving`; measured evidence is recorded in
+`docs/metal/BUILDLOG.md`.
 
 ## Acknowledgements
 

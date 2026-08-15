@@ -166,6 +166,7 @@ q27_agent_worker_state q27_agent_worker_get_state(q27_agent_worker *worker);
 // used to construct the engine.
 int q27_agent_worker_tokenizer_sha1(q27_agent_worker *worker,
                                     unsigned char out_sha1[20]);
+int q27_agent_worker_tool_dialect_xml(q27_agent_worker *worker);
 // Creates one owned, monotonic post-publication terminal without requiring
 // engine admission; usable even when snapshot I/O put the worker in ERROR.
 int q27_agent_worker_selection_event(q27_agent_worker *worker,

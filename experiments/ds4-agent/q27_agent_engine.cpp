@@ -7,6 +7,7 @@
 #include "../../src/sampling.h"
 #include "../../src/tokenizer.h"
 #include "../../src/toolconstrain.h"
+#include "../../src/tool_preamble.h"
 
 #include <algorithm>
 #include <atomic>
@@ -137,6 +138,7 @@ struct q27_agent_engine {
     unsigned char tokenizer_sha1[20] = {0};
     uint32_t context;
     uint32_t mtp_width = 0; // 0 = serial; 2..12 = free-decode MTP quanta
+    bool xml_dialect = false;
 
     q27_agent_engine(const char *model_path, const char *tokenizer_path, uint32_t ctx)
         : context(ctx) {
@@ -163,6 +165,7 @@ struct q27_agent_engine {
         if (tokenizer->vocab_size() != q27::MetalEngine::vocabulary_size())
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared = q27::MetalEngine::open_shared(model_path);
+        xml_dialect = q27::select_tool_dialect_for_model(shared->model.meta_json);
         session = std::make_unique<q27::MetalEngine>(shared, ctx, false);
     }
 };
@@ -206,6 +209,11 @@ extern "C" void q27_agent_engine_set_mtp_width(q27_agent_engine *engine,
     if (width == 1) width = 0;
     if (width > 12) width = 12;
     engine->mtp_width = width;
+}
+
+extern "C" int q27_agent_engine_tool_dialect_xml(
+    const q27_agent_engine *engine) {
+    return engine && engine->xml_dialect;
 }
 
 extern "C" uint32_t q27_agent_engine_mtp_width(const q27_agent_engine *engine) {
@@ -664,7 +672,7 @@ extern "C" q27_agent_status q27_agent_generate(
             names.reserve(registered_count);
             for (size_t i = 0; i < registered_count; ++i)
                 names.emplace_back(registered_names[i]);
-            constrainer->begin(names);
+            constrainer->begin(names, engine->xml_dialect);
         }
         struct ConstraintCleanup {
             q27_agent_engine *engine;

@@ -56,6 +56,7 @@ test-cpu: build/test_artifacts build/test_depthctl build/test_toolconstrain buil
 	@# host-only, keep the Metal lane honest about the CUDA server's parser
 	@# fixes (drift modes, fence-skip, think resolution).
 	./build/test_tool_drift
+	Q27_TOOL_STRICT=1 Q27_TEST_STRICT_XML=1 ./build/test_tool_drift
 	./build/test_think_resolve
 	./build/test_stream_split
 	@# test_openai_bridge covers the tolerant jnum/jint/jbool/jstr readers and
@@ -243,7 +244,7 @@ build/q27_agent_editor_c.o: experiments/ds4-agent/q27_agent_editor.c experiments
 build/q27_agent_linenoise_c.o: experiments/ds4-agent/third_party/linenoise/linenoise.c experiments/ds4-agent/third_party/linenoise/linenoise.h | build
 	$(CC) $(CFLAGS) -I experiments/ds4-agent/third_party/linenoise -c experiments/ds4-agent/third_party/linenoise/linenoise.c -o $@
 
-build/q27-agent: build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_frontend_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o build/q27_agent_tui_c.o build/q27_agent_commands_c.o build/q27_agent_editor_c.o build/q27_agent_linenoise_c.o experiments/ds4-agent/q27_agent_engine.cpp experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_session.h experiments/ds4-agent/q27_agent_stall.h src/toolconstrain.h src/toolgram.h \
+build/q27-agent: build/q27_agent_c.o build/q27_agent_worker_c.o build/q27_agent_frontend_c.o build/q27_agent_tools_c.o build/q27_agent_sha256_c.o build/q27_agent_selections_c.o build/q27_agent_persistence_c.o build/q27_agent_protocol_cpp.o build/q27_agent_tui_c.o build/q27_agent_commands_c.o build/q27_agent_editor_c.o build/q27_agent_linenoise_c.o experiments/ds4-agent/q27_agent_engine.cpp experiments/ds4-agent/q27_agent_engine.h experiments/ds4-agent/q27_agent_session.h experiments/ds4-agent/q27_agent_stall.h src/toolconstrain.h src/toolgram.h src/tool_preamble.h \
                  src/metal/metal_engine.cpp src/metal/metal_engine.h src/suffixdraft.h src/sampling.h \
                  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
                  src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h | build
@@ -330,7 +331,7 @@ build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 
 # Upstream shared-parser tests: keep the files pristine for future merges
 # (they include "api_common.h" path-less), hence -Isrc here.
-build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h | build
+build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/toolgram.h src/tool_preamble.h src/stream_split.h | build
 	$(CXX) $(CXXFLAGS) -Isrc tools/test_tool_drift.cpp -o $@
 
 build/test_think_resolve: tools/test_think_resolve.cpp src/api_common.h | build

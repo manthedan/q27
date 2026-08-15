@@ -144,14 +144,18 @@ cmd_serve() {
     local n="${1:-$(recommend_pack)}"
     [ -n "$n" ] || { echo "q27 serve: no pack fits this machine; see \`q27 recommend\`" >&2; exit 1; }
     local art tok server
+    local -a serve_args=(--port 8080
+        --snapshot-dir "${Q27_SNAPSHOT_DIR:-$HOME/.q27/snapshots}"
+        --max-tokens-default "${Q27_MAX_TOKENS:-16384}")
     art="$(q27_artifact_path "$n")" || { echo "q27 serve: $n not installed — run \`q27 pull $n\`" >&2; exit 1; }
     tok="$(q27_tokenizer_path "$n")" || { echo "q27 serve: $n tokenizer missing — re-run \`q27 pull $n\`" >&2; exit 1; }
     server="$(q27_bin q27-metal-server)" || { echo "q27 serve: q27-metal-server not found" >&2; exit 1; }
+    case "$n" in
+        q38-*) serve_args+=(--think) ;;
+    esac
     echo "q27 serve: $n ($(basename "$art")) on 127.0.0.1:8080"
     echo "  export ANTHROPIC_BASE_URL=http://localhost:8080"
-    q27_run_consumer "$server" "$art" "$tok" --port 8080 \
-        --snapshot-dir "${Q27_SNAPSHOT_DIR:-$HOME/.q27/snapshots}" \
-        --max-tokens-default "${Q27_MAX_TOKENS:-16384}"
+    q27_run_consumer "$server" "$art" "$tok" "${serve_args[@]}"
 }
 
 # Prefer Ratatui FP1 client when available. Override with Q27_AGENT_UI:

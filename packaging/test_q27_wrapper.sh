@@ -419,6 +419,7 @@ printf '%s\n%s\n' \
     "$TMP/q38-home/q38-q4s/qwen38-27b-mtp.tok" \
     >"$TMP/q38-server-paths-expected"
 diff -u "$TMP/q38-server-paths-expected" "$TMP/q38-server-paths"
+grep -Fxq -- '--think' "$TMP/q38-server-args"
 wait_lock_clear || {
     echo "FAIL: q38 serve consumer flock remained held" >&2; exit 1; }
 

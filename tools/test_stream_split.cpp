@@ -29,4 +29,14 @@ int main(){
   // ever appears in the generated stream.
   { StreamSplitter s; s.chan=StreamSplitter::THINK; auto th=collect(s,{"reason","ing","</think>","\n\nans"},StreamSplitter::THINK); check("preseeded THINK: reasoning routes",th,"reasoning"); }
   { StreamSplitter s; s.chan=StreamSplitter::THINK; auto tx=collect(s,{"reason","ing","</think>","\n\nans"},StreamSplitter::TEXT); check("preseeded THINK: answer after </think>",tx,"\n\nans"); }
+  { StreamSplitter s; s.native_xml=true; auto tool=collect(s,{"<func","tion=read><parameter=path>x</parameter>","</function>"},StreamSplitter::TOOL); check("native XML pair -> TOOL",tool,"<function=read><parameter=path>x</parameter></function>"); }
+  { StreamSplitter s; s.native_xml=true; auto tx=collect(s,{"<function=read><parameter=path>x</parameter></function>"},StreamSplitter::TEXT); check("native XML emits no visible TEXT",tx,""); }
+  { StreamSplitter s; s.native_xml=true; auto tool=collect(s,{"   <function=read><parameter=path>x</parameter></function>"},StreamSplitter::TOOL); check("three-space native call allowed",tool,"<function=read><parameter=path>x</parameter></function>"); }
+  { StreamSplitter s; s.native_xml=true; auto tx=collect(s,{"    <function=read><parameter=path>x</parameter></function>"},StreamSplitter::TEXT); check("indented native example stays TEXT",tx,"    <function=read><parameter=path>x</parameter></function>"); }
+  { StreamSplitter s; s.native_xml=true; auto tx=collect(s,{"Quoted:\n\"\n","<function=read><parameter=path>x</parameter></function>\n\""},StreamSplitter::TEXT); check("quoted native example stays TEXT",tx,"Quoted:\n\"\n<function=read><parameter=path>x</parameter></function>\n\""); }
+  { StreamSplitter s; s.native_xml=true; s.chan=StreamSplitter::THINK; auto tool=collect(s,{"reason","</think>\n","<function=read><parameter=path>x</parameter></function>"},StreamSplitter::TOOL); check("native call after reasoning -> TOOL",tool,"<function=read><parameter=path>x</parameter></function>"); }
+  { StreamSplitter s; s.native_xml=true; auto out=s.feed("<function=read></function><function=write></function>");
+    int tools=0,bounds=0; std::string joined;
+    for(auto&[ch,t]:out) { if(ch==StreamSplitter::TOOL){ tools++; joined+=t; } else if(ch==StreamSplitter::TEXT&&t.empty()) bounds++; }
+    check("adjacent native calls stay separated",tools==2&&bounds==1&&joined=="<function=read></function><function=write></function>"?"ok":"bad","ok"); }
 }

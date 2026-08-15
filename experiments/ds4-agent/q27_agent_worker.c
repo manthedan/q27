@@ -83,6 +83,7 @@ struct q27_agent_worker {
     size_t event_count;
     size_t event_bytes;
     unsigned char tokenizer_sha1[20];
+    int xml_dialect;
     char error[512];
 #ifdef Q27_AGENT_WORKER_TESTING
     void (*stop_hook)(void *, int, int);
@@ -461,6 +462,7 @@ static void *worker_main(void *opaque) {
         engine = NULL;
     }
     if (engine) q27_agent_engine_set_mtp_width(engine, worker->mtp_width);
+    if (engine) worker->xml_dialect = q27_agent_engine_tool_dialect_xml(engine);
 
     pthread_mutex_lock(&worker->mu);
     worker->init_done = 1;
@@ -944,6 +946,14 @@ int q27_agent_worker_tokenizer_sha1(q27_agent_worker *worker,
     if (ok) memcpy(out_sha1, worker->tokenizer_sha1, 20);
     pthread_mutex_unlock(&worker->mu);
     return ok;
+}
+
+int q27_agent_worker_tool_dialect_xml(q27_agent_worker *worker) {
+    if (!worker) return 0;
+    pthread_mutex_lock(&worker->mu);
+    const int xml = worker->init_ok && worker->xml_dialect;
+    pthread_mutex_unlock(&worker->mu);
+    return xml;
 }
 
 int q27_agent_worker_selection_event(q27_agent_worker *worker,

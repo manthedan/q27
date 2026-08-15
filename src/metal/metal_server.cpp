@@ -269,7 +269,7 @@ std::string text_content(const json& content) {
 // assistant.tool_calls arrays and role:"tool" results are reconstructed to
 // the model's <tool_call>/<tool_response> markers (agentic-parity round,
 // docs/metal/plans/2026-07-17-metal-agentic-parity.md).
-std::vector<q27::Msg> openai_msgs(const json& body) {
+std::vector<q27::Msg> openai_msgs(const json& body, bool xml_dialect) {
     std::vector<q27::Msg> msgs;
     if(body.contains("system")) {
         std::string system=text_content(body["system"]);
@@ -301,7 +301,7 @@ std::vector<q27::Msg> openai_msgs(const json& body) {
                     } else args=fn["arguments"];
                 }
                 if(!content.empty() && content.back()!='\n') content+="\n";
-                content+=q27::tool_call_text(q27::jstr(fn,"name"),args);
+                content+=q27::tool_call_text(q27::jstr(fn,"name"),args,xml_dialect);
             }
         }
         msgs.push_back({role,content});
@@ -328,7 +328,7 @@ struct ResponsesPromptInput {
 // opt-in experimental prefix prewarmer. Keeping one canonicalizer is the
 // central safety property: a prewarmed token prefix must be byte-for-byte
 // the same prompt the serving path would ingest.
-ResponsesPromptInput responses_prompt_input(const json& body) {
+ResponsesPromptInput responses_prompt_input(const json& body, bool xml_dialect) {
     ResponsesPromptInput out;
     if(body.contains("tools") && body["tools"].is_array())
         for(const auto& t:body["tools"]) {
@@ -372,8 +372,8 @@ ResponsesPromptInput responses_prompt_input(const json& body) {
                         try { args=json::parse(q27::jstr(item,"arguments","{}")); }
                         catch(...) { args=q27::jstr(item,"arguments"); }
                     } else args={{"input",q27::jstr(item,"input")}};
-                    out.messages.push_back({"assistant",
-                        q27::tool_call_text(q27::jstr(item,"name"),args)});
+                    out.messages.push_back({"assistant", q27::tool_call_text(
+                        q27::jstr(item,"name"), args, xml_dialect)});
                 } else if(type=="function_call_output" || type=="custom_tool_call_output") {
                     std::string value;
                     if(item.contains("output"))
@@ -708,6 +708,7 @@ struct Runtime {
     uint64_t snapshot_max_bytes_config=0;
     uint32_t max_tokens_default_config=0;
     bool think_default=false;   // --think; see the profile comment above
+    bool xml_dialect=false;
     std::mutex model_identity_mu;
     // Auto-snapshot threshold in prompt tokens (0 = hint-only); set with
     // the snapshot store, meaningful only when snapstore.enabled().
@@ -762,6 +763,7 @@ struct Runtime {
                     {"gqa_threshold",shared->backend.gqa_threshold()},
                     {"gpu_sample",e.gpu_sample_enabled()},{"resident",e.resident_enabled()},
                     {"bare_system",getenv("Q27_BARE")!=nullptr},{"tool_strict",q27::tool_strict()},
+                    {"tool_dialect",xml_dialect?"xml":"json"},
                     {"test_failpoints",test_failpoints},
                     {"tokenizer",tokenizer_name},{"tokenizer_sha1",tokenizer_sha1}}}};
     }
@@ -814,6 +816,7 @@ struct Runtime {
         if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
+        xml_dialect=q27::select_tool_dialect_for_model(shared->model.meta_json);
         // G6 admission budget (hoisted 2026-07-22 for --ctx auto): the
         // device serving envelope every slot's KV + fixed state + snapshot
         // capacity must fit. Default = half the recommended working set
@@ -1501,7 +1504,7 @@ struct Runtime {
         tc.enabled=constrain_tools && !tool_names.empty() && sampling.temperature==0.0f && !mtp_width && !suffix_width;
         {
             auto gpu=lease_now();
-            tc.begin(tool_names);
+            tc.begin(tool_names, xml_dialect);
         }
         // Scope-exit constraint cleanup: runs on normal return, client
         // disconnect, and engine exceptions alike, and never throws (a
@@ -2335,12 +2338,13 @@ int main(int argc,char** argv) {
                     std::vector<q27::Msg> messages;
                     bool think=true;
                     if(api=="chat" || api=="chat_completions") {
-                        messages=openai_msgs(request);
+                        messages=openai_msgs(request,runtime.xml_dialect);
                         if(request.contains("tools") && request["tools"].is_array())
                             tools=request["tools"];
                         think=q27::resolve_think(request,think_default,req_think);
                     } else if(api=="responses") {
-                        ResponsesPromptInput normalized=responses_prompt_input(request);
+                        ResponsesPromptInput normalized=responses_prompt_input(
+                            request,runtime.xml_dialect);
                         tools=std::move(normalized.tools);
                         messages=std::move(normalized.messages);
                         think=q27::resolve_think(request,think_default,req_think);
@@ -2350,7 +2354,7 @@ int main(int argc,char** argv) {
                         // chatml_prompt(anthropic_msgs(body), tools, true)) so
                         // the prewarmed prefix is byte-for-byte the prefix the
                         // live request will prefill. Same resolver as serving.
-                        messages=q27::anthropic_msgs(request);
+                        messages=q27::anthropic_msgs(request,runtime.xml_dialect);
                         tools=q27::anthropic_tools_json(request);
                         think=q27::resolve_think(request,think_default,req_think);
                     } else throw std::runtime_error(
@@ -2358,7 +2362,7 @@ int main(int argc,char** argv) {
 
                     std::string full_rendered;
                     const std::string prefix_rendered=q27::initial_harness_prefix(
-                        messages,tools,think,&full_rendered);
+                        messages,tools,think,&full_rendered,runtime.xml_dialect);
                     auto prefix_ids=to_u32(runtime.tokenizer.encode(prefix_rendered));
                     const auto full_ids=to_u32(runtime.tokenizer.encode(full_rendered));
                     if(prefix_ids.empty() || prefix_ids.size()>=full_ids.size() ||
@@ -2520,7 +2524,9 @@ int main(int argc,char** argv) {
             bool think_req=q27::resolve_think(body,think_default,req_think);
             const json tools=body.contains("tools") && body["tools"].is_array()
                                  ?body["tools"]:json::array();
-            const std::string rendered=q27::chatml_prompt(openai_msgs(body),tools,think_req);
+            const std::string rendered=q27::chatml_prompt(
+                openai_msgs(body,runtime.xml_dialect),tools,think_req,
+                nullptr,nullptr,runtime.xml_dialect);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
@@ -2551,6 +2557,7 @@ int main(int argc,char** argv) {
                     {"snapshot",snap_hint},{"token_head",trace_token_head(ids)},{"rendered",trace_text(rendered)}});
             if(!wants_stream(body)) {
                 q27::StreamSplitter sp;
+                sp.native_xml=runtime.xml_dialect;
                 // think=true renders an OPEN think tag: the first generated
                 // token is already inside the block, so pre-seed the channel
                 // (upstream fee3b27; mirrors the FORCED tool_choice pre-seed).
@@ -2560,7 +2567,8 @@ int main(int argc,char** argv) {
                 auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                     if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
                     if(!tool_buf.empty()) {
-                        calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                        calls.push_back(q27::parse_tool_call(
+                            q27::strip_ws2(tool_buf), &tools, runtime.xml_dialect));
                         tool_buf.clear();
                     }
                     (ch==q27::StreamSplitter::THINK?think_buf:text)+=t;
@@ -2573,7 +2581,8 @@ int main(int argc,char** argv) {
                         tnames,snap_hint,socket_live(sock),id); });
                 if(outcome.finish==Runtime::Finish::Cancelled) { r.status=499; return; }
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
-                if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(
+                    q27::strip_ws2(tool_buf), &tools, runtime.xml_dialect));
                 std::string th=q27::strip_ws2(think_buf),tx=q27::strip_ws2(text);
                 // Malformed wrapped calls surface as text so nothing is lost;
                 // then the wrapper-less recovery chain runs over the text.
@@ -2585,7 +2594,8 @@ int main(int argc,char** argv) {
                 if(has_tools) {
                     std::string pre;
                     auto bcs=q27::parse_bare_tool_calls(
-                        tx,&pre,&tools,outcome.finish!=Runtime::Finish::Length);
+                        tx,&pre,&tools,outcome.finish!=Runtime::Finish::Length,
+                        true,runtime.xml_dialect);
                     if(!bcs.empty()) {
                         fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat nonstream)\n",bcs.size());
                         runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",false},{"count",bcs.size()}});
@@ -2648,12 +2658,14 @@ int main(int argc,char** argv) {
                         // also the client-gone probe before generation starts.
                         if(!chunk({{"role","assistant"},{"content",""}},nullptr)) { sink.done(); return true; }
                         q27::StreamSplitter sp;
+                        sp.native_xml=runtime.xml_dialect;
                         if(think_req) sp.chan=q27::StreamSplitter::THINK;
                         std::string tool_buf,text_accum;
                         int tool_counter=0;
                         bool any_call=false,all_calls_clean=true;
                         auto emit_tool=[&](){
-                            auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                            auto c=q27::parse_tool_call(
+                                q27::strip_ws2(tool_buf), &tools, runtime.xml_dialect);
                             tool_buf.clear();
                             if(!c.ok) { // malformed: surface as text so nothing is lost
                                 text_accum+=c.raw;
@@ -2682,7 +2694,8 @@ int main(int argc,char** argv) {
                             const std::string tr=q27::strip_ws2(raw);
                             if(tr.empty()) return;
                             std::string pre;
-                            auto bcs=q27::parse_bare_tool_calls(tr,&pre,&tools,allow_repair);
+                            auto bcs=q27::parse_bare_tool_calls(
+                                tr,&pre,&tools,allow_repair,true,runtime.xml_dialect);
                             if(!pre.empty()) { text_accum+=pre; chunk({{"content",pre}},nullptr); }
                             if(!bcs.empty()) {
                                 fprintf(stderr,"[tool-stream] %zu trailing call(s) recovered after streamed call\n",bcs.size());
@@ -2700,6 +2713,10 @@ int main(int argc,char** argv) {
                             }
                         };
                         auto close_tool=[&](){
+                            if(runtime.xml_dialect) {
+                                if(!tool_buf.empty()) emit_tool();
+                                return;
+                            }
                             if(!ts.active()) return;
                             std::string tail;
                             const bool clean=ts.finalize(&tail);
@@ -2735,6 +2752,10 @@ int main(int argc,char** argv) {
                         };
                         auto emit_seg=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                             if(ch==q27::StreamSplitter::TOOL) {
+                                if(runtime.xml_dialect) {
+                                    tool_buf+=t;
+                                    return;
+                                }
                                 bool opened=false;
                                 const std::string frag=ts.feed(t,&opened);
                                 if(opened) {
@@ -2769,7 +2790,8 @@ int main(int argc,char** argv) {
                             // chunks still fire so the client can execute.
                             std::string pre;
                             auto bcs=q27::parse_bare_tool_calls(
-                                text_accum,&pre,&tools,outcome.finish!=Runtime::Finish::Length);
+                                text_accum,&pre,&tools,outcome.finish!=Runtime::Finish::Length,
+                                true,runtime.xml_dialect);
                             if(!bcs.empty()) {
                                 fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (chat stream)\n",bcs.size());
                                 runtime.trace.event({{"kind","tool_recovery"},{"api","chat"},{"id",id},{"stream",true},{"count",bcs.size()}});
@@ -2832,8 +2854,9 @@ int main(int argc,char** argv) {
                 return;
             }
             const std::string rendered=q27::chatml_prompt(
-                q27::anthropic_msgs(body),q27::anthropic_tools_json(body),
-                q27::resolve_think(body,think_default,req_think));
+                q27::anthropic_msgs(body,runtime.xml_dialect),q27::anthropic_tools_json(body),
+                q27::resolve_think(body,think_default,req_think),
+                nullptr,nullptr,runtime.xml_dialect);
             const long input_tokens=(long)runtime.tokenizer.encode(rendered).size();
             if(runtime.trace.enabled())
                 runtime.trace.event({{"kind","request"},{"api","count_tokens"},{"id",id},
@@ -2846,7 +2869,9 @@ int main(int argc,char** argv) {
         server.Post("/v1/messages",anthropic_guarded("messages",[&](const json& body,httplib::Response& r,socket_t sock){
             const json tools=q27::anthropic_tools_json(body);
             const bool think_req=q27::resolve_think(body,think_default,req_think);
-            const std::string rendered=q27::chatml_prompt(q27::anthropic_msgs(body),tools,think_req);
+            const std::string rendered=q27::chatml_prompt(
+                q27::anthropic_msgs(body,runtime.xml_dialect),tools,think_req,
+                nullptr,nullptr,runtime.xml_dialect);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
@@ -2878,13 +2903,15 @@ int main(int argc,char** argv) {
                     {"snapshot",snap_hint},{"token_head",trace_token_head(ids)},{"rendered",trace_text(rendered)}});
             if(!wants_stream(body)) {
                 q27::StreamSplitter sp;
+                sp.native_xml=runtime.xml_dialect;
                 if(think_req) sp.chan=q27::StreamSplitter::THINK;
                 std::string think,text,tool_buf;
                 std::vector<q27::ToolCall> calls;
                 auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                     if(ch==q27::StreamSplitter::TOOL) { tool_buf+=t; return; }
                     if(!tool_buf.empty()) {
-                        calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                        calls.push_back(q27::parse_tool_call(
+                            q27::strip_ws2(tool_buf), &tools, runtime.xml_dialect));
                         tool_buf.clear();
                     }
                     (ch==q27::StreamSplitter::THINK?think:text)+=t;
@@ -2897,7 +2924,8 @@ int main(int argc,char** argv) {
                         tnames,snap_hint,socket_live(sock),mid); });
                 if(outcome.finish==Runtime::Finish::Cancelled) { r.status=499; return; }
                 for(auto& [ch,t]:sp.flush()) route(ch,t);
-                if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
+                if(!tool_buf.empty()) calls.push_back(q27::parse_tool_call(
+                    q27::strip_ws2(tool_buf), &tools, runtime.xml_dialect));
                 json content=json::array();
                 std::string th=q27::strip_ws2(think),tx=q27::strip_ws2(text);
                 if(!th.empty())
@@ -2911,7 +2939,8 @@ int main(int argc,char** argv) {
                     // wrapper-less call recovery (see parse_bare_tool_calls)
                     std::string pre;
                     auto bcs=q27::parse_bare_tool_calls(
-                        tx,&pre,&tools,outcome.finish!=Runtime::Finish::Length);
+                        tx,&pre,&tools,outcome.finish!=Runtime::Finish::Length,
+                        true,runtime.xml_dialect);
                     if(!bcs.empty()) {
                         fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (nonstream)\n",bcs.size());
                         runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},{"stream",false},{"count",bcs.size()}});
@@ -2962,6 +2991,7 @@ int main(int argc,char** argv) {
                     int block_counter=0,tool_counter=0,idx=-1,chan_open=-1;
                     bool any=false,any_call=false;
                     q27::StreamSplitter sp;
+                    sp.native_xml=runtime.xml_dialect;
                     if(think_req) sp.chan=q27::StreamSplitter::THINK;
                     std::string tool_buf,text_accum;
                     auto close_block=[&](){
@@ -2986,6 +3016,7 @@ int main(int argc,char** argv) {
                     };
                     auto emit_tool_block=[&](const std::string& name,const json& args){
                         any_call=true;
+                        any=true;
                         close_block();
                         const int ti=block_counter++;
                         const std::string tid="toolu_metal_"+runtime.boot_id+"_"+std::to_string(rid)+"_"+
@@ -2999,7 +3030,8 @@ int main(int argc,char** argv) {
                         ev("content_block_stop",{{"type","content_block_stop"},{"index",ti}});
                     };
                     auto emit_tool=[&](){
-                        auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                        auto c=q27::parse_tool_call(
+                            q27::strip_ws2(tool_buf), &tools, runtime.xml_dialect);
                         tool_buf.clear();
                         if(!c.ok) { // malformed: surface as text so nothing is lost
                             open_block(0);
@@ -3027,7 +3059,8 @@ int main(int argc,char** argv) {
                         const std::string tr=q27::strip_ws2(raw);
                         if(tr.empty()) return;
                         std::string pre;
-                        auto bcs=q27::parse_bare_tool_calls(tr,&pre,&tools,allow_repair);
+                        auto bcs=q27::parse_bare_tool_calls(
+                            tr,&pre,&tools,allow_repair,true,runtime.xml_dialect);
                         if(!pre.empty()) {
                             text_accum+=pre; open_block(0);
                             ev("content_block_delta",{{"type","content_block_delta"},{"index",idx},
@@ -3045,6 +3078,10 @@ int main(int argc,char** argv) {
                         }
                     };
                     auto close_tool=[&](){
+                        if(runtime.xml_dialect) {
+                            if(!tool_buf.empty()) emit_tool();
+                            return;
+                        }
                         if(!ts.active()) return;
                         std::string tail;
                         const bool clean=ts.finalize(&tail);
@@ -3069,6 +3106,10 @@ int main(int argc,char** argv) {
                     };
                     auto emit_seg=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                         if(ch==q27::StreamSplitter::TOOL) {
+                            if(runtime.xml_dialect) {
+                                tool_buf+=t;
+                                return;
+                            }
                             bool opened=false;
                             const std::string frag=ts.feed(t,&opened);
                             if(opened) {
@@ -3133,7 +3174,8 @@ int main(int argc,char** argv) {
                             // text_delta (cosmetic); tool_use blocks still fire
                             std::string pre;
                             auto bcs=q27::parse_bare_tool_calls(
-                                text_accum,&pre,&tools,outcome.finish!=Runtime::Finish::Length);
+                                text_accum,&pre,&tools,outcome.finish!=Runtime::Finish::Length,
+                                true,runtime.xml_dialect);
                             if(!bcs.empty()) {
                                 fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (stream)\n",bcs.size());
                                 runtime.trace.event({{"kind","tool_recovery"},{"api","messages"},{"id",mid},{"stream",true},{"count",bcs.size()}});
@@ -3206,12 +3248,13 @@ int main(int argc,char** argv) {
             // Canonicalization is shared with the experimental prewarmer so
             // a cache pack can never encode a different interpretation of a
             // Responses request than the ordinary serving path.
-            ResponsesPromptInput normalized=responses_prompt_input(body);
+            ResponsesPromptInput normalized=responses_prompt_input(body,runtime.xml_dialect);
             json tools=std::move(normalized.tools);
             std::set<std::string> custom_names=std::move(normalized.custom_names);
             std::vector<q27::Msg> merged=std::move(normalized.messages);
             const bool think_req=q27::resolve_think(body,think_default,req_think);
-            const std::string rendered=q27::chatml_prompt(merged,tools,think_req);
+            const std::string rendered=q27::chatml_prompt(
+                merged,tools,think_req,nullptr,nullptr,runtime.xml_dialect);
             auto ids=to_u32(runtime.tokenizer.encode(rendered));
             uint32_t n=max_tokens(body,8192); // unified default (upstream v0.4.0)
             const q27::SamplingParams sampling=sampling_params(body);
@@ -3284,9 +3327,9 @@ int main(int argc,char** argv) {
                     // call within the same natural segment is trimmed by
                     // tx=pre — parse_bare_tool_calls reports no suffix.
                     std::string pre;
-                    auto bcs=q27::parse_bare_tool_calls(tx,&pre,
-                                                        tools.empty()?nullptr:&tools,
-                                                        final_turn && !incomplete_item);
+                    auto bcs=q27::parse_bare_tool_calls(
+                        tx,&pre,tools.empty()?nullptr:&tools,
+                        final_turn && !incomplete_item,true,runtime.xml_dialect);
                     if(!bcs.empty()) {
                         fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp nonstream)\n",bcs.size());
                         runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},{"stream",false},{"count",bcs.size()}});
@@ -3300,7 +3343,8 @@ int main(int argc,char** argv) {
                     for(auto& bc:bcs) push_call(bc.name,bc.arguments,incomplete_item);
                 };
                 auto flush_tool=[&](bool final_turn,bool incomplete_item=false){
-                    auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
+                    auto c=q27::parse_tool_call(
+                        q27::strip_ws2(tool_buf), &tools, runtime.xml_dialect); tool_buf.clear();
                     if(!c.ok) { // malformed: commit the raw as its OWN text
                         // segment right now (chat/Anthropic recovery
                         // convention): recovery runs over it, so a
@@ -3314,6 +3358,7 @@ int main(int argc,char** argv) {
                     push_call(c.name,c.arguments,incomplete_item);
                 };
                 q27::StreamSplitter sp;
+                sp.native_xml=runtime.xml_dialect;
                 if(think_req) sp.chan=q27::StreamSplitter::THINK;
                 auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                     if(ch==q27::StreamSplitter::TOOL) {
@@ -3395,6 +3440,7 @@ int main(int argc,char** argv) {
                     std::string think,text,tool_buf,bare_pending,active_msg_id;
                     bool bare_holding=false;
                     q27::StreamSplitter sp;
+                    sp.native_xml=runtime.xml_dialect;
                     if(think_req) sp.chan=q27::StreamSplitter::THINK;
                         auto item_done=[&](const json& it){
                             ev({{"type","response.output_item.done"},{"output_index",out_index++},{"item",it}});
@@ -3487,7 +3533,8 @@ int main(int argc,char** argv) {
                             item_done(item);
                         };
                         auto flush_tool=[&](bool final_turn,bool incomplete_item=false){
-                            auto c=q27::parse_tool_call(q27::strip_ws2(tool_buf)); tool_buf.clear();
+                            auto c=q27::parse_tool_call(
+                                q27::strip_ws2(tool_buf), &tools, runtime.xml_dialect); tool_buf.clear();
                             if(!c.ok) {
                                 runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},
                                     {"stream",true},{"malformed_wrapper",true},{"count",0}});
@@ -3502,8 +3549,9 @@ int main(int argc,char** argv) {
                                 // malformed raw keeps the reference behavior.
                                 if(final_turn && !incomplete_item) {
                                     std::string pre;
-                                    auto bcs=q27::parse_bare_tool_calls(c.raw,&pre,
-                                                                        tools.empty()?nullptr:&tools,true);
+                                    auto bcs=q27::parse_bare_tool_calls(
+                                        c.raw,&pre,tools.empty()?nullptr:&tools,
+                                        true,true,runtime.xml_dialect);
                                     if(!bcs.empty()) {
                                         fprintf(stderr,"[tool-fallback] %zu truncated wrapped call(s) recovered (resp stream)\n",bcs.size());
                                         runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},{"stream",true},{"truncated_wrapper",true},{"count",bcs.size()}});
@@ -3535,7 +3583,7 @@ int main(int argc,char** argv) {
                             std::string pre;
                             auto bcs=q27::parse_bare_tool_calls(
                                 bare_pending,&pre,tools.empty()?nullptr:&tools,
-                                final_turn && !incomplete_item);
+                                final_turn && !incomplete_item,true,runtime.xml_dialect);
                             if(!bcs.empty()) {
                                 fprintf(stderr,"[tool-fallback] %zu bare call(s) recovered (resp stream)\n",bcs.size());
                                 runtime.trace.event({{"kind","tool_recovery"},{"api","responses"},{"id",resp_id},{"stream",true},{"count",bcs.size()}});
@@ -3569,8 +3617,9 @@ int main(int argc,char** argv) {
                             const std::string tr=q27::strip_ws2(raw);
                             if(tr.empty()) return;
                             std::string pre;
-                            auto bcs=q27::parse_bare_tool_calls(tr,&pre,
-                                tools.empty()?nullptr:&tools,allow_repair);
+                            auto bcs=q27::parse_bare_tool_calls(
+                                tr,&pre,tools.empty()?nullptr:&tools,allow_repair,
+                                true,runtime.xml_dialect);
                             if(!pre.empty()) emit_text(pre);
                             if(!bcs.empty()) {
                                 fprintf(stderr,"[tool-stream] %zu trailing call(s) recovered after streamed call (resp)\n",bcs.size());
@@ -3583,6 +3632,10 @@ int main(int argc,char** argv) {
                             }
                         };
                         auto close_stream_tool=[&](bool incomplete_item){
+                            if(runtime.xml_dialect) {
+                                if(!tool_buf.empty()) flush_tool(false,incomplete_item);
+                                return;
+                            }
                             if(!ts.active()) return;
                             // Custom tool: never streamed incremental; hand the
                             // verbatim raw to the buffered flush_tool -> push_call
@@ -3632,6 +3685,10 @@ int main(int argc,char** argv) {
                         };
                         auto route=[&](q27::StreamSplitter::Chan ch,const std::string& t){
                             if(ch==q27::StreamSplitter::TOOL) {
+                                if(runtime.xml_dialect) {
+                                    tool_buf+=t;
+                                    return;
+                                }
                                 flush_bare(false);
                                 if(!think.empty()) flush_think();
                                 if(!text.empty()) flush_text();
@@ -3684,14 +3741,10 @@ int main(int argc,char** argv) {
                                 think+=t; return;
                             }
                             if(!think.empty()) flush_think();
-                            // Bare JSON calls are TEXT to StreamSplitter. Stream
-                            // prose normally, but retain bytes from the first
-                            // object/array opener until classification. This
-                            // supports `prose\n{"name":...}` without putting
-                            // the raw call on the wire before emitting its
-                            // structured item. Ordinary brace-free text remains
-                            // token-streamed; JSON prose buffers from its opener
-                            // to turn end, a correctness-over-latency trade.
+                            // Bare JSON calls remain TEXT to StreamSplitter.
+                            // Retain bytes from the first object/array opener
+                            // until end-of-turn classification; native XML is
+                            // already routed through the TOOL channel.
                             if(bare_holding) { bare_pending+=t; return; }
                             size_t obj=t.find('{'), arr=t.find('[');
                             size_t cut=obj==std::string::npos?arr:

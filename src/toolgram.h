@@ -1,13 +1,13 @@
-// P7: char-level pushdown machine for the <tool_call> body. Once the model
-// emits <tool_call>, decode is constrained so that only
-//   {"name": "<registered tool>", "arguments": <valid JSON object>}
-// (plus surrounding whitespace and the </tool_call> closer token) is
-// sampleable. Built against the five observed drift modes of Qwopus v1.4
-// under no-think greedy (see api_common.h parse_bare_tool_calls): dropped
-// wrapper, unterminated JSON, <content>-tagged values, {"tool_call": opener,
-// raw control chars inside strings. The machine advances per accepted char;
-// token legality is checked by simulating a token's bytes on a copy
-// (token_ok). EOS/im_end must be masked upstream until done().
+// Character-level pushdown machine for the <tool_call> body. Once the model
+// emits <tool_call>, decode is constrained to the active model dialect:
+// either {"name": "<registered tool>", "arguments": <valid JSON object>}
+// or Qwen3.8's trained <function=...><parameter=...>...</parameter></function>
+// form, plus surrounding whitespace and the </tool_call> closer token.
+// The JSON machine is built against the observed Qwopus v1.4 drift modes
+// (see api_common.h parse_bare_tool_calls). The XML machine follows the
+// native Qwen3.8 template exactly while allowing arbitrary UTF-8 parameter
+// values. Both advance per accepted byte; token legality is checked by
+// simulating a token on a copy. EOS/im_end stays masked until done().
 #pragma once
 #include <algorithm>
 #include <cstdint>
@@ -18,21 +18,36 @@
 namespace q27 {
 
 struct ToolGrammar {
-    void reset(const std::vector<std::string>& tool_names) {
+    void reset(const std::vector<std::string>& tool_names, bool xml_dialect = false) {
         names_ = tool_names;
+        if (xml_dialect)
+            for (std::string& name : names_) {
+                std::string escaped;
+                escaped.reserve(name.size());
+                for (char c : name) {
+                    if (c == '&') escaped += "&amp;";
+                    else if (c == '<') escaped += "&lt;";
+                    else if (c == '>') escaped += "&gt;";
+                    else escaped += c;
+                }
+                name = std::move(escaped);
+            }
         // canonicalized allowlist key for mask caching (review 2026-07-09 P1
         // #3): token legality depends on names_ (NAME_VAL prefix matching), so
         // two requests with different tool sets must never share a cached
         // mask. Sorted so registration order doesn't fragment the cache.
         // '\x1f' can't appear in sampleable tool names (str_byte rejects
         // control chars), so the join is unambiguous.
-        std::vector<std::string> sorted = tool_names;
+        std::vector<std::string> sorted = names_;
         std::sort(sorted.begin(), sorted.end());
         names_key_.clear();
         for (auto& n : sorted) { names_key_ += n; names_key_ += '\x1f'; }
-        st_ = WS_OBJ_OPEN;
+        xml_dialect_ = xml_dialect;
+        st_ = xml_dialect ? XML_WS_FUNCTION : WS_OBJ_OPEN;
         lit_ = 0;
+        lit_word_.clear();
         name_pref_.clear();
+        xml_close_pref_.clear();
         stack_.clear();
         dead_ = false;
     }
@@ -100,7 +115,16 @@ struct ToolGrammar {
         J_KEY_U1, J_KEY_U2, J_KEY_U3, J_KEY_U4, // \uXXXX inside key string
         J_KEYCOLON,    // expect ':' after key
         J_AFTER_VAL,   // expect ',' or closer
-        OBJ_CLOSE,     // expect final '}' of the outer call object
+        OBJ_CLOSE,     // expect final '}' of the outer JSON call object
+        XML_WS_FUNCTION,    // expect optional ws then "<function="
+        XML_FUNCTION_OPEN,  // matching the rest of "<function="
+        XML_NAME,           // registered tool name followed by '>'
+        XML_IN_FUNCTION,    // ws then parameter opener or function closer
+        XML_TAG_KIND,       // branch after '<': parameter or /function>
+        XML_PARAMETER_OPEN, // matching the rest of "parameter="
+        XML_PARAMETER_KEY,  // non-empty parameter name followed by '>'
+        XML_PARAMETER_VALUE,// bytes until the exact "</parameter>" closer
+        XML_FUNCTION_CLOSE, // matching the rest of "/function>"
         DONE_,         // body complete; expect ws then the literal closer
         CLOSER_,       // matching "</tool_call>" (model emits it as BPE text)
         CLOSED_        // closer consumed; anything goes (host deactivates)
@@ -320,6 +344,112 @@ struct ToolGrammar {
                 if (is_ws(c)) return true;
                 if (c == '}') { st_ = DONE_; return true; }
                 return false;
+            case XML_WS_FUNCTION:
+                if (is_ws(c)) return true;
+                if (c == '<') {
+                    lit_word_ = "<function=";
+                    lit_ = 1;
+                    st_ = XML_FUNCTION_OPEN;
+                    return true;
+                }
+                return false;
+            case XML_FUNCTION_OPEN:
+                if (lit_ >= lit_word_.size() || c != lit_word_[lit_]) return false;
+                lit_++;
+                if (lit_ == lit_word_.size()) {
+                    name_pref_.clear();
+                    st_ = XML_NAME;
+                }
+                return true;
+            case XML_NAME:
+                if (c == '>') {
+                    for (const auto& n : names_)
+                        if (n == name_pref_) {
+                            st_ = XML_IN_FUNCTION;
+                            return true;
+                        }
+                    return false;
+                }
+                if (!str_byte(c)) return false;
+                name_pref_ += c;
+                for (const auto& n : names_)
+                    if (n.compare(0, name_pref_.size(), name_pref_) == 0) return true;
+                return false;
+            case XML_IN_FUNCTION:
+                if (is_ws(c)) return true;
+                if (c == '<') {
+                    st_ = XML_TAG_KIND;
+                    return true;
+                }
+                return false;
+            case XML_TAG_KIND:
+                if (c == 'p') {
+                    lit_word_ = "parameter=";
+                    lit_ = 1;
+                    st_ = XML_PARAMETER_OPEN;
+                    return true;
+                }
+                if (c == '/') {
+                    lit_word_ = "/function>";
+                    lit_ = 1;
+                    st_ = XML_FUNCTION_CLOSE;
+                    return true;
+                }
+                return false;
+            case XML_PARAMETER_OPEN:
+                if (lit_ >= lit_word_.size() || c != lit_word_[lit_]) return false;
+                lit_++;
+                if (lit_ == lit_word_.size()) {
+                    lit_ = 0; // reused as the parameter-key byte count
+                    st_ = XML_PARAMETER_KEY;
+                }
+                return true;
+            case XML_PARAMETER_KEY:
+                if (c == '>') {
+                    if (lit_ == 0) return false;
+                    xml_close_pref_.clear();
+                    st_ = XML_PARAMETER_VALUE;
+                    return true;
+                }
+                if (!str_byte(c) || is_ws(c) || c == '<') return false;
+                lit_++;
+                return true;
+            case XML_PARAMETER_VALUE: {
+                static const std::string close = "</parameter>";
+                static const std::string outer_close = "</tool_call>";
+                if (xml_close_pref_.empty()) {
+                    if (c == '<') xml_close_pref_ = "<";
+                    else if (!str_byte(c) && !is_ws(c)) return false;
+                    return true;
+                }
+                const size_t next = xml_close_pref_.size();
+                const bool parameter_prefix =
+                    next < close.size() && c == close[next] &&
+                    close.compare(0, next, xml_close_pref_) == 0;
+                const bool outer_prefix =
+                    next < outer_close.size() && c == outer_close[next] &&
+                    outer_close.compare(0, next, xml_close_pref_) == 0;
+                if (parameter_prefix || outer_prefix) {
+                    if (outer_prefix && next + 1 == outer_close.size()) return false;
+                    xml_close_pref_ += c;
+                    if (parameter_prefix && next + 1 == close.size()) {
+                        xml_close_pref_.clear();
+                        st_ = XML_IN_FUNCTION;
+                    }
+                    return true;
+                }
+                // The buffered prefix was ordinary parameter content. The
+                // current byte can immediately begin a fresh closer candidate.
+                xml_close_pref_.clear();
+                if (c == '<') xml_close_pref_ = "<";
+                else if (!str_byte(c) && !is_ws(c)) return false;
+                return true;
+            }
+            case XML_FUNCTION_CLOSE:
+                if (lit_ >= lit_word_.size() || c != lit_word_[lit_]) return false;
+                lit_++;
+                if (lit_ == lit_word_.size()) st_ = DONE_;
+                return true;
             case DONE_:
                 if (is_ws(c)) return true;
                 if (c == '<') { lit_word_ = "</tool_call>"; lit_ = 1; st_ = CLOSER_; return true; }
@@ -347,9 +477,11 @@ struct ToolGrammar {
     std::string names_key_; // sorted allowlist join (mask-cache key component)
     std::string name_pref_;
     std::string lit_word_;
+    std::string xml_close_pref_; // partial "</parameter>" candidate in XML value
     std::vector<char> stack_;
     size_t lit_ = 0;
     St st_ = WS_OBJ_OPEN;
+    bool xml_dialect_ = false;
     bool dead_ = false;
 
   public:
@@ -362,6 +494,7 @@ struct ToolGrammar {
     // masks and be steered into A's tool names.
     std::string signature() const {
         std::string s;
+        s += xml_dialect_ ? 'X' : 'J';
         s += (char)('A' + (int)st_);
         s += dead_ ? '!' : '.';
         s.append(stack_.begin(), stack_.end());
@@ -369,15 +502,16 @@ struct ToolGrammar {
         s += std::to_string(lit_);
         s += '|';
         s += lit_word_;
-        // The name-prefix and allowlist components only matter where token
-        // legality can depend on them: a token from any state up to NAME_VAL
-        // can span into name-prefix matching, but from ARG_COMMA onward the
-        // grammar can never re-enter NAME_VAL (one name, then arguments) and
-        // name_pref_ is dead state. Keying them on EVERY state duplicated
-        // identical argument-state masks per tool set (and per chosen name)
-        // and exhausted the 512-entry device pool (review follow-up
-        // 2026-07-09 #2).
-        if (st_ <= NAME_VAL) {
+        s += '|';
+        s += xml_close_pref_;
+        // Name-prefix and allowlist state matters only before the registered
+        // tool name has been accepted. Omitting it afterward lets requests
+        // with different tool sets share identical argument/value masks.
+        const bool name_sensitive =
+            (!xml_dialect_ && st_ <= NAME_VAL) ||
+            (xml_dialect_ &&
+             (st_ == XML_WS_FUNCTION || st_ == XML_FUNCTION_OPEN || st_ == XML_NAME));
+        if (name_sensitive) {
             s += '|';
             s += name_pref_;
             s += '|';

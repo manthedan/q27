@@ -1839,9 +1839,13 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
         q27_agent_tool_call call = {0};
         char error[512] = {0};
         const size_t generated_bytes = generated.len;
+        const int xml_dialect = q27_agent_worker_tool_dialect_xml(worker);
+        const int bare_xml_call = xml_dialect && !engine_closed_call &&
+            generated.bytes && memmem(generated.bytes, generated.len,
+                                      "<function=", 10) != NULL;
         q27_agent_tool_call_status parsed = q27_agent_parse_tool_call(
             (const unsigned char *)(generated.bytes ? generated.bytes : ""),
-            generated.len, &call, error, sizeof(error), turn_eos);
+            generated.len, &call, error, sizeof(error), turn_eos, xml_dialect);
         if (parsed == Q27_TOOL_CALL_NONE) {
             free(generated.bytes);
             if (engine_closed_call) {
@@ -1852,7 +1856,8 @@ static int run_agent_cycle(q27_agent_worker *worker, transcript *chat,
             return 1;
         }
         free(generated.bytes);
-        if (parsed != Q27_TOOL_CALL_VALID || !engine_closed_call) {
+        if (parsed != Q27_TOOL_CALL_VALID ||
+            (!engine_closed_call && !bare_xml_call)) {
             tui_diagf( "q27-agent: invalid model tool call: %s\n",
                     error[0] ? error : "constraint/parser mismatch");
             q27_agent_tool_call_free(&call);
@@ -2317,6 +2322,7 @@ int main(int argc, char **argv) {
         close_signal_pipe();
         return 1;
     }
+    const int xml_dialect = q27_agent_worker_tool_dialect_xml(worker);
     selections = q27_agent_selection_ledger_create(arc4random());
     if (!selections) {
         tui_diagf( "q27-agent: could not allocate selection ledger\n");
@@ -2355,7 +2361,7 @@ int main(int argc, char **argv) {
                 ok = 0;
             } else {
                 const char *current_preamble = auto_tools ?
-                    q27_agent_tool_preamble() : NULL;
+                    q27_agent_tool_preamble(xml_dialect) : NULL;
                 const size_t preamble_len = current_preamble ?
                     strlen(current_preamble) : 0;
                 const int preamble_matches = !auto_tools ||
@@ -2408,7 +2414,7 @@ int main(int argc, char **argv) {
     }
     if (ok && !loaded_session) {
         if (auto_tools) {
-            const char *preamble = q27_agent_tool_preamble();
+            const char *preamble = q27_agent_tool_preamble(xml_dialect);
             output_buffer combined = {0};
             ok = preamble &&
                  output_append(&combined, (const unsigned char *)preamble,

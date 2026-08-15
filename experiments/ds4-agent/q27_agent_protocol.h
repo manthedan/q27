@@ -43,9 +43,9 @@ typedef struct {
     int body_fence_ticks;
 } q27_agent_tool_call;
 
-// Returns the fixed registry and instructions inserted into the system message
-// when automatic tools are explicitly enabled.
-const char *q27_agent_tool_preamble(void);
+// Returns the fixed registry and dialect-specific instructions inserted into
+// the system message when automatic tools are explicitly enabled.
+const char *q27_agent_tool_preamble(int xml_dialect);
 
 // Returns the same ordered fixed registry used by the prompt and constrained
 // decoder. The returned array and strings have static lifetime.
@@ -64,21 +64,22 @@ int q27_agent_tool_kind_expects_body(q27_agent_tool_kind kind);
 int q27_agent_payload_rejected(const unsigned char *bytes, size_t len,
                                char *error, size_t error_cap);
 
-// Parses exactly one closed wrapped call. Prefix prose is allowed.
-// Non-body tools forbid non-whitespace after the closer.
-// Body tools expect a markdown-fenced body after the closer. An empty *fenced*
-// body is valid; a missing or unusable fence returns VALID with missing_body
-// set so the control loop can soft-fail without a side effect. VALID owns all
-// request bytes in `call`; release with tool_call_free.
-// eos_reached must reflect how the turn ended: the unclosed-fence recovery is
-// only legal at a real EOS (the observed pattern it exists for). After a
-// non-EOS stop (max_tokens output limit) an unclosed fence means the body is
-// TRUNCATED; recovering it would silently publish a partial file (codex
-// branch-review P1), so it fails closed like any other unusable fence.
+// Parses exactly one closed wrapped call. In the selected XML dialect, a
+// wrapperless <function=...>...</function> call is normalized to the same
+// protocol before validation. Prefix prose is allowed. Non-body tools forbid
+// non-whitespace after the closer. Body tools expect a markdown-fenced body
+// after the closer. An empty *fenced* body is valid; a missing or unusable
+// fence returns VALID with missing_body set so the control loop can soft-fail
+// without a side effect. VALID owns all request bytes in `call`; release with
+// tool_call_free. eos_reached must reflect how the turn ended: the unclosed-
+// fence recovery is only legal at a real EOS (the observed pattern it exists
+// for). After a non-EOS stop (max_tokens output limit) an unclosed fence means
+// the body is TRUNCATED; recovering it would silently publish a partial file,
+// so it fails closed like any other unusable fence.
 q27_agent_tool_call_status q27_agent_parse_tool_call(
     const unsigned char *bytes, size_t len,
     q27_agent_tool_call *call,
-    char *error, size_t error_cap, int eos_reached);
+    char *error, size_t error_cap, int eos_reached, int xml_dialect);
 void q27_agent_tool_call_free(q27_agent_tool_call *call);
 
 // Removes one unambiguous outer Markdown fence from a known whole-file

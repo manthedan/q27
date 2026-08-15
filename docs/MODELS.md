@@ -66,9 +66,11 @@ newer Qwen3.8-27B-MTP checkpoint; it is not hosted or auto-recommended.
   checkpoint is available. Its 128-token canonical and OpenAI/Anthropic tool
   workflows pass; PPL is 0.73% worse than the Qwen3.8 default tier, while the
   larger q5f/default artifacts leave less memory headroom and decode much more
-  slowly on base M4. `q27 pull q38-q4s` prints the exact local installation
-  paths. Because the artifact is not hosted, the wrapper does not select it
-  automatically.
+  slowly on base M4. `q27 serve q38-q4s` enables thinking and selects the
+  checkpoint's trained XML tool-call dialect from model metadata; set
+  `Q27_TOOL_DIALECT=json` only for a client that requires the legacy JSON
+  prompt. `q27 pull q38-q4s` prints the exact local installation paths. Because
+  the artifact is not hosted, the wrapper does not select it automatically.
 - **q8** is the high-fidelity tier. **It is UNVALIDATED upstream pending
   48GB-class hardware** — which is exactly why we need your report. If you
   have a 36–48 GB+ machine, `q27 pull q8 && q27 report --full` and send us

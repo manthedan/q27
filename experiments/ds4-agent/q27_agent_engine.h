@@ -55,6 +55,7 @@ void q27_agent_engine_close(q27_agent_engine *engine);
 // also stays serial so the per-token think-budget check can fire.
 void q27_agent_engine_set_mtp_width(q27_agent_engine *engine, uint32_t width);
 uint32_t q27_agent_engine_mtp_width(const q27_agent_engine *engine);
+int q27_agent_engine_tool_dialect_xml(const q27_agent_engine *engine);
 
 // Optional think budget for streaming `<think>…</think>`. 0 = unlimited
 // (default). When non-zero and still inside an open think span after N tokens,

@@ -10,10 +10,11 @@
 
 static q27_agent_tool_call_status parse(const std::string& text,
                                         q27_agent_tool_call& call,
-                                        char *error, size_t cap, int eos = 1) {
+                                        char *error, size_t cap, int eos = 1,
+                                        int xml_dialect = 0) {
     return q27_agent_parse_tool_call(
         reinterpret_cast<const unsigned char *>(text.data()), text.size(),
-        &call, error, cap, eos);
+        &call, error, cap, eos, xml_dialect);
 }
 
 int main() {
@@ -31,6 +32,70 @@ int main() {
           "strict read call parses with prefix prose");
     q27_agent_tool_call_free(&call);
 
+    std::string native_read = "<tool_call>\n<function=read>\n<parameter=path>\n"
+        "src/native.cc\n</parameter>\n</function>\n</tool_call>\n";
+    CHECK(parse(native_read, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.request.kind == Q27_TOOL_READ &&
+          std::strcmp(call.request.path, "src/native.cc") == 0,
+          "native XML read call parses");
+    q27_agent_tool_call_free(&call);
+
+    std::string bare_native_read = "<function=read>\n<parameter=path>\n"
+        "src/bare-native.cc\n</parameter>\n</function>\n";
+    CHECK(parse(bare_native_read, call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_VALID && call.request.kind == Q27_TOOL_READ &&
+          std::strcmp(call.request.path, "src/bare-native.cc") == 0,
+          "selected XML dialect normalizes a wrapperless native read call");
+    q27_agent_tool_call_free(&call);
+    std::string thinking_then_native =
+        "reasoning about the file\n</think>\n"
+        "<function=read><parameter=path>src/after-think.cc"
+        "</parameter></function>";
+    CHECK(parse(thinking_then_native, call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_VALID &&
+          std::strcmp(call.request.path, "src/after-think.cc") == 0,
+          "wrapperless native call parses after the thinking span");
+    q27_agent_tool_call_free(&call);
+    CHECK(parse(bare_native_read, call, error, sizeof(error)) ==
+              Q27_TOOL_CALL_NONE,
+          "JSON dialect leaves wrapperless native XML as text");
+    CHECK(parse("Example:\n```xml\n<function=read><parameter=path>x"
+                "</parameter></function>\n```", call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_NONE,
+          "wrapperless native XML inside a markdown fence is not executed");
+    CHECK(parse("Example:\n``````xml\n<function=shell><parameter=command>"
+                "echo unsafe</parameter></function>\n``````", call, error,
+                sizeof(error), 1, 1) == Q27_TOOL_CALL_NONE,
+          "six-backtick native XML examples are not executed");
+    CHECK(parse("Example:\n~~~~xml\n<function=shell><parameter=command>"
+                "echo unsafe</parameter></function>\n~~~~", call, error,
+                sizeof(error), 1, 1) == Q27_TOOL_CALL_NONE,
+          "tilde-fenced native XML examples are not executed");
+    CHECK(parse("    <function=shell><parameter=command>echo unsafe"
+                "</parameter></function>", call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_NONE,
+          "indented-code native XML examples are not executed");
+    CHECK(parse("<function=fixture><parameter=value>\n<function=shell>"
+                "<parameter=command>echo unsafe</parameter></function>"
+                "</parameter></function>", call, error, sizeof(error), 1, 1) !=
+              Q27_TOOL_CALL_VALID,
+          "native XML nested in another parameter is not executed");
+    CHECK(parse("{\"example\":\"<function=read><parameter=path>/tmp/x"
+                "</parameter></function>\"}", call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_NONE,
+          "quoted native XML examples are not executed");
+    std::string example_then_call =
+        "Example:\n```xml\n<function=read><parameter=path>ignored"
+        "</parameter></function>\n```\nNow inspect it:\n"
+        "<function=read><parameter=path>src/later.cc</parameter></function>";
+    CHECK(parse(example_then_call, call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_NONE,
+          "native parser never executes a later call after displayed examples");
+    CHECK(parse("Quoted output:\n\"\n<function=shell><parameter=command>"
+                "echo unsafe</parameter></function>\n\"", call, error,
+                sizeof(error), 1, 1) == Q27_TOOL_CALL_NONE,
+          "multiline quoted native XML examples are not executed");
+
     std::string write = "<tool_call>{\"name\":\"write\",\"arguments\":{"
         "\"path\":\"new.py\"}}</tool_call>\n"
         "```python\nprint(f\"hi {name}\")\n```\n";
@@ -40,6 +105,27 @@ int main() {
           !std::memcmp(call.request.input, "print(f\"hi {name}\")\n",
                        call.request.input_len),
           "write carries same-turn fenced body with f-string intact");
+    q27_agent_tool_call_free(&call);
+
+    std::string native_write =
+        "<tool_call>\n<function=write>\n<parameter=path>\nnative.py\n</parameter>\n"
+        "</function>\n</tool_call>\n```python\nprint('native')\n```\n";
+    CHECK(parse(native_write, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.request.kind == Q27_TOOL_WRITE && !call.missing_body &&
+          std::strcmp(call.request.path, "native.py") == 0 &&
+          call.request.input_len == std::strlen("print('native')\n"),
+          "native XML write carries same-turn fenced body");
+    q27_agent_tool_call_free(&call);
+
+    std::string bare_native_write =
+        "<function=write>\n<parameter=path>\nbare-native.py\n</parameter>\n"
+        "</function>\n```python\nprint('bare native')\n```\n";
+    CHECK(parse(bare_native_write, call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_VALID && call.request.kind == Q27_TOOL_WRITE &&
+          !call.missing_body &&
+          std::strcmp(call.request.path, "bare-native.py") == 0 &&
+          call.request.input_len == std::strlen("print('bare native')\n"),
+          "wrapperless native XML write preserves its same-turn fenced body");
     q27_agent_tool_call_free(&call);
 
     CHECK(parse("<tool_call>{\"name\":\"write\",\"arguments\":{"
@@ -365,6 +451,18 @@ int main() {
           "bounded shell options parse");
     q27_agent_tool_call_free(&call);
 
+    std::string native_shell =
+        "<tool_call>\n<function=shell>\n<parameter=command>\nprintf 'x &amp; y'\n"
+        "</parameter>\n<parameter=timeout_ms>\n321\n</parameter>\n"
+        "<parameter=max_output_bytes>\n654\n</parameter>\n</function>\n</tool_call>";
+    CHECK(parse(native_shell, call, error, sizeof(error)) == Q27_TOOL_CALL_VALID &&
+          call.request.kind == Q27_TOOL_SHELL && call.request.timeout_ms == 321 &&
+          call.request.max_output_bytes == 654 &&
+          std::string(reinterpret_cast<const char *>(call.request.input),
+                      call.request.input_len) == "printf 'x & y'",
+          "native XML shell uses schema types and decodes escaped string bytes");
+    q27_agent_tool_call_free(&call);
+
     CHECK(parse("<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\",\"x\":1}}</tool_call>",
                 call, error, sizeof(error)) == Q27_TOOL_CALL_INVALID,
           "unknown arguments fail closed");
@@ -458,6 +556,12 @@ int main() {
     CHECK(q27_agent_payload_rejected(toolish, sizeof(toolish) - 1, reject_err,
                                      sizeof(reject_err)) != 0,
           "payload rejector catches tool-shaped bytes");
+    static const unsigned char literal_function_file[] =
+        "<function=fixture><parameter=value>x</parameter></function>";
+    CHECK(q27_agent_payload_rejected(
+              literal_function_file, sizeof(literal_function_file) - 1,
+              reject_err, sizeof(reject_err)) == 0,
+          "legitimate files beginning with a function-like XML tag remain writable");
 
     const char *const *names = nullptr;
     CHECK(q27_agent_tool_names(&names) == 7 && names &&
@@ -468,15 +572,21 @@ int main() {
           !std::strcmp(names[6], "shell"),
           "prompt and constrained decoder share one ordered registry");
 
-    const char *preamble = q27_agent_tool_preamble();
+    const char *preamble = q27_agent_tool_preamble(1);
     CHECK(preamble && std::strstr(preamble, "<tools>") &&
           std::strstr(preamble, "\"name\":\"read\"") &&
           std::strstr(preamble, "\"name\":\"write\"") &&
           std::strstr(preamble, "\"name\":\"overwrite\"") &&
           std::strstr(preamble, "\"name\":\"edit_selection\"") &&
           std::strstr(preamble, "markdown fenced") &&
+          std::strstr(preamble, "<function=write>") &&
           std::strstr(preamble, "additionalProperties"),
-          "fixed strict registry is present in preamble");
+          "fixed strict registry and native XML example are present in preamble");
+    const char *json_preamble = q27_agent_tool_preamble(0);
+    CHECK(json_preamble && !std::strstr(json_preamble, "<function=write>") &&
+          std::strstr(json_preamble, "{\"name\":\"write\"") &&
+          std::strcmp(json_preamble, preamble) != 0,
+          "native preamble cache remains dialect-specific");
 
     std::puts("q27 agent protocol selftest: PASS");
     return 0;
