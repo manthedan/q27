@@ -1,0 +1,116 @@
+// Strict q27 <tool_call> protocol and fixed native-tool registry.
+//
+// Body tools (write / overwrite / edit / edit_selection) use thin JSON headers
+// and carry file bytes as a same-turn markdown-fenced body after </tool_call>.
+// Content is never JSON-escaped, and the harness no longer free-decodes a
+// second raw-payload chat turn for those tools.
+#ifndef Q27_AGENT_PROTOCOL_H
+#define Q27_AGENT_PROTOCOL_H
+
+#include "q27_agent_tools.h"
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Hard cap on literal edit `old` so models use surgical patches or overwrite.
+enum { Q27_AGENT_EDIT_OLD_MAX_BYTES = 512 };
+
+typedef enum {
+    Q27_TOOL_CALL_NONE = 0,
+    Q27_TOOL_CALL_VALID = 1,
+    Q27_TOOL_CALL_INVALID = 2
+} q27_agent_tool_call_status;
+
+typedef struct {
+    q27_agent_tool_request request;
+    char *path;
+    unsigned char *input;
+    unsigned char *replacement;
+    char *selection;
+    // 1 when a body-tool call is schema-valid but the fenced body is missing
+    // or unusable (soft-fail path; no side effect).
+    int missing_body;
+    // Optional owned message for missing/unusable body (free with tool_call_free).
+    char *body_error;
+    // Tick count of the transport fence that carried the body (0 = none).
+    // The legacy double-wrap repair (unwrap) may only run for a minimal
+    // 3-tick transport: a longer fence means the model deliberately fenced
+    // AROUND inner content (CommonMark), so a first-line fence is content
+    // and must survive (codex branch-review P2).
+    int body_fence_ticks;
+} q27_agent_tool_call;
+
+// Returns the fixed registry and dialect-specific instructions inserted into
+// the system message when automatic tools are explicitly enabled.
+const char *q27_agent_tool_preamble(int xml_dialect);
+// Immutable registry for the current upstream XML schema-aware constrainer.
+const char *q27_agent_tool_registry_json(void);
+
+// Returns the same ordered fixed registry used by the prompt and constrained
+// decoder. The returned array and strings have static lifetime.
+size_t q27_agent_tool_names(const char *const **names_out);
+
+// True when the constrained decoder should keep generating after </tool_call>
+// so the model can emit a fenced body in the same turn.
+int q27_agent_tool_name_expects_body(const char *name);
+
+// True when this request kind attaches file/replacement bytes via a same-turn
+// fenced body rather than a second free generation.
+int q27_agent_tool_kind_expects_body(q27_agent_tool_kind kind);
+
+// Rejects payloads that look like another tool call or empty/control junk.
+// Returns 0 when safe to publish, non-zero with a message when not.
+int q27_agent_payload_rejected(const unsigned char *bytes, size_t len,
+                               char *error, size_t error_cap);
+
+// Parses exactly one closed wrapped call. In the selected XML dialect, a
+// wrapperless <function=...>...</function> call is normalized to the same
+// protocol before validation. Prefix prose is allowed. Non-body tools forbid
+// non-whitespace after the closer. Body tools expect a markdown-fenced body
+// after the closer. An empty *fenced* body is valid; a missing or unusable
+// fence returns VALID with missing_body set so the control loop can soft-fail
+// without a side effect. VALID owns all request bytes in `call`; release with
+// tool_call_free. eos_reached must reflect how the turn ended: the unclosed-
+// fence recovery is only legal at a real EOS (the observed pattern it exists
+// for). After a non-EOS stop (max_tokens output limit) an unclosed fence means
+// the body is TRUNCATED; recovering it would silently publish a partial file,
+// so it fails closed like any other unusable fence.
+q27_agent_tool_call_status q27_agent_parse_tool_call(
+    const unsigned char *bytes, size_t len,
+    q27_agent_tool_call *call,
+    char *error, size_t error_cap, int eos_reached, int xml_dialect);
+void q27_agent_tool_call_free(q27_agent_tool_call *call);
+
+// Removes one unambiguous outer Markdown fence from a known whole-file
+// source-code payload. Callers must not apply this to edit fragments. This is
+// a weak-model transport repair, not general Markdown parsing: a three-backtick
+// opening language must match the file extension (or be empty), the closing
+// fence must be the final line, and prose/Markdown files remain untouched.
+// Returns 1 when bytes were normalized, 0 when unchanged, and -1 on invalid
+// arguments. The buffer is modified in place and remains NUL-terminated.
+int q27_agent_unwrap_whole_file_source_fence(
+    const char *path, unsigned char *bytes, size_t *len);
+
+// Extracts a required outer markdown fence from `bytes` (already a body
+// region). On success, allocates a NUL-terminated body into *out and sets
+// *out_len. Returns 1 on success, 0 when no usable fence body is present.
+// Prefers a CommonMark-closed fence; if the opener is present but the closer
+// is missing (common EOS under free-decode), recovers content through end of
+// turn after stripping trailing </tool_call> protocol echo — but ONLY when
+// eos_reached is true: after an output-limit stop the unclosed body is
+// truncated and must not be published. After a closed
+// fence, only whitespace and extra literal </tool_call> tags are tolerated;
+// other trailing bytes fail closed so a premature ``` cannot silently
+// truncate a published body.
+int q27_agent_extract_fenced_body(const unsigned char *bytes, size_t len,
+                                  unsigned char **out, size_t *out_len,
+                                  char *error, size_t error_cap,
+                                  int eos_reached, int *transport_ticks);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

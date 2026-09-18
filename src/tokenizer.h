@@ -39,6 +39,11 @@ class Tokenizer {
         const std::vector<std::pair<std::string, std::string>>& messages,
         bool think = true) const;
 
+    // Closed transcript only (no assistant opener), for exact native-agent
+    // persistence. Uses the same sanitizer/encoder as apply_chat_template.
+    std::vector<int> apply_chat_prefix(
+        const std::vector<std::pair<std::string, std::string>>& messages) const;
+
     // Exact-string vocab lookup (-1 if absent). Needed for added tokens like
     // <think> that BPE merges cannot form and the special-matcher (type-3
     // controls only) does not cover.

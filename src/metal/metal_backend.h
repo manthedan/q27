@@ -155,6 +155,12 @@ class MetalBackend final : public ComputeBackend {
     void kv_store_f16(const BackendBuffer& k, const BackendBuffer& v,
                       BackendBuffer& k_cache, BackendBuffer& v_cache,
                       uint32_t position, uint32_t row_length);
+    // Bonsai 2's normalized 1024-point WHT. Unlike the KV codec's WHT,
+    // signs are checkpoint data. Forward: grouped GDN permutation (optional),
+    // signs, H; embedding inverse: H, signs. Input/output must not alias.
+    void bonsai_hadamard(const BackendBuffer& x, const BackendBuffer& signs,
+                         BackendBuffer& out, uint32_t n, bool inverse,
+                         bool grouped_gdn = false);
     void turbo_wht(BackendBuffer& x, uint32_t heads, uint32_t stride,
                    bool inverse) override;
     void kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& v,

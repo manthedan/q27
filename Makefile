@@ -60,7 +60,7 @@ build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/mark
 test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai_bridge build/test_kv_bank \
             build/test_chat_completions_integration build/test_think_resolve \
             build/test_stream_split build/test_toolconstrain build/test_template_golden \
-            build/test_drift_capture build/test_drift_hook
+            build/test_drift_capture build/test_drift_hook build/test_bonsai2_contract build/test_toolgram_cache
 	./tools/extract_check.sh
 	./build/test_tool_drift
 	Q27_TOOL_STRICT=1 ./build/test_tool_drift
@@ -74,6 +74,31 @@ test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai
 	./build/test_drift_capture
 	./build/test_drift_hook
 	./build/test_kv_bank
+	./build/test_bonsai2_contract
+	./build/test_toolgram_cache
+	$(PYTHON) tools/test_bonsai2_serving_contract.py
+
+build/tokenize_to_bin: tools/tokenize_to_bin.cpp src/tokenizer.cpp src/tokenizer.h src/unicode_tables.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/tokenize_to_bin.cpp src/tokenizer.cpp -o $@
+
+# Optional oracle instrument; its dependency is a separately built pinned
+# Prism checkout, never a runtime dependency of q27.
+build/bonsai2-prism-probe: tools/bonsai2_probe.cpp | build
+	@test -n "$(PRISM_DIR)" || { echo 'set PRISM_DIR to the pinned Prism llama.cpp checkout' >&2; exit 2; }
+	@test "$$(git -C "$(PRISM_DIR)" rev-parse HEAD)" = 1a07bfa5f4144274c8f1c9963821dd9d9a51854b
+	$(CXX) $(CXXFLAGS) -DQ27_PRISM_REFERENCE -I "$(PRISM_DIR)/include" -I "$(PRISM_DIR)/ggml/include" \
+	  tools/bonsai2_probe.cpp -L "$(PRISM_DIR)/build/bin" -Wl,-rpath,"$(PRISM_DIR)/build/bin" \
+	  -lllama -lggml -lggml-base -o $@
+
+build/test_toolgram_cache: tools/test_toolgram_cache.cpp src/toolgram.h experiments/ds4-agent/q27_agent_mask_epoch.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_toolgram_cache.cpp -o $@
+
+build/test_bonsai2_contract: tools/test_bonsai2_contract.cpp src/metal/bonsai_rotation.h src/loader.h src/api_common.h src/toolgram.h | build
+	$(CXX) $(CXXFLAGS) tools/test_bonsai2_contract.cpp -o $@
+
+.PHONY: test-bonsai2-repack
+test-bonsai2-repack:
+	$(PYTHON) tools/test_repack_bonsai2.py
 
 build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_openai_bridge.cpp -o $@
@@ -188,7 +213,8 @@ check-responses-integration: $(SERVER) tools/test_responses_integration.py
 build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 	$(CXX) $(CXXFLAGS) tools/test_depthctl.cpp -o $@
 
-build/test_toolconstrain: tools/test_toolconstrain.cpp src/toolconstrain.h src/toolgram.h | build
+build/test_toolconstrain: tools/test_toolconstrain.cpp src/toolconstrain.h src/toolgram.h src/api_common.h \
+                          src/stream_split.h src/markdown_lex.h src/drift_capture.h third_party/json.hpp | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_toolconstrain.cpp -o $@
 
 build/test_suffixdraft: tools/test_suffixdraft.cpp src/suffixdraft.h | build
@@ -356,6 +382,25 @@ ifeq ($(UNAME_S),Darwin)
 METALFLAGS := $(CXXFLAGS) -Werror -fobjc-arc -pthread -I src/metal
 METALLIBS := -framework Foundation -framework Metal
 
+build/metal_prefill_bench: tools/metal_prefill_bench.cpp tools/bench_env.h src/metal/metal_backend.mm \
+                           src/metal/metal_backend.h src/metal/q27_kernels.metal src/loader.cpp | build
+	$(CXX) $(METALFLAGS) tools/metal_prefill_bench.cpp src/metal/metal_backend.mm \
+	  src/loader.cpp $(METALLIBS) -o $@
+
+build/bonsai2-metal-probe: tools/bonsai2_probe.cpp src/metal/metal_engine.cpp src/metal/metal_engine.h \
+                          src/metal/bonsai_rotation.h src/metal/metal_backend.mm src/metal/metal_backend.h \
+                          src/metal/q27_kernels.metal src/loader.cpp | build
+	$(CXX) $(METALFLAGS) tools/bonsai2_probe.cpp src/metal/metal_engine.cpp src/metal/metal_backend.mm \
+	  src/loader.cpp $(METALLIBS) -o $@
+
+build/q27-metal build/q27-metal-server build/q27-metal-server-test build/metal-engine.o \
+  build/test_metal_engine_contracts build/test_metal_model_contracts: src/metal/bonsai_rotation.h
+
+build/test_bonsai_hadamard: src/metal/test_bonsai_hadamard.cpp src/metal/metal_backend.mm \
+                           src/metal/metal_backend.h src/metal/q27_kernels.metal src/loader.cpp | build
+	$(CXX) $(METALFLAGS) src/metal/test_bonsai_hadamard.cpp src/metal/metal_backend.mm \
+	       src/loader.cpp $(METALLIBS) -o $@
+
 build/test-metal-backend: src/metal/test_metal.cpp src/metal/metal_backend.mm \
                           src/metal/metal_backend.h src/metal/q27_kernels.metal \
                           src/backend.h src/loader.cpp src/loader.h | build
@@ -473,9 +518,10 @@ test-metal-canonical: build/q27-metal
 	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=...tok" >&2; exit 2; }
 	tools/metal_canonical_gate.sh "$(MODEL)" "$(TOKENIZER)"
 
-test-metal-backend: build/test-metal-backend build/test-metal-ops
+test-metal-backend: build/test-metal-backend build/test-metal-ops build/test_bonsai_hadamard
 	./build/test-metal-backend
 	./build/test-metal-ops
+	./build/test_bonsai_hadamard
 else
 test-metal-backend:
 	@echo "test-metal-backend requires macOS" >&2; exit 1
@@ -494,6 +540,8 @@ test-metal:
 test-metal-canonical:
 	@echo "test-metal-canonical requires macOS" >&2; exit 1
 endif
+
+include experiments/ds4-agent/Makefile.inc
 
 build/dflash2_smoke: tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@

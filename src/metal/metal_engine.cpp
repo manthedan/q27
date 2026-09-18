@@ -1,4 +1,5 @@
 #include "metal_engine.h"
+#include "bonsai_rotation.h"
 
 #include "../../third_party/json.hpp"
 #include "../suffixdraft.h"
@@ -85,7 +86,7 @@ const BackendTensor& MetalEngine::layer_weight(uint32_t layer, const char* leaf)
     return weight("blk." + std::to_string(layer) + "." + leaf);
 }
 
-void MetalEngine::validate_architecture() const {
+BonsaiRotation MetalEngine::validate_architecture() const {
     nlohmann::json meta;
     try { meta = nlohmann::json::parse(model_.meta_json); }
     catch (const std::exception& e) { throw std::runtime_error(std::string("q27 Metal: invalid metadata JSON: ") + e.what()); }
@@ -100,7 +101,8 @@ void MetalEngine::validate_architecture() const {
     // layer, bonsai-dtype embeddings/head/alpha/beta. The sibling packs
     // share this architecture even though their trained tensor bytes differ.
     const std::string policy = meta.value("quant_policy", std::string());
-    const bool ternary = policy == "bonsai-t2-v1";
+    const auto rotation = BonsaiRotation::parse(meta, model_.tensors);
+    const bool ternary = policy == "bonsai-t2-v1" || rotation.enabled;
     const bool binary = policy == "bonsai-b1-v1";
     // Mixed-tier census packs (docs/metal/plans/2026-07-17-mixed-tier-census.md,
     // tools/q27_mix.py): per-tensor T2/B1 routing over the same bonsai
@@ -275,7 +277,11 @@ void MetalEngine::validate_architecture() const {
         } else {
             matrix(p + "attn_qkv.weight", GDN_CH, N_EMBD);
             matrix(p + "attn_gate.weight", GDN_V, N_EMBD);
-            if (bonsai) {
+            if (rotation.enabled) {
+                // Bonsai 2 keeps BF16 gates; conversion widens them exactly.
+                require(p + "ssm_alpha.weight", DType::F32, {GDN_HEADS, N_EMBD});
+                require(p + "ssm_beta.weight", DType::F32, {GDN_HEADS, N_EMBD});
+            } else if (bonsai) {
                 require_tier(p + "ssm_alpha.weight", ternary ? DType::T2_G128 : DType::B1_G128,
                              {GDN_HEADS, N_EMBD});
                 require_tier(p + "ssm_beta.weight", ternary ? DType::T2_G128 : DType::B1_G128,
@@ -296,7 +302,9 @@ void MetalEngine::validate_architecture() const {
         // repack, so its absence is asserted rather than tolerated silently.
         if (model_.find("blk.64.attn_norm.weight") || model_.find("output_q4.weight"))
             throw std::runtime_error("q27 Metal: unexpected MTP tensors in a bonsai artifact");
-        return;
+        if (rotation.enabled && model_.tensors.size() != 851)
+            throw std::runtime_error("q27 Metal: Bonsai 2 requires exactly 851 tensors");
+        return rotation;
     }
     const std::string p = "blk.64.";
     require(p + "nextn.enorm.weight", DType::F32, {N_EMBD});
@@ -314,6 +322,7 @@ void MetalEngine::validate_architecture() const {
     matrix(p + "ffn_gate.weight", N_FFN, N_EMBD);
     matrix(p + "ffn_up.weight", N_FFN, N_EMBD);
     matrix(p + "ffn_down.weight", N_EMBD, N_FFN);
+    return rotation;
 }
 
 std::shared_ptr<MetalEngine::Shared> MetalEngine::open_shared(const std::string& model_path) {
@@ -454,7 +463,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
       backend_(shared_->backend), max_context_(context), turbo3_kv_(turbo3_kv),
       weights_(shared_->weights) {
     if (!context || context > 262144) throw std::runtime_error("q27 Metal: context must be 1..262144");
-    validate_architecture();
+    const auto rotation = validate_architecture();
     per_tensor_upload_ = backend_.uses_per_tensor_upload(model_);
     has_mtp_ = model_.find("blk.64.attn_norm.weight") != nullptr;
     const uint64_t cache_row_bytes = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
@@ -511,6 +520,19 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
         shared_->weights = std::move(uploaded);
     }
 
+    if (rotation.enabled) {
+        rotation_scratch_ = alloc_f32(N_FFN);
+        for (const auto& entry : rotation.signs) {
+            auto buffer = alloc_f32(entry.first);
+            backend_.write(*buffer, 0, entry.second.data(), uint64_t(entry.first) * 4);
+            rotation_signs_.emplace(entry.first, std::move(buffer));
+        }
+        for (const auto& name : rotation.weights) {
+            const auto& w = weight(name);
+            rotated_weights_.emplace(&w, RotationBinding{
+                rotation_signs_.at(uint32_t(w.cols)), name.find(".ssm_out.") != std::string::npos});
+        }
+    }
     layers_.resize(N_LAYER);
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         if (attention_layer(layer)) {
@@ -793,6 +815,9 @@ uint64_t MetalEngine::fixed_state_bytes(bool chunked,bool has_mtp) {
         // MTP embed/hidden norms, concat, x, hidden output, and logits.
         bytes += (6ull * N_EMBD + VOCAB) * 4;
     }
+    // Conservatively reserve Bonsai 2's three sign vectors and scratch for
+    // every no-MTP model (legacy Bonsai simply leaves this small reserve unused).
+    if (!has_mtp) bytes += (uint64_t(N_EMBD) + GDN_V + 2ull * N_FFN) * 4;
     if (!chunked) return bytes;
     // Chunked-prefill f32 rows (ch/cx1/cy, cqg, ckbuf/cvbuf, cattn_out,
     // cqkv, cz, alpha/beta_raw/g/beta, cconv_out, cdelta_out, cgated_out,
@@ -1537,7 +1562,12 @@ uint32_t MetalEngine::pending_from_logits() {
 // kernels produce the float output and the int8 copy together.
 void MetalEngine::project(const BackendTensor& w, const BackendBuffer& x_float,
                           const BackendQuantized& xq, BackendBuffer& out) {
-    if (is_bonsai_dtype(w.dtype)) backend_.matvec(w, x_float, out);
+    const auto rotation = rotated_weights_.find(&w);
+    if (rotation != rotated_weights_.end()) {
+        backend_.bonsai_hadamard(x_float, *rotation->second.signs, *rotation_scratch_,
+                                 uint32_t(w.cols), false, rotation->second.grouped_gdn);
+        backend_.matvec(w, *rotation_scratch_, out);
+    } else if (is_bonsai_dtype(w.dtype)) backend_.matvec(w, x_float, out);
     else backend_.matvec_quantized(w, xq, out);
 }
 
@@ -1654,6 +1684,10 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_f
         backend_.embedding_from_device(weight("token_embd.weight"), *token_out_, *h_);
     else
         backend_.embedding_q8(weight("token_embd.weight"), token, *h_);
+    if (rotation_scratch_) {
+        backend_.bonsai_hadamard(*h_, *rotation_signs_.at(N_EMBD), *rotation_scratch_, N_EMBD, true);
+        backend_.copy(*rotation_scratch_, 0, *h_, 0, uint64_t(N_EMBD) * 4);
+    }
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         backend_.rmsnorm_quantized(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
         if (attention_layer(layer)) attention_block(layer, pos); else gdn_block(layer);

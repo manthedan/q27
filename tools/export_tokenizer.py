@@ -12,7 +12,7 @@ Format (little-endian):
 import struct
 import sys
 
-from gguf import GGUFReader
+from prism_gguf import GGUFReader
 
 def main():
     src, dst = sys.argv[1], sys.argv[2]

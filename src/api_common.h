@@ -277,13 +277,19 @@ inline bool& tool_dialect_xml_default() {
     return v;
 }
 inline void set_tool_dialect_for_model(const std::string& meta_json) {
-    std::string name;
-    try { name = json::parse(meta_json).value("general.name", std::string()); }
-    catch (...) {}
+    std::string name, profile;
+    try {
+        const auto meta = json::parse(meta_json);
+        name = meta.value("general.name", std::string());
+        profile = meta.value("q27.model_profile", std::string());
+    } catch (...) {}
     std::string norm;
     for (char c : name)
         if (isalnum((unsigned char)c)) norm += (char)tolower((unsigned char)c);
-    tool_dialect_xml_default() = norm.find("qwen38") != std::string::npos;
+    // The pinned Bonsai 2 GGUF calls itself "Hf". Preserve that provenance
+    // while selecting its trained Qwen3.8 rendering through an explicit profile.
+    tool_dialect_xml_default() = profile == "bonsai2-qwen38-v1" ||
+                                 norm.find("qwen38") != std::string::npos;
     fprintf(stderr, "tool dialect: %s (general.name \"%s\"%s)\n",
             tool_dialect_xml_default() ? "xml (trained-format default)" : "json",
             name.c_str(),
@@ -665,7 +671,8 @@ inline std::string openai_tools_decl(const std::string& raw_body,
     return out;
 }
 
-inline std::string tools_preamble(const json& tools, const std::string& decl = std::string()) {
+inline std::string tools_preamble(const json& tools, const std::string& decl = std::string(),
+                                  bool xml_dialect = tool_dialect_xml()) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     // tool declarations carry caller-controlled (and often third-party-
     // authored) description strings -- same forgery surface as message
@@ -675,7 +682,7 @@ inline std::string tools_preamble(const json& tools, const std::string& decl = s
     if (!decl.empty()) s += decl;
     else for (auto& t : tools) s += "\n" + strip_ctrl(t.dump());
     s += "\n</tools>\n\n";
-    if (tool_dialect_xml()) {
+    if (xml_dialect) {
         // The template's text, verbatim (tools/golden/qwen38_tools_request.prompt).
         // The earlier paraphrase dropped the nesting reminder -- the one rule
         // every drift shape of 2026-08-20/21 violated -- and we parsed around
@@ -731,7 +738,8 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
                                  size_t* sys_off = nullptr,
                                  const std::string& tool_instruction = {},
                                  const json* unavailable_tools = nullptr,
-                                 const TemplateOpts* opts = nullptr) {
+                                 const TemplateOpts* opts = nullptr,
+                                 bool xml_history = tool_dialect_xml()) {
     std::string p;
     size_t start = 0;
     std::string sys;
@@ -761,7 +769,8 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     // -- a shape the checkpoint never saw -- on every turn of every session.
     // Keyed on the XML dialect = the 3.8 template's format (3.6-family renders
     // are byte-identical to before). Golden: tools/golden/qwen38_history_*.
-    const bool rules38 = tool_dialect_xml();
+    // Native engines pass their own dialect instead of mutating boot globals.
+    const bool rules38 = xml_history;
     if (rules38) sys = trim_ws(sys);
     const bool has_tools=tools.is_array() && !tools.empty();
     const bool has_unavailable=unavailable_tools && unavailable_tools->is_array() &&
@@ -2853,6 +2862,51 @@ tool_required_keys_per_name(const OpenAIToolSelection& selected) {
     json arr = json::array();
     for (const auto& t : selected.tools) arr.push_back(t);
     return tool_required_keys_per_name(arr);
+}
+
+struct ToolGrammarSchema {
+    std::vector<std::vector<std::string>> properties, required;
+    std::vector<bool> present, additional;
+};
+inline ToolGrammarSchema tool_grammar_schema_for_names(
+        const json& tools, const std::vector<std::string>& names) {
+    // Responses may append hosted names or reorder its eligible registry.
+    // Align by name, not by the original array index. Unknown/non-function
+    // tools retain the existing names-only fallback rather than borrowing
+    // some other tool's schema.
+    json aligned = json::array();
+    for (const auto& name : names) {
+        json selected = json::object();
+        if (tools.is_array()) for (const auto& tool : tools) {
+            if (tool.is_object() && tool.contains("function") &&
+                tool["function"].is_object() &&
+                tool["function"].value("name", std::string()) == name) {
+                selected = tool; break;
+            }
+        }
+        aligned.push_back(std::move(selected));
+    }
+    ToolGrammarSchema result{tool_param_keys_per_name(aligned), tool_required_keys_per_name(aligned), {}, {}};
+    for (size_t i = 0; i < aligned.size(); ++i) {
+        const auto& tool = aligned[i];
+        const bool present = tool.contains("function") && tool["function"].contains("parameters") &&
+                             tool["function"]["parameters"].is_object();
+        result.present.push_back(present);
+        const bool additional = !present || !tool["function"]["parameters"].contains("additionalProperties") ||
+                                tool["function"]["parameters"]["additionalProperties"] != false;
+        result.additional.push_back(additional);
+        if (!present) continue;
+        for (const auto& key : result.required[i]) {
+            if (std::find(result.properties[i].begin(), result.properties[i].end(), key) != result.properties[i].end()) continue;
+            // A required-only open schema may name keys without declaring
+            // properties. Include them in the grammar's supported subset.
+            // A closed schema cannot satisfy such a requirement: fail closed.
+            if (!additional)
+                throw std::runtime_error("tool schema requires an undeclared key with additionalProperties=false: " + key);
+            result.properties[i].push_back(key);
+        }
+    }
+    return result;
 }
 
 // Anthropic counts every declaration even when tool_choice narrows eligibility.

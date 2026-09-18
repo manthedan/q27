@@ -3,3 +3,7 @@ __pycache__/
 build/
 scratchpad/
 bench/swebench/*.journal
+models/
+logs/
+.venv/
+experiments/q27-tui/target/

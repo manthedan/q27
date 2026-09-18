@@ -22,26 +22,12 @@ import re
 import struct
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
-import gguf.constants as _ggc
-from gguf import GGUFReader
-
-# The PrismML fork's types are absent from mainline gguf-py; forge the enum
-# members so GGUFReader can parse their packs. (block_size, type_size) per
-# ggml/src/ggml-common.h at tag prism-b9591-62061f9.
-def _forge_fork_type(name, value, blck, tsize):
-    if value in _ggc.GGMLQuantizationType._value2member_map_:
-        return _ggc.GGMLQuantizationType(value)
-    m = int.__new__(_ggc.GGMLQuantizationType, value)
-    m._name_, m._value_ = name, value
-    _ggc.GGMLQuantizationType._member_map_[name] = m
-    _ggc.GGMLQuantizationType._value2member_map_[value] = m
-    _ggc.GGML_QUANT_SIZES[m] = (blck, tsize)
-    return m
-
-_forge_fork_type("Q2_0", 42, 128, 34)
-_forge_fork_type("Q1_0", 41, 128, 18)
+# Several fixture/pack tools load this module by file path from another cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from prism_gguf import GGUFReader
 
 MAGIC = 0x46373251  # "Q27F" LE
 VERSION = 1
@@ -643,6 +629,10 @@ def main():
     arch = _field_value(r, "general.architecture")
     if not isinstance(arch, str) or not arch:
         raise ValueError("source GGUF is missing general.architecture")
+    if any(k.startswith("prism.hadamard.") for k in r.fields) or any(
+            t.tensor_type.name in ("PQ2_0", "PTQ1_0") for t in source_tensors):
+        raise ValueError("rotated/private ternary pack: use tools/repack_bonsai2.py; "
+                         "legacy repack must not discard activation-transform metadata")
     ternary = any(t.tensor_type.name == "Q2_0" for t in source_tensors)
     binary = any(t.tensor_type.name == "Q1_0" for t in source_tensors)
     if mtp_reader:

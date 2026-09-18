@@ -1,0 +1,78 @@
+{
+  "date": "2026-09-18",
+  "device": "Apple M4 / 24 GiB",
+  "upstream_base": "0f1f1d496476929560fdcb93d736b796aabb2f69",
+  "reference_source": "PrismML-Eng/llama.cpp@1a07bfa5f4144274c8f1c9963821dd9d9a51854b",
+  "reference_build_note": "AppleClang, Metal, -include cerrno for the pinned gguf.cpp missing errno declaration; source unmodified",
+  "source_repo": "prism-ml/Ternary-Bonsai-2-27B-gguf",
+  "source_revision": "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
+  "source_sha256": "3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1",
+  "artifact_sha256": "765ee57d0cecbb1ca8fb8ee8032c3654af76ccc2b2e8188008cb74f497ecd9ae",
+  "artifact_bytes": 7242384384,
+  "tokenizer_sha256": "f8adac2001668f3ba68e040e5c13f0982d6a194e2b4d9047cc050fdc6d7c93f2",
+  "kv": "fp16",
+  "prefill": "serial one-token teacher forcing on both runtimes",
+  "parity_command": "PRISM_DIR=... tools/bonsai2_gate.sh",
+  "cases": [
+    {
+      "passed": true,
+      "positions": 102,
+      "max_relative_rmse": 0.00013050052355587132,
+      "mean_kl": 6.47399959220773e-09,
+      "max_kl": 8.352043294081615e-08,
+      "argmax_matches": 102,
+      "high_margin_mismatches": [],
+      "reference_sha256": "8d389bc8d85e824d129711a23b4bbf2b0bf0433efe933b1c5b31be5b5c682732",
+      "candidate_sha256": "48094584b6be7d336339af64fbae5880114674d6f8c9d953fcde1eb143793ac3",
+      "name": "prose",
+      "input_tokens_sha256": "586e80c446ccdece10a257c37e55f52c6240c013ec9ea6090b28bb9fda31c197"
+    },
+    {
+      "passed": true,
+      "positions": 128,
+      "max_relative_rmse": 0.0016784481187974696,
+      "mean_kl": 3.7673065792380054e-10,
+      "max_kl": 1.2643750084577176e-08,
+      "argmax_matches": 128,
+      "high_margin_mismatches": [],
+      "reference_sha256": "59013a09451b49a5550f5bb0329d947223631f2cf1a6ed831076ae07f463bf43",
+      "candidate_sha256": "0b5bbd0fd51c5a8690a3ab02dd4c85b5385d96fd6d1e82c77e834a7df74825b4",
+      "name": "code",
+      "input_tokens_sha256": "69d7213e7ff657728051cf12dc5189d3cfba3578ed7cdf7b07fd90d26c623dc3"
+    },
+    {
+      "passed": true,
+      "positions": 110,
+      "max_relative_rmse": 6.814934793946053e-05,
+      "mean_kl": 8.611691455903442e-10,
+      "max_kl": 1.502199258551323e-08,
+      "argmax_matches": 110,
+      "high_margin_mismatches": [],
+      "reference_sha256": "845880312b2ec76b849b12581a09c683ab4609011ff87310b72a18a522bf22c6",
+      "candidate_sha256": "f1e4ccefbe33eb95686c4a89005b5fac6f6625658903bb371c7ca3d74bbad843",
+      "name": "tools_unicode",
+      "input_tokens_sha256": "d2d4a51f13c127aa4383a12011fb9303a91aad83233881bab991b7543689bd77"
+    }
+  ],
+  "passed_gates": [
+    "CPU/API/tool/parser/template suites",
+    "legacy split GGUF tests",
+    "Bonsai2 repack fixtures (ordinary and python -O)",
+    "Metal backend and operation suites",
+    "dense CPU vs GPU signed Hadamard / inverse / grouped-GDN / bounds",
+    "legacy T2/B1/q4s model validation",
+    "9 native-agent CPU suites",
+    "8 Ratatui tests",
+    "native read tool -> marigold in disposable workspace",
+    "native save + restart -> resumed with 41 cached tokens",
+    "Bonsai2 Chat/Messages/Responses, SSE, count_tokens, malformed limit rejection",
+    "recovered kernel-agent no-change baseline (zero optimization attempts)"
+  ],
+  "limitations": [
+    "Short-context correctness only; no task-quality or long-context performance claim.",
+    "Initial native snapshot save exceeded an external 180s timeout; fresh retry and resume passed. Cold-start/persistence soak remains open.",
+    "q4s HTTP snapshot-recovery suite is not a pass for Bonsai: hints are disabled without chunked prefill; post-publication failpoint not consumed.",
+    "Native agent transcript/tool protocol remains experimental.",
+    "PTQ1_0, accelerated Bonsai prefill and packaged release remain pending. Subsequent 16 GiB/context-2048 validation is recorded separately in bonsai2-mini-2026-09-18.json; larger-context/soak validation remains pending."
+  ]
+}

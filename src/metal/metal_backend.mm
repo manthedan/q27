@@ -81,7 +81,7 @@ uint64_t checked_mul(uint64_t a, uint64_t b, const char* operation) {
 // Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
 // from that file at runtime, so a host binary built before a buffer-binding
 // change would otherwise misbind silently against a newer shader file.
-constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 13";
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 14";
 
 std::string source_sha1(NSString* source) {
     NSData* data=[source dataUsingEncoding:NSUTF8StringEncoding];
@@ -193,6 +193,7 @@ struct GateArgs { uint32_t heads, head_dim; };
 struct ConcatArgs { uint32_t a_count, b_count; };
 struct RopeArgs { uint32_t heads, head_dim, n_rot, stride, position; float freq_base; };
 struct KvStoreArgs { uint32_t position, row_length; };
+struct BonsaiWhtArgs { uint32_t n, inverse, grouped_gdn; };
 struct TurboWhtArgs { uint32_t heads, stride, inverse; };
 struct TurboStoreArgs { uint32_t position, kv_heads; };
 struct AttentionArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim; float scale; };
@@ -279,6 +280,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> argmax;
     id<MTLComputePipelineState> kv_store;
     id<MTLComputePipelineState> turbo_wht;
+    id<MTLComputePipelineState> bonsai_wht;
     id<MTLComputePipelineState> kv_store_turbo3;
     id<MTLComputePipelineState> attention_turbo3;
     id<MTLComputePipelineState> attention;
@@ -734,6 +736,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->argmax = make_pipeline(impl_->device, impl_->library, @"q27_argmax");
         impl_->kv_store = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16");
         impl_->turbo_wht = make_pipeline(impl_->device, impl_->library, @"q27_turbo_wht");
+        impl_->bonsai_wht = make_pipeline(impl_->device, impl_->library, @"q27_bonsai_wht");
         impl_->kv_store_turbo3 = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3");
         impl_->attention_turbo3 = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3");
         impl_->attention = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16");
@@ -1866,6 +1869,33 @@ void MetalBackend::embedding_from_device(const BackendTensor& weight, const Back
         [enc setBytes:&cols length:sizeof(cols) atIndex:4];
         [enc dispatchThreads:MTLSizeMake(cols, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         if (own) impl_->finish_command("embedding (device token)");
+    }
+}
+
+void MetalBackend::bonsai_hadamard(const BackendBuffer& x, const BackendBuffer& signs,
+                                   BackendBuffer& out, uint32_t n, bool inverse,
+                                   bool grouped_gdn) {
+    if (!n || n % 1024 || (grouped_gdn && (n != 6144 || inverse)))
+        throw std::runtime_error("q27 Metal: invalid Bonsai Hadamard shape/mode");
+    const auto& input = metal_buffer(x);
+    const auto& sb = metal_buffer(signs);
+    auto& output = metal_buffer(out);
+    if (input.handle() == output.handle() || sb.handle() == output.handle())
+        throw std::runtime_error("q27 Metal: Bonsai Hadamard buffers must not alias");
+    check_range(input.size(), 0, uint64_t(n) * 4, "Bonsai Hadamard input");
+    check_range(sb.size(), 0, uint64_t(n) * 4, "Bonsai Hadamard signs");
+    check_range(output.size(), 0, uint64_t(n) * 4, "Bonsai Hadamard output");
+    BonsaiWhtArgs args{n, uint32_t(inverse), uint32_t(grouped_gdn)};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_bonsai_wht");
+        [enc setComputePipelineState:impl_->bonsai_wht];
+        [enc setBuffer:input.handle() offset:0 atIndex:0];
+        [enc setBuffer:sb.handle() offset:0 atIndex:1];
+        [enc setBuffer:output.handle() offset:0 atIndex:2];
+        [enc setBytes:&args length:sizeof(args) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(n / 1024,1,1)
+             threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        if (own) impl_->finish_command("Bonsai Hadamard");
     }
 }
 

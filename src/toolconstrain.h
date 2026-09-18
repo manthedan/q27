@@ -20,7 +20,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace q27 {
@@ -64,6 +66,11 @@ struct BasicToolConstrainer {
     std::vector<std::string> names;
     std::vector<std::vector<std::string>> params_per_name; // per-tool param-key allowlists (XML)
     std::vector<std::vector<std::string>> required_per_name; // per-tool REQUIRED keys (issue #2)
+    std::vector<bool> schema_present, allow_additional;
+    // Serial Metal owners can recycle a full pool at a completed-step boundary.
+    // The callback must also invalidate EVERY map into that engine's pool.
+    // Unset for CUDA's speculative/multi-lane flow.
+    std::function<void()> prepare_serial_masks;
     bool dialect_xml = false;  // select XML grammar (ToolGrammarXml) vs JSON (ToolGrammar)
     std::string tail; // rolling decoded-text window for the opener trigger
     int skip_feed = 0; // round tokens already consumed by scan_round
@@ -79,6 +86,8 @@ struct BasicToolConstrainer {
         reengage_bare = false;
         params_per_name.clear();
         required_per_name.clear();
+        schema_present.clear();
+        allow_additional.clear();
     }
     // Schema + dialect aware begin: pass params_per_name aligned with `n` and
     // dialect_xml=true to constrain the body with ToolGrammarXml (the 3.8
@@ -98,15 +107,38 @@ struct BasicToolConstrainer {
     void begin(std::vector<std::string> n,
                std::vector<std::vector<std::string>> pp,
                std::vector<std::vector<std::string>> rq,
-               bool dialect_xml_) {
+               bool dialect_xml_, std::vector<bool> present = {},
+               std::vector<bool> additional = {}) {
         begin(std::move(n));
         dialect_xml = dialect_xml_;
         params_per_name = std::move(pp);
         required_per_name = std::move(rq);
+        schema_present = std::move(present);
+        allow_additional = std::move(additional);
         // default ON for XML; Q27_TG_REENGAGE=0 opts out (A/B hatch)
         const char* e = getenv("Q27_TG_REENGAGE");
         reengage_bare = dialect_xml_ && (!e || strcmp(e, "0") != 0);
-        if (dialect_xml_) tg_xml.reset(names, params_per_name, required_per_name);
+        if (dialect_xml_) tg_xml.reset(names, params_per_name, required_per_name, schema_present, allow_additional);
+    }
+    // Metal's serial callers cannot recover from a dropped mask by sampling
+    // unmasked logits. Both HTTP and native use this checked transition before
+    // the next engine step; the CUDA speculative flow keeps its own policy.
+    void advance_serial_or_throw(int id) {
+        if (!enabled) return;
+        if (prepare_serial_masks) prepare_serial_masks();
+        const long before_engaged = engaged;
+        const bool before_active = active;
+        scan_round(&id, 1);
+        on_id(id);
+        const bool closed = dialect_xml ? tg_xml.closed() : tg.closed();
+        if (pool_dead || ((before_active || engaged != before_engaged) && !active && !closed))
+            throw std::runtime_error("tool grammar could not remain fail-closed");
+        if (active) {
+            if (dialect_xml) apply(tg_xml);
+            else apply(tg);
+            if (pool_dead || !active)
+                throw std::runtime_error("tool grammar mask pool exhausted");
+        }
     }
     // pool id for grammar state g's legal-token mask (-1 if pool full)
     int mask_id(const ToolGrammar& g) {
@@ -118,9 +150,9 @@ struct BasicToolConstrainer {
         // behind the map's back) -- re-upload rather than decode under a
         // wrong mask. LIMITATION (review m2): this is a RANGE check, not an
         // identity check -- it cannot catch an id that is stale but still
-        // in-range. Safe today because the pool is append-only for an
-        // engine's lifetime; if pool reset/eviction is ever added, the whole
-        // host2dev map must be invalidated (epoch stamp), not spot-checked.
+        // in-range. Pools are append-only within an epoch; EVERY reset must
+        // invalidate the whole host2dev map, not rely on this range check.
+        // Metal's prepare_serial_masks callback owns that epoch boundary.
         if (slot >= 0 && slot >= eng->mask_pool_used) {
             fprintf(stderr, "[toolgram] stale mask id %d >= pool %d -- re-uploading\n", slot,
                     eng->mask_pool_used);
@@ -287,7 +319,7 @@ struct BasicToolConstrainer {
                 if (bp != std::string::npos &&
                     bp + 9 > tail.size() - bytes.size()) {
                     std::string rem = tail.substr(bp);
-                    tg_xml.reset(names, params_per_name, required_per_name);
+                    tg_xml.reset(names, params_per_name, required_per_name, schema_present, allow_additional);
                     active = true;
                     engaged++;
                     fprintf(stderr, "[toolgram] re-engaged (bare <function=, rem=%zu)\n",
@@ -326,7 +358,7 @@ struct BasicToolConstrainer {
             // remainder bytes after it already belong to the call body
             if (pos == std::string::npos || pos + 11 <= tail.size() - bytes.size()) continue;
             std::string rem = tail.substr(pos + 11);
-            if (dialect_xml) tg_xml.reset(names, params_per_name, required_per_name);
+            if (dialect_xml) tg_xml.reset(names, params_per_name, required_per_name, schema_present, allow_additional);
             else tg.reset(names);
             active = true;
             engaged++;

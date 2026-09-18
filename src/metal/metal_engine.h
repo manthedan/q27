@@ -15,6 +15,7 @@
 namespace q27 {
 
 class SuffixDraft;
+struct BonsaiRotation;
 
 class MetalEngine {
   public:
@@ -447,6 +448,10 @@ class MetalEngine {
     SuffixStats last_suffix_stats_;
     std::unordered_map<std::string, BackendTensor>& weights_;
     std::vector<LayerState> layers_;
+    struct RotationBinding { std::shared_ptr<BackendBuffer> signs; bool grouped_gdn; };
+    std::unordered_map<const BackendTensor*, RotationBinding> rotated_weights_;
+    std::unordered_map<uint32_t, std::shared_ptr<BackendBuffer>> rotation_signs_;
+    std::shared_ptr<BackendBuffer> rotation_scratch_;
 
     std::shared_ptr<BackendBuffer> h_, x1_, y_;
     std::shared_ptr<BackendBuffer> qg_, kbuf_, vbuf_, attn_out_;
@@ -495,7 +500,7 @@ class MetalEngine {
     const BackendTensor& layer_weight(uint32_t layer, const char* leaf) const;
     static bool attention_layer(uint32_t layer) { return layer % 4 == 3; }
 
-    void validate_architecture() const;
+    BonsaiRotation validate_architecture() const;
     uint32_t sample_next(const SamplingParams& params, std::mt19937_64& random);
     uint32_t decode_resident(uint32_t pending, uint32_t* out, uint32_t k);
     void project(const BackendTensor& w, const BackendBuffer& x_float,

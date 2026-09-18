@@ -1,4 +1,4 @@
-// Q27_SHADER_ABI 13
+// Q27_SHADER_ABI 14
 //
 // Shaders compile from this file at RUNTIME, so a host binary built before a
 // buffer-binding change silently misbinds against a newer file (this exact
@@ -1654,6 +1654,7 @@ kernel void q27_matvec_t2_quantized_x2(device const uchar *weights [[buffer(0)]]
     if (lane == 0) { out[row] = acc_a; out[args.rows + row] = acc_b; }
 }
 
+// [[kernel-agent:begin q27_matmul_q4_mm]]
 // Tiled simdgroup-matrix GEMM (x_rows 1..12) for chunked prefill and
 // batched MTP verification. A 128-thread threadgroup (4 simdgroups) owns a
 // 32-row x 16-token output tile and walks K in 64-column tiles: weights are
@@ -1766,6 +1767,8 @@ kernel void q27_matmul_q4_mm(
     if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
+
+// [[kernel-agent:end]]
 
 kernel void q27_matmul_q8_mm(
         device const char *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
@@ -4344,6 +4347,40 @@ inline void turbo_butterfly(threadgroup float *xs, uint j) {
         xs[j] = (j & h) ? (b - a) : (a + b);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Prism's model-weight rotation is not the turbo3 KV transform. Signs are
+// checkpoint-defined and the Sylvester transform has block size 1024.
+struct BonsaiWhtArgs { uint n; uint inverse; uint grouped_gdn; };
+kernel void q27_bonsai_wht(device const float *x [[buffer(0)]],
+                           device const float *signs [[buffer(1)]],
+                           device float *out [[buffer(2)]],
+                           constant BonsaiWhtArgs &args [[buffer(3)]],
+                           uint group [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float values[1024];
+    const uint base = group * 1024;
+    for (uint j = tid; j < 1024; j += 256) {
+        const uint dst = base + j;
+        // Reference: tiled [hd=128,nk=16,rep=3] -> grouped [hd,rep,nk].
+        const uint src = args.grouped_gdn
+            ? dst % 128 + 128 * (dst / 128 / 3 + 16 * (dst / 128 % 3)) : dst;
+        values[j] = x[src] * (args.inverse ? 1.0f : signs[dst]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint h = 1; h < 1024; h <<= 1) {
+        // Disjoint pairs; each thread owns two. The barrier completes the
+        // entire stage before any thread reads the next butterfly inputs.
+        for (uint pair = tid; pair < 512; pair += 256) {
+            const uint a = (pair / h) * (2 * h) + pair % h;
+            const float left = values[a], right = values[a + h];
+            values[a] = left + right;
+            values[a + h] = left - right;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = tid; j < 1024; j += 256)
+        out[base + j] = values[j] * (1.0f / 32.0f) * (args.inverse ? signs[base + j] : 1.0f);
 }
 
 struct TurboWhtArgs { uint heads; uint stride; uint inverse; };

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Source-checkout launcher. Does not install/replace Homebrew or publish packs.
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="$PWD"
+MODEL_DIR="${Q27_BONSAI2_DIR:-$ROOT/models/bonsai2}"
+CONTEXT="${Q27_CONTEXT:-8192}"
+ACTION="${1:-help}"
+if [[ $# -gt 0 ]]; then shift; fi
+case "$ACTION" in
+  help|--help|-h)
+    printf '%s\n' 'q27 revival — native Bonsai 2 on Metal' \
+      '  ./q27 build          build engine, server, native agent' \
+      '  ./q27 agent [args]   classic native agent (tools require --auto-tools)' \
+      '  ./q27 tui [args]     Ratatui frontend over the same native agent' \
+      '  ./q27 serve [args]   local HTTP service on 127.0.0.1:8080' \
+      'Models/setup: docs/metal/BONSAI2.md' \
+      'Overrides: Q27_BONSAI2_DIR, Q27_CONTEXT, Q27_METAL_SOURCE'
+    exit 0 ;;
+  build) exec make -C "$ROOT" -j2 build/q27-metal build/q27-metal-server agent ;;
+  agent|tui|serve) ;;
+  *) echo "unknown command: $ACTION (see ./q27 help)" >&2; exit 2 ;;
+esac
+MODEL="$MODEL_DIR/bonsai2-t2.q27"
+TOKENIZER="$MODEL_DIR/bonsai2.tok"
+[[ -f "$MODEL" && -f "$TOKENIZER" ]] || {
+  echo "Bonsai 2 pack missing in $MODEL_DIR; see $ROOT/docs/metal/BONSAI2.md" >&2; exit 1;
+}
+export Q27_METAL_SOURCE="${Q27_METAL_SOURCE:-$ROOT/src/metal/q27_kernels.metal}"
+export Q27_MODEL_PROFILE=bonsai2-qwen38-v1
+case "$ACTION" in
+  serve)
+    make -C "$ROOT" -j2 build/q27-metal-server >&2
+    exec "$ROOT/build/q27-metal-server" "$MODEL" "$TOKENIZER" \
+      --ctx "$CONTEXT" --slots 1 --think --think-budget 0 \
+      --temperature-default 1.0 --top-p-default 0.95 --top-k-default 20 "$@" ;;
+  agent|tui)
+    make -C "$ROOT" -j2 agent >&2
+    if [[ "$ACTION" == tui ]]; then
+      make -C "$ROOT" tui >&2
+      export Q27_AGENT="$ROOT/build/q27-agent"
+      exec "$ROOT/build/q27-tui" -- "$MODEL" "$TOKENIZER" \
+        --context "$CONTEXT" --workspace "$WORKSPACE" \
+        --temperature 1.0 --top-p 0.95 --top-k 20 "$@"
+    fi
+    exec "$ROOT/build/q27-agent" "$MODEL" "$TOKENIZER" \
+      --context "$CONTEXT" --workspace "$WORKSPACE" \
+      --temperature 1.0 --top-p 0.95 --top-k 20 "$@" ;;
+esac

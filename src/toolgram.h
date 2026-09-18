@@ -69,6 +69,10 @@ struct ToolGrammar {
     // literal </tool_call> fully matched -- constraint can disengage
     bool closed() const { return !dead_ && st_ == CLOSED_; }
 
+    // Native body-tool transport needs the completed registered name before
+    // allowing a fenced payload. Never expose a partial name as a decision.
+    std::string tool_name() const { return done() ? name_pref_ : std::string(); }
+
     // would every byte of s be legal from the current state?
     bool token_ok(const std::string& s) const {
         ToolGrammar copy = *this;
@@ -509,10 +513,44 @@ struct ToolGrammarXml {
     // them, dead-looping the session with no server-side signal at all.
     void reset(const std::vector<std::string>& tool_names,
                const std::vector<std::vector<std::string>>& params_per_name,
-               const std::vector<std::vector<std::string>>& required_per_name) {
+               const std::vector<std::vector<std::string>>& required_per_name,
+               const std::vector<bool>& schema_present = {},
+               const std::vector<bool>& allow_additional = {}) {
         names_ = tool_names;
         params_per_name_ = params_per_name;
         required_per_name_ = required_per_name;
+        schema_present_.clear();
+        allow_additional_.clear();
+        for (size_t i = 0; i < names_.size(); ++i) {
+            schema_present_.push_back(i < schema_present.size() ? schema_present[i] :
+                i < params_per_name.size() || (i < required_per_name.size() && !required_per_name[i].empty()));
+            // Legacy list-only callers treated empty lists as unrestricted.
+            // Schema-aware callers supply the actual additionalProperties
+            // policy; presence alone never tells us whether an object is open.
+            allow_additional_.push_back(i < allow_additional.size() ? allow_additional[i] :
+                i < schema_present.size() ? !schema_present[i] :
+                i >= params_per_name.size() || params_per_name[i].empty());
+            // Required names need stable emitted/required slots even when the
+            // caller has a required-only (open) schema. Closed contradictions
+            // are rejected by the API schema adapter before reaching here.
+            if (i < required_per_name.size() && !required_per_name[i].empty()) {
+                if (params_per_name_.size() <= i) params_per_name_.resize(i + 1);
+                for (const auto& key : required_per_name[i])
+                    if (std::find(params_per_name_[i].begin(), params_per_name_[i].end(), key) == params_per_name_[i].end())
+                        params_per_name_[i].push_back(key);
+            }
+        }
+        cur_allow_additional_ = true;
+        schema_key_.clear();
+        for (bool present : schema_present_) schema_key_ += present ? '1' : '0';
+        schema_key_ += ':';
+        for (bool additional : allow_additional_) schema_key_ += additional ? '1' : '0';
+        schema_key_ += ':';
+        append_list(schema_key_, names_);
+        append_key(schema_key_, std::to_string(params_per_name_.size()));
+        for (const auto& params : params_per_name_) append_list(schema_key_, params);
+        append_key(schema_key_, std::to_string(required_per_name_.size()));
+        for (const auto& required : required_per_name_) append_list(schema_key_, required);
         cur_params_.clear();
         cur_required_.clear();
         emitted_.clear();
@@ -546,12 +584,21 @@ struct ToolGrammarXml {
         return !dead_ && (st_ == DONE_ || st_ == CT_CLOSE || st_ == CLOSED_);
     }
     bool closed() const { return !dead_ && st_ == CLOSED_; }
+    std::string tool_name() const { return done() ? name_pref_ : std::string(); }
     bool token_ok(const std::string& s) const {
         ToolGrammarXml copy = *this;
         return copy.advance_str(s);
     }
 
   private:
+    static void append_key(std::string& out, const std::string& value) {
+        out += std::to_string(value.size()) + ":";
+        out += value;
+    }
+    static void append_list(std::string& out, const std::vector<std::string>& values) {
+        append_key(out, std::to_string(values.size()));
+        for (const auto& value : values) append_key(out, value);
+    }
     enum St {
         WS0,            // ws before first element; first element MUST be <function
         FUNC_LT,        // consumed '<', expect 'f' for <function
@@ -619,6 +666,7 @@ struct ToolGrammarXml {
                     for (size_t i = 0; i < names_.size(); i++)
                         if (names_[i] == name_pref_) {
                             cur_name_idx_ = (int)i;
+                            cur_allow_additional_ = allow_additional_[i];
                             cur_params_key_.clear();
                             required_key_.clear();
                             cur_params_.clear();
@@ -662,7 +710,10 @@ struct ToolGrammarXml {
                 if (c == '<') { st_ = PARAM_LT; return true; }
                 return false;
             case PARAM_LT:
-                if (c == 'p') { lit_word_ = "parameter"; lit_ = 1; st_ = PARAM_LIT; return true; }
+                if (c == 'p') {
+                    if (!cur_allow_additional_ && cur_params_.empty()) return false;
+                    lit_word_ = "parameter"; lit_ = 1; st_ = PARAM_LIT; return true;
+                }
                 if (c == '/') { st_ = SLASH; return true; }
                 return false;
             case PARAM_LIT:
@@ -679,16 +730,9 @@ struct ToolGrammarXml {
                 return false;
             case KEY: {
                 if (c == '>') {
-                    if (cur_params_key_.empty()) {
-                        // no schema: permissive (accept any exact key)
-                        st_ = GT2;
-                        return true;
-                    }
-                    // schema active: the key must be declared AND not already
-                    // emitted. A duplicate <parameter=content> used to be
-                    // accepted, doubling the value (issue #2) -- the model
-                    // reopened the tag mid-content when the content itself
-                    // quoted the dialect.
+                    // Declared keys retain required/duplicate accounting even
+                    // when additional names are allowed by an open schema.
+                    // A repeated declared key must not double its value.
                     for (size_t j = 0; j < cur_params_.size(); j++)
                         if (cur_params_[j] == key_pref_) {
                             if (emitted_[j]) return false; // duplicate key
@@ -696,10 +740,12 @@ struct ToolGrammarXml {
                             st_ = GT2;
                             return true;
                         }
-                    return false;
+                    if (!cur_allow_additional_ || key_pref_.empty()) return false;
+                    st_ = GT2;
+                    return true;
                 }
                 std::string next = key_pref_ + c;
-                if (cur_params_key_.empty()) {
+                if (cur_allow_additional_) {
                     key_pref_ = next;
                     return true;
                 }
@@ -775,12 +821,15 @@ struct ToolGrammarXml {
     std::vector<std::string> names_;
     std::vector<std::vector<std::string>> params_per_name_;
     std::vector<std::vector<std::string>> required_per_name_;
+    std::vector<bool> schema_present_, allow_additional_;
+    bool cur_allow_additional_ = true;
     std::vector<std::string> cur_params_;   // sorted; indexes emitted_/cur_required_
     std::vector<char> cur_required_;
     std::vector<char> emitted_;
     std::string required_key_;
     std::string names_key_;
     std::string cur_params_key_;
+    std::string schema_key_;
     std::string name_pref_;
     std::string key_pref_;
     std::string lit_word_;
@@ -790,54 +839,24 @@ struct ToolGrammarXml {
     bool dead_ = false;
 
   public:
-    // Same signature scheme as ToolGrammar: state + lit progress + allowlist
-    // components only where token legality depends on them. NAME depends on
-    // names_key_ + name_pref_; KEY depends on cur_params_key_ + key_pref_;
-    // literal-match states depend on lit_. Argument/closer states never
-    // re-enter the allowlist branches.
+    // A vocab token can cross MANY character states: e.g. "=path" starts
+    // in PARAM_EQ and enters KEY. State-conditional schema keys therefore
+    // aliased read/shell masks, including at WS1 and closer states. Capture
+    // all transition-relevant state and the complete registry. The cache's
+    // content dedupe still shares identical bitsets/device slots.
     std::string signature() const {
         std::string s;
         s += (char)('a' + (int)st_);
         s += dead_ ? '!' : '.';
-        // Required-argument enforcement (issue #2) makes token legality depend
-        // on WHICH keys were already emitted, in two places: KEY (a duplicate
-        // is illegal) and SLASH (</function> is illegal until required are
-        // satisfied). Both must therefore be part of the mask cache key, or a
-        // stale mask would let the model close a call it must not close. The
-        // emitted set is monotone within a call, so this adds at most one new
-        // cached state per parameter, not a combinatorial blow-up.
-        auto append_emitted = [&] {
-            s += '|';
-            for (size_t j = 0; j < emitted_.size(); j++) s += emitted_[j] ? '1' : '0';
-            s += '|';
-            s += required_key_;
-        };
-        if (st_ == NAME) {
-            s += '|';
-            s += name_pref_;
-            s += '|';
-            s += names_key_;
-        } else if (st_ == KEY) {
-            s += '|';
-            s += key_pref_;
-            s += '|';
-            s += cur_params_key_;
-            append_emitted();
-        } else if (st_ == SLASH || st_ == VAL_LT || st_ == PARAM_LT ||
-                   st_ == WS1 || st_ == GT1) {
-            // states from which </function> is reachable
-            append_emitted();
-        } else if (st_ == FUNC_LIT || st_ == PARAM_LIT) {
-            s += '|';
-            s += std::to_string(lit_);
-            s += '|';
-            s += lit_word_;
-        } else if (st_ == PARAM_CLOSE || st_ == FUNC_CLOSE || st_ == CT_CLOSE) {
-            s += '|';
-            s += std::to_string(lit_);
-            s += '|';
-            s += lit_word_;
-        }
+        append_key(s, schema_key_);
+        append_key(s, std::to_string(lit_));
+        append_key(s, lit_word_);
+        append_key(s, name_pref_);
+        append_key(s, key_pref_);
+        append_key(s, std::to_string(cur_name_idx_));
+        append_key(s, cur_params_key_);
+        append_key(s, required_key_);
+        append_key(s, std::string(emitted_.begin(), emitted_.end()));
         return s;
     }
 };

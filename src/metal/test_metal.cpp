@@ -479,9 +479,10 @@ int test_t2_wide(q27::MetalBackend& backend) {
 // the fast path it gates.
 int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
                       uint32_t rows,uint32_t cols) {
-    constexpr uint32_t tokens=12;
+    constexpr uint32_t tokens=96;
     std::vector<uint8_t> data(dtype==q27::DType::Q4_G64?(size_t)rows*cols/2:
-                              dtype==q27::DType::T2_G128?(size_t)rows*cols/4:(size_t)rows*cols,0);
+                              dtype==q27::DType::T2_G128?(size_t)rows*cols/4:
+                              dtype==q27::DType::B1_G128?(size_t)rows*cols/8:(size_t)rows*cols,0);
     for(uint32_t r=0;r<rows;r++) for(uint32_t c=0;c<cols;c++) {
         int q=(int)((r*7+c*3)%15)-7;
         if(dtype==q27::DType::Q4_G64) {
@@ -490,6 +491,8 @@ int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
         } else if(dtype==q27::DType::T2_G128) {
             q=(int)((r*7+c*3)%3)-1;
             data[(size_t)r*cols/4+c/4]|=(uint8_t)((q+1)<<((c%4)*2));
+        } else if(dtype==q27::DType::B1_G128) {
+            data[(size_t)r*cols/8+c/8]|=uint8_t(((r*7+c*3)%2)<<(c%8));
         } else data[(size_t)r*cols+c]=(uint8_t)(int8_t)q;
     }
     uint32_t groups=cols/(dtype==q27::DType::Q4_G64?64:128);
@@ -499,8 +502,14 @@ int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
     q27::Tensor tensor; tensor.name="matmul-tiles"; tensor.dtype=dtype; tensor.shape={rows,cols};
     tensor.data=data.data(); tensor.data_size=data.size(); tensor.scales=(const uint8_t*)scales.data(); tensor.scales_size=scales.size()*2;
     auto weight=backend.upload(tensor); std::vector<float> x(tokens*cols);
-    for(uint32_t t=0;t<tokens;t++) for(uint32_t c=0;c<cols;c++)
+    for(uint32_t t=0;t<tokens;t++) for(uint32_t c=0;c<cols;c++) {
         x[(size_t)t*cols+c]=(((int)((t+1)*11+c*5)%31)-15)*(float)(c/32+1)/(float)(t+3);
+        // Keep the new production-width fixture at normalized activation
+        // magnitudes. The original ramp reaches ~800 at cols=5120 and makes
+        // near-cancellation measure reduction-order roundoff instead of the
+        // registered 3e-4 GEMM envelope. Existing narrow fixtures are unchanged.
+        if (cols >= 5120) x[(size_t)t*cols+c] *= 1.0f / 128;
+    }
     std::vector<float> reference(tokens*rows);
     for(uint32_t t=0;t<tokens;t++) {
         auto xb=backend.allocate(cols*4),yb=backend.allocate(rows*4); backend.write(*xb,0,x.data()+(size_t)t*cols,cols*4);
@@ -508,7 +517,7 @@ int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
         backend.read(*yb,0,reference.data()+(size_t)t*rows,rows*4);
     }
     auto all_x=backend.allocate(x.size()*4); backend.write(*all_x,0,x.data(),x.size()*4);
-    for(uint32_t n:{1u,4u,5u,8u,9u,12u}) {
+    for(uint32_t n:{1u,4u,5u,8u,9u,12u,16u,17u,20u,33u,48u,64u,96u}) {
         auto q=backend.allocate_quantized(n*cols); auto out=backend.allocate((uint64_t)n*rows*4);
         backend.begin_commands(); backend.quantize(*all_x,q); backend.matmul_quantized(weight,q,n,*out); backend.end_commands();
         std::vector<float> got(n*rows); backend.read(*out,0,got.data(),got.size()*4);
@@ -523,7 +532,15 @@ int test_matmul_shape(q27::MetalBackend& backend,q27::DType dtype,
 int test_matmul_tiles(q27::MetalBackend& backend,q27::DType dtype) {
     return test_matmul_shape(backend,dtype,9,256) ||
            test_matmul_shape(backend,dtype,9,1024) ||
-           test_matmul_shape(backend,dtype,17,1152);
+           test_matmul_shape(backend,dtype,17,1152) ||
+           test_matmul_shape(backend,dtype,65,5120) ||
+           // Preserve the donor adoption gate's aligned tiles, row/token
+           // remainders and actual GDN projection dimensions. A timing-only
+           // production bench cannot validate a shape-specialized candidate.
+           test_matmul_shape(backend,dtype,33,5120) ||
+           test_matmul_shape(backend,dtype,100,1152) ||
+           test_matmul_shape(backend,dtype,64,128) ||
+           test_matmul_shape(backend,dtype,10240,5120);
 }
 
 // Production-width GEMV parity. The packed-dot kernels take a vectorized
@@ -737,9 +754,18 @@ int test_profiled_batch_atomicity() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         q27::MetalBackend backend;
+        if (argc == 2 && std::string(argv[1]) == "--matmul-tiles") {
+            if (!backend.supports_quantized_matmul()) return 1;
+            for (auto dtype : {q27::DType::Q4_G64, q27::DType::Q8_G128,
+                               q27::DType::T2_G128, q27::DType::B1_G128})
+                if (test_matmul_tiles(backend, dtype)) return 1;
+            puts("Metal matmul tiles: OK");
+            return 0;
+        }
+        if (argc != 1) throw std::runtime_error("unknown test-metal-backend option");
         printf("Metal device: %s\n", backend.name().c_str());
         printf("working set %.1f GiB, max buffer %.1f GiB, threadgroup memory %.1f KiB\n",
                backend.recommended_working_set_size() / 1073741824.0,

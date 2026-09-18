@@ -1,0 +1,79 @@
+{
+  "date": "2026-09-18",
+  "host": "mac-mini",
+  "device": "Apple M4 / 16 GiB",
+  "memory_bytes": 17179869184,
+  "upstream_base": "0f1f1d496476929560fdcb93d736b796aabb2f69",
+  "scope": "Source-checkout continuation; one model/GPU job at a time, one HTTP slot, context 2048, fp16 KV. Not a release or throughput benchmark.",
+  "migration": {
+    "source_manifest_files_verified": 963,
+    "executable_bits_verified": true,
+    "yukon_preparation_exit": 0,
+    "artifact_sha256_verified_on_mini": "765ee57d0cecbb1ca8fb8ee8032c3654af76ccc2b2e8188008cb74f497ecd9ae",
+    "tokenizer_sha256_verified_on_mini": "f8adac2001668f3ba68e040e5c13f0982d6a194e2b4d9047cc050fdc6d7c93f2",
+    "laptop_reference_parity_rerun": false
+  },
+  "passed_gates": [
+    "make -j2 test-tools test-inspect test-agent; sampling/tokenizer selftests; Metal stream and snapshot-store CPU suites",
+    "10 native-agent CPU suites, including profile/effort/toggles/reasoning/history and real-tokenizer stable-prefix checks",
+    "cargo test --manifest-path experiments/q27-tui/Cargo.toml --locked: 8 passed",
+    "Yukon: make test-repack test-bonsai2-repack PYTHON=.venv/bin/python; optimized-python Bonsai fixtures also passed",
+    "make test-metal-backend: backend, ops, dense-reference Hadamard at 1024/5120/6144/17408",
+    "kernel-agent baseline/no-change gate: production/aligned row shapes; zero optimization attempts",
+    "Bonsai model --validate-only",
+    "2148 XML prefix/schema cache states, empty-versus-absent cache keys, and 128 full-capacity native device epochs",
+    "Serial mask guard: entry rejection, mid-call rejection, unrecoverable upload failure; valid 64-character tool name completes with bounded 8/64-slot recycling and 512-slot pool",
+    "Open/closed schema policy survives alignment, wrapped/bare resets and mask-cache keys; required-only open schemas permit extras without dropping required/duplicate accounting for declared keys; legacy empty list-only callers remain permissive",
+    "Live HTTP: all six streaming/non-streaming AUTO XML routes each engage and close once, with exactly one echo(word=marigold) result; separate closed-empty, open and required-only schemas pass",
+    "Live native: consecutive read/search under XML grammar, default-thinking one-token forced close, durable save/restart with 83 cached tokens"
+  ],
+  "final_focused_commands": [
+    "make -j2 test-tools test-agent build/test_tokenizer build/test_metal_stream build/q27-metal-server agent",
+    "build/test_q27_agent_prompt models/bonsai2/bonsai2.tok",
+    "build/test_tokenizer --selftest; build/test_metal_stream",
+    "python3.14 tools/test_bonsai2_serving.py build/q27-metal-server models/bonsai2/bonsai2-t2.q27 models/bonsai2/bonsai2.tok",
+    "python3.14 tools/test_bonsai2_native.py build/q27-agent models/bonsai2/bonsai2-t2.q27 models/bonsai2/bonsai2.tok"
+  ],
+  "smoke_timings_not_throughput": {
+    "http_suite_wall_seconds": 164.99,
+    "native_suite_wall_seconds": 200.83,
+    "http_suite_time_l_maximum_resident_bytes": 7458078720,
+    "native_suite_time_l_maximum_resident_bytes": 7464583168,
+    "measurement_note": "Fresh mini measurements from /usr/bin/time -l over each serialized test runner. RSS is not total unified-memory usage; not an idle-host performance comparison."
+  },
+  "kernel_harness": {
+    "command": "python3.14 tools/kernel_agent/driver.py --iterations 0 --ab-pairs 1 --bench-prompt 192 --run-dir logs/revival/mini-kernel-agent",
+    "attempts": 0,
+    "accepted": 0,
+    "baseline_ratio": 1.0006874528762142,
+    "scope": "Short synthetic Q4 harness-mechanics smoke, not a Bonsai prefill benchmark or statistically meaningful optimization result."
+  },
+  "local_log_sha256": {
+    "logs/revival/mini-metal.log": "5e7e647954a762e63c9907d66027dd1dbd82d310e3fcc4a41b694526ae90fa1b",
+    "logs/revival/mini-build-cpu.log": "7866e556b29722713541f0f4252e3c53fa6906467f5aafe82093f3114e79b7ee",
+    "logs/revival/review8-build-cpu.log": "cbdea11c4a8d285c871fddb34c0b50e92813a6468295babc9cbb29d8ad4b1a5e",
+    "logs/revival/review8-serving.log": "eb13db76600cede763cf3968ec5ac28f272a4811e1ecc5e728d356d51d32923f",
+    "logs/revival/review8-native.log": "e8e0d107d107b6c217bffcf5221191eeec8777720e4a5325e28515e1094c2fc1",
+    "logs/revival/review8-focused-tests.log": "91ff7391208d286492a5ec93384fd1d042a769a138b6dac7a9f321d85df67d28"
+  },
+  "review_closeout": {
+    "engine": "codex",
+    "status": "clean: no accepted/actionable findings reported",
+    "run": 9,
+    "exit_code": 0,
+    "findings": 0,
+    "accepted_findings_resolved_in_continuation": 7,
+    "earlier_handoff_fixes_retained": 4,
+    "rejected_findings": 0,
+    "command": "~/.pi/agent/skills/autoreview/scripts/autoreview --mode local --engine codex --prompt-file logs/revival/review9-notes.md --dataset docs/metal/evidence/bonsai2-mini-2026-09-18.json --output logs/revival/review9.txt --json-output logs/revival/review9.json --stream-engine-output",
+    "structured_result": "docs/metal/evidence/bonsai2-review-2026-09-18.json",
+    "structured_result_sha256": "de6c4f41c0b7d97e40eab7926e918e0c2f2a3a6665232e30c00724c1044c95da"
+  },
+  "limitations": [
+    "The laptop's 340/340 reference argmax result is historical evidence in bonsai2-2026-09-18.json, not a mini measurement.",
+    "Only context 2048 and one resident engine/slot tested here; default 8192, long context, quality, cancellation soak and cold persistence reliability are not certified.",
+    "XML grammar constrains tool/parameter names and required-key presence, not arbitrary JSON Schema value semantics.",
+    "The generic q4s HTTP snapshot-recovery gate remains inapplicable to serial-only Bonsai and is not claimed as passed.",
+    "PTQ1_0, accelerated Bonsai prefill and Homebrew/prebuilt publication remain pending."
+  ]
+}

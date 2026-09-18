@@ -1,0 +1,6 @@
+{
+  "findings": [],
+  "overall_correctness": "patch is correct",
+  "overall_explanation": "No remaining actionable correctness, integration, security, regression, or coverage defects were identified in the reviewed bundle. The final changes consistently propagate schema presence and additionalProperties policy, recycle serial Metal mask pools while invalidating device-slot maps, fail closed on grammar transition errors, use the profile-aware native Qwen3.8 renderer across generation and persistence paths, strictly validate Bonsai rotation metadata, and back the stated mini evidence with matching log digests and scoped limitations.",
+  "overall_confidence": 0.89
+}

@@ -665,6 +665,7 @@ struct Runtime {
     // think tag. Either way, per-request fields override (resolve_think).
     std::vector<std::string> vocab_bytes_v;
     q27::ToolMaskCache<q27::ToolGrammar> mask_cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> mask_cache_xml;
     DiskSnapshotStore snapstore{&snap_peek_adapter,&snap_hash_sha1};
     TraceLog trace;
     std::string model_name,model_sha1_cache,boot_id,server_sha1,tokenizer_name,tokenizer_sha1;
@@ -790,6 +791,9 @@ struct Runtime {
         if(tokenizer.vocab_size()!=q27::MetalEngine::vocabulary_size())
             throw std::runtime_error("tokenizer/model vocabulary mismatch");
         shared=q27::MetalEngine::open_shared(model);
+        // CUDA already selects this at boot. Metal must do the same before
+        // rendering requests, especially Bonsai 2 whose source name is "Hf".
+        q27::set_tool_dialect_for_model(shared->model.meta_json);
         // G6 admission budget (hoisted 2026-07-22 for --ctx auto): the
         // device serving envelope every slot's KV + fixed state + snapshot
         // capacity must fit. Default = half the recommended working set
@@ -1050,6 +1054,7 @@ struct Runtime {
         if(constrain_tools) {
             vocab_bytes_v=tokenizer.vocab_bytes();
             mask_cache.init(&vocab_bytes_v,tokenizer.token_id("</tool_call>"));
+            mask_cache_xml.init(&vocab_bytes_v,tokenizer.token_id("</tool_call>"));
             fprintf(stderr,"constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
                     tokenizer.token_id("<tool_call>"),tokenizer.token_id("</tool_call>"));
         }
@@ -1279,7 +1284,8 @@ struct Runtime {
                 const std::string& trace_id="",
                 ThinkControl* think_control=nullptr,
                 bool forced_tool_choice=false,
-                const std::function<bool()>& live={}) {
+                const std::function<bool()>& live={},
+                const json& grammar_tools=json::array()) {
         if(prompt.empty()) throw std::runtime_error("prompt is empty");
         q27::validate_sampling(sampling);
         // `mtp` (prefill warm + decode path) is resolved after the slot's
@@ -1706,31 +1712,26 @@ struct Runtime {
         // the CUDA engage-lag truncation degenerates to plain sequencing: the
         // constraint set here masks the NEXT token's logits inside step()).
         q27::BasicToolConstrainer<q27::MetalEngine,q27::Tokenizer> tc;
-        tc.eng=&engine; tc.tok=&tokenizer; tc.cache=&mask_cache; tc.host2dev=&slot->host2dev;
+        tc.eng=&engine; tc.tok=&tokenizer; tc.cache=&mask_cache;
+        tc.cache_xml=&mask_cache_xml; tc.host2dev=&slot->host2dev;
+        tc.prepare_serial_masks=[&] {
+            // Called under the GPU lease after the previous synchronous step.
+            // Only the next mask is live in serial decode; a new device epoch
+            // bounds memory without rejecting valid long names/schemas. CPU
+            // cache contents survive, but no old device index may survive.
+            if(engine.mask_pool_used>=q27::MetalEngine::MASK_POOL_CAP) {
+                engine.reset_mask_pool();
+                slot->host2dev.clear();
+            }
+        };
         tc.enabled=q27::metal_tool_constraint_enabled(
             constrain_tools,!tool_names.empty(),sampling.temperature==0.0f,
             effective_speculation_width(sampling,bounded_reasoning),forced_tool_choice);
-        // Metal is still on the 1-arg tc.begin (JSON grammar only) -- it has
-        // no parallel cache_xml and the filtered tools JSON isn't threaded
-        // through to this site. If the model is XML-trained (Qwen3.8) and
-        // --constrain-tools is on, the JSON grammar dead-states on the first
-        // body byte ('<', where JSON expects '{') and the constraint drops
-        // cleanly. No crash, but the feature silently no-ops. Warn once so
-        // it's visible (review 2026-08-20).
-        if (tc.enabled && q27::tool_dialect_xml()) {
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                fprintf(stderr,
-                        "[metal] WARNING: --constrain-tools + XML-dialect model "
-                        "(Qwen3.8) is not wired on Metal -- constraint will "
-                        "disengage on the first body byte. CUDA path uses "
-                        "ToolGrammarXml and works correctly; Metal is JSON-only.\n");
-            }
-        }
+        const auto grammar_schema=q27::tool_grammar_schema_for_names(grammar_tools,tool_names);
         {
             auto gpu=lease_now();
-            tc.begin(tool_names);
+            tc.begin(tool_names,grammar_schema.properties,grammar_schema.required,
+                     q27::tool_dialect_xml(),grammar_schema.present,grammar_schema.additional);
         }
         // Scope-exit constraint cleanup: runs on normal return, client
         // disconnect, and engine exceptions alike, and never throws (a
@@ -1846,27 +1847,26 @@ struct Runtime {
                     // uses the same peek-advance shape as the CUDA flow. The
                     // engage path still builds its entry mask under the lease,
                     // once per tool call.
-                    q27::ToolGrammar peek=tc.tg;
-                    bool ok=true;
-                    for(char c:tokenizer.decode_one((int)current))
-                        if(!peek.advance(c)) { ok=false; break; }
-                    if(ok && !peek.closed()) {
-                        std::lock_guard<std::mutex> mk(mask_mutex_);
-                        mask_cache.get(peek);
-                    }
+                    auto prewarm_mask=[&](auto peek,auto& cache) {
+                        bool ok=true;
+                        for(char c:tokenizer.decode_one((int)current))
+                            if(!peek.advance(c)) { ok=false; break; }
+                        if(ok && !peek.closed()) {
+                            std::lock_guard<std::mutex> mk(mask_mutex_);
+                            cache.get(peek);
+                        }
+                    };
+                    if(tc.dialect_xml) prewarm_mask(tc.tg_xml,mask_cache_xml);
+                    else prewarm_mask(tc.tg,mask_cache);
                 }
                 auto gpu=lease_now();
                 if(tc.enabled) {
                     // mask_mutex_ inside the lease guards the shared host
                     // cache against a concurrent slot's prewarm above.
                     std::lock_guard<std::mutex> mk(mask_mutex_);
-                    const int tid=(int)current;
-                    tc.scan_round(&tid,1);
-                    tc.on_id(tid);
-                    // Restage the advanced grammar state's mask: on_id moves
-                    // tc.tg but stages nothing, so otherwise every step after
-                    // the first constrained token uses the prior legal set.
-                    if(tc.active) tc.apply(tc.tg);
+                    // Restage the next mask and abort on entry/mid-call pool
+                    // exhaustion or grammar rejection, never step unmasked.
+                    tc.advance_serial_or_throw((int)current);
                 }
                 pending=engine.step(current);
             }
@@ -2678,7 +2678,7 @@ int main(int argc,char** argv) {
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ return feed_piece(piece,false); },
                         tnames,snap_hint,id,&think_control,
-                        tchoice.mode==q27::ToolChoice::FORCED,live); });
+                        tchoice.mode==q27::ToolChoice::FORCED,live,tools); });
                 if(outcome.finish==Runtime::Finish::Cancelled) { r.status=499; return; }
                 const bool final_tool_incomplete=
                     outcome.finish==Runtime::Finish::Length && sp.chan==q27::StreamSplitter::TOOL;
@@ -2930,7 +2930,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },tnames,snap_hint,id,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_writable(); });
+                                [&]{ return sink.is_writable(); },tools);
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         const bool final_tool_incomplete=
@@ -3129,7 +3129,7 @@ int main(int argc,char** argv) {
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ return feed_piece(piece,false); },
                         tnames,snap_hint,mid,&think_control,
-                        tchoice.mode==q27::ToolChoice::FORCED,live); });
+                        tchoice.mode==q27::ToolChoice::FORCED,live,tools); });
                 if(outcome.finish==Runtime::Finish::Cancelled) { r.status=499; return; }
                 const bool final_tool_incomplete=
                     outcome.finish==Runtime::Finish::Length && sp.chan==q27::StreamSplitter::TOOL;
@@ -3432,7 +3432,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },tnames,snap_hint,mid,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_writable(); });
+                                [&]{ return sink.is_writable(); },tools);
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) { sink.done(); return false; }
                         const bool final_tool_incomplete=
@@ -3719,7 +3719,7 @@ int main(int argc,char** argv) {
                     return runtime.run(ids,n,sampling,stops,
                         [&](const std::string& piece){ return feed_piece(piece,false); },
                         grammar_tool_names,snap_hint,resp_id,&think_control,
-                        tchoice.mode==q27::ToolChoice::FORCED,live);
+                        tchoice.mode==q27::ToolChoice::FORCED,live,tools);
                 });
                 if(outcome.finish==Runtime::Finish::Cancelled) {
                     runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},
@@ -4316,7 +4316,7 @@ int main(int argc,char** argv) {
                                     return alive;
                                 },grammar_tool_names,snap_hint,resp_id,&think_control,
                                 tchoice.mode==q27::ToolChoice::FORCED,
-                                [&]{ return sink.is_writable(); });
+                                [&]{ return sink.is_writable(); },tools);
                         });
                         if(outcome.finish==Runtime::Finish::Cancelled) {
                             runtime.trace.event({{"kind","outcome"},{"api","responses"},{"id",resp_id},

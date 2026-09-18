@@ -1,5 +1,12 @@
 # Quasar
 
+> **Apple Silicon revival (2026-09-18):** this branch adds native Bonsai 2
+> PQ2_0/Hadamard inference and restores the direct-engine agent, Ratatui TUI,
+> and kernel-agent experiment harness on current upstream. Start with
+> [`docs/metal/BONSAI2.md`](docs/metal/BONSAI2.md) and `./q27 help`.
+> Source-checkout milestone only; no new Homebrew/prebuilt release is implied.
+> The upstream engine documentation follows below.
+
 A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and their fine-tunes on a single RTX 5090 (3090 and 4090/Ada also supported; Apple-silicon Metal backend for the q4s tier). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
 ## Why this is interesting

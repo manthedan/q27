@@ -784,7 +784,96 @@ static void test_issue35_on_pending_xml_guards() {
     CHECK(!tc.active);
 }
 
+// The same checked serial transition is used by HTTP and native Metal.
+static void test_serial_fail_closed() {
+    auto throws = [](auto action) {
+        try { action(); } catch (const std::runtime_error&) { return true; }
+        return false;
+    };
+    {
+        Rig r;
+        r.eng.pool_cap = 0;
+        CHECK(throws([&] { r.tc.advance_serial_or_throw(T_MARK); }));
+        CHECK(r.tc.pool_dead && !r.tc.active);
+    }
+    {
+        Rig r;
+        r.tc.advance_serial_or_throw(T_MARK);
+        CHECK(throws([&] { r.tc.advance_serial_or_throw(T_HELLO); }));
+        CHECK(!r.tc.active); // mid-call grammar rejection
+    }
+    {
+        Rig r;
+        CHECK(throws([&] { r.tc.advance_serial_or_throw(T_MARKBAD); }));
+    }
+    // More than 64 distinct next-byte masks, using a valid 64-character tool
+    // name. Production-capacity epochs recycle at completed serial steps;
+    // an unrecoverable zero-capacity/upload failure must still fail closed.
+    const std::string name = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    FakeTok tok;
+    tok.vocab = {"</tool_call>", "<tool_call>", "<function=", ">", "</function>"};
+    for (char c : name) tok.vocab.push_back(std::string(1, c));
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> xml;
+    cache.init(&tok.vocab, 0);
+    xml.init(&tok.vocab, 0);
+    for (int capacity : {0,8,64,512}) {
+        FakeEngine eng;
+        eng.pool_cap = capacity;
+        std::vector<int> slots;
+        TC tc;
+        tc.eng = &eng; tc.tok = &tok; tc.cache = &cache;
+        tc.cache_xml = &xml; tc.host2dev = &slots; tc.enabled = true;
+        int epochs = 0;
+        tc.prepare_serial_masks = [&] {
+            if (eng.mask_pool_used >= capacity) {
+                eng.set_tool_constraint(-1);
+                eng.mask_pool_used = 0;
+                slots.clear();
+                ++epochs;
+            }
+        };
+        tc.begin({name},{{}},{},true,{true});
+        std::vector<int> ids{1,2};
+        for (size_t i=0; i<name.size(); ++i) ids.push_back(5+(int)i);
+        ids.insert(ids.end(),{3,4,0});
+        int steps=0;
+        const bool rejected = throws([&] {
+            for (int id : ids) {
+                tc.advance_serial_or_throw(id);
+                ++steps; // engine.step is only reachable after the guard
+            }
+        });
+        CHECK(rejected == (capacity == 0));
+        if (rejected) {
+            CHECK(tc.pool_dead && !tc.active && eng.mask_pool_used == capacity);
+            CHECK(steps < (int)ids.size());
+        } else {
+            CHECK(tc.tg_xml.closed() && !tc.active);
+            CHECK(eng.mask_pool_used <= capacity);
+            CHECK((epochs > 0) == (capacity < 512));
+        }
+    }
+    // Presence must survive begin AND both wrapped/bare engagement resets.
+    for (bool present : {false,true}) for (bool additional : {false,true}) for (bool bare : {false,true}) {
+        if (!present && !additional) continue; // absent schemas use open fallback
+        FakeEngine eng;
+        std::vector<int> slots;
+        FakeTok edge;
+        edge.vocab = {"</tool_call>",
+            "<function=zero><parameter=x>x</parameter></function></tool_call>", "<tool_call>"};
+        q27::ToolMaskCache<q27::ToolGrammarXml> masks;
+        masks.init(&edge.vocab,0);
+        TC tc;
+        tc.eng=&eng; tc.tok=&edge; tc.cache_xml=&masks; tc.host2dev=&slots; tc.enabled=true;
+        tc.begin({"zero"},{{}},{},true,{present},{additional});
+        if (!bare) tc.advance_serial_or_throw(2);
+        CHECK(throws([&] { tc.advance_serial_or_throw(1); }) == (present && !additional));
+    }
+}
+
 int main() {
+    test_serial_fail_closed();
     test_c1_engage_truncate_midround();
     test_c2_marker_spans_rounds();
     test_c3_rem_advances();

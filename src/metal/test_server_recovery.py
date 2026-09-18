@@ -35,16 +35,16 @@ def available_port():
         return probe.getsockname()[1]
 
 
-def start_server(server, model, tokenizer, snapshot_dir, extra_env):
+def start_server(server, model, tokenizer, snapshot_dir, extra_env, context=256, extra_args=()):
     port = available_port()
     env = os.environ.copy()
     env.pop("Q27_API_KEY", None)
     env.update(extra_env)
     process = subprocess.Popen(
         [server, model, tokenizer, "--host", "127.0.0.1", "--port", str(port),
-         "--ctx", "256", "--slots", "1", "--max-tokens-default", "1",
+         "--ctx", str(context), "--slots", "1", "--max-tokens-default", "1",
          "--think-budget", "0", "--snapshot-dir", snapshot_dir,
-         "--snapshot-max-mb", "256"],
+         "--snapshot-max-mb", "256"] + list(extra_args),
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env,
     )
     stderr_lines = []
