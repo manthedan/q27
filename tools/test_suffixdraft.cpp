@@ -72,6 +72,37 @@ int main() {
         CHECK(m == 4, "append match len");
         CHECK(out[0] == 9 && out[1] == 42, "append continuation");
     }
+    // sync() builds exactly reset()'s index: random multi-turn continuations
+    // over small vocabs (forces MAXCAND evictions), plus re-render drift
+    {
+        unsigned r = 12345;
+        auto rnd = [&]() { r = r * 1103515245u + 12345u; return (int)((r >> 16) & 0x7fff); };
+        int bad = 0, kept = 0;
+        for (int trial = 0; trial < 200; trial++) {
+            const int vocab = trial % 3 == 0 ? 3 : trial % 3 == 1 ? 20 : 5000;
+            std::vector<int> p;
+            SuffixDraft inc;
+            for (int turn = 0; turn < 6; turn++) {
+                if (turn && rnd() % 4 == 0 && p.size() > 50) p.resize(p.size() - rnd() % 40);
+                const int add = 20 + rnd() % 400;
+                for (int j = 0; j < add; j++) p.push_back(rnd() % vocab);
+                kept += inc.sync(p) > 0;
+                SuffixDraft ref;
+                ref.reset(p);
+                if (inc.index_digest() != ref.index_digest()) bad++;
+                int o1[8], o2[8];
+                for (int q = 0; q < 8; q++) {
+                    const int pend = rnd() % vocab;
+                    const int a = inc.propose_with(pend, 8, o1), b = ref.propose_with(pend, 8, o2);
+                    if (a != b || (a && std::vector<int>(o1, o1 + 8) != std::vector<int>(o2, o2 + 8))) bad++;
+                }
+                for (int j = 0; j < 30; j++) inc.append(rnd() % vocab); // emitted tokens, then next turn
+            }
+        }
+        CHECK(bad == 0, "sync == reset (index digest + proposals)");
+        CHECK(kept > 100, "sync keeps the common prefix on continuations");
+        printf("  sync vs reset: %d mismatches, %d incremental syncs of 1200\n", bad, kept);
+    }
     if (fails == 0) printf("suffixdraft: all tests PASS\n");
     return fails ? 1 : 0;
 }

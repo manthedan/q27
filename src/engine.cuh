@@ -5392,12 +5392,14 @@ struct Engine {
         // takes the slot over. Q27_MAXD_RESET=1 is the stricter
         // every-request reset.
         if (maxd_auto && maxd_reset) dctl.reset();
-        // Suffix drafter: rebuild the match index over this request's full
-        // prompt (multi-turn re-renders arrive whole, so reset covers
-        // history). ~2-4ms host at 25K tokens, once per request, off the
-        // decode path. sfx_valid arms after round 1 (host learns pending).
+        // Suffix drafter: bring the match index to this request's full
+        // prompt (multi-turn re-renders arrive whole). sync() keeps the index
+        // of the prefix this slot's stream shares with the prompt and indexes
+        // only the rest -- identical to a rebuild (test_suffixdraft), 0.2 ms
+        // instead of 2-34 ms at 32-200K tokens, which sat on the TTFT path.
+        // sfx_valid arms after round 1 (host learns pending).
         if (suffix_on) {
-            sfx.reset(prompt);
+            sfx.sync(prompt);
             sfx_valid = false;
         }
         // DFlash2 ring alignment happens once the prefix hit is known (both

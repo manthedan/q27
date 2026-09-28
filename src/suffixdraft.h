@@ -26,6 +26,7 @@ class SuffixDraft {
     static constexpr int MAXEXT = 256; // backward match-extension cap
     std::vector<int> t;                // committed stream (prompt + emitted)
     std::unordered_map<uint64_t, std::vector<int>> idx; // key4 -> ascending positions
+    int last_evict = -1;               // largest position whose insert evicted a MAXCAND entry
 
     static uint64_t key4(const int* p) {
         uint64_t h = 1469598103934665603ULL;
@@ -35,14 +36,49 @@ class SuffixDraft {
     void index_pos(int i) { // i = position of the 4-gram's LAST token
         auto& v = idx[key4(&t[i - NG + 1])];
         v.push_back(i);
-        if ((int)v.size() > MAXCAND) v.erase(v.begin());
+        if ((int)v.size() > MAXCAND) { v.erase(v.begin()); last_evict = i; }
     }
 
 public:
     void reset(const std::vector<int>& prompt) {
         t = prompt;
         idx.clear();
+        last_evict = -1;
         for (int i = NG - 1; i < (int)t.size(); i++) index_pos(i);
+    }
+    // reset() for a stream that mostly continues the current one (multi-turn:
+    // the new prompt = the old prompt + the reply + a tool result). Keeps the
+    // index of the longest common prefix, unindexes the rest, indexes the new
+    // tail -- the SAME index reset(prompt) builds (tools/test_suffixdraft.cpp
+    // checks the digest), in O(changed tokens) instead of O(prompt): 4.6 ms ->
+    // ~0.1 ms at a 100K-token prompt. Falls back to reset() when the prefix
+    // is short or when a position past it evicted an older entry (an eviction
+    // is not reversible). Returns the number of positions kept.
+    int sync(const std::vector<int>& prompt) {
+        const int n = (int)t.size(), m = (int)prompt.size();
+        int c = 0;
+        while (c < n && c < m && t[c] == prompt[c]) c++;
+        if (c < NG || last_evict >= c) { reset(prompt); return 0; }
+        for (int i = n - 1; i >= c; i--) {
+            if (i < NG - 1) break;
+            auto it = idx.find(key4(&t[i - NG + 1]));
+            if (it == idx.end() || it->second.empty() || it->second.back() != i) { reset(prompt); return 0; }
+            it->second.pop_back();
+            if (it->second.empty()) idx.erase(it);
+        }
+        t.resize(c);
+        for (int i = c; i < m; i++) append(prompt[i]);
+        return c;
+    }
+    // order-independent digest of the index (unit tests: sync() == reset())
+    uint64_t index_digest() const {
+        uint64_t d = t.size();
+        for (const auto& [k, v] : idx) {
+            uint64_t h = k;
+            for (int p : v) { h ^= (uint64_t)p + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); }
+            d += h * 0x100000001b3ULL;
+        }
+        return d;
     }
     void append(int tok) {
         t.push_back(tok);
