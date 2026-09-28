@@ -15714,6 +15714,36 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-27 (ay): llama.cpp's n-gram drafting ideas, replayed on our traffic -- only the index rebuild was worth taking
+
+Prompted by jadidbourbaki's prompt-lookup post (llama.cpp's n-gram drafter,
+165 -> 1.2 us per draft) and its threshold pre-check PR. Our suffix drafter
+already proposes in ~0.05 us against a ~14 ms verify round, so the latency
+work does not transfer; what cost us was **rebuilding the match index over the
+whole prompt on every request** (2-34 ms at 32-200K tokens, on the TTFT path).
+`SuffixDraft::sync()` keeps the index of the prefix the slot's stream shares
+with the new prompt, unindexes the rest and indexes the tail: 0.16-0.19 ms at
+32-200K, the same index as a rebuild (test_suffixdraft: digest + proposals over
+1,200 random multi-turn syncs incl. small-vocab eviction cases; eviction past
+the prefix falls back to a rebuild). Server gate (3090, T3+MTP pack, 3-turn
+re-emit conversation, suffix firing at 7.8-9.4 tok/round): texts and round
+counts identical before/after (92/42/36). Commit 206aead.
+
+**Replay of the post's other ideas** (offline, the three 09-18 Bonsai campaign
+legs from REQBODY_LOG: 36 sessions, 1,246 turns, 786K output tokens; a
+simplified render, so A/B/C are comparable to each other, not to the engine):
+
+    variant                                     fires           covered      accepted/fire
+    A  suffix drafter as shipped (L>=12, K=16)  ~2% of rounds   12.5-14.9%   7.4-8.0
+    B  + cross-session index (dynamic cache)    +0.2%           +0.5%        2.35-2.62
+    C  + llama.cpp n-gram frequency fallback    +~28%           +28-31%      1.15-1.28
+
+A round without a suffix proposal gets the model drafter's 2.85 (Bonsai MTP
+ladder) to 3.8-4.0 (DFlash2) tokens, so C would replace good drafts with
+1.2-token ones on 28% of rounds and B is both rare and below that bar. Not
+built. The n-gram frequency drafter is a no-draft-model tool; with one, the
+long-match suffix echo is the part that earns its verify width.
+
 ## 2026-09-25 (ax): gemv_t3 passes gemv_t2 -- subtract-form digit pop + hoisted addressing; T3 decode 72-74 -> 79-82 t/s on the 3090, still bitwise
 
 Prompted by an agentic-CUDA-optimizer repo (not used: no license, OpenAI-only,
