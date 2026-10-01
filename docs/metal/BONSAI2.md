@@ -13,7 +13,6 @@ parity run was on a base M4 / 24 GiB laptop.
 
 ```sh
 cd "$HOME/projects/q27-revival"
-export Q27_CONTEXT=16384           # fits a 16 GiB mini with fp16 KV; launcher default is 8192
 ./q27 build
 ./q27 agent                        # classic native agent; no model-driven tools
 ./q27 tui                          # Rust/Ratatui frontend, same native engine
@@ -52,9 +51,16 @@ mkdir -m 700 -p "$HOME/.q27-revival-sessions"
 
 Keep the shader/runtime unchanged when resuming: snapshots deliberately bind
 the model, tokenizer/transcript, and runtime identities and reject mismatches.
-Cold load and first snapshot latency still need soak/attribution; one initial
-save exceeded an external 180-second timeout, although the subsequent save and
-restart/reuse checks passed. This is not yet a packaged-release reliability claim.
+The launcher defaults to `Q27_CONTEXT=16384`, which fits a 16 GiB Mac with fp16
+KV (see "Context on a 16 GiB Mac").
+
+Session soak on the M4 / 16 GiB mini (`tools/test_bonsai2_session_soak.py`, 8
+process restarts on one session at context 16384): cold start ~12 s, session
+load ~5.5 s, save 0.4-3.7 s; a resumed turn takes ~20 s end to end while the
+saved history grows from 4.1K to 8.2K tokens (session snapshot 428 -> 707 MB),
+and every resumed turn reuses the whole prior prefix. The September 180-second
+first save did not reproduce. This is a soak of one machine, not a
+packaged-release reliability claim.
 
 ## Reproduce the pack on another checkout
 

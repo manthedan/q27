@@ -1,0 +1,76 @@
+{
+ "date": "2026-10-01",
+ "device": "Apple M4 / 16 GiB (mini)",
+ "pack": "bonsai2-27b-t2-slim.q27",
+ "tool": "tools/test_bonsai2_session_soak.py",
+ "ctx_8192_4_turns": [
+  {
+   "turn": 1,
+   "total_s": 137.6,
+   "model_ready_s": 11.3,
+   "save_s": 4.0,
+   "prompt": 4075,
+   "cached": 0,
+   "session_mb": 428
+  },
+  {
+   "turn": 2,
+   "total_s": 19.9,
+   "session_loaded_s": 17.3,
+   "save_s": 0.7,
+   "prompt": 4145,
+   "cached": 4123
+  },
+  {
+   "turn": 3,
+   "total_s": 18.9,
+   "save_s": 0.5,
+   "prompt": 4181,
+   "cached": 4152
+  },
+  {
+   "turn": 4,
+   "total_s": 19.2,
+   "save_s": 0.7,
+   "prompt": 4202,
+   "cached": 4183,
+   "session_mb": 433
+  }
+ ],
+ "ctx_16384_8_turns": {
+  "total_s": [
+   140.2,
+   20.3,
+   19.3,
+   19.5,
+   171.8,
+   21.0,
+   20.1,
+   20.0
+  ],
+  "save_s": [
+   3.7,
+   0.7,
+   0.4,
+   0.6,
+   1.2,
+   0.9,
+   0.9,
+   0.9
+  ],
+  "session_mb": [
+   428,
+   430,
+   432,
+   433,
+   702,
+   704,
+   706,
+   707
+  ],
+  "model_ready_s": "11.3-12.3",
+  "session_load_s": "~5.5",
+  "note": "turn 5 repeats the ~4K README prompt (new tokens at depth 4-8K)"
+ },
+ "september_180s_first_save": "not reproduced"
+}

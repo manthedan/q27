@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$PWD"
 MODEL_DIR="${Q27_BONSAI2_DIR:-$ROOT/models/bonsai2}"
-CONTEXT="${Q27_CONTEXT:-8192}"
+CONTEXT="${Q27_CONTEXT:-16384}"
 ACTION="${1:-help}"
 if [[ $# -gt 0 ]]; then shift; fi
 case "$ACTION" in
