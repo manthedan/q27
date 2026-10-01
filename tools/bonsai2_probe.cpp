@@ -38,6 +38,14 @@ int main(int argc,char** argv) {
         if(stride<1) throw std::runtime_error("Q27_PROBE_STRIDE must be >= 1");
         const char* kv_env=std::getenv("Q27_PROBE_KV");
         const bool turbo3=kv_env && !std::strcmp(kv_env,"turbo3");
+        // Q27_PROBE_PREFILL=chunk (q27 only): for each kept position i, reset
+        // and ingest tokens[0..i) through 96-token prefill chunks, then step
+        // tokens[i] serially -- the engine's own prefill shape -- so batched
+        // prefill is compared position by position against the reference.
+        const char* prefill_env=std::getenv("Q27_PROBE_PREFILL");
+        const bool chunked=prefill_env && !std::strcmp(prefill_env,"chunk");
+        if(prefill_env && !chunked && std::strcmp(prefill_env,"serial"))
+            throw std::runtime_error("Q27_PROBE_PREFILL must be serial or chunk");
         if(kv_env && !turbo3 && std::strcmp(kv_env,"fp16")) throw std::runtime_error("Q27_PROBE_KV must be fp16 or turbo3");
 #ifdef Q27_PRISM_REFERENCE
         ggml_backend_load_all();
@@ -56,9 +64,12 @@ int main(int argc,char** argv) {
         std::unique_ptr<llama_context,decltype(&llama_free)> engine(
             llama_init_from_model(model.get(),cp),llama_free);
         if(!engine) throw std::runtime_error("reference context failed");
-        if(turbo3) throw std::runtime_error("Q27_PROBE_KV=turbo3 applies to the q27 probe only");
+        if(turbo3||chunked) throw std::runtime_error("Q27_PROBE_KV/Q27_PROBE_PREFILL apply to the q27 probe only");
 #else
         q27::MetalEngine engine(argv[1],context,turbo3);
+        if(chunked && !engine.chunked_prefill())
+            throw std::runtime_error("Q27_PROBE_PREFILL=chunk: this pack has no chunked prefill");
+        if(!chunked && engine.chunked_prefill()) engine.set_chunked_prefill(false);
 #endif
         for(size_t i=0;i<tokens.size();++i) {
 #ifdef Q27_PRISM_REFERENCE
@@ -68,6 +79,18 @@ int main(int argc,char** argv) {
             const float* logits=llama_get_logits_ith(engine.get(),-1);
             if(!logits) throw std::runtime_error("reference logits absent");
 #else
+            if(chunked && i%stride!=stride-1) continue;
+            if(chunked) {
+                engine.reset();
+                size_t done=0;
+                while(i-done>=2) {
+                    const uint32_t n=static_cast<uint32_t>(std::min<size_t>(
+                        q27::MetalEngine::prefill_chunk_max(),i-done));
+                    engine.prefill_chunk(tokens.data()+done,n);
+                    done+=n;
+                }
+                for(;done<i;++done) engine.step(tokens[done]);
+            }
             engine.step(tokens[i]);
             auto row=engine.read_logits();
             const float* logits=row.data();

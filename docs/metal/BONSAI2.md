@@ -163,13 +163,13 @@ short-context correctness, not a long-context or task-benchmark claim.
 ## What is not enabled
 
 - **PTQ1_0 / the 5.95 GB dense pack**: not supported by this converter yet.
-- **Bonsai chunked prefill**: remains off. Old chunk GEMM activation
-  quantization is not equivalent to the correct float-activation path.
+- **Chunked prefill for T3 and legacy Bonsai packs**: those stay serial. T2
+  packs use the float-activation chunk path (see "Batched prefill").
 - **MTP**: the checkpoint has no MTP layer; requesting it fails.
 - **Vision**: this port is text-only; no vision tower/mmproj is loaded.
-- **HTTP snapshot hints**: upstream ignores explicit hints for serial-only
-  Bonsai. Its q4s snapshot-recovery suite therefore does not pass unchanged;
-  do not substitute the endpoint smoke for a full recovery gate.
+- **HTTP snapshot recovery**: with chunked prefill, snapshot hints now engage
+  for T2 packs, but the q4s snapshot-recovery suite has not been rerun on
+  Bonsai 2; do not substitute the endpoint smoke for a full recovery gate.
 - **Homebrew/prebuilt release** and cold start/persistence soak: still pending.
   The serving/native gates run at context 2048.
 
@@ -191,8 +191,30 @@ but its next-token NLL is indistinguishable from the reference at this sample
 size (-0.4% PPL, +/-1.4%). Use fp16 up to 16K; `serve --kv turbo3` for longer
 contexts. The native agent has no `--kv` option and always uses fp16.
 
-Prompt ingestion is still serial (~10 tok/s), so a 16K prompt takes ~27
-minutes to prefill; batched Bonsai prefill is the next milestone.
+## Batched prefill
+
+T2 packs ingest prompts in chunks of up to 96 tokens through the same layer
+loop as the Q tiers, but with float activations: each chunk's rows are
+Hadamard-rotated once per shared input (`bonsai_hadamard`, row-batched) and fed
+to `q27_matmul_t2_mm_f`, the T2 chunk GEMM with float instead of int8
+activations. The final prompt token stays serial. `--prefill serial` (CLI)
+forces the old path. Measured on the M4 / 16 GiB mini
+([evidence](evidence/bonsai2-prefill-2026-10-01.json)):
+
+| prompt | chunked | serial |
+|---|---|---|
+| 512 | 40.9 tok/s (12.5 s) | 12.3 tok/s (41.6 s) |
+| 2,048 | 36.4 tok/s (56 s) | |
+| 4,096 | 34.2 tok/s (2.0 min) | |
+| 13,000 | 26.7 tok/s (8.1 min) | ~18 min (extrapolated) |
+
+Chunked and serial prefill produce identical greedy text on a 1,381-token
+prompt. Against the Prism reference, chunk-prefilling to every position of the
+three gate inputs gives the same 339/340 argmax as serial (same near-tie), and
+chunk-prefilling to 15 cut points across the 4K input gives 15/15 with KL
+~1e-8. The float GEMM is 83% of prefill time at ~2.1 TFLOPS (about half the M4
+GPU's fp32 rate); attention grows with depth. Half-precision activation
+staging is the remaining lever and would need its own quality gate.
 
 ## Recovered experiments
 

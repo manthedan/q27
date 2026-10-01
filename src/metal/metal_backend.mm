@@ -258,6 +258,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q4_quantized_matmul;
     id<MTLComputePipelineState> q8_quantized_matmul;
     id<MTLComputePipelineState> t2_quantized_matmul;
+    id<MTLComputePipelineState> t2_float_matmul;
     id<MTLComputePipelineState> b1_quantized_matmul;
     id<MTLComputePipelineState> embedding;
     id<MTLComputePipelineState> embedding_t2;
@@ -696,6 +697,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->q4_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q4_mm");
             impl_->q8_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_q8_mm");
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
+            impl_->t2_float_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_f");
             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
             // q27_matmul_q4_mm_h is probe-only pending its valid quiet gate
             // and routes only under Q27_METAL_GEMM_HALF_Q4=1 — built lazily on
@@ -1414,6 +1416,43 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
     }
 }
 
+void MetalBackend::matmul_t2_float(const BackendTensor& weight, const BackendBuffer& x,
+                                   uint32_t x_rows, BackendBuffer& y) {
+    if (!impl_->t2_float_matmul)
+        throw std::runtime_error("q27 Metal: float T2 matmul requires Apple GPU family 7 or newer");
+    if (weight.dtype != DType::T2_G128 || !weight.data || !weight.scales)
+        throw std::runtime_error("q27 Metal: float matmul requires a T2 weight");
+    if (!x_rows || x_rows > 96 || !weight.rows || !weight.cols || weight.rows > UINT32_MAX ||
+        weight.cols > UINT32_MAX || weight.cols % 128 || (uint64_t)weight.cols * x_rows > UINT32_MAX)
+        throw std::runtime_error("q27 Metal: invalid float T2 matmul dimensions");
+    const MetalBuffer& data = metal_buffer_view(weight.data);
+    const MetalBuffer& ws = metal_buffer_view(weight.scales);
+    const MetalBuffer& xv = metal_buffer(x);
+    MetalBuffer& out = metal_buffer(y);
+    if (xv.handle() == out.handle())
+        throw std::runtime_error("q27 Metal: float T2 matmul buffers must not alias");
+    check_range(tensor_limit(data.size(), weight.data_offset, weight.data_size), weight.data_offset,
+                weight.rows * weight.cols / 4, "float T2 matmul weight");
+    check_range(tensor_limit(ws.size(), weight.scales_offset, weight.scales_size), weight.scales_offset,
+                weight.rows * (weight.cols / 128) * 2, "float T2 matmul weight scales");
+    check_range(xv.size(), 0, weight.cols * x_rows * 4, "float T2 matmul input");
+    check_range(out.size(), 0, weight.rows * x_rows * 4, "float T2 matmul output");
+    MatmulArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols, x_rows, 1};
+    @autoreleasepool {
+        bool own; auto enc = impl_->encoder_for_operation(own, "q27_matmul_t2_mm_f");
+        [enc setComputePipelineState:impl_->t2_float_matmul];
+        [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
+        [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
+        [enc setBuffer:xv.handle() offset:0 atIndex:2];
+        [enc setBuffer:out.handle() offset:0 atIndex:3];
+        [enc setBytes:&args length:sizeof(args) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows + 31) / 32,
+                                              (NSUInteger)(x_rows + 15) / 16, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (own) impl_->finish_command("float T2 simdgroup matmul");
+    }
+}
+
 // A/B/C MMA roofline probe entries (bench-only, docs/plans/2026-07-16-mma-
 // roofline.md): same dispatch grid and MatmulArgs as the production T2
 // GEMM. Arm 'b' takes half operands + half weight scales + float
@@ -1874,17 +1913,17 @@ void MetalBackend::embedding_from_device(const BackendTensor& weight, const Back
 
 void MetalBackend::bonsai_hadamard(const BackendBuffer& x, const BackendBuffer& signs,
                                    BackendBuffer& out, uint32_t n, bool inverse,
-                                   bool grouped_gdn) {
-    if (!n || n % 1024 || (grouped_gdn && (n != 6144 || inverse)))
+                                   bool grouped_gdn, uint32_t rows) {
+    if (!n || n % 1024 || !rows || rows > 96 || (grouped_gdn && (n != 6144 || inverse)))
         throw std::runtime_error("q27 Metal: invalid Bonsai Hadamard shape/mode");
     const auto& input = metal_buffer(x);
     const auto& sb = metal_buffer(signs);
     auto& output = metal_buffer(out);
     if (input.handle() == output.handle() || sb.handle() == output.handle())
         throw std::runtime_error("q27 Metal: Bonsai Hadamard buffers must not alias");
-    check_range(input.size(), 0, uint64_t(n) * 4, "Bonsai Hadamard input");
+    check_range(input.size(), 0, uint64_t(n) * rows * 4, "Bonsai Hadamard input");
     check_range(sb.size(), 0, uint64_t(n) * 4, "Bonsai Hadamard signs");
-    check_range(output.size(), 0, uint64_t(n) * 4, "Bonsai Hadamard output");
+    check_range(output.size(), 0, uint64_t(n) * rows * 4, "Bonsai Hadamard output");
     BonsaiWhtArgs args{n, uint32_t(inverse), uint32_t(grouped_gdn)};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_bonsai_wht");
@@ -1893,7 +1932,7 @@ void MetalBackend::bonsai_hadamard(const BackendBuffer& x, const BackendBuffer& 
         [enc setBuffer:sb.handle() offset:0 atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof(args) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(n / 1024,1,1)
+        [enc dispatchThreadgroups:MTLSizeMake(n / 1024,rows,1)
              threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         if (own) impl_->finish_command("Bonsai Hadamard");
     }

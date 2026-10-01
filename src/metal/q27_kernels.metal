@@ -1943,6 +1943,93 @@ kernel void q27_matmul_t2_mm(
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
 
+// Float-activation T2 chunk GEMM (Bonsai 2 batched prefill): the tiling of
+// q27_matmul_t2_mm with float activations staged directly instead of int8 x
+// scale, matching the serial path's float-activation T2 GEMV contract.
+kernel void q27_matmul_t2_mm_f(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const float *x [[buffer(2)]],
+        device float *out [[buffer(3)]], constant MatmulArgs &args [[buffer(4)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Wt[32 * 64];
+    threadgroup float Xt[64 * 16];
+    threadgroup float Sc[4 * 128];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
+    const bool xvalid = xtok < args.x_rows;
+    device const float *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 128;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            threadgroup float *dst = Wt + wrow * 64 + wcb;
+            dst[0]  = float(int(wp         & 3u) - 1);
+            dst[1]  = float(int((wp >>  2) & 3u) - 1);
+            dst[2]  = float(int((wp >>  4) & 3u) - 1);
+            dst[3]  = float(int((wp >>  6) & 3u) - 1);
+            dst[4]  = float(int((wp >>  8) & 3u) - 1);
+            dst[5]  = float(int((wp >> 10) & 3u) - 1);
+            dst[6]  = float(int((wp >> 12) & 3u) - 1);
+            dst[7]  = float(int((wp >> 14) & 3u) - 1);
+            dst[8]  = float(int((wp >> 16) & 3u) - 1);
+            dst[9]  = float(int((wp >> 18) & 3u) - 1);
+            dst[10] = float(int((wp >> 20) & 3u) - 1);
+            dst[11] = float(int((wp >> 22) & 3u) - 1);
+            dst[12] = float(int((wp >> 24) & 3u) - 1);
+            dst[13] = float(int((wp >> 26) & 3u) - 1);
+            dst[14] = float(int((wp >> 28) & 3u) - 1);
+            dst[15] = float(int((wp >> 30)      ) - 1);
+        }
+        {
+            const float4 xa = xvalid ? *(device const float4 *)(xsrc + c0 + xcb) : 0.0f;
+            const float4 xb = xvalid ? *(device const float4 *)(xsrc + c0 + xcb + 4) : 0.0f;
+            threadgroup float *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = xa.x; dst[1 * 16] = xa.y; dst[2 * 16] = xa.z; dst[3 * 16] = xa.w;
+            dst[4 * 16] = xb.x; dst[5 * 16] = xb.y; dst[6 * 16] = xb.z; dst[7 * 16] = xb.w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k8 = 0; k8 < 64; k8 += 8) {
+            simdgroup_float8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                float4(wsA, wsB, wsA, wsB);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
 // Half-staging variant of the T2 chunk GEMM (default path,
 // Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
 // variant G′): tiles are half — doubled simdgroup-MMA rate, halved
@@ -4356,10 +4443,13 @@ kernel void q27_bonsai_wht(device const float *x [[buffer(0)]],
                            device const float *signs [[buffer(1)]],
                            device float *out [[buffer(2)]],
                            constant BonsaiWhtArgs &args [[buffer(3)]],
-                           uint group [[threadgroup_position_in_grid]],
+                           uint2 group [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float values[1024];
-    const uint base = group * 1024;
+    const uint base = group.x * 1024;
+    // grid.y indexes rows of a [rows, n] batch; signs are per column.
+    x += (ulong)group.y * args.n;
+    out += (ulong)group.y * args.n;
     for (uint j = tid; j < 1024; j += 256) {
         const uint dst = base + j;
         // Reference: tiled [hd=128,nk=16,rep=3] -> grouped [hd,rep,nk].

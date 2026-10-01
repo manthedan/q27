@@ -107,6 +107,10 @@ class MetalBackend final : public ComputeBackend {
                            const BackendQuantized& x, BackendBuffer& y);
     void matmul_quantized(const BackendTensor& weight,const BackendQuantized& x,
                           uint32_t x_rows,BackendBuffer& y) override;
+    // Bonsai 2 batched prefill: T2 weight x float activation rows
+    // [x_rows, cols] -> [x_rows, rows]; 1..96 rows, the chunk GEMM tiling.
+    void matmul_t2_float(const BackendTensor& weight, const BackendBuffer& x,
+                         uint32_t x_rows, BackendBuffer& y);
     void embedding_q8(const BackendTensor& weight, uint32_t token,
                       BackendBuffer& out) override;
     void rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
@@ -160,7 +164,7 @@ class MetalBackend final : public ComputeBackend {
     // signs, H; embedding inverse: H, signs. Input/output must not alias.
     void bonsai_hadamard(const BackendBuffer& x, const BackendBuffer& signs,
                          BackendBuffer& out, uint32_t n, bool inverse,
-                         bool grouped_gdn = false);
+                         bool grouped_gdn = false, uint32_t rows = 1);
     void turbo_wht(BackendBuffer& x, uint32_t heads, uint32_t stride,
                    bool inverse) override;
     void kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& v,

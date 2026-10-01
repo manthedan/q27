@@ -452,6 +452,17 @@ class MetalEngine {
     std::unordered_map<const BackendTensor*, RotationBinding> rotated_weights_;
     std::unordered_map<uint32_t, std::shared_ptr<BackendBuffer>> rotation_signs_;
     std::shared_ptr<BackendBuffer> rotation_scratch_;
+    // Bonsai 2 batched prefill (T2 packs): chunk projections rotate float
+    // rows into crot_ and run the float T2 GEMM instead of int8 activations.
+    bool bonsai_chunk_ = false;
+    std::shared_ptr<BackendBuffer> crot_;
+    uint32_t crot_width_ = 0;
+    bool crot_grouped_ = false;
+    const BackendBuffer& rotate_rows(const BackendBuffer& x, uint32_t width, bool grouped,
+                                     uint32_t count);
+    void chunk_matmul(const BackendTensor& w, const BackendQuantized& xq,
+                      const BackendBuffer* rotated, uint32_t count, BackendBuffer& out);
+    void chunk_head(const BackendQuantized& x5, uint32_t count);
 
     std::shared_ptr<BackendBuffer> h_, x1_, y_;
     std::shared_ptr<BackendBuffer> qg_, kbuf_, vbuf_, attn_out_;

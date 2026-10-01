@@ -33,6 +33,14 @@ bool is_bonsai_dtype(DType dtype) {
     return dtype == DType::T2_G128 || dtype == DType::T3_G128 || dtype == DType::B1_G128;
 }
 
+// Bonsai 2 T2 packs take the float-activation chunk path. Static so the
+// serving reservation estimate and the engine agree before construction
+// (the engine's validate_architecture() has the authoritative check).
+bool bonsai2_t2_pack(const Model& model) {
+    const Tensor* body = model.find("blk.0.ffn_down.weight");
+    return model.find("hadamard_signs.5120") && body && body->dtype == DType::T2_G128;
+}
+
 class CommandBatch {
   public:
     explicit CommandBatch(MetalBackend& backend) : backend_(backend) { backend_.begin_commands(); }
@@ -443,7 +451,8 @@ uint64_t MetalEngine::serving_reservation_bytes(const Shared& shared,uint32_t co
     if(!context || context>262144)
         throw std::runtime_error("q27 Metal: context must be 1..262144");
     const bool has_mtp=shared.model.find("blk.64.attn_norm.weight")!=nullptr;
-    const bool chunked=shared.backend.supports_quantized_matmul() && has_mtp;
+    const bool chunked=shared.backend.supports_quantized_matmul() &&
+                       (has_mtp || bonsai2_t2_pack(shared.model));
     const auto side=production_kv_side_config(turbo3_kv,false);
     const uint64_t cache_row=turbo3_kv ? (uint64_t)N_KV*2*50
                                          : (uint64_t)N_KV*HEAD_DIM*2;
@@ -480,7 +489,10 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     // ctx-scaled allocation. Sizing deliberately ignores the GQA threshold:
     // the envelope instrument flips it at runtime, which must only change
     // routing, never invalidate the buffer.
-    const bool chunk_capable = backend_.supports_quantized_matmul() && has_mtp_;
+    bonsai_chunk_ = rotation.enabled && !rotation.t3;
+    if (bonsai_chunk_ != bonsai2_t2_pack(model_))
+        throw std::runtime_error("q27 Metal: Bonsai 2 chunk-path detection disagrees with the rotation contract");
+    const bool chunk_capable = backend_.supports_quantized_matmul() && (has_mtp_ || bonsai_chunk_);
     const uint64_t partial_bytes =
         gqa_partial_peak(max_context_, backend_.gqa_block_size(), chunk_capable);
     // Production KV fp16 exception cells
@@ -590,10 +602,12 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
 
     // Layer-major chunked prefill routes every projection through
     // activation-quantized simdgroup GEMM. Official Q4/Q8 models use that
-    // contract; Bonsai T2/B1/mixed serial projection deliberately keeps
-    // float activations, so it must remain serial until an equivalent
-    // batched float-activation path exists.
+    // contract. Bonsai 2 T2 packs use the float-activation equivalent
+    // (rotate rows, float T2 GEMM), matching the serial projection; legacy
+    // Bonsai T2/B1/mixed and Bonsai 2 T3 packs stay serial.
     chunked_prefill_ = chunk_capable;
+    if (chunked_prefill_ && bonsai_chunk_)
+        crot_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_FFN);
     if (chunked_prefill_) {
         ch_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
         cx1_ = alloc_f32((uint64_t)PREFILL_CHUNK_MAX * N_EMBD);
@@ -644,8 +658,8 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
 }
 
 void MetalEngine::set_chunked_prefill(bool enabled) {
-    if (enabled && !has_mtp_)
-        throw std::runtime_error("q27 Metal: Bonsai models require serial float-activation prefill");
+    if (enabled && !has_mtp_ && !bonsai_chunk_)
+        throw std::runtime_error("q27 Metal: this Bonsai pack requires serial float-activation prefill");
     if (enabled && !ch_)
         throw std::runtime_error("q27 Metal: chunked prefill requires quantized matmul support");
     chunked_prefill_ = enabled;
@@ -825,6 +839,8 @@ uint64_t MetalEngine::fixed_state_bytes(bool chunked,bool has_mtp) {
     // every no-MTP model (legacy Bonsai simply leaves this small reserve unused).
     if (!has_mtp) bytes += (uint64_t(N_EMBD) + GDN_V + 2ull * N_FFN) * 4;
     if (!chunked) return bytes;
+    // No-MTP chunked engines are Bonsai 2 T2 packs: rotated-row scratch.
+    if (!has_mtp) bytes += (uint64_t)PREFILL_CHUNK_MAX * N_FFN * 4;
     // Chunked-prefill f32 rows (ch/cx1/cy, cqg, ckbuf/cvbuf, cattn_out,
     // cqkv, cz, alpha/beta_raw/g/beta, cconv_out, cdelta_out, cgated_out,
     // ffn gate+up).
@@ -1715,10 +1731,41 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_f
     }
 }
 
+const BackendBuffer& MetalEngine::rotate_rows(const BackendBuffer& x, uint32_t width,
+                                              bool grouped, uint32_t count) {
+    backend_.bonsai_hadamard(x, *rotation_signs_.at(width), *crot_, width, false, grouped, count);
+    crot_width_ = width;
+    crot_grouped_ = grouped;
+    return *crot_;
+}
+
+// One chunk projection. Bonsai 2: `rotated` holds the input rows already in
+// the weight's rotated basis (rotate_rows); the binding check keeps a
+// width/grouping mismatch from silently producing plausible wrong output.
+void MetalEngine::chunk_matmul(const BackendTensor& w, const BackendQuantized& xq,
+                               const BackendBuffer* rotated, uint32_t count, BackendBuffer& out) {
+    if (!rotated) { backend_.matmul_quantized(w, xq, count, out); return; }
+    const auto binding = rotated_weights_.find(&w);
+    if (binding == rotated_weights_.end() || w.cols != crot_width_ ||
+        binding->second.grouped_gdn != crot_grouped_)
+        throw std::runtime_error("q27 Metal: Bonsai chunk projection without matching rotation");
+    backend_.matmul_t2_float(w, *rotated, count, out);
+}
+
+// Chunk-row LM head (verify/oracle/teacher-force/suffix paths). Bonsai 2's
+// head is a rotated T2 matrix; these int8 paths have no rotation and are not
+// validated for it, so they fail loudly instead of returning wrong logits.
+void MetalEngine::chunk_head(const BackendQuantized& x5, uint32_t count) {
+    if (bonsai_chunk_)
+        throw std::runtime_error("q27 Metal: chunked LM-head paths are not supported for Bonsai 2");
+    backend_.matmul_quantized(weight("output.weight"), x5, count, *clogits_);
+}
+
 void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count, bool verify) {
     BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
-    backend_.matmul_quantized(layer_weight(layer, "attn_qkv.weight"), x5, count, *cqkv_);
-    backend_.matmul_quantized(layer_weight(layer, "attn_gate.weight"), x5, count, *cz_);
+    const BackendBuffer* r5 = bonsai_chunk_ ? &rotate_rows(*cx1_, N_EMBD, false, count) : nullptr;
+    chunk_matmul(layer_weight(layer, "attn_qkv.weight"), x5, r5, count, *cqkv_);
+    chunk_matmul(layer_weight(layer, "attn_gate.weight"), x5, r5, count, *cz_);
     // Official tier: fused F16 pair-rows kernel. Bonsai tiers: alpha/beta
     // are T2/B1 matrices; their chunk GEMMs write the same [token][row] layout.
     const BackendTensor& alpha_w = layer_weight(layer, "ssm_alpha.weight");
@@ -1753,17 +1800,23 @@ void MetalEngine::gdn_chunk(uint32_t layer, uint32_t count, bool verify) {
     backend_.gated_norm_gdn(*cdelta_out_, layer_weight(layer, "ssm_norm.weight"), *cz_,
                             *cgated_out_, count * GDN_HEADS, GDN_DIM, EPS);
     BackendQuantized x6 = quantized_view(cq6144_, count * GDN_V);
+    if (bonsai_chunk_) {
+        chunk_matmul(layer_weight(layer, "ssm_out.weight"), x6,
+                     &rotate_rows(*cgated_out_, GDN_V, true, count), count, *cy_);
+        return;
+    }
     backend_.quantize(*cgated_out_, x6);
     backend_.matmul_quantized(layer_weight(layer, "ssm_out.weight"), x6, count, *cy_);
 }
 
 void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
     BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
-    backend_.matmul_quantized(layer_weight(layer, "attn_q.weight"), x5, count, *cqg_);
+    const BackendBuffer* r5 = bonsai_chunk_ ? &rotate_rows(*cx1_, N_EMBD, false, count) : nullptr;
+    chunk_matmul(layer_weight(layer, "attn_q.weight"), x5, r5, count, *cqg_);
     backend_.rmsnorm_heads(*cqg_, layer_weight(layer, "attn_q_norm.weight"),
                            count * N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS);
-    backend_.matmul_quantized(layer_weight(layer, "attn_k.weight"), x5, count, *ckbuf_);
-    backend_.matmul_quantized(layer_weight(layer, "attn_v.weight"), x5, count, *cvbuf_);
+    chunk_matmul(layer_weight(layer, "attn_k.weight"), x5, r5, count, *ckbuf_);
+    chunk_matmul(layer_weight(layer, "attn_v.weight"), x5, r5, count, *cvbuf_);
     backend_.rmsnorm_heads(*ckbuf_, layer_weight(layer, "attn_k_norm.weight"),
                            count * N_KV, HEAD_DIM, HEAD_DIM, EPS);
     backend_.rope_neox_rows(*cqg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM,
@@ -1817,16 +1870,27 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
     }
     backend_.sigmoid_gate_mul_rows(*cattn_out_, *cqg_, N_HEAD, HEAD_DIM, count);
     BackendQuantized x6 = quantized_view(cq6144_, count * N_HEAD * HEAD_DIM);
+    if (bonsai_chunk_) {
+        chunk_matmul(layer_weight(layer, "attn_output.weight"), x6,
+                     &rotate_rows(*cattn_out_, N_HEAD * HEAD_DIM, false, count), count, *cy_);
+        return;
+    }
     backend_.quantize(*cattn_out_, x6);
     backend_.matmul_quantized(layer_weight(layer, "attn_output.weight"), x6, count, *cy_);
 }
 
 void MetalEngine::ffn_chunk(uint32_t layer, uint32_t count) {
     BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
-    backend_.matmul_quantized(layer_weight(layer, "ffn_gate.weight"), x5, count, *cffn_gate_);
-    backend_.matmul_quantized(layer_weight(layer, "ffn_up.weight"), x5, count, *cffn_up_);
+    const BackendBuffer* r5 = bonsai_chunk_ ? &rotate_rows(*cx1_, N_EMBD, false, count) : nullptr;
+    chunk_matmul(layer_weight(layer, "ffn_gate.weight"), x5, r5, count, *cffn_gate_);
+    chunk_matmul(layer_weight(layer, "ffn_up.weight"), x5, r5, count, *cffn_up_);
     backend_.silu_mul(*cffn_gate_, *cffn_up_, *cffn_gate_, count * N_FFN);
     BackendQuantized x17 = quantized_view(cq17408_, count * N_FFN);
+    if (bonsai_chunk_) {
+        chunk_matmul(layer_weight(layer, "ffn_down.weight"), x17,
+                     &rotate_rows(*cffn_gate_, N_FFN, false, count), count, *cy_);
+        return;
+    }
     backend_.quantize(*cffn_gate_, x17);
     backend_.matmul_quantized(layer_weight(layer, "ffn_down.weight"), x17, count, *cy_);
 }
@@ -1842,6 +1906,11 @@ void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count, bool ver
     for (uint32_t i = 0; i < count; i++)
         if (tokens[i] >= VOCAB) throw std::runtime_error("q27 Metal: token out of range");
     backend_.embedding_q8_rows(weight("token_embd.weight"), tokens, count, *ch_);
+    if (bonsai_chunk_) {
+        // Embedding rows are stored rotated: inverse transform, as serial.
+        backend_.bonsai_hadamard(*ch_, *rotation_signs_.at(N_EMBD), *crot_, N_EMBD, true, false, count);
+        backend_.copy(*crot_, 0, *ch_, 0, uint64_t(count) * N_EMBD * 4);
+    }
     BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         backend_.rmsnorm_rows_quantized(*ch_, layer_weight(layer, "attn_norm.weight"),
@@ -2192,7 +2261,7 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
         BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
         backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                         N_EMBD, live, EPS, x5);
-        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        chunk_head(x5, live);
         backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
         batch.finish();
     }
@@ -2300,7 +2369,7 @@ uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uin
         BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
         backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                         N_EMBD, live, EPS, x5);
-        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        chunk_head(x5, live);
         // No argmax_rows — acceptance is rejection sampling on the served dist.
         batch.finish();
     }
@@ -2426,7 +2495,7 @@ void MetalEngine::oracle_round(const uint32_t* lanes, uint32_t live, bool last,
         BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
         backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                         N_EMBD, live, EPS, x5);
-        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        chunk_head(x5, live);
         backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
         batch.finish();
     }
@@ -2507,7 +2576,7 @@ uint32_t MetalEngine::stream_mtp_batched(uint32_t pending, uint32_t count, uint3
             BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
             backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                             N_EMBD, live, EPS, x5);
-            backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+            chunk_head(x5, live);
             backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
             batch.finish();
         }
@@ -2619,7 +2688,7 @@ std::vector<float> MetalEngine::teacher_force_nll(const std::vector<uint32_t>& t
                 BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
                 backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                                 N_EMBD, count, EPS, x5);
-                backend_.matmul_quantized(weight("output.weight"), x5, count, *clogits_);
+                chunk_head(x5, count);
                 backend_.nll_rows(*clogits_, *ctargets_, *cnll_, VOCAB, count);
                 batch.finish();
             }
@@ -2697,7 +2766,7 @@ void MetalEngine::teacher_force_logits(const uint32_t* tokens, uint32_t count,
             BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
             backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                             N_EMBD, count, EPS, x5);
-            backend_.matmul_quantized(weight("output.weight"), x5, count, *clogits_);
+            chunk_head(x5, count);
             // Commit recurrent/KV state and both serial coherence buffers as
             // one unit. A command failure poisons the backend in finish().
             backend_.copy(*clogits_, (uint64_t)(count - 1) * VOCAB * sizeof(float),
@@ -2763,7 +2832,7 @@ void MetalEngine::teacher_force_logits_wide(const uint32_t* tokens, uint32_t cou
                 BackendQuantized x5 = quantized_view(cq5120_, slice * N_EMBD);
                 backend_.rmsnorm_rows_quantized(*wide_head_stage_, weight("output_norm.weight"),
                                                 *cfinal_, N_EMBD, slice, EPS, x5);
-                backend_.matmul_quantized(weight("output.weight"), x5, slice, *clogits_);
+                chunk_head(x5, slice);
                 if (final_slice) {
                     const uint32_t last_row = slice - 1;
                     backend_.copy(*clogits_, (uint64_t)last_row * VOCAB * sizeof(float),
@@ -3095,7 +3164,7 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
         BackendQuantized x5 = quantized_view(cq5120_, live * N_EMBD);
         backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                         N_EMBD, live, EPS, x5);
-        backend_.matmul_quantized(weight("output.weight"), x5, live, *clogits_);
+        chunk_head(x5, live);
         backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
         batch.finish();
     }

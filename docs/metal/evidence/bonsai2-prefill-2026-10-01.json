@@ -1,0 +1,73 @@
+{
+ "date": "2026-10-01",
+ "device": "Apple M4 / 16 GiB (mini)",
+ "pack": "bonsai2-27b-t2-slim.q27 (b85094a0...)",
+ "path": "chunk_forward with Bonsai 2 branch: row-batched bonsai_hadamard + q27_matmul_t2_mm_f (float activations), 96-token chunks, final token serial",
+ "speed_tok_s": {
+  "chunked": {
+   "512": 40.9,
+   "2048": 36.4,
+   "4096": 34.2,
+   "13000": 26.7
+  },
+  "serial": {
+   "512": 12.3,
+   "1381": 12.2
+  },
+  "chunked_1381": 39.6,
+  "method": "q27-metal --tokens/--prompt -n 1, ctx 16384 (4096 for 1381), elapsed includes one decoded token; single runs"
+ },
+ "profile_1381": {
+  "q27_matmul_t2_mm_f": "83.4%",
+  "q27_attention_f16_causal": "6.8%",
+  "q27_bonsai_wht": "2.1%",
+  "q27_delta_chunk": "1.9%",
+  "other": "5.8%"
+ },
+ "equivalence": "1381-token README prompt: chunked and serial greedy 40 tokens identical",
+ "reference_parity_chunked": {
+  "gate_inputs_every_position": {
+   "prose": {
+    "passed": true,
+    "positions": 102,
+    "max_relative_rmse": 0.0001626964690567896,
+    "mean_kl": 6.607478518865174e-09,
+    "max_kl": 1.3575829351001447e-07,
+    "argmax_matches": 102
+   },
+   "code": {
+    "passed": true,
+    "positions": 128,
+    "max_relative_rmse": 0.0009587944240737308,
+    "mean_kl": 2.7585949387214796e-10,
+    "max_kl": 4.108426585423152e-09,
+    "argmax_matches": 128
+   },
+   "tools_unicode": {
+    "passed": true,
+    "positions": 110,
+    "max_relative_rmse": 5.0745980306295744e-05,
+    "mean_kl": 9.022696632961438e-10,
+    "max_kl": 1.4054720674433539e-08,
+    "argmax_matches": 109
+   }
+  },
+  "long_4064_cuts_every_256": {
+   "passed": true,
+   "positions": 15,
+   "max_relative_rmse": 0.0009940242660521716,
+   "mean_kl": 8.675276704752426e-09,
+   "max_kl": 4.4173906210033485e-08,
+   "argmax_matches": 15
+  }
+ },
+ "gates": [
+  "test_bonsai_hadamard: batched rows bitwise == single-row; float T2 GEMM vs double CPU reference, widths 128..17408, 1..96 tokens, red zones, rejections",
+  "make test-tools test-inspect test-agent",
+  "make test-metal-backend",
+  "test_bonsai2_serving.py PASS (after aligning the serving reservation estimate)",
+  "test_bonsai2_native.py PASS",
+  "./q27 agent smoke"
+ ],
+ "not_rerun": "q4s HTTP snapshot-recovery suite"
+}
