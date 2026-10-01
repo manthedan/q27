@@ -116,6 +116,10 @@ python3 tools/test_bonsai2_serving.py build/q27-metal-server \
   models/bonsai2/bonsai2-27b-t2-slim.q27 models/bonsai2/bonsai2.tok
 python3 tools/test_bonsai2_native.py build/q27-agent \
   models/bonsai2/bonsai2-27b-t2-slim.q27 models/bonsai2/bonsai2.tok
+make test-metal-recovery MODEL=models/bonsai2/bonsai2-27b-t2-slim.q27 \
+  TOKENIZER=models/bonsai2/bonsai2.tok
+python3 tools/test_bonsai2_snapshot_reuse.py build/q27-metal-server \
+  models/bonsai2/bonsai2-27b-t2-slim.q27 models/bonsai2/bonsai2.tok
 ```
 
 For the independent oracle, build Prism's `prism` branch at
@@ -167,9 +171,8 @@ short-context correctness, not a long-context or task-benchmark claim.
   packs use the float-activation chunk path (see "Batched prefill").
 - **MTP**: the checkpoint has no MTP layer; requesting it fails.
 - **Vision**: this port is text-only; no vision tower/mmproj is loaded.
-- **HTTP snapshot recovery**: with chunked prefill, snapshot hints now engage
-  for T2 packs, but the q4s snapshot-recovery suite has not been rerun on
-  Bonsai 2; do not substitute the endpoint smoke for a full recovery gate.
+- **Prefix snapshots on T3/legacy Bonsai packs**: they need chunked prefill,
+  so only T2 packs get them (see "Prefix snapshots").
 - **Homebrew/prebuilt release** and cold start/persistence soak: still pending.
   The serving/native gates run at context 2048.
 
@@ -214,6 +217,19 @@ three gate inputs gives the same 339/340 argmax as serial (same near-tie), and
 chunk-prefilling to 15 cut points across the 4K input gives 15/15 with KL
 ~1e-8. The float GEMM is 83% of prefill time at ~2.1 TFLOPS (about half the M4
 GPU's fp32 rate); attention grows with depth.
+
+## Prefix snapshots
+
+Chunked prefill also enables the server's prefix snapshots for T2 packs
+(`serve --snapshot-dir DIR`, request `"snapshot": true`, or automatic above a
+prompt-length threshold). The unchanged Metal recovery suite
+(`make test-metal-recovery`) passes on Bonsai 2: cross-client snapshot reuse,
+slot reconstruction after an injected Metal failure, and post-publication
+failure isolation. `tools/test_bonsai2_snapshot_reuse.py` checks that reuse
+does not change output: on a 3.3K-token system prompt, greedy text is identical
+fresh, from an in-process snapshot, and from a disk snapshot after restart,
+while time to answer drops from 95 s to 5.2 s (in process) and 8.9 s (after
+restart).
 
 **Experiment, not default:** `Q27_METAL_T2F_HALF=1` stages activations as
 half (`q27_matmul_t2_mm_fh`). Prefill rises to 51 tok/s at 512 tokens and ~45

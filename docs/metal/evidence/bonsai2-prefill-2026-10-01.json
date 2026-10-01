@@ -128,5 +128,19 @@
   },
   "lut_unpack_float_kernel": "bit-identical, no speedup (41.1 vs 40.9 tok/s at 512); not adopted",
   "risk": "no overflow guard for activations above 65504"
+ },
+ "prefix_snapshots": {
+  "recovery_suite": "make test-metal-recovery on bonsai2-27b-t2-slim: PASS (shared snapshot reuse q27_prefix_hit>0, slot reconstruction after injected failure, post-publication failpoint consumed)",
+  "equivalence": {
+   "tool": "tools/test_bonsai2_snapshot_reuse.py",
+   "prompt": "~3.3K tokens (README head as system prompt), 48 greedy tokens, ctx 4096",
+   "fresh_s": 94.7,
+   "first_with_save_s": 99.0,
+   "same_process_hit_tokens": 3273,
+   "same_process_s": 5.2,
+   "restart_disk_hit_tokens": 3168,
+   "restart_s": 8.9,
+   "identical_text": true
+  }
  }
 }
