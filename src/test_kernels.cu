@@ -58,6 +58,19 @@ static float cpu_deq(const q27::Tensor& t, int64_t r, int64_t c) {
         __half s = ((const __half*)t.scales)[r * (t.cols() / 128) + c / 128];
         return (float)v * __half2float(s);
     }
+    if (t.dtype == DType::T2_G128) { // FORMAT.md sequential order (host bytes)
+        uint8_t b = t.data[r * (t.cols() / 4) + c / 4];
+        int code = (b >> ((c & 3) * 2)) & 3;
+        __half s = ((const __half*)t.scales)[r * (t.cols() / 128) + c / 128];
+        return (float)(code - 1) * __half2float(s);
+    }
+    if (t.dtype == DType::T3_G128) { // FORMAT.md: 26 bytes per 128, base-3, c0 least significant
+        const int64_t g = c / 128, j = c % 128;
+        int v = t.data[r * (t.cols() / 128) * 26 + g * 26 + j / 5];
+        for (int d = 0; d < j % 5; d++) v /= 3;
+        __half s = ((const __half*)t.scales)[r * (t.cols() / 128) + g];
+        return (float)(v % 3 - 1) * __half2float(s);
+    }
     if (t.dtype == DType::F16) return __half2float(((const __half*)t.data)[r * t.cols() + c]);
     return ((const float*)t.data)[r * t.cols() + c];
 }
@@ -72,6 +85,10 @@ static std::vector<float> rand_vec(int64_t n, uint32_t seed) {
 
 static void test_dequant(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
     const q27::Tensor& t = m.get(name);
+    if (t.dtype != DType::Q4_G64 && t.dtype != DType::Q8_G128) {
+        printf("  %s %s: dtype %s not covered by this test, skip\n", "test_dequant", name, q27::dtype_name(t.dtype));
+        return;
+    }
     const q27::DevTensor& d = dm.upload(name);
     int64_t rows = std::min<int64_t>(t.rows(), 32), cols = t.cols();
 
@@ -114,6 +131,12 @@ static void test_gemv(q27::DeviceModel& dm, const q27::Model& m, const char* nam
             break;
         case DType::Q8_G128:
             q27k::gemv_q8((const int8_t*)d.data, (const __half*)d.scales, xq, d_y, rows, cols);
+            break;
+        case DType::T2_G128: // device copy is interleaved by upload(); reference reads host order
+            q27k::gemv_t2((const uint8_t*)d.data, (const __half*)d.scales, xq, d_y, rows, cols);
+            break;
+        case DType::T3_G128: // device copy is the window layout (upload relayout); reference reads host order
+            q27k::gemv_t3((const uint8_t*)d.data, (const __half*)d.scales, xq, d_y, rows, cols);
             break;
         case DType::F16:
             q27k::gemv_f16((const __half*)d.data, d_x, d_y, rows, cols);
@@ -199,14 +222,18 @@ static void test_embed(q27::DeviceModel& dm, const q27::Model& m) {
     CUDA_CHECK(cudaMalloc(&d_out, cols * 4));
     CUDA_CHECK(cudaMalloc(&d_tok, 4));
     CUDA_CHECK(cudaMemcpy(d_tok, &row_i, 4, cudaMemcpyHostToDevice));
-    q27k::embed_row_q8((const int8_t*)d.data, (const __half*)d.scales, d_tok, cols, d_out);
+    // Qwen tiers carry a Q8 table, Bonsai slim packs a T2 one (own row kernel)
+    if (t.dtype == DType::T2_G128)
+        q27k::embed_row_t2((const uint8_t*)d.data, (const __half*)d.scales, d_tok, cols, d_out);
+    else
+        q27k::embed_row_q8((const int8_t*)d.data, (const __half*)d.scales, d_tok, cols, d_out);
     std::vector<float> got(cols);
     CUDA_CHECK(cudaMemcpy(got.data(), d_out, cols * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(d_out));
     double maxd = 0;
     for (int64_t c = 0; c < cols; c++)
         maxd = std::max(maxd, (double)std::fabs(got[c] - cpu_deq(t, row, c)));
-    check("embed_row_q8(token 1234)", maxd, 1e-6);
+    check(t.dtype == DType::T2_G128 ? "embed_row_t2(token 1234)" : "embed_row_q8(token 1234)", maxd, 1e-6);
 }
 
 static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
@@ -238,11 +265,35 @@ static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const cha
             for (int64_t r = 0; r < rows; r++)
                 maxd = std::max(maxd, (double)std::fabs(yb[r] - y1[r]));
         }
-    } else {
+    } else if (t.dtype == DType::Q8_G128) {
         float* const ysb[3] = {d_yb, d_yb + rows, d_yb + 2 * rows};
         q27k::gemv_q8_n((const int8_t*)d.data, (const __half*)d.scales, xqs, NB, ysb, rows, cols);
         for (int n = 0; n < NB; n++) {
             q27k::gemv_q8((const int8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
+            std::vector<float> yb(rows), y1(rows);
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_yb + (size_t)n * rows, rows * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(y1.data(), d_y1, rows * 4, cudaMemcpyDeviceToHost));
+            for (int64_t r = 0; r < rows; r++)
+                maxd = std::max(maxd, (double)std::fabs(yb[r] - y1[r]));
+        }
+    }
+    if (t.dtype == DType::T3_G128) {
+        float* const ysb[3] = {d_yb, d_yb + rows, d_yb + 2 * rows};
+        q27k::gemv_t3_n((const uint8_t*)d.data, (const __half*)d.scales, xqs, NB, ysb, rows, cols);
+        for (int n = 0; n < NB; n++) {
+            q27k::gemv_t3((const uint8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
+            std::vector<float> yb(rows), y1(rows);
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_yb + (size_t)n * rows, rows * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(y1.data(), d_y1, rows * 4, cudaMemcpyDeviceToHost));
+            for (int64_t r = 0; r < rows; r++)
+                maxd = std::max(maxd, (double)std::fabs(yb[r] - y1[r]));
+        }
+    }
+    if (t.dtype == DType::T2_G128) {
+        float* const ysb[3] = {d_yb, d_yb + rows, d_yb + 2 * rows};
+        q27k::gemv_t2_n((const uint8_t*)d.data, (const __half*)d.scales, xqs, NB, ysb, rows, cols);
+        for (int n = 0; n < NB; n++) {
+            q27k::gemv_t2((const uint8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
             std::vector<float> yb(rows), y1(rows);
             CUDA_CHECK(cudaMemcpy(yb.data(), d_yb + (size_t)n * rows, rows * 4, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(y1.data(), d_y1, rows * 4, cudaMemcpyDeviceToHost));
@@ -261,6 +312,10 @@ static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const cha
 // shows as O(1)+ relative error -- clean separation from the 1e-6 noise floor.
 static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
     const q27::Tensor& t = m.get(name);
+    if (t.dtype != DType::Q4_G64 && t.dtype != DType::Q8_G128) {
+        printf("  %s %s: dtype %s not covered by this test, skip\n", "test_gemm_mma", name, q27::dtype_name(t.dtype));
+        return;
+    }
     const q27::DevTensor& d = dm.upload(name);
     int64_t rows = t.rows(), cols = t.cols();
     const int T = 33;
@@ -308,6 +363,64 @@ static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char*
     CUDA_CHECK(cudaFree(d_yb));
 }
 
+// Bonsai 2 Phase 3: the T2 prefill GEMM against the exact-Q4 image of the
+// same ternary matrix ("<name>.q4x", repack --bonsai2-container t2+q4x). Both
+// stagings hand the MMA identical s8 values (code-1 == nibble-8) and identical
+// per-group scale floats (the Q4 image duplicates the 128-scale into both
+// 64-groups), so every output must be BITWISE equal on the exact g32 leg and
+// the g64 serving leg alike; T=300 also reaches the ntx minitile kernel on
+// sm_120. An indexing slip in the 2-bit unpack shows as O(1) here.
+static void test_gemm_t2_shadow(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
+    const std::string sname = std::string(name) + ".q4x";
+    const q27::Tensor* base = m.find(name);
+    if (!base || base->dtype != DType::T2_G128 || !m.find(sname)) {
+        printf("  %s %s: needs a T2_G128 base with a .q4x shadow, skip\n", "test_gemm_t2_shadow",
+               name);
+        return;
+    }
+    const q27::DevTensor& d = dm.upload(name);
+    const q27::DevTensor& q = dm.upload(sname);
+    const int64_t rows = base->rows(), cols = base->cols();
+    for (int T : {33, 300}) {
+        std::vector<float> x = rand_vec((size_t)T * cols, 21 + T);
+        float *d_x, *d_ya, *d_yb;
+        CUDA_CHECK(cudaMalloc(&d_x, (size_t)T * cols * 4));
+        CUDA_CHECK(cudaMalloc(&d_ya, (size_t)T * rows * 4));
+        CUDA_CHECK(cudaMalloc(&d_yb, (size_t)T * rows * 4));
+        CUDA_CHECK(cudaMemcpy(d_x, x.data(), (size_t)T * cols * 4, cudaMemcpyHostToDevice));
+        const int Tpad = (T + 31) & ~31;
+        q27k::XQuant xq = q27k::xquant_alloc((size_t)Tpad * cols, /*g64=*/true);
+        q27k::quantize_x(d_x, (size_t)T * cols, xq);
+        q27k::quantize_x_g64(d_x, (size_t)T * cols, xq);
+        for (const char* xg : {"32", "64"}) {
+            setenv("Q27_PREFILL", "mma", 1);
+            setenv("Q27_PF_XG", xg, 1);
+            q27k::gemm_t2_T((const uint8_t*)d.data, (const __half*)d.scales, xq, d_ya, rows,
+                            cols, T, 0);
+            q27k::gemm_q4_T((const uint8_t*)q.data, (const __half*)q.scales, xq, d_yb, rows,
+                            cols, T, 0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unsetenv("Q27_PREFILL");
+            unsetenv("Q27_PF_XG");
+            std::vector<float> ya((size_t)T * rows), yb((size_t)T * rows);
+            CUDA_CHECK(cudaMemcpy(ya.data(), d_ya, ya.size() * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_yb, yb.size() * 4, cudaMemcpyDeviceToHost));
+            double maxabs = 0;
+            size_t ndiff = 0;
+            for (size_t i = 0; i < ya.size(); i++) {
+                if (ya[i] != yb[i]) ndiff++;
+                maxabs = std::max(maxabs, (double)std::fabs(ya[i] - yb[i]));
+            }
+            char label[128];
+            snprintf(label, sizeof label, "gemm T2 vs Q4 shadow g%s T=%d %s", xg, T, name);
+            check(label, maxabs + (double)ndiff, 1e-30); // bitwise: zero differing outputs
+        }
+        CUDA_CHECK(cudaFree(d_x));
+        CUDA_CHECK(cudaFree(d_ya));
+        CUDA_CHECK(cudaFree(d_yb));
+    }
+}
+
 // Regroup gate: MMA g64 path vs the dp4a exact path fed the SAME g64
 // quantization expanded to g32 form (nat = nat64, both 32-halves of each
 // 64-group share its s64 scale, isum/eo rebuilt from nat64). Integer dots
@@ -318,6 +431,10 @@ static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char*
 // (policy sign-off 2026-07-04).
 static void test_gemm_mma_g64(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
     const q27::Tensor& t = m.get(name);
+    if (t.dtype != DType::Q4_G64 && t.dtype != DType::Q8_G128) {
+        printf("  %s %s: dtype %s not covered by this test, skip\n", "test_gemm_mma_g64", name, q27::dtype_name(t.dtype));
+        return;
+    }
     const q27::DevTensor& d = dm.upload(name);
     int64_t rows = t.rows(), cols = t.cols();
     const int T = 33;
@@ -529,12 +646,24 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
     const q27::Tensor& ht = m.get("output.weight");
     const bool head_q4 = ht.dtype == q27::DType::Q4_G64;
     auto head_gemv = [&](q27k::XQuant* q, int nb, float** y) {
-        if (head_q4)
-            q27k::gemv_q4_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
-                            ht.rows(), cols, 0);
-        else
-            q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
-                            ht.rows(), cols, 0);
+        switch (ht.dtype) { // slim Bonsai packs carry a T2 (or T3) head
+            case q27::DType::Q4_G64:
+                q27k::gemv_q4_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                                ht.rows(), cols, 0);
+                break;
+            case q27::DType::T2_G128:
+                q27k::gemv_t2_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                                ht.rows(), cols, 0);
+                break;
+            case q27::DType::T3_G128:
+                q27k::gemv_t3_n((const uint8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                                ht.rows(), cols, 0);
+                break;
+            default:
+                q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, q, nb, y,
+                                ht.rows(), cols, 0);
+                break;
+        }
     };
     double h5 = timeit([&] {
         head_gemv(qs, 5, ys);
@@ -543,27 +672,47 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
     double h10 = timeit([&] { head_gemv(qs, 10, ys); });
     printf("  gemv10 head %s: 2x5=%.3fms 1x10=%.3fms ratio(10 vs 2x5)=%.2f\n",
            head_q4 ? "Q4" : "Q8", h5, h10, h10 / h5);
-    // (b) Q4 ffn_gate rotating 4 layers
+    // (b) ffn_gate rotating 4 layers -- dtype-dispatched like the head: the
+    // Qwen tiers carry Q4 here, Bonsai 2 packs T2_G128 (an unconditional
+    // gemv_q4_n read the 2-bit rows as nibbles and ran off the allocation:
+    // illegal address on the 09-18 t2 pack).
     const char* names[4] = {"blk.0.ffn_gate.weight", "blk.1.ffn_gate.weight",
                             "blk.2.ffn_gate.weight", "blk.4.ffn_gate.weight"};
     const q27::DevTensor* fd[4];
     for (int i = 0; i < 4; i++) fd[i] = &dm.upload(names[i]);
     const q27::Tensor& ft = m.get(names[0]);
+    auto ffn_gemv = [&](const q27::DevTensor* t, q27k::XQuant* q, int nb, float** y) {
+        switch (t->dtype) {
+            case q27::DType::Q4_G64:
+                q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, q, nb, y,
+                                ft.rows(), cols, 0);
+                break;
+            case q27::DType::T2_G128:
+                q27k::gemv_t2_n((const uint8_t*)t->data, (const __half*)t->scales, q, nb, y,
+                                ft.rows(), cols, 0);
+                break;
+            case q27::DType::T3_G128:
+                q27k::gemv_t3_n((const uint8_t*)t->data, (const __half*)t->scales, q, nb, y,
+                                ft.rows(), cols, 0);
+                break;
+            default:
+                q27k::gemv_q8_n((const int8_t*)t->data, (const __half*)t->scales, q, nb, y,
+                                ft.rows(), cols, 0);
+                break;
+        }
+    };
     int rot5 = 0, rot10 = 0;
     double f5 = timeit([&] {
         const q27::DevTensor* t = fd[rot5++ & 3];
-        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs, 5, ys,
-                        ft.rows(), cols, 0);
-        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs + 5, 5, ys + 5,
-                        ft.rows(), cols, 0);
+        ffn_gemv(t, qs, 5, ys);
+        ffn_gemv(t, qs + 5, 5, ys + 5);
     });
     double f10 = timeit([&] {
         const q27::DevTensor* t = fd[rot10++ & 3];
-        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs, 10, ys,
-                        ft.rows(), cols, 0);
+        ffn_gemv(t, qs, 10, ys);
     });
-    printf("  gemv10 ffn Q4 (L2-rotated): 2x5=%.3fms 1x10=%.3fms ratio=%.2f\n", f5, f10,
-           f10 / f5);
+    printf("  gemv10 ffn %s (L2-rotated): 2x5=%.3fms 1x10=%.3fms ratio=%.2f\n",
+           q27::dtype_name(ft.dtype), f5, f10, f10 / f5);
     // correctness: lane 7 of a fresh 10-lane HEAD run == a plain 1-lane gemv
     // (must re-run the head here -- the ffn bench above overwrote ys[]).
     // Dtype-matched to the tier's head kernel.
@@ -572,6 +721,12 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
     CUDA_CHECK(cudaMemcpy(got.data(), ys[7], 128 * 4, cudaMemcpyDeviceToHost));
     if (head_q4)
         q27k::gemv_q4((const uint8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
+                      ht.rows(), cols, 0);
+    else if (ht.dtype == q27::DType::T2_G128)
+        q27k::gemv_t2((const uint8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
+                      ht.rows(), cols, 0);
+    else if (ht.dtype == q27::DType::T3_G128)
+        q27k::gemv_t3((const uint8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
                       ht.rows(), cols, 0);
     else
         q27k::gemv_q8((const int8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0],
@@ -3627,6 +3782,208 @@ static void test_rmsnorm3q() {
     CUDA_CHECK(cudaFree(d_w));
 }
 
+// Bonsai 2 activation rotation (kernels.cuh hadamard1024): natural-order
+// 1024-point WHT with a sign diagonal, fwd = (1/32) H (s*x), inv = s * ((1/32) H y).
+// The GPU butterfly writes each element once per stage from the same two
+// operands the CPU loop reads, so fwd is BITWISE CPU-equal (gate kept);
+// inv(fwd(x)) == x to fp32 rounding; the GDN tiled->grouped permutation is
+// checked against its index formula.
+static void cpu_wht1024(float* v) {
+    for (int h = 1; h < 1024; h <<= 1)
+        for (int idx = 0; idx < 512; idx++) {
+            const int j = ((idx / h) * 2 * h) + (idx % h);
+            const float a = v[j], b = v[j + h];
+            v[j] = a + b;
+            v[j + h] = a - b;
+        }
+}
+static void cpu_hadamard(float* x, const float* s, int width, bool inv) {
+    for (int b = 0; b < width / 1024; b++) {
+        float* xb = x + b * 1024;
+        const float* sb = s + b * 1024;
+        if (!inv) for (int j = 0; j < 1024; j++) xb[j] *= sb[j];
+        cpu_wht1024(xb);
+        for (int j = 0; j < 1024; j++) xb[j] = inv ? (xb[j] * 0.03125f) * sb[j] : xb[j] * 0.03125f;
+    }
+}
+static void test_hadamard1024() {
+    std::mt19937 rng(2718);
+    std::uniform_real_distribution<float> U(-2.f, 2.f);
+    for (int width : {5120, 6144, 17408}) {
+        const int T = 3;
+        std::vector<float> x((size_t)T * width), s(width), ref, back;
+        for (auto& v : x) v = U(rng);
+        for (auto& v : s) v = (rng() & 1) ? 1.f : -1.f;
+        ref = x;
+        for (int t = 0; t < T; t++) cpu_hadamard(&ref[(size_t)t * width], s.data(), width, false);
+        float *d_x, *d_s;
+        CUDA_CHECK(cudaMalloc((void**)&d_x, x.size() * 4));
+        CUDA_CHECK(cudaMalloc((void**)&d_s, s.size() * 4));
+        CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_s, s.data(), s.size() * 4, cudaMemcpyHostToDevice));
+        // rows form (prefill)
+        q27k::hadamard1024_rows(d_x, d_s, width, T, width, false);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> got(x.size());
+        CUDA_CHECK(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost));
+        long bad = 0;
+        for (size_t i = 0; i < got.size(); i++) if (memcmp(&got[i], &ref[i], 4)) bad++;
+        char nm[96];
+        snprintf(nm, sizeof nm, "hadamard1024 fwd rows w=%d vs CPU (bitwise)", width);
+        check(nm, (double)bad, 1);
+        // inverse restores x
+        q27k::hadamard1024_rows(d_x, d_s, width, T, width, true);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost));
+        double err = 0;
+        for (size_t i = 0; i < got.size(); i++) err = std::max(err, (double)std::fabs(got[i] - x[i]));
+        snprintf(nm, sizeof nm, "hadamard1024 inv(fwd(x)) == x w=%d", width);
+        check(nm, err, 1e-5);
+        // single-vector and lanes forms hit the same bits as the rows form
+        CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+        q27k::hadamard1024(d_x, d_s, width, false);
+        q27k::P3 lanes{{d_x + width, d_x + 2 * (size_t)width}};
+        q27k::hadamard1024_lanes(lanes, d_s, width, 2, false);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost));
+        bad = 0;
+        for (size_t i = 0; i < got.size(); i++) if (memcmp(&got[i], &ref[i], 4)) bad++;
+        snprintf(nm, sizeof nm, "hadamard1024 single+lanes w=%d vs CPU (bitwise)", width);
+        check(nm, (double)bad, 1);
+        CUDA_CHECK(cudaFree(d_x));
+        CUDA_CHECK(cudaFree(d_s));
+    }
+    // fused rotate+quantize == hadamard1024 on a copy, then quantize_x (bitwise
+    // nat/eo/scale/isum); with the GDN permutation; and the norm twin ==
+    // rmsnorm3 + hadamard lanes + quantize3.
+    {
+        std::mt19937 rng2(4242);
+        std::uniform_real_distribution<float> U2(-3.f, 3.f);
+        auto cmp_xq = [&](const q27k::XQuant& a, const q27k::XQuant& b, int width, const char* nm) {
+            const int nb = width / 32;
+            std::vector<int8_t> na(width), nb_(width);
+            std::vector<uint2> ea(width / 8), eb(width / 8);
+            std::vector<float> sa(nb), sb(nb);
+            std::vector<int> ia(nb), ib(nb);
+            CUDA_CHECK(cudaMemcpy(na.data(), a.nat, width, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(nb_.data(), b.nat, width, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ea.data(), a.eo, width, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(eb.data(), b.eo, width, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(sa.data(), a.scale, nb * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(sb.data(), b.scale, nb * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ia.data(), a.isum, nb * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ib.data(), b.isum, nb * 4, cudaMemcpyDeviceToHost));
+            long bad = (memcmp(na.data(), nb_.data(), width) != 0) + (memcmp(ea.data(), eb.data(), width) != 0) +
+                       (memcmp(sa.data(), sb.data(), nb * 4) != 0) + (memcmp(ia.data(), ib.data(), nb * 4) != 0);
+            check(nm, (double)bad, 1);
+        };
+        for (int width : {5120, 6144, 17408}) {
+            const bool perm = width == 6144;
+            std::vector<float> x(width), sg(width);
+            for (auto& v : x) v = U2(rng2);
+            for (auto& v : sg) v = (rng2() & 1) ? 1.f : -1.f;
+            float *d_x, *d_s, *d_tmp;
+            CUDA_CHECK(cudaMalloc((void**)&d_x, width * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_s, width * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_tmp, width * 4));
+            CUDA_CHECK(cudaMemcpy(d_x, x.data(), width * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_s, sg.data(), width * 4, cudaMemcpyHostToDevice));
+            q27k::XQuant qa = q27k::xquant_alloc(width), qb = q27k::xquant_alloc(width);
+            // reference: (perm) -> rotate copy -> quantize
+            if (perm) q27k::gdn_v_tiled_to_grouped(d_x, d_tmp, 128, 16, 3);
+            else CUDA_CHECK(cudaMemcpy(d_tmp, d_x, width * 4, cudaMemcpyDeviceToDevice));
+            q27k::hadamard1024(d_tmp, d_s, width, false);
+            q27k::quantize_x(d_tmp, width, qa);
+            q27k::rotq(d_x, d_s, width, qb, 0, perm, 128, 16, 3);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            char nm[96];
+            snprintf(nm, sizeof nm, "rotq w=%d%s == rotate+quantize (bitwise)", width, perm ? " perm" : "");
+            cmp_xq(qa, qb, width, nm);
+            // lanes form
+            q27k::CP3 in{{d_x, d_x}};
+            q27k::XQuant qc = q27k::xquant_alloc(width);
+            q27k::XQ3 q3{};
+            q3.q[0] = qc; q3.q[1] = qb;
+            q27k::rotq3(in, d_s, width, q3, 2, 0, perm, 128, 16, 3);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            snprintf(nm, sizeof nm, "rotq3 w=%d%s lane 0 == rotq (bitwise)", width, perm ? " perm" : "");
+            cmp_xq(qa, qc, width, nm);
+            CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_s)); CUDA_CHECK(cudaFree(d_tmp));
+        }
+        // norm twin at 5120, 2 lanes
+        {
+            const int n = 5120;
+            std::vector<float> x(2 * n), w(n), sg(n);
+            for (auto& v : x) v = U2(rng2);
+            for (auto& v : w) v = 0.5f + 0.01f * U2(rng2);
+            for (auto& v : sg) v = (rng2() & 1) ? 1.f : -1.f;
+            float *d_x, *d_w, *d_s, *d_y, *d_y2;
+            CUDA_CHECK(cudaMalloc((void**)&d_x, 2 * n * 4)); CUDA_CHECK(cudaMalloc((void**)&d_w, n * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_s, n * 4)); CUDA_CHECK(cudaMalloc((void**)&d_y, 2 * n * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_y2, 2 * n * 4));
+            CUDA_CHECK(cudaMemcpy(d_x, x.data(), 2 * n * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_w, w.data(), n * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_s, sg.data(), n * 4, cudaMemcpyHostToDevice));
+            q27k::CP3 in{{d_x, d_x + n}};
+            q27k::P3 y{{d_y, d_y + n}}, y2{{d_y2, d_y2 + n}};
+            q27k::XQuant qa0 = q27k::xquant_alloc(n), qa1 = q27k::xquant_alloc(n);
+            q27k::XQuant qb0 = q27k::xquant_alloc(n), qb1 = q27k::xquant_alloc(n);
+            // reference: rmsnorm3 -> copy lanes -> hadamard lanes -> quantize3
+            q27k::rmsnorm3(in, d_w, y, n, 1e-6f, 0, 2);
+            CUDA_CHECK(cudaMemcpy(d_y2, d_y, 2 * n * 4, cudaMemcpyDeviceToDevice));
+            q27k::hadamard1024_lanes(y2, d_s, n, 2, false, 0);
+            q27k::CP3 y2c{{d_y2, d_y2 + n}};
+            q27k::XQ3 qa{}; qa.q[0] = qa0; qa.q[1] = qa1;
+            q27k::quantize3(y2c, n, qa, 0, 2);
+            // fused
+            float* d_y3; CUDA_CHECK(cudaMalloc((void**)&d_y3, 2 * n * 4));
+            q27k::P3 y3{{d_y3, d_y3 + n}};
+            q27k::XQ3 qb{}; qb.q[0] = qb0; qb.q[1] = qb1;
+            q27k::rmsnorm3_rotq(in, d_w, y3, d_s, qb, n, 1e-6f, 0, 2);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<float> ya(2 * n), yb(2 * n);
+            CUDA_CHECK(cudaMemcpy(ya.data(), d_y, 2 * n * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_y3, 2 * n * 4, cudaMemcpyDeviceToHost));
+            check("rmsnorm3_rotq y == rmsnorm3 y (bitwise)", (double)(memcmp(ya.data(), yb.data(), 2 * n * 4) != 0), 1);
+            cmp_xq(qa0, qb0, n, "rmsnorm3_rotq lane 0 == norm+rotate+quantize (bitwise)");
+            cmp_xq(qa1, qb1, n, "rmsnorm3_rotq lane 1 == norm+rotate+quantize (bitwise)");
+        }
+    }
+    // GDN value-head permutation: out[k*rep*hd + r*hd + h] = in[r*nk*hd + k*hd + h]
+    {
+        const int hd = 128, nk = 16, rep = 3, n = hd * nk * rep, T = 2;
+        std::vector<float> in((size_t)T * n), ref((size_t)T * n), got((size_t)T * n);
+        for (size_t i = 0; i < in.size(); i++) in[i] = (float)i;
+        for (int t = 0; t < T; t++)
+            for (int k = 0; k < nk; k++)
+                for (int r = 0; r < rep; r++)
+                    for (int h = 0; h < hd; h++)
+                        ref[(size_t)t * n + k * rep * hd + r * hd + h] =
+                            in[(size_t)t * n + r * nk * hd + k * hd + h];
+        float *d_in, *d_out;
+        CUDA_CHECK(cudaMalloc((void**)&d_in, in.size() * 4));
+        CUDA_CHECK(cudaMalloc((void**)&d_out, in.size() * 4));
+        CUDA_CHECK(cudaMemcpy(d_in, in.data(), in.size() * 4, cudaMemcpyHostToDevice));
+        q27k::gdn_v_tiled_to_grouped_rows(d_in, d_out, hd, nk, rep, T, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(got.data(), d_out, got.size() * 4, cudaMemcpyDeviceToHost));
+        long bad = 0;
+        for (size_t i = 0; i < got.size(); i++) if (got[i] != ref[i]) bad++;
+        check("gdn_v_tiled_to_grouped rows vs index formula", (double)bad, 1);
+        q27k::CP3 li{{d_in, d_in + n}};
+        q27k::P3 lo{{d_out, d_out + n}};
+        CUDA_CHECK(cudaMemset(d_out, 0, in.size() * 4));
+        q27k::gdn_v_tiled_to_grouped_lanes(li, lo, hd, nk, rep, T);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(got.data(), d_out, got.size() * 4, cudaMemcpyDeviceToHost));
+        bad = 0;
+        for (size_t i = 0; i < got.size(); i++) if (got[i] != ref[i]) bad++;
+        check("gdn_v_tiled_to_grouped lanes vs index formula", (double)bad, 1);
+        CUDA_CHECK(cudaFree(d_in));
+        CUDA_CHECK(cudaFree(d_out));
+    }
+}
+
 int main(int argc, char** argv) {
     // The sampler kernels are synthetic (no weights). --sampling-only runs just
     // them, skipping the 17.7GB model load, so they can be validated while a
@@ -3665,6 +4022,8 @@ int main(int argc, char** argv) {
     test_gemm_mma_g64(dm, m, "blk.0.attn_qkv.weight");
     test_gemm_mma_g64(dm, m, "blk.0.ffn_down.weight");
     test_gemm_mma_g64(dm, m, "blk.3.attn_k.weight");
+    test_gemm_t2_shadow(dm, m, "blk.0.attn_qkv.weight"); // Bonsai 2 t2+q4x packs only
+    test_gemm_t2_shadow(dm, m, "blk.0.ffn_down.weight");
     test_gemm_mma_g64(dm, m, "output.weight");
     test_attn_mma();
     test_attn_split();
@@ -3694,6 +4053,7 @@ int main(int argc, char** argv) {
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);
+    test_hadamard1024();
     printf("resident: %.2f GB\n%s\n", dm.bytes_resident() / 1e9, g_fail ? "FAILED" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

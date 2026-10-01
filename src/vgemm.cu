@@ -24,7 +24,7 @@ static __device__ __forceinline__ void mma_s8(int& d0, int& d1, int& d2, int& d3
 // MODE 0: store straight to the per-lane outputs (z == 1 -- no workspace, no
 //         reduce node, deterministic by construction; this is the vocab head).
 // MODE 1: store this z-slice's partial; k_reduce_z sums them in index order.
-template <int MR, bool Q4IN, int MODE>
+template <int MR, int DT, int MODE>
 __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
                                                   const __half* __restrict__ S,
                                                   __grid_constant__ const XLanes X,
@@ -38,6 +38,7 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
     constexpr int KB = KG * KS;
     constexpr int LDW = KB + 16, LDX = KB + 16;
     constexpr int XSC = KS / 32;      // x-scales per row per stage (group-32 activations)
+    constexpr bool Q4IN = DT == 1, T2IN = DT == 2; // 0 = Q8, 1 = Q4, 2 = T2 (Bonsai 2)
     constexpr int NWS = Q4IN ? 2 : 1; // w-scales per row per stage (g64 vs g128)
     static_assert(KG >= 1 && KG * WM * 2 == 8, "warp split");
 
@@ -62,7 +63,7 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
 
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
 
-    constexpr int WBY = Q4IN ? (MR * KB / 2) : (MR * KB);
+    constexpr int WBY = Q4IN ? (MR * KB / 2) : T2IN ? (MR * KB / 4) : (MR * KB);
     constexpr int SLD = (MR * KG * NWS + 255) / 256;
     constexpr int XSL = (NT * KG * XSC + 255) / 256;
 
@@ -73,31 +74,42 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
     // 4-byte LDG buys a quarter of the in-flight bytes a 16-byte one does, and
     // this tile is bandwidth-bound with nothing else to hide the shortfall.
     // Measured against a same-grid pure-read floor (tools/vgemm_e6).
-    constexpr int WCPR = (Q4IN ? KB / 2 : KB) / 16; // 16B chunks per row (Q4 8, Q8 16)
+    // T2 stages 8-byte chunks (32 codes) so the pass geometry stays Q4's:
+    // half the bytes per request, same number of requests per row.
+    constexpr int WCB = T2IN ? 8 : 16;              // bytes per weight chunk
+    constexpr int WCPR = (Q4IN ? KB / 2 : T2IN ? KB / 4 : KB) / WCB; // chunks per row (Q4 8, Q8 16, T2 8)
     constexpr int WRPP = 256 / WCPR;                // rows covered per 256-thread pass
-    constexpr int WV = MR / WRPP;                   // passes = uint4 per thread (Q4 1, Q8 2)
+    constexpr int WV = MR / WRPP;                   // passes = chunks per thread (Q4 1, Q8 2, T2 1)
     constexpr int XCPR = KB / 16;                   // 16B chunks per lane row (16)
-    static_assert(WV * 256 * 16 == WBY, "W stage is not an exact uint4 per thread per pass");
+    static_assert(WV * 256 * WCB == WBY, "W stage is not an exact chunk per thread per pass");
     static_assert(256 / XCPR == NT && NT * KB == 256 * 16, "X stage is not one uint4 per thread");
 
     const int wrr = tid / WCPR, wch = tid % WCPR;
     const int xtt = tid / XCPR, xch = tid % XCPR;
-    const int64_t wrstride = Q4IN ? (cols / 2) : cols;
+    const int64_t wrstride = Q4IN ? (cols / 2) : T2IN ? (cols / 4) : cols;
 
     uint4 rw[WV], rx;
     float rws[SLD], rxs[XSL];
 
     auto load_stage = [&](int sst) {
         const int64_t k0 = (int64_t)sst * KS;
-        const int64_t wk0 = Q4IN ? (k0 / 2) : k0;
+        const int64_t wk0 = Q4IN ? (k0 / 2) : T2IN ? (k0 / 4) : k0;
 #pragma unroll
         for (int p = 0; p < WV; p++) {
             const int rr = wrr + p * WRPP;
-            // 0x88 = the q4 zero point pre-bias, so padded rows contribute 0.
-            rw[p] = (r0 + rr < rows)
-                        ? __ldg((const uint4*)(W + (r0 + rr) * wrstride + wk0 + wch * 16))
-                        : (Q4IN ? make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u)
-                                : make_uint4(0u, 0u, 0u, 0u));
+            // 0x88 = the q4 zero point pre-bias (0x55 = T2's code 1), so padded
+            // rows contribute 0.
+            if constexpr (T2IN) {
+                const uint2 v = (r0 + rr < rows)
+                                    ? __ldg((const uint2*)(W + (r0 + rr) * wrstride + wk0 + wch * 8))
+                                    : make_uint2(0x55555555u, 0x55555555u);
+                rw[p] = make_uint4(v.x, v.y, 0u, 0u);
+            } else {
+                rw[p] = (r0 + rr < rows)
+                            ? __ldg((const uint4*)(W + (r0 + rr) * wrstride + wk0 + wch * 16))
+                            : (Q4IN ? make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u)
+                                    : make_uint4(0u, 0u, 0u, 0u));
+            }
         }
         // dead lanes are never dereferenced: X.nat[tt >= T] may be null.
         rx = xtt < T ? __ldg((const uint4*)(X.nat[xtt] + k0 + xch * 16))
@@ -125,11 +137,31 @@ __global__ __launch_bounds__(256, 4) void k_vgemm(const uint8_t* __restrict__ W,
         a = __vsub4(__byte_perm(lo, hi, 0x5140), 0x08080808u);
         b = __vsub4(__byte_perm(lo, hi, 0x7362), 0x08080808u);
     };
+    // one interleaved T2 word (16 codes, kernels.cuh order) -> 16 sequential
+    // int8 with the "-1" bias folded in: field 4b+{0,1,2,3} = e[2b], e[2b+1],
+    // e[8+2b], e[9+2b], so the four masked extractions are the even/odd halves
+    // of each 8-element run and __byte_perm re-interleaves them in order.
+    auto unpack_t2 = [](uint32_t w, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3) {
+        const uint32_t M = 0x03030303u;
+        const uint32_t A = w & M, B = (w >> 2) & M, C = (w >> 4) & M, D = (w >> 6) & M;
+        o0 = __vsub4(__byte_perm(A, B, 0x5140), 0x01010101u); // e0..e3
+        o1 = __vsub4(__byte_perm(A, B, 0x7362), 0x01010101u); // e4..e7
+        o2 = __vsub4(__byte_perm(C, D, 0x5140), 0x01010101u); // e8..e11
+        o3 = __vsub4(__byte_perm(C, D, 0x7362), 0x01010101u); // e12..e15
+    };
     auto store_stage = [&]() {
 #pragma unroll
         for (int p = 0; p < WV; p++) {
             const int rr = wrr + p * WRPP;
-            if constexpr (Q4IN) {
+            if constexpr (T2IN) {
+                // 8 packed bytes -> 32 unpacked, two STS.128 (wch*32 stays 16B-aligned)
+                int8_t* dst = s_w + rr * LDW + wch * 32;
+                uint4 o;
+                unpack_t2(rw[p].x, o.x, o.y, o.z, o.w);
+                *(uint4*)dst = o;
+                unpack_t2(rw[p].y, o.x, o.y, o.z, o.w);
+                *(uint4*)(dst + 16) = o;
+            } else if constexpr (Q4IN) {
                 // 16 packed bytes -> 32 unpacked, written as two STS.128. LDW is
                 // a multiple of 16 and wch*32 is too, so both stay 16B-aligned.
                 int8_t* dst = s_w + rr * LDW + wch * 32;
@@ -332,7 +364,14 @@ int vgemm_z(int64_t rows, int64_t cols) {
 size_t vgemm_ws_bytes_model(const q27::Model& m, int64_t min_rows) {
     size_t mx = 0;
     for (const q27::Tensor& t : m.tensors) {
-        if (t.dtype != q27::DType::Q4_G64 && t.dtype != q27::DType::Q8_G128) continue;
+        // T3_G128 never runs the vgemm (vgemm_verify refuses it), but the
+        // workspace must exist: the conductor's union view asserts on it
+        // (build_union_view), and a T3 pack's only other matmuls are the
+        // Q8 MTP block -- a T3 body without one sized the workspace to zero
+        // and every fused round died at the assert (2026-09-21, the first
+        // 8 GB-card install without Q27_BATCH=0).
+        if (t.dtype != q27::DType::Q4_G64 && t.dtype != q27::DType::Q8_G128 &&
+            t.dtype != q27::DType::T2_G128 && t.dtype != q27::DType::T3_G128) continue;
         const int64_t rows = (int64_t)t.rows(), cols = (int64_t)t.cols();
         if (rows < min_rows) continue;          // stays on the GEMV
         if (cols % VG_KB_MULT != 0) continue;   // ineligible; vgemm_verify refuses it
@@ -356,22 +395,22 @@ size_t vgemm_ws_bytes(const q27::DevTensor* const* wl, int n) {
     return mx;
 }
 
-template <bool Q4IN, int MODE>
+template <int DT, int MODE>
 static void set_attr_once() {
     static bool done = false;
     if (done) return;
     // 13.75 KB is under the 48 KB static default, so this is a no-op today. Keep
     // it (and the assert) so a future tile bump cannot silently reintroduce the
     // lazy-cudaFuncSetAttribute-during-graph-capture hazard.
-    static_assert(vgemm_smem_bytes(Q4IN) < 48 * 1024,
+    static_assert(vgemm_smem_bytes(DT == 1) < 48 * 1024,
                   "smem over the 48KB default -- setattr must move out of capture");
-    CUDA_CHECK(cudaFuncSetAttribute(k_vgemm<VG_MR, Q4IN, MODE>,
+    CUDA_CHECK(cudaFuncSetAttribute(k_vgemm<VG_MR, DT, MODE>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    (int)vgemm_smem_bytes(Q4IN)));
+                                    (int)vgemm_smem_bytes(DT == 1)));
     done = true;
 }
 
-template <bool Q4IN>
+template <int DT>
 static void launch(const q27::DevTensor& w, const XLanes& X, const YLanes& Y, float* ws, int T,
                    cudaStream_t st) {
     const int n_stages = (int)(w.cols / VG_KS);
@@ -380,15 +419,15 @@ static void launch(const q27::DevTensor& w, const XLanes& X, const YLanes& Y, fl
     spz = (spz + VG_KG - 1) / VG_KG * VG_KG; // KB-align: a slice can never straddle n_stages
     z = (n_stages + spz - 1) / spz;          // trim empty slices (k_reduce_z would sum garbage)
     dim3 grid(1, (unsigned)((w.rows + VG_MR - 1) / VG_MR), (unsigned)z);
-    const size_t sm = vgemm_smem_bytes(Q4IN);
+    const size_t sm = vgemm_smem_bytes(DT == 1);
     if (z == 1) {
-        set_attr_once<Q4IN, 0>();
-        k_vgemm<VG_MR, Q4IN, 0><<<grid, 256, sm, st>>>((const uint8_t*)w.data,
+        set_attr_once<DT, 0>();
+        k_vgemm<VG_MR, DT, 0><<<grid, 256, sm, st>>>((const uint8_t*)w.data,
                                                        (const __half*)w.scales, X, Y, nullptr,
                                                        w.rows, w.cols, T, spz);
     } else {
-        set_attr_once<Q4IN, 1>();
-        k_vgemm<VG_MR, Q4IN, 1><<<grid, 256, sm, st>>>((const uint8_t*)w.data,
+        set_attr_once<DT, 1>();
+        k_vgemm<VG_MR, DT, 1><<<grid, 256, sm, st>>>((const uint8_t*)w.data,
                                                        (const __half*)w.scales, X, Y, ws, w.rows,
                                                        w.cols, T, spz);
         dim3 g2((unsigned)((w.rows + 255) / 256), (unsigned)T);
@@ -397,19 +436,23 @@ static void launch(const q27::DevTensor& w, const XLanes& X, const YLanes& Y, fl
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool Q4IN, int MODE>
+template <int DT, int MODE>
 static VgemmAttrs attrs_of() {
     cudaFuncAttributes a{};
-    CUDA_CHECK(cudaFuncGetAttributes(&a, k_vgemm<VG_MR, Q4IN, MODE>));
+    CUDA_CHECK(cudaFuncGetAttributes(&a, k_vgemm<VG_MR, DT, MODE>));
     int blocks = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_vgemm<VG_MR, Q4IN, MODE>,
-                                                             256, vgemm_smem_bytes(Q4IN)));
-    return VgemmAttrs{a.numRegs, (size_t)a.localSizeBytes, vgemm_smem_bytes(Q4IN), blocks};
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_vgemm<VG_MR, DT, MODE>,
+                                                             256, vgemm_smem_bytes(DT == 1)));
+    return VgemmAttrs{a.numRegs, (size_t)a.localSizeBytes, vgemm_smem_bytes(DT == 1), blocks};
 }
 
 VgemmAttrs vgemm_attrs(bool q4in, int mode) {
-    if (q4in) return mode ? attrs_of<true, 1>() : attrs_of<true, 0>();
-    return mode ? attrs_of<false, 1>() : attrs_of<false, 0>();
+    if (q4in) return mode ? attrs_of<1, 1>() : attrs_of<1, 0>();
+    return mode ? attrs_of<0, 1>() : attrs_of<0, 0>();
+}
+VgemmAttrs vgemm_attrs_dt(int dt, int mode) {
+    if (dt == 2) return mode ? attrs_of<2, 1>() : attrs_of<2, 0>();
+    return vgemm_attrs(dt == 1, mode);
 }
 
 bool vgemm_verify(const q27::DevTensor& w, const XLanes& X, const YLanes& Y, float* ws, int T,
@@ -421,8 +464,9 @@ bool vgemm_verify(const q27::DevTensor& w, const XLanes& X, const YLanes& Y, flo
         fprintf(stderr, "vgemm: cols %ld not a multiple of %d\n", (long)w.cols, VG_KB_MULT);
         abort();
     }
-    if (w.dtype == q27::DType::Q4_G64) launch<true>(w, X, Y, ws, T, st);
-    else if (w.dtype == q27::DType::Q8_G128) launch<false>(w, X, Y, ws, T, st);
+    if (w.dtype == q27::DType::Q4_G64) launch<1>(w, X, Y, ws, T, st);
+    else if (w.dtype == q27::DType::Q8_G128) launch<0>(w, X, Y, ws, T, st);
+    else if (w.dtype == q27::DType::T2_G128) launch<2>(w, X, Y, ws, T, st);
     else return false;
     return true;
 }

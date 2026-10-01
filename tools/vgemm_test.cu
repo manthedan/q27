@@ -54,14 +54,16 @@ int main(int argc, char** argv) {
                p.minor, p.multiProcessorCount, p.regsPerMultiprocessor,
                p.sharedMemPerMultiprocessor);
         // The four instantiations the round actually launches.
-        struct { const char* tag; bool q4; int mode; } inst[4] = {
-            {"Q4 MODE=0 (z==1, head)", true, 0},
-            {"Q4 MODE=1 (z>1, partials)", true, 1},
-            {"Q8 MODE=0", false, 0},
-            {"Q8 MODE=1", false, 1},
+        struct { const char* tag; int dt; int mode; } inst[6] = {
+            {"Q4 MODE=0 (z==1, head)", 1, 0},
+            {"Q4 MODE=1 (z>1, partials)", 1, 1},
+            {"Q8 MODE=0", 0, 0},
+            {"Q8 MODE=1", 0, 1},
+            {"T2 MODE=0 (Bonsai 2)", 2, 0},
+            {"T2 MODE=1 (Bonsai 2)", 2, 1},
         };
         for (auto& I : inst) {
-            q27k::VgemmAttrs a = q27k::vgemm_attrs(I.q4, I.mode);
+            q27k::VgemmAttrs a = q27k::vgemm_attrs_dt(I.dt, I.mode);
             printf("  %-28s regs=%3d  stack=%zu  smem=%5zu  CTA/SM=%d\n", I.tag, a.regs,
                    (size_t)a.local_bytes, a.smem, a.cta_per_sm);
             CHECK(a.regs <= 64, "%s: %d regs > 64 (would drop below 4 CTA/SM)", I.tag, a.regs);
@@ -150,6 +152,9 @@ int main(int argc, char** argv) {
             for (int t = 0; t < W_PLUMB; t++) { qs[t] = xq[t]; ys[t] = d_y_g[t]; }
             if (q4)
                 q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, T, ys, rows,
+                                cols, 0);
+            else if (w.dtype == q27::DType::T2_G128)
+                q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, T, ys, rows,
                                 cols, 0);
             else
                 q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, T, ys, rows,

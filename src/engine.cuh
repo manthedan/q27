@@ -132,9 +132,24 @@ static inline void arch_require_s(const std::string& mj, const char* key, const 
 static inline void validate_arch(const q27::Model& model) {
     const std::string& mj = model.meta_json;
     arch_require_s(mj, "general.architecture", "qwen35");
-    // block_count counts the MTP layer, hence N_LAYER + 1.
-    arch_require_u(mj, "qwen35.block_count", N_LAYER + 1);
-    arch_require_u(mj, "qwen35.nextn_predict_layers", 1);
+    // block_count counts the MTP layer, hence N_LAYER + 1 -- or exactly
+    // N_LAYER for a pack without one (Bonsai 2: no nextn block; the manifest
+    // treats blk.64 as optional and the engine's MTP paths are gated on it).
+    {
+        size_t p = arch_value_at(mj, "qwen35.block_count");
+        if (p == std::string::npos) arch_fail("qwen35.block_count", "missing from metadata");
+        const uint64_t bc = strtoull(mj.c_str() + p, nullptr, 10);
+        if (bc == N_LAYER + 1) {
+            arch_require_u(mj, "qwen35.nextn_predict_layers", 1);
+        } else if (bc == N_LAYER) {
+            if (arch_value_at(mj, "qwen35.nextn_predict_layers") != std::string::npos)
+                arch_require_u(mj, "qwen35.nextn_predict_layers", 0);
+        } else {
+            arch_fail("qwen35.block_count", "is " + std::to_string(bc) + ", this build needs " +
+                                                 std::to_string(N_LAYER) + " or " +
+                                                 std::to_string(N_LAYER + 1));
+        }
+    }
     arch_require_u(mj, "qwen35.embedding_length", N_EMBD);
     arch_require_u(mj, "qwen35.feed_forward_length", N_FFN);
     arch_require_u(mj, "qwen35.attention.head_count", N_HEAD);
@@ -350,6 +365,21 @@ static_assert(W_PLUMB == 16, "LANESW lists 16 slots -- keep it in step with W_PL
       (V).F[7], (V).F[8], (V).F[9], (V).F[10], (V).F[11], (V).F[12],           \
       (V).F[13], (V).F[14], (V).F[15]}}
 
+// The head dtype kinds DFlash2 reads directly (dflash2.h set_engine_head):
+// fail loud on any other, since the old ternary chain mapped unknown dtypes
+// to Q8 and would read a T3 head's 1.6-bit rows as int8.
+static inline int d2_head_kind(DType t) {
+    switch (t) {
+        case DType::Q8_G128: return 0;
+        case DType::Q4_G64: return 1;
+        case DType::T2_G128: return 2;
+        default:
+            fprintf(stderr, "dflash2: engine head dtype %s unsupported (repack the head as Q8/Q4/T2)\n",
+                    dtype_name(t));
+            exit(1);
+    }
+}
+
 struct Engine {
     // P10-A1: weights (Model + DeviceModel) are shared read-only across slots.
     // The owning ctor keeps them in owned_*; the borrowing ctor binds refs to
@@ -361,6 +391,89 @@ struct Engine {
     q27::DeviceModel& dm;
     int max_ctx;
     bool attn_layer[N_LAYER + 1] = {false};
+    // MTP block present (blk.64.nextn.*). A 64-block pack (Bonsai 2) has none:
+    // the ladder drafter and the prefill MTP warm are skipped; DFlash2 and
+    // plain decode do not need it.
+    bool has_mtp = true;
+    // Draftless conductor member (Bonsai 2 without a DFlash2 pack, 2026-09-18):
+    // fused rounds run this engine as a width-2 lane pair whose lane 1 is
+    // never accepted (finish/accept get max_draft 0), so every fused round
+    // emits exactly one token per member under the spec-round convention
+    // (pending unemitted) that the conductor's outcome bookkeeping assumes.
+    // Set after d2_setup() in build_spec_graphs; read by the verify tails at
+    // graph capture (host branch, init-fixed).
+    bool plain_lanes = false;
+    // Bonsai 2 (docs/plans/2026-09-18-bonsai2-ternary.md): every projection
+    // is stored Hadamard-rotated on its input dim; the engine rotates the
+    // activation right before each such matmul (kernels.cuh hadamard1024) and
+    // inverse-rotates embedding rows after lookup. Sign vectors travel in the
+    // pack as F32 tensors hadamard_signs.<width>.
+    bool bonsai2 = false;
+    bool bz_gdn_grouped = false;           // ssm_out folded in grouped V-head order
+    const float* bz_s5120 = nullptr;       // sign vectors, device
+    const float* bz_s6144 = nullptr;
+    const float* bz_s17408 = nullptr;
+    float* bz_xrot = nullptr;              // rotated copy of the GDN input (alpha/beta read the raw one)
+    float* bz_ogp = nullptr;               // permuted GDN value output
+    float* bz_xrotT = nullptr;             // prefill twins (PF_T rows)
+    // T3_G128 packs (8 GB cards, 2026-09-20): the prefill GEMM's T2 scratch,
+    // sized for the largest T3 matrix (mmT rewrites each one into it first).
+    uint8_t* t3_pf_w = nullptr;
+    size_t t3_pf_bytes = 0;
+    float* bz_ogpT = nullptr;
+    float* bz_xrot_L[W_PLUMB] = {};        // multi-lane twins (speculative verify)
+    float* bz_ogp_L[W_PLUMB] = {};
+    static q27k::P3 bz_p3(float* const* p) {
+        q27k::P3 r{};
+        for (int i = 0; i < 16; i++) r.p[i] = p[i];
+        return r;
+    }
+    static std::array<float*, W_PLUMB> bz_arr(float* const* p) {
+        std::array<float*, W_PLUMB> a{};
+        for (int i = 0; i < W_PLUMB; i++) a[i] = p[i];
+        return a;
+    }
+    void bz_rot_lanes(const std::array<float*, W_PLUMB>& x, int width, int vw, cudaStream_t st) {
+        q27k::hadamard1024_lanes(bz_p3(x.data()), bz_signs(width), width, vw, false, st);
+    }
+    void bz_unrot_lanes(const std::array<float*, W_PLUMB>& x, int vw, cudaStream_t st) {
+        q27k::hadamard1024_lanes(bz_p3(x.data()), bz_s5120, N_EMBD, vw, true, st);
+    }
+    const float* bz_signs(int width) const {
+        return width == N_EMBD ? bz_s5120 : width == GDN_V ? bz_s6144 : bz_s17408;
+    }
+    // fwd rotation in place (single vector / T rows); inverse for embeddings.
+    void bz_rot(float* x, int width, cudaStream_t st) {
+        q27k::hadamard1024(x, bz_signs(width), width, false, st);
+    }
+    void bz_rot_T(float* x, int width, int T) {
+        q27k::hadamard1024_rows(x, bz_signs(width), width, T, width, false, stm);
+    }
+    void bz_unrot_embed(float* x, cudaStream_t st) { q27k::hadamard1024(x, bz_s5120, N_EMBD, true, st); }
+    // Embedding lookups dispatched on the table's dtype: exact-Q8 (Bonsai 2
+    // t2 packs, every Qwen tier) or T2_G128 (Bonsai 2 slim packs, 2026-09-19;
+    // bitwise the Q8 lookup for an exact ternary table).
+    void embed_row(const DevTensor& emb, const int* tok, float* out, cudaStream_t st) {
+        if (emb.dtype == DType::T2_G128)
+            q27k::embed_row_t2((const uint8_t*)emb.data, (const __half*)emb.scales, tok, N_EMBD, out, st);
+        else
+            q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, tok, N_EMBD, out, st);
+    }
+    void embed_lanes(const DevTensor& emb, q27k::IP3 tok, q27k::P3 out, cudaStream_t st, int ntok) {
+        if (emb.dtype == DType::T2_G128)
+            q27k::embed3_t2((const uint8_t*)emb.data, (const __half*)emb.scales, tok, N_EMBD, out, st, ntok);
+        else
+            q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, tok, N_EMBD, out, st, ntok);
+    }
+    void embed_rows_T(const DevTensor& emb, const int* toks, int T, float* out) {
+        if (emb.dtype == DType::T2_G128)
+            q27k::embed_rows_t2_T((const uint8_t*)emb.data, (const __half*)emb.scales, toks, N_EMBD, T, out, stm);
+        else
+            q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, toks, N_EMBD, T, out, stm);
+    }
+    void bz_unrot_embed_T(float* x, int T) {
+        q27k::hadamard1024_rows(x, bz_s5120, N_EMBD, T, N_EMBD, true, stm);
+    }
     cudaStream_t stm;
     cudaGraphExec_t graph_exec = nullptr;
     cudaGraphExec_t sample_graph = nullptr; // plain forward + sample (temp>0)
@@ -390,6 +503,10 @@ struct Engine {
     float* d_nuc = nullptr;  // [W_PLUMB][4]: {thresh,M,logZ,mass} per verify lane
     int* d_spec = nullptr;   // [3]: {n, stop_lane, exclude_token} (Phase-2 verdict)
     bool samp_first = false; // first sampled token comes from the retained prefill logits
+    // Greedy no-draft rounds (a pack without an MTP block and no DFlash2):
+    // the first token is the prefill tail's argmax already in d_token; every
+    // later round replays the token graph. Mirrors sample_round's shape.
+    bool plain_first = false;
     // MTP draft head state (stage 1: host-driven acceptance measurement)
     float *h_next, *e_hn, *x_mtp, *mtp_logits;
     void *mtp_k, *mtp_v;
@@ -1019,8 +1136,51 @@ struct Engine {
         // Needs attn_layer[], so it cannot live inside validate_arch(); still
         // ahead of every cudaMalloc and of upload_all().
         validate_tensor_manifest(model, attn_layer);
+        has_mtp = model.find("blk.64.nextn.eh_proj.weight") != nullptr;
+        {
+            // Bonsai 2 pack: "bonsai2": true plus the hadamard block. The
+            // hand-rolled scanner finds the first occurrence of a key, so the
+            // keys read here are unique in the meta by construction (repack).
+            size_t bp = arch_value_at(mj, "bonsai2");
+            bonsai2 = bp != std::string::npos && mj.compare(bp, 4, "true") == 0;
+            if (bonsai2) {
+                arch_require_u(mj, "block_size", 1024);
+                arch_require_s(mj, "transform", "normalized-sylvester-walsh-hadamard");
+                arch_require_s(mj, "axis", "input-last-dimension");
+                arch_require_s(mj, "sign_mode", "explicit");
+                size_t gp = arch_value_at(mj, "gdn_v_grouped");
+                bz_gdn_grouped = gp != std::string::npos && mj.compare(gp, 4, "true") == 0;
+                for (int w : {N_EMBD, GDN_V, N_FFN}) {
+                    const q27::Tensor* st = model.find("hadamard_signs." + std::to_string(w));
+                    if (!st || st->dtype != q27::DType::F32 || st->shape != std::vector<uint64_t>{(uint64_t)w})
+                        arch_fail(("hadamard_signs." + std::to_string(w)).c_str(),
+                                  "missing or not an F32 vector of that width");
+                }
+                // An MTP block in a Bonsai 2 pack (2026-09-18: a third-party
+                // head distilled onto the ternary target) is a plain Qwen3.8
+                // layer trained in the UNROTATED space: its projections read
+                // the raw hidden state, only its embedding lookup (rotated
+                // rows) and its output through the folded head see the
+                // rotation. Every bz_* site below is gated on il < N_LAYER.
+                fprintf(stderr, "bonsai2: Hadamard-folded pack (block 1024, gdn_v_grouped=%d); "
+                                "activation rotation ON, MTP ladder %s\n", (int)bz_gdn_grouped,
+                        has_mtp ? "ON (unrotated MTP block)" : "OFF");
+            }
+        }
+        if (!has_mtp && !bonsai2)
+            fprintf(stderr, "note: pack has no MTP block; ladder drafting unavailable\n");
 
         auto A = [](void** pp, size_t n) { CUDA_CHECK(cudaMalloc(pp, n)); };
+        if (bonsai2) {
+            A((void**)&bz_xrot, N_EMBD * 4);
+            A((void**)&bz_ogp, GDN_V * 4);
+            A((void**)&bz_xrotT, (size_t)PF_T * N_EMBD * 4);
+            A((void**)&bz_ogpT, (size_t)PF_T * GDN_V * 4);
+            for (int i = 0; i < W_PLUMB; i++) {
+                A((void**)&bz_xrot_L[i], N_EMBD * 4);
+                A((void**)&bz_ogp_L[i], GDN_V * 4);
+            }
+        }
         A((void**)&h, N_EMBD * 4); A((void**)&x1, N_EMBD * 4); A((void**)&y, N_EMBD * 4);
         A((void**)&qg, 2 * N_HEAD * HEAD_DIM * 4);
         A((void**)&kbuf, N_KV * HEAD_DIM * 4); A((void**)&vbuf, N_KV * HEAD_DIM * 4);
@@ -1463,6 +1623,23 @@ struct Engine {
                 fprintf(stderr, "prefill: Q27_PREFILL=fp4 requested but this pack has no .pf4 "
                                 "sidecars (repack with --pf4) -- int path stays\n");
         }
+        if (bonsai2) {
+            // resident either way (own upload above, or the server's shared one)
+            bz_s5120 = (const float*)dm.get("hadamard_signs.5120").data;
+            bz_s6144 = (const float*)dm.get("hadamard_signs.6144").data;
+            bz_s17408 = (const float*)dm.get("hadamard_signs.17408").data;
+        }
+        {
+            size_t mx = 0;
+            for (const q27::Tensor& t : dm.model().tensors)
+                if (t.dtype == DType::T3_G128) mx = std::max(mx, (size_t)t.rows() * (size_t)(t.cols() / 4));
+            if (mx) {
+                CUDA_CHECK(cudaMalloc((void**)&t3_pf_w, mx));
+                t3_pf_bytes = mx;
+                fprintf(stderr, "T3_G128 pack: prefill GEMMs read a %.1f MB T2 scratch per matrix\n",
+                        mx / 1e6);
+            }
+        }
     }
 
   public:
@@ -1491,6 +1668,14 @@ struct Engine {
                 q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
                               w.cols, st);
                 break;
+            case DType::T2_G128:
+                q27k::gemv_t2((const uint8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
+                              w.cols, st);
+                break;
+            case DType::T3_G128:
+                q27k::gemv_t3((const uint8_t*)w.data, (const __half*)w.scales, xq, out, w.rows,
+                              w.cols, st);
+                break;
             case DType::F16:
                 q27k::gemv_f16((const __half*)w.data, x, out, w.rows, w.cols, st);
                 break;
@@ -1501,7 +1686,11 @@ struct Engine {
     }
 
     void gdn_block(int il, const float* xin, float* yout) {
-        qx(xin, N_EMBD);
+        // qkv/gate are folded, alpha/beta are not (F16, read the raw xin):
+        // the fused rotate+quantize feeds the member xq from the rotated
+        // values without touching xin.
+        if (bonsai2) q27k::rotq(xin, bz_s5120, N_EMBD, xq, stm);
+        else qx(xin, N_EMBD);
         mm(T(il, "attn_qkv.weight"), xin, qkv);
         mm(T(il, "attn_gate.weight"), xin, z);
         mm(T(il, "ssm_alpha.weight"), xin, alpha);
@@ -1515,7 +1704,8 @@ struct Engine {
         q27k::delta_step(S[il], S[il], convout, g, beta, o, stm);
         q27k::gated_norm_gdn(o, (const float*)T(il, "ssm_norm.weight").data, z, og, GDN_HEADS,
                              GDN_DIM, EPS, stm);
-        qx(og, GDN_V);
+        if (bonsai2) q27k::rotq(og, bz_s6144, GDN_V, xq, stm, bz_gdn_grouped, GDN_DIM, GDN_HEADS / 3, 3);
+        else qx(og, GDN_V);
         mm(T(il, "ssm_out.weight"), og, yout);
     }
 
@@ -1537,7 +1727,8 @@ struct Engine {
             vt = kv_vtab(ci);
         }
         if (!pos_src) pos_src = d_pos;
-        qx(xin, N_EMBD, st);
+        if (bonsai2 && il < N_LAYER) q27k::rotq(xin, bz_s5120, N_EMBD, xq, st); // q/k/v all folded (not the MTP layer)
+        else qx(xin, N_EMBD, st);
         mm(T(il, "attn_q.weight"), xin, qg, st);
         q27k::rmsnorm_heads(qg, (const float*)T(il, "attn_q_norm.weight").data, qg, N_HEAD,
                             HEAD_DIM, 2 * HEAD_DIM, EPS, st);
@@ -1573,16 +1764,19 @@ struct Engine {
             q27k::wht3(ow, N_HEAD, HEAD_DIM, HEAD_DIM, true, st, 1);
         }
         q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, st);
-        qx(attnout, N_HEAD * HEAD_DIM, st);
+        if (bonsai2 && il < N_LAYER) q27k::rotq(attnout, bz_s6144, N_HEAD * HEAD_DIM, xq, st);
+        else qx(attnout, N_HEAD * HEAD_DIM, st);
         mm(T(il, "attn_output.weight"), attnout, yout, st);
     }
 
     void ffn(int il, const float* xin, float* yout) {
-        qx(xin, N_EMBD);
+        if (bonsai2 && il < N_LAYER) q27k::rotq(xin, bz_s5120, N_EMBD, xq, stm);
+        else qx(xin, N_EMBD);
         mm(T(il, "ffn_gate.weight"), xin, ffn_g);
         mm(T(il, "ffn_up.weight"), xin, ffn_u);
         q27k::silu_mul(ffn_g, ffn_u, ffn_g, N_FFN, stm);
-        qx(ffn_g, N_FFN);
+        if (bonsai2 && il < N_LAYER) q27k::rotq(ffn_g, bz_s17408, N_FFN, xq, stm);
+        else qx(ffn_g, N_FFN);
         mm(T(il, "ffn_down.weight"), ffn_g, yout);
     }
 
@@ -1599,8 +1793,8 @@ struct Engine {
     static constexpr int DFLASH_TAPS[5] = {5, 19, 33, 47, 61};
     void token_launches(float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
-                           stm);
+        embed_row(emb, d_token, h, stm);
+        if (bonsai2) bz_unrot_embed(h, stm);
         int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm(h, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
@@ -1618,7 +1812,8 @@ struct Engine {
             }
         }
         q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS, stm);
-        qx(x1, N_EMBD);
+        if (bonsai2) q27k::rotq(x1, bz_s5120, N_EMBD, xq, stm);
+        else qx(x1, N_EMBD);
         mm(dm.get("output.weight"), x1, logits);
         q27k::argmax(logits, VOCAB, d_token, d_amax, stm); // d_token becomes NEXT token
         q27k::advance(d_pos, d_step, d_gen, d_token, stm); // record + pos++
@@ -1632,8 +1827,8 @@ struct Engine {
     // untouched -- this is a SEPARATE graph, never on the canonical-gated path.
     void token_launches_sampled() {
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
-                           stm);
+        embed_row(emb, d_token, h, stm);
+        if (bonsai2) bz_unrot_embed(h, stm);
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm(h, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
             if (attn_layer[il]) attn_block(il, x1, y);
@@ -1645,7 +1840,8 @@ struct Engine {
             q27k::add_inplace(h, y, N_EMBD, stm);
         }
         q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS, stm);
-        qx(x1, N_EMBD);
+        if (bonsai2) q27k::rotq(x1, bz_s5120, N_EMBD, xq, stm);
+        else qx(x1, N_EMBD);
         mm(dm.get("output.weight"), x1, logits);
         q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 1, d_token, d_amax, stm);
         q27k::advance(d_pos, d_step, d_gen, d_token, stm);
@@ -1705,6 +1901,15 @@ struct Engine {
     }
     // qx5/mm5 twins over the MTP view (A4 thin surface: MtpLaneView shares no
     // fields with LaneView, so no adapter/friend layer -- two small helpers).
+    // Bonsai 2: the MTP lanes' head input is rotated like the main head's
+    // (rotq3 into the MTP lane view's activation slots; bitwise the
+    // hadamard-on-copy + quantize3 pair, test_hadamard1024).
+    void mtp_rotq(const MtpLaneView& v, const std::array<float*, W_PLUMB>& x, int width) {
+        q27k::CP3 in{};
+        q27k::XQ3 q{};
+        for (int i = 0; i < W_PLUMB; i++) { in.p[i] = x[i]; q.q[i] = v.xq[i]; }
+        q27k::rotq3(in, bz_signs(width), width, q, v.vw, v.stm);
+    }
     void mtp_qx(const MtpLaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
         q27k::XQ3 q{};
         q27k::CP3 xs{};
@@ -1727,6 +1932,14 @@ struct Engine {
         switch (w.dtype) {
             case DType::Q4_G64:
                 q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
+                                w.rows, w.cols, v.stm);
+                break;
+            case DType::T2_G128:
+                q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
+                                w.rows, w.cols, v.stm);
+                break;
+            case DType::T3_G128:
+                q27k::gemv_t3_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
                                 w.rows, w.cols, v.stm);
                 break;
             case DType::Q8_G128:
@@ -1754,6 +1967,14 @@ struct Engine {
                 q27k::gemv_q4((const uint8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
                               w.rows, w.cols, v.stm);
                 break;
+            case DType::T2_G128:
+                q27k::gemv_t2((const uint8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
+                              w.rows, w.cols, v.stm);
+                break;
+            case DType::T3_G128:
+                q27k::gemv_t3((const uint8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
+                              w.rows, w.cols, v.stm);
+                break;
             case DType::Q8_G128:
                 q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, v.xq[0], out,
                               w.rows, w.cols, v.stm);
@@ -1777,8 +1998,8 @@ struct Engine {
         const float* en = (const float*)T(il, "nextn.enorm.weight").data;
         const float* hn = (const float*)T(il, "nextn.hnorm.weight").data;
         if (v.vw == 1) {
-            q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, v.tok[0],
-                               N_EMBD, v.e_hn[0], v.stm);
+            embed_row(emb, v.tok[0], v.e_hn[0], v.stm);
+            if (bonsai2) bz_unrot_embed(v.e_hn[0], v.stm); // rotated embedding rows
             q27k::rmsnorm(v.e_hn[0], en, v.e_hn[0], N_EMBD, EPS, v.stm);
             q27k::rmsnorm(v.h_src[0], hn, v.e_hn[0] + N_EMBD, N_EMBD, EPS, v.stm);
             q27k::quantize_x(v.e_hn[0], 2 * N_EMBD, v.xq[0], v.stm);
@@ -1786,8 +2007,8 @@ struct Engine {
             return;
         }
         q27k::IP3 tk LANESV(v, tok);
-        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, tk, N_EMBD,
-                     LANESV(v, e_hn), v.stm, v.vw);
+        embed_lanes(emb, tk, LANESV(v, e_hn), v.stm, v.vw);
+        if (bonsai2) bz_unrot_lanes(v.e_hn, v.vw, v.stm); // rotated embedding rows
         q27k::CP3 Ec LANESV(v, e_hn);
         q27k::P3 Em LANESV(v, e_hn);
         q27k::rmsnorm3(Ec, en, Em, N_EMBD, EPS, v.stm, v.vw);
@@ -1826,7 +2047,8 @@ struct Engine {
             mtp_mm1(v, T(il, "ffn_down.weight"), v.y[0]);
             q27k::add_inplace(v.x_mtp[0], v.y[0], N_EMBD, v.stm);
             q27k::rmsnorm(v.x_mtp[0], sn, v.x1[0], N_EMBD, EPS, v.stm);
-            q27k::quantize_x(v.x1[0], N_EMBD, v.xq[0], v.stm);
+            if (bonsai2) q27k::rotq(v.x1[0], bz_s5120, N_EMBD, v.xq[0], v.stm); // folded head
+            else q27k::quantize_x(v.x1[0], N_EMBD, v.xq[0], v.stm);
             mtp_mm1(v, *head, v.lg[0]);
             return;
         }
@@ -1844,7 +2066,8 @@ struct Engine {
         mtp_mm(v, T(il, "ffn_down.weight"), v.y);
         q27k::add3(Xm, Yc, N_EMBD, v.stm, v.vw);
         q27k::rmsnorm3(Xc, sn, X1m, N_EMBD, EPS, v.stm, v.vw);
-        mtp_qx(v, v.x1, N_EMBD);
+        if (bonsai2) mtp_rotq(v, v.x1, N_EMBD); // folded head
+        else mtp_qx(v, v.x1, N_EMBD);
         mtp_mm(v, *head, v.lg);
     }
     void mtp_tail(const MtpLaneView& v) {
@@ -2004,6 +2227,25 @@ struct Engine {
         for (int i = 0; i < W_PLUMB; i++) q.q[i] = v.xq[i];
         q27k::rmsnorm3q(x, w, y, q, cols, EPS, v.stm, v.vw);
     }
+    // Bonsai 2 twin of rmsnorm3q5 for the layer-input norms: norm -> rotate ->
+    // quantize. GDN layers rotate a COPY (bz_xrot_L) because gdn_pre's alpha/
+    // beta F16 GEMVs read the raw x1 lanes; attention/FFN/head rotate in place.
+    // fused rotate+quantize of the lanes into the view's activation set
+    void bz_rotq5(const LaneView& v, const std::array<float*, W_PLUMB>& x, int width,
+                  bool perm = false) {
+        q27k::CP3 in{};
+        q27k::XQ3 q{};
+        for (int i = 0; i < W_PLUMB; i++) { in.p[i] = x[i]; q.q[i] = v.xq[i]; }
+        q27k::rotq3(in, bz_signs(width), width, q, v.vw, v.stm, perm, GDN_DIM, GDN_HEADS / 3, 3);
+    }
+    void bz_norm3_rot_q5(const LaneView& v, const q27k::CP3& x, const float* w,
+                         const q27k::P3& y, bool /*gdn*/) {
+        // one launch: norm (y unrotated, so gdn_pre's alpha/beta F16 GEMVs
+        // read the plain normed lanes) + rotate + quantize into the view's xq
+        q27k::XQ3 q{};
+        for (int i = 0; i < W_PLUMB; i++) q.q[i] = v.xq[i];
+        q27k::rmsnorm3_rotq(x, w, y, bz_s5120, q, N_EMBD, EPS, v.stm, v.vw);
+    }
     void qx5(const LaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
         q27k::XQ3 q{};
         q27k::CP3 xs{};
@@ -2048,7 +2290,16 @@ struct Engine {
         if (w.dtype == DType::Q4_G64)
             q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
                             w.cols, v.stm);
-        else
+        else if (w.dtype == DType::T2_G128)
+            q27k::gemv_t2_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
+                            w.cols, v.stm);
+        else if (w.dtype == DType::T3_G128)
+            q27k::gemv_t3_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
+                            w.cols, v.stm);
+        else if (w.dtype != DType::Q8_G128) {
+            fprintf(stderr, "mm5: unsupported dtype\n"); // was a bare else (silent Q8 route)
+            exit(1);
+        } else
             q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
                             w.cols, v.stm);
     }
@@ -2162,7 +2413,8 @@ struct Engine {
         q27k::gated_norm3(LANESV(v, o), nw,
                           LANESV(v, z),
                           LANESV(v, og), GDN_HEADS, GDN_DIM, EPS, v.stm, v.vw);
-        qx5(v, v.og, GDN_V);
+        if (bonsai2) bz_rotq5(v, v.og, GDN_V, bz_gdn_grouped);
+        else qx5(v, v.og, GDN_V);
         mm5(v, T(il, "ssm_out.weight"), v.y);
     }
     void gdn_pair(int il, const LaneView& v, bool x1q = false) {
@@ -2229,7 +2481,8 @@ struct Engine {
     void attn_post(int il, const LaneView& v) {
         q27k::sigmoid_gate3(LANESV(v, attnout),
                             LANESV(v, qg), N_HEAD, HEAD_DIM, v.stm, v.vw);
-        qx5(v, v.attnout, N_HEAD * HEAD_DIM);
+        if (bonsai2) bz_rotq5(v, v.attnout, N_HEAD * HEAD_DIM);
+        else qx5(v, v.attnout, N_HEAD * HEAD_DIM);
         mm5(v, T(il, "attn_output.weight"), v.y);
     }
     void attn_pair(int il, const LaneView& v, bool x1q = false) {
@@ -2247,7 +2500,8 @@ struct Engine {
         mm5(v, T(il, "ffn_up.weight"), v.ffn_u);
         q27k::silu_mul3(LANESV(v, ffn_g),
                         LANESV(v, ffn_u), N_FFN, v.stm, v.vw);
-        qx5(v, v.ffn_g, N_FFN);
+        if (bonsai2) bz_rotq5(v, v.ffn_g, N_FFN);
+        else qx5(v, v.ffn_g, N_FFN);
         mm5(v, T(il, "ffn_down.weight"), v.y);
     }
 
@@ -2330,9 +2584,8 @@ struct Engine {
         // MUST be mirrored there and re-gated with fused_smoke (build line
         // in tools/fused_smoke.cu's header).
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, v.vtok,
-                     N_EMBD, LANESV(v, h), v.stm,
-                     v.vw);
+        embed_lanes(emb, v.vtok, LANESV(v, h), v.stm, v.vw);
+        if (bonsai2) bz_unrot_lanes(v.h, v.vw, v.stm);
         q27k::CP3 Hc LANESV(v, h),
             Yc LANESV(v, y);
         q27k::P3 Hm LANESV(v, h),
@@ -2340,12 +2593,14 @@ struct Engine {
         int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
-            rmsnorm3q5(v, Hc, an, X1m, N_EMBD); // norm + quantize x1, one launch
+            if (bonsai2) bz_norm3_rot_q5(v, Hc, an, X1m, !attn_layer[il]);
+            else rmsnorm3q5(v, Hc, an, X1m, N_EMBD); // norm + quantize x1, one launch
             if (attn_layer[il]) attn_pair(il, v, true);
             else gdn_pair(il, v, true);
             q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
-            rmsnorm3q5(v, Hc, pn, X1m, N_EMBD);
+            if (bonsai2) bz_norm3_rot_q5(v, Hc, pn, X1m, false);
+            else rmsnorm3q5(v, Hc, pn, X1m, N_EMBD);
             ffn_pair(il, v, true);
             q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
             if (taps && tap_k < 5 && il == DFLASH_TAPS[tap_k]) {
@@ -2357,7 +2612,8 @@ struct Engine {
             }
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
-        rmsnorm3q5(v, Hc, on, X1m, N_EMBD);
+        if (bonsai2) bz_norm3_rot_q5(v, Hc, on, X1m, false);
+        else rmsnorm3q5(v, Hc, on, X1m, N_EMBD);
         const char* vhead = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                              : "output.weight";
         // lane t's logits live at v.lg[t] (solo: logits2 + t*VOCAB, alloc is
@@ -2395,7 +2651,8 @@ struct Engine {
         q27k::finish_round(d_P, d_token, drafts,
                            LANESW(d_v),
                            LANESW(x1),
-                           h_next, d_outcome, N_EMBD, d_accept_cap, v.vw - 1, v.stm);
+                           h_next, d_outcome, N_EMBD, d_accept_cap,
+                           plain_lanes ? 0 : v.vw - 1, v.stm);
     }
     void spec_verify_launches(const LaneView& v) {
         spec_verify_forward(v);
@@ -2432,7 +2689,7 @@ struct Engine {
         q27k::IP3 drafts{};
         for (int k = 0; k + 1 < W_PLUMB; k++) drafts.p[k] = d_draft_L[k];
         q27k::spec_accept(logits2, d_nuc, drafts, d_samp, d_P,
-                          d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
+                          d_accept_cap, plain_lanes ? 0 : v.vw - 1, VOCAB, d_spec, v.stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, v.stm);
         q27k::finish_sampled(d_P, d_token, d_spec, drafts, LANESW(x1), h_next, d_outcome,
                              N_EMBD, v.stm);
@@ -2505,6 +2762,53 @@ struct Engine {
     }
 
     void build_spec_graphs() {
+        if (!has_mtp) {
+            // No MTP block: the ladder's draft/verify graph zoo has nothing to
+            // capture. decode_step runs plain rounds, or DFlash2 rounds when a
+            // pack is loaded -- and d2_setup() captures the verify graphs
+            // WITHOUT its own warm run (the ladder's warm rounds normally did
+            // that). Warm the multi-lane verify kernels here, at the DFlash2
+            // width, with the lane state the ladder's seed makes valid.
+            fprintf(stderr, "spec graphs: skipped (pack has no MTP block; plain decode%s)\n",
+                    getenv("Q27_DFLASH2") ? " unless DFlash2 rounds" : "");
+            {
+                // Warm the multi-lane verify kernels (attribute latches, first-
+                // launch state) at the width the engine will run them: K+1 for
+                // DFlash2, else 2 -- the conductor's draftless lane pair
+                // (fused rounds never launch a kernel cold: capture-illegal).
+                int kk = d2_k;
+                if (const char* k = getenv("Q27_DFLASH2_K")) kk = atoi(k);
+                const int w = getenv("Q27_DFLASH2") ? std::max(2, std::min(kk + 1, W_MAX)) : 2;
+                int zs[W_PLUMB], z0 = 0;
+                for (int i = 0; i < W_PLUMB; i++) zs[i] = i;
+                for (int i = 0; i < W_PLUMB; i++)
+                    CUDA_CHECK(cudaMemcpyAsync(d_pos_L[i], &zs[i], 4, cudaMemcpyHostToDevice, stm));
+                CUDA_CHECK(cudaMemcpyAsync(d_token, &z0, 4, cudaMemcpyHostToDevice, stm));
+                CUDA_CHECK(cudaMemsetAsync(d_P, 0, 4, stm));
+                for (int k = 0; k + 1 < W_PLUMB; k++)
+                    CUDA_CHECK(cudaMemsetAsync(d_draft_L[k], 0, 4, stm)); // valid token ids
+                if (sampled_graphs) {
+                    q27k::SampleParams warm{1.f, 1.f, 0ull};
+                    CUDA_CHECK(cudaMemcpyAsync(d_samp, &warm, sizeof warm, cudaMemcpyHostToDevice, stm));
+                }
+                set_round_width(w);
+                LaneView v = solo_view();
+                v.vw = w;
+                spec_verify_forward(v, nullptr);
+                spec_verify_tail(v);
+                if (sampled_graphs) {
+                    spec_verify_forward(v, nullptr);
+                    spec_verify_tail_sampled(v);
+                }
+                CUDA_CHECK(cudaStreamSynchronize(stm));
+                reset(); // GDN state, conv rings, positions churned by the warm
+                fprintf(stderr, "spec graphs: multi-lane verify warmed at width %d for %s\n", w,
+                        getenv("Q27_DFLASH2") ? "DFlash2" : "draftless fused rounds");
+            }
+            d2_setup();
+            plain_lanes = !d2_on;
+            return;
+        }
         // one warm (executing) round to initialize lazy CUDA state, then reset.
         // seed + reset are factored so the Phase-2 sampled graph set warms the
         // same way (its verify tail launches new kernels that also need warming).
@@ -2886,12 +3190,14 @@ struct Engine {
         const char* vh = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                          : "output.weight";
         const DevTensor& hw = dm.get(vh);
-        d2->set_engine_head(hw.data, (const __half*)hw.scales, hw.dtype == DType::Q4_G64);
+        d2->set_engine_head(hw.data, (const __half*)hw.scales, d2_head_kind(hw.dtype));
         // reuse the engine's Q8 token embedding for the drafter's anchor/mask
         // rows (the serving pack ships no fp16 target.embed). MUST precede
         // alloc(), which caches the mask-token embedding.
         const DevTensor& ew = dm.get("token_embd.weight");
-        d2->set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales);
+        d2->set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales,
+                             ew.dtype == DType::T2_G128 ? 2 : 0);
+        if (bonsai2) d2->set_bonsai2_signs(bz_s5120); // rotated embed table + folded head
         d2->alloc(4096); // sliding ring (window 2048 + headroom)
         set_round_width(d2_w);
         CUDA_CHECK(cudaMalloc((void**)&d2_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
@@ -3479,6 +3785,16 @@ struct Engine {
     // and the extra staged lanes are never read (same contract as the gated
     // rounds' unread draft rows). Suffix rounds skip the MTP chain, so the
     // stale-MTP-KV note on suffix_on applies to fused rounds identically.
+    // Draftless member's round prologue (the conductor's draft_widths calls it
+    // in suffix_propose's slot): prep_round derives the two lane positions and
+    // snapshots the pending token; d_draft_L[0] keeps whatever valid id it
+    // holds (init 0), it is embedded and forwarded but max_draft 0 in the tail
+    // means it is never accepted. Width 2 = the union floor.
+    int plain_propose() {
+        q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
+                         stm);
+        return 2;
+    }
     int suffix_propose() {
         if (!(!tool_split_active && suffix_on && sfx_valid && pmin_theta > 0.f &&
               h_mask_id0 < 0 &&
@@ -3573,6 +3889,21 @@ struct Engine {
     // replay sample_graph, which forwards the just-emitted token and samples the
     // next. No MTP, no spec: correctness-first per the design (Phase 2 adds spec
     // rejection sampling for speed).
+    // Greedy plain round: one token per round through the captured token
+    // graph (token_launches: forward + argmax + advance). The first round
+    // emits the token the prefill tail already argmax'd into d_token, exactly
+    // like the CLI's device-chained loop after step_with.
+    int plain_round(int* emit) {
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
+        if (plain_first) plain_first = false;
+        else CUDA_CHECK(cudaGraphLaunch(graph_exec, stm));
+        int tok;
+        CUDA_CHECK(cudaMemcpyAsync(&tok, d_token, 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        emit[0] = tok;
+        return 1;
+    }
+
     int sample_round(int* emit) {
         if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
         if (samp_first) {
@@ -3858,7 +4189,22 @@ struct Engine {
                 return;
             }
         }
-        mmT(T2(il, leaf), xT, yout, T); // T2: the int T param shadows T()
+        mmT(TP(il, leaf), xT, yout, T); // T2: the int T param shadows T()
+    }
+    // Prefill weight for (il, leaf). A T2_G128 base runs the native T2 MMA
+    // GEMM (Bonsai 2 Phase 3, gemm_t2_T). Q27_T2_PF_SHADOW=1 routes it through
+    // the exact Q4 shadow "<name>.q4x" instead (repack --bonsai2-container
+    // t2+q4x carries one per blk.* matrix): the bitwise A/B of that GEMM on a
+    // served model, and the Phase 2 path it replaced. Anything else is the base.
+    const DevTensor& TP(int il, const char* leaf) {
+        const DevTensor& base = T(il, leaf);
+        static const bool shadow = [] { const char* e = getenv("Q27_T2_PF_SHADOW"); return e && atoi(e) != 0; }();
+        if (base.dtype != DType::T2_G128 || !shadow) return base;
+        char buf[128];
+        snprintf(buf, sizeof buf, "blk.%d.%s.q4x", il, leaf);
+        if (const DevTensor* s = dm.try_get(buf)) return *s;
+        fprintf(stderr, "mmT: %s is T2_G128 with no .q4x prefill shadow\n", buf);
+        exit(1);
     }
     void mmT(const DevTensor& w, const float* xT, float* yout, int T) {
         switch (w.dtype) {
@@ -3870,6 +4216,25 @@ struct Engine {
                 q27k::gemm_q8_T((const int8_t*)w.data, (const __half*)w.scales, xqT, yout,
                                 w.rows, w.cols, T, stm, splitk_p());
                 break;
+            case DType::T2_G128: // Bonsai 2: same MMA family, 2-bit staging unpack
+                q27k::gemm_t2_T((const uint8_t*)w.data, (const __half*)w.scales, xqT, yout,
+                                w.rows, w.cols, T, stm, splitk_p());
+                break;
+            case DType::T3_G128: {
+                // 8 GB packs (2026-09-20): the MMA GEMM reads T2 words, so the
+                // T3 matrix is rewritten into the engine's T2 scratch first
+                // (stream-ordered on stm; ~22 MB, the largest T3 matrix). Same
+                // codes and scales -> the GEMM output is bitwise the T2 pack's.
+                const size_t need = (size_t)w.rows * (size_t)(w.cols / 4);
+                if (!t3_pf_w || need > t3_pf_bytes) {
+                    fprintf(stderr, "mmT: T3 prefill scratch %zu B < %zu needed\n", t3_pf_bytes, need);
+                    exit(1);
+                }
+                q27k::t3_to_t2_device((const uint8_t*)w.data, t3_pf_w, w.rows, w.cols, stm);
+                q27k::gemm_t2_T(t3_pf_w, (const __half*)w.scales, xqT, yout, w.rows, w.cols, T,
+                                stm, splitk_p());
+                break;
+            }
             case DType::F16:
                 q27k::gemm_f16_T((const __half*)w.data, xT, yout, w.rows, w.cols, T, stm);
                 break;
@@ -3880,9 +4245,18 @@ struct Engine {
     }
 
     void gdn_block_T(int il, int T) {
-        qxT(x1T, N_EMBD, T);
-        mmT(T2(il, "attn_qkv.weight"), x1T, qkvT, T);
-        mmT(T2(il, "attn_gate.weight"), x1T, zT, T);
+        if (bonsai2) {
+            // same split as gdn_block: folded qkv/gate read the rotated copy,
+            // unfolded alpha/beta (F16 GEMM reads the float rows) the raw one
+            CUDA_CHECK(cudaMemcpyAsync(bz_xrotT, x1T, (size_t)T * N_EMBD * 4,
+                                       cudaMemcpyDeviceToDevice, stm));
+            bz_rot_T(bz_xrotT, N_EMBD, T);
+            qxT(bz_xrotT, N_EMBD, T);
+        } else {
+            qxT(x1T, N_EMBD, T);
+        }
+        mmT(TP(il, "attn_qkv.weight"), x1T, qkvT, T);
+        mmT(TP(il, "attn_gate.weight"), x1T, zT, T);
         mmT(T2(il, "ssm_alpha.weight"), x1T, alphaT, T);
         mmT(T2(il, "ssm_beta.weight"), x1T, betarT, T);
         q27k::gdn_gates_T(alphaT, betarT, (const float*)T2(il, "ssm_a").data,
@@ -3895,20 +4269,33 @@ struct Engine {
         q27k::delta_scan_T(S[il], convT, gT, betaT, oT, T, stm, wy_p());
         q27k::gated_norm_gdn_T(oT, (const float*)T2(il, "ssm_norm.weight").data, zT, ogT,
                                GDN_HEADS, GDN_DIM, T, EPS, stm);
+        if (bonsai2) {
+            float* v = ogT;
+            if (bz_gdn_grouped) {
+                q27k::gdn_v_tiled_to_grouped_rows(ogT, bz_ogpT, GDN_DIM, GDN_HEADS / 3, 3, T,
+                                                  GDN_V, stm);
+                v = bz_ogpT;
+            }
+            bz_rot_T(v, GDN_V, T);
+            qxT(v, GDN_V, T);
+            mmT(TP(il, "ssm_out.weight"), v, yT, T);
+            return;
+        }
         qxT(ogT, GDN_V, T);
-        mmT(T2(il, "ssm_out.weight"), ogT, yT, T);
+        mmT(TP(il, "ssm_out.weight"), ogT, yT, T);
     }
 
     void attn_block_T(int il, int base, int T, void* const* kt, void* const* vt) {
         const int QROW = N_HEAD * 2 * HEAD_DIM, KVROW = N_KV * HEAD_DIM;
+        if (bonsai2 && il < N_LAYER) bz_rot_T(x1T, N_EMBD, T);
         qxT(x1T, N_EMBD, T);
         mmT_pf4(il, "attn_q.weight", x1T, qgT, T);
         q27k::rmsnorm_heads_T(qgT, (const float*)T2(il, "attn_q_norm.weight").data, qgT, N_HEAD,
                               HEAD_DIM, 2 * HEAD_DIM, QROW, T, EPS, stm);
-        mmT(T2(il, "attn_k.weight"), x1T, kT, T);
+        mmT(TP(il, "attn_k.weight"), x1T, kT, T);
         q27k::rmsnorm_heads_T(kT, (const float*)T2(il, "attn_k_norm.weight").data, kT, N_KV,
                               HEAD_DIM, HEAD_DIM, KVROW, T, EPS, stm);
-        mmT(T2(il, "attn_v.weight"), x1T, vT, T);
+        mmT(TP(il, "attn_v.weight"), x1T, vT, T);
         q27k::rope_neox_T(qgT, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, QROW, base, T, FREQ_BASE,
                           stm);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
@@ -3928,15 +4315,18 @@ struct Engine {
         if (kv_kind >= KV_T3)
             q27k::wht_T(attnT, N_HEAD, HEAD_DIM, HEAD_DIM, N_HEAD * HEAD_DIM, T, true, stm);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
+        if (bonsai2 && il < N_LAYER) bz_rot_T(attnT, N_HEAD * HEAD_DIM, T);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
         mmT_pf4(il, "attn_output.weight", attnT, yT, T);
     }
 
     void ffn_T(int il, int T) {
+        if (bonsai2 && il < N_LAYER) bz_rot_T(x1T, N_EMBD, T);
         qxT(x1T, N_EMBD, T);
         mmT_pf4(il, "ffn_gate.weight", x1T, ffnGT, T);
         mmT_pf4(il, "ffn_up.weight", x1T, ffnUT, T);
         q27k::silu_mul(ffnGT, ffnUT, ffnGT, (int64_t)T * N_FFN, stm);
+        if (bonsai2 && il < N_LAYER) bz_rot_T(ffnGT, N_FFN, T);
         qxT(ffnGT, N_FFN, T);
         mmT_pf4(il, "ffn_down.weight", ffnGT, yT, T);
     }
@@ -3950,8 +4340,8 @@ struct Engine {
     // compute change) -- prefill stays byte-identical when taps == nullptr.
     void prefill_chunk(const int* d_toks, int base, int T, float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks,
-                              N_EMBD, T, hT, stm);
+        embed_rows_T(emb, d_toks, T, hT);
+        if (bonsai2) bz_unrot_embed_T(hT, T);
         int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm_T(hT, (const float*)T2(il, "attn_norm.weight").data, x1T, N_EMBD, T,
@@ -3980,13 +4370,19 @@ struct Engine {
     // Warm the MTP KV cache for pairs (h(base+t), token[base+t+1]) -> stored at
     // position base+t+1. Only the K/V projections matter for warming; the MTP
     // attention/FFN outputs were always discarded here, so they are skipped.
+    // Q27_MTP_WARM=0: skip the prefill-time MTP KV warm (bisect lever, 2026-09-18:
+    // drafts then start cold -- acceptance drops, emitted text must not move).
+    static bool mtp_warm_on() {
+        static const bool on = [] { const char* e = getenv("Q27_MTP_WARM"); return !(e && atoi(e) == 0); }();
+        return on;
+    }
     void mtp_warm_T(const int* d_toks_next, int base, int T) {
         const int il = 64;
         const DevTensor& emb = dm.get("token_embd.weight");
         const int KVROW = N_KV * HEAD_DIM;
         // x1T currently holds output_norm(hT) (set by caller)
-        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks_next,
-                              N_EMBD, T, embT, stm);
+        embed_rows_T(emb, d_toks_next, T, embT);
+        if (bonsai2) bz_unrot_embed_T(embT, T); // rotated embedding rows
         q27k::rmsnorm_T(embT, (const float*)T2(il, "nextn.enorm.weight").data, ehnT, N_EMBD, T,
                         EPS, stm, N_EMBD, 2 * N_EMBD);
         q27k::rmsnorm_T(x1T, (const float*)T2(il, "nextn.hnorm.weight").data, ehnT + N_EMBD,
@@ -3996,10 +4392,10 @@ struct Engine {
         q27k::rmsnorm_T(xmtpT, (const float*)T2(il, "attn_norm.weight").data, x1T, N_EMBD, T,
                         EPS, stm);
         qxT(x1T, N_EMBD, T);
-        mmT(T2(il, "attn_k.weight"), x1T, kT, T);
+        mmT(TP(il, "attn_k.weight"), x1T, kT, T);
         q27k::rmsnorm_heads_T(kT, (const float*)T2(il, "attn_k_norm.weight").data, kT, N_KV,
                               HEAD_DIM, HEAD_DIM, KVROW, T, EPS, stm);
-        mmT(T2(il, "attn_v.weight"), x1T, vT, T);
+        mmT(TP(il, "attn_v.weight"), x1T, vT, T);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base + 1, T, FREQ_BASE,
                           stm);
         if (kv_kind >= KV_T3)
@@ -4703,6 +5099,7 @@ struct Engine {
             CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
             samp_first = true;
         }
+        plain_first = true;
         t.n_max = n_max;
         t.eos = eos;
         t.on_token = std::ref(on_token);
@@ -4964,6 +5361,9 @@ struct Engine {
             // rejection-verify twin; Q27_SAMPLE_PLAIN still forces the plain
             // sampler (the spec==non-spec distribution A/B lever).
             n = dflash2_round(em, t.sampling);
+        } else if (!has_mtp) {
+            // no MTP block (Bonsai 2): nothing to draft with -- plain rounds
+            n = t.sampling ? sample_round(em) : plain_round(em);
         } else {
             n = t.sampling ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
                            : spec_round(em);
@@ -4992,12 +5392,14 @@ struct Engine {
         // takes the slot over. Q27_MAXD_RESET=1 is the stricter
         // every-request reset.
         if (maxd_auto && maxd_reset) dctl.reset();
-        // Suffix drafter: rebuild the match index over this request's full
-        // prompt (multi-turn re-renders arrive whole, so reset covers
-        // history). ~2-4ms host at 25K tokens, once per request, off the
-        // decode path. sfx_valid arms after round 1 (host learns pending).
+        // Suffix drafter: bring the match index to this request's full
+        // prompt (multi-turn re-renders arrive whole). sync() keeps the index
+        // of the prefix this slot's stream shares with the prompt and indexes
+        // only the rest -- identical to a rebuild (test_suffixdraft), 0.2 ms
+        // instead of 2-34 ms at 32-200K tokens, which sat on the TTFT path.
+        // sfx_valid arms after round 1 (host learns pending).
         if (suffix_on) {
-            sfx.reset(prompt);
+            sfx.sync(prompt);
             sfx_valid = false;
         }
         // DFlash2 ring alignment happens once the prefix hit is known (both
@@ -5263,7 +5665,7 @@ struct Engine {
                 // DFlash2 engine then carry unwarmed MTP rows -- a ladder
                 // config must never restore from a DFlash2 root (the launch
                 // script's ladder mode has no cache; keep it that way).
-                if (!d2_on) mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                if (!d2_on && has_mtp && mtp_warm_on()) mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
@@ -5327,7 +5729,7 @@ struct Engine {
                     CUDA_CHECK(cudaMemcpyAsync(x1, x1T + (size_t)(Tc - 1) * N_EMBD, (size_t)N_EMBD * 4,
                                                cudaMemcpyDeviceToDevice, stm));
                 // MTP warm needs each row's successor token; NP-1 has none
-                if (!d2_on && Tc - (has_last ? 1 : 0) > 0)
+                if (!d2_on && has_mtp && mtp_warm_on() && Tc - (has_last ? 1 : 0) > 0)
                     mtp_warm_T(d_prompt + c0 + 1, c0, Tc - (has_last ? 1 : 0)); // see above
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
@@ -5341,7 +5743,8 @@ struct Engine {
             if (fold_last) {
                 // token_launches' tail on the batched row: head, greedy next
                 // token, position/record advance (d_pos -> NP, d_gen[NP-1]).
-                qx(x1, N_EMBD);
+                if (bonsai2) q27k::rotq(x1, bz_s5120, N_EMBD, xq, stm);
+                else qx(x1, N_EMBD);
                 mm(dm.get("output.weight"), x1, logits);
                 q27k::argmax(logits, VOCAB, d_token, d_amax, stm);
                 q27k::advance(d_pos, d_step, d_gen, d_token, stm);

@@ -5,6 +5,7 @@
 
 #include "cuda_common.h"
 #include "device_model.h"
+#include "kernels.cuh"
 
 namespace q27 {
 
@@ -27,6 +28,7 @@ static unsigned long long host_xsum(const void* p, size_t bytes) {
     for (size_t i = 0; i < bytes % 8; i++) t |= (unsigned long long)tail[i] << (8 * i);
     return s + t;
 }
+static unsigned long long xsum_dev(const void* p, uint64_t bytes, unsigned long long* d_out);
 
 const DevTensor& DeviceModel::upload(const std::string& name) {
     auto it = dev_.find(name);
@@ -39,7 +41,15 @@ const DevTensor& DeviceModel::upload(const std::string& name) {
     d.dtype = src.dtype;
     d.rows = src.rows();
     d.cols = src.cols();
-    CUDA_CHECK(cudaMalloc(&d.data, src.data_size));
+    // T3_G128: the device copy is a different (and differently sized) layout
+    // (kernels.cuh t3_relayout_device); the FORMAT.md bytes land in a
+    // transient buffer first so the transfer itself is still summed.
+    const bool t3 = d.dtype == DType::T3_G128;
+    const uint64_t dev_bytes = t3 ? q27k::t3_device_bytes(d.rows, d.cols) : src.data_size;
+    void* raw = nullptr;
+    CUDA_CHECK(cudaMalloc(&d.data, dev_bytes));
+    if (t3) CUDA_CHECK(cudaMalloc(&raw, src.data_size));
+    else raw = d.data;
     // read the source bytes on the CPU immediately before handing them to the
     // copy engine, so the two totals describe the same load
     if (want_host_sum_) {
@@ -47,9 +57,31 @@ const DevTensor& DeviceModel::upload(const std::string& name) {
         host_sum_ += hs;
         host_sums_[name] = hs;
     }
-    CUDA_CHECK(cudaMemcpy(d.data, src.data, src.data_size, cudaMemcpyHostToDevice));
-    bytes_ += src.data_size;
-    d.data_bytes = src.data_size;
+    CUDA_CHECK(cudaMemcpy(raw, src.data, src.data_size, cudaMemcpyHostToDevice));
+    if (d.dtype == DType::T2_G128) {
+        // the device copy uses the dp4a-interleaved word order (kernels.cuh);
+        // the host bytes stay FORMAT.md-sequential (checksums, CPU references)
+        q27k::t2_interleave_device((uint8_t*)d.data, src.data_size);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } else if (t3) {
+        if (want_host_sum_) {
+            // the transfer check T2/Q4 get from [locate]: the raw bytes on the
+            // device must sum to the host total before the relayout consumes them
+            unsigned long long* d_out;
+            CUDA_CHECK(cudaMalloc(&d_out, 8));
+            const unsigned long long ds = xsum_dev(raw, src.data_size, d_out);
+            CUDA_CHECK(cudaFree(d_out));
+            if (ds != host_sums_[name])
+                fprintf(stderr, "[upload] T3 transfer MISMATCH tensor=%s host=%llx dev=%llx\n",
+                        name.c_str(), host_sums_[name], ds);
+        }
+        q27k::t3_relayout_device((const uint8_t*)raw, (uint8_t*)d.data, (int64_t)d.rows,
+                                 (int64_t)d.cols);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(raw));
+    }
+    bytes_ += dev_bytes;
+    d.data_bytes = dev_bytes;
     if (src.scales) {
         CUDA_CHECK(cudaMalloc(&d.scales, src.scales_size));
         if (want_host_sum_) host_sum_ += host_xsum(src.scales, src.scales_size);
@@ -110,6 +142,10 @@ int DeviceModel::locate_upload_errors() const {
         const DevTensor& t = *by_addr[k].second;
         auto hit = host_sums_.find(name);
         if (hit == host_sums_.end()) continue;
+        // T2/T3 device copies are relaid at upload (kernels.cuh), so their
+        // bytes never equal the host bytes; T3's transfer is checked inline in
+        // upload() instead, T2's is not checked here.
+        if (t.dtype == DType::T2_G128 || t.dtype == DType::T3_G128) continue;
         const unsigned long long ds = xsum_dev(t.data, t.data_bytes, d_out);
         if (ds == hit->second) continue;
         bad++;

@@ -11,6 +11,12 @@
 #            verify, NO prefix cache (every first turn and every returning turn
 #            after a side request re-prefills cold)
 #   ladder   the pre-09-08 production config (MTP ladder + suffix drafter)
+#   bonsai2  the d2-pfx config serving PrismML's Ternary Bonsai 2 27B
+#            (docs/plans/2026-09-18-bonsai2-ternary.md; BONSAI2_MODEL overrides
+#            the artifact). The pack has no MTP block, so DFlash2 is the only
+#            drafter; its cache root is its own (different numerics), and the
+#            t2 artifact needs the 5090 (22.4 GB resident until the T2 prefill
+#            GEMM drops the .q4x shadows).
 # Extra `-E K=V` after the mode are passed to systemd-run (e.g. -E Q27_SYSBLK=1).
 set -euo pipefail
 Q=/mnt/ai/projects/q27
@@ -52,7 +58,19 @@ case "$mode" in
   d2-pfx)  mkdir -p "$PFX_DIR"
            systemd-run --user --unit q27-38 $D2ENV $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS $PFXARGS ;;
   ladder)  systemd-run --user --unit q27-38 -E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS ;;
-  *) echo "usage: $0 d2|d2-pfx|ladder [-E K=V ...]" >&2; exit 2 ;;
+  bonsai2) MODEL=${BONSAI2_MODEL:-/mnt/ai/models/bonsai2-27b/q27/bonsai2-27b-t2.q27}
+           # the Bonsai-trained DFlash2 drafter (ProCreations, repacked by
+           # tools/dflash2_pack.py --q8): 3.80 vs 3.47 tok/round over the Qwen3.8
+           # pack, 227.7 vs 178.8 t/s aggregate over the MTP ladder on the
+           # single-slot campaign (BUILDLOG 2026-09-18 (as), (au)). Multi-slot
+           # wants the T2+MTP pack instead (BONSAI2_MODEL=...t2-mtp.q27 with
+           # Q27_BATCH=1 and no Q27_DFLASH2).
+           BZPACK=${BONSAI2_PACK:-/mnt/ai/models/bonsai2-27b-dflash2-bf16/bonsai2-dflash2-q8-serve.d2w}
+           BZD2ENV="-E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 -E Q27_BATCH=0 -E Q27_DFLASH2=$BZPACK -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_D2_TIMING=1"
+           PFX_DIR=${PFX_DIR_BONSAI2:-/dev/shm/q27-pfx-bonsai2}; mkdir -p "$PFX_DIR"
+           PFXARGS="--prefix-cache $PFX_DIR --prefix-cache-max-gb ${PFX_MAX_GB:-40} --prefix-cache-ram-gb ${PFX_RAM_GB:-0} --prefix-cache-max-tokens ${PFX_MAX_TOK:-65536}"
+           systemd-run --user --unit q27-38 $BZD2ENV $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS $PFXARGS ;;
+  *) echo "usage: $0 d2|d2-pfx|ladder|bonsai2 [-E K=V ...]" >&2; exit 2 ;;
 esac
 # readiness: key on THIS invocation (a --since window can match the previous
 # unit's line) and on the listener ("listening on"); the DFlash2 "serving ON"

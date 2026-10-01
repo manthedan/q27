@@ -212,10 +212,17 @@ int main(int argc, char** argv) {
                                  ? "output_q4.weight"
                                  : "output.weight";
             const DevTensor& hw = e.dm.get(vh);
-            d2.set_engine_head(hw.data, (const __half*)hw.scales,
-                               hw.dtype == DType::Q4_G64);
+            d2.set_engine_head(hw.data, (const __half*)hw.scales, d2_head_kind(hw.dtype));
             fprintf(stderr, "dflash2: engine head (%s)\n", vh);
         }
+        {
+            // serving packs drop target.embed/target.head: use the engine's Q8
+            // embedding like the server does (Bonsai: inverse-rotated inside)
+            const DevTensor& ew = e.dm.get("token_embd.weight");
+            d2.set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales,
+                                ew.dtype == DType::T2_G128 ? 2 : 0);
+        }
+        if (e.bonsai2) d2.set_bonsai2_signs(e.bz_s5120); // rotated embed table + folded head
         float* d_vtaps;
         CUDA_CHECK(cudaMalloc((void**)&d_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
         // prompt: eager tapped steps, ingest each committed position
@@ -342,6 +349,7 @@ int main(int argc, char** argv) {
             e.prefill_chunk(d_toks + depth, depth, TT);
             if (with_head) {
                 q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, TT, EPS, e.stm);
+                if (e.bonsai2) e.bz_rot_T(e.x1T, N_EMBD, TT); // Bonsai 2: head input is folded
                 e.qxT(e.x1T, N_EMBD, TT);
                 e.mmT(head, e.x1T, d_lg, TT);
             }
@@ -919,6 +927,7 @@ int main(int argc, char** argv) {
                 const int T = std::min(PT, N - c0);
                 e.prefill_chunk(d_toks + c0, c0, T);
                 q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                if (e.bonsai2) e.bz_rot_T(e.x1T, N_EMBD, T); // Bonsai 2: head input is folded
                 e.qxT(e.x1T, N_EMBD, T);
                 e.mmT(head, e.x1T, d_lg, T);
                 const int nrows = std::min(T, N - 1 - c0);
@@ -1000,6 +1009,7 @@ int main(int argc, char** argv) {
                 int T = std::min(PT, N - c0);
                 e.prefill_chunk(d_toks + c0, c0, T);
                 q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                if (e.bonsai2) e.bz_rot_T(e.x1T, N_EMBD, T); // Bonsai 2: head input is folded
                 e.qxT(e.x1T, N_EMBD, T);
                 e.mmT(head, e.x1T, d_lg, T);
                 int nrows = std::min(T, N - 1 - c0);
@@ -1075,6 +1085,7 @@ int main(int argc, char** argv) {
                     int T = std::min(PT, C - c0);
                     e.prefill_chunk(d_toks + c0, c0, T);
                     q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                    if (e.bonsai2) e.bz_rot_T(e.x1T, N_EMBD, T); // Bonsai 2: head input is folded
                     e.qxT(e.x1T, N_EMBD, T);
                     e.mmT(head, e.x1T, d_lg, T);
                     int nrows = std::min(T, C - 1 - c0);
@@ -1188,8 +1199,7 @@ int main(int argc, char** argv) {
         e.reset();
         const DevTensor& emb = e.dm.get("token_embd.weight");
         CUDA_CHECK(cudaMemcpy(e.d_token, &tok0, 4, cudaMemcpyHostToDevice));
-        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, e.d_token,
-                           N_EMBD, e.h, e.stm);
+        e.embed_row(emb, e.d_token, e.h, e.stm);
         q27k::rmsnorm(e.h, (const float*)e.T(0, "attn_norm.weight").data, e.x1, N_EMBD, EPS,
                       e.stm);
         e.gdn_block(0, e.x1, e.y);
@@ -1202,8 +1212,7 @@ int main(int argc, char** argv) {
         // batched layer 0, T=1
         e.reset();
         CUDA_CHECK(cudaMemcpy(e.d_token, &tok0, 4, cudaMemcpyHostToDevice));
-        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, e.d_token,
-                              N_EMBD, 1, e.hT, e.stm);
+        e.embed_rows_T(emb, e.d_token, 1, e.hT);
         q27k::rmsnorm_T(e.hT, (const float*)e.T(0, "attn_norm.weight").data, e.x1T, N_EMBD, 1,
                         EPS, e.stm);
         e.gdn_block_T(0, 1);
@@ -1253,7 +1262,7 @@ int main(int argc, char** argv) {
         e.reset();
         for (int i = 0; i < T; i++) {
             e.step_with(prompt[i]);
-            if (i + 1 < T) {
+            if (i + 1 < T && e.has_mtp) {
                 CUDA_CHECK(cudaStreamSynchronize(e.stm));
                 CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4,
                                            cudaMemcpyDeviceToDevice, e.stm));
@@ -1284,7 +1293,7 @@ int main(int argc, char** argv) {
             return out;
         };
         auto s_kc = grabh(false, 0, T);
-        auto s_mk = grabh(false, e.kv_mtp_pair(), T);
+        auto s_mk = e.has_mtp ? grabh(false, e.kv_mtp_pair(), T) : std::vector<float>();
         // pass 2: batched (chunked prefill only, no final serial token)
         e.reset();
         if (e.d_prompt_cap < N) {
@@ -1298,7 +1307,7 @@ int main(int argc, char** argv) {
             e.prefill_chunk(e.d_prompt + c0, c0, Tc);
             q27k::rmsnorm_T(e.hT, (const float*)e.dm.get("output_norm.weight").data, e.x1T,
                             N_EMBD, Tc, EPS, e.stm);
-            e.mtp_warm_T(e.d_prompt + c0 + 1, c0, Tc);
+            if (e.has_mtp) e.mtp_warm_T(e.d_prompt + c0 + 1, c0, Tc);
         }
         CUDA_CHECK(cudaStreamSynchronize(e.stm));
         int lastrow = (T - 1) % Engine::PF_T;
@@ -1307,13 +1316,13 @@ int main(int argc, char** argv) {
         auto b_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
         auto b_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
         auto b_kc = grabh(false, 0, T);
-        auto b_mk = grabh(false, e.kv_mtp_pair(), T);
+        auto b_mk = e.has_mtp ? grabh(false, e.kv_mtp_pair(), T) : std::vector<float>();
         printf("h(last):"); maxdiff(s_h, b_h); printf("\n");
         printf("S[0]   :"); maxdiff(s_S0, b_S0); printf("\n");
         printf("S[62]  :"); maxdiff(s_S62, b_S62); printf("\n");
         printf("ring[0]:"); maxdiff(s_ring0, b_ring0); printf("\n");
         printf("kcache :"); maxdiff(s_kc, b_kc); printf("\n");
-        printf("mtp_k  :"); maxdiff(s_mk, b_mk); printf("\n");
+        if (e.has_mtp) { printf("mtp_k  :"); maxdiff(s_mk, b_mk); printf("\n"); }
         return 0;
     }
 

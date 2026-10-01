@@ -237,7 +237,7 @@ static __device__ __forceinline__ void mma_s8_acc(int& d0, int& d1, int& d2, int
 // decode path's per-32) -- gated by tolerance + PPL + canonical instead of
 // the pf-identity gate (policy sign-off 2026-07-04). XG64=false is the exact
 // legacy path, bit-identical to the pre-regroup kernel.
-template <bool Q4IN, bool XG64, int NT>
+template <int DT, bool XG64, int NT>
 // tmp: split-K partial buffer (nsp slices of T*rows). When gridDim.z==1 the
 // kernel is byte-identical to the pre-split path (writes acc straight to y,
 // tmp untouched). When gridDim.z>1 each z-block owns a contiguous stage range
@@ -249,6 +249,7 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
                              const int8_t* __restrict__ nat, const float* __restrict__ xs,
                              float* __restrict__ y, float* __restrict__ tmp, int64_t rows,
                              int64_t cols, int T) {
+    constexpr bool Q4IN = DT == 1, T2IN = DT == 2; // 0 Q8, 1 Q4, 2 T2 (Bonsai 2 Phase 3)
     constexpr int MR = 64, KS = 128;  // block tile: rows, staged K (NT = token tile, templated)
     constexpr int XGS = XG64 ? 64 : 32;         // activation quant group
     constexpr int XSC = KS / XGS;               // x-scales per token per stage
@@ -296,7 +297,7 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
     // was latency-bound, not BW-bound). Per-thread slice: 4 (Q4) / 8 (Q8)
     // weight u32 + 4 activation u32 + 2 predicated scale floats. The Q4
     // nibble unpack happens at the reg->smem store, off the load path.
-    constexpr int WLD = Q4IN ? MR * (KS / 2) / 4 / 256 : MR * KS / 4 / 256;
+    constexpr int WLD = Q4IN ? MR * (KS / 2) / 4 / 256 : T2IN ? MR * (KS / 4) / 4 / 256 : MR * KS / 4 / 256;
     constexpr int XLD = NT * KS / 4 / 256;
     constexpr int XSL = (NT * XSC + 255) / 256; // x-scale slices (can exceed 256 threads)
     const int tid = threadIdx.x;
@@ -314,6 +315,15 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
                 rw[i] = r0 + rr < rows
                             ? __ldg((const uint32_t*)(W + (r0 + rr) * (cols / 2) + k0 / 2) + pb4)
                             : 0x88888888u; // unpacks to 0 after -8
+            }
+        } else if (T2IN) {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid;
+                int rr = idx / (KS / 16), u = idx % (KS / 16); // 8 u32 of 16 codes per row
+                rw[i] = r0 + rr < rows
+                            ? __ldg((const uint32_t*)(W + (r0 + rr) * (cols / 4) + k0 / 4) + u)
+                            : 0x55555555u; // code 1 -> 0 after -1
             }
         } else {
 #pragma unroll
@@ -369,6 +379,26 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
                 const uint32_t lo = p & 0x0F0F0F0Fu, hi = (p >> 4) & 0x0F0F0F0Fu;
                 *(uint32_t*)dst = __vsub4(__byte_perm(lo, hi, 0x5140), 0x08080808u);
                 *(uint32_t*)(dst + 4) = __vsub4(__byte_perm(lo, hi, 0x7362), 0x08080808u);
+            }
+        } else if (T2IN) {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid;
+                int rr = idx / (KS / 16), u = idx % (KS / 16);
+                // one interleaved T2 word (t2_interleave_device order: field
+                // 4b+{0,1,2,3} = e[2b], e[2b+1], e[8+2b], e[9+2b]) -> 16
+                // sequential s8 with the -1 folded in: the four masked
+                // extractions are the even/odd halves of each 8-run and
+                // __byte_perm re-interleaves them (vgemm's unpack_t2). LDW
+                // and u*16 are 16B multiples, so one STS.128.
+                const uint32_t w = rw[i], M = 0x03030303u;
+                const uint32_t A = w & M, B = (w >> 2) & M, C = (w >> 4) & M, D = (w >> 6) & M;
+                uint4 o;
+                o.x = __vsub4(__byte_perm(A, B, 0x5140), 0x01010101u);
+                o.y = __vsub4(__byte_perm(A, B, 0x7362), 0x01010101u);
+                o.z = __vsub4(__byte_perm(C, D, 0x5140), 0x01010101u);
+                o.w = __vsub4(__byte_perm(C, D, 0x7362), 0x01010101u);
+                *(uint4*)(s_w + rr * LDW + u * 16) = o;
             }
         } else {
 #pragma unroll
@@ -507,10 +537,11 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
 // on ffn_gate T=1024 vs the MR=64 kernel. Per-output FP accumulation order is
 // identical to k_gemm_mma_T -> BITWISE. No split-K: this path serves the
 // SATURATED large-T grid, the opposite regime from split-K's underfill.
-template <bool Q4IN, int NT>
+template <int DT, int NT>
 __global__ void k_gemm_mma_ntx(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                                const int8_t* __restrict__ nat, const float* __restrict__ xs,
                                float* __restrict__ y, int64_t rows, int64_t cols, int T) {
+    constexpr bool Q4IN = DT == 1, T2IN = DT == 2;
     constexpr int MR = 128, KS = 128, XGS = 64, XSC = KS / XGS, TS = NT / 16, LDW = KS + 16,
                   LDX = KS + 16;
     extern __shared__ unsigned char smem_raw[];
@@ -528,7 +559,7 @@ __global__ void k_gemm_mma_ntx(const uint8_t* __restrict__ W, const __half* __re
     for (int m = 0; m < 2; m++)
         for (int s = 0; s < TS; s++)
             for (int e = 0; e < 4; e++) acc[m][s][e] = 0.f;
-    constexpr int WLD = Q4IN ? MR * (KS / 2) / 4 / 256 : MR * KS / 4 / 256;
+    constexpr int WLD = Q4IN ? MR * (KS / 2) / 4 / 256 : T2IN ? MR * (KS / 4) / 4 / 256 : MR * KS / 4 / 256;
     constexpr int XLD = NT * KS / 4 / 256;
     constexpr int XSL = (NT * XSC + 255) / 256;
     const int tid = threadIdx.x;
@@ -544,6 +575,15 @@ __global__ void k_gemm_mma_ntx(const uint8_t* __restrict__ W, const __half* __re
                 rw[i] = r0 + rr < rows
                             ? __ldg((const uint32_t*)(W + (r0 + rr) * (cols / 2) + k0 / 2) + pb4)
                             : 0x88888888u;
+            }
+        } else if (T2IN) {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid;
+                int rr = idx / (KS / 16), u = idx % (KS / 16); // 8 u32 of 16 codes per row
+                rw[i] = r0 + rr < rows
+                            ? __ldg((const uint32_t*)(W + (r0 + rr) * (cols / 4) + k0 / 4) + u)
+                            : 0x55555555u; // code 1 -> 0 after -1
             }
         } else {
 #pragma unroll
@@ -585,6 +625,26 @@ __global__ void k_gemm_mma_ntx(const uint8_t* __restrict__ W, const __half* __re
                 const uint32_t p = rw[i], lo = p & 0x0F0F0F0Fu, hi = (p >> 4) & 0x0F0F0F0Fu;
                 *(uint32_t*)dst = __vsub4(__byte_perm(lo, hi, 0x5140), 0x08080808u);
                 *(uint32_t*)(dst + 4) = __vsub4(__byte_perm(lo, hi, 0x7362), 0x08080808u);
+            }
+        } else if (T2IN) {
+#pragma unroll
+            for (int i = 0; i < WLD; i++) {
+                int idx = i * 256 + tid;
+                int rr = idx / (KS / 16), u = idx % (KS / 16);
+                // one interleaved T2 word (t2_interleave_device order: field
+                // 4b+{0,1,2,3} = e[2b], e[2b+1], e[8+2b], e[9+2b]) -> 16
+                // sequential s8 with the -1 folded in: the four masked
+                // extractions are the even/odd halves of each 8-run and
+                // __byte_perm re-interleaves them (vgemm's unpack_t2). LDW
+                // and u*16 are 16B multiples, so one STS.128.
+                const uint32_t w = rw[i], M = 0x03030303u;
+                const uint32_t A = w & M, B = (w >> 2) & M, C = (w >> 4) & M, D = (w >> 6) & M;
+                uint4 o;
+                o.x = __vsub4(__byte_perm(A, B, 0x5140), 0x01010101u);
+                o.y = __vsub4(__byte_perm(A, B, 0x7362), 0x01010101u);
+                o.z = __vsub4(__byte_perm(C, D, 0x5140), 0x01010101u);
+                o.w = __vsub4(__byte_perm(C, D, 0x7362), 0x01010101u);
+                *(uint4*)(s_w + rr * LDW + u * 16) = o;
             }
         } else {
 #pragma unroll
@@ -784,15 +844,16 @@ static int prefill_nt() {
     return e ? atoi(e) : 0;
 }
 
-template <bool Q4IN, bool XG64, int NT>
+template <int DT, bool XG64, int NT>
 static void launch_gemm_nt(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
                            int64_t rows, int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     constexpr int MR = 64, KS = 128, LDW = KS + 16, LDX = KS + 16;
     constexpr int XSC = XG64 ? 2 : 4;
+    constexpr bool Q4IN = DT == 1; // only the Q4 leg carries two 64-scales per stage
     const size_t SM = (size_t)MR * LDW + (size_t)NT * LDX + (MR * (Q4IN ? 2 : 1) + NT * XSC) * 4;
-    static bool attr = false; // per-<Q4IN,XG64,NT> instantiation
+    static bool attr = false; // per-<DT,XG64,NT> instantiation
     if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_mma_T<Q4IN, XG64, NT>,
+        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_mma_T<DT, XG64, NT>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
         attr = true;
     }
@@ -818,7 +879,7 @@ static void launch_gemm_nt(const uint8_t* W, const __half* S, const XQuant& xq, 
         }
     }
     float* tmp = nsp > 1 ? sk->buf : nullptr;
-    k_gemm_mma_T<Q4IN, XG64, NT><<<grid, 256, SM, st>>>(
+    k_gemm_mma_T<DT, XG64, NT><<<grid, 256, SM, st>>>(
         W, S, XG64 ? xq.nat64 : xq.nat, XG64 ? xq.s64 : xq.scale, y, tmp, rows, cols, T);
     CUDA_CHECK(cudaGetLastError());
     if (nsp > 1) {
@@ -830,25 +891,26 @@ static void launch_gemm_nt(const uint8_t* W, const __half* S, const XQuant& xq, 
     }
 }
 
-template <bool Q4IN, int NT>
+template <int DT, int NT>
 static void launch_gemm_ntx(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
                             int64_t rows, int64_t cols, int T, cudaStream_t st) {
     constexpr int MR = 128, KS = 128, LDW = KS + 16, LDX = KS + 16, XSC = 2;
+    constexpr bool Q4IN = DT == 1;
     const size_t SM = (size_t)MR * LDW + (size_t)NT * LDX + (MR * (Q4IN ? 2 : 1) + NT * XSC) * 4;
     static bool attr = false;
     if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_mma_ntx<Q4IN, NT>,
+        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_mma_ntx<DT, NT>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
         attr = true;
     }
     dim3 grid((unsigned)((T + NT - 1) / NT), (unsigned)((rows + MR - 1) / MR));
     static bool announced = false;
     if (!announced && getenv("Q27_PF_NTX_DBG")) {
-        fprintf(stderr, "ntx: engaged (first fire Q4=%d NT=%d T=%d rows=%ld)\n", (int)Q4IN, NT, T,
+        fprintf(stderr, "ntx: engaged (first fire DT=%d NT=%d T=%d rows=%ld)\n", DT, NT, T,
                 (long)rows);
         announced = true;
     }
-    k_gemm_mma_ntx<Q4IN, NT><<<grid, 256, SM, st>>>(W, S, xq.nat64, xq.s64, y, rows, cols, T);
+    k_gemm_mma_ntx<DT, NT><<<grid, 256, SM, st>>>(W, S, xq.nat64, xq.s64, y, rows, cols, T);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -864,7 +926,7 @@ static bool prefill_ntx() {
 // prefix-cache suffix or short prompt runs at 1.5-3x (measured, ffn_gate Q4).
 // NT is BITWISE-invariant (same per-output FP accumulation order), so this only
 // changes speed. Prefill is not graph-captured, so the launch-time choice is free.
-template <bool Q4IN, bool XG64>
+template <int DT, bool XG64>
 static void launch_gemm_mma_x(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
                               int64_t rows, int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     constexpr int KS = 128;
@@ -881,33 +943,33 @@ static void launch_gemm_mma_x(const uint8_t* W, const __half* S, const XQuant& x
         if (nt == 0 && prefill_ntx() && cur_sm_major() >= 12 && T >= 96 && xq.nat64) {
             int64_t blk = (int64_t)((T + 127) / 128) * ((rows + 63) / 64);
             if (blk >= 2 * (int64_t)cur_nsm()) {
-                launch_gemm_ntx<Q4IN, 96>(W, S, xq, y, rows, cols, T, st);
+                launch_gemm_ntx<DT, 96>(W, S, xq, y, rows, cols, T, st);
                 return;
             }
         }
     }
     if (nt == 0) nt = T <= 16 ? 16 : T <= 32 ? 32 : T <= 64 ? 64 : 128;
     switch (nt) {
-        case 16: launch_gemm_nt<Q4IN, XG64, 16>(W, S, xq, y, rows, cols, T, st, sk); break;
-        case 32: launch_gemm_nt<Q4IN, XG64, 32>(W, S, xq, y, rows, cols, T, st, sk); break;
-        case 64: launch_gemm_nt<Q4IN, XG64, 64>(W, S, xq, y, rows, cols, T, st, sk); break;
-        default: launch_gemm_nt<Q4IN, XG64, 128>(W, S, xq, y, rows, cols, T, st, sk); break;
+        case 16: launch_gemm_nt<DT, XG64, 16>(W, S, xq, y, rows, cols, T, st, sk); break;
+        case 32: launch_gemm_nt<DT, XG64, 32>(W, S, xq, y, rows, cols, T, st, sk); break;
+        case 64: launch_gemm_nt<DT, XG64, 64>(W, S, xq, y, rows, cols, T, st, sk); break;
+        default: launch_gemm_nt<DT, XG64, 128>(W, S, xq, y, rows, cols, T, st, sk); break;
     }
 }
 
-template <bool Q4IN>
+template <int DT>
 static void launch_gemm_mma(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
                             int64_t rows, int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     if (prefill_xg64() && xq.nat64)
-        launch_gemm_mma_x<Q4IN, true>(W, S, xq, y, rows, cols, T, st, sk);
+        launch_gemm_mma_x<DT, true>(W, S, xq, y, rows, cols, T, st, sk);
     else
-        launch_gemm_mma_x<Q4IN, false>(W, S, xq, y, rows, cols, T, st, sk);
+        launch_gemm_mma_x<DT, false>(W, S, xq, y, rows, cols, T, st, sk);
 }
 
 void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     if (prefill_use_mma()) {
-        launch_gemm_mma<true>(W, S, xq, y, rows, cols, T, st, sk);
+        launch_gemm_mma<1>(W, S, xq, y, rows, cols, T, st, sk);
         return;
     }
     constexpr int TB = 32, CS = 32, RB = 16;
@@ -929,7 +991,7 @@ void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, in
 void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     if (prefill_use_mma()) {
-        launch_gemm_mma<false>((const uint8_t*)W, S, xq, y, rows, cols, T, st, sk);
+        launch_gemm_mma<0>((const uint8_t*)W, S, xq, y, rows, cols, T, st, sk);
         return;
     }
     constexpr int TB = 32, CS = 32, RB = 16;
@@ -946,6 +1008,22 @@ void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int
         k_gemm_q8_T<TB, CS><<<grid, RB * 32, SM, st>>>(W, S, xq.nat, xq.scale, y, rows, cols, T,
                                                        t0);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// T2_G128 (Bonsai 2 Phase 3): the MMA staging unpacks the interleaved 2-bit
+// words to s8 (code-1) the way the Q4 leg unpacks nibbles (nibble-8), and the
+// per-128 scale rides Q8's slot. A ternary matrix packed as exact Q4 (nibble =
+// trit+8, both 64-scales = d) therefore produces BITWISE the same output
+// through gemm_q4_T -- that identity is the gate (test_kernels
+// test_gemm_t2_shadow; Q27_T2_PF_SHADOW=1 on a served t2+q4x pack). No dp4a
+// leg: Q27_PREFILL=dp4a is refused for T2 rather than silently served by MMA.
+void gemm_t2_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
+               int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
+    if (!prefill_use_mma()) {
+        fprintf(stderr, "gemm_t2_T: T2_G128 prefill has no dp4a leg (Q27_PREFILL=dp4a)\n");
+        exit(1);
+    }
+    launch_gemm_mma<2>(W, S, xq, y, rows, cols, T, st, sk);
 }
 
 // Fixed split-K partial buffer, sized once at engine init (no mid-serving
@@ -1066,6 +1144,25 @@ __global__ void k_embed_rows_q8_T(const int8_t* __restrict__ emb, const __half* 
         out[(size_t)t * cols + i] = (float)row[i] * __half2float(sr[i / 128]);
 }
 
+__global__ void k_embed_rows_t2_T(const uint8_t* __restrict__ emb, const __half* __restrict__ sc,
+                                  const int* __restrict__ toks, int cols, float* __restrict__ out) {
+    int t = blockIdx.y;
+    int tok = toks[t];
+    const uint8_t* row = emb + (size_t)tok * (cols / 4);
+    const __half* sr = sc + (size_t)tok * (cols / 128);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < cols; i += gridDim.x * blockDim.x) {
+        const uint32_t w = ((const uint32_t*)row)[i >> 4];
+        const int j = i & 15;
+        const int f = j < 8 ? 4 * (j >> 1) + (j & 1) : 4 * ((j - 8) >> 1) + 2 + ((j - 8) & 1);
+        out[(size_t)t * cols + i] = (float)((int)((w >> (2 * f)) & 3u) - 1) * __half2float(sr[i >> 7]);
+    }
+}
+void embed_rows_t2_T(const uint8_t* emb, const __half* scales, const int* toks, int cols, int T,
+                     float* out, cudaStream_t st) {
+    dim3 grid(20, T);
+    k_embed_rows_t2_T<<<grid, 256, 0, st>>>(emb, scales, toks, cols, out);
+    CUDA_CHECK(cudaGetLastError());
+}
 void embed_rows_q8_T(const int8_t* emb, const __half* scales, const int* toks, int cols, int T,
                      float* out, cudaStream_t st) {
     dim3 grid(20, T);

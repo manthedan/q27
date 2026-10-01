@@ -7,14 +7,15 @@
 int main() {
     using q27::DType;
 
-    for (DType dtype : {DType::F32, DType::F16, DType::Q8_G128, DType::Q4_G64}) {
+    for (DType dtype : {DType::F32, DType::F16, DType::Q8_G128, DType::Q4_G64,
+                        DType::T2_G128, DType::T3_G128}) {
         if (!q27::cuda_weight_dtype_supported(dtype)) {
             std::fprintf(stderr, "CUDA-compatible dtype rejected: %s\n",
                          q27::dtype_name(dtype));
             return 1;
         }
     }
-    for (DType dtype : {DType::T2_G128, DType::T3_G128, DType::B1_G128}) {
+    for (DType dtype : {DType::B1_G128}) {
         if (q27::cuda_weight_dtype_supported(dtype)) {
             std::fprintf(stderr, "CUDA-unsupported packed dtype accepted: %s\n",
                          q27::dtype_name(dtype));
@@ -37,7 +38,7 @@ int main() {
 
     q27::Tensor packed;
     packed.name = "blk.0.ffn_gate.weight";
-    packed.dtype = DType::T2_G128;
+    packed.dtype = DType::B1_G128;
     model.index.emplace(packed.name, model.tensors.size());
     model.tensors.push_back(packed);
     bool packed_rejected = false;
@@ -45,7 +46,7 @@ int main() {
         q27::validate_cuda_model(model);
     } catch (const std::runtime_error& error) {
         packed_rejected = std::string(error.what()).find(
-            "unsupported weight dtype T2_G128") != std::string::npos;
+            "unsupported weight dtype B1_G128") != std::string::npos;
     }
     if (!packed_rejected) {
         std::fputs("CUDA-unsupported packed model was accepted\n", stderr);
@@ -56,7 +57,7 @@ int main() {
         q27::validate_cuda_tensor(packed);
     } catch (const std::runtime_error& error) {
         selective_packed_rejected = std::string(error.what()).find(
-            "unsupported weight dtype T2_G128") != std::string::npos;
+            "unsupported weight dtype B1_G128") != std::string::npos;
     }
     if (!selective_packed_rejected) {
         std::fputs("CUDA-unsupported packed tensor was accepted\n", stderr);
@@ -64,13 +65,13 @@ int main() {
     }
 
 
-    model.tensors[0].dtype = DType::T2_G128;
+    model.tensors[0].dtype = DType::Q4_G64; // T2 became legal for the embedding (slim packs)
     bool embedding_rejected = false;
     try {
         q27::validate_cuda_model(model);
     } catch (const std::runtime_error& error) {
         embedding_rejected = std::string(error.what()).find(
-            "token_embd.weight must be Q8_G128") != std::string::npos;
+            "token_embd.weight must be Q8_G128 or T2_G128") != std::string::npos;
     }
     if (!embedding_rejected) {
         std::fputs("non-Q8 CUDA embedding was accepted\n", stderr);

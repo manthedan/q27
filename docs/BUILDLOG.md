@@ -15714,6 +15714,703 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-27 (ay): llama.cpp's n-gram drafting ideas, replayed on our traffic -- only the index rebuild was worth taking
+
+Prompted by jadidbourbaki's prompt-lookup post (llama.cpp's n-gram drafter,
+165 -> 1.2 us per draft) and its threshold pre-check PR. Our suffix drafter
+already proposes in ~0.05 us against a ~14 ms verify round, so the latency
+work does not transfer; what cost us was **rebuilding the match index over the
+whole prompt on every request** (2-34 ms at 32-200K tokens, on the TTFT path).
+`SuffixDraft::sync()` keeps the index of the prefix the slot's stream shares
+with the new prompt, unindexes the rest and indexes the tail: 0.16-0.19 ms at
+32-200K, the same index as a rebuild (test_suffixdraft: digest + proposals over
+1,200 random multi-turn syncs incl. small-vocab eviction cases; eviction past
+the prefix falls back to a rebuild). Server gate (3090, T3+MTP pack, 3-turn
+re-emit conversation, suffix firing at 7.8-9.4 tok/round): texts and round
+counts identical before/after (92/42/36). Commit 206aead.
+
+**Replay of the post's other ideas** (offline, the three 09-18 Bonsai campaign
+legs from REQBODY_LOG: 36 sessions, 1,246 turns, 786K output tokens; a
+simplified render, so A/B/C are comparable to each other, not to the engine):
+
+    variant                                     fires           covered      accepted/fire
+    A  suffix drafter as shipped (L>=12, K=16)  ~2% of rounds   12.5-14.9%   7.4-8.0
+    B  + cross-session index (dynamic cache)    +0.2%           +0.5%        2.35-2.62
+    C  + llama.cpp n-gram frequency fallback    +~28%           +28-31%      1.15-1.28
+
+A round without a suffix proposal gets the model drafter's 2.85 (Bonsai MTP
+ladder) to 3.8-4.0 (DFlash2) tokens, so C would replace good drafts with
+1.2-token ones on 28% of rounds and B is both rare and below that bar. Not
+built. The n-gram frequency drafter is a no-draft-model tool; with one, the
+long-match suffix echo is the part that earns its verify width.
+
+## 2026-09-25 (ax): gemv_t3 passes gemv_t2 -- subtract-form digit pop + hoisted addressing; T3 decode 72-74 -> 79-82 t/s on the 3090, still bitwise
+
+Prompted by an agentic-CUDA-optimizer repo (not used: no license, OpenAI-only,
+unsandboxed generated Python, tolerance oracle); the same loop run by hand with
+t3_gate as the bitwise oracle, SASS counts and ncu.
+
+**SASS (sm_86), main loop per 32-weight chunk**: gemv_t2 41.5 instructions,
+gemv_t3 72.6 -- 1.75x the issue on 20% fewer bytes, which is why the 24% byte
+saving bought nothing. Two cuts:
+
+- **Digit pop without the chain.** With q the scaled byte, T_r = floor(3^r q /
+  256) and digit_r = T_{r+1} - 3 T_r (brute-forced over all 243 values, and
+  packed four-wide). Each T_{r+1} comes from the ORIGINAL 16-bit lanes (e *
+  3^(r+1) < 65536, floor(/256) = the lane's high byte, one PRMT gathers four),
+  and since each byte of T_{r+1} - 3T_r is 0..2 the four-lane subtract is one
+  plain 32-bit IMAD with no inter-byte borrow. 21 ops per u32 (was 27), rounds
+  independent. 72.6 -> 66.2.
+- **Addressing.** Per-chunk pointer math and bounds checks were 12.6
+  IADD3/LEA per chunk (T2: 4). Base pointers now hoist once per unit (chunk I
+  of a unit is ch0 + 32I and (ch0 + 32I) >> 2 == (ch0 >> 2) + 8I, so offsets
+  fold into load immediates) and full windows skip the check. 66.2 -> 56.4;
+  single-lane registers 56 -> 40.
+
+Tried and dropped: prefetching window m+1 before decoding m (3 interleaved
+rounds x 3 builds: no single-lane gain, -20% at width 2 from spills at the
+64-register cap). ncu after the cuts: ALU pipe 36%, FMA 17% -- latency, not
+issue.
+
+**Result (3090)**: t3_gate 400/400 bitwise at w1/2/5/8 + conversion,
+test_kernels 429/0, ninv ALL PASS, CLI canonical identical (T3 82.9 vs T2
+76.5 t/s). Per matrix, T3 now beats T2 at width 1 (ffn_gate/up 0.028 vs
+0.033 ms, ffn_down 0.031-0.033 vs 0.033), ties at width 2, trails 4% at 8.
+Server 1 slot turbo5k: T3 79-82 t/s (was 71-74; T2 74-76), texts IDENTICAL
+x4; conductor on (server defaults) 66-67 (was 59-60), identical. The 3060
+Ti should gain at least as much (the cut is issue, and it has 38 SMs to the
+3090's 82); unmeasured until the field bench reruns.
+
+## 2026-09-20 (aw): Bonsai 2 on an 8 GB card -- T3_G128, five trits per byte, bitwise the T2 pack; 6.06 GB, 45K context at 8.0 GB free
+
+The 12 GB fit left 7.2 GB of weights against a card with ~8 GB usable, so
+no amount of estimator honesty gets there: the body has to shrink below 2
+bits per weight. Ternary has 1.58 bits of entropy; five trits in a byte is
+1.6 bpw, and FORMAT.md already reserved that container (T3_G128, dtype 5,
+26 bytes per 128-group, base-3 `c0 + 3c1 + ... + 81c4`) -- the Metal
+matvec reads it, CUDA never did. Now it does, and the file bytes are the
+Metal ones.
+
+**The device layout is chosen for identity, not for the file.** Upload
+relays the 26-byte groups into a window layout (kernels.cuh, T3 section):
+a window is 160 chunks (5120 elements); lane L of the warp owns chunks L,
+L+32, ... exactly as k_gemv_q4/t2 do, and its five chunks of a window sit
+together as one 8-u32 unit, stored half-split so both of the lane's 16-byte
+loads are 512 contiguous bytes across the warp. u32 k of a unit holds dp4a
+words 5k..5k+4 in the XQuant.eo order; each byte packs one lane's five
+codes as `V = sum code_r * 3^(4-r)`, stored scaled `ceil(V*256/243)` so
+round r pops the next code as `(q*3)>>8`, two 16-bit lanes per u32 (the
+TQ1_0 top-digit trick; `T3Dec`). The 3^5 = 243 < 256 slack is what makes
+that exact (brute-forced over all 243 values before writing a line of CUDA).
+Because the lane -> chunk map and the per-chunk float chain (`s * (dot -
+isum)`) are gemv_t2's, **gemv_t3 is bitwise gemv_t2** on the same ternary
+matrix -- not "close", the same floats. Tail windows (6144 and 17408 cols)
+pack 1 or 2 chunks per lane at 8/16 bytes. Row bytes 1024 / 1280 / 3584 for
+5120 / 6144 / 17408 = 1.60 / 1.67 / 1.65 bpw before the fp16 scale.
+
+**Prefill stays on the T2 MMA GEMM**: `mmT` rewrites a T3 matrix into a
+22 MB T2 scratch (`t3_to_t2_device`: block = one (row, window), warp = one
+(chunk-in-unit, half) so the first-word residue is warp-uniform and every
+decode is a static instantiation) and calls gemm_t2_T on it. Same codes,
+same scales, so the GEMM output is the T2 pack's by construction; the cost
+is 12 GB of extra traffic per chunk (read 5.3, write 6.5), measured +4% on
+the --nll wall at chunk 512 on the 3090 (247 vs 238 s). vgemm refuses T3
+(gemv_t3_n serves every width); the DFlash2 head hook fails loud on a T3
+head (`d2_head_kind`), so `--slim` keeps embed and head in T2.
+
+**Gate (3090, bench/bonsai2/t3_gate_3090.sh)**, T2 slim pack vs T3 slim pack:
+
+    tools/t3_gate (new)   400/400 body matrices: gemv w1/2/5/8 BITWISE vs gemv_t2, T3->T2 conversion byte-equal to the T2 upload
+    test_kernels          429 PASS / 0 FAIL on the T3 pack (cpu_deq T3 reference; the slim T2 embed test now dispatches embed_row_t2)
+    ninv_test             ALL PASS (vgemm row skipped for T3 with a note; gemv_t3_n is the contract)
+    CLI canonical         generated md5 e8a16115 on both packs (fp8, 128 greedy); T3 74.6 t/s vs T2 76.8
+    server, turbo5k       four greedy texts IDENTICAL; T3 71-74 t/s vs T2 74-76 (1 slot, Q27_BATCH=0)
+    --nll chunk 512       mean NLL 2.224766 / PPL 9.2513 on BOTH packs (the tier-table protocol)
+
+**Speed: the extraction is exposed on the 3090.** Per-matrix bench
+(t3_gate --bench, blk.0.ffn_gate 17408x5120): T2 0.033 / 0.032 / 0.098 ms at
+widths 1/2/8 (719 GB/s), T3 0.035 / 0.041 / 0.102 (544 GB/s-equivalent on
+24% fewer bytes). Two trims that should have mattered did not: gathering the
+four popped codes with one `__byte_perm` instead of shift+mask (INT-pipe
+count 21 -> 15 per u32) and the half-split window (each LDG.128 a full 512-B
+run instead of a 32-B stride) both left the numbers where they were, so the
+limiter is neither INT issue nor coalescing; the serial five-round chain per
+u32 (ILP 8 across the unit) or occupancy is next to test. The decode step
+lands at T2's speed rather than 24% under it. On a 3060 the SM-to-bandwidth
+ratio is 1.33x the 3090's, so it should sit closer to the byte floor there
+(5.3 GB at 240 GB/s = 22 ms, ~40 t/s class); unmeasured.
+
+**The estimator was the other half of the fit.** The 12 GB run left 1.87 GB
+unused: with Q27_FIXED_STACK_GB the auto-ctx block trusted the value but the
+pool block still added its floors (graph + GDN constants 0.79 GB even under
+the env, the 0.25 arena-on pad, 256 MB per slot, the 1.0 GB Ampere slack) --
+1.45 GB reserved against a stack that measures 0.54 GB (post-weights 3.87
+minus the 0.23 arena, the 1.23 pool and the 1.87 spare). On an 8 GB card
+that reservation is the whole KV budget. The env now IS the reserve:
+single_fixed and ENG_FIXED_BYTES equal it, the per-slot pad is gone under
+it, and the pool slack is 0.15 GB like the auto-ctx one. Measure it as
+"vram at ready" minus pool minus arena on the target build; 0.6 for the 12g
+plain, 0.8 with the MTP ladder (its stack measures 0.74).
+
+**8 GB simulation (bench/bonsai2/g8_3090.sh: the hog leaves N GB free on
+the 3090, 12g build, Q27_FIXED_STACK_GB per pack, Ampere-default turbo5k
+KV, --ctx 49152, reference = the full-memory turbo5k texts)**:
+
+    pack           free    post-weights  pool     ctx      at ready  t/s (3090 silicon)  identity
+    t3-slim 6.06   8.8 GB  2.59 GB       1.61 GB  49152    0.20 GB   72-74               IDENTICAL x4
+    t3-slim        8.4     2.18          1.20     49152    0.20      72-74               IDENTICAL x4
+    t3-slim        8.0     1.78          0.88     45056    0.12      72-74               IDENTICAL x4
+    t3-slim        7.6     1.39          0.48     24576    0.12      72-74               IDENTICAL x4
+    t3-mtp  6.49   8.8     2.15          1.17     49152    0.01      98-119 (2.5-3.3/rd) width>=4 flips vs plain (control below)
+    t3-mtp         8.0     1.34          0.24     12288    0.14      98-119              same
+    t3-mtp         7.6     --            OOM at boot
+
+A headless 8 GB card (~8.0-8.3 GB free before the process context) serves
+the plain pack at 45K context and the MTP ladder at 12K; with a display on
+the card (~7.6 free) it is 24K plain and no ladder. Every plain text matches
+the full-memory server byte for byte. The ladder's long/code differ from
+plain by the known width>=4 near-tie flips (BUILDLOG (au)); the T2-mtp vs
+T3-mtp control on the same 12g binary at full memory: all four texts
+IDENTICAL, same round counts (9/26/279/540), T3 97-118 t/s vs T2 105-126 --
+the T3 ladder is the T2 ladder.
+
+**09-21 follow-up, found by the installer test**: with the server DEFAULTS
+(conductor on, no Q27_BATCH=0 -- the one configuration none of the gates
+above ran) the T3 plain pack died at `build_union_view`'s
+`assert(vgemm_ws() != nullptr)`: vgemm_ws_bytes_model sized the workspace
+from Q4/Q8/T2 tensors only, and a T3 body without the Q8 MTP block has
+none, so the pointer was null. T3 shapes now size it (vgemm still refuses
+T3; the view only needs the buffer to exist). Re-gated with the conductor on
+(gate12g leg `fusedplain`): texts IDENTICAL x4 at full memory and at 8.0 GB
+free (45056 ctx again), but 59-60 t/s against 72-74 with Q27_BATCH=0 -- the
+k=1 fused round runs the width-2 GEMV, which is where gemv_t3_n loses most
+(0.041 vs 0.033 ms per ffn matrix). Single-slot 8 GB serving should set
+Q27_BATCH=0; the installer's run.sh does.
+
+**09-22 field report (an RTX 3060 Ti 8 GB, driver 580.126, CUDA 13.4,
+headless via `init 3` -- nvidia-smi's display_active=Enabled only means a
+cable, tools/bench-bonsai2-8gb.sh)**: wsum 3b876779744bd102
+(the upload is right), free 1.68 GB post-weights, pool 0.70 GB, ctx 36864,
+0.20 GB at ready -- so a real 8 GB card exposes ~7.9 GB, and the
+"45K at 8.0 GB free" row above is what 8.3 GB would buy; **36.9K is the
+headless 8 GB number**. Decode **41.1-42.5 t/s** plain (the 3090 does 72-75 on the
+same build), prefill **481 tok/s** on a 5,267-token prompt (3090: 1,060).
+The 3060 Ti's byte floor is 12.5 ms/token (5.6 GB at 448 GB/s) against the
+24 ms measured, and the 3090's 6 ms against 13.7: the T3 decode step is
+half fixed cost on both, so the small card lands at 57% of the 3090 on 48%
+of its bandwidth and 46% of its SMs. Identity: short/cities/long replies
+md5-MATCH the 3090's; **the 1500-token code reply DIFFERS** (5ef4d92f vs
+4228b9dd). Weights identical, three prompts bitwise, one long one not --
+the shape of a toolchain difference (his nvcc 13.4 vs 13.2 here; ptxas
+contraction has already been seen to differ per arch, BUILDLOG 2026-07-16)
+rather than corruption. The bench now saves the replies so the divergence
+position can be found from a paste; unresolved until then.
+
+Not done: an 8 GB card in this machine (the 3060 numbers above are silicon
+scaling, not a measurement); the extraction limiter; token_embd on the host
+(0.34 GB = 19K more tokens of turbo5k); a T3 head (0.07 GB, the same GEMV).
+Packs: bonsai2-27b-t3-slim.q27 6.055 GB (md5 292fbb0cc5f19ffdb2f60be19ad21e97,
+wsum 3b876779744bd102), bonsai2-27b-t3-mtp-slim.q27 6.486 GB (md5
+f49b3e52ebc3903637dabd2a9e3290e5, wsum b9ab2d8221224dfd); not published.
+
+## 2026-09-19 (av): Bonsai 2 on a 12 GB card -- slim packs (7.2 / 7.6 GB), a sm_86-only server build, and a measured fixed stack: 32K plain or 20K with the MTP ladder
+
+The question was whether the 9.44 GB pack fits a 3060. It does not: on the
+3090 the server's own accounting put 4.25 GB of non-KV stack beside the
+weights (24 - 9.44 weights - 10.31 KV pool), which is the whole card on a
+12 GB part. Three levers, all landed:
+
+- **`repack.py --slim`**: token_embd and output as T2_G128 too (exact -- an
+  int8 trit in a 2-bit box), no output_q4 copy. Three new kernels
+  (embed_row_t2 / embed3_t2 / embed_rows_t2_T over the device-interleaved
+  words, kernels.cuh order) behind engine helpers embed_row / embed_lanes /
+  embed_rows_T that dispatch on the table's dtype at all nine lookup sites
+  (decode, sampled, the MTP draft path single and lanes, the verify forward,
+  the fused round, prefill, the MTP warm, the CLI); DFlash2's engine-embed
+  hook takes a kind. The loader contract that pinned token_embd to Q8 now
+  admits T2 (test_loader_contracts updated; Q4 is the illegal example).
+  Pure slim 7.20 GB (wsum 36e2d6597bac3347), slim + MTP 7.63 GB (wsum
+  b5069c622882b042).
+- **`build/q27-server-12g`** (Makefile): a single sm_86 image, W_MAX=8,
+  256-row prefill chunks. On Ampere the calibrated base (1.77 GB) is mostly
+  module images for three architectures plus the 1024-row arena; this build
+  measures ~0.75 GB of total non-KV stack (free 3.87 GB post-weights, 2.83
+  at ready with an 8K KV).
+- **`Q27_FIXED_STACK_GB`** (server): the estimator's per-arch calibration
+  cannot describe that build, refused the paged pool ("pool -0.41 GB") and
+  fell back to an 8K per-slot KV with 2.8 GB unused. The env replaces
+  kEngBase so the single-slot fixed stack equals the given value (Ampere
+  slack 0.15 GB with it). 0.9 is the 12g figure.
+
+**Gate (3090, bench/bonsai2/gate12g_3090.sh + vram_hog.py)**: a torch
+process holds 12.4 GB so the server sees 11.70 GB free (a 3060's usable
+memory, slightly pessimistic). 12g build + slim pack + FIXED 0.9:
+
+    leg                         pack   post-weights  pool     ctx     at ready  t/s (3090 silicon)     identity vs pure-pack plain
+    plain                       7.20   3.87 GB       1.23 GB  32768   1.87 GB   74-77 (vs 70 Q8 head)  IDENTICAL x4 (T2 embed + head are exact)
+    MTP ladder (slim+mtp)       7.63   3.43 GB       0.80 GB  20480   1.69 GB   102-127                short/cities identical; long/code the known width>=4 flips
+    DFlash2 (Bonsai pack)       7.20   3.87 GB       0.23 GB  4096    0.48 GB   123-182                same flip class
+
+So a 12 GB card serves Bonsai 2 at 32K context plain or 20K with the MTP
+ladder; the 2.1 GB DFlash2 pack costs the context (4K), so the MTP pack is
+the 12 GB drafter. Speed on a real 3060 scales with bandwidth (360 vs 936
+GB/s): expect ~30 t/s plain, ~45 with the ladder. The ctx caps come from
+the pool's "entitlable window" rule with 1.7-1.9 GB still free at ready,
+so there is headroom in the policy if a 12 GB user wants it. Slim packs
+are local for now (md5 12ee25013ee2985f1236170bd2a6abec /
+5cecaf4544b96843bf6f3fdfe413c9b0); publishing is a separate call.
+
+## 2026-09-18 (au): the lane-1 draft -- a third-party MTP head on the ternary target; 8 slots at 16K = 512 t/s aggregate (was 329), C=1 173 t/s (was 105)
+
+The (at) ladder left half of every fused round's lanes empty because a
+Bonsai 2 pack has no drafter. ProCreations' Ternary-Bonsai-2-27B-MTP
+(independent, Apache-2.0) is the Qwen3.8 MTP block -- donor tensors
+byte-verified against the official release in their provenance report --
+distilled onto Bonsai's hidden states. It ships as HF-named BF16 safetensors
+(mtp.fc.weight, mtp.layers.0.*, mtp.norm, mtp.pre_fc_norm_*), so the port is
+a converter path plus the rotation exemption:
+
+- repack `--mtp-safetensors <file>`: the 15 tensors mapped to blk.64.* (the
+  llama.cpp names the engine expects), Q8 matmuls, F32 norms, block_count 65
+  + nextn_predict_layers 1, meta `bonsai2_mtp`. Two traps: (1) Qwen3.5's
+  RMSNorm is zero-centered (y = x * (1 + w)) and llama.cpp stores the
+  effective multiplier, so the HF norms need +1.0 -- caught by a provenance
+  check (scratchpad mtp_provenance.py) that compared the checkpoint against
+  the Qwen3.8 pack's own blk.64: norms offset exactly 1.000 at corr 1.0,
+  every matmul row corr 0.999+ with the donor at the SAME row and nowhere
+  else (so no q/k permute; neox rope); (2) the bonsai2 meta block wrote
+  block_count 64 and popped the nextn key after the MTP insertion -- now
+  conditional.
+- engine: the "Bonsai cannot carry an MTP block" guard lifted; every bz_*
+  rotation site in attn_block / ffn / the T-row blocks gated on
+  `il < N_LAYER` (the MTP layer is a plain Qwen layer trained in the
+  unrotated space: it reads the raw hidden state); the MTP draft path gets
+  the inverse rotation after its embedding lookup (rotated rows, single and
+  lanes) and the rotation before the shared folded head (mtp_post, both
+  branches; `mtp_rotq` for the lanes); mtp_warm_T (the prefill-time MTP KV
+  warm) gets the embed inverse and reads x1T as the caller leaves it --
+  the UNROTATED output norm. With an MTP block present plain_lanes is
+  false and the engine is an ordinary gated ladder member.
+
+Artifact: bonsai2-27b-t2-mtp.q27, 9.87 GB, 870 tensors. Not redistributed
+(their checkpoint; one repack command).
+
+**Correctness gates (3090).** CLI canonical: plain decode on the pure pack
+vs `--spec` on the MTP pack, identical at 128 tokens (md5 e8a16115) and
+over 1500 tokens (d9062fb1) in every ladder configuration (default, PMIN=0,
+DEXIT=0, MAXD=4, GEMM_MIN=99), at 3.81 tokens/round. Plain decode on the
+MTP pack == the pure pack. Server: short and cities identical to plain in
+every ladder leg (1-slot, 2-slot fused, conductor off, thinking off,
+GEMV-pinned); the long and code prompts flip at near-tie word swaps
+(`_add_to_front` vs `_add_front`, `If a slot` vs `If the target slot`) at
+points that move with the round shapes. Bisected: it is not the ladder --
+DFlash2 exact mode on the PURE pack flips code@2231 at K=3/5/7 while K=1
+(width 2) matches plain, and the Qwen3.8 DEFAULT tier flips code@368
+between K=2 and K=3/7 on the same card. So the multi-lane verify is not
+width-invariant at width >= 4 on sm_86 either (the 09-07 finding, wider
+than recorded); the draftless width-2 rounds of (at) are the only fused
+shape that is bitwise vs plain. ninv_test, extended to gemv_t2 /
+gemv_t2_n, passes on the T2 pack (every family, zero diffs at T=2..16 and
+scattered slots), so the width effect lives in the shared lane path, not
+in anything Bonsai-specific. Q27_MTP_WARM=0 (skip the prefill warm) is a
+bisect lever that stays; Q27_DFLASH2_K=1 is unsupported on Q4 tiers
+("gemv_q4_n: bad nbatch 1"). The server enables the suffix drafter by
+default (the CLI does not), so width-12 suffix rounds cross gemm_min 9
+there.
+
+**Ladder (5090, 8 slots / 16K, temp 0.6, the (at) protocol; 22.76 GB free
+after weights):**
+
+    C                   1       2       4       8
+    T2 + MTP head     173.2   231.0   384.1   512.2
+    T2 draftless (at) 105.5   150.0   200.4   328.9
+    q27 q4s (08-19)   141.3   229.7   352.3   530.6
+
+Speed: 3090 single-stream ladder 109 t/s on the long/code prompts (2.6-2.7
+tok/round) vs 70 plain and 93 with the Bonsai DFlash2 pack; 2-stream fused
+~140 aggregate. The 9.87 GB pack lands in the Qwen tiers' concurrency class
+at every C, above q4s at C=1..4.
+
+**Width-flip hunt (tools/width_probe.cu, new).** A bitwise probe of the
+multi-lane verify against plain decode, engine-level, 3090: lane-0 forward
+through all 64 layers and the head at widths 2/4/8; a round that accepts
+the plain path's own next T tokens, flush_fold, one more step (folds T=1..4);
+a round whose drafts all fail, then a step (rejections at widths 2/4/8);
+refinish_round(m of 5) then a step (truncations m=1..4); the width-4 and
+width-8 verify captured into a CUDA graph and replayed vs eager. Every one
+is bitwise -- zero differing logits -- on the Bonsai pure-T2 pack and the
+Qwen3.8 default tier, fp8 KV, at position 70 and at position 617 (the code
+prompt plus 550 of plain decode's own tokens), after serial and after
+batched prefill. ninv_test with the T2 families passes too. So the serving
+flips at width >= 4 are not any single-round mechanism in isolation; they
+are a multi-round effect this probe does not model. What IS ruled out:
+kernel width dependence, the fold, stale rejected-lane KV rows, the
+truncation rewind, graph capture, the GEMM family (pinned), the conductor,
+thinking mode, the MTP pack, the MTP warm. Next instrument: a per-round
+lane-0 logits dump in the server (first differing round in situ). Probe
+traps for the next person: prefill_serial needs fused_smoke's d_P epilogue
+or the lanes sit at position 1; the token graph positions from d_pos
+(advance kernel) while rounds position from d_P, so a step_with after a
+round needs d_pos = d_P + 1; plain_lanes must be cleared for the tail to
+accept.
+
+**Single-slot campaign A/B (leg bonsai2mtp: the ladder alone, batching
+default, 12 instances)**: 2.85 tok/round, 178.8 t/s aggregate, 32.8 turns,
+150 s/inst, gold 10/12 -- against the Bonsai DFlash2 pack's 3.80 / 227.7 /
+37.2 / 138 / 10/12 (bonsai2d2b). DFlash2 wins single-slot by 27%; the MTP
+pack is the multi-slot choice (512 vs 329 at C=8). tools/launch_q27_38.sh
+`bonsai2` now serves the pure T2 pack with the Bonsai drafter pack
+(BONSAI2_PACK); multi-slot = the T2+MTP pack with Q27_BATCH=1 and no
+drafter env.
+
+## 2026-09-18 (at): Bonsai 2 in fused multi-slot rounds -- draftless members ride the floor-2 machinery; 8 slots at 16K = 329 t/s aggregate (3.1x), bitwise vs plain decode on sm_86
+
+The conductor's fused round assumed every member drafts (MTP chain or the
+suffix drafter): width >= 2 per member, trim floor 2, the B8 cap
+re-derivation, and the outcome convention (the round forwards the pending
+token and emits it; the new pending stays unemitted). A Bonsai 2 engine has
+no MTP block, so its solo path is plain_round -- the token graph, which
+emits the pending token first and forwards it next round. Mixing the two
+per round duplicates or drops a token, and a no-drafter member did not fit
+the union view at all. Rather than teach the whole scheduler about width-1
+members, a draftless member now rides the existing machinery as a width-2
+lane pair whose second lane is a dummy that is never accepted:
+
+- engine: `plain_lanes` (= no MTP and no DFlash2 pack, set after d2_setup);
+  `plain_propose()` = suffix_propose's prep_round + width 2; the greedy and
+  sampled tails pass max_draft 0 when plain_lanes (finish_round / spec_accept
+  then commit exactly the pending token; sample_stop samples lane 0). The
+  no-MTP branch of build_spec_graphs warms the multi-lane verify at width 2
+  always (was: only with DFlash2, at K+1), so no fused round launches a
+  kernel cold inside a capture.
+- conductor: draft_widths (and the fallback Member::want_width) give such
+  members width 2 with no MTP chain, sampled bootstrap included, not a
+  suffix round (GEMM policy, telemetry); the B8 re-derivation skips them;
+  a new `always_fused` hook keeps a lone plain member on the fused path at
+  k == 1 (the convention argument above -- it must never fall through to
+  solo_round). fused_verify_round mirrors spec_verify_forward's Bonsai
+  sites: inverse rotation after embed3, norm -> rotate -> quantize at the
+  three norms (pre functions take x1q = true), post functions already
+  rotate. The Qwen path is byte-for-byte what it was (every new line is
+  behind `bonsai2` / `plain_lanes`). Q27_BONSAI_FUSED=0 pins Bonsai members
+  to solo rounds -- the control.
+
+**Identity gate (3090, bench/bonsai2/fused_gate_3090.sh)**: four greedy
+prompts (one 29-token reply, a thinking one-liner, a 700-token and a
+1500-token thinking answer) as two concurrent pairs and each alone, on five
+servers: the conductor-free 1-slot reference (Q27_BATCH=0, plain token
+graph), 1-slot fused (k=1 rounds), 2-slot fused (k=2 unions), 2-slot solo-
+pinned, 2-slot FIFO. 32/32 texts IDENTICAL to the reference. Two streams on
+the 3090: fused 44+53 t/s while overlapping (~97 aggregate) vs 65-70 solo;
+the solo-pinned and FIFO legs time-slice at ~70. A lone request in a fused
+round costs the dummy lane: 65.6 vs 69.5 t/s on the 3090, 105.5 vs 111.1 on
+the 5090. test_conductor ALL PASS.
+
+**Ladder (5090, the 08-14 protocol: --slots 8 --ctx 16384, Q27_KV=fp8
+Q27_BATCH=1, C salted streams at temp 0.6, max_tokens 8192, aggregate =
+sum(dec) / union of decode intervals; bench/ladder/ladder.py; bench/bonsai2/ladder_5090.sh)**, pure-T2
+pack, 23.19 GB free after weights, all 8 slots fit without a clamp:
+
+    C            1       2       4       8
+    fused      105.5   150.0   200.4   328.9    (3.1x)
+    solo-pin   111.1   116.4   116.1   116.9    (time-sliced, the control)
+    q27 q4s    141.3   229.7   352.3   530.6    (08-19, MTP ladder, for scale)
+
+The sampled tail (max_draft 0 + sample_stop) produced coherent text at
+temp 0.6 on both legs (the ladder is sampled). Each fused round yields one
+token per member -- half the union's lanes are dummies -- and the round wall
+at C=8 is ~24 ms for 16 lanes, the same neighbourhood as the q4s ladder's
+16-lane rounds that yield ~14 tokens. So the 329 vs 531 gap is the missing
+draft, not the kernels: a real lane-1 proposal (the MTP head port for
+Bonsai, or a shared DFlash2 drafter across members) is the lever, and the
+9.44 GB pack's extra 8 GB of KV is the reason to want it (8 slots at ~32K
+or 12 at 16K where the Qwen tiers stop at 8 x 16K).
+
+Regression on the incumbent: tools/fused_smoke on the Qwen3.8 default tier
+(3090) -- FUSED / CONDUCTOR / A2 ERROR-PATH / GRAPH SMOKE all PASS, byte-
+identical to solo (its header's build line gained src/dflash2.cu and
+build/pf4.o, which the engine has linked for weeks). NOT gated: sampled
+identity between the plain sampler and the fused sampled tail (they consume
+the RNG differently; a paired-seed probe is the instrument if it is ever
+needed).
+
+## 2026-09-18 (as): a Bonsai-trained DFlash2 drafter (third-party) -- +7% tokens per round on code, identity clean on sm_86; and the 5090 identity gate is not an identity gate
+
+PrismML ships no MTP block for Bonsai 2 (64 blocks, no nextn tensors, no MTP
+repo under prism-ml). ProCreations (independent, Apache-2.0, updated today)
+ships two drafters: a Qwen3.8 MTP head distilled onto Bonsai hidden states
+(HF-named safetensors; 58.6% draft acceptance at draft 2 in their runtime,
+~2.2 tok/round, below what DFlash2 already gives us -- not pursued, a day
+of engine work for a footprint win only) and a DFlash2 drafter retrained on
+Bonsai features. The DFlash2 one is the z-lab architecture exactly: 81
+tensors, names and shapes equal to the Qwen3.8 drafter, same mask token and
+target taps, so tools/dflash2_pack.py --q8 packs it unchanged (2.08 GB,
+md5 e6dd75e7574f4fe414a9e3893570b9b5, checkpoint sha256 verified against
+the repo's own manifest). Treated as untrusted weights and gated like ours.
+
+**Prompt A/B on the 5090** (pure-T2 target, same binary, same four greedy
+prompts, the Qwen3.8 Q8 pack as the same-day control; exact-mode rounds
+then vgemm timing):
+
+    prompt   tok/round  qwen -> bonsai    t/s (vgemm)  qwen -> bonsai
+    short        7.3 -> 4.8 (29 tokens)          492 -> 326
+    cities       5.1 -> 5.8                      344 -> 389
+    long         3.45 -> 3.48                    231 -> 232
+    code         4.01 -> 4.31  (+7.5%)           266 -> 286
+    round wall 14.9 ms both (same bytes, same kernels)
+
+3090 (sm_86) on the same target, exact mode: long 3.50 -> 3.74 (+7%).
+Target-trained drafting helps on code and short answers, is a wash on the
+prose prompt, and loses on a 29-token reply (one more round). Campaign leg
+`bonsai2d2b` (pure T2 + this pack) added to campaign.sh; see below.
+
+**Identity gate finding.** Plain vs DFlash2 with Q27_D2_VGEMM=0 (the GEMV
+verify family) on the 5090 DIFFERS for BOTH drafters at the same character
+(long 906, code 366; short and cities identical), deterministically (run 2
+== run 1 on every text), with clean weight digests on every load, and
+gemv_t2_n vs gemv_t2 bitwise (err 0). Same experiment on the 3090: IDENTICAL
+on every prompt with either pack. Same experiment on the Qwen3.8 DEFAULT
+tier on the 5090: DIFFERS (long 435, code 863). So this is the 09-07 (f)
+instrument finding again -- serving greedy on the 5090 is not
+width-invariant, reduction shapes differ between the width-1 and width-8
+paths and near-ties flip -- pre-existing, arch-specific, nothing to do with
+Bonsai or the drafters. The (ao) entry's identity gate was run on the 3090
+for that reason; the rule is now written down: plain-vs-DFlash2 identity is
+an sm_86 instrument; on the 5090 compare drafters against each other.
+
+**Campaign leg `bonsai2d2b`** (pure-T2 pack + the Bonsai-trained Q8 drafter,
+otherwise the morning's bonsai2 config; 12 instances, fresh pfx root):
+
+    leg          drafter     tok/round  agg t/s  median req t/s  turns/i  think K/i  wall s/i  gold
+    bonsai2d2b   bonsai      3.802      227.7    240.6           37.2     66.1       138       10/12
+    bonsai2      qwen3.8     3.466      205.1    220.0           37.3     74.8       182       11/12
+    q27seed      (3.8 target) 4.02      222.0    245.1           22.0     34.5        78       11/12
+
++9.7% tokens per round and +11% aggregate decode on live Claude Code traffic
+(480 vs 490 requests, reuse 0.966 vs 0.969), which lifts the ternary target
+above the Qwen3.8 default tier's aggregate. Trajectory shape unchanged (37
+turns either way; the thinking drop is one-trial sampled variance, as is
+the gold flip on requests-1921 -- the verify is exact in distribution, a
+drafter cannot move outcomes). So the third-party drafter is the better pack
+for this target; the Qwen3.8 one stays the fallback. Not redistributed: it
+is ProCreations' checkpoint, repacked locally (pack path in the campaign
+comment). Also fixed: stop_engine dropped only q27* cache roots, so the
+morning's 37 GB bonsai2 root starved the next leg's 40 GB budget (refused,
+SKIPPED) -- bonsai* roots are dropped now.
+
+## 2026-09-18 (ar): Bonsai 2 Phase 3 + the gates -- T2 prefill GEMM drops the 13 GB of Q4 shadows (9.44 GB pack, 262K auto ctx); PPL 9.25 vs 7.31, HE+ 25/30, needle 6/6, campaign gold 11/12 at 2x the reasoning
+
+**Phase 3.** prefill.cu's two MMA GEMM kernels (k_gemm_mma_T, k_gemm_mma_ntx)
+take a dtype instead of `bool Q4IN` (0 Q8, 1 Q4, 2 T2). The T2 leg stages 8
+u32 per row per 128-K stage (pad word 0x55555555 = code 1 = 0) and unpacks
+each interleaved word to 16 sequential s8 with the -1 folded in -- vgemm's
+unpack_t2 (four masked extractions + two __byte_perm + __vsub4), one STS.128
+per word -- so the mma fragments, the fp accumulation order and the scale
+slots are the Q8 leg's (T2's g128 scale rides Q8's per-row slot; the Q4 leg
+keeps its two 64-scales). gemm_t2_T is MMA-only: Q27_PREFILL=dp4a is refused
+for T2 rather than silently served. engine mmT dispatches T2_G128; TP()
+reads the `.q4x` shadow only under Q27_T2_PF_SHADOW=1 (the A/B). repack
+`--bonsai2-container` is now q4x | t2 (pure, the default) | t2+q4x (the
+Phase 2 layout). Artifacts: bonsai2-27b-t2.q27 = pure T2 9.44 GB (repack 160
+s, 403 tensors slot-verified); bonsai2-27b-t2q4x.q27 = the 22.36 GB A/B pack.
+
+Gates, in order of strength: (1) test_kernels test_gemm_t2_shadow -- the T2
+GEMM against gemm_q4_T on the exact-Q4 image of the same matrix, ZERO
+differing outputs on g32 and g64 at T=33 and T=300 (the ntx minitile
+kernel), attn_qkv and ffn_down, 8/8 on the mini pack (3090) and on the full
+pack (5090); (2) full-corpus --nll chunk 512 on pure T2 vs the shadow path
+(Q27_T2_PF_SHADOW=1 on t2q4x): mean NLL 2.224715 both, all six digits, over
+147,900 predictions; chunk 2048 on pure T2 reproduces the morning's t2q4x
+number (2.113447 / 8.2767) exactly. Serving: pure T2 leaves 23.19 GB after
+weights on the 5090 (was ~10 with the shadows), auto ctx 262144 (was 98304),
+round wall unchanged 14.88 = draft 2.22 + verify 12.53 ms (decode reads the
+same T2 tensors either way). One test_kernels casualty on T2 packs:
+test_gemv10_scaling's ffn leg called gemv_q4_n on blk.*.ffn_gate
+unconditionally (T2 rows read as nibbles ran off the allocation -> illegal
+address, sticky, exit 1 with every check PASS); now dtype-dispatched like
+its head leg, and the full t2+q4x pack runs test_kernels to ALL PASS on the
+5090 (444 checks; the T2 ffn 10-lane ratio is 0.87 at 0.043 ms -- the whole
+17408x5120 ternary matrix is 22 MB and sits in L2, so that number is not a
+weight-streaming measurement).
+
+**Tier gates.** The README's 3.8 tier table is the chunk 512 / ctx 512
+protocol (the default tier's 7.3121 reruns at 7.3102 on the 3090; chunk 2048
+gives 6.873 -- know which one you are quoting). Same ids
+(wiki.test.qwen38.i32 == the qwopus i32), fp8 KV:
+
+    protocol            Bonsai 2            Qwen3.8 default     instrument
+    chunk 512 / 512     9.2508 / 9.2513     7.3121 / 7.3102     5090 / 3090
+    chunk 2048 / 2048   8.2767 / 8.2718     6.8824 / 6.8730     5090 / 3090
+    fork llama-perplexity -c 2048 on the PTQ1_0 GGUF: 8.2643 +/- 0.056
+
++20-27% PPL for the ternary checkpoint; the port itself is within 0.15% of
+the reference fork (fp8 KV + activation quant), so the gap is the model's.
+HumanEval+-30 (benchlocal, no-think, temp 0, Docker verifier): 25/30 vs
+30/30 for every 3.8 tier (fails 0, 3, 12, 28, 29). Needle 6/6 at 270K chars
+(~90K tokens) on pure T2 + DFlash2. The fork's llama-perplexity is an
+sm_120-only build whose PDL probe aborts ("no kernel image", device 1) when
+the 3090 is visible: CUDA_VISIBLE_DEVICES=0.
+
+**Campaign** (bench/crossengine/agentic-2026-09-18-bonsai2, leg `bonsai2` in
+campaign.sh: t2q4x + DFlash2 Q8 pack, medium effort, fresh pfx root, 12
+instances): gold 11/12 -- the same set as every q27 leg and ninfer; 37.3
+turns / 74.8K thinking chars / 26.2K output tokens per instance vs 22.0 /
+34.5K / 12.6K for the same-day 3.8 DFlash2 leg (q27seed), wall 182 vs 78
+s/inst; serving 205.1 vs 222.0 t/s aggregate, 3.47 vs 4.02 tok/round (the
+3.8-trained drafter accepts a little less on the ternary target), reuse
+0.969 vs 0.962. Same outcome, twice the reasoning: the #49 axis with the
+sign flipped (ninfer's NVFP4 arm reasons shorter than the model, Bonsai 2
+longer), engine mechanics identical on both sides. turns_cmp.py knows the
+dir; the campaign README has the per-instance table.
+
+Also: tools/launch_q27_38.sh `bonsai2` mode (own pfx root, BONSAI2_MODEL);
+README tier section; FORMAT.md container update; plan log. Production stayed
+on the Qwen3.8 default tier throughout (relaunched after each 5090 window).
+
+## 2026-09-18 (aq): fused rotate+quantize -- the rotation costs no graph node; Bonsai 2 round 14.75 ms, 233 t/s
+
+kernels.cu rotq / rotq3 (one 256-thread block per 1024-chunk: sign+load the
+raw activation -- optionally through the GDN tiled->grouped gather --
+butterfly in smem, then each warp quantizes four 32-groups with
+k_quantize_x's body on s*1/32) and rmsnorm3_rotq (k_rmsnorm3q's 1024-thread
+norm writing the UNROTATED y for the F16 alpha/beta projections, then
+per-chunk rotate+quantize). Every decode and verify call site that did
+copy/rotate/perm + quantize now issues one launch, and the rotated floats are
+never written. test_kernels: rotq / rotq3 (5120, 6144 with perm, 17408) and
+rmsnorm3_rotq (y and both lanes) BITWISE vs the separate sequences; whole
+suite ALL PASS on the production model. 3090 identity gate (q4x,
+Q27_D2_VGEMM=0): plain vs DFlash2 identical on all three prompts; plain
+46.8 -> 47.5 t/s.
+
+5090 t2 + DFlash2 K=7: round 14.75 = draft 2.21 + verify 12.42 + host 0.13
+(was 15.26 / 12.91); 700-token 233 t/s (was 225), cities 346 t/s (was 335).
+The gain is the launch count, ~0.5 ms/round; what remains in verify is the
+width-8 attention/GDN/norm work the Q4 tier also carries (~8 ms) plus the
+T2 staging. Bonsai 2 now serves faster than the Q4_G64 production tier on
+this traffic class (233 vs ~216-222), at 22.4 GB resident (T2 + the Q4
+prefill shadows); Phase 3 (T2 prefill GEMM) is what brings residency to
+~9 GB.
+
+## 2026-09-18 (ap): T2 verify GEMM -- Bonsai 2 DFlash2 round 18.4 -> 15.3 ms, 225 t/s on the 700-token prompt
+
+k_vgemm (vgemm.cu) takes a third dtype mode (template int DT: 0 Q8, 1 Q4,
+2 T2): T2 stages 8-byte chunks (32 codes) so the pass geometry stays Q4's,
+undoes the device-side interleave at the smem unpack (four masked
+extractions + __byte_perm re-interleave, __vsub4 0x01 = the "-1" bias),
+g128 scales like Q8, 0x55 (code 1) for padded rows. vgemm_verify dispatches
+T2; vgemm_ws_bytes_model counts T2 tensors; vgemm_attrs_dt exposes the
+attrs. Gates (tools/vgemm_test.cu, now 6 instantiations): 5090 all six at
+64 regs / 0 stack / 4 CTA per SM; numerics vs gemv_t2_n on every T2 shape
+of the mini artifact worst rel 1.2e-7..1.8e-7 on all 16 lanes and widths,
+bitwise-stable across repeats. (On the 3090 the Q8 instantiations show 8 B
+of stack -- an sm_86 allocation artifact; the gate's home is the 5090.)
+
+5090, t2 artifact + DFlash2 K=7, Q27_D2_TIMING: 200 rounds, wall 15.26 =
+draft 2.22 + verify 12.91 + host 0.13 ms/round (was 18.41 / 16.07);
+700-token 225.3 t/s (was 184), cities 334.9 t/s (was 276). Verify still
+carries ~9.6 ms of non-weight work vs the Q4 tier's ~8: the rotation is 6-8
+extra launches per layer per lane set (norm3 + hadamard + quantize3 instead
+of the fused rmsnorm3q, plus the GDN lane copy and perm). Next: fuse
+rotate+quantize (and norm+rotate+quantize) so the count returns to the Q4
+tier's; the plain token graph gains the same.
+
+## 2026-09-18 (ao): DFlash2 on the ternary target -- Bonsai 2 serves at 184-391 t/s on the 5090, greedy-exact vs plain
+
+The drafter attaches to the unrotated residual stream, so the pack trained on
+BF16 Qwen3.8-27B drafts for Bonsai 2 unchanged; what needed rotation was the
+engine's multi-lane verify forward and the two places the drafter touches
+folded tensors. engine.cuh: bz_norm3_rot_q5 (rmsnorm3 -> rotate lanes ->
+quantize3; GDN layers on a lane COPY because gdn_pre's alpha/beta F16 GEMVs
+read the raw x1), gdn_post perm+rotate via bz_ogp_L, attn_post/ffn_pair
+rotate lanes in place, embed3 inverse, head-norm rotation; conductor.h forces
+solo rounds for bonsai2 engines (fused_verify_round is not mirrored);
+dflash2.{h,cu}: set_bonsai2_signs -> inverse on the mask/anchor embed rows,
+head input rotated on a copy (the selector projection keeps plain nhf), and
+the engine-head kind is now an enum (Q8/Q4/T2) so a T2 head runs gemv_t2_n
+(the t2 artifact's output_q4.weight IS T2; reading it as Q8 was the 5090
+illegal access at dflash2.cu:737). build_spec_graphs' no-MTP branch now
+seeds the lanes (d_pos_L[i]=i, tokens 0, d_samp warm), runs
+spec_verify_forward + tail (+ sampled tail) eagerly at width K+1, reset(),
+then d2_setup() -- d2_setup captures its verify graphs with no warm of its
+own, and the ladder's warm rounds that used to provide it are gone here.
+
+Gates (server, scratchpad/bonsai/server_d2_gate.sh: plain vs DFlash2
+servers, identical greedy requests): 3090 q4x with Q27_D2_VGEMM=0 -> all
+three outputs IDENTICAL to plain (the verify chain is exact on the ternary
+target); default vgemm family -> identical on the short prompts, the
+700-token one diverges at char 197 (the known accumulation-order family, same
+as on the BF16 model). Acceptance: 7.3 / 5.1 / 3.5-3.8 tokens per round on
+the short / cities / 700-token prompts -- the BF16 model's class.
+
+5090, bonsai2-27b-t2.q27 (T2 decode + .q4x prefill shadows, 22.4 GB), ctx
+8192: plain 110 t/s; DFlash2 K=7: short 391 t/s, cities 276 t/s, 700-token
+184 t/s (203 rounds, 18.7 ms/round). The round wall is NOT below the Q4
+production tier's (~17.4 ms) despite half the weight bytes: T2 has no vgemm
+(MMA) verify path yet, so width-8 rounds run the register-bound gemv_t2_n<8>,
+plus 6 rotation launches per layer per lane set. Next lever: a T2 verify
+GEMM (dequant to int8 tiles + MMA, the k_vgemm family) and the fused
+rotate+quantize kernel.
+
+Trap: the CLI's --dflash2 bring-up path is stale (map::at on the serving
+pack for the production model too); gate DFlash2 through the server.
+
+## 2026-09-18 (an): Bonsai 2 27B (PrismML ternary Qwen3.8-27B) runs on q27 -- fork-parity logits, plain decode 110 t/s on the 5090 with the first ternary kernel
+
+Plan: docs/plans/2026-09-18-bonsai2-ternary.md. Model: Qwen3.8-27B with
+every projection ternary (fp16 scale per 128) in a Hadamard-rotated basis
+(block 1024, explicit signs), no MTP block; PrismML's PTQ1_0 GGUF
+(5.95 GB) + their llama.cpp fork as the reference (built sm_120 in
+/mnt/ai/projects/prism-llama; build files diffed vs upstream first).
+
+Converter (tools/repack.py): PTQ1_0/PQ2_0 detected (forged types 143/142),
+trit decode per the fork's element map (numpy, 0 mismatches vs ggml
+to_float on 524288 real values), EXACT containers: Q4_G64 nibble = trit+8
+with the 128-group scale duplicated per 64, Q8_G128 int8 = trit for
+token_embd/output, T2_G128 with --bonsai2-container t2 plus a `.q4x` exact-Q4
+shadow per blk.* matrix for prefill; hadamard meta verbatim + F32 tensors
+hadamard_signs.<width>; general.name carries qwen38 (the GGUF says "Hf");
+block_count 64. Artifacts: bonsai2-27b-q4x.q27 (16.24 GB, wsum
+2ec46317f507727b), bonsai2-27b-t2.q27 (22.36 GB, wsum 650f9dc2acd266d1).
+
+Engine: kernels.cu hadamard1024 (rows/lanes/single, fwd + inv, natural-order
+butterfly, bitwise CPU-equal) + gdn_v_tiled_to_grouped (ssm_out was folded in
+the training V-head order); engine.cuh bonsai2/has_mtp flags, validate_arch
+accepts block_count 64, rotation before every folded matmul (gdn_block on a
+rotated COPY since ssm_alpha/beta read the raw input; attn/ffn in place;
+ssm_out perm+rot; head input) and the inverse after the embedding lookup, in
+decode, sampled decode, batched prefill, fold_last and the CLI's teacher-forced
+heads; mtp_warm_T gated; plain_round (token-graph replay) + sample_round when
+there is no MTP block, build_spec_graphs skips. Phase 2: gemv_t2 / gemv_t2_n
+(dp4a over 2-bit codes, sum = dp4a(c,x) - isum, device words interleaved at
+upload so the Q4 kernels' even/odd activation words apply unchanged), loader
+accepts T2 on CUDA (B1/T3 still refused; contract test updated), mm/mm5/mtp
+dispatch (mm5's bare else now fails loud), prefill reads the .q4x shadow via
+TP(il, leaf).
+
+Gates: test_kernels hadamard1024 bitwise vs CPU, inv(fwd)=x; T2 gemv vs CPU
+(err 1.6e-2, tol 2e-2), gemv_n bitwise vs gemv; loader contracts PASS;
+384-position teacher-forced parity vs the fork (tools/bonsai/
+llama_logits_dump.cpp, scratchpad parity.py): top-1 agreement 0.9974
+(1/383), fork argmax in q27 top-5 100%, NLL 2.0792 vs 2.0796, mean|dNLL|
+0.011, top-16 logit mean|d| 0.026; serial-vs-batched prefill (--pfdbg 1/8)
+ordinary g32/g64 quant noise. Server smoke (3090, plain): thinking on,
+greedy + sampled correct, prefix cache hits, 46 t/s.
+
+5090 plain decode (384-token prompt, 128 tokens): q4x 78.6 t/s, t2 109.9 t/s
+with BITWISE-identical greedy tokens (same per-chunk integer dots). The
+marginal bandwidth of the weight bytes removed (7.2 GB for 3.6 ms) is ~2
+TB/s, so the ternary GEMV is near the roofline already; the remaining
+step (~9 ms) is the Q8 head (1.3 GB), the rotation launches (~6 per layer)
+and the fixed decode cost. The fork's own llama-bench aborted on this box.
+
+Trap: the CLI head-row rotation was inserted after that build had started
+-- the first position-wise runs (NLL 12.7) were a stale binary. Check the
+binary carries an edit before debugging it.
+
+Next: DFlash2 on the ternary target (multi-lane rotation path incl. the
+drafter's embedding inverse), fused rotate+quantize, T2 head, T2 prefill
+GEMM (drop the shadow), tier README numbers, the agentic campaign.
+
 ## 2026-09-17 (am): issue #49 -- why ninfer runs half the Claude Code turns: the planning turn, not a cutoff; every q27-side mechanism excluded; render_request had the wrong tool dialect for 3.8
 
 Full readout with tables: bench/crossengine/agentic-2026-09-17-turns/README.md.
@@ -15786,6 +16483,17 @@ pin (#46), the per-slot DFlash2 reserve (#47). Gates are (ak)'s (test-tools
 boot on the 5090). Token ids and prompts unchanged. Production is the
 v0.11.6 build until a deploy; the #45 read exists there too, on every
 streaming /v1/messages response, so the deploy should not wait long.
+
+DEPLOYED 2026-09-17 17:10 PDT: built from the v0.11.7 tag (1c1f972) in a
+throwaway worktree, md5 63ce03d9, moved atomically into
+/mnt/ai/projects/q27/build/q27-server; the v0.11.6 build saved as
+q27-server.v0.11.6 (b15a569e) for rollback, v0.11.4 and v0.11.3 still
+there. Boot: wsum b743d26b1f0562a9, XML dialect, DFlash2 serving ON K=7,
+listening; health 200 in 2 s. Smoke on the #45 path: streaming
+message_start carries the requested model name ("claude-opus-4-8"), text
+delivered; non-stream fine. Master is 0f1f1d4 (issue #49 readout,
+Q27_SEED, render_request --dialect) -- NOT in this build; the deployed
+source is exactly the tag's.
 
 ## 2026-09-15 (ak): three field bugs -- a dangling capture that crashed streaming /v1/messages (#45), a fatal pinned-memory failure in the checkpoint ring (#46), the DFlash2 reserve counted once for N slots (#47)
 

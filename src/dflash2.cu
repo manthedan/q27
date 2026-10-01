@@ -592,13 +592,15 @@ void Dflash2::alloc(int cap) {
     // anchor-token device buffer (always: the selector walk reads it on
     // device so the drafter forward is graph-capturable)
     D2CHECK(cudaMalloc(&d_anchor_tok, 4));
+    D2CHECK(cudaMalloc(&nrot, (size_t)D2_WMAX * D2_H * 4)); // Bonsai 2 head input twin
     // cache the mask-token embedding once (engine Q8 embed if set, else the
     // packed fp16 target.embed)
     if (eembed_data) {
         D2CHECK(cudaMalloc(&d_mask_tok, 4));
         const int mtok = D2_MASK;
         D2CHECK(cudaMemcpy(d_mask_tok, &mtok, 4, cudaMemcpyHostToDevice));
-        q27k::embed_row_q8(eembed_data, eembed_scales, d_mask_tok, D2_H, maskrow, 0);
+        engine_embed_row(d_mask_tok, maskrow, 0);
+        if (bz_signs) q27k::hadamard1024(maskrow, bz_signs, D2_H, true, 0); // rotated table
     } else {
         k_d2_rowcast<<<40, 256>>>(f16("target.embed.weight") + (size_t)D2_MASK * D2_H, maskrow,
                                   D2_H);
@@ -756,8 +758,10 @@ void Dflash2::draft_compute(int K, cudaStream_t st, bool sampling) {
     const int W = K + 1;
     char nm[64];
     // anchor row (engine Q8 embed, device anchor) + K mask rows
-    if (eembed_data)
-        q27k::embed_row_q8(eembed_data, eembed_scales, d_anchor_tok, D2_H, nx, st);
+    if (eembed_data) {
+        engine_embed_row(d_anchor_tok, nx, st);
+        if (bz_signs) q27k::hadamard1024(nx, bz_signs, D2_H, true, st); // rotated table
+    }
     for (int r = 1; r < W; r++)
         D2CHECK(cudaMemcpyAsync(nx + (size_t)r * D2_H, maskrow, D2_H * 4,
                                 cudaMemcpyDeviceToDevice, st));
@@ -828,13 +832,24 @@ void Dflash2::draft_compute(int K, cudaStream_t st, bool sampling) {
     if (ehead_data) {
         q27k::XQ3 xq{};
         for (int i = 0; i < 16; i++) xq.q[i] = hxq[i < K ? i : 0];
-        q27k::quantize3(mkCP3(nhf, D2_H, K), D2_H, xq, st, K);
+        const float* hin = nhf;
+        if (bz_signs) {
+            // the engine head is folded: rotate a copy (the selector
+            // projection below still reads the plain nhf)
+            D2CHECK(cudaMemcpyAsync(nrot, nhf, (size_t)K * D2_H * 4, cudaMemcpyDeviceToDevice, st));
+            q27k::hadamard1024_rows(nrot, bz_signs, D2_H, K, D2_H, false, st);
+            hin = nrot;
+        }
+        q27k::quantize3(mkCP3(hin, D2_H, K), D2_H, xq, st, K);
         float* ys[16];
         for (int i = 0; i < 16; i++) ys[i] = nlogits + (size_t)(i < K ? i : 0) * D2_V;
         q27k::XQuant qs[16];
         for (int i = 0; i < 16; i++) qs[i] = hxq[i < K ? i : 0];
-        if (ehead_q4)
+        if (ehead_kind == 1)
             q27k::gemv_q4_n((const uint8_t*)ehead_data, ehead_scales, qs, K, ys, D2_V, D2_H,
+                            st);
+        else if (ehead_kind == 2)
+            q27k::gemv_t2_n((const uint8_t*)ehead_data, ehead_scales, qs, K, ys, D2_V, D2_H,
                             st);
         else
             q27k::gemv_q8_n((const int8_t*)ehead_data, ehead_scales, qs, K, ys, D2_V, D2_H,

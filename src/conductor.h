@@ -217,6 +217,12 @@ struct ConductorCore {
     // drafting any other member; otherwise fused drafting overwrites the
     // staged forced id and the transition never reaches decoder state.
     std::function<bool(MemberT&)> needs_solo_round;
+    // Members that must take the FUSED path even alone (k == 1): a draftless
+    // member's rounds run under the spec-round outcome convention (pending
+    // unemitted) and its engine's solo decode_step runs the plain token
+    // graph (pending emitted) -- mixing the two per round duplicates or
+    // drops a token, so such a member never falls through to solo_round.
+    std::function<bool(MemberT&)> always_fused;
 
     std::function<void(MemberT**, const int*, const bool*, int, bool*)> fused_round;
     std::function<void(MemberT&)> on_leave;
@@ -274,7 +280,7 @@ struct ConductorCore {
             last_idle = !members.empty();
             return (int)members.size();
         }
-        if (k == 1) {
+        if (k == 1 && !(always_fused && always_fused(*act[0]))) {
             // solo fallthrough: byte-for-byte today's path (captured
             // graphs); fusion only engages at >= 2 (design "Scheduler").
             if (solo_round(*act[0])) drop(act[0]);
@@ -668,8 +674,15 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
     const Engine::LaneView& v = uv.view;
     Engine& e0 = *es[0];
     const DevTensor& emb = e0.shared_dm().get("token_embd.weight");
-    q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, v.vtok, N_EMBD,
-                 LANESV(v, h), v.stm, v.vw);
+    e0.embed_lanes(emb, v.vtok, LANESV(v, h), v.stm, v.vw);
+    // Bonsai 2 mirror (2026-09-18, spec_verify_forward's bz_* sites): the
+    // embedding rows are stored rotated (inverse after lookup); every layer-
+    // input norm becomes norm -> rotate -> quantize in one launch (the pre
+    // functions then skip their own quantize, x1q=true); the post functions
+    // rotate their own inputs already (bz_rotq5 inside). The Qwen path below
+    // is byte-for-byte what it was.
+    const bool bz = e0.bonsai2;
+    if (bz) e0.bz_unrot_lanes(v.h, v.vw, v.stm);
     q27k::CP3 Hc LANESV(v, h), Yc LANESV(v, y);
     q27k::P3 Hm LANESV(v, h), X1m LANESV(v, x1);
     // P2b: one fork/join per mixer layer. DEVICE-side ordering only (B6):
@@ -707,25 +720,31 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
     };
     for (int il = 0; il < N_LAYER; il++) {
         const float* an = (const float*)e0.T(il, "attn_norm.weight").data;
-        q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
+        if (bz) e0.bz_norm3_rot_q5(v, Hc, an, X1m, !e0.is_attn_layer(il));
+        else q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
         if (e0.is_attn_layer(il)) {
-            e0.attn_pre(il, v);
+            e0.attn_pre(il, v, bz);
             mix_all(il, true);
             e0.attn_post(il, v);
         } else {
-            e0.gdn_pre(il, v);
+            e0.gdn_pre(il, v, bz);
             mix_all(il, false);
             e0.gdn_post(il, v);
         }
         q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
         const float* pn = (const float*)e0.T(il, "post_attention_norm.weight").data;
-        q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, v.stm, v.vw);
-        e0.ffn_pair(il, v);
+        if (bz) e0.bz_norm3_rot_q5(v, Hc, pn, X1m, false);
+        else q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, v.stm, v.vw);
+        e0.ffn_pair(il, v, bz);
         q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
     }
     const float* on = (const float*)e0.shared_dm().get("output_norm.weight").data;
-    q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, v.stm, v.vw);
-    e0.qx5(v, v.x1, N_EMBD);
+    if (bz) {
+        e0.bz_norm3_rot_q5(v, Hc, on, X1m, false);
+    } else {
+        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, v.stm, v.vw);
+        e0.qx5(v, v.x1, N_EMBD);
+    }
     const char* vhead = (e0.fast_head_on() && e0.shared_dm().model_has("output_q4.weight"))
                             ? "output_q4.weight"
                             : "output.weight";
@@ -858,6 +877,11 @@ public:
         // semantics the interleave must (and does -- B8) reproduce.
         int want_width() {
             gate_cap = md_used = -1;
+            if (e->plain_lanes) { // draftless member (see Conductor::draft_widths)
+                sfx_round = false;
+                if (sampled) e->draft_sample_bootstrap();
+                return e->plain_propose();
+            }
             // mirror spec_round's branch order: the suffix drafter fires
             // before the MTP chain (greedy only -- spec_sample_round has no
             // suffix branch), on this engine's OWN stream.
@@ -997,7 +1021,12 @@ public:
         // whose ctor throws never runs. Tear down + rethrow.
         try {
             core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
-            core.needs_solo_round = [](Member& mm) { return mm.t->round_forced; };
+            // Bonsai 2 packs take fused rounds since 2026-09-18 (the rotation
+            // is mirrored in fused_verify_round); Q27_BONSAI_FUSED=0 pins them
+            // to solo rounds -- the A/B control for the fused path.
+            static const bool bz_solo = [] { const char* e = getenv("Q27_BONSAI_FUSED"); return e && atoi(e) == 0; }();
+            core.needs_solo_round = [](Member& mm) { return mm.t->round_forced || (mm.e->bonsai2 && bz_solo); };
+            core.always_fused = [](Member& mm) { return mm.e->plain_lanes && !bz_solo; };
             core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
                                       int k, bool* done) {
                 this->fused_round(ms, granted, sfx, k, done);
@@ -1413,6 +1442,16 @@ private:
         for (int i = 0; i < k; i++) {
             Member& mm = *ms[i];
             mm.gate_cap = mm.md_used = -1;
+            if (mm.e->plain_lanes) {
+                // draftless (Bonsai 2 without DFlash2): a width-2 lane pair,
+                // lane 1 never accepted (engine tails, max_draft 0). Not a
+                // suffix round (GEMM policy, telemetry), no MTP chain.
+                mm.sfx_round = false;
+                sfx[i] = false;
+                if (mm.sampled) mm.e->draft_sample_bootstrap();
+                want[i] = mm.e->plain_propose();
+                continue;
+            }
             // mirror spec_round's branch order (== want_width): the suffix
             // drafter fires before the MTP chain, greedy only, on this
             // engine's OWN stream. Suffix decisions are host one-shots over
@@ -1535,7 +1574,7 @@ private:
         // first sub-theta). Any mismatch is an interleave logic bug --
         // caught here, before it can reach the byte gate.
         for (int i = 0; i < k; i++) {
-            if (sfx[i]) continue;
+            if (sfx[i] || ms[i]->e->plain_lanes) continue; // no draft chain to re-derive
             const Engine& e = *ms[i]->e;
             int rcap = 0, rlaunched = 0;
             for (int s = 0; s < mdu[i]; s++) {

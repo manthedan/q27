@@ -153,6 +153,8 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* const* ktab, const void* 
 // embedding row lookup for ntok device tokens.
 void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0,
             int ntok = 3);
+void embed3_t2(const uint8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0,
+               int ntok = 3);
 
 // Device-side round bookkeeping (width-12 P0: pointer-struct signatures --
 // the old flat lists sat at 17/25 params and could not widen). prep derives

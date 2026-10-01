@@ -109,9 +109,9 @@ bool cuda_weight_dtype_supported(DType dtype) {
         case DType::Q8_G128:
         case DType::Q4_G64:
         case DType::FP4_G16: // uploadable bytes; consumed only by the pf4 prefill leg
+        case DType::T2_G128: // Bonsai 2 Phase 2: decode GEMVs (gemv_t2); prefill reads the .q4x shadow
+        case DType::T3_G128: // Bonsai 2 8 GB packs (2026-09-20): gemv_t3 + the T2 prefill scratch
             return true;
-        case DType::T2_G128:
-        case DType::T3_G128:
         case DType::B1_G128:
             return false;
     }
@@ -138,8 +138,11 @@ bool metal_weight_dtype_supported(DType dtype) {
     return false;
 }
 void validate_cuda_tensor(const Tensor& tensor) {
-    if(tensor.name=="token_embd.weight" && tensor.dtype!=DType::Q8_G128)
-        throw std::runtime_error("q27 CUDA: token_embd.weight must be Q8_G128");
+    // the embedding lookups are Q8 (every Qwen tier, Bonsai 2 t2 packs) or
+    // T2 (Bonsai 2 slim packs, 2026-09-19); no Q4/F16/B1 row kernels exist
+    if(tensor.name=="token_embd.weight" && tensor.dtype!=DType::Q8_G128 &&
+       tensor.dtype!=DType::T2_G128)
+        throw std::runtime_error("q27 CUDA: token_embd.weight must be Q8_G128 or T2_G128");
     if(!cuda_weight_dtype_supported(tensor.dtype))
         throw std::runtime_error("q27 CUDA: unsupported weight dtype " +
                                  std::string(dtype_name(tensor.dtype)) +

@@ -43,7 +43,8 @@
 //     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120
 //     -Xcompiler -Wall tools/fused_smoke.cu src/blocks.cu src/prefill.cu
 //     src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu
-//     src/loader.cpp -o build/fused_smoke
+//     src/loader.cpp src/dflash2.cu build/pf4.o -o build/fused_smoke
+//   (dflash2.cu and build/pf4.o since the engine grew those; 2026-09-18)
 //
 // Run: build/fused_smoke [model.q27]   (default: the canonical vanilla qwen)
 // Success lines: "FUSED SMOKE PASS: streamA identical, streamB identical"

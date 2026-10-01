@@ -7,7 +7,7 @@
 > Source-checkout milestone only; no new Homebrew/prebuilt release is implied.
 > The upstream engine documentation follows below.
 
-A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and their fine-tunes on a single RTX 5090 (3090 and 4090/Ada also supported; Apple-silicon Metal backend for the q4s tier). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
+A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GDN+attention, trained-in MTP heads), their fine-tunes, and PrismML's **Ternary Bonsai 2 27B** (2-bit, Hadamard-folded) on a single RTX 5090 (3090 and 4090/Ada also supported; Apple-silicon Metal backend for the q4s tier). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
 ## Why this is interesting
 
@@ -135,6 +135,103 @@ recipe the full 19-task suite scores **0.928 hidden / 0.895 composite**
 same suite scored 0.511 -- the recipe is the difference, not the checkpoint.
 The engine auto-selects 3.8's trained XML tool dialect from the artifact name.
 
+### Bonsai 2 27B (ternary Qwen3.8, 2026-09-18)
+
+[PrismML's Ternary Bonsai 2 27B](https://prismml.com/news/bonsai-2-27b) is
+Qwen3.8-27B with every projection ternary (one fp16 scale per 128) in a
+Hadamard-rotated basis and no MTP block. q27 serves it natively: the repack
+keeps the ternary values exact in a 2-bit container (`T2_G128`, 9.44 GB for
+the whole model, embeddings and head in exact Q8), the engine rotates the
+activations itself (sign + Walsh-Hadamard per 1024-block, fused into the
+activation quantizers), decode runs 2-bit dp4a GEMVs, prefill and the
+speculative verify run the int8 tensor-core GEMMs off a 2-bit staging
+unpack, and DFlash2 drafts against the ternary target with the Qwen3.8 Q8
+pack (the pack has no MTP head, so DFlash2 is the only drafter). The pack
+is at [signalnine/Bonsai-2-27B-q27](https://huggingface.co/signalnine/Bonsai-2-27B-q27)
+with the tokenizer and checksums. Bit-exact
+containers mean the port is checkable against the reference fork: teacher-
+forced logits agree at top-1 0.9974 over 383 positions and wikitext PPL
+matches `llama-perplexity` on the same GGUF to 0.15% (8.2767 vs 8.2643 at
+2048). `docs/plans/2026-09-18-bonsai2-ternary.md` has the design and log.
+
+| tier | GB | wikitext PPL | HumanEval+ | needle | 5090 decode (DFlash2 K=7) |
+|---|--:|--:|--:|---|---|
+| Qwen3.8 default (v2) | 17.00 | 7.3121 | 30/30 | 6/6 @ ~120K | ~220 t/s |
+| Bonsai 2 (T2) | 9.44 | 9.2508 | 25/30 | 6/6 @ ~90K | 233 t/s on the 700-token prompt, 346 on cities; round 14.8 ms; plain 110 t/s |
+| Bonsai 2 (T3, `--bonsai2-container t3 --slim`) | 6.06 | 9.2513 (bitwise the T2 pack on the 3090) | same model | same model | the 8 GB-card pack; decode at the T2 pack's speed |
+
+Same protocol as the table above (chunk 512, fp8 KV; the same-card pair on
+the 3090 is 9.2513 vs 7.3102). The 2.3 GB engine stack plus the 9.44 GB
+weights leave 23 GB of KV on a 32 GB card (auto context 262K). Read the PPL
+and HumanEval+ columns before picking it: it is a different checkpoint, not
+a quant tier of the one above. On the 12-instance Claude Code SWE-bench
+campaign it lands the same patches (gold 11/12, identical to the Qwen3.8
+legs) at 205 vs 222 t/s aggregate, but reasons about twice as long per
+instance (37 vs 22 API turns, 75K vs 35K thinking chars), so wall is 2.3x
+(`bench/crossengine/agentic-2026-09-18-bonsai2/`).
+
+The Qwen3.8 drafter works against this target as-is. A drafter trained on
+the ternary target does better: ProCreations'
+[Ternary-Bonsai-2-27B-DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)
+(independent, Apache-2.0, the z-lab architecture retrained on Bonsai
+features) packs unchanged through `tools/dflash2_pack.py --q8` and on the
+same campaign gives 3.80 tok/round and 227.7 t/s aggregate against 3.47 and
+205 -- above the Qwen3.8 default tier's own aggregate on this traffic, at
+the same trajectory shape. Identity-gated against plain decode on the 3090
+(the 5090's greedy is not width-invariant for any drafter, a known
+instrument property; BUILDLOG 2026-09-18 (as)).
+
+Multi-slot works too: without a drafter a Bonsai member rides the fused
+round as a width-2 lane pair whose second lane is never accepted, so the
+conductor's union sweep serves every slot from one weight pass (BUILDLOG
+2026-09-18 (at); `Q27_BONSAI_FUSED=0` pins members to solo rounds). On the
+5090 at 8 slots / 16K: 105 / 150 / 200 / **329 t/s** aggregate at C = 1 / 2
+/ 4 / 8 against 111 / 116 / 116 / 117 time-sliced, byte-identical to plain
+decode on the 3090 gate. Half the lanes are dummies there. With a drafter in
+the pack the lanes fill: ProCreations'
+[Ternary-Bonsai-2-27B-MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP)
+head (independent, Apache-2.0, the Qwen3.8 MTP block distilled onto Bonsai)
+repacks as the pack's blk.64 with `tools/repack.py ... --mtp-safetensors
+model_mtp.safetensors` (9.87 GB), the engine runs its ordinary gated ladder
+against the ternary target (the MTP layer stays unrotated), and the same
+ladder reads 173 / 231 / 384 / **512 t/s** at C = 1 / 2 / 4 / 8 -- the
+Qwen tiers' class from a 9.9 GB pack (BUILDLOG 2026-09-18 (au); the
+ladder is bitwise vs plain decode at 1500 CLI tokens, and the width-4-plus
+verify has the engine's own near-tie flips on either model).
+
+On a 12 GB card (3060 class): `repack.py --slim` stores the embedding and
+head as T2 too (exact; 7.2 GB, or 7.6 GB with the MTP head), the
+`build/q27-server-12g` target is a single sm_86 image with 8 lanes and
+256-row prefill chunks, and `Q27_FIXED_STACK_GB=0.9` tells the pool sizer
+what that build actually costs. Simulated at 11.7 GB free on the 3090: 32K
+context plain, 20K with the MTP ladder, bitwise the full pack's plain
+decode; the 2.1 GB DFlash2 pack leaves only 4K there, so the MTP pack is
+the 12 GB drafter (BUILDLOG 2026-09-19 (av)).
+
+On an 8 GB card: `repack.py --bonsai2-container t3 --slim` packs the body
+as `T3_G128`, five trits per byte (1.6 bpw; 6.06 GB, or 6.49 GB with the
+MTP head). The CUDA decode GEMV reads it in a layout built to sum exactly
+what the T2 kernel sums, so the pack is bitwise the T2 pack at every width
+(400/400 matrices, same PPL to six digits, same server texts); prefill
+converts each matrix into a 22 MB T2 scratch on the fly (+4% wall). With
+`Q27_FIXED_STACK_GB=0.6` and the Ampere-default turbo5k KV, a headless
+RTX 3060 Ti measures 36.9K context, 42 t/s decode and 481 tok/s prefill
+(first field report, 09-22); the 3090 simulation put 45K at 8.0 GB free,
+12K with the MTP ladder (`Q27_FIXED_STACK_GB=0.8`), and 24K plain with a
+display on the card. Decode runs at the T2 pack's speed rather than 24%
+under it -- the digit extraction is exposed on the 3090 (BUILDLOG
+2026-09-20 (aw)).
+
+```bash
+# Bonsai 2: repack the PTQ1_0 GGUF (exact, ~3 min, default container t2),
+# serve with the Qwen3.8 tokenizer and DFlash2 pack (tools/launch_q27_38.sh
+# has a `bonsai2` mode with this config)
+python3 tools/repack.py Ternary-Bonsai-2-27B-PTQ1_0.gguf models/bonsai2-27b-t2.q27
+Q27_KV=fp8 Q27_BATCH=0 Q27_DFLASH2=models/qwen38-dflash2-q8-serve.d2w Q27_DFLASH2_RESERVE_GB=3 \
+  ./build/q27-server models/bonsai2-27b-t2.q27 models/qwen38-27b-mtp.tok --think \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0
+```
+
 ```bash
 # 1. tokenizer + your chosen tier (Apache-2.0)
 huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \
@@ -172,17 +269,33 @@ Expect ~170-230 t/s decode on a 5090 depending on traffic shape, warm
 multi-turn prefills from the prefix cache, and `count_tokens` plus
 anthropic-shaped context-limit errors so Claude Code compacts correctly.
 
-## State of the engine (2026-09-10)
+## State of the engine (2026-09-21)
 
 One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
 persistent prefix cache that hits on real agentic traffic, and a tool-call
 parser measured against a labelled corpus of the model's own drift. Current
-release: [v0.11.7](https://github.com/signalnine/q27/releases).
+release: [v0.14.1](https://github.com/signalnine/q27/releases).
 
 Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
 
+- **Ternary Bonsai 2 27B (v0.12.0)**: PrismML's 2-bit Qwen3.8 served
+  natively from a 9.44 GB pack -- exact ternary containers, activation
+  rotation fused into the quantizers, 2-bit GEMVs for decode and a 2-bit
+  staging unpack for the tensor-core prefill and verify GEMMs, DFlash2 on
+  the ternary target. On the same 12-instance Claude Code run: **227.7 t/s
+  aggregate at 3.80 tok/round** with a target-trained drafter (205 / 3.47
+  with the Qwen3.8 one), 23 GB of KV left on a 32 GB card. The checkpoint
+  itself measures +27% wikitext PPL and 25/30 HumanEval+ against the
+  Qwen3.8 default tier and reasons about twice as long per instance --
+  same patches landed, 2.3x the wall (09-18; the tier table below). Fused
+  multi-slot rounds serve it at 329 t/s aggregate over 8 slots at 16K, and
+  512 t/s with a third-party MTP head repacked into the pack. Small cards
+  (v0.14.0): slim packs and a sm_86 build put it on 12 GB (32K context),
+  and a five-trits-per-byte container, bitwise the 2-bit pack, on 8 GB
+  (6.06 GB; a 3060 Ti measures 36.9K context at 42 t/s;
+  `tools/install-bonsai2-8gb.sh`).
 - Claude Code traffic, 12 SWE-bench instances, medium effort (the only
   level both engines render), 2026-09-10 re-bench: **q27 v0.11.3 218-222
   t/s** aggregate decode (232-233 median, 4.05-4.10 tok/round, two runs)
@@ -606,6 +719,8 @@ competitor binaries byte-identical to 08-17):
 |---|--:|--:|--:|--:|
 | **q27** q4s | 141.3 | 229.7 | 352.3 | **530.6** |
 | **q27** q5f | 134.7 | 173.8 | 299.9 | 509.7 |
+| **q27** Bonsai 2 T2 (no drafter, 09-18) | 105.5 | 150.0 | 200.4 | 328.9 |
+| **q27** Bonsai 2 T2 + MTP head (09-18) | 173.2 | 231.0 | 384.1 | 512.2 |
 | ninfer NVFP4 | 157.2 | 299.7 | 442.3 | **834.3** |
 | ninfer int8 | 137.0 | 179.5 | 219.5 | 353.6 |
 | vLLM NVFP4 | 67.4 | 121.4 | 215.7 | 438.7 |

@@ -1339,6 +1339,27 @@ __global__ void k_embed3(const int8_t* __restrict__ W, const __half* __restrict_
          c += (int64_t)gridDim.x * blockDim.x)
         outp.p[t][c] = (float)wr[c] * __half2float(sr[c / 128]);
 }
+__global__ void k_embed3_t2(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                            __grid_constant__ const IP3 tok, int64_t cols,
+                            __grid_constant__ const P3 outp) {
+    const int t = blockIdx.y;
+    int64_t row = *tok.p[t];
+    const uint8_t* wr = W + row * (cols / 4);
+    const __half* sr = S + row * (cols / 128);
+    for (int64_t c = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; c < cols;
+         c += (int64_t)gridDim.x * blockDim.x) {
+        const uint32_t w = ((const uint32_t*)wr)[c >> 4];
+        const int j = (int)(c & 15);
+        const int f = j < 8 ? 4 * (j >> 1) + (j & 1) : 4 * ((j - 8) >> 1) + 2 + ((j - 8) & 1);
+        outp.p[t][c] = (float)((int)((w >> (2 * f)) & 3u) - 1) * __half2float(sr[c >> 7]);
+    }
+}
+void embed3_t2(const uint8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st,
+               int ntok) {
+    dim3 g(8, ntok);
+    k_embed3_t2<<<g, 256, 0, st>>>(W, S, tok, cols, out);
+    CUDA_CHECK(cudaGetLastError());
+}
 void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st,
             int ntok) {
     dim3 g(8, ntok);

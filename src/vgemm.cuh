@@ -111,5 +111,6 @@ struct VgemmAttrs {
     int cta_per_sm;
 };
 VgemmAttrs vgemm_attrs(bool q4in, int mode);
+VgemmAttrs vgemm_attrs_dt(int dt, int mode); // 0 = Q8, 1 = Q4, 2 = T2 (Bonsai 2)
 
 } // namespace q27k
