@@ -259,6 +259,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q8_quantized_matmul;
     id<MTLComputePipelineState> t2_quantized_matmul;
     id<MTLComputePipelineState> t2_float_matmul;
+    id<MTLComputePipelineState> t2_float_matmul_h;   // experiment, Q27_METAL_T2F_HALF=1
     id<MTLComputePipelineState> b1_quantized_matmul;
     id<MTLComputePipelineState> embedding;
     id<MTLComputePipelineState> embedding_t2;
@@ -716,6 +717,8 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
                 impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
             if (const char* env = getenv("Q27_METAL_GEMM_HALF_Q4"); env && *env)
                 impl_->gemm_half_q4 = strtoul(env, nullptr, 10) != 0;
+            if (const char* env = getenv("Q27_METAL_T2F_HALF"); env && strtoul(env, nullptr, 10))
+                impl_->t2_float_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_fh");
         }
         impl_->embedding = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8");
         impl_->embedding_t2 = make_pipeline(impl_->device, impl_->library, @"q27_embedding_t2");
@@ -1439,8 +1442,9 @@ void MetalBackend::matmul_t2_float(const BackendTensor& weight, const BackendBuf
     check_range(out.size(), 0, weight.rows * x_rows * 4, "float T2 matmul output");
     MatmulArgs args{(uint32_t)weight.rows, (uint32_t)weight.cols, x_rows, 1};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own, "q27_matmul_t2_mm_f");
-        [enc setComputePipelineState:impl_->t2_float_matmul];
+        const bool h = impl_->t2_float_matmul_h != nil;
+        bool own; auto enc = impl_->encoder_for_operation(own, h ? "q27_matmul_t2_mm_fh" : "q27_matmul_t2_mm_f");
+        [enc setComputePipelineState:h ? impl_->t2_float_matmul_h : impl_->t2_float_matmul];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2];

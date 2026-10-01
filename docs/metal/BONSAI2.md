@@ -213,8 +213,15 @@ prompt. Against the Prism reference, chunk-prefilling to every position of the
 three gate inputs gives the same 339/340 argmax as serial (same near-tie), and
 chunk-prefilling to 15 cut points across the 4K input gives 15/15 with KL
 ~1e-8. The float GEMM is 83% of prefill time at ~2.1 TFLOPS (about half the M4
-GPU's fp32 rate); attention grows with depth. Half-precision activation
-staging is the remaining lever and would need its own quality gate.
+GPU's fp32 rate); attention grows with depth.
+
+**Experiment, not default:** `Q27_METAL_T2F_HALF=1` stages activations as
+half (`q27_matmul_t2_mm_fh`). Prefill rises to 51 tok/s at 512 tokens and ~45
+at 2K (+20-25%), but reference KL grows ~100x (gate inputs: max 2.3e-5, one
+extra argmax flip on a near-tie, 338/340; 4K cuts 15/15, mean KL 1.5e-7) and
+nothing guards against activations above half's 65504. A byte-LUT trit unpack
+in the float kernel gave no speedup (41.1 vs 40.9 tok/s), so the GEMM is
+MMA/staging-bound, not unpack-bound.
 
 ## Recovered experiments
 

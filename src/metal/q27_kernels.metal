@@ -2429,6 +2429,86 @@ kernel void q27_matmul_t2_mm_h(
     if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
 }
 
+// EXPERIMENT (Q27_METAL_T2F_HALF=1, not default): q27_matmul_t2_mm_f with
+// activations rounded to half at staging; trits exact in half (byte-LUT
+// unpack as in q27_matmul_t2_mm_h), float accumulators. ~20-25% faster
+// prefill on the M4 but ~100x the reference KL of the float path, and
+// activations above 65504 would overflow (docs/metal/BONSAI2.md).
+kernel void q27_matmul_t2_mm_fh(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const float *x [[buffer(2)]],
+        device float *out [[buffer(3)]], constant MatmulArgs &args [[buffer(4)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half Wt[32 * 64];
+    threadgroup half Xt[64 * 16];
+    threadgroup float Sc[4 * 128];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
+    const bool xvalid = xtok < args.x_rows;
+    device const float *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 128;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            // Byte-LUT trit unpack (shared with q27_matmul_t2_mm_h): the
+            // staged floats are the same exact values as the arithmetic
+            // unpack, so the GEMM output is bit-identical.
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+            dst[3] = q27_t2_half4_lut[wp >> 24         ];
+        }
+        {
+            const float4 xa = xvalid ? *(device const float4 *)(xsrc + c0 + xcb) : 0.0f;
+            const float4 xb = xvalid ? *(device const float4 *)(xsrc + c0 + xcb + 4) : 0.0f;
+            threadgroup half *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = half(xa.x); dst[1 * 16] = half(xa.y); dst[2 * 16] = half(xa.z); dst[3 * 16] = half(xa.w);
+            dst[4 * 16] = half(xb.x); dst[5 * 16] = half(xb.y); dst[6 * 16] = half(xb.z); dst[7 * 16] = half(xb.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k8 = 0; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(acc0, sc, 8);
+        simdgroup_store(acc1, sc + 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+        racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                float4(wsA, wsB, wsA, wsB);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
 
 // Byte -> 2 Q4 halves (low nibble first, code n -> n-8): one constant-
 // memory gather replaces two shift/mask/int-sub/convert chains. 1 KB,

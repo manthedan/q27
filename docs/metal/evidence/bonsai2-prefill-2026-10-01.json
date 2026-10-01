@@ -69,5 +69,64 @@
   "test_bonsai2_native.py PASS",
   "./q27 agent smoke"
  ],
- "not_rerun": "q4s HTTP snapshot-recovery suite"
+ "not_rerun": "q4s HTTP snapshot-recovery suite",
+ "half_activation_experiment": {
+  "switch": "Q27_METAL_T2F_HALF=1 (q27_matmul_t2_mm_fh), not default",
+  "speed_tok_s": {
+   "512": [
+    51.1,
+    51.0
+   ],
+   "2048": [
+    45.0,
+    44.4
+   ]
+  },
+  "float_same_session_tok_s": {
+   "512": [
+    41.1,
+    40.7
+   ],
+   "2048": [
+    38.3,
+    36.2
+   ]
+  },
+  "parity_chunked": {
+   "prose": {
+    "passed": true,
+    "positions": 102,
+    "max_relative_rmse": 0.001378894389667614,
+    "mean_kl": 6.546402815523346e-07,
+    "max_kl": 2.2850398687883136e-05,
+    "argmax_matches": 101
+   },
+   "code": {
+    "passed": true,
+    "positions": 128,
+    "max_relative_rmse": 0.0022337246538504537,
+    "mean_kl": 1.4130227307076715e-08,
+    "max_kl": 7.409831586691513e-07,
+    "argmax_matches": 128
+   },
+   "tools_unicode": {
+    "passed": true,
+    "positions": 110,
+    "max_relative_rmse": 0.0008958246811464054,
+    "mean_kl": 9.066145427177274e-08,
+    "max_kl": 3.1773363338444965e-06,
+    "argmax_matches": 109
+   },
+   "long": {
+    "passed": true,
+    "positions": 15,
+    "max_relative_rmse": 0.0019337737240334913,
+    "mean_kl": 1.4557719213727412e-07,
+    "max_kl": 5.824406760745715e-07,
+    "argmax_matches": 15
+   }
+  },
+  "lut_unpack_float_kernel": "bit-identical, no speedup (41.1 vs 40.9 tok/s at 512); not adopted",
+  "risk": "no overflow guard for activations above 65504"
+ }
 }
