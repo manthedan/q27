@@ -13,7 +13,7 @@ parity run was on a base M4 / 24 GiB laptop.
 
 ```sh
 cd "$HOME/projects/q27-revival"
-export Q27_CONTEXT=2048            # validated mini context; launcher default is 8192
+export Q27_CONTEXT=16384           # fits a 16 GiB mini with fp16 KV; launcher default is 8192
 ./q27 build
 ./q27 agent                        # classic native agent; no model-driven tools
 ./q27 tui                          # Rust/Ratatui frontend, same native engine
@@ -170,9 +170,29 @@ short-context correctness, not a long-context or task-benchmark claim.
 - **HTTP snapshot hints**: upstream ignores explicit hints for serial-only
   Bonsai. Its q4s snapshot-recovery suite therefore does not pass unchanged;
   do not substitute the endpoint smoke for a full recovery gate.
-- **Homebrew/prebuilt release**, larger-context 16 GiB validation, and cold
-  start/persistence soak: still pending. The mini gates use context 2048, not
-  the launcher's default 8192.
+- **Homebrew/prebuilt release** and cold start/persistence soak: still pending.
+  The serving/native gates run at context 2048.
+
+## Context on a 16 GiB Mac
+
+Measured on the M4 / 16 GiB mini with the t2-slim pack
+([evidence](evidence/bonsai2-longctx-2026-10-01.json)). The KV cache is
+allocated up front for the whole `--ctx`:
+
+| KV | 8K | 16K | 32K | 64K | 128K |
+|---|---|---|---|---|---|
+| fp16 | ok | ok, full speed | ok, but swapping (decode 11 -> 6.9 tok/s) | GPU out of memory | refused by cache budget |
+| turbo3 | ok | ok | ok | ok | ok (~9 tok/s) |
+
+Correctness at depth: over a 4,064-token prose/code prompt, fp16 KV matches the
+Prism reference at all 127 sampled positions with KL ~1e-8 that does not grow
+with depth. turbo3 KV differs measurably (mean KL 0.01 nats, 124/127 argmax)
+but its next-token NLL is indistinguishable from the reference at this sample
+size (-0.4% PPL, +/-1.4%). Use fp16 up to 16K; `serve --kv turbo3` for longer
+contexts. The native agent has no `--kv` option and always uses fp16.
+
+Prompt ingestion is still serial (~10 tok/s), so a 16K prompt takes ~27
+minutes to prefill; batched Bonsai prefill is the next milestone.
 
 ## Recovered experiments
 

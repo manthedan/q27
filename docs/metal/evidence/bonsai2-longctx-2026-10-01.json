@@ -1,0 +1,52 @@
+{
+ "date": "2026-10-01",
+ "device": "Apple M4 / 16 GiB (mini)",
+ "pack": "bonsai2-27b-t2-slim.q27 (b85094a0...)",
+ "allocation_sweep": {
+  "note": "q27-metal --prompt Hi -n 4, KV allocated for full --ctx; footprint excludes the 6.7 GiB weight mmap",
+  "fp16": {
+   "8192": "ok 0.74 GiB 9.8 tok/s",
+   "16384": "ok 1.25 GiB 11.0 tok/s, no swap growth",
+   "32768": "ok 2.24 GiB 6.85 tok/s, swap grew",
+   "65536": "kIOGPUCommandBufferCallbackErrorOutOfMemory",
+   "131072": "refused: exceeds cache budget"
+  },
+  "turbo3": {
+   "8192": "ok 0.34 GiB 11.0 tok/s",
+   "32768": "ok 0.63 GiB 11.4 tok/s",
+   "65536": "ok 1.02 GiB 10.0 tok/s",
+   "131072": "ok 1.81 GiB 8.9 tok/s"
+  }
+ },
+ "depth_parity": {
+  "input": "4064 tokens: README head + bonsai_rotation.h + repack.py head",
+  "stride": 32,
+  "positions": 127,
+  "reference": "Prism 1a07bfa5, fp16 KV, serial",
+  "fp16": {
+   "passed": true,
+   "positions": 127,
+   "max_relative_rmse": 0.0008564562607840862,
+   "mean_kl": 9.981965581938986e-09,
+   "max_kl": 1.2787104738377052e-07,
+   "argmax_matches": 127
+  },
+  "turbo3": {
+   "passed": false,
+   "positions": 127,
+   "max_relative_rmse": 0.30074364285010025,
+   "mean_kl": 0.010521670359930749,
+   "max_kl": 0.07811543557310524,
+   "argmax_matches": 124
+  },
+  "next_token_nll": {
+   "n": 126,
+   "reference": 2.2494,
+   "fp16": 2.2494,
+   "turbo3": 2.245,
+   "turbo3_dppl_pct": -0.44,
+   "stderr_pct": 1.4
+  }
+ },
+ "serial_prefill": "~9.8 tok/s including per-position logit readback (4064 tokens in 412 s)"
+}

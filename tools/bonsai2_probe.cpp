@@ -8,6 +8,8 @@
 #include "../src/metal/metal_engine.h"
 #endif
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -29,6 +31,14 @@ int main(int argc,char** argv) {
         std::ofstream out(argv[3],std::ios::binary);
         if(!out) throw std::runtime_error("cannot open logit output");
         const uint32_t context=std::max<uint32_t>(128,tokens.size()+32);
+        // Long-context runs: Q27_PROBE_STRIDE=k keeps every k-th position's
+        // logits (all positions still run); Q27_PROBE_KV=turbo3 (q27 only).
+        const char* stride_env=std::getenv("Q27_PROBE_STRIDE");
+        const size_t stride=stride_env?std::strtoul(stride_env,nullptr,10):1;
+        if(stride<1) throw std::runtime_error("Q27_PROBE_STRIDE must be >= 1");
+        const char* kv_env=std::getenv("Q27_PROBE_KV");
+        const bool turbo3=kv_env && !std::strcmp(kv_env,"turbo3");
+        if(kv_env && !turbo3 && std::strcmp(kv_env,"fp16")) throw std::runtime_error("Q27_PROBE_KV must be fp16 or turbo3");
 #ifdef Q27_PRISM_REFERENCE
         ggml_backend_load_all();
         llama_backend_init();
@@ -46,8 +56,9 @@ int main(int argc,char** argv) {
         std::unique_ptr<llama_context,decltype(&llama_free)> engine(
             llama_init_from_model(model.get(),cp),llama_free);
         if(!engine) throw std::runtime_error("reference context failed");
+        if(turbo3) throw std::runtime_error("Q27_PROBE_KV=turbo3 applies to the q27 probe only");
 #else
-        q27::MetalEngine engine(argv[1],context,false);
+        q27::MetalEngine engine(argv[1],context,turbo3);
 #endif
         for(size_t i=0;i<tokens.size();++i) {
 #ifdef Q27_PRISM_REFERENCE
@@ -61,6 +72,7 @@ int main(int argc,char** argv) {
             auto row=engine.read_logits();
             const float* logits=row.data();
 #endif
+            if(i%stride!=stride-1) continue;
             out.write(reinterpret_cast<const char*>(logits),248320*sizeof(float));
             if(!out) throw std::runtime_error("short logit write");
             std::cerr<<"position "<<i<<" argmax "<<(std::max_element(logits,logits+248320)-logits)<<'\n';
