@@ -277,18 +277,19 @@ inline bool& tool_dialect_xml_default() {
     return v;
 }
 inline void set_tool_dialect_for_model(const std::string& meta_json) {
-    std::string name, profile;
+    std::string name;
+    bool bonsai2 = false;
     try {
         const auto meta = json::parse(meta_json);
         name = meta.value("general.name", std::string());
-        profile = meta.value("q27.model_profile", std::string());
+        bonsai2 = meta.value("bonsai2", false);
     } catch (...) {}
     std::string norm;
     for (char c : name)
         if (isalnum((unsigned char)c)) norm += (char)tolower((unsigned char)c);
-    // The pinned Bonsai 2 GGUF calls itself "Hf". Preserve that provenance
-    // while selecting its trained Qwen3.8 rendering through an explicit profile.
-    tool_dialect_xml_default() = profile == "bonsai2-qwen38-v1" ||
+    // Bonsai 2 packs are Qwen3.8 fine-tunes whatever general.name says
+    // (the source GGUF calls itself "Hf"); "bonsai2": true is authoritative.
+    tool_dialect_xml_default() = bonsai2 ||
                                  norm.find("qwen38") != std::string::npos;
     fprintf(stderr, "tool dialect: %s (general.name \"%s\"%s)\n",
             tool_dialect_xml_default() ? "xml (trained-format default)" : "json",

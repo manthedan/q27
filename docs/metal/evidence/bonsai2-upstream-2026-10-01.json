@@ -1,0 +1,121 @@
+{
+ "date": "2026-10-01",
+ "device": "Apple M4 / 16 GiB (mini)",
+ "base": "revival/bonsai2 merged with upstream v0.14.1 (e30304d)",
+ "reference_source": "PrismML-Eng/llama.cpp@1a07bfa5f4144274c8f1c9963821dd9d9a51854b",
+ "reference_build_note": "AppleClang, Metal, -include cerrno; source unmodified; cmake 4.4.3 from the project venv",
+ "source_repo": "prism-ml/Ternary-Bonsai-2-27B-gguf",
+ "source_revision": "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
+ "source_sha256": "3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1",
+ "tokenizer_sha256": "f8adac2001668f3ba68e040e5c13f0982d6a194e2b4d9047cc050fdc6d7c93f2",
+ "converter": "tools/repack.py --bonsai2-container {t2,t3} --slim (upstream)",
+ "kv": "fp16",
+ "prefill": "serial one-token teacher forcing on both runtimes",
+ "packs": {
+  "t2-slim": {
+   "sha256": "b85094a0f53c68c25fc73c28e70e05462620417698c7b08a8977d475391f0aeb",
+   "bytes": 7195341824,
+   "cases": [
+    {
+     "passed": true,
+     "positions": 102,
+     "argmax_matches": 102,
+     "high_margin_mismatches": [],
+     "max_relative_rmse": 0.00021855626165281038,
+     "mean_kl": 1.1463273908911694e-08,
+     "max_kl": 3.273986291933654e-07,
+     "reference_sha256": "8d389bc8d85e824d129711a23b4bbf2b0bf0433efe933b1c5b31be5b5c682732",
+     "candidate_sha256": "41fc72e397206b51d9ec545feadcbec225d0fc68382af2586f6d8c1fa0bcfec1",
+     "name": "prose"
+    },
+    {
+     "passed": true,
+     "positions": 128,
+     "argmax_matches": 128,
+     "high_margin_mismatches": [],
+     "max_relative_rmse": 0.001111685431414263,
+     "mean_kl": 2.7871918294697694e-10,
+     "max_kl": 5.581857954314978e-09,
+     "reference_sha256": "59013a09451b49a5550f5bb0329d947223631f2cf1a6ed831076ae07f463bf43",
+     "candidate_sha256": "6187f851fb83976ffe7ee55198eadd36a906c19807b94488665729a97dd8594f",
+     "name": "code"
+    },
+    {
+     "passed": true,
+     "positions": 110,
+     "argmax_matches": 109,
+     "high_margin_mismatches": [],
+     "max_relative_rmse": 5.677565151917977e-05,
+     "mean_kl": 9.236070398062793e-10,
+     "max_kl": 2.0297251428972977e-08,
+     "reference_sha256": "845880312b2ec76b849b12581a09c683ab4609011ff87310b72a18a522bf22c6",
+     "candidate_sha256": "4b896321a0516070963c24de5aacab6cfc398224eaa6cfc9c8ca0f549da84144",
+     "name": "tools_unicode"
+    }
+   ],
+   "decode_tok_s_128": [
+    11.36,
+    10.94
+   ]
+  },
+  "t3-slim": {
+   "sha256": "e548b5208c693f087cb00fe6c73a5da4942982612d4923374a2031bf653e669d",
+   "bytes": 6055015680,
+   "matches_published": "signalnine/Bonsai-2-27B-q27 bonsai2-27b-t3-slim.q27 (HF LFS sha256)",
+   "cases": [
+    {
+     "passed": true,
+     "positions": 102,
+     "argmax_matches": 102,
+     "high_margin_mismatches": [],
+     "max_relative_rmse": 0.0002292191759478319,
+     "mean_kl": 1.0229505074641672e-08,
+     "max_kl": 2.7660764991659016e-07,
+     "reference_sha256": "8d389bc8d85e824d129711a23b4bbf2b0bf0433efe933b1c5b31be5b5c682732",
+     "candidate_sha256": "f7faa94e65258913b6e28ee1bdf8759ee08eae023f993c170faa35a545d75bcc",
+     "name": "prose"
+    },
+    {
+     "passed": true,
+     "positions": 128,
+     "argmax_matches": 128,
+     "high_margin_mismatches": [],
+     "max_relative_rmse": 0.0015178184278075103,
+     "mean_kl": 3.369610008890464e-10,
+     "max_kl": 9.905885621790226e-09,
+     "reference_sha256": "59013a09451b49a5550f5bb0329d947223631f2cf1a6ed831076ae07f463bf43",
+     "candidate_sha256": "496bc5dace0b0fa4d6217dcf6992eccd8fbef3e0a575dff668446c92bf51d36a",
+     "name": "code"
+    },
+    {
+     "passed": true,
+     "positions": 110,
+     "argmax_matches": 110,
+     "high_margin_mismatches": [],
+     "max_relative_rmse": 4.293893244361004e-05,
+     "mean_kl": 8.248017184745446e-10,
+     "max_kl": 1.5045926752248065e-08,
+     "reference_sha256": "845880312b2ec76b849b12581a09c683ab4609011ff87310b72a18a522bf22c6",
+     "candidate_sha256": "75fa9b917b97a2fd6bfb4d6d33dd0dfceb6b7c8d41d4199b39d689cedd1d2ed8",
+     "name": "tools_unicode"
+    }
+   ],
+   "decode_tok_s_128": [
+    7.68,
+    7.87
+   ]
+  }
+ },
+ "argmax_flip_note": "t2-slim tools_unicode position 2: reference top-2 logits 10.15867 vs 10.15865 (2e-5 apart). The retired F32-gate pack scores 110/110 on the same device and build lineage (old probe, max logit delta vs t2-slim 0.0019), so the flip is the F16 storage of the BF16 GDN gates (8,016 of 23.6M values below 3e-8 in magnitude), not the device. Gate tolerances pass; no high-margin mismatches.",
+ "pack_equivalence": "retired bonsai2-t2-hadamard-v1 pack vs t2-slim: every ternary tensor's codes/scales and every F32 tensor byte-identical; hadamard contract identical; hadamard_signs tensors equal sign_values",
+ "runtime_gates": [
+  "make test-tools test-inspect test-agent",
+  "make test-repack test-bonsai2-repack",
+  "make test-metal-backend",
+  "tools/test_bonsai2_serving.py (APIs/SSE/count_tokens, six XML tool routes)",
+  "tools/test_bonsai2_native.py (read/search XML, thinking save/restart cached=83)",
+  "./q27 agent smoke with Q27_MODEL_PROFILE check",
+  "retired pack rejected at load with a reconvert message"
+ ],
+ "decode_note": "q27-metal --prompt, -n 128, ctx 2048, interleaved t2/t3/t2/t3; one run each, not a noise-controlled benchmark"
+}

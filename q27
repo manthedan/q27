@@ -15,13 +15,14 @@ case "$ACTION" in
       '  ./q27 tui [args]     Ratatui frontend over the same native agent' \
       '  ./q27 serve [args]   local HTTP service on 127.0.0.1:8080' \
       'Models/setup: docs/metal/BONSAI2.md' \
-      'Overrides: Q27_BONSAI2_DIR, Q27_CONTEXT, Q27_METAL_SOURCE'
+      'Overrides: Q27_BONSAI2_DIR, Q27_BONSAI2_PACK, Q27_CONTEXT, Q27_METAL_SOURCE'
     exit 0 ;;
   build) exec make -C "$ROOT" -j2 build/q27-metal build/q27-metal-server agent ;;
   agent|tui|serve) ;;
   *) echo "unknown command: $ACTION (see ./q27 help)" >&2; exit 2 ;;
 esac
-MODEL="$MODEL_DIR/bonsai2-t2.q27"
+# Upstream tools/repack.py --slim packs: t2 (7.2 GB) by default, t3 (6.1 GB) via override.
+MODEL="${Q27_BONSAI2_PACK:-$MODEL_DIR/bonsai2-27b-t2-slim.q27}"
 TOKENIZER="$MODEL_DIR/bonsai2.tok"
 [[ -f "$MODEL" && -f "$TOKENIZER" ]] || {
   echo "Bonsai 2 pack missing in $MODEL_DIR; see $ROOT/docs/metal/BONSAI2.md" >&2; exit 1;

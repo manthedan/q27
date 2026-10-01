@@ -5,6 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${PRISM_DIR:?set PRISM_DIR to the built pinned Prism llama.cpp checkout}"
 [[ "$(git -C "$PRISM_DIR" rev-parse HEAD)" == 1a07bfa5f4144274c8f1c9963821dd9d9a51854b ]]
 MODELS="${Q27_BONSAI2_DIR:-$ROOT/models/bonsai2}"
+PACK="${Q27_BONSAI2_PACK:-$MODELS/bonsai2-27b-t2-slim.q27}"
 OUT="${1:-$ROOT/logs/bonsai2-gate-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT"
 make -C "$ROOT" -j2 build/bonsai2-metal-probe build/tokenize_to_bin
@@ -25,7 +26,7 @@ for case in prose code tools_unicode; do
   "$ROOT/build/tokenize_to_bin" "$MODELS/bonsai2.tok" "$OUT/$case.txt" "$OUT/$case.u32"
   "$ROOT/build/bonsai2-prism-probe" "$MODELS/Ternary-Bonsai-2-27B-PQ2_0.gguf" \
     "$OUT/$case.u32" "$OUT/$case.reference.f32" > "$OUT/$case.reference.log" 2>&1
-  "$ROOT/build/bonsai2-metal-probe" "$MODELS/bonsai2-t2.q27" \
+  "$ROOT/build/bonsai2-metal-probe" "$PACK" \
     "$OUT/$case.u32" "$OUT/$case.metal.f32" > "$OUT/$case.metal.log" 2>&1
   python3 "$ROOT/tools/bonsai2_compare.py" "$OUT/$case.reference.f32" "$OUT/$case.metal.f32" \
     --output "$OUT/$case.json"

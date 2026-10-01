@@ -28,7 +28,7 @@ inline std::string model_family_for_metadata(const std::string& meta_json,
     try {
         const auto meta = nlohmann::json::parse(meta_json);
         name = meta.value("general.name", std::string());
-        if (meta.value("q27.model_profile", std::string()) == "bonsai2-qwen38-v1") {
+        if (meta.value("bonsai2", false)) {
             if (model_name) *model_name = name;
             return "qwen38";
         }
@@ -55,7 +55,7 @@ inline bool model_profile_matches_metadata(const std::string& profile,
     const std::string family = model_family_for_metadata(meta_json);
     if (family_out) *family_out = family;
     if (profile == "bonsai2-qwen38-v1") {
-        try { return nlohmann::json::parse(meta_json).value("q27.model_profile", std::string()) == profile; }
+        try { return nlohmann::json::parse(meta_json).value("bonsai2", false); }
         catch (...) { return false; }
     }
     if (profile == "qwen38-thinking-v1") return family == "qwen38";

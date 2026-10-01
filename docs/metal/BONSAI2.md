@@ -1,10 +1,13 @@
 # Bonsai 2 on q27 / Apple Silicon
 
-This is the **source-checkout revival**, based on upstream `0f1f1d49` plus
-Bonsai 2 Metal support and the recovered native agent/TUI. It does not replace
-your Homebrew installation or publish a release. Reference parity was tested
-on a base M4 / 24 GiB laptop; short-context runtime gates also pass on an M4 /
-16 GiB mini (one engine/slot, context 2048).
+This is the **source-checkout revival**: upstream v0.14.1 (which serves Bonsai 2
+on CUDA) plus Bonsai 2 Metal support and the recovered native agent/TUI. Metal
+reads **upstream's own Bonsai 2 packs** (`tools/repack.py --slim`, FORMAT.md
+"Bonsai 2 packs"); the revival's earlier `bonsai2-t2-hadamard-v1` container is
+retired and rejected at load. It does not replace your Homebrew installation or
+publish a release. Reference parity and the short-context runtime gates pass on
+an M4 / 16 GiB mini (one engine/slot, context 2048); the original revival
+parity run was on a base M4 / 24 GiB laptop.
 
 ## Use the prepared checkout
 
@@ -74,8 +77,11 @@ printf '%s  %s\n' \
   3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1 \
   models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0.gguf | shasum -a 256 -c -
 
-.venv/bin/python tools/repack_bonsai2.py \
-  models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0.gguf models/bonsai2/bonsai2-t2.q27
+.venv/bin/python tools/repack.py --bonsai2-container t2 --slim \
+  models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0.gguf models/bonsai2/bonsai2-27b-t2-slim.q27
+# optional, 1.1 GB smaller but ~30% slower decode on M4 (see below):
+.venv/bin/python tools/repack.py --bonsai2-container t3 --slim \
+  models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0.gguf models/bonsai2/bonsai2-27b-t3-slim.q27
 .venv/bin/python tools/export_tokenizer.py \
   models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0.gguf models/bonsai2/bonsai2.tok
 ./q27 build
@@ -85,13 +91,19 @@ Expected SHA-256:
 
 | file | SHA-256 |
 |---|---|
-| `bonsai2-t2.q27` | `765ee57d0cecbb1ca8fb8ee8032c3654af76ccc2b2e8188008cb74f497ecd9ae` |
+| `bonsai2-27b-t2-slim.q27` | `b85094a0f53c68c25fc73c28e70e05462620417698c7b08a8977d475391f0aeb` |
+| `bonsai2-27b-t3-slim.q27` | `e548b5208c693f087cb00fe6c73a5da4942982612d4923374a2031bf653e669d` |
 | `bonsai2.tok` | `f8adac2001668f3ba68e040e5c13f0982d6a194e2b4d9047cc050fdc6d7c93f2` |
 
-The output is **7,242,384,384 bytes**, slightly larger than the source: its
-96 BF16 GDN gate tensors widen exactly to F32. The 402 ternary tensors retain
-all source codes/scales; this is not another quantization pass. Conversion
-spools one tensor at a time rather than keeping a second full model in RAM.
+The t2-slim pack is **7,195,341,824 bytes**; t3-slim is **6,055,015,680**. Both
+are upstream's containers byte for byte: the t3-slim hash equals
+`signalnine/Bonsai-2-27B-q27`'s published `bonsai2-27b-t3-slim.q27`, which can
+be downloaded instead of converted (its `qwen38-27b-mtp.tok` is identical to
+`bonsai2.tok`). The 402 ternary tensors keep every source code and scale; the
+96 BF16 GDN gates are stored as F16 (8,016 of 23.6M values, all below 3e-8 in
+magnitude, round or flush). Conversion peaks at about 8.7 GB RAM. Select the T3
+pack with `Q27_BONSAI2_PACK=models/bonsai2/bonsai2-27b-t3-slim.q27`. Non-slim
+upstream packs (Q8 embedding/head, ~9.4 GB) and MTP packs are rejected on Metal.
 
 ## Gates and evidence
 
@@ -101,9 +113,9 @@ make test-repack test-bonsai2-repack PYTHON=.venv/bin/python
 make test-metal-backend             # run GPU jobs serially
 cargo test --manifest-path experiments/q27-tui/Cargo.toml --locked
 python3 tools/test_bonsai2_serving.py build/q27-metal-server \
-  models/bonsai2/bonsai2-t2.q27 models/bonsai2/bonsai2.tok
+  models/bonsai2/bonsai2-27b-t2-slim.q27 models/bonsai2/bonsai2.tok
 python3 tools/test_bonsai2_native.py build/q27-agent \
-  models/bonsai2/bonsai2-t2.q27 models/bonsai2/bonsai2.tok
+  models/bonsai2/bonsai2-27b-t2-slim.q27 models/bonsai2/bonsai2.tok
 ```
 
 For the independent oracle, build Prism's `prism` branch at
@@ -122,7 +134,14 @@ PRISM_DIR=/absolute/path/to/prism-llama tools/bonsai2_gate.sh
 reference's `gguf.cpp`; its source and math were not modified. The gate runs
 reference and q27 **sequentially**, never two resident models together.
 
-[Committed evidence](evidence/bonsai2-2026-09-18.json): 340 teacher-forced
+[Current evidence](evidence/bonsai2-upstream-2026-10-01.json), on the 16 GiB
+mini with upstream's packs: t2-slim **339/340** argmax agreement (one flip on a
+2e-5-logit tie, traced to the F16 gate storage), t3-slim **340/340**, worst KL
+below `3.3e-7` nats, no high-margin mismatches; serving, native and launcher
+gates pass on t2-slim. Measured decode at context 2048: t2-slim ~11 tok/s,
+t3-slim ~7.8 tok/s.
+
+[Original revival evidence](evidence/bonsai2-2026-09-18.json), retired pack: 340 teacher-forced
 positions over prose, code, and tool-history/Unicode inputs; **340/340 argmax
 agreement**, worst KL below `8.4e-8` nats. The separate dense-CPU/GPU transform
 tests cover widths 1024/5120/6144/17408, signs, inverse order, grouped-GDN

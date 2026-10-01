@@ -26,11 +26,11 @@
 namespace q27 {
 namespace {
 
-// Bonsai matrix tiers (T2 ternary / B1 binary): exact select-form math on
+// Bonsai matrix tiers (T2/T3 ternary / B1 binary): exact select-form math on
 // float activations, no activation quantization — one dispatch policy for
-// both (binary-tier plan, Phase 3). Q4/Q8 keep the packed-dot quantized path.
+// all (binary-tier plan, Phase 3). Q4/Q8 keep the packed-dot quantized path.
 bool is_bonsai_dtype(DType dtype) {
-    return dtype == DType::T2_G128 || dtype == DType::B1_G128;
+    return dtype == DType::T2_G128 || dtype == DType::T3_G128 || dtype == DType::B1_G128;
 }
 
 class CommandBatch {
@@ -158,6 +158,10 @@ BonsaiRotation MetalEngine::validate_architecture() const {
         exact_str("t2_codes", "0=-1,1=0,2=+1;3 forbidden");
         exact_str("t2_slot_order", "seq-lsb-first");
     }
+    if (rotation.t3) {
+        exact("group_t3", 128);
+        exact_str("t3_codes", "base-3 five per byte, c0 least significant, 26 B per 128; code = trit+1");
+    }
     if (binary || mixed) {
         exact("group_b1", 128);
         exact_str("b1_codes", "1=+d,0=-d");
@@ -196,7 +200,7 @@ BonsaiRotation MetalEngine::validate_architecture() const {
     // Pure/mixed Bonsai policies pin their packed dtype. Published Q tiers
     // use the exact repack recipe named by quant_policy above.
     auto bonsai_matrix_dtype_ok = [&](DType dtype) {
-        if (ternary) return dtype == DType::T2_G128;
+        if (ternary) return dtype == (rotation.t3 ? DType::T3_G128 : DType::T2_G128);
         if (binary) return dtype == DType::B1_G128;
         return mixed && (dtype == DType::T2_G128 || dtype == DType::B1_G128);
     };
@@ -278,9 +282,10 @@ BonsaiRotation MetalEngine::validate_architecture() const {
             matrix(p + "attn_qkv.weight", GDN_CH, N_EMBD);
             matrix(p + "attn_gate.weight", GDN_V, N_EMBD);
             if (rotation.enabled) {
-                // Bonsai 2 keeps BF16 gates; conversion widens them exactly.
-                require(p + "ssm_alpha.weight", DType::F32, {GDN_HEADS, N_EMBD});
-                require(p + "ssm_beta.weight", DType::F32, {GDN_HEADS, N_EMBD});
+                // Bonsai 2 keeps BF16 gates; the repack stores them as F16
+                // like the Q tiers (tools/repack.py policy()).
+                require(p + "ssm_alpha.weight", DType::F16, {GDN_HEADS, N_EMBD});
+                require(p + "ssm_beta.weight", DType::F16, {GDN_HEADS, N_EMBD});
             } else if (bonsai) {
                 require_tier(p + "ssm_alpha.weight", ternary ? DType::T2_G128 : DType::B1_G128,
                              {GDN_HEADS, N_EMBD});
@@ -302,8 +307,9 @@ BonsaiRotation MetalEngine::validate_architecture() const {
         // repack, so its absence is asserted rather than tolerated silently.
         if (model_.find("blk.64.attn_norm.weight") || model_.find("output_q4.weight"))
             throw std::runtime_error("q27 Metal: unexpected MTP tensors in a bonsai artifact");
-        if (rotation.enabled && model_.tensors.size() != 851)
-            throw std::runtime_error("q27 Metal: Bonsai 2 requires exactly 851 tensors");
+        // 851 model tensors plus the three hadamard_signs.<width> vectors.
+        if (rotation.enabled && model_.tensors.size() != 854)
+            throw std::runtime_error("q27 Metal: Bonsai 2 requires exactly 854 tensors");
         return rotation;
     }
     const std::string p = "blk.64.";

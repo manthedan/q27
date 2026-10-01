@@ -1,5 +1,10 @@
 # Bonsai 2 implementation — 2026-09-18
 
+> **Superseded container (2026-10-01).** This records the revival's own
+> `bonsai2-t2-hadamard-v1` pack and `repack_bonsai2.py`, both retired. Metal
+> now loads upstream's slim Bonsai 2 packs (F16 GDN gates, `hadamard_signs.*`
+> tensors); see [BONSAI2.md](BONSAI2.md). The rotation math below is unchanged.
+
 Branch: `revival/bonsai2`, upstream base `0f1f1d496476929560fdcb93d736b796aabb2f69`.
 Worktree: `/Users/macthedan/projects/q27-revival`. Original checkout untouched.
 
