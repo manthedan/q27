@@ -4619,6 +4619,20 @@ inline float turbo_dequant(device const uchar *block, uint j) {
     return turbo_centroids[low | (high << 2)] * float(*(device const half *)block);
 }
 
+// KV codec of the compressed-cache attention kernels, chosen per pipeline by
+// function constant 1 (MTLFunctionConstantValues): 0 = turbo3 (50-byte
+// 128-dim blocks, the default when unset, so existing pipelines compile to
+// the same code), 1 = q8 (136-byte blocks: four half scales, one per 32,
+// then 128 int8 values). Both caches hold K/V in turbo3's signed-WHT domain.
+constant uint kv_codec_fc [[function_constant(1)]];
+constant uint kv_codec = is_function_constant_defined(kv_codec_fc) ? kv_codec_fc : 0u;
+constant uint kv_block = kv_codec == 1u ? 136u : 50u;
+inline float kv_dequant(device const uchar *block, uint j) {
+    if (kv_codec == 1u)
+        return float(((device const char *)(block + 8))[j]) * float(((device const half *)block)[j >> 5]);
+    return turbo_dequant(block, j);
+}
+
 // Online-softmax turbo3 decode attention. Mirrors q27_attention_f16 exactly
 // — one threadgroup per query head, eight simdgroups striping the sequence
 // with running max/denominator/weighted-value in registers and a log2 merge
@@ -4642,18 +4656,18 @@ kernel void q27_attention_turbo3(device const float *q [[buffer(0)]],
     for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
     float m = -INFINITY, l = 0.0f;
     for (uint p = sg; p < args.seq_len; p += 8) {
-        device const uchar *kb = kc + ((ulong)p * args.kv_heads + kvh) * 2 * 50;
+        device const uchar *kb = kc + ((ulong)p * args.kv_heads + kvh) * 2 * kv_block;
         float partial = 0.0f;
         for (uint d = lane; d < args.head_dim; d += 32)
-            partial += qh_ptr[d] * turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            partial += qh_ptr[d] * kv_dequant(kb + (d >> 7) * kv_block, d & 127);
         const float score = simd_sum(partial) * args.scale;
         const float m_new = max(m, score);
         const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
         const float weight = exp(score - m_new);
         l = l * correction + weight;
-        device const uchar *vb = vc + ((ulong)p * args.kv_heads + kvh) * 2 * 50;
+        device const uchar *vb = vc + ((ulong)p * args.kv_heads + kvh) * 2 * kv_block;
         for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
-            acc[i] = acc[i] * correction + weight * turbo_dequant(vb + (d >> 7) * 50, d & 127);
+            acc[i] = acc[i] * correction + weight * kv_dequant(vb + (d >> 7) * kv_block, d & 127);
         m = m_new;
     }
 
@@ -4727,6 +4741,53 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
         for (uint i = 0; i < 8; i++) bits |= uchar((indices[j+i] >> 2) << i);
         block[34 + j / 8] = bits;
     }
+}
+
+// q8 KV store (Bonsai-era long-context tier): K/V in turbo3's signed-WHT
+// domain (the transform turbo_wht applies to queries), then symmetric int8
+// with a half absmax scale per 32. Block per 128-dim half-head: four half
+// scales, then 128 int8 values (136 bytes); kv_dequant(kv_codec 1) reads it.
+// One 128-thread threadgroup per block; simdgroups are the 32-value groups.
+inline void q8_store_block(device const float *src, device uchar *block,
+                           threadgroup float *xs, uint j) {
+    xs[j] = src[j] * float(turbo_s1[j]);
+    turbo_butterfly(xs, j);
+    const float y = xs[j] * turbo_inv_sqrt_128 * float(turbo_s2[j]);
+    const half scale = half(min(simd_max(fabs(y)) / 127.0f, float(HALF_MAX)));
+    if ((j & 31u) == 0) ((device half *)block)[j >> 5] = scale;
+    const float fs = float(scale);
+    ((device char *)(block + 8))[j] = char(fs > 0.0f ? clamp(rint(y / fs), -127.0f, 127.0f) : 0.0f);
+}
+
+kernel void q27_kv_store_q8(device const float *k [[buffer(0)]],
+                            device const float *v [[buffer(1)]],
+                            device uchar *kc [[buffer(2)]],
+                            device uchar *vc [[buffer(3)]],
+                            constant TurboStoreArgs &args [[buffer(4)]],
+                            uint2 group [[threadgroup_position_in_grid]],
+                            uint j [[thread_index_in_threadgroup]]) {
+    const uint h = group.x >> 1, g = group.x & 1;
+    if (h >= args.kv_heads || group.y >= 2) return;
+    threadgroup float xs[128];
+    q8_store_block((group.y ? v : k) + (ulong)h * 256 + g * 128,
+                   (group.y ? vc : kc) + ((ulong)args.position * args.kv_heads * 2 + h * 2 + g) * 136,
+                   xs, j);
+}
+
+kernel void q27_kv_store_q8_rows(device const float *k [[buffer(0)]],
+                                 device const float *v [[buffer(1)]],
+                                 device uchar *kc [[buffer(2)]],
+                                 device uchar *vc [[buffer(3)]],
+                                 constant TurboStoreRowsArgs &args [[buffer(4)]],
+                                 uint3 group [[threadgroup_position_in_grid]],
+                                 uint j [[thread_index_in_threadgroup]]) {
+    const uint h = group.x >> 1, g = group.x & 1, token = group.z;
+    if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens) return;
+    threadgroup float xs[128];
+    q8_store_block((group.y ? v : k) + (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128,
+                   (group.y ? vc : kc) +
+                       ((ulong)(args.position + token) * args.kv_heads * 2 + h * 2 + g) * 136,
+                   xs, j);
 }
 
 // KV-codec attribution store (kl-kv instrument): writes the fp16 KV cache,
@@ -4873,18 +4934,18 @@ kernel void q27_attention_turbo3_causal(device const float *q [[buffer(0)]],
     for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
     float m = -INFINITY, l = 0.0f;
     for (uint p = sg; p < seq_len; p += 8) {
-        device const uchar *kb = kc + ((ulong)p * args.kv_heads + kvh) * 2 * 50;
+        device const uchar *kb = kc + ((ulong)p * args.kv_heads + kvh) * 2 * kv_block;
         float partial = 0.0f;
         for (uint d = lane; d < args.head_dim; d += 32)
-            partial += qh_ptr[d] * turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            partial += qh_ptr[d] * kv_dequant(kb + (d >> 7) * kv_block, d & 127);
         const float score = simd_sum(partial) * args.scale;
         const float m_new = max(m, score);
         const float correction = exp(m - m_new);    // first iteration: exp(-inf) = 0
         const float weight = exp(score - m_new);
         l = l * correction + weight;
-        device const uchar *vb = vc + ((ulong)p * args.kv_heads + kvh) * 2 * 50;
+        device const uchar *vb = vc + ((ulong)p * args.kv_heads + kvh) * 2 * kv_block;
         for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
-            acc[i] = acc[i] * correction + weight * turbo_dequant(vb + (d >> 7) * 50, d & 127);
+            acc[i] = acc[i] * correction + weight * kv_dequant(vb + (d >> 7) * kv_block, d & 127);
         m = m_new;
     }
 
@@ -5014,10 +5075,10 @@ kernel void q27_attention_turbo3_gqa(device const float *q [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint idx = tid; idx < rows * 256; idx += threads) {
             const uint r = idx >> 8, d = idx & 255;
-            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
-            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
-            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
-            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * kv_block;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * kv_block;
+            Kt[r][d] = kv_dequant(kb + (d >> 7) * kv_block, d & 127);
+            Vt[r][d] = kv_dequant(vb + (d >> 7) * kv_block, d & 127);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < rows; r++) {
@@ -5166,10 +5227,10 @@ kernel void q27_attention_turbo3_causal_gqa(device const float *q [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint idx = tid; idx < rows * 256; idx += threads) {
             const uint r = idx >> 8, d = idx & 255;
-            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
-            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
-            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
-            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * kv_block;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * kv_block;
+            Kt[r][d] = kv_dequant(kb + (d >> 7) * kv_block, d & 127);
+            Vt[r][d] = kv_dequant(vb + (d >> 7) * kv_block, d & 127);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < rows; r++) {
@@ -5262,17 +5323,17 @@ kernel void q27_attention_turbo3_gqa_hm(device const float *q [[buffer(0)]],
     float acc[8];
     for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
     float m = -INFINITY, l = 0.0f;
-    device const uchar *khead = kc + (ulong)kvh * args.seq_cap * 100;
-    device const uchar *vhead = vc + (ulong)kvh * args.seq_cap * 100;
+    device const uchar *khead = kc + (ulong)kvh * args.seq_cap * 2 * kv_block;
+    device const uchar *vhead = vc + (ulong)kvh * args.seq_cap * 2 * kv_block;
     for (uint t0 = p0; t0 < p1; t0 += 8) {
         const uint rows = min(8u, p1 - t0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint idx = tid; idx < rows * 256; idx += threads) {
             const uint r = idx >> 8, d = idx & 255;
-            device const uchar *kb = khead + (ulong)(t0 + r) * 100;
-            device const uchar *vb = vhead + (ulong)(t0 + r) * 100;
-            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
-            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+            device const uchar *kb = khead + (ulong)(t0 + r) * 2 * kv_block;
+            device const uchar *vb = vhead + (ulong)(t0 + r) * 2 * kv_block;
+            Kt[r][d] = kv_dequant(kb + (d >> 7) * kv_block, d & 127);
+            Vt[r][d] = kv_dequant(vb + (d >> 7) * kv_block, d & 127);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < rows; r++) {
@@ -5339,10 +5400,10 @@ inline void turbo3_causal_gqa_tiled_body(device const float *q,
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint idx = tid; idx < rows * 256; idx += threads) {
             const uint r = idx >> 8, d = idx & 255;
-            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
-            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
-            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
-            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * kv_block;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * kv_block;
+            Kt[r][d] = kv_dequant(kb + (d >> 7) * kv_block, d & 127);
+            Vt[r][d] = kv_dequant(vb + (d >> 7) * kv_block, d & 127);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < rows; r++) {
@@ -5422,13 +5483,13 @@ inline void turbo3_causal_gqa_bf_body(device const float *q,
         for (uint i = 0; i < 8; i++) acc[f][i] = 0.0f;
     }
     for (uint pos = p0; pos < p1; pos++) {
-        device const uchar *kb = kc + ((ulong)pos * args.kv_heads + kvh) * 2 * 50;
-        device const uchar *vb = vc + ((ulong)pos * args.kv_heads + kvh) * 2 * 50;
+        device const uchar *kb = kc + ((ulong)pos * args.kv_heads + kvh) * 2 * kv_block;
+        device const uchar *vb = vc + ((ulong)pos * args.kv_heads + kvh) * 2 * kv_block;
         float kv[8], vv[8];
         for (uint d = lane, i = 0; d < 256; d += 32, i++)
-            kv[i] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            kv[i] = kv_dequant(kb + (d >> 7) * kv_block, d & 127);
         for (uint d = lane, i = 0; d < 256; d += 32, i++)
-            vv[i] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+            vv[i] = kv_dequant(vb + (d >> 7) * kv_block, d & 127);
         float partial[TF];
         for (uint f = 0; f < TF; f++) partial[f] = 0.0f;
         for (uint d = lane, i = 0; d < 256; d += 32, i++) {

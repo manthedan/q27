@@ -25,10 +25,11 @@ typedef struct {
 } alive_gate;
 
 q27_agent_engine *q27_agent_engine_open(const char *model, const char *tokenizer,
-                                         uint32_t context,
+                                         uint32_t context, uint32_t kv_kind,
                                          char *error, size_t error_cap) {
     (void)tokenizer;
     (void)context;
+    (void)kv_kind;
     if (!strcmp(model, "fail")) {
         snprintf(error, error_cap, "injected open failure");
         return NULL;

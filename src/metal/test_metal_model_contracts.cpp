@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        q27::MetalEngine engine(argv[1], 32, false);
+        q27::MetalEngine engine(argv[1], 32, q27::KvKind::F16);
         constexpr uint32_t vocab = q27::MetalEngine::vocabulary_size();
         std::vector<uint32_t> allow_all((vocab + 31) / 32, UINT32_MAX);
         for (int i = 0; i < q27::MetalEngine::MASK_POOL_CAP; i++)

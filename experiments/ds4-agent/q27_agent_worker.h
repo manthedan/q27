@@ -86,7 +86,7 @@ q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
                                              const char *tokenizer_path,
                                              uint32_t context,
                                              const char *workspace_root,
-                                             uint32_t mtp_width,
+                                             uint32_t mtp_width, uint32_t kv_kind,
                                              char *error, size_t error_cap);
 
 // Deep-copies every message before returning. enable_tools opts into the fixed

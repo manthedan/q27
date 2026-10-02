@@ -43,9 +43,10 @@ typedef struct {
     uint64_t seed;
 } q27_agent_sampling;
 
+// kv_kind: 0 = fp16, 1 = turbo3, 2 = q8 KV cache (q27::KvKind).
 q27_agent_engine *q27_agent_engine_open(const char *model_path,
                                          const char *tokenizer_path,
-                                         uint32_t context,
+                                         uint32_t context, uint32_t kv_kind,
                                          char *error, size_t error_cap);
 void q27_agent_engine_close(q27_agent_engine *engine);
 // MTP draft width (0 = serial only). Values 2..12 enable greedy mtp_round

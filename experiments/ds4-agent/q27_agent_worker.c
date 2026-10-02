@@ -52,6 +52,7 @@ struct q27_agent_worker {
     int workspace_fd;
     uint32_t context;
     uint32_t mtp_width;
+    uint32_t kv_kind;
 
     q27_agent_worker_state state;
     int init_done;
@@ -454,7 +455,7 @@ static void *worker_main(void *opaque) {
     char error[512] = {0};
     q27_agent_engine *engine = q27_agent_engine_open(
         worker->model_path, worker->tokenizer_path, worker->context,
-        error, sizeof(error));
+        worker->kv_kind, error, sizeof(error));
     if (engine && q27_agent_engine_tokenizer_sha1(
                       engine, worker->tokenizer_sha1,
                       error, sizeof(error)) != Q27_AGENT_OK) {
@@ -607,7 +608,7 @@ q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
                                              const char *tokenizer_path,
                                              uint32_t context,
                                              const char *workspace_root,
-                                             uint32_t mtp_width,
+                                             uint32_t mtp_width, uint32_t kv_kind,
                                              char *error, size_t error_cap) {
     if (!model_path || !tokenizer_path || !workspace_root) {
         copy_error(error, error_cap,
@@ -630,6 +631,7 @@ q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     worker->context = context;
     worker->mtp_width = mtp_width;
+    worker->kv_kind = kv_kind;
     worker->state = Q27_WORKER_STARTING;
     struct stat workspace_stat;
     if (!worker->model_path || !worker->tokenizer_path ||
@@ -690,7 +692,7 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
                                           uint32_t context,
                                           char *error, size_t error_cap) {
     return q27_agent_worker_start_at(model_path, tokenizer_path, context, ".",
-                                     /*mtp_width=*/0, error, error_cap);
+                                     /*mtp_width=*/0, /*kv_kind=*/0, error, error_cap);
 }
 
 q27_agent_status q27_agent_worker_submit(

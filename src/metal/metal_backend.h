@@ -7,6 +7,12 @@
 
 namespace q27 {
 
+// Compressed (signed-WHT-domain) KV cache codecs. The *_turbo3 entry points
+// take one; Q8 = int8 per 32 with half scales (136-byte 128-dim blocks).
+enum class KvCodec : uint32_t { Turbo3 = 0, Q8 = 1 };
+constexpr uint64_t kv_block_bytes(KvCodec codec) { return codec == KvCodec::Q8 ? 136 : 50; }
+
+
 class MetalBackend final : public ComputeBackend {
   public:
     MetalBackend();
@@ -169,13 +175,13 @@ class MetalBackend final : public ComputeBackend {
                    bool inverse) override;
     void kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& v,
                          BackendBuffer& k_cache, BackendBuffer& v_cache,
-                         uint32_t position, uint32_t kv_heads);
+                         uint32_t position, uint32_t kv_heads, KvCodec codec = KvCodec::Turbo3);
     void attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
                           const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                           BackendBuffer& out,
                           uint32_t seq_len, uint32_t q_heads, uint32_t kv_heads,
                           uint32_t head_dim, float scale,
-                          BackendBuffer* partials);
+                          BackendBuffer* partials, KvCodec codec = KvCodec::Turbo3);
     void attention_f16(const BackendBuffer& q, uint32_t q_stride,
                        const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                        BackendBuffer& out, uint32_t seq_len,
@@ -260,7 +266,8 @@ class MetalBackend final : public ComputeBackend {
                                      uint32_t tokens, float scale);
     void kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
                               BackendBuffer& k_cache, BackendBuffer& v_cache,
-                              uint32_t position, uint32_t kv_heads, uint32_t tokens);
+                              uint32_t position, uint32_t kv_heads, uint32_t tokens,
+                              KvCodec codec = KvCodec::Turbo3);
     void kv_store_f16_attrib_rows(const BackendBuffer& k, const BackendBuffer& v,
                                   BackendBuffer& k_cache, BackendBuffer& v_cache,
                                   uint32_t position, uint32_t kv_heads, uint32_t tokens,
@@ -277,7 +284,8 @@ class MetalBackend final : public ComputeBackend {
                                  const BackendBuffer& v_cache,
                                  BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                  uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                 float scale, BackendBuffer* partials);
+                                 float scale, BackendBuffer* partials,
+                                 KvCodec codec = KvCodec::Turbo3);
     // Phase-0 probes for cache-block scheduling R1/R1b — bench-only entry
     // points (build/metal_attn_bench), never engine-routed; see
     // docs/metal/plans/2026-07-15-cache-block-scheduling.md. k/v caches hold rows

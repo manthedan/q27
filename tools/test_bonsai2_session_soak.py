@@ -4,7 +4,8 @@ Timestamps each stderr line to attribute cold start / session load /
 generation / save time. Prompts cycle; the first is ~4K tokens (README head).
 Fails on any non-zero exit; prints per-turn timings for evidence.
 
-Usage: test_bonsai2_session_soak.py AGENT MODEL TOKENIZER CONTEXT TURNS"""
+Usage: test_bonsai2_session_soak.py AGENT MODEL TOKENIZER CONTEXT TURNS
+Q27_SOAK_KV=fp16|turbo3|q8 passes --kv to the agent (default: agent default)."""
 import os, subprocess, sys, tempfile, time, re
 from pathlib import Path
 
@@ -23,6 +24,8 @@ env = dict(os.environ, Q27_MODEL_PROFILE="bonsai2-qwen38-v1")
 for turn in range(TURNS):
     args = [AGENT, MODEL, TOK, "--context", CTX, "--workspace", str(work), "--session", str(session),
             "--no-think", "--temperature", "0", "--max-tokens", "48", "--prompt", prompts[turn % len(prompts)]]
+    if os.environ.get("Q27_SOAK_KV"):
+        args[3:3] = ["--kv", os.environ["Q27_SOAK_KV"]]
     t0 = time.time()
     p = subprocess.Popen(args, cwd=work, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     events = []

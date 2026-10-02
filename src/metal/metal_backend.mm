@@ -154,8 +154,22 @@ NSString* load_kernel_source() {
 }
 
 id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device, id<MTLLibrary> library,
-                                          NSString* name) {
-    id<MTLFunction> function = [library newFunctionWithName:name];
+                                          NSString* name, int kv_codec = -1) {
+    id<MTLFunction> function = nil;
+    if (kv_codec < 0) {
+        function = [library newFunctionWithName:name];
+    } else {
+        // Compressed-KV attention kernels: function constant 1 selects the
+        // codec (q27_kernels.metal kv_codec); unset means turbo3.
+        MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+        const uint32_t value = (uint32_t)kv_codec;
+        [constants setConstantValue:&value type:MTLDataTypeUInt atIndex:1];
+        NSError* fn_error = nil;
+        function = [library newFunctionWithName:name constantValues:constants error:&fn_error];
+        if (!function)
+            throw std::runtime_error("q27 Metal: specializing " + std::string(name.UTF8String) + " failed: " +
+                                     std::string(fn_error ? fn_error.localizedDescription.UTF8String : "unknown"));
+    }
     if (!function)
         throw std::runtime_error("q27 Metal: shader function not found: " +
                                  std::string(name.UTF8String));
@@ -311,6 +325,9 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> nll_rows_p;
     id<MTLComputePipelineState> attention_f16_gqa_p;
     id<MTLComputePipelineState> attention_turbo3_gqa_p;
+    // q8 KV twins (kv_codec = 1) of the engine-routed compressed-KV pipelines.
+    id<MTLComputePipelineState> kv_store_q8, kv_store_q8_rows, attention_q8, attention_q8_gqa_p,
+        attention_q8_causal_p, attention_q8_causal_gqa_p, attention_q8_causal_gqa_t2_p;
     id<MTLComputePipelineState> attention_gqa_merge_p;
     id<MTLComputePipelineState> attention_f16_causal_gqa_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_p;
@@ -387,7 +404,8 @@ struct MetalBackend::Impl {
     // and only bounds-checked here: no growth on the hot path (audit C3).
     uint32_t gqa_threshold = 2048;
 
-    void attention_gqa_dispatch(bool turbo3, const MetalBuffer& qb, uint32_t q_stride,
+    // kv: 0 = fp16, 1 = turbo3, 2 = q8 cache.
+    void attention_gqa_dispatch(uint32_t kv, const MetalBuffer& qb, uint32_t q_stride,
                                 const MetalBuffer& kc, const MetalBuffer& vc,
                                 MetalBuffer& output, uint32_t seq_len, uint32_t q_heads,
                                 uint32_t kv_heads, uint32_t head_dim, float scale,
@@ -403,9 +421,11 @@ struct MetalBackend::Impl {
                               block, n_blocks, scale};
         @autoreleasepool {
             bool own;
-            auto enc = encoder_for_operation(own, turbo3 ? "q27_attention_turbo3_gqa"
-                                                         : "q27_attention_f16_gqa");
-            [enc setComputePipelineState:turbo3 ? attention_turbo3_gqa_p : attention_f16_gqa_p];
+            auto enc = encoder_for_operation(own, kv == 2 ? "q27_attention_q8_gqa"
+                                                : kv ? "q27_attention_turbo3_gqa"
+                                                     : "q27_attention_f16_gqa");
+            [enc setComputePipelineState:kv == 2 ? attention_q8_gqa_p
+                                         : kv ? attention_turbo3_gqa_p : attention_f16_gqa_p];
             [enc setBuffer:qb.handle() offset:0 atIndex:0];
             [enc setBuffer:kc.handle() offset:0 atIndex:1];
             [enc setBuffer:vc.handle() offset:0 atIndex:2];
@@ -428,7 +448,7 @@ struct MetalBackend::Impl {
         }
     }
 
-    void attention_gqa_causal_dispatch(bool turbo3, const MetalBuffer& qb, uint32_t q_stride,
+    void attention_gqa_causal_dispatch(uint32_t kv, const MetalBuffer& qb, uint32_t q_stride,
                                        uint32_t q_row_stride, const MetalBuffer& kc,
                                        const MetalBuffer& vc, MetalBuffer& output,
                                        uint32_t base_len, uint32_t q_heads, uint32_t kv_heads,
@@ -452,10 +472,12 @@ struct MetalBackend::Impl {
         @autoreleasepool {
             bool own;
             auto enc = encoder_for_operation(own,
-                turbo3 ? (tiled ? "q27_attention_turbo3_causal_gqa_t2" : "q27_attention_turbo3_causal_gqa")
-                       : (tiled ? "q27_attention_f16_causal_gqa_t2" : "q27_attention_f16_causal_gqa"));
-            [enc setComputePipelineState:turbo3 ? (tiled ? attention_turbo3_causal_gqa_t2_p : attention_turbo3_causal_gqa_p)
-                                                : (tiled ? attention_f16_causal_gqa_t2_p : attention_f16_causal_gqa_p)];
+                kv == 2 ? (tiled ? "q27_attention_q8_causal_gqa_t2" : "q27_attention_q8_causal_gqa")
+                : kv ? (tiled ? "q27_attention_turbo3_causal_gqa_t2" : "q27_attention_turbo3_causal_gqa")
+                     : (tiled ? "q27_attention_f16_causal_gqa_t2" : "q27_attention_f16_causal_gqa"));
+            [enc setComputePipelineState:kv == 2 ? (tiled ? attention_q8_causal_gqa_t2_p : attention_q8_causal_gqa_p)
+                                         : kv ? (tiled ? attention_turbo3_causal_gqa_t2_p : attention_turbo3_causal_gqa_p)
+                                              : (tiled ? attention_f16_causal_gqa_t2_p : attention_f16_causal_gqa_p)];
             [enc setBuffer:qb.handle() offset:(NSUInteger)q_byte_offset atIndex:0];
             [enc setBuffer:kc.handle() offset:0 atIndex:1];
             [enc setBuffer:vc.handle() offset:0 atIndex:2];
@@ -743,7 +765,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->turbo_wht = make_pipeline(impl_->device, impl_->library, @"q27_turbo_wht");
         impl_->bonsai_wht = make_pipeline(impl_->device, impl_->library, @"q27_bonsai_wht");
         impl_->kv_store_turbo3 = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_turbo3");
-        impl_->attention_turbo3 = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3");
+        impl_->attention_turbo3 = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3", 0);
         impl_->attention = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16");
         impl_->gates = make_pipeline(impl_->device, impl_->library, @"q27_gdn_gates");
         impl_->conv = make_pipeline(impl_->device, impl_->library, @"q27_conv_step");
@@ -763,21 +785,28 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->attention_causal = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal");
         impl_->attention_causal_win = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_win");
         impl_->kv_store_head_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_head_rows");
-        impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal");
+        impl_->attention_turbo3_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal", 0);
         impl_->sigmoid_gate_rows = make_pipeline(impl_->device, impl_->library, @"q27_sigmoid_gate_mul_rows");
         impl_->argmax_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_argmax_rows");
         impl_->nll_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_nll_rows");
         impl_->attention_f16_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_gqa");
-        impl_->attention_turbo3_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa");
+        impl_->attention_turbo3_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa", 0);
         impl_->attention_gqa_merge_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge");
         impl_->attention_f16_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa");
-        impl_->attention_turbo3_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa");
+        impl_->attention_turbo3_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa", 0);
         impl_->attention_gqa_merge_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge_rows");
-        impl_->attention_turbo3_gqa_hm_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_hm");
-        impl_->attention_turbo3_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t2");
-        impl_->attention_turbo3_causal_gqa_t4_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t4");
-        impl_->attention_turbo3_causal_gqa_bf2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_bf2");
+        impl_->attention_turbo3_gqa_hm_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_hm", 0);
+        impl_->attention_turbo3_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t2", 0);
+        impl_->attention_turbo3_causal_gqa_t4_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t4", 0);
+        impl_->attention_turbo3_causal_gqa_bf2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_bf2", 0);
         impl_->attention_f16_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa_t2");
+        impl_->kv_store_q8 = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_q8");
+        impl_->kv_store_q8_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_q8_rows");
+        impl_->attention_q8 = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3", 1);
+        impl_->attention_q8_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa", 1);
+        impl_->attention_q8_causal_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal", 1);
+        impl_->attention_q8_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa", 1);
+        impl_->attention_q8_causal_gqa_t2_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa_t2", 1);
         if (const char* env = getenv("Q27_METAL_GQA_TILE"); env && *env) {
             const unsigned long tile = strtoul(env, nullptr, 10);
             if (tile != 1 && tile != 2)
@@ -2222,18 +2251,20 @@ void MetalBackend::turbo_wht(BackendBuffer& x, uint32_t heads, uint32_t stride,
 
 void MetalBackend::kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& v,
                                     BackendBuffer& k_cache, BackendBuffer& v_cache,
-                                    uint32_t position, uint32_t kv_heads) {
+                                    uint32_t position, uint32_t kv_heads, KvCodec codec) {
     if (!kv_heads) throw std::runtime_error("q27 Metal: invalid turbo3 KV dimensions");
     const MetalBuffer& kb=metal_buffer(k); const MetalBuffer& vb=metal_buffer(v);
     MetalBuffer& kc=metal_buffer(k_cache); MetalBuffer& vc=metal_buffer(v_cache);
-    const uint64_t row_bytes=(uint64_t)kv_heads*2*50;
+    const bool q8=codec==KvCodec::Q8;
+    const uint64_t row_bytes=(uint64_t)kv_heads*2*kv_block_bytes(codec);
     check_range(kb.size(),0,(uint64_t)kv_heads*256*4,"turbo3 K row");
     check_range(vb.size(),0,(uint64_t)kv_heads*256*4,"turbo3 V row");
     check_range(kc.size(),(uint64_t)position*row_bytes,row_bytes,"turbo3 K cache");
     check_range(vc.size(),(uint64_t)position*row_bytes,row_bytes,"turbo3 V cache");
     TurboStoreArgs args{position,kv_heads};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own, "q27_kv_store_turbo3"); [enc setComputePipelineState:impl_->kv_store_turbo3];
+        bool own; auto enc=impl_->encoder_for_operation(own, q8 ? "q27_kv_store_q8" : "q27_kv_store_turbo3");
+        [enc setComputePipelineState:q8 ? impl_->kv_store_q8 : impl_->kv_store_turbo3];
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
@@ -2246,26 +2277,28 @@ void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
                                      const BackendBuffer& k_cache, const BackendBuffer& v_cache,
                                      BackendBuffer& out, uint32_t seq_len,
                                      uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
-                                     float scale, BackendBuffer* partials) {
+                                     float scale, BackendBuffer* partials, KvCodec codec) {
     if (!seq_len || !kv_heads || q_heads%kv_heads || head_dim != 256)
         throw std::runtime_error("q27 Metal: invalid turbo3 attention dimensions");
+    const bool q8=codec==KvCodec::Q8;
     const MetalBuffer& qb=metal_buffer(q); const MetalBuffer& kc=metal_buffer(k_cache); const MetalBuffer& vc=metal_buffer(v_cache);
     MetalBuffer& output=metal_buffer(out);
     check_range(qb.size(),0,((uint64_t)(q_heads-1)*q_stride+head_dim)*4,"turbo3 attention Q");
-    const uint64_t cache_bytes=(uint64_t)seq_len*kv_heads*2*50;
+    const uint64_t cache_bytes=(uint64_t)seq_len*kv_heads*2*kv_block_bytes(codec);
     check_range(kc.size(),0,cache_bytes,"turbo3 K cache"); check_range(vc.size(),0,cache_bytes,"turbo3 V cache");
     check_range(output.size(),0,(uint64_t)q_heads*head_dim*4,"turbo3 attention output");
     const uint32_t gqa=q_heads/kv_heads;
     if (impl_->gqa_threshold && seq_len >= impl_->gqa_threshold && gqa >= 2 && gqa <= 8) {
         if (!partials)
             throw std::runtime_error("q27 Metal: blocked GQA route needs a partials buffer");
-        impl_->attention_gqa_dispatch(true,qb,q_stride,kc,vc,output,seq_len,q_heads,kv_heads,head_dim,scale,
+        impl_->attention_gqa_dispatch(q8 ? 2 : 1,qb,q_stride,kc,vc,output,seq_len,q_heads,kv_heads,head_dim,scale,
                                       metal_buffer(*partials));
         return;
     }
     AttentionArgs args{q_stride,seq_len,q_heads,kv_heads,head_dim,scale};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_turbo3"); [enc setComputePipelineState:impl_->attention_turbo3];
+        bool own; auto enc=impl_->encoder_for_operation(own, q8 ? "q27_attention_q8" : "q27_attention_turbo3");
+        [enc setComputePipelineState:q8 ? impl_->attention_q8 : impl_->attention_turbo3];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(q_heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
@@ -2917,20 +2950,22 @@ void MetalBackend::attention_f16_causal_window(const BackendBuffer& q, uint32_t 
 
 void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuffer& v,
                                         BackendBuffer& k_cache, BackendBuffer& v_cache,
-                                        uint32_t position, uint32_t kv_heads, uint32_t tokens) {
+                                        uint32_t position, uint32_t kv_heads, uint32_t tokens,
+                                        KvCodec codec) {
     if (!kv_heads || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked turbo3 KV store");
     const MetalBuffer& kb = metal_buffer(k); const MetalBuffer& vb = metal_buffer(v);
     MetalBuffer& kc = metal_buffer(k_cache); MetalBuffer& vc = metal_buffer(v_cache);
-    const uint64_t row_bytes = (uint64_t)kv_heads * 2 * 50;
+    const bool q8 = codec == KvCodec::Q8;
+    const uint64_t row_bytes = (uint64_t)kv_heads * 2 * kv_block_bytes(codec);
     check_range(kb.size(), 0, (uint64_t)kv_heads * 256 * tokens * 4, "chunked turbo3 K rows");
     check_range(vb.size(), 0, (uint64_t)kv_heads * 256 * tokens * 4, "chunked turbo3 V rows");
     check_range(kc.size(), (uint64_t)position * row_bytes, row_bytes * tokens, "chunked turbo3 K cache");
     check_range(vc.size(), (uint64_t)position * row_bytes, row_bytes * tokens, "chunked turbo3 V cache");
     TurboStoreRowsArgs args{position, kv_heads, tokens};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own, "q27_kv_store_turbo3_rows");
-        [enc setComputePipelineState:impl_->kv_store_turbo3_rows];
+        bool own; auto enc = impl_->encoder_for_operation(own, q8 ? "q27_kv_store_q8_rows" : "q27_kv_store_turbo3_rows");
+        [enc setComputePipelineState:q8 ? impl_->kv_store_q8_rows : impl_->kv_store_turbo3_rows];
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
@@ -3063,9 +3098,10 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
                                            const BackendBuffer& v_cache,
                                            BackendBuffer& out, uint32_t base_len, uint32_t q_heads,
                                            uint32_t kv_heads, uint32_t head_dim, uint32_t tokens,
-                                           float scale, BackendBuffer* partials) {
+                                           float scale, BackendBuffer* partials, KvCodec codec) {
     if (!base_len || !kv_heads || q_heads % kv_heads || head_dim != 256 || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid chunked turbo3 attention dimensions");
+    const bool q8 = codec == KvCodec::Q8;
     if (base_len > UINT32_MAX - (tokens - 1))
         throw std::runtime_error("q27 Metal: chunked attention sequence length overflow");
     const MetalBuffer& qb = metal_buffer(q); const MetalBuffer& kc = metal_buffer(k_cache);
@@ -3075,7 +3111,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
     check_range(qb.size(), 0,
                 ((uint64_t)(tokens-1)*q_row_stride + (uint64_t)(q_heads-1)*q_stride + head_dim)*4,
                 "chunked turbo3 attention Q");
-    const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * 2 * 50;
+    const uint64_t cache_bytes = (uint64_t)max_seq * kv_heads * 2 * kv_block_bytes(codec);
     check_range(kc.size(), 0, cache_bytes, "chunked turbo3 K cache");
     check_range(vc.size(), 0, cache_bytes, "chunked turbo3 V cache");
     check_range(output.size(), 0, (uint64_t)tokens * q_heads * head_dim * 4, "chunked turbo3 attention output");
@@ -3091,7 +3127,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
     if (gqa_from < tokens) {
         if (!partials)
             throw std::runtime_error("q27 Metal: blocked GQA route needs a partials buffer");
-        impl_->attention_gqa_causal_dispatch(true, qb, q_stride, q_row_stride, kc, vc, output,
+        impl_->attention_gqa_causal_dispatch(q8 ? 2 : 1, qb, q_stride, q_row_stride, kc, vc, output,
                                              base_len + gqa_from, q_heads, kv_heads, head_dim,
                                              tokens - gqa_from, scale,
                                              (uint64_t)gqa_from * q_row_stride * 4,
@@ -3101,8 +3137,8 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
     }
     AttentionCausalArgs args{q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, gqa_from, scale};
     @autoreleasepool {
-        bool own; auto enc = impl_->encoder_for_operation(own, "q27_attention_turbo3_causal");
-        [enc setComputePipelineState:impl_->attention_turbo3_causal_p];
+        bool own; auto enc = impl_->encoder_for_operation(own, q8 ? "q27_attention_q8_causal" : "q27_attention_turbo3_causal");
+        [enc setComputePipelineState:q8 ? impl_->attention_q8_causal_p : impl_->attention_turbo3_causal_p];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];

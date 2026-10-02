@@ -191,14 +191,22 @@ allocated up front for the whole `--ctx`:
 | KV | 8K | 16K | 32K | 64K | 128K |
 |---|---|---|---|---|---|
 | fp16 | ok | ok, full speed | ok, but swapping (decode 11 -> 6.9 tok/s) | GPU out of memory | refused by cache budget |
+| **q8** | ok | ok, 0.83 GiB | ok, 10.7 tok/s | ok, 10.7 tok/s (some swap) | GPU out of memory |
 | turbo3 | ok | ok | ok | ok | ok (~9 tok/s) |
 
 Correctness at depth: over a 4,064-token prose/code prompt, fp16 KV matches the
 Prism reference at all 127 sampled positions with KL ~1e-8 that does not grow
 with depth. turbo3 KV differs measurably (mean KL 0.01 nats, 124/127 argmax)
 but its next-token NLL is indistinguishable from the reference at this sample
-size (-0.4% PPL, +/-1.4%). Use fp16 up to 16K; `serve --kv turbo3` for longer
-contexts. The native agent has no `--kv` option and always uses fp16.
+size (-0.4% PPL, +/-1.4%).
+
+**`--kv q8`** (agent, TUI, `serve` and the CLI) stores K/V as int8 with one
+half scale per 32 values in turbo3's rotated domain: 1,088 bytes per token per
+attention layer side versus 2,048 for fp16. Against the Prism reference over
+the 4K input it gives 126/127 argmax with mean KL 8.9e-6 (chunked prefill:
+15/15, 6.8e-6), about 1,000x closer than turbo3. It decodes faster than fp16
+at depth (9.2 vs 8.1 tok/s at 4K) and prefills at the same rate. Use fp16 up
+to 16K, `--kv q8` to 64K, turbo3 beyond.
 
 8-bit KV candidates, measured as store-time round-trips on the same 4K input
 (fp16 cache and kernels, so only the codec differs; `Q27_PROBE_KV_ATTRIB`):
@@ -213,8 +221,7 @@ contexts. The native agent has no `--kv` option and always uses fp16.
 | turbo3 (K and V) | ~3.1 | 124/127 | 1.1e-2 |
 
 turbo3's error splits about evenly between K (5.9e-3) and V (4.3e-3).
-Rotated int8 is the candidate for a near-fp16 32K tier; it is not implemented
-as a storage format yet.
+Rotated int8 is what `--kv q8` stores (measured as a real cache above).
 
 ## Batched prefill
 

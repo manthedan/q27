@@ -17,6 +17,19 @@ namespace q27 {
 class SuffixDraft;
 struct BonsaiRotation;
 
+// KV cache storage. Turbo3 and Q8 hold K/V in turbo3's signed-WHT domain
+// (queries are rotated to match, outputs rotated back); Q8 is int8 per 32
+// with half scales. Values are persisted in snapshot headers.
+enum class KvKind : uint8_t { F16 = 0, Turbo3 = 1, Q8 = 2 };
+// Bytes per cached token per attention layer (all KV heads, K or V side).
+constexpr uint64_t kv_row_bytes(KvKind kind) {
+    return kind == KvKind::F16 ? 4ull * 256 * 2 : 4ull * 2 * kv_block_bytes(
+        kind == KvKind::Q8 ? KvCodec::Q8 : KvCodec::Turbo3);
+}
+// Parses the --kv option values: fp16 | turbo3 | q8.
+KvKind parse_kv_kind(const std::string& name);
+const char* kv_kind_name(KvKind kind);
+
 class MetalEngine {
   public:
     struct Snapshot;
@@ -55,8 +68,8 @@ class MetalEngine {
     };
     static std::shared_ptr<Shared> open_shared(const std::string& model_path);
     explicit MetalEngine(const std::string& model_path, uint32_t context = 128,
-                         bool turbo3_kv = false);
-    MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool turbo3_kv);
+                         KvKind kv = KvKind::F16);
+    MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, KvKind kv);
     // Reference members alias shared GPU state; a copy with an independent
     // position_ would corrupt its sibling. Engines are pinned to their spot.
     MetalEngine(const MetalEngine&) = delete;
@@ -80,7 +93,7 @@ class MetalEngine {
     // GQA scratch, fixed/lazy state, plus configured in-memory snapshots.
     // Reads the same production KV-side-cache environment as the constructor.
     static uint64_t serving_reservation_bytes(const Shared& shared,uint32_t context,
-                                              bool turbo3_kv,size_t snapshot_entries);
+                                              KvKind kv,size_t snapshot_entries);
     // Conservative pre-construction footprint for one fp16-KV engine:
     // MTP-present cache, widest chunked buffers, and the smallest supported
     // GQA block. Used by dual-engine CLI modes before either engine allocates.
@@ -411,7 +424,9 @@ class MetalEngine {
     Model& model_;
     MetalBackend& backend_;
     uint32_t max_context_;
-    bool turbo3_kv_;
+    KvKind kv_kind_;
+    bool rotated_kv_;     // turbo3 or q8: WHT-domain cache and attention
+    KvCodec kv_codec_;
     bool per_tensor_upload_ = false;
     uint32_t kv_attrib_ = 0;
     uint32_t kv_attrib_layer_ = UINT32_MAX;

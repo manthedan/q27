@@ -1,0 +1,74 @@
+{
+ "date": "2026-10-02",
+ "device": "Apple M4 / 16 GiB (mini)",
+ "pack": "bonsai2-27b-t2-slim.q27",
+ "format": "turbo3 signed-WHT domain, int8 symmetric absmax/127, half scale per 32; 136 B per 128-dim block, 1088 B per token per attention-layer side",
+ "parity_4064": {
+  "serial_stride32": {
+   "passed": true,
+   "positions": 127,
+   "max_relative_rmse": 0.009717132457096088,
+   "mean_kl": 8.860019651761594e-06,
+   "max_kl": 6.984630500794609e-05,
+   "argmax_matches": 126
+  },
+  "chunked_cuts_every_256": {
+   "passed": true,
+   "positions": 15,
+   "max_relative_rmse": 0.008502960960170466,
+   "mean_kl": 6.781137974276518e-06,
+   "max_kl": 3.409735810779363e-05,
+   "argmax_matches": 15
+  },
+  "emulated_mode7_prediction_mean_kl": 9.09e-06
+ },
+ "turbo3_after_refactor": "4K stride-32 logits bitwise identical to pre-refactor turbo3 run",
+ "memory_sweep_rivers_n64": {
+  "16384": "ok 0.83 GiB 11.06 tok/s",
+  "32768": "ok 1.36 GiB 10.67 tok/s",
+  "65536": "ok 2.42 GiB 10.71 tok/s, swap +0.6 GB",
+  "131072": "kIOGPUCommandBufferCallbackErrorOutOfMemory"
+ },
+ "decode_at_4k_depth_tok_s": {
+  "fp16": 8.06,
+  "q8": 9.17,
+  "turbo3": 9.28
+ },
+ "prefill_4k_s": {
+  "fp16": 118.04,
+  "q8": 118.36,
+  "turbo3": 120.6
+ },
+ "native_soak_ctx32768_q8": {
+  "total_s": [
+   140.0,
+   19.9,
+   19.2,
+   18.9,
+   159.9
+  ],
+  "save_s": [
+   3.8,
+   0.7,
+   0.5,
+   0.4,
+   1.1
+  ],
+  "session_mb": [
+   301,
+   302,
+   304,
+   304,
+   447
+  ],
+  "replies": "identical to the fp16 soak"
+ },
+ "gates": [
+  "test-metal-ops test_q8_kv: nrmse 0.0025 vs fp16 (turbo3 0.11), serial/rows store bytes equal, chunk-causal == serial decode bitwise, blocked-GQA decode/chunk (tiled and untiled) within 2e-5",
+  "make test-metal-backend, test-tools, test-inspect, test-agent",
+  "test_bonsai2_serving.py (fp16 default)",
+  "serve --kv q8 at ctx 32768 smoke"
+ ],
+ "review": "two independent read-only review agents (kernels/backend; engine/plumbing): no definite bugs; fixed row-store test, untiled causal-GQA coverage, scale clamp, specialization error text, KV-cell/budget messages",
+ "known_gap": "agent session files do not record the KV kind; resuming with another --kv fails closed at snapshot load (KV dtype mismatch) with a generic error"
+}

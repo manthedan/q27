@@ -146,7 +146,8 @@ struct q27_agent_engine {
     bool xml_dialect = false;
     bool qwen38_profile = false;
 
-    q27_agent_engine(const char *model_path, const char *tokenizer_path, uint32_t ctx)
+    q27_agent_engine(const char *model_path, const char *tokenizer_path, uint32_t ctx,
+                     q27::KvKind kv_kind)
         : context(ctx) {
         // Pin one tokenizer inode across identity hashing and parsing. The
         // /dev/fd open gives Tokenizer its own stream over these exact bytes,
@@ -181,7 +182,7 @@ struct q27_agent_engine {
                     std::string("Q27_MODEL_PROFILE '") + profile +
                     "' does not match artifact model family '" + family + "'");
         }
-        session = std::make_unique<q27::MetalEngine>(shared, ctx, false);
+        session = std::make_unique<q27::MetalEngine>(shared, ctx, kv_kind);
     }
 };
 
@@ -198,7 +199,7 @@ static void reset_agent_state(q27_agent_engine *engine) noexcept {
 
 extern "C" q27_agent_engine *q27_agent_engine_open(
     const char *model_path, const char *tokenizer_path, uint32_t context,
-    char *error, size_t error_cap) {
+    uint32_t kv_kind, char *error, size_t error_cap) {
     if (!model_path || !*model_path || !tokenizer_path || !*tokenizer_path) {
         set_error(error, error_cap, "model and tokenizer paths are required");
         return nullptr;
@@ -207,8 +208,13 @@ extern "C" q27_agent_engine *q27_agent_engine_open(
         set_error(error, error_cap, "context must be at least 2 tokens");
         return nullptr;
     }
+    if (kv_kind > 2) {
+        set_error(error, error_cap, "kv kind must be 0 (fp16), 1 (turbo3) or 2 (q8)");
+        return nullptr;
+    }
     try {
-        return new q27_agent_engine(model_path, tokenizer_path, context);
+        return new q27_agent_engine(model_path, tokenizer_path, context,
+                                    static_cast<q27::KvKind>(kv_kind));
     } catch (const std::exception& e) {
         set_error(error, error_cap, e.what());
     } catch (...) {

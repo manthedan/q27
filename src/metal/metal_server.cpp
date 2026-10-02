@@ -542,8 +542,8 @@ struct Runtime {
         std::vector<int> host2dev;
         bool busy=false;
         enum class Phase { Idle, Prefill, Decode, Verify } phase=Phase::Idle;
-        Slot(std::shared_ptr<q27::MetalEngine::Shared> s,uint32_t ctx,bool turbo3,size_t entries)
-            :engine(std::move(s),ctx,turbo3),cache(entries) {}
+        Slot(std::shared_ptr<q27::MetalEngine::Shared> s,uint32_t ctx,q27::KvKind kv,size_t entries)
+            :engine(std::move(s),ctx,kv),cache(entries) {}
     };
     std::vector<std::unique_ptr<Slot>> slots;
     uint32_t mtp_width;
@@ -672,7 +672,7 @@ struct Runtime {
     json serving_identity_cache;
     bool snapshot_spine_pin_config=false;
     std::string os_sysname,os_release,os_machine;
-    bool turbo3_kv=false;
+    q27::KvKind kv_kind=q27::KvKind::F16;
     std::atomic<bool> test_fail_after_snapshot_publish{false};
     size_t prefix_entries_config=0;
     uint64_t snapshot_max_bytes_config=0;
@@ -720,7 +720,7 @@ struct Runtime {
                     {"metal_device",shared->backend.name()}}},
                 {"shader_abi",q27::MetalBackend::shader_abi_tag()},
                 {"shader_sha1",shared->backend.shader_source_sha1()},
-                {"protocol",{{"context",context},{"kv",turbo3_kv?"turbo3":"fp16"},
+                {"protocol",{{"context",context},{"kv",q27::kv_kind_name(kv_kind)},
                     {"mtp",mtp_width},{"slots",slots.size()},
                     {"prefix_entries",prefix_entries_config},{"constrain_tools",constrain_tools},
                     {"snapshots",snapstore.enabled()},{"snapshot_auto_min",snap_auto_min},
@@ -759,13 +759,13 @@ struct Runtime {
     // parsed flag values, already range-validated in main; the sentinel
     // (0 / empty / 0 / -1) means "flag absent, fall back to the env twin".
     // An explicit flag always wins over the env.
-    Runtime(const std::string& model,const std::string& tok,uint32_t ctx,bool turbo3,
+    Runtime(const std::string& model,const std::string& tok,uint32_t ctx,q27::KvKind kv,
             uint32_t width,size_t cache_entries,bool constrain,
             uint32_t slot_count,uint32_t budget_mb,const std::string& snapshot_dir,
             uint32_t snapshot_max_mb,long long snapshot_auto,uint32_t max_tokens_default,
             int spine_pin,bool think_srv)
         :tokenizer(tok),model_path(model),mtp_width(width),context(ctx),
-         constrain_tools(constrain),turbo3_kv(turbo3),prefix_entries_config(cache_entries),
+         constrain_tools(constrain),kv_kind(kv),prefix_entries_config(cache_entries),
          max_tokens_default_config(max_tokens_default),think_default(think_srv) {
         // Server identity (homebrew plan Q2): /health and the boot trace name
         // the resident artifact so wrapper/clients can tell what's loaded.
@@ -849,9 +849,9 @@ struct Runtime {
             // briefly violating an explicit budget through probe engines.
             const uint32_t p1=1024,p2=8192;
             const uint64_t t1=q27::MetalEngine::serving_reservation_bytes(
-                *shared,p1,turbo3,cache_entries);
+                *shared,p1,kv,cache_entries);
             const uint64_t t2=q27::MetalEngine::serving_reservation_bytes(
-                *shared,p2,turbo3,cache_entries);
+                *shared,p2,kv,cache_entries);
             const double slope=(double)(t2-t1)/(double)(p2-p1);
             const uint64_t intercept=t1-(uint64_t)(slope*p1);
             // Degrade like the admission loop promises: if the requested
@@ -875,7 +875,7 @@ struct Runtime {
             if(solved<8192) {
                 if(!solved) {
                     const uint64_t minimum=q27::MetalEngine::serving_reservation_bytes(
-                        *shared,1,turbo3,cache_entries);
+                        *shared,1,kv,cache_entries);
                     if(minimum>kv_budget) {
                         const uint64_t need_mb=(minimum+1048575)/1048576;
                         const uint64_t have_mb=kv_budget/1048576;
@@ -900,7 +900,7 @@ struct Runtime {
                     split,slot_count,slot_count==1?"":"s");
         }
         const uint64_t planned_per_slot=q27::MetalEngine::serving_reservation_bytes(
-            *shared,ctx,turbo3,cache_entries);
+            *shared,ctx,kv,cache_entries);
         if(planned_per_slot>budget) {
             const uint64_t need_mb=(planned_per_slot+1048575)/1048576;
             const uint64_t have_mb=budget/1048576;
@@ -908,7 +908,7 @@ struct Runtime {
                 std::to_string(need_mb)+" MB required > "+
                 std::to_string(have_mb)+" MB budget)");
         }
-        slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries));
+        slots.push_back(std::make_unique<Slot>(shared,ctx,kv,cache_entries));
         model_has_mtp=slots.front()->engine.has_mtp();
         model_chunked_prefill=slots.front()->engine.chunked_prefill();
 
@@ -942,7 +942,7 @@ struct Runtime {
                         budget_mb?" (--budget-mb)":(budget_env?" (Q27_METAL_BUDGET_MB)":""),slots.size());
                 break;
             }
-            try { slots.push_back(std::make_unique<Slot>(shared,ctx,turbo3,cache_entries)); }
+            try { slots.push_back(std::make_unique<Slot>(shared,ctx,kv,cache_entries)); }
             catch(const std::exception& e) {
                 fprintf(stderr,"multislot: slot %u admission failed (%s); serving with %zu slot(s)\n",
                         s,e.what(),slots.size());
@@ -994,7 +994,7 @@ struct Runtime {
             tag.reserve(104);
             char hex[3];
             for(int i=0;i<20;i++) { snprintf(hex,3,"%02x",sha[i]); tag+=hex; }
-            tag+=turbo3?'t':'f';
+            tag+=kv==q27::KvKind::Q8?'q':kv==q27::KvKind::Turbo3?'t':'f';
             tag+='r';
             for(unsigned char byte:runtime_sha) {
                 snprintf(hex,3,"%02x",byte);
@@ -1124,7 +1124,7 @@ struct Runtime {
         try {
             for(size_t i=0;i<slot_count;i++) {
                 replacement_slots.push_back(std::make_unique<Slot>(
-                    replacement_shared,context,turbo3_kv,prefix_entries_config));
+                    replacement_shared,context,kv_kind,prefix_entries_config));
             }
         } catch(const std::exception& error) {
             fprintf(stderr,"Metal backend recovery: slot rebuild stopped after %zu/%zu (%s)\n",
@@ -2081,7 +2081,7 @@ static int mark_supervisor_lock_close_on_exec() {
 int main(int argc,char** argv) {
     if (mark_supervisor_lock_close_on_exec() != 0) return 2;
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12] [--kv fp16|turbo3] [--prefix-entries N] [--constrain-tools] [--think] [--request-think] [--think-budget N] [--slots N] [--trace path]\n"
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12] [--kv fp16|turbo3|q8] [--prefix-entries N] [--constrain-tools] [--think] [--request-think] [--think-budget N] [--slots N] [--trace path]\n"
                        "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
                        "       [--temperature-default T] [--top-p-default P] [--top-k-default K] [--api-key KEY] [--api-key-file path]\n"
                        "       (the snapshot/max-tokens/budget/sampling-default flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,SNAPSHOT_SPINE_PIN,MAX_TOKENS_DEFAULT,BUDGET_MB,TEMPERATURE_DEFAULT,TOP_P_DEFAULT,TOP_K_DEFAULT}; an explicit flag wins)\n",argv[0]);
@@ -2116,7 +2116,7 @@ int main(int argc,char** argv) {
         uint32_t top_k_default=UINT32_MAX;
         long long snapshot_auto=-1;
         int spine_pin=-1;   // -1 = unset (env/default); 0/1 explicit flag
-        bool turbo3=false; bool constrain_tools=false;
+        q27::KvKind kv=q27::KvKind::F16; bool constrain_tools=false;
         // Opt-in Bearer/x-api-key authentication on serving endpoints. Empty
         // means authentication is disabled.
         std::vector<std::string> api_keys;
@@ -2139,7 +2139,7 @@ int main(int argc,char** argv) {
             else if(arg=="--mtp" && i+1<argc) width=parse_u32(argv[++i],"--mtp");
             else if(arg=="--prefix-entries" && i+1<argc) prefix_entries=parse_u32(argv[++i],"--prefix-entries");
             else if(arg=="--slots" && i+1<argc) slot_count=parse_u32(argv[++i],"--slots");
-            else if(arg=="--kv" && i+1<argc) { std::string mode=argv[++i]; if(mode=="turbo3")turbo3=true; else if(mode!="fp16")throw std::runtime_error("invalid --kv"); }
+            else if(arg=="--kv" && i+1<argc) { kv=q27::parse_kv_kind(argv[++i]); }
             else if(arg=="--constrain-tools") constrain_tools=true;
             else if(arg=="--think") think_default=true;
             else if(arg=="--request-think") req_think=true;
@@ -2251,12 +2251,12 @@ int main(int argc,char** argv) {
         if(sampling_default_temperature>0.0f && width)
             fprintf(stderr,"[sampling-default] temperature default %.4g uses sampled MTP (rejection accept) when --mtp is set; set temperature=0 per-request for greedy MTP\n",
                     (double)sampling_default_temperature);
-        Runtime runtime(model,tok,context,turbo3,width,prefix_entries,constrain_tools,slot_count,
+        Runtime runtime(model,tok,context,kv,width,prefix_entries,constrain_tools,slot_count,
                         budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto,max_tokens_default,spine_pin,
                         think_default);
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
-            runtime.trace.event({{"kind","boot"},{"ctx",runtime.context},{"kv",turbo3?"turbo3":"fp16"},
+            runtime.trace.event({{"kind","boot"},{"ctx",runtime.context},{"kv",q27::kv_kind_name(kv)},
                                  {"mtp",width},{"slots",runtime.slots.size()},
                                  {"model",runtime.model_name},{"artifact_sha1",runtime.resident_model_sha1()},
                                  {"runtime",runtime.serving_identity()},{"boot_id",runtime.boot_id}});
@@ -4456,7 +4456,7 @@ int main(int argc,char** argv) {
             return 1;
         }
         fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u, slots=%zu)\n",
-                host.c_str(),port,runtime.context,turbo3?"turbo3":"fp16",width,runtime.slots.size());
+                host.c_str(),port,runtime.context,q27::kv_kind_name(kv),width,runtime.slots.size());
         if(!server.listen_after_bind()) throw std::runtime_error("server listen failed");
         return 0;
     } catch(const std::exception& e) { fprintf(stderr,"%s\n",e.what()); return 1; }

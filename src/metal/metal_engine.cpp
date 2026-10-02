@@ -387,6 +387,17 @@ void MetalEngine::set_tool_constraint(int mask_id) {
     active_mask_ = mask_id < 0 ? -1 : mask_id;
 }
 
+KvKind parse_kv_kind(const std::string& name) {
+    if (name == "fp16") return KvKind::F16;
+    if (name == "turbo3") return KvKind::Turbo3;
+    if (name == "q8") return KvKind::Q8;
+    throw std::runtime_error("--kv must be fp16, turbo3 or q8");
+}
+
+const char* kv_kind_name(KvKind kind) {
+    return kind == KvKind::Q8 ? "q8" : kind == KvKind::Turbo3 ? "turbo3" : "fp16";
+}
+
 namespace {
 std::shared_ptr<MetalEngine::Shared> require_shared(std::shared_ptr<MetalEngine::Shared> shared) {
     if (!shared) throw std::runtime_error("q27 Metal: null shared context");
@@ -429,7 +440,7 @@ ProductionKvSideConfig production_kv_side_config(bool turbo3,bool log_ignored) {
                     config.heads++;
                 }
         } else if(log_ignored) {
-            fprintf(stderr,"q27 Metal: Q27_METAL_KV_FP16_CELLS ignored on an fp16-KV engine (cells already fp16)\n");
+            fprintf(stderr,"q27 Metal: Q27_METAL_KV_FP16_CELLS ignored: fp16 exception cells apply only to --kv turbo3\n");
         }
     }
     if(const char* codec_env=getenv("Q27_METAL_KV_CELLS_CODEC")) {
@@ -438,7 +449,7 @@ ProductionKvSideConfig production_kv_side_config(bool turbo3,bool log_ignored) {
             throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC must be fp16 or e4m3");
         if(codec=="e4m3") {
             if(!config.heads)
-                throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC=e4m3 needs a non-empty Q27_METAL_KV_FP16_CELLS (nothing to encode)");
+                throw std::runtime_error("q27 Metal: Q27_METAL_KV_CELLS_CODEC=e4m3 needs --kv turbo3 and a non-empty Q27_METAL_KV_FP16_CELLS (nothing to encode)");
             config.codec=1;
         }
     }
@@ -447,15 +458,14 @@ ProductionKvSideConfig production_kv_side_config(bool turbo3,bool log_ignored) {
 } // namespace
 
 uint64_t MetalEngine::serving_reservation_bytes(const Shared& shared,uint32_t context,
-                                                bool turbo3_kv,size_t snapshot_entries) {
+                                                KvKind kv,size_t snapshot_entries) {
     if(!context || context>262144)
         throw std::runtime_error("q27 Metal: context must be 1..262144");
     const bool has_mtp=shared.model.find("blk.64.attn_norm.weight")!=nullptr;
     const bool chunked=shared.backend.supports_quantized_matmul() &&
                        (has_mtp || bonsai2_t2_pack(shared.model));
-    const auto side=production_kv_side_config(turbo3_kv,false);
-    const uint64_t cache_row=turbo3_kv ? (uint64_t)N_KV*2*50
-                                         : (uint64_t)N_KV*HEAD_DIM*2;
+    const auto side=production_kv_side_config(kv==KvKind::Turbo3,false);
+    const uint64_t cache_row=kv_row_bytes(kv);
     const uint64_t side_bytes=side.heads*2ull*context*HEAD_DIM*2;
     const uint64_t cache_bytes=(16ull+(has_mtp?1ull:0ull))*2*context*cache_row+
         gqa_partial_peak(context,shared.backend.gqa_block_size(),chunked)+side_bytes;
@@ -470,19 +480,20 @@ uint64_t MetalEngine::serving_reservation_bytes(const Shared& shared,uint32_t co
     return base+(uint64_t)snapshot_entries*snapshot;
 }
 
-MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, bool turbo3_kv)
-    : MetalEngine(open_shared(model_path), context, turbo3_kv) {}
+MetalEngine::MetalEngine(const std::string& model_path, uint32_t context, KvKind kv)
+    : MetalEngine(open_shared(model_path), context, kv) {}
 
-MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool turbo3_kv)
+MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, KvKind kv)
     : shared_(require_shared(std::move(shared))), model_(shared_->model),
-      backend_(shared_->backend), max_context_(context), turbo3_kv_(turbo3_kv),
+      backend_(shared_->backend), max_context_(context), kv_kind_(kv),
+      rotated_kv_(kv != KvKind::F16),
+      kv_codec_(kv == KvKind::Q8 ? KvCodec::Q8 : KvCodec::Turbo3),
       weights_(shared_->weights) {
     if (!context || context > 262144) throw std::runtime_error("q27 Metal: context must be 1..262144");
     const auto rotation = validate_architecture();
     per_tensor_upload_ = backend_.uses_per_tensor_upload(model_);
     has_mtp_ = model_.find("blk.64.attn_norm.weight") != nullptr;
-    const uint64_t cache_row_bytes = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
-                                                : (uint64_t)N_KV * HEAD_DIM * 2;
+    const uint64_t cache_row_bytes = kv_row_bytes(kv_kind_);
     // Per-engine blocked-GQA partials (audit E2): sized once here for this
     // engine's own context at the widest attention width this device can
     // dispatch, and reserved alongside the caches — it is the other
@@ -502,7 +513,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     // and V cells together (step 4b: K alone retains nothing, V alone
     // amplifies — only the pair is meaningful). fp16-KV engines ignore the
     // env (their cells are already fp16), so the kl-kv baseline coexists.
-    const auto side_config=production_kv_side_config(turbo3_kv_,true);
+    const auto side_config=production_kv_side_config(kv_kind_==KvKind::Turbo3,true);
     for(uint32_t li=0;li<16;li++) kv_fp16_head_masks_[li]=side_config.head_masks[li];
     kv_fp16_except_=side_config.heads!=0;
     kv_fp16_side_codec_=side_config.codec;
@@ -514,7 +525,7 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, bool 
     // this one. Shared defaults to half the device recommendation; serving
     // callers may install an explicit policy ceiling before constructing.
     if(shared_->cache_bytes+total_cache_bytes>shared_->cache_budget)
-        throw std::runtime_error("q27 Metal: requested KV cache (across engines on this mapping) exceeds the configured cache budget; use --kv turbo3, raise --budget-mb, or reduce --ctx");
+        throw std::runtime_error("q27 Metal: requested KV cache (across engines on this mapping) exceeds the configured cache budget; use --kv q8 (or turbo3), raise --budget-mb, or reduce --ctx");
     // The destructor runs only for fully constructed engines, so a throw in
     // any allocation below would otherwise strand this reservation and
     // falsely reject later engines on a still-live Shared. Roll back unless
@@ -672,8 +683,8 @@ void MetalEngine::set_kv_attrib(uint32_t mode) {
     if (mode == 3 || mode > 7)
         throw std::runtime_error("q27 Metal: KV attribution mode must be 0 (off), 1 (K), 2 (V), 4 (e4m3 both "
                                  "sides), 5 (int8/32 both sides) or 6 (int8/128 both sides)");
-    if (mode && turbo3_kv_)
-        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (mode && rotated_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv)");
     // Any change after rows are cached — including turning attribution off
     // or widening a cell back to all layers/heads — would leave a mixed
     // cache behind position_.
@@ -701,8 +712,8 @@ void MetalEngine::set_kv_attrib_rt(bool scale32, const float* feature_scales) {
 }
 
 void MetalEngine::set_kv_attrib_stats() {
-    if (turbo3_kv_)
-        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (rotated_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv)");
     if (position_)
         throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
     kv_attrib_ = 1;              // ignored by the STATS branch; enables routing
@@ -724,8 +735,8 @@ void MetalEngine::read_kv_attrib_stats(std::vector<float>& out) {
 void MetalEngine::set_kv_attrib_cell(uint32_t mode, uint32_t layer, uint32_t head) {
     if (mode != 1 && mode != 2)
         throw std::runtime_error("q27 Metal: KV attribution cell mode must be 1 (K) or 2 (V)");
-    if (turbo3_kv_)
-        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (rotated_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv)");
     if (layer != UINT32_MAX && (layer >= 64 || layer % 4 != 3))
         throw std::runtime_error("q27 Metal: KV attribution layer must be an attention layer (layer%4==3)");
     if (head != UINT32_MAX && head >= N_KV)
@@ -740,8 +751,8 @@ void MetalEngine::set_kv_attrib_cell(uint32_t mode, uint32_t layer, uint32_t hea
 }
 
 void MetalEngine::set_kv_attrib_except(const uint32_t* cells, size_t n) {
-    if (turbo3_kv_)
-        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
+    if (rotated_kv_)
+        throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv)");
     if (position_)
         throw std::runtime_error("q27 Metal: set KV attribution before encoding any tokens");
     if (n && !cells)
@@ -763,8 +774,7 @@ void MetalEngine::set_kv_attrib_except(const uint32_t* cells, size_t n) {
 void MetalEngine::initialize_mtp_sentinel() {
     if (!mtp_k_cache_) return;
     static const std::array<unsigned char, N_KV * HEAD_DIM * 2> zero_row{};
-    const uint64_t row_bytes = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
-                                          : (uint64_t)N_KV * HEAD_DIM * 2;
+    const uint64_t row_bytes = kv_row_bytes(kv_kind_);
     backend_.write(*mtp_k_cache_, 0, zero_row.data(), row_bytes);
     backend_.write(*mtp_v_cache_, 0, zero_row.data(), row_bytes);
 }
@@ -794,8 +804,7 @@ void MetalEngine::reset() {
 // mirrors the constructor's own per-engine partials allocation (audit E2).
 // Keep each term paired with its allocation site.
 uint64_t MetalEngine::snapshot_bytes() const {
-    const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
-                                          : (uint64_t)N_KV * HEAD_DIM * 2;
+    const uint64_t cache_row = kv_row_bytes(kv_kind_);
     const uint64_t active = (uint64_t)max_context_ * cache_row;
     const uint64_t attn_layers = N_LAYER / 4, gdn_layers = N_LAYER - attn_layers;
     uint64_t bytes = gdn_layers * ((uint64_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3ull * GDN_CH) * 4;
@@ -891,8 +900,7 @@ std::shared_ptr<MetalEngine::Snapshot> MetalEngine::capture_state() {
     snapshot->logits_resident = logits_resident_;
     snapshot->mtp_cache_valid = mtp_cache_valid_;
     snapshot->layers.resize(N_LAYER);
-    const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
-                                          : (uint64_t)N_KV * HEAD_DIM * 2;
+    const uint64_t cache_row = kv_row_bytes(kv_kind_);
     const uint64_t active_cache = (uint64_t)position_ * cache_row;
     CommandBatch batch(backend_);
     for (uint32_t i=0;i<N_LAYER;i++) {
@@ -938,8 +946,7 @@ void MetalEngine::restore_state(const Snapshot& snapshot) {
     if(snapshot.kv_side.size()!=side_expected)
         throw std::runtime_error("q27 Metal: incompatible state snapshot (KV fp16 exception side rows)");
     backend_.synchronize();
-    const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
-                                          : (uint64_t)N_KV * HEAD_DIM * 2;
+    const uint64_t cache_row = kv_row_bytes(kv_kind_);
     const uint64_t active_cache=(uint64_t)snapshot.position*cache_row;
     CommandBatch batch(backend_);
     for(uint32_t i=0;i<N_LAYER;i++) {
@@ -989,7 +996,7 @@ struct SnapshotHeader {
     uint64_t artifact_size;
     unsigned char artifact_sha1[20];
     unsigned char runtime_sha1[20];
-    uint32_t kv_dtype;      // 0 fp16, 1 turbo3
+    uint32_t kv_dtype;      // KvKind: 0 fp16, 1 turbo3, 2 q8
     uint32_t position;
     uint32_t token_count;
     uint32_t reserved;
@@ -1124,8 +1131,7 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         if (with_device) with_device(operation); else operation();
     };
     run_device([&] { backend_.synchronize(); });
-    const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
-                                          : (uint64_t)N_KV * HEAD_DIM * 2;
+    const uint64_t cache_row = kv_row_bytes(kv_kind_);
     const uint64_t active_cache = (uint64_t)position_ * cache_row;
     std::string tmp_template = path + ".tmp.XXXXXX";
     std::vector<char> tmp_name(tmp_template.begin(), tmp_template.end());
@@ -1166,7 +1172,7 @@ void MetalEngine::save_state(const std::string& path, const uint32_t* tokens,
         run_device([&] { memcpy(h.artifact_sha1, snapshot_identity(), sizeof h.artifact_sha1); });
         const auto runtime_identity = snapshot_runtime_identity();
         memcpy(h.runtime_sha1, runtime_identity.data(), runtime_identity.size());
-        h.kv_dtype = turbo3_kv_ ? 1 : 0;
+        h.kv_dtype = (uint32_t)kv_kind_;
         h.position = position_;
         h.token_count = token_count;
         h.reserved = (logits_resident ? 0u : 1u) | (kv_fp16_except_ ? 2u : 0u)
@@ -1339,7 +1345,7 @@ uint32_t MetalEngine::load_state_fd(int source_fd,const std::string& path,
         const auto runtime_identity = snapshot_runtime_identity();
         if (memcmp(h.runtime_sha1, runtime_identity.data(), runtime_identity.size()) != 0)
             throw std::runtime_error("q27 Metal: snapshot runtime configuration does not match this engine: " + path);
-        if (h.kv_dtype != (turbo3_kv_ ? 1u : 0u))
+        if (h.kv_dtype != (uint32_t)kv_kind_)
             throw std::runtime_error("q27 Metal: snapshot KV dtype does not match this engine: " + path);
         if (h.position > max_context_)
             throw std::runtime_error("q27 Metal: snapshot position exceeds this engine's context: " + path);
@@ -1362,8 +1368,7 @@ uint32_t MetalEngine::load_state_fd(int source_fd,const std::string& path,
             throw std::runtime_error("q27 Metal: snapshot tokens do not match the requested prefix: " + path);
         const uint64_t payload_start = reader.tell();
         reader.skip((uint64_t)h.token_count * 4);
-        const uint64_t cache_row = turbo3_kv_ ? (uint64_t)N_KV * 2 * 50
-                                              : (uint64_t)N_KV * HEAD_DIM * 2;
+        const uint64_t cache_row = kv_row_bytes(kv_kind_);
         const uint64_t active_cache = (uint64_t)h.position * cache_row;
         // The expected blob sequence, mirrored from save_state. Validating
         // every length (pass 1) before the first GPU write (pass 2) means a
@@ -1636,9 +1641,9 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
     backend_.rope_neox(*qg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, pos, FREQ_BASE);
     backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, pos, FREQ_BASE);
     LayerState& state = layers_[layer];
-    if (turbo3_kv_) {
+    if (rotated_kv_) {
         backend_.turbo_wht(*qg_, N_HEAD, 2 * HEAD_DIM, false);
-        backend_.kv_store_turbo3(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, pos, N_KV);
+        backend_.kv_store_turbo3(*kbuf_, *vbuf_, *state.k_cache, *state.v_cache, pos, N_KV, kv_codec_);
         // fp16 exception cells: side-store the masked heads' rows in the
         // turbo3 WHT domain (kbuf/vbuf are dead after the store, so the
         // in-place transform is safe) — the window re-attention below then
@@ -1656,7 +1661,7 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *state.k_cache, *state.v_cache,
                                   *attn_out_, pos + 1, N_HEAD, N_KV,
                                   HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
-                                  gqa_partials_.get());
+                                  gqa_partials_.get(), kv_codec_);
         for (const KvFp16Side& s : side)
             backend_.attention_f16_window(*qg_, 2 * HEAD_DIM, s.head * (N_HEAD / N_KV),
                                           *s.k, *s.v, *attn_out_, pos + 1,
@@ -1826,10 +1831,10 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
                             N_KV * HEAD_DIM, position_, count, FREQ_BASE);
     LayerState& state = layers_[layer];
     const float scale = 1.0f / std::sqrt((float)HEAD_DIM);
-    if (turbo3_kv_) {
+    if (rotated_kv_) {
         backend_.turbo_wht(*cqg_, count * N_HEAD, 2 * HEAD_DIM, false);
         backend_.kv_store_turbo3_rows(*ckbuf_, *cvbuf_, *state.k_cache, *state.v_cache,
-                                      position_, N_KV, count);
+                                      position_, N_KV, count, kv_codec_);
         // fp16 exception cells: WHT-domain side store + window re-attention
         // (see the serial branch for the domain argument). ckbuf/cvbuf are
         // dead after the turbo3 store.
@@ -1845,7 +1850,7 @@ void MetalEngine::attention_chunk(uint32_t layer, uint32_t count) {
         backend_.attention_turbo3_causal(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                          *state.k_cache, *state.v_cache,
                                          *cattn_out_, position_ + 1, N_HEAD, N_KV,
-                                         HEAD_DIM, count, scale, gqa_partials_.get());
+                                         HEAD_DIM, count, scale, gqa_partials_.get(), kv_codec_);
         for (const KvFp16Side& s : side)
             backend_.attention_f16_causal_window(*cqg_, 2 * HEAD_DIM, 2 * N_HEAD * HEAD_DIM,
                                                  s.head * (N_HEAD / N_KV), *s.k, *s.v,
@@ -2026,8 +2031,8 @@ void MetalEngine::mtp_warm(const BackendBuffer& hidden, uint32_t token, uint32_t
     backend_.rmsnorm_heads(*kbuf_, layer_weight(layer, "attn_k_norm.weight"),
                            N_KV, HEAD_DIM, HEAD_DIM, EPS);
     backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position, FREQ_BASE);
-    if (turbo3_kv_)
-        backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV);
+    if (rotated_kv_)
+        backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV, kv_codec_);
     else if (kv_attrib_ && kv_attrib_layer_ == UINT32_MAX)
         // Plain round-trip only: step-2 flags index per-attn-layer slots
         // that do not exist for the MTP layer (instrument never runs MTP).
@@ -2135,13 +2140,13 @@ uint32_t MetalEngine::mtp_forward(const BackendBuffer& hidden, uint32_t token,
                            N_KV, HEAD_DIM, HEAD_DIM, EPS);
     backend_.rope_neox(*qg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, position, FREQ_BASE);
     backend_.rope_neox(*kbuf_, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, position, FREQ_BASE);
-    if (turbo3_kv_) {
+    if (rotated_kv_) {
         backend_.turbo_wht(*qg_, N_HEAD, 2 * HEAD_DIM, false);
-        backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV);
+        backend_.kv_store_turbo3(*kbuf_, *vbuf_, *mtp_k_cache_, *mtp_v_cache_, position, N_KV, kv_codec_);
         backend_.attention_turbo3(*qg_, 2 * HEAD_DIM, *mtp_k_cache_, *mtp_v_cache_,
                                   *attn_out_, position + 1, N_HEAD, N_KV,
                                   HEAD_DIM, 1.0f / std::sqrt((float)HEAD_DIM),
-                                  gqa_partials_.get());
+                                  gqa_partials_.get(), kv_codec_);
         backend_.turbo_wht(*attn_out_, N_HEAD, HEAD_DIM, true);
     } else {
         if (kv_attrib_ && kv_attrib_layer_ == UINT32_MAX)

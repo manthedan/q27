@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
             bool rejected=false;
             try {
                 auto shared=q27::MetalEngine::open_shared(argv[1]);
-                (void)q27::MetalEngine::serving_reservation_bytes(*shared,1,false,0);
+                (void)q27::MetalEngine::serving_reservation_bytes(*shared,1,q27::KvKind::F16,0);
             } catch(const std::runtime_error& error) {
                 rejected=std::string(error.what()).find("needs a non-empty")!=std::string::npos;
             }
@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
             auto limited=q27::MetalEngine::open_shared(argv[1]);
             limited->cache_budget=1;
             bool rejected=false;
-            try { q27::MetalEngine over_budget(limited,1,false); }
+            try { q27::MetalEngine over_budget(limited,1,q27::KvKind::F16); }
             catch(const std::runtime_error& error) {
                 rejected=std::string(error.what()).find("configured cache budget")!=std::string::npos;
             }
@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         {
-            q27::MetalEngine engine(argv[1], 16, false);
+            q27::MetalEngine engine(argv[1], 16, q27::KvKind::F16);
             // The serving scheduler splits MTP prompt warming into bounded
             // serial quanta. It must match the former whole-prompt path.
             const std::vector<uint32_t> serial_prompt(9,1);
@@ -315,7 +315,7 @@ int main(int argc, char** argv) {
             requires_mtp_reject("teacher_force_nll");
         }
         {
-            q27::MetalEngine engine(argv[1], 16, false);
+            q27::MetalEngine engine(argv[1], 16, q27::KvKind::F16);
             const std::vector<uint32_t> prompt{1, 2};
             (void)engine.ingest_prompt(prompt, false, true);
             const std::string path = "/tmp/q27-snapshot-fd-" +
@@ -474,7 +474,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (argc == 3) {
-            q27::MetalEngine bonsai(argv[2], 8, false);
+            q27::MetalEngine bonsai(argv[2], 8, q27::KvKind::F16);
             if (bonsai.has_mtp())
                 throw std::runtime_error("Bonsai artifact unexpectedly exposed an MTP layer");
             if (bonsai.chunked_prefill())

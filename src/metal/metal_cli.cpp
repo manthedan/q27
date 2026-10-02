@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text] "
-                "[-n count] [--ctx count] [--mtp width] [--kv fp16|turbo3] [--prefill chunk|serial] "
+                "[-n count] [--ctx count] [--mtp width] [--kv fp16|turbo3|q8] [--prefill chunk|serial] "
                 "[--temperature T --top-p P --top-k K --seed S] [--dump-token-ids file]\n",
                 argv[0]);
         return 1;
@@ -87,7 +87,8 @@ int main(int argc, char** argv) {
         std::string token_list, prompt_text, dump_token_ids;
         uint32_t count = 1, context = 128, mtp_width = 0;
         q27::SamplingParams sampling;
-        bool validate_only = false, serial_prefill = false, turbo3_kv = false;
+        bool validate_only = false, serial_prefill = false;
+        q27::KvKind kv_kind = q27::KvKind::F16;
         bool token_list_supplied = false, prompt_supplied = false;
 
         for (int i = 3; i < argc; i++) {
@@ -106,8 +107,7 @@ int main(int argc, char** argv) {
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
             else if (arg == "--kv" && i + 1 < argc) {
                 const std::string mode = argv[++i];
-                if (mode == "turbo3") turbo3_kv = true;
-                else if (mode != "fp16") throw std::runtime_error("--kv must be fp16 or turbo3");
+                kv_kind = q27::parse_kv_kind(mode);
             }
             else if (arg == "--prefill" && i + 1 < argc) {
                 const std::string mode = argv[++i];
@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
             if (token >= q27::MetalEngine::vocabulary_size())
                 throw std::runtime_error("prompt token id is outside the model vocabulary");
 
-        q27::MetalEngine engine(model_path, context, turbo3_kv);
+        q27::MetalEngine engine(model_path, context, kv_kind);
         if (serial_prefill) engine.set_chunked_prefill(false);
         const auto loaded = std::chrono::steady_clock::now();
         fprintf(stderr, "Metal model ready on %s in %.2f s (shader sha1 %s)\n",

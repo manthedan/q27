@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -341,6 +342,131 @@ int test_turbo3(q27::MetalBackend& backend) {
     // reversible WHT. Keep the bound below the observed failure modes for a
     // broken sign/group mapping while allowing the 3-bit codec's expected loss.
     if(nrmse>.30 || cosine<.95) { fprintf(stderr,"turbo3 attention quality: nrmse %.5f cosine %.6f\n",nrmse,cosine); failures++; }
+    return failures;
+}
+
+// q8 KV tier: rotated int8/32 blocks through the shared compressed-KV
+// attention kernels (kv_codec 1). Checks codec quality against fp16 at the
+// production head shape, that the blocked-GQA and chunk-causal q8 routes
+// reproduce the serial q8 decode kernel (GQA within float reassociation;
+// chunk rows bit for bit, the same contract turbo3 keeps), that the serial
+// and row store kernels write identical blocks, and zero-vector packing.
+int test_q8_kv(q27::MetalBackend& backend) {
+    constexpr uint32_t seq = 133, qh = 24, kvh = 4, dim = 256, tokens = 5;
+    const uint32_t base = seq - tokens;
+    const float scale = 1 / std::sqrt(float(dim));
+    const uint64_t row = (uint64_t)kvh * 2 * q27::kv_block_bytes(q27::KvCodec::Q8);
+    int failures = 0;
+    auto k16 = backend.allocate((uint64_t)seq * kvh * dim * 2), v16 = backend.allocate((uint64_t)seq * kvh * dim * 2);
+    auto kq = backend.allocate(seq * row), vq = backend.allocate(seq * row);
+    std::vector<float> zeros((size_t)kvh * dim, 0);
+    auto zerob = upload_buffer(backend, zeros);
+    backend.kv_store_turbo3(*zerob, *zerob, *kq, *vq, 0, kvh, q27::KvCodec::Q8);
+    std::vector<uint8_t> zero_row(row);
+    backend.read(*kq, 0, zero_row.data(), zero_row.size());
+    for (uint8_t byte : zero_row) if (byte) { fprintf(stderr, "q8 zero-vector block not all zero\n"); failures++; break; }
+    std::vector<float> all_k((size_t)seq * kvh * dim), all_v(all_k.size());
+    for (uint32_t p = 0; p < seq; p++) {
+        for (uint32_t i = 0; i < kvh * dim; i++) {
+            // Mixed magnitudes per 32-group, so per-group scales matter.
+            const float spike = (i % 37 == 5) ? 4.0f : 1.0f;
+            all_k[(size_t)p * kvh * dim + i] = spike * (.5f * std::sin(float(i + 13 * p) * .041f) + .1f * std::cos(float(i) * .17f));
+            all_v[(size_t)p * kvh * dim + i] = spike * (.7f * std::cos(float(i + 7 * p) * .023f) - .15f * std::sin(float(i) * .09f));
+        }
+        std::vector<float> k(all_k.begin() + (size_t)p * kvh * dim, all_k.begin() + (size_t)(p + 1) * kvh * dim);
+        std::vector<float> v(all_v.begin() + (size_t)p * kvh * dim, all_v.begin() + (size_t)(p + 1) * kvh * dim);
+        auto kb = upload_buffer(backend, k), vb = upload_buffer(backend, v);
+        backend.kv_store(*kb, *vb, *k16, *v16, p, kvh, dim, q27::KvFormat::F16);
+        backend.kv_store_turbo3(*kb, *vb, *kq, *vq, p, kvh, q27::KvCodec::Q8);
+    }
+    // Row store over the last `tokens` positions must write the same bytes
+    // the serial store did (both sides; the range is cleared first).
+    std::vector<uint8_t> before(tokens * row), before_v(tokens * row), after(tokens * row), after_v(tokens * row);
+    backend.read(*kq, base * row, before.data(), before.size());
+    backend.read(*vq, base * row, before_v.data(), before_v.size());
+    std::vector<uint8_t> cleared(tokens * row, 0);
+    backend.write(*kq, base * row, cleared.data(), cleared.size());
+    backend.write(*vq, base * row, cleared.data(), cleared.size());
+    std::vector<float> chunk_k(all_k.begin() + (size_t)base * kvh * dim, all_k.end());
+    std::vector<float> chunk_v(all_v.begin() + (size_t)base * kvh * dim, all_v.end());
+    auto ckb = upload_buffer(backend, chunk_k), cvb = upload_buffer(backend, chunk_v);
+    backend.kv_store_turbo3_rows(*ckb, *cvb, *kq, *vq, base, kvh, tokens, q27::KvCodec::Q8);
+    backend.read(*kq, base * row, after.data(), after.size());
+    backend.read(*vq, base * row, after_v.data(), after_v.size());
+    if (before != after || before_v != after_v) { fprintf(stderr, "q8 row store differs from serial store\n"); failures++; }
+
+    std::vector<float> q((size_t)tokens * qh * dim);
+    for (size_t i = 0; i < q.size(); i++) q[i] = .3f * std::sin(float(i) * .029f) + .1f * std::cos(float(i) * .061f);
+    const uint32_t saved_threshold = backend.gqa_threshold();
+    auto partials = backend.allocate((uint64_t)tokens * qh * 64 * 258 * 4);
+    auto serial_q8 = [&](uint32_t t, uint32_t len) {
+        std::vector<float> qt(q.begin() + (size_t)t * qh * dim, q.begin() + (size_t)(t + 1) * qh * dim);
+        auto qb = upload_buffer(backend, qt);
+        auto out = backend.allocate((uint64_t)qh * dim * 4);
+        backend.begin_commands();
+        backend.turbo_wht(*qb, qh, dim, false);
+        backend.attention_turbo3(*qb, dim, *kq, *vq, *out, len, qh, kvh, dim, scale, partials.get(), q27::KvCodec::Q8);
+        backend.turbo_wht(*out, qh, dim, true);
+        backend.end_commands();
+        return read_f32(backend, *out, (size_t)qh * dim);
+    };
+    backend.set_gqa_threshold(0);
+    // Quality vs fp16 at the full sequence (last query row).
+    {
+        std::vector<float> qt(q.end() - (size_t)qh * dim, q.end());
+        auto qb = upload_buffer(backend, qt);
+        auto out16 = backend.allocate((uint64_t)qh * dim * 4);
+        backend.attention(*qb, dim, *k16, *v16, *out16, seq, qh, kvh, dim, scale, q27::KvFormat::F16, nullptr);
+        const auto base16 = read_f32(backend, *out16, (size_t)qh * dim);
+        const auto got = serial_q8(tokens - 1, seq);
+        double signal = 0, error = 0;
+        for (size_t i = 0; i < got.size(); i++) { signal += base16[i] * base16[i]; error += (got[i] - base16[i]) * (got[i] - base16[i]); }
+        const double nrmse = std::sqrt(error / std::max(signal, 1e-30));
+        printf("q8 KV synthetic attention: nrmse %.6f vs fp16 (turbo3 bound is 0.30)\n", nrmse);
+        if (!(nrmse < 0.01)) { fprintf(stderr, "q8 attention quality: nrmse %.6f\n", nrmse); failures++; }
+    }
+    // Chunk-causal rows must equal serial decode at each row's length.
+    std::vector<std::vector<float>> serial_rows;
+    for (uint32_t t = 0; t < tokens; t++) serial_rows.push_back(serial_q8(t, base + t + 1));
+    // n rows starting at chunk row `first` (n == 1 takes the untiled
+    // causal-GQA kernel; n >= 2 the factor-2 tiled one).
+    auto chunk = [&](uint32_t first = 0, uint32_t n = tokens) {
+        std::vector<float> qs(q.begin() + (size_t)first * qh * dim, q.begin() + (size_t)(first + n) * qh * dim);
+        auto qb = upload_buffer(backend, qs);
+        auto out = backend.allocate((uint64_t)n * qh * dim * 4);
+        backend.begin_commands();
+        backend.turbo_wht(*qb, n * qh, dim, false);
+        backend.attention_turbo3_causal(*qb, dim, qh * dim, *kq, *vq, *out, base + first + 1, qh, kvh, dim,
+                                        n, scale, partials.get(), q27::KvCodec::Q8);
+        backend.turbo_wht(*out, n * qh, dim, true);
+        backend.end_commands();
+        return read_f32(backend, *out, (size_t)n * qh * dim);
+    };
+    const auto chunk_rows = chunk();
+    for (uint32_t t = 0; t < tokens; t++)
+        if (std::memcmp(chunk_rows.data() + (size_t)t * qh * dim, serial_rows[t].data(), (size_t)qh * dim * 4)) {
+            fprintf(stderr, "q8 chunk-causal row %u differs from serial decode\n", t); failures++; break;
+        }
+    // Blocked-GQA routes (decode and chunk) vs the serial kernel.
+    backend.set_gqa_threshold(1);
+    const auto gqa_last = serial_q8(tokens - 1, seq);
+    const auto gqa_chunk = chunk();
+    const auto gqa_single = chunk(tokens - 1, 1);
+    backend.set_gqa_threshold(saved_threshold);
+    for (size_t i = 0; i < gqa_single.size(); i++)
+        if (!near(gqa_single[i], serial_rows[tokens - 1][i], 2e-5f)) {
+            fprintf(stderr, "q8 untiled GQA chunk[%zu] %.8g vs serial %.8g\n", i, gqa_single[i], serial_rows[tokens - 1][i]); failures++; break;
+        }
+    for (size_t i = 0; i < gqa_last.size(); i++)
+        if (!near(gqa_last[i], serial_rows[tokens - 1][i], 2e-5f)) {
+            fprintf(stderr, "q8 GQA decode[%zu] %.8g vs serial %.8g\n", i, gqa_last[i], serial_rows[tokens - 1][i]); failures++; break;
+        }
+    for (uint32_t t = 0; t < tokens; t++)
+        for (size_t i = 0; i < (size_t)qh * dim; i++)
+            if (!near(gqa_chunk[(size_t)t * qh * dim + i], serial_rows[t][i], 2e-5f)) {
+                fprintf(stderr, "q8 GQA chunk row %u[%zu] differs from serial\n", t, i); failures++; break;
+            }
+    if (!failures) printf("q8 KV: store parity, chunk==serial bitwise, GQA routes, zero packing OK\n");
     return failures;
 }
 
@@ -983,7 +1109,7 @@ int main() {
         int failures = test_primitives(backend) + test_attention(backend) +
                        test_unsupported_kv_formats(backend) +
                        test_attention_production_shape(backend) +
-                       test_turbo3(backend) + test_turbo3_production_shape(backend) +
+                       test_turbo3(backend) + test_turbo3_production_shape(backend) + test_q8_kv(backend) +
                        test_gdn(backend) + test_chunked(backend);
         if (failures) { fprintf(stderr, "Metal ops: %d failure(s)\n", failures); return 1; }
         puts("Metal decode primitives, FP16/turbo3 attention, GDN, and chunked prefill ops: OK");

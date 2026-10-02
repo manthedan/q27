@@ -32,12 +32,12 @@ int main(int argc,char** argv) {
         if(!out) throw std::runtime_error("cannot open logit output");
         const uint32_t context=std::max<uint32_t>(128,tokens.size()+32);
         // Long-context runs: Q27_PROBE_STRIDE=k keeps every k-th position's
-        // logits (all positions still run); Q27_PROBE_KV=turbo3 (q27 only).
+        // logits (all positions still run); Q27_PROBE_KV=turbo3|q8 (q27 only).
         const char* stride_env=std::getenv("Q27_PROBE_STRIDE");
         const size_t stride=stride_env?std::strtoul(stride_env,nullptr,10):1;
         if(stride<1) throw std::runtime_error("Q27_PROBE_STRIDE must be >= 1");
         const char* kv_env=std::getenv("Q27_PROBE_KV");
-        const bool turbo3=kv_env && !std::strcmp(kv_env,"turbo3");
+        [[maybe_unused]] const bool compressed_kv=kv_env && std::strcmp(kv_env,"fp16");
         // Q27_PROBE_PREFILL=chunk (q27 only): for each kept position i, reset
         // and ingest tokens[0..i) through 96-token prefill chunks, then step
         // tokens[i] serially -- the engine's own prefill shape -- so batched
@@ -46,7 +46,6 @@ int main(int argc,char** argv) {
         const bool chunked=prefill_env && !std::strcmp(prefill_env,"chunk");
         if(prefill_env && !chunked && std::strcmp(prefill_env,"serial"))
             throw std::runtime_error("Q27_PROBE_PREFILL must be serial or chunk");
-        if(kv_env && !turbo3 && std::strcmp(kv_env,"fp16")) throw std::runtime_error("Q27_PROBE_KV must be fp16 or turbo3");
 #ifdef Q27_PRISM_REFERENCE
         ggml_backend_load_all();
         llama_backend_init();
@@ -64,9 +63,9 @@ int main(int argc,char** argv) {
         std::unique_ptr<llama_context,decltype(&llama_free)> engine(
             llama_init_from_model(model.get(),cp),llama_free);
         if(!engine) throw std::runtime_error("reference context failed");
-        if(turbo3||chunked) throw std::runtime_error("Q27_PROBE_KV/Q27_PROBE_PREFILL apply to the q27 probe only");
+        if(compressed_kv||chunked) throw std::runtime_error("Q27_PROBE_KV/Q27_PROBE_PREFILL apply to the q27 probe only");
 #else
-        q27::MetalEngine engine(argv[1],context,turbo3);
+        q27::MetalEngine engine(argv[1],context,q27::parse_kv_kind(kv_env?kv_env:"fp16"));
         if(chunked && !engine.chunked_prefill())
             throw std::runtime_error("Q27_PROBE_PREFILL=chunk: this pack has no chunked prefill");
         if(!chunked && engine.chunked_prefill()) engine.set_chunked_prefill(false);

@@ -386,6 +386,7 @@ static void usage(FILE *out, const char *argv0) {
         "  -s, --system TEXT       replace the default system prompt\n"
         "  -n, --max-tokens N|auto maximum generated tokens (default 512; 4096 with --auto-tools at context >=8192)\n"
         "  -c, --context N         engine context (default 8192)\n"
+        "      --kv fp16|turbo3|q8  KV cache: q8 ~halves memory at near-fp16 accuracy\n"
         "      --no-think          append the Qwen no-thinking prefix\n"
         "      --max-think-tokens N  hard-stop open <think> after N tokens (0=off)\n"
         "      --output-format F   text (default) or jsonl events\n"
@@ -2122,6 +2123,7 @@ int main(int argc, char **argv) {
     uint32_t context = 8192, max_tokens = 512, max_tool_rounds = 8;
     uint32_t compact_at = 0, compact_keep = 4, compact_tokens = 1024;
     uint32_t mtp_width = 0;
+    uint32_t kv_kind = 0;
     int think = 1, jsonl = 0, auto_tools = 0, max_tokens_explicit = 0;
     int adaptive_tokens = 0;
     int frontend_proto = 0;
@@ -2226,6 +2228,18 @@ int main(int argc, char **argv) {
                 tui_diagf( "q27-agent: invalid seed\n");
                 return 2;
             }
+        } else if (!strcmp(arg, "--kv")) {
+            if (++i == argc) {
+                fprintf(stderr, "q27-agent: --kv needs fp16, turbo3 or q8\n");
+                return 2;
+            }
+            if (!strcmp(argv[i], "fp16")) kv_kind = 0;
+            else if (!strcmp(argv[i], "turbo3")) kv_kind = 1;
+            else if (!strcmp(argv[i], "q8")) kv_kind = 2;
+            else {
+                fprintf(stderr, "q27-agent: --kv must be fp16, turbo3 or q8\n");
+                return 2;
+            }
         } else if (!strcmp(arg, "--mtp")) {
             if (++i == argc || !parse_u32_allow_zero(argv[i], &mtp_width) ||
                 mtp_width == 1 || mtp_width > 12) {
@@ -2298,7 +2312,7 @@ int main(int argc, char **argv) {
     char error[512] = {0};
     unsigned char tokenizer_sha1[20];
     q27_agent_worker *worker = q27_agent_worker_start_at(
-        model, tokenizer, context, workspace, mtp_width, error, sizeof(error));
+        model, tokenizer, context, workspace, mtp_width, kv_kind, error, sizeof(error));
     if (!worker) {
         tui_diagf( "q27-agent: worker start failed: %s\n",
                 error[0] ? error : "unknown error");
