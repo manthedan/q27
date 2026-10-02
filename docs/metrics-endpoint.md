@@ -1,6 +1,7 @@
 # /metrics -- Prometheus text exposition
 
-**Status:** implemented 2026-08-30 on `feat/metrics-endpoint`. Opt-in via
+**Status:** implemented 2026-08-30 (`feat/metrics-endpoint`, shipped since
+v0.11.0). Opt-in via
 `--enable-metrics` (default off). Auth-exempt like `/health`. This document
 is the reference for every series, the observation semantics, and the
 consumer contract; `src/metrics.h` is the implementation and the comment
@@ -136,8 +137,9 @@ sampled path (`spec_sample_round`, and the conductor's fused
 ratio read a constant 0 on sampled-only serving profiles -- the measured
 recipe runs `--temp 1.0`, so that was the normal case, not an edge case.
 Both sampled paths now mirror the greedy lane accounting, monitoring-only:
-no depth-controller or EMA feed, because the sampled ceiling is fixed at 4
-and adaptive depth is greedy-only. Expect 0.4-0.75 depending on request mix;
+no depth-controller or EMA feed, because the sampled ceiling is the fixed
+`gate_maxd` (7 under the server's default `Q27_MAXD=auto7`) and adaptive
+depth is greedy-only. Expect 0.4-0.75 depending on request mix;
 0 with traffic flowing means the gate never fired (e.g. `Q27_PMIN=0`).
 
 **Why preemptions is an honest 0.** q27's admission is a FIFO queue: a

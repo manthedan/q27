@@ -3,6 +3,7 @@
 Offline validation of the z-lab Qwen3.8-27B-DFlash2 drafter before any
 engine work. Design + results: `docs/plans/2026-09-06-dflash2-integration.md`
 (Phase 0 results section). Raw output: `p0a.log`, `p0a_sweep.log`.
+The integration write-up is `FINDINGS.md`; the width > 8 gate is `width/`.
 
 Setup (one-time):
 
@@ -28,6 +29,9 @@ load the composite Qwen3.8 checkpoint directly as `Qwen3_5ForCausalLM`
 - `p0b_drafter_cost.py` -- drafter per-round cost in eager torch, faithful
   to the generate loop's shape (warm draft KV, few fresh context rows + 8
   noise rows per round). Point CUDA_VISIBLE_DEVICES at a free GPU.
+- `p1_qtap_al.py` -- the Phase 1 quant-tap gate: replays the drafter over a
+  `q27 --dump-taps` dump (`q27` mode) or validates the replay rig against
+  z-lab's E2E loop (`hfcontrol` mode). Logs: `p1_*.log`; prompts: `toks/`.
 
 Model paths are hardcoded for haight (`/mnt/ai/models/qwen38-27b-hf`,
 `/mnt/ai/models/qwen38-27b-dflash2-bf16`).

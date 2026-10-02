@@ -47,11 +47,19 @@ docker build -f Dockerfile -t <you>/q27-serverless:v0.3.1 .
 docker push <you>/q27-serverless:v0.3.1
 ```
 
+Both Dockerfiles pin release v0.3.1 (Qwen3.6 era). `Dockerfile.source`
+takes `--build-arg Q27_REF=<tag>` to build another release; the prebuilt
+`Dockerfile` hardcodes the v0.3.1 tarball URL. `Dockerfile.source` builds
+and ships only `q27-server-w8`; to use `q27-server` there, add it to the
+`make` line and the `COPY`.
+
 ## 3. Create the endpoint
 
 - **GPU**: a 24-48 GB card the fatbin covers -- A5000 / A6000 (sm_86),
-  4090 / L40 / L40S (sm_89). (A100 sm_80 and H100 sm_90 are NOT in the
-  build and you don't need them for a 27B model.)
+  4090 / L40 / L40S (sm_89). The prebuilt release binaries also carry
+  sm_120 (RTX 5090); `Dockerfile.source` builds sm_86 + sm_89 only unless
+  you add the gencode. (A100 sm_80 and H100 sm_90 are NOT in either build
+  and you don't need them for a 27B model.)
 - Attach the network volume from step 1.
 - **Container disk** can be small (weights are on the volume).
 - **Cold start**: first boot on a fresh worker is minutes (weight load +
@@ -65,10 +73,12 @@ docker push <you>/q27-serverless:v0.3.1
 |---|---|---|
 | `Q27_MODEL` | `/runpod-volume/qwen36-27b-mtp-q4s.q27` | tier on the volume |
 | `Q27_TOK` | `/runpod-volume/qwen36-27b-mtp.tok` | tokenizer |
-| `Q27_BIN` | `/opt/q27/q27-server-w8` | use `q27-server` (W12) on >24 GB cards |
-| `Q27_KV` | `turbo3` | `fp8` = faster/less ctx; turbo3 = full 262K on 24 GB |
+| `Q27_BIN` | `/opt/q27/q27-server-w8` | use `q27-server` (W12) on >24 GB cards (prebuilt image; see step 2 for the source image) |
+| `Q27_KV` | `turbo3` | set by the image; `fp8` = faster/less ctx, turbo3 = deepest window. Unset, the server picks fp8 on sm_89+ and turbo5k on sm_86 |
 | `Q27_SAMPLED` | (unset) | `0` = greedy-only, skips ~600 MB sampled graphs + shortens boot (temperature>0 requests then 400) |
 | `Q27_BOOT_TIMEOUT_S` | `600` | health-wait budget for cold boot |
+| `Q27_GEN_TIMEOUT_S` | `600` | per-job HTTP timeout to the local server |
+| `Q27_PORT` | `8081` | local server port (bound to 127.0.0.1) |
 
 ## 4. Call it
 
@@ -85,7 +95,10 @@ Chat shape (one turn):
 {"input": {"messages": [{"role": "user", "content": "say hi"}], "max_tokens": 32}}
 ```
 
-Response: `{"text": "...", "finish_reason": "...", "usage": {...}}`.
+Response: `{"text": "...", "finish_reason": "...", "usage": {...}}` for
+`prompt`; `{"text": "...", "stop_reason": "...", "usage": {...}}` for
+`messages` (text blocks only; thinking is dropped). Errors come back as
+`{"error": "..."}`.
 
 ## Throughput tip: let q27 batch concurrent jobs
 

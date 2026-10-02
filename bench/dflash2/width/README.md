@@ -34,11 +34,14 @@ same-token divergence for every K >= 8 is what a dispatch switch looks like.
   shas (compare A vs B within a boot only -- across K the sampled walk
   realises different tokens under different proposals by design).
 - `width_repeat.sh <outdir>` -- repeats of the one MMA-arm outlier.
+- `seeded_hash.py <base> <tag>` and `width_depth_probe.py <base> <tag>
+  <depth> [seeds]` -- the stream and depth drivers `width_serve.sh` calls.
 
 ## Traps
 
 - The reference is the LADDER stream, not plain greedy: the plain decode
-  graph uses `k_gemv_q4`, which is not `k_gemv_q4_n<1>` (engine.cuh:1709),
+  graph uses `k_gemv_q4`, which is not `k_gemv_q4_n<1>` (src/engine.cuh,
+  the `mtp_mm1` comment),
   so plain differs from every width-N verify at some token (prose 32,
   code-write 52, code-edit 127; echo happens to agree). The 09-06 gate
   compared against `--spec` too.

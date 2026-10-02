@@ -368,7 +368,7 @@ sampling is close to meaningless.
 
     bash bench/crossengine/harness/run_all.sh <outdir> [arms] [legs]
       arms  agentic,quality,ladder
-      legs  q4s,nint,q5f,nvfp4,llama,vllm
+      legs  q4s,nint,q5f,nvfp4,llama,vllm (default; also q38,q38q4s,llama38,nvfp4m)
 
 `harness/analyze.py bench/crossengine` regenerates every table in RESULTS.txt
 from the data committed beside it.
@@ -415,6 +415,13 @@ block compact and key-sorted since 08-22 -- and neither moved the
 trajectory length (12-instance A/B with a same-day control; probe re-run
 on the corrected prompt). Drafter, KV dtype, tier and sampler chain are
 excluded on q27.*
+
+*Later (BUILDLOG 2026-09-10 (ad), 2026-09-17 (am)): most of the per-turn
+thinking gap was a q27 tokenizer bug (the tool-call tags never encoded as
+their added tokens; fixed in 6084562), and the remaining turn-count gap
+traces to ninfer's planning turn. See
+[agentic-2026-09-10-effort/](agentic-2026-09-10-effort/README.md) and
+[agentic-2026-09-17-turns/](agentic-2026-09-17-turns/README.md).*
 
 ## 2026-08-22 addendum: Qwen3.8 quality legs, q27 vs llama.cpp
 

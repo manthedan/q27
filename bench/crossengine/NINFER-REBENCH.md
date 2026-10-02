@@ -21,7 +21,9 @@ as the vLLM MTP-corruption note.
   instances via Claude Code, `tapproxy.py` in front (client-observed timing,
   `--strip-fields output_config,thinking --translate-thinking`), artifact =
   the same local `qwen3_6_27b_nvfp4.ninfer` the 08-17/08-19 legs served, so
-  the delta is engine behavior alone.
+  the delta is engine behavior alone. (The committed `nvfp4m` leg in
+  `harness/legs.sh`, added later that day in bd8d8ca, serves the 3.8 release
+  artifact with `--spec dflash2 --draft-tokens 7`, not this 3.6 leg.)
 - Decode sweeps: `xengine_longctx.py` arm A (cold unique prefixes, 512
   tokens, median of 3, think-on) against ninfer's released
   `Qwen3.8-27B-nvfp4-NInfer` artifact -- which now carries the DFlash2

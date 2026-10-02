@@ -49,7 +49,8 @@ The specific vulnerability class in the essay does not reach this codebase.
 ## What q27 does have: a deliberately forgiving parser
 
 The real surface is `parse_bare_tool_calls` and the drift chain around it --
-22 recovery modes, brace repair, dialect-closer blanking, tool-name inference,
+23 numbered recovery modes (mode 23 added after this doc was first
+written), brace repair, dialect-closer blanking, tool-name inference,
 and recovery from inside reasoning. Every one exists because a model emitted
 that shape in production and lost a call. Every one is also a rule that turns
 model-authored bytes into control flow.
@@ -58,7 +59,9 @@ Two distinct risks, and they need different defences.
 
 ### 1. Memory safety (would give GPU-host code execution)
 
-~109 `substr()` calls and 72 span computations over model-authored strings.
+~120 `substr()` calls in `api_common.h` alone (2026-10-01 count; ~109 when
+this was first written) plus dozens of span computations over model-authored
+strings.
 The characteristic failure is a span whose `source_begin` is `npos` or behind
 the cursor, making `raw.substr(cursor, source_begin - cursor)` underflow to
 `SIZE_MAX`. That exact bug was found in review on 2026-08-20 (mode 20 leaving

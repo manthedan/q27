@@ -9,7 +9,10 @@ quality work from 2026-08-14 on is Qwen3.8-27B-MTP** (`qwen38-27b-mtp`, the
 default in `tools/effort_ab.sh`): tool-call parity, the drift-mode catalogue,
 the cross-engine quality legs, the sampler and think-budget findings. The two
 are different models; a claim from one arc does not transfer to the other
-without re-measurement.
+without re-measurement. **Bonsai 2 27B** (PrismML's ternary Qwen3.8, T2/T3
+packs, from 2026-09-18) is a third model with its own anchors and gates
+(`build/t3_gate` from `tools/t3_gate.cu`, `tools/bench-bonsai2-8gb.sh` for the small-card packs); its
+numbers do not transfer to either Qwen arc.
 
 **Byte-identity is necessary, not sufficient.** GPU0 silently corrupts a small
 fraction of model loads with single-bit flips in resident weights, and
@@ -23,7 +26,7 @@ treat their margins accordingly, and re-measure any constant a decision rests
 on. See BUILDLOG 2026-08-18..19 and the localization queue.
 
 How the q27 numbers are produced, and how to reproduce the cross-engine
-comparison against the [llama-cpp-turboquant](https://github.com/) fork with
+comparison against the [llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) fork with
 `ngram-mod`. Two engines are compared throughout:
 
 | engine | build | quant | spec-decode |
@@ -238,10 +241,17 @@ otherwise tears the job's cgroup down).
 
 ## Results
 
-The current cross-engine standing (2026-09-09, DFlash2 era, both engines
+The cross-engine standing of the DFlash2 era (2026-09-09, both engines
 at ~97% prefix reuse) is in
-[bench/crossengine/agentic-2026-09-09/README.md](../bench/crossengine/agentic-2026-09-09/README.md);
-the 08-17/08-19 four-engine runs in [bench/crossengine/FINDINGS.md](../bench/crossengine/FINDINGS.md).
+[bench/crossengine/agentic-2026-09-09/README.md](../bench/crossengine/agentic-2026-09-09/README.md),
+re-benched on v0.11.3 in
+[agentic-2026-09-10](../bench/crossengine/agentic-2026-09-10/README.md); the
+reasoning-length and turn-count follow-ups are in
+[agentic-2026-09-10-effort](../bench/crossengine/agentic-2026-09-10-effort/README.md)
+and [agentic-2026-09-17-turns](../bench/crossengine/agentic-2026-09-17-turns/README.md),
+and the Bonsai 2 leg in
+[agentic-2026-09-18-bonsai2](../bench/crossengine/agentic-2026-09-18-bonsai2/README.md).
+The 08-17/08-19 four-engine runs are in [bench/crossengine/FINDINGS.md](../bench/crossengine/FINDINGS.md).
 The 07-14 results below are the original Method A/B numbers and are kept
 as the baseline they were.
 
@@ -432,7 +442,8 @@ Caveats, theirs and ours, stated plainly:
   Part of the 3090 gap is power, not engine.
 - **Sampling parity is temp+top_p only.** Their harness pins temperature
   0.6 / top_p 0.95 in the request; their engines compose a server-default
-  top_k=20 on top, and q27 has no top_k. A sampling-distribution nuance,
+  top_k=20 on top, and q27 had no top_k then (`top_k`/`min_p` landed
+  2026-08-23). A sampling-distribution nuance,
   TPS-neutral -- every run on both sides decodes to the max_tokens cap.
 - **Wall vs decode preserved** per their two-metric convention; both are
   quoted wherever they publish both.
@@ -653,7 +664,7 @@ captures on public tasks.
 
 ## Honest caveats
 
-- Quantization confound: the two llama builds are Q5_K_M (+0.25 bpw vs q27's
+- Quantization confound: the two llama builds are Q5_K_M (+0.25 bpw vs
   q27's 4-bit, favors llama); vLLM is NVFP4 proper -- e2m1 + fp8 block scales,
   a different format than q27's integer group quant but the same bit class, so the
   cleanest comparison), but from a different checkpoint (`unsloth`, the multimodal

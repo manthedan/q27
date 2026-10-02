@@ -1,0 +1,312 @@
+2026-09-10 15:07:38.079  INFO  listening on http://0.0.0.0:8081 | model qwen3.8-27b | auth disabled
+2026-09-10 15:07:39.951  INFO  req#1 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:43.079  INFO  throughput | 5.0s | prefill 4.49k tok/s (22,449 tok) | running 1 (prefill 1) | host 8.8% (438 ms)
+2026-09-10 15:07:44.166  INFO  req#1 done | anthropic | tool calls 1 | prompt 25,125 | output 118 | cache 0 (0.0%) | TTFT 3.6s | total 4.2s | prefill 7.01k tok/s | decode 197.3 tok/s | dflash2 accepted 85/224 (37.9%)
+2026-09-10 15:07:44.224  INFO  req#2 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:44.623  INFO  req#2 done | anthropic | tool calls 1 | prompt 26,007 | output 78 | cache 25,242 (97.1%, private endpoint) | TTFT 190 ms | total 413 ms | queue 11.7 ms | prefill 4.66k tok/s | decode 345.4 tok/s | dflash2 accepted 66/84 (78.6%)
+2026-09-10 15:07:44.646  INFO  req#3 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:45.335  INFO  req#3 done | anthropic | tool calls 1 | prompt 27,087 | output 168 | cache 26,084 (96.3%, private endpoint) | TTFT 238 ms | total 702 ms | prefill 4.72k tok/s | decode 359.7 tok/s | dflash2 accepted 143/175 (81.7%)
+2026-09-10 15:07:45.378  INFO  req#4 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:46.485  INFO  req#4 done | anthropic | tool calls 1 | prompt 27,301 | output 256 | cache 27,254 (99.8%, private endpoint) | TTFT 99.7 ms | total 1.1s | prefill 628.5 tok/s | decode 249.9 tok/s | dflash2 accepted 201/385 (52.2%)
+2026-09-10 15:07:46.514  INFO  req#5 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:46.935  INFO  req#5 done | anthropic | tool calls 1 | prompt 27,597 | output 119 | cache 27,556 (99.9%, private endpoint) | TTFT 99.5 ms | total 434 ms | prefill 547.1 tok/s | decode 353.3 tok/s | dflash2 accepted 101/126 (80.2%)
+2026-09-10 15:07:46.977  INFO  req#6 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:47.379  INFO  req#6 done | anthropic | tool calls 1 | prompt 27,774 | output 128 | cache 27,715 (99.8%, private endpoint) | TTFT 100 ms | total 416 ms | prefill 778.1 tok/s | decode 402.3 tok/s | dflash2 accepted 111/119 (93.3%)
+2026-09-10 15:07:47.501  INFO  req#7 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:48.064  INFO  req#7 done | anthropic | tool calls 1 | prompt 28,048 | output 116 | cache 27,901 (99.5%, private endpoint) | TTFT 112 ms | total 576 ms | prefill 1.69k tok/s | decode 247.9 tok/s | dflash2 accepted 91/175 (52.0%)
+2026-09-10 15:07:48.079  INFO  throughput | 5.0s | prefill 947.6 tok/s (4,738 tok) | decode 195.2 tok/s (976 tok) | running 0 | batch 1.00 | host 4.2% (212 ms)
+2026-09-10 15:07:48.148  INFO  req#8 started | anthropic stream | 18 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:49.586  INFO  req#8 done | anthropic | stop token | prompt 28,270 | output 270 | cache 28,163 (99.6%, private endpoint) | TTFT 113 ms | total 1.5s | prefill 1.23k tok/s | decode 201.1 tok/s | dflash2 accepted 198/504 (39.3%)
+2026-09-10 15:07:51.754  INFO  req#9 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:53.079  INFO  throughput | 5.0s | prefill 2.07k tok/s (10,347 tok) | decode 53.8 tok/s (269 tok) | running 1 (prefill 1) | batch 1.00 | host 3.5% (174 ms)
+2026-09-10 15:07:55.792  INFO  req#9 done | anthropic | tool calls 1 | prompt 25,187 | output 105 | cache 0 (0.0%) | TTFT 3.6s | total 4.1s | queue 12.1 ms | prefill 7.06k tok/s | decode 243.5 tok/s | dflash2 accepted 82/161 (50.9%)
+2026-09-10 15:07:55.842  INFO  req#10 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:56.166  INFO  req#10 done | anthropic | tool calls 1 | prompt 25,314 | output 75 | cache 25,291 (99.9%, private endpoint) | TTFT 96.4 ms | total 338 ms | prefill 323.9 tok/s | decode 306.9 tok/s | dflash2 accepted 61/91 (67.0%)
+2026-09-10 15:07:56.194  INFO  req#11 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:56.539  INFO  req#11 done | anthropic | tool calls 1 | prompt 25,596 | output 76 | cache 25,388 (99.2%, private endpoint) | TTFT 116 ms | total 357 ms | prefill 2.30k tok/s | decode 311.3 tok/s | dflash2 accepted 63/91 (69.2%)
+2026-09-10 15:07:56.563  INFO  req#12 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:07:58.079  INFO  throughput | 5.0s | prefill 3.21k tok/s (16,028 tok) | decode 109.4 tok/s (547 tok) | running 1 (decode-ready 1) | batch 1.00 | host 7.7% (383 ms)
+2026-09-10 15:07:59.793  INFO  req#12 done | anthropic | tool calls 1 | prompt 26,521 | output 702 | cache 25,671 (96.8%, private endpoint) | TTFT 206 ms | total 3.2s | prefill 4.79k tok/s | decode 230.8 tok/s | dflash2 accepted 539/1,141 (47.2%)
+2026-09-10 15:07:59.826  INFO  req#13 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:00.191  INFO  req#13 done | anthropic | tool calls 1 | prompt 27,262 | output 64 | cache 27,222 (99.9%, private endpoint) | TTFT 100 ms | total 379 ms | prefill 537.3 tok/s | decode 226.3 tok/s | dflash2 accepted 49/105 (46.7%)
+2026-09-10 15:08:00.216  INFO  req#14 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:00.698  INFO  req#14 done | anthropic | tool calls 1 | prompt 27,437 | output 104 | cache 27,325 (99.6%, private endpoint) | TTFT 105 ms | total 495 ms | prefill 1.41k tok/s | decode 264.3 tok/s | dflash2 accepted 83/147 (56.5%)
+2026-09-10 15:08:00.723  INFO  req#15 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:03.079  INFO  throughput | 5.0s | prefill 35.0 tok/s (175 tok) | decode 222.2 tok/s (1,111 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.8% (40.1 ms)
+2026-09-10 15:08:03.138  INFO  req#15 done | anthropic | tool calls 1 | prompt 27,563 | output 565 | cache 27,540 (99.9%, private endpoint) | TTFT 97.9 ms | total 2.4s | prefill 316.2 tok/s | decode 242.1 tok/s | dflash2 accepted 439/875 (50.2%)
+2026-09-10 15:08:03.160  INFO  req#16 started | anthropic stream | 17 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:04.530  INFO  req#16 done | anthropic | tool calls 1 | prompt 28,286 | output 408 | cache 28,127 (99.4%, private endpoint) | TTFT 114 ms | total 1.4s | prefill 1.81k tok/s | decode 321.0 tok/s | dflash2 accepted 340/476 (71.4%)
+2026-09-10 15:08:04.571  INFO  req#17 started | anthropic stream | 20 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:08.079  INFO  throughput | 5.0s | prefill 58.6 tok/s (293 tok) | decode 231.8 tok/s (1,159 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.8% (41.6 ms)
+2026-09-10 15:08:08.489  INFO  req#17 done | anthropic | tool calls 1 | prompt 28,827 | output 878 | cache 28,693 (99.5%, private endpoint) | TTFT 136 ms | total 3.9s | prefill 1.23k tok/s | decode 231.1 tok/s | dflash2 accepted 675/1,421 (47.5%)
+2026-09-10 15:08:08.535  INFO  req#18 started | anthropic stream | 22 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:10.007  INFO  req#18 done | anthropic | tool calls 1 | prompt 29,749 | output 309 | cache 29,704 (99.8%, private endpoint) | TTFT 103 ms | total 1.5s | prefill 584.1 tok/s | decode 222.8 tok/s | dflash2 accepted 235/518 (45.4%)
+2026-09-10 15:08:10.030  INFO  req#19 started | anthropic stream | 24 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:11.855  INFO  req#19 done | anthropic | tool calls 1 | prompt 30,197 | output 430 | cache 30,057 (99.5%, private endpoint) | TTFT 116 ms | total 1.8s | prefill 1.58k tok/s | decode 249.1 tok/s | dflash2 accepted 338/644 (52.5%)
+2026-09-10 15:08:11.898  INFO  req#20 started | anthropic stream | 26 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:13.079  INFO  throughput | 5.0s | prefill 46.0 tok/s (230 tok) | decode 228.2 tok/s (1,141 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.9% (45.7 ms)
+2026-09-10 15:08:13.223  INFO  req#20 done | anthropic | tool calls 1 | prompt 30,671 | output 295 | cache 30,626 (99.9%, private endpoint) | TTFT 105 ms | total 1.3s | prefill 576.6 tok/s | decode 238.2 tok/s | dflash2 accepted 229/462 (49.6%)
+2026-09-10 15:08:13.252  INFO  req#21 started | anthropic stream | 28 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:14.053  INFO  req#21 done | anthropic | tool calls 1 | prompt 31,006 | output 209 | cache 30,965 (99.9%, private endpoint) | TTFT 105 ms | total 815 ms | prefill 524.8 tok/s | decode 293.0 tok/s | dflash2 accepted 170/266 (63.9%)
+2026-09-10 15:08:14.085  INFO  req#22 started | anthropic stream | 30 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:14.719  INFO  req#22 done | anthropic | tool calls 1 | prompt 31,272 | output 140 | cache 31,214 (99.8%, private endpoint) | TTFT 107 ms | total 648 ms | prefill 730.9 tok/s | decode 256.7 tok/s | dflash2 accepted 110/203 (54.2%)
+2026-09-10 15:08:14.742  INFO  req#23 started | anthropic stream | 33 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:17.153  INFO  req#23 done | anthropic | stop token | prompt 31,655 | output 567 | cache 31,411 (99.2%, private endpoint) | TTFT 155 ms | total 2.4s | prefill 1.93k tok/s | decode 249.3 tok/s | dflash2 accepted 446/847 (52.7%)
+2026-09-10 15:08:18.079  INFO  throughput | 5.0s | prefill 68.6 tok/s (343 tok) | decode 190.8 tok/s (954 tok) | running 0 | batch 1.00 | host 1.1% (52.7 ms)
+2026-09-10 15:08:19.043  INFO  req#24 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:20.730  INFO  req#24 done | anthropic | tool calls 2 | prompt 27,276 | output 183 | cache 22,449 (82.3%, shared prefix) | TTFT 955 ms | total 1.7s | queue 16.2 ms | prefill 5.31k tok/s | decode 244.0 tok/s | dflash2 accepted 143/280 (51.1%)
+2026-09-10 15:08:20.777  INFO  req#25 started | anthropic stream | 6 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:21.287  INFO  req#25 done | anthropic | tool calls 1 | prompt 27,916 | output 90 | cache 27,458 (98.4%, private endpoint) | TTFT 168 ms | total 522 ms | prefill 3.29k tok/s | decode 251.2 tok/s | dflash2 accepted 71/133 (53.4%)
+2026-09-10 15:08:21.307  INFO  req#26 started | anthropic stream | 8 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:22.934  INFO  req#26 done | anthropic | tool calls 2 | prompt 28,449 | output 350 | cache 28,005 (98.4%, private endpoint) | TTFT 142 ms | total 1.6s | prefill 3.91k tok/s | decode 233.0 tok/s | dflash2 accepted 270/560 (48.2%)
+2026-09-10 15:08:22.963  INFO  req#27 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:23.079  INFO  throughput | 5.0s | prefill 1.15k tok/s (5,757 tok) | decode 124.0 tok/s (620 tok) | running 1 (prefill 1) | batch 1.00 | host 4.0% (198 ms)
+2026-09-10 15:08:23.312  INFO  req#27 done | anthropic | tool calls 1 | prompt 28,916 | output 88 | cache 28,798 (99.6%, private endpoint) | TTFT 140 ms | total 363 ms | prefill 1.08k tok/s | decode 389.4 tok/s | dflash2 accepted 75/84 (89.3%)
+2026-09-10 15:08:23.341  INFO  req#28 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:24.364  INFO  req#28 done | anthropic | tool calls 1 | prompt 29,171 | output 263 | cache 29,003 (99.4%, private endpoint) | TTFT 120 ms | total 1.0s | prefill 1.88k tok/s | decode 286.0 tok/s | dflash2 accepted 214/343 (62.4%)
+2026-09-10 15:08:24.403  INFO  req#29 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:25.488  INFO  req#29 done | anthropic | tool calls 1 | prompt 29,478 | output 211 | cache 29,433 (99.8%, private endpoint) | TTFT 106 ms | total 1.1s | prefill 585.4 tok/s | decode 211.9 tok/s | dflash2 accepted 158/371 (42.6%)
+2026-09-10 15:08:25.515  INFO  req#30 started | anthropic stream | 18 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:26.034  INFO  req#30 done | anthropic | tool calls 1 | prompt 29,818 | output 127 | cache 29,688 (99.6%, private endpoint) | TTFT 141 ms | total 533 ms | prefill 1.17k tok/s | decode 321.7 tok/s | dflash2 accepted 106/147 (72.1%)
+2026-09-10 15:08:26.191  INFO  req#31 started | anthropic stream | 20 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:27.645  INFO  req#31 done | anthropic | tool calls 1 | prompt 30,249 | output 300 | cache 29,944 (99.0%, private endpoint) | TTFT 136 ms | total 1.5s | prefill 2.88k tok/s | decode 224.7 tok/s | dflash2 accepted 228/497 (45.9%)
+2026-09-10 15:08:27.681  INFO  req#32 started | anthropic stream | 22 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:28.079  INFO  throughput | 5.0s | prefill 152.6 tok/s (763 tok) | decode 210.6 tok/s (1,053 tok) | running 1 (decode-ready 1) | batch 1.00 | host 2.2% (108 ms)
+2026-09-10 15:08:28.937  INFO  req#32 done | anthropic | tool calls 1 | prompt 30,573 | output 238 | cache 30,548 (99.9%, private endpoint) | TTFT 108 ms | total 1.3s | prefill 326.7 tok/s | decode 203.9 tok/s | dflash2 accepted 176/434 (40.6%)
+2026-09-10 15:08:28.959  INFO  req#33 started | anthropic stream | 24 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:31.589  INFO  req#33 done | anthropic | stop token | prompt 31,002 | output 505 | cache 30,810 (99.4%, private endpoint) | TTFT 123 ms | total 2.6s | prefill 2.08k tok/s | decode 200.0 tok/s | dflash2 accepted 371/938 (39.6%)
+2026-09-10 15:08:33.079  INFO  throughput | 5.0s | prefill 38.4 tok/s (192 tok) | decode 134.4 tok/s (672 tok) | running 0 | batch 1.00 | host 0.5% (27.0 ms)
+2026-09-10 15:08:33.665  INFO  req#34 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:34.684  INFO  req#34 done | anthropic | tool calls 1 | prompt 25,320 | output 99 | cache 22,449 (88.7%, shared prefix) | TTFT 607 ms | total 1.0s | queue 21.1 ms | prefill 5.10k tok/s | decode 229.2 tok/s | dflash2 accepted 75/161 (46.6%)
+2026-09-10 15:08:34.730  INFO  req#35 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:36.216  INFO  req#35 done | anthropic | tool calls 1 | prompt 27,048 | output 277 | cache 25,418 (94.0%, private endpoint) | TTFT 354 ms | total 1.5s | prefill 4.93k tok/s | decode 241.1 tok/s | dflash2 accepted 216/427 (50.6%)
+2026-09-10 15:08:36.242  INFO  req#36 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:38.079  INFO  throughput | 5.0s | prefill 1.05k tok/s (5,264 tok) | decode 137.8 tok/s (689 tok) | running 1 (decode-ready 1) | batch 1.00 | host 3.6% (182 ms)
+2026-09-10 15:08:42.495  INFO  req#36 done | anthropic | tool calls 1 | prompt 28,087 | output 1,226 | cache 27,324 (97.3%, private endpoint) | TTFT 193 ms | total 6.3s | prefill 4.50k tok/s | decode 201.8 tok/s | dflash2 accepted 903/2,261 (39.9%)
+2026-09-10 15:08:42.528  INFO  req#37 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:43.079  INFO  throughput | 5.0s | prefill 38.0 tok/s (190 tok) | decode 202.6 tok/s (1,013 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.5% (27.5 ms)
+2026-09-10 15:08:43.254  INFO  req#37 done | anthropic | tool calls 1 | prompt 29,502 | output 141 | cache 29,312 (99.4%, private endpoint) | TTFT 123 ms | total 740 ms | prefill 2.10k tok/s | decode 226.7 tok/s | dflash2 accepted 108/231 (46.8%)
+2026-09-10 15:08:44.259  INFO  req#38 rejected during prepare | anthropic stream | HTTP 400 | conflicting template option | messages 2
+2026-09-10 15:08:44.278  INFO  req#39 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:46.977  INFO  req#39 done | anthropic | tool calls 1 | prompt 29,672 | output 492 | cache 29,642 (99.9%, private endpoint) | TTFT 102 ms | total 2.7s | prefill 394.5 tok/s | decode 188.2 tok/s | dflash2 accepted 353/973 (36.3%)
+2026-09-10 15:08:47.009  INFO  req#40 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:47.978  INFO  req#40 done | anthropic | tool calls 1 | prompt 30,793 | output 166 | cache 30,163 (98.0%, private endpoint) | TTFT 193 ms | total 983 ms | prefill 3.87k tok/s | decode 208.8 tok/s | dflash2 accepted 124/294 (42.2%)
+2026-09-10 15:08:48.027  INFO  req#41 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:48.079  INFO  throughput | 5.0s | prefill 132.0 tok/s (660 tok) | decode 138.6 tok/s (693 tok) | running 1 (prefill 1) | batch 1.00 | host 1.0% (50.0 ms)
+2026-09-10 15:08:48.753  INFO  req#41 done | anthropic | tool calls 1 | prompt 31,668 | output 159 | cache 30,958 (97.8%, private endpoint) | TTFT 215 ms | total 740 ms | prefill 3.87k tok/s | decode 300.5 tok/s | dflash2 accepted 131/196 (66.8%)
+2026-09-10 15:08:48.786  INFO  req#42 started | anthropic stream | 17 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:49.670  INFO  req#42 done | anthropic | tool calls 1 | prompt 32,656 | output 208 | cache 31,826 (97.5%, private endpoint) | TTFT 227 ms | total 898 ms | prefill 4.22k tok/s | decode 308.5 tok/s | dflash2 accepted 173/245 (70.6%)
+2026-09-10 15:08:49.692  INFO  req#43 started | anthropic stream | 19 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:50.066  INFO  req#43 done | anthropic | tool calls 1 | prompt 32,908 | output 75 | cache 32,863 (99.9%, private endpoint) | TTFT 107 ms | total 388 ms | prefill 559.5 tok/s | decode 263.6 tok/s | dflash2 accepted 60/105 (57.1%)
+2026-09-10 15:08:50.103  INFO  req#44 started | anthropic stream | 22 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:50.801  INFO  req#44 done | anthropic | tool calls 1 | prompt 33,163 | output 175 | cache 32,982 (99.5%, private endpoint) | TTFT 149 ms | total 712 ms | prefill 1.50k tok/s | decode 308.8 tok/s | dflash2 accepted 145/210 (69.0%)
+2026-09-10 15:08:50.830  INFO  req#45 started | anthropic stream | 24 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:52.472  INFO  req#45 done | anthropic | stop token | prompt 33,382 | output 334 | cache 33,337 (99.9%, private endpoint) | TTFT 109 ms | total 1.7s | prefill 557.6 tok/s | decode 215.1 tok/s | dflash2 accepted 252/574 (43.9%)
+2026-09-10 15:08:53.079  INFO  throughput | 5.0s | prefill 362.2 tok/s (1,811 tok) | decode 189.2 tok/s (946 tok) | running 0 | batch 1.00 | host 2.6% (129 ms)
+2026-09-10 15:08:53.729  INFO  req#46 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:54.707  INFO  req#46 done | anthropic | tool calls 1 | prompt 25,282 | output 101 | cache 22,449 (88.8%, shared prefix) | TTFT 600 ms | total 991 ms | queue 15.9 ms | prefill 5.03k tok/s | decode 255.9 tok/s | dflash2 accepted 80/147 (54.4%)
+2026-09-10 15:08:54.750  INFO  req#47 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:55.299  INFO  req#47 done | anthropic | tool calls 1 | prompt 25,495 | output 114 | cache 25,382 (99.6%, private endpoint) | TTFT 95.5 ms | total 561 ms | prefill 1.46k tok/s | decode 242.7 tok/s | dflash2 accepted 89/175 (50.9%)
+2026-09-10 15:08:55.329  INFO  req#48 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:55.884  INFO  req#48 done | anthropic | tool calls 1 | prompt 25,882 | output 121 | cache 25,608 (98.9%, private endpoint) | TTFT 120 ms | total 568 ms | prefill 2.71k tok/s | decode 268.2 tok/s | dflash2 accepted 96/168 (57.1%)
+2026-09-10 15:08:55.908  INFO  req#49 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:57.195  INFO  req#49 done | anthropic | tool calls 1 | prompt 26,492 | output 237 | cache 26,002 (98.2%, private endpoint) | TTFT 159 ms | total 1.3s | prefill 3.54k tok/s | decode 206.8 tok/s | dflash2 accepted 176/427 (41.2%)
+2026-09-10 15:08:57.216  INFO  req#50 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:08:58.079  INFO  throughput | 5.0s | prefill 803.8 tok/s (4,019 tok) | decode 139.8 tok/s (699 tok) | running 1 (decode-ready 1) | batch 1.00 | host 3.6% (180 ms)
+2026-09-10 15:09:03.079  INFO  throughput | 5.0s | decode 210.4 tok/s (1,052 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (4.32 ms)
+2026-09-10 15:09:04.520  INFO  req#50 done | anthropic | tool calls 1 | prompt 27,037 | output 1,521 | cache 26,728 (98.9%, private endpoint) | TTFT 123 ms | total 7.3s | prefill 2.99k tok/s | decode 211.4 tok/s | dflash2 accepted 1,138/2,681 (42.4%)
+2026-09-10 15:09:04.546  INFO  req#51 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:07.652  INFO  req#51 done | anthropic | tool calls 1 | prompt 29,800 | output 581 | cache 28,557 (95.8%, private endpoint) | TTFT 309 ms | total 3.1s | prefill 4.33k tok/s | decode 206.4 tok/s | dflash2 accepted 431/1,043 (41.3%)
+2026-09-10 15:09:07.673  INFO  req#52 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:08.079  INFO  throughput | 5.0s | prefill 269.4 tok/s (1,347 tok) | decode 196.0 tok/s (980 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.3% (67.1 ms)
+2026-09-10 15:09:09.210  INFO  req#52 done | anthropic | tool calls 1 | prompt 30,484 | output 367 | cache 30,380 (99.7%, private endpoint) | TTFT 102 ms | total 1.6s | prefill 1.27k tok/s | decode 252.7 tok/s | dflash2 accepted 290/539 (53.8%)
+2026-09-10 15:09:09.239  INFO  req#53 started | anthropic stream | 17 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:11.582  INFO  req#53 done | anthropic | tool calls 1 | prompt 30,896 | output 500 | cache 30,850 (99.9%, private endpoint) | TTFT 97.4 ms | total 2.4s | prefill 586.9 tok/s | decode 220.9 tok/s | dflash2 accepted 380/840 (45.2%)
+2026-09-10 15:09:11.612  INFO  req#54 started | anthropic stream | 20 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:12.397  INFO  req#54 done | anthropic | tool calls 1 | prompt 31,525 | output 247 | cache 31,395 (99.6%, private endpoint) | TTFT 143 ms | total 800 ms | prefill 1.14k tok/s | decode 374.6 tok/s | dflash2 accepted 212/245 (86.5%)
+2026-09-10 15:09:12.466  INFO  req#55 started | anthropic stream | 22 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:13.079  INFO  throughput | 5.0s | prefill 95.6 tok/s (478 tok) | decode 227.4 tok/s (1,137 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.1% (56.7 ms)
+2026-09-10 15:09:13.566  INFO  req#55 done | anthropic | tool calls 1 | prompt 32,073 | output 190 | cache 31,771 (99.1%, private endpoint) | TTFT 137 ms | total 1.1s | prefill 2.80k tok/s | decode 193.4 tok/s | dflash2 accepted 137/364 (37.6%)
+2026-09-10 15:09:13.593  INFO  req#56 started | anthropic stream | 24 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:15.701  INFO  req#56 done | anthropic | tool calls 1 | prompt 32,290 | output 469 | cache 32,262 (99.9%, private endpoint) | TTFT 106 ms | total 2.1s | prefill 356.2 tok/s | decode 232.2 tok/s | dflash2 accepted 363/749 (48.5%)
+2026-09-10 15:09:15.736  INFO  req#57 started | anthropic stream | 26 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:16.793  INFO  req#57 done | anthropic | tool calls 1 | prompt 32,849 | output 339 | cache 32,758 (99.7%, private endpoint) | TTFT 112 ms | total 1.1s | prefill 1.09k tok/s | decode 352.3 tok/s | dflash2 accepted 289/357 (81.0%)
+2026-09-10 15:09:16.828  INFO  req#58 started | anthropic stream | 28 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:18.079  INFO  throughput | 5.0s | prefill 35.2 tok/s (176 tok) | decode 226.4 tok/s (1,132 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.9% (42.9 ms)
+2026-09-10 15:09:19.450  INFO  req#58 done | anthropic | stop token | prompt 33,244 | output 518 | cache 33,187 (99.8%, private endpoint) | TTFT 110 ms | total 2.6s | prefill 701.1 tok/s | decode 204.6 tok/s | dflash2 accepted 384/938 (40.9%)
+2026-09-10 15:09:20.771  INFO  req#59 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:21.854  INFO  req#59 done | anthropic | tool calls 1 | prompt 25,865 | output 105 | cache 22,449 (86.8%, shared prefix) | TTFT 702 ms | total 1.1s | queue 16.0 ms | prefill 5.14k tok/s | decode 264.0 tok/s | dflash2 accepted 84/147 (57.1%)
+2026-09-10 15:09:21.904  INFO  req#60 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:22.263  INFO  req#60 done | anthropic | tool calls 1 | prompt 26,196 | output 82 | cache 25,969 (99.1%, private endpoint) | TTFT 111 ms | total 372 ms | prefill 2.46k tok/s | decode 311.1 tok/s | dflash2 accepted 67/98 (68.4%)
+2026-09-10 15:09:22.286  INFO  req#61 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:23.079  INFO  throughput | 5.0s | prefill 858.6 tok/s (4,293 tok) | decode 121.4 tok/s (607 tok) | running 1 (decode-ready 1) | batch 1.00 | host 3.2% (161 ms)
+2026-09-10 15:09:23.993  INFO  req#61 done | anthropic | tool calls 1 | prompt 26,927 | output 317 | cache 26,277 (97.6%, private endpoint) | TTFT 182 ms | total 1.7s | prefill 4.04k tok/s | decode 205.5 tok/s | dflash2 accepted 235/574 (40.9%)
+2026-09-10 15:09:24.019  INFO  req#62 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:25.579  INFO  req#62 done | anthropic | tool calls 1 | prompt 27,300 | output 268 | cache 27,243 (99.8%, private endpoint) | TTFT 93.6 ms | total 1.6s | prefill 753.2 tok/s | decode 180.5 tok/s | dflash2 accepted 189/553 (34.2%)
+2026-09-10 15:09:25.611  INFO  req#63 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:26.927  INFO  req#63 done | anthropic | tool calls 1 | prompt 27,625 | output 237 | cache 27,567 (99.8%, private endpoint) | TTFT 94.0 ms | total 1.3s | prefill 764.6 tok/s | decode 191.0 tok/s | dflash2 accepted 171/462 (37.0%)
+2026-09-10 15:09:26.954  INFO  req#64 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:27.907  INFO  req#64 done | anthropic | tool calls 1 | prompt 28,146 | output 248 | cache 27,861 (99.0%, private endpoint) | TTFT 124 ms | total 966 ms | prefill 2.75k tok/s | decode 293.2 tok/s | dflash2 accepted 203/315 (64.4%)
+2026-09-10 15:09:27.934  INFO  req#65 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:28.079  INFO  throughput | 5.0s | prefill 89.4 tok/s (447 tok) | decode 189.8 tok/s (949 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.2% (58.6 ms)
+2026-09-10 15:09:29.554  INFO  req#65 done | anthropic | tool calls 1 | prompt 28,440 | output 379 | cache 28,393 (99.8%, private endpoint) | TTFT 94.9 ms | total 1.6s | prefill 616.7 tok/s | decode 245.8 tok/s | dflash2 accepted 296/574 (51.6%)
+2026-09-10 15:09:29.579  INFO  req#66 started | anthropic stream | 17 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:31.715  INFO  req#66 done | anthropic | tool calls 1 | prompt 28,865 | output 436 | cache 28,818 (99.8%, private endpoint) | TTFT 103 ms | total 2.1s | prefill 614.7 tok/s | decode 212.6 tok/s | dflash2 accepted 327/763 (42.9%)
+2026-09-10 15:09:31.737  INFO  req#67 started | anthropic stream | 19 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:33.079  INFO  throughput | 5.0s | prefill 62.4 tok/s (312 tok) | decode 202.2 tok/s (1,011 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.8% (38.8 ms)
+2026-09-10 15:09:34.978  INFO  req#67 done | anthropic | stop token | prompt 29,565 | output 606 | cache 29,300 (99.1%, private endpoint) | TTFT 132 ms | total 3.3s | prefill 2.54k tok/s | decode 193.8 tok/s | dflash2 accepted 440/1,162 (37.9%)
+2026-09-10 15:09:36.432  INFO  req#68 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:37.417  INFO  req#68 done | anthropic | tool calls 1 | prompt 25,702 | output 90 | cache 22,449 (87.3%, shared prefix) | TTFT 664 ms | total 999 ms | queue 15.9 ms | prefill 5.19k tok/s | decode 265.8 tok/s | dflash2 accepted 72/126 (57.1%)
+2026-09-10 15:09:37.464  INFO  req#69 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:37.785  INFO  req#69 done | anthropic | tool calls 1 | prompt 26,013 | output 75 | cache 25,791 (99.1%, private endpoint) | TTFT 111 ms | total 334 ms | prefill 2.42k tok/s | decode 331.6 tok/s | dflash2 accepted 63/84 (75.0%)
+2026-09-10 15:09:37.809  INFO  req#70 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:38.079  INFO  throughput | 5.0s | prefill 904.0 tok/s (4,520 tok) | decode 111.8 tok/s (559 tok) | running 1 (decode-ready 1) | batch 1.00 | host 3.1% (154 ms)
+2026-09-10 15:09:39.405  INFO  req#70 done | anthropic | tool calls 1 | prompt 27,132 | output 300 | cache 26,087 (96.1%, private endpoint) | TTFT 257 ms | total 1.6s | prefill 4.43k tok/s | decode 221.2 tok/s | dflash2 accepted 228/504 (45.2%)
+2026-09-10 15:09:39.430  INFO  req#71 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:39.977  INFO  req#71 done | anthropic | tool calls 1 | prompt 27,471 | output 163 | cache 27,431 (99.9%, private endpoint) | TTFT 92.7 ms | total 560 ms | prefill 533.6 tok/s | decode 347.0 tok/s | dflash2 accepted 138/175 (78.9%)
+2026-09-10 15:09:40.007  INFO  req#72 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:40.611  INFO  req#72 done | anthropic | tool calls 1 | prompt 27,696 | output 170 | cache 27,633 (99.8%, private endpoint) | TTFT 94.3 ms | total 618 ms | prefill 826.0 tok/s | decode 322.9 tok/s | dflash2 accepted 141/196 (71.9%)
+2026-09-10 15:09:40.635  INFO  req#73 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:41.747  INFO  req#73 done | anthropic | tool calls 1 | prompt 27,906 | output 192 | cache 27,865 (99.9%, private endpoint) | TTFT 93.3 ms | total 1.1s | prefill 544.5 tok/s | decode 185.1 tok/s | dflash2 accepted 137/385 (35.6%)
+2026-09-10 15:09:41.775  INFO  req#74 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:42.459  INFO  req#74 done | anthropic | tool calls 1 | prompt 28,199 | output 152 | cache 28,097 (99.6%, private endpoint) | TTFT 98.7 ms | total 698 ms | prefill 1.28k tok/s | decode 252.2 tok/s | dflash2 accepted 120/224 (53.6%)
+2026-09-10 15:09:42.514  INFO  req#75 started | anthropic stream | 17 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:43.024  INFO  req#75 done | anthropic | tool calls 1 | prompt 28,381 | output 100 | cache 28,350 (99.9%, private endpoint) | TTFT 93.2 ms | total 523 ms | prefill 413.2 tok/s | decode 230.5 tok/s | dflash2 accepted 77/161 (47.8%)
+2026-09-10 15:09:43.063  INFO  req#76 started | anthropic stream | 19 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:43.079  INFO  throughput | 5.0s | prefill 55.4 tok/s (277 tok) | decode 213.8 tok/s (1,069 tok) | running 1 (prefill 1) | batch 1.00 | host 1.2% (60.5 ms)
+2026-09-10 15:09:43.595  INFO  req#76 done | anthropic | tool calls 1 | prompt 28,551 | output 118 | cache 28,480 (99.8%, private endpoint) | TTFT 96.4 ms | total 545 ms | prefill 905.2 tok/s | decode 260.9 tok/s | dflash2 accepted 94/168 (56.0%)
+2026-09-10 15:09:43.621  INFO  req#77 started | anthropic stream | 21 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:09:48.079  INFO  throughput | 5.0s | prefill 322.6 tok/s (1,613 tok) | decode 187.8 tok/s (939 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.6% (78.6 ms)
+2026-09-10 15:09:53.079  INFO  throughput | 5.0s | decode 188.8 tok/s (944 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (3.43 ms)
+2026-09-10 15:09:58.079  INFO  throughput | 5.0s | decode 189.4 tok/s (947 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (4.11 ms)
+2026-09-10 15:10:03.079  INFO  throughput | 5.0s | decode 174.6 tok/s (873 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (3.36 ms)
+2026-09-10 15:10:03.442  INFO  req#77 done | anthropic | tool calls 1 | prompt 30,210 | output 3,661 | cache 28,668 (94.9%, private endpoint) | TTFT 370 ms | total 19.8s | prefill 4.53k tok/s | decode 188.1 tok/s | dflash2 accepted 2,630/7,217 (36.4%)
+2026-09-10 15:10:03.481  INFO  req#78 started | anthropic stream | 24 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:10:04.691  INFO  req#78 done | anthropic | tool calls 1 | prompt 34,197 | output 214 | cache 33,870 (99.0%, private endpoint) | TTFT 168 ms | total 1.2s | prefill 2.37k tok/s | decode 201.7 tok/s | dflash2 accepted 158/392 (40.3%)
+2026-09-10 15:10:06.005  INFO  req#79 rejected during prepare | anthropic stream | HTTP 400 | conflicting template option | messages 2
+2026-09-10 15:10:06.030  INFO  req#80 started | anthropic stream | 26 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:10:06.348  INFO  req#80 done | anthropic | tool calls 1 | prompt 34,440 | output 57 | cache 34,410 (99.9%, private endpoint) | TTFT 112 ms | total 336 ms | prefill 371.3 tok/s | decode 249.9 tok/s | dflash2 accepted 45/84 (53.6%)
+2026-09-10 15:10:06.370  INFO  req#81 started | anthropic stream | 28 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:10:08.079  INFO  throughput | 5.0s | prefill 89.4 tok/s (447 tok) | decode 125.6 tok/s (628 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.2% (62.0 ms)
+2026-09-10 15:10:13.079  INFO  throughput | 5.0s | decode 179.4 tok/s (897 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (3.44 ms)
+2026-09-10 15:10:17.524  INFO  req#81 done | anthropic | tool calls 1 | prompt 34,586 | output 2,028 | cache 34,496 (99.7%, private endpoint) | TTFT 113 ms | total 11.2s | prefill 1.06k tok/s | decode 183.4 tok/s | dflash2 accepted 1,445/4,081 (35.4%)
+2026-09-10 15:10:17.564  INFO  req#82 started | anthropic stream | 30 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:10:18.079  INFO  throughput | 5.0s | prefill 5.0 tok/s (25 tok) | decode 184.2 tok/s (921 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.3% (14.3 ms)
+2026-09-10 15:10:23.079  INFO  throughput | 5.0s | decode 207.4 tok/s (1,037 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (3.40 ms)
+2026-09-10 15:10:28.079  INFO  throughput | 5.0s | decode 220.2 tok/s (1,101 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (3.55 ms)
+2026-09-10 15:10:33.079  INFO  throughput | 5.0s | decode 186.8 tok/s (934 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (3.36 ms)
+2026-09-10 15:10:38.079  INFO  throughput | 5.0s | decode 190.2 tok/s (951 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (3.51 ms)
+2026-09-10 15:10:43.079  INFO  throughput | 5.0s | decode 161.2 tok/s (806 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (3.43 ms)
+2026-09-10 15:10:47.253  INFO  req#82 done | anthropic | tool calls 1 | prompt 36,638 | output 5,659 | cache 36,613 (99.9%, private endpoint) | TTFT 110 ms | total 29.7s | prefill 304.2 tok/s | decode 191.2 tok/s | dflash2 accepted 4,110/10,843 (37.9%)
+2026-09-10 15:10:47.331  INFO  req#83 started | anthropic stream | 32 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:10:48.079  INFO  throughput | 5.0s | prefill 204.8 tok/s (1,024 tok) | decode 150.6 tok/s (753 tok) | running 1 (prefill 1) | batch 1.00 | host 1.4% (69.1 ms)
+2026-09-10 15:10:53.079  INFO  throughput | 5.0s | prefill 3.17k tok/s (15,847 tok) | decode 29.2 tok/s (146 tok) | running 1 (decode-ready 1) | batch 1.00 | host 12.6% (630 ms)
+2026-09-10 15:10:53.679  INFO  req#83 done | anthropic | tool calls 1 | prompt 42,568 | output 274 | cache 25,697 (60.4%, turn closure) | TTFT 4.8s | total 6.4s | queue 36.4 ms | prefill 3.59k tok/s | decode 170.5 tok/s | dflash2 accepted 191/581 (32.9%)
+2026-09-10 15:10:53.810  INFO  req#84 started | anthropic stream | 34 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:10:54.222  INFO  req#84 done | anthropic | tool calls 1 | prompt 42,963 | output 101 | cache 42,841 (99.7%, private endpoint) | TTFT 125 ms | total 429 ms | prefill 1.29k tok/s | decode 329.3 tok/s | dflash2 accepted 85/112 (75.9%)
+2026-09-10 15:10:54.254  INFO  req#85 started | anthropic stream | 36 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:10:56.209  INFO  req#85 done | anthropic | tool calls 1 | prompt 43,347 | output 425 | cache 43,063 (99.3%, private endpoint) | TTFT 151 ms | total 2.0s | prefill 2.41k tok/s | decode 232.7 tok/s | dflash2 accepted 330/665 (49.6%)
+2026-09-10 15:10:56.255  INFO  req#86 started | anthropic stream | 38 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:10:58.079  INFO  throughput | 5.0s | prefill 90.6 tok/s (453 tok) | decode 201.4 tok/s (1,007 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.3% (63.6 ms)
+2026-09-10 15:10:58.566  INFO  req#86 done | anthropic | stop token | prompt 43,818 | output 427 | cache 43,771 (99.9%, private endpoint) | TTFT 122 ms | total 2.3s | prefill 518.2 tok/s | decode 193.0 tok/s | dflash2 accepted 312/805 (38.8%)
+2026-09-10 15:11:00.022  INFO  req#87 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:01.036  INFO  req#87 done | anthropic | tool calls 1 | prompt 25,269 | output 109 | cache 22,449 (88.8%, shared prefix) | TTFT 599 ms | total 1.0s | queue 16.1 ms | prefill 5.02k tok/s | decode 252.1 tok/s | dflash2 accepted 86/161 (53.4%)
+2026-09-10 15:11:01.084  INFO  req#88 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:01.481  INFO  req#88 done | anthropic | tool calls 1 | prompt 25,487 | output 82 | cache 25,377 (99.6%, private endpoint) | TTFT 112 ms | total 410 ms | prefill 1.20k tok/s | decode 272.1 tok/s | dflash2 accepted 65/112 (58.0%)
+2026-09-10 15:11:01.502  INFO  req#89 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:02.314  INFO  req#89 done | anthropic | tool calls 1 | prompt 26,263 | output 134 | cache 25,568 (97.4%, private endpoint) | TTFT 205 ms | total 825 ms | prefill 3.95k tok/s | decode 214.9 tok/s | dflash2 accepted 101/231 (43.7%)
+2026-09-10 15:11:02.338  INFO  req#90 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:02.956  INFO  req#90 done | anthropic | tool calls 1 | prompt 26,692 | output 122 | cache 26,396 (98.9%, private endpoint) | TTFT 144 ms | total 630 ms | prefill 2.53k tok/s | decode 249.1 tok/s | dflash2 accepted 95/182 (52.2%)
+2026-09-10 15:11:02.976  INFO  req#91 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:03.079  INFO  throughput | 5.0s | prefill 784.6 tok/s (3,923 tok) | decode 102.6 tok/s (513 tok) | running 1 (prefill 1) | batch 1.00 | host 3.6% (180 ms)
+2026-09-10 15:11:03.835  INFO  req#91 done | anthropic | tool calls 1 | prompt 27,391 | output 160 | cache 26,813 (97.9%, private endpoint) | TTFT 197 ms | total 871 ms | prefill 3.45k tok/s | decode 236.0 tok/s | dflash2 accepted 124/252 (49.2%)
+2026-09-10 15:11:03.855  INFO  req#92 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:04.884  INFO  req#92 done | anthropic | tool calls 1 | prompt 28,521 | output 229 | cache 27,550 (96.6%, private endpoint) | TTFT 271 ms | total 1.0s | prefill 4.03k tok/s | decode 295.6 tok/s | dflash2 accepted 187/287 (65.2%)
+2026-09-10 15:11:04.914  INFO  req#93 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:05.524  INFO  req#93 done | anthropic | tool calls 1 | prompt 28,797 | output 133 | cache 28,749 (99.8%, private endpoint) | TTFT 117 ms | total 623 ms | prefill 528.8 tok/s | decode 261.3 tok/s | dflash2 accepted 105/189 (55.6%)
+2026-09-10 15:11:05.552  INFO  req#94 started | anthropic stream | 17 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:07.215  INFO  req#94 done | anthropic | tool calls 1 | prompt 29,295 | output 315 | cache 28,929 (98.8%, private endpoint) | TTFT 152 ms | total 1.7s | prefill 2.98k tok/s | decode 206.0 tok/s | dflash2 accepted 233/567 (41.1%)
+2026-09-10 15:11:07.237  INFO  req#95 started | anthropic stream | 20 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:07.858  INFO  req#95 done | anthropic | tool calls 1 | prompt 29,849 | output 130 | cache 29,609 (99.2%, private endpoint) | TTFT 167 ms | total 635 ms | prefill 1.74k tok/s | decode 275.6 tok/s | dflash2 accepted 105/175 (60.0%)
+2026-09-10 15:11:07.888  INFO  req#96 started | anthropic stream | 22 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:08.079  INFO  throughput | 5.0s | prefill 463.0 tok/s (2,315 tok) | decode 195.0 tok/s (975 tok) | running 1 (decode-ready 1) | batch 1.00 | host 3.3% (167 ms)
+2026-09-10 15:11:09.371  INFO  req#96 done | anthropic | stop token | prompt 30,092 | output 242 | cache 29,978 (99.6%, private endpoint) | TTFT 124 ms | total 1.5s | prefill 1.18k tok/s | decode 175.6 tok/s | dflash2 accepted 169/511 (33.1%)
+2026-09-10 15:11:11.510  INFO  req#97 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:12.390  INFO  req#97 done | anthropic | tool calls 1 | prompt 26,069 | output 44 | cache 22,449 (86.1%, shared prefix) | TTFT 745 ms | total 894 ms | queue 16.3 ms | prefill 5.11k tok/s | decode 289.1 tok/s | dflash2 accepted 36/56 (64.3%)
+2026-09-10 15:11:12.416  INFO  req#98 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:13.079  INFO  throughput | 5.0s | prefill 1.25k tok/s (6,261 tok) | decode 60.2 tok/s (301 tok) | running 1 (decode-ready 1) | batch 1.00 | host 3.6% (179 ms)
+2026-09-10 15:11:17.763  INFO  req#98 done | anthropic | tool calls 1 | prompt 28,753 | output 1,036 | cache 26,112 (90.8%, private endpoint) | TTFT 541 ms | total 5.4s | prefill 5.09k tok/s | decode 214.8 tok/s | dflash2 accepted 780/1,792 (43.5%)
+2026-09-10 15:11:17.849  INFO  req#99 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:18.079  INFO  throughput | 5.0s | prefill 31.2 tok/s (156 tok) | decode 206.4 tok/s (1,032 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.5% (25.2 ms)
+2026-09-10 15:11:20.953  INFO  req#99 done | anthropic | tool calls 1 | prompt 29,944 | output 811 | cache 29,788 (99.5%, private endpoint) | TTFT 109 ms | total 3.1s | prefill 1.75k tok/s | decode 269.2 tok/s | dflash2 accepted 651/1,120 (58.1%)
+2026-09-10 15:11:20.997  INFO  req#100 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:22.086  INFO  req#100 done | anthropic | tool calls 1 | prompt 30,801 | output 206 | cache 30,754 (99.8%, private endpoint) | TTFT 109 ms | total 1.1s | prefill 600.5 tok/s | decode 206.1 tok/s | dflash2 accepted 153/371 (41.2%)
+2026-09-10 15:11:22.110  INFO  req#101 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:23.079  INFO  throughput | 5.0s | prefill 145.8 tok/s (729 tok) | decode 225.4 tok/s (1,127 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.1% (56.9 ms)
+2026-09-10 15:11:23.897  INFO  req#101 done | anthropic | stop token | prompt 31,688 | output 341 | cache 31,006 (97.8%, private endpoint) | TTFT 202 ms | total 1.8s | prefill 3.99k tok/s | decode 212.5 tok/s | dflash2 accepted 256/595 (43.0%)
+2026-09-10 15:11:26.037  INFO  req#102 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:27.206  INFO  req#102 done | anthropic | tool calls 1 | prompt 25,874 | output 110 | cache 22,449 (86.8%, shared prefix) | TTFT 699 ms | total 1.2s | queue 16.0 ms | prefill 5.18k tok/s | decode 225.2 tok/s | dflash2 accepted 83/182 (45.6%)
+2026-09-10 15:11:27.254  INFO  req#103 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:27.456  INFO  req#103 done | anthropic | tool calls 1 | prompt 26,006 | output 42 | cache 25,983 (99.9%, private endpoint) | TTFT 84.8 ms | total 215 ms | prefill 354.2 tok/s | decode 315.0 tok/s | dflash2 accepted 35/49 (71.4%)
+2026-09-10 15:11:27.478  INFO  req#104 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:28.079  INFO  throughput | 5.0s | prefill 1.30k tok/s (6,522 tok) | decode 70.2 tok/s (351 tok) | running 1 (prefill 1) | batch 1.00 | host 4.1% (203 ms)
+2026-09-10 15:11:30.036  INFO  req#104 done | anthropic | tool calls 1 | prompt 30,618 | output 374 | cache 26,047 (85.1%, private endpoint) | TTFT 948 ms | total 2.6s | queue 11.4 ms | prefill 4.97k tok/s | decode 229.6 tok/s | dflash2 accepted 288/602 (47.8%)
+2026-09-10 15:11:30.067  INFO  req#105 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:30.376  INFO  req#105 done | anthropic | tool calls 1 | prompt 31,056 | output 72 | cache 30,991 (99.8%, private endpoint) | TTFT 118 ms | total 323 ms | prefill 693.2 tok/s | decode 345.7 tok/s | dflash2 accepted 61/77 (79.2%)
+2026-09-10 15:11:30.398  INFO  req#106 started | anthropic stream | 11 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:33.079  INFO  throughput | 5.0s | prefill 391.0 tok/s (1,955 tok) | decode 201.0 tok/s (1,005 tok) | running 1 (decode-ready 1) | batch 1.00 | host 2.0% (99.9 ms)
+2026-09-10 15:11:33.769  INFO  req#106 done | anthropic | tool calls 1 | prompt 31,520 | output 763 | cache 31,127 (98.8%, private endpoint) | TTFT 160 ms | total 3.4s | prefill 3.05k tok/s | decode 236.3 tok/s | dflash2 accepted 592/1,197 (49.5%)
+2026-09-10 15:11:33.827  INFO  req#107 started | anthropic stream | 13 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:37.592  INFO  req#107 done | anthropic | tool calls 1 | prompt 32,321 | output 802 | cache 32,282 (99.9%, private endpoint) | TTFT 121 ms | total 3.8s | prefill 416.5 tok/s | decode 219.0 tok/s | dflash2 accepted 608/1,358 (44.8%)
+2026-09-10 15:11:37.648  INFO  req#108 started | anthropic stream | 15 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:38.079  INFO  throughput | 5.0s | prefill 37.0 tok/s (185 tok) | decode 216.8 tok/s (1,084 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.8% (40.9 ms)
+2026-09-10 15:11:43.079  INFO  throughput | 5.0s | decode 181.6 tok/s (908 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.1% (4.04 ms)
+2026-09-10 15:11:46.294  INFO  req#108 done | anthropic | tool calls 1 | prompt 33,268 | output 1,667 | cache 33,122 (99.6%, private endpoint) | TTFT 135 ms | total 8.7s | prefill 1.37k tok/s | decode 195.5 tok/s | dflash2 accepted 1,216/3,157 (38.5%)
+2026-09-10 15:11:46.342  INFO  req#109 started | anthropic stream | 17 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:48.079  INFO  throughput | 5.0s | prefill 1.23k tok/s (6,144 tok) | decode 135.2 tok/s (676 tok) | running 1 (prefill 1) | batch 1.00 | host 4.4% (222 ms)
+2026-09-10 15:11:53.079  INFO  throughput | 5.0s | prefill 591.2 tok/s (2,956 tok) | decode 171.0 tok/s (855 tok) | running 1 (decode-ready 1) | batch 1.00 | host 2.9% (143 ms)
+2026-09-10 15:11:55.770  INFO  req#109 done | anthropic | tool calls 1 | prompt 34,969 | output 1,549 | cache 25,869 (74.0%, turn closure) | TTFT 2.4s | total 9.4s | queue 21.1 ms | prefill 3.81k tok/s | decode 220.8 tok/s | dflash2 accepted 1,180/2,583 (45.7%)
+2026-09-10 15:11:55.823  INFO  req#110 started | anthropic stream | 20 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:57.341  INFO  req#110 done | anthropic | tool calls 1 | prompt 36,653 | output 290 | cache 36,517 (99.6%, private endpoint) | TTFT 168 ms | total 1.5s | prefill 983.1 tok/s | decode 211.8 tok/s | dflash2 accepted 218/504 (43.3%)
+2026-09-10 15:11:57.376  INFO  req#111 started | anthropic stream | 22 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:58.079  INFO  throughput | 5.0s | prefill 33.8 tok/s (169 tok) | decode 220.0 tok/s (1,100 tok) | running 1 (decode-ready 1) | batch 1.00 | host 0.7% (36.6 ms)
+2026-09-10 15:11:58.130  INFO  req#111 done | anthropic | tool calls 1 | prompt 36,975 | output 133 | cache 36,942 (99.9%, private endpoint) | TTFT 127 ms | total 770 ms | prefill 336.9 tok/s | decode 205.4 tok/s | dflash2 accepted 99/238 (41.6%)
+2026-09-10 15:11:58.181  INFO  req#112 started | anthropic stream | 24 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:58.798  INFO  req#112 done | anthropic | tool calls 1 | prompt 37,250 | output 113 | cache 37,107 (99.6%, private endpoint) | TTFT 142 ms | total 633 ms | prefill 1.30k tok/s | decode 228.1 tok/s | dflash2 accepted 87/182 (47.8%)
+2026-09-10 15:11:58.828  INFO  req#113 started | anthropic stream | 26 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:11:59.697  INFO  req#113 done | anthropic | tool calls 1 | prompt 37,395 | output 164 | cache 37,362 (99.9%, private endpoint) | TTFT 128 ms | total 885 ms | prefill 335.7 tok/s | decode 215.4 tok/s | dflash2 accepted 124/280 (44.3%)
+2026-09-10 15:11:59.740  INFO  req#114 started | anthropic stream | 28 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:00.063  INFO  req#114 done | anthropic | tool calls 1 | prompt 37,575 | output 73 | cache 37,558 (100.0%, private endpoint) | TTFT 94.2 ms | total 339 ms | prefill 263.2 tok/s | decode 294.2 tok/s | dflash2 accepted 60/91 (65.9%)
+2026-09-10 15:12:00.098  INFO  req#115 started | anthropic stream | 30 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:03.079  INFO  throughput | 5.0s | prefill 96.8 tok/s (484 tok) | decode 196.8 tok/s (984 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.7% (84.1 ms)
+2026-09-10 15:12:03.743  INFO  req#115 done | anthropic | stop token | prompt 37,938 | output 722 | cache 37,647 (99.2%, private endpoint) | TTFT 160 ms | total 3.7s | prefill 2.28k tok/s | decode 206.0 tok/s | dflash2 accepted 538/1,288 (41.8%)
+2026-09-10 15:12:05.634  INFO  req#116 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:07.223  INFO  req#116 done | anthropic | tool calls 2 | prompt 26,354 | output 233 | cache 22,449 (85.2%, shared prefix) | TTFT 781 ms | total 1.6s | queue 16.1 ms | prefill 5.26k tok/s | decode 282.4 tok/s | dflash2 accepted 189/308 (61.4%)
+2026-09-10 15:12:07.271  INFO  req#117 started | anthropic stream | 6 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:08.079  INFO  throughput | 5.0s | prefill 929.2 tok/s (4,646 tok) | decode 92.6 tok/s (463 tok) | running 1 (decode-ready 1) | batch 1.00 | host 3.0% (150 ms)
+2026-09-10 15:12:09.047  INFO  req#117 done | anthropic | tool calls 1 | prompt 27,327 | output 376 | cache 26,586 (97.3%, private endpoint) | TTFT 216 ms | total 1.8s | prefill 3.81k tok/s | decode 238.4 tok/s | dflash2 accepted 292/588 (49.7%)
+2026-09-10 15:12:09.069  INFO  req#118 started | anthropic stream | 8 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:09.717  INFO  req#118 done | anthropic | tool calls 1 | prompt 27,883 | output 193 | cache 27,702 (99.4%, private endpoint) | TTFT 119 ms | total 661 ms | prefill 2.04k tok/s | decode 354.7 tok/s | dflash2 accepted 164/203 (80.8%)
+2026-09-10 15:12:09.762  INFO  req#119 started | anthropic stream | 10 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:11.068  INFO  req#119 done | anthropic | tool calls 1 | prompt 28,122 | output 260 | cache 28,075 (99.8%, private endpoint) | TTFT 102 ms | total 1.3s | prefill 621.0 tok/s | decode 212.9 tok/s | dflash2 accepted 195/455 (42.9%)
+2026-09-10 15:12:11.095  INFO  req#120 started | anthropic stream | 12 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:12.645  INFO  req#120 done | anthropic | tool calls 1 | prompt 28,419 | output 307 | cache 28,381 (99.9%, private endpoint) | TTFT 102 ms | total 1.6s | prefill 503.0 tok/s | decode 209.4 tok/s | dflash2 accepted 229/546 (41.9%)
+2026-09-10 15:12:12.676  INFO  req#121 started | anthropic stream | 14 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:13.079  INFO  throughput | 5.0s | prefill 61.4 tok/s (307 tok) | decode 220.2 tok/s (1,101 tok) | running 1 (decode-ready 1) | batch 1.00 | host 1.2% (59.6 ms)
+2026-09-10 15:12:13.175  INFO  req#121 done | anthropic | tool calls 1 | prompt 28,766 | output 133 | cache 28,725 (99.9%, private endpoint) | TTFT 103 ms | total 513 ms | prefill 539.4 tok/s | decode 321.6 tok/s | dflash2 accepted 111/154 (72.1%)
+2026-09-10 15:12:13.206  INFO  req#122 started | anthropic stream | 17 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:13.890  INFO  req#122 done | anthropic | tool calls 1 | prompt 29,041 | output 161 | cache 28,898 (99.5%, private endpoint) | TTFT 138 ms | total 698 ms | prefill 1.29k tok/s | decode 285.6 tok/s | dflash2 accepted 132/210 (62.9%)
+2026-09-10 15:12:13.930  INFO  req#123 started | anthropic stream | 19 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:15.072  INFO  req#123 done | anthropic | tool calls 1 | prompt 29,284 | output 255 | cache 29,201 (99.7%, private endpoint) | TTFT 107 ms | total 1.2s | prefill 1.04k tok/s | decode 242.1 tok/s | dflash2 accepted 198/392 (50.5%)
+2026-09-10 15:12:15.106  INFO  req#124 started | anthropic stream | 21 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:17.129  INFO  req#124 done | anthropic | stop token | prompt 29,571 | output 421 | cache 29,538 (99.9%, private endpoint) | TTFT 103 ms | total 2.0s | prefill 433.0 tok/s | decode 217.2 tok/s | dflash2 accepted 318/721 (44.1%)
+2026-09-10 15:12:18.079  INFO  throughput | 5.0s | prefill 51.8 tok/s (259 tok) | decode 172.8 tok/s (864 tok) | running 0 | batch 1.00 | host 0.9% (47.0 ms)
+2026-09-10 15:12:18.622  INFO  req#125 started | anthropic stream | 3 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:19.348  INFO  req#125 done | anthropic | tool calls 1 | prompt 25,398 | output 50 | cache 22,449 (88.4%, shared prefix) | TTFT 608 ms | total 739 ms | queue 16.2 ms | prefill 5.16k tok/s | decode 376.6 tok/s | dflash2 accepted 43/49 (87.8%)
+2026-09-10 15:12:19.371  INFO  req#126 started | anthropic stream | 5 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:20.742  INFO  req#126 done | anthropic | tool calls 1 | prompt 26,643 | output 291 | cache 25,447 (95.5%, private endpoint) | TTFT 298 ms | total 1.4s | prefill 4.34k tok/s | decode 267.3 tok/s | dflash2 accepted 232/406 (57.1%)
+2026-09-10 15:12:20.769  INFO  req#127 started | anthropic stream | 7 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:21.537  INFO  req#127 done | anthropic | tool calls 1 | prompt 26,981 | output 174 | cache 26,933 (99.8%, private endpoint) | TTFT 109 ms | total 781 ms | prefill 538.5 tok/s | decode 257.4 tok/s | dflash2 accepted 137/252 (54.4%)
+2026-09-10 15:12:21.580  INFO  req#128 started | anthropic stream | 9 messages | max output 64,000 | thinking medium | tools 28
+2026-09-10 15:12:22.572  INFO  req#128 done | anthropic | stop token | prompt 27,185 | output 185 | cache 27,154 (99.9%, private endpoint) | TTFT 108 ms | total 1.0s | prefill 351.3 tok/s | decode 205.1 tok/s | dflash2 accepted 137/336 (40.8%)
+2026-09-10 15:12:23.079  INFO  throughput | 5.0s | prefill 844.8 tok/s (4,224 tok) | decode 139.2 tok/s (696 tok) | running 0 | batch 1.00 | host 3.2% (162 ms)

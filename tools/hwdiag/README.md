@@ -26,9 +26,11 @@ memory entry.
     nvcc -O2 -arch=sm_120 -Xcompiler -mavx2 -o hot hot.cu    # cache-hot vs non-temporal staging
     nvcc -O2 -arch=sm_120 -Xcompiler -mavx2 -Xcompiler -mclflushopt -o hot3 hot3.cu  # per-CCD + flushed
     nvcc -O2 -arch=sm_120 -o addr  addr.cu               # same data -> two device regions
-    g++  -O2 -o hostscan hostscan.cpp                    # host DRAM only, no GPU
     g++  -O2 -std=c++17 -I llama.cpp/include -I llama.cpp/ggml/include \
          llama_load_readback.cpp -o llcheck -lllama -lggml -lggml-base
+
+(The host-DRAM-only scan and the `hot4` arm runner referenced below were
+never committed; only the six sources above are in this directory.)
 
 `Q27_WSUM_LOCATE=1` (with `Q27_PRINT_WSUM=1`) does the same for q27's own
 loader, per tensor.

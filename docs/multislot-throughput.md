@@ -31,8 +31,11 @@ aggregate (90.9% graph-cache hits). ON by default since v0.2.0
 (`Q27_BATCH=0` restores FIFO time-slicing; `Q27_BATCH_GRAPH=0` keeps
 batching but drops graph replay; `Q27_PROFILE=ref` = conservative
 reference). Serving shapes of record for CC traffic: fp8 2x48K, turbo3
-2x96K (the w16 build caps at 2x32K on 32 GB). One edge: `--slots N` does
-not auto-size `--ctx` -- pass the window you want per slot.
+2x96K (the w16 build caps at 2x32K on 32 GB). One edge (v0.2.0): `--slots N`
+did not auto-size `--ctx`. Superseded by elastic windows (v0.11.2): with
+`--slots N` and no `--ctx`, every slot may use the whole shared KV pool and
+admission arbitrates; an explicit `--ctx` now also propagates to slots 1+
+unless `--slot1-ctx` is given (`server.cu`).
 
 Per-stream trade: each concurrent stream runs at ~63% of its solo rate
 while the box produces ~41% more total tokens. Bursty agentic traffic

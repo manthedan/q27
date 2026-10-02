@@ -1,7 +1,9 @@
 # Request recording + sequential replay (2026-09-08, item 2 of the (p) agenda)
 
-q27 samples with seed 0 when the client sends none (Claude Code never does),
-so a turn's output is deterministic per prompt AND per preceding sequence:
+q27 samples with seed 0 when the client sends none (Claude Code never does;
+`Q27_SEED=N` moves that base, and `Q27_SEED=random` draws a fresh seed per
+seedless request, which defeats replay -- leave it unset or fixed on both
+arms), so a turn's output is deterministic per prompt AND per preceding sequence:
 the DFlash2 drafter ring and every prefix-cache tier are history-dependent,
 and the same prompt after a different history draws different tokens
 (BUILDLOG (s): the same instance re-run through the harness produced a
