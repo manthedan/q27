@@ -12,7 +12,7 @@ sudo -n systemctl stop vox-transcriber vox-transcriber-gmrs; sleep 3
 b3=$(nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid --format=csv,noheader | grep GPU-5a723c5e || true)
 [ -n "$b3" ] && { log "3090 busy: $b3"; sudo -n systemctl start vox-transcriber vox-transcriber-gmrs; exit 3; }
 systemctl --user reset-failed bz-hog 2>/dev/null
-systemd-run --user --unit bz-hog -E CUDA_VISIBLE_DEVICES=1 -p StandardOutput=file:$S/hog.log -p StandardError=file:$S/hog.log python3 $M/bench/bonsai2/vram_hog.py $HOG cuda:0
+systemd-run --user --unit bz-hog -E CUDA_VISIBLE_DEVICES=1 -p StandardOutput=truncate:$S/hog.log -p StandardError=truncate:$S/hog.log python3 $M/bench/bonsai2/vram_hog.py $HOG cuda:0
 for i in $(seq 1 30); do grep -q "hog: holding" $S/hog.log 2>/dev/null && break; sleep 1; done; cat $S/hog.log
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader | sed -n 1p
 run_leg() { # $1 label, rest = -E envs

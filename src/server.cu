@@ -715,6 +715,12 @@ int main(int argc, char** argv) {
     // slack". With the arena on, no engine allocates that scratch at all --
     // it is one real allocation deducted from measured free VRAM below -- so
     // what remains in the per-slot stack is the slack alone.
+    // Per-slot pad on top of the fixed stack, and the pool-sizing slack: one
+    // source for the projection, the pool floor and the build-loop skip checks
+    // (2026-10-01: the skip checks still added 256 MB under Q27_FIXED_STACK_GB,
+    // so the last projected slot could be skipped with its pool share unused).
+    const size_t kSlotPad = fixed_env > 0 ? 0 : (256ull << 20);
+    const double kPoolSlackFixed = 0.15e9;
     const size_t ENG_FIXED_BYTES = fixed_env > 0
         ? (size_t)fixed_env // the measured stack, exactly (see Q27_FIXED_STACK_GB above)
         : (size_t)(kEngBase + kEngGraphs + kEngGdn +
@@ -1061,10 +1067,11 @@ int main(int argc, char** argv) {
             if (const char* r = getenv("Q27_DFLASH2_RESERVE_GB")) d2_reserve = atof(r) * 1e9;
         }
         const double per_extra = (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
-                                 (double)(256ull << 20) + d2_reserve;
+                                 (double)kSlotPad + d2_reserve;
+        const double fit_slack = fixed_env > 0 ? kPoolSlackFixed : 0.25e9;
         int fit_slots = 1;
-        if ((double)freeb > (double)ENG_FIXED_BYTES + 0.25e9 + d2_reserve)
-            fit_slots = 1 + (int)(((double)freeb - (double)ENG_FIXED_BYTES - 0.25e9 - d2_reserve) /
+        if ((double)freeb > (double)ENG_FIXED_BYTES + fit_slack + d2_reserve)
+            fit_slots = 1 + (int)(((double)freeb - (double)ENG_FIXED_BYTES - fit_slack - d2_reserve) /
                                   per_extra);
         if (fit_slots < n_slots) {
             fprintf(stderr, "[pool] clamping projected slots %d -> %d (fixed stacks)\n",
@@ -1099,8 +1106,8 @@ int main(int argc, char** argv) {
         // the pool is allocated BEFORE any capture and would otherwise eat it.
         // Q27_FIXED_STACK_GB: the operator measured the stack, so the slack is
         // the 0.15 GB the auto-ctx block uses and the per-slot 256 MB is gone.
-        const double pool_slack = fixed_env > 0 ? 0.15e9 : cc_arch >= 120 ? 0.25e9 : 1.0e9;
-        const double per_slot_pad = fixed_env > 0 ? 0.0 : (double)(256ull << 20);
+        const double pool_slack = fixed_env > 0 ? kPoolSlackFixed : cc_arch >= 120 ? 0.25e9 : 1.0e9;
+        const double per_slot_pad = (double)kSlotPad;
         auto fixed_for = [&](int ns) {
             return (double)ENG_FIXED_BYTES +
                    (double)(ns - 1) * (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
@@ -1288,7 +1295,7 @@ int main(int argc, char** argv) {
             // skipped slots just leave more headroom).
             size_t freeb = 0, totalb = 0;
             cudaMemGetInfo(&freeb, &totalb);
-            size_t need = ENG_FIXED_BYTES - (size_t)kEngBase + (256ull << 20);
+            size_t need = ENG_FIXED_BYTES - (size_t)kEngBase + kSlotPad;
             if (freeb < need) {
                 fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB fixed stack\n",
                         si, freeb / 1e9, need / 1e9);
@@ -1317,8 +1324,7 @@ int main(int argc, char** argv) {
             // slot 0 already paid it; charging it per slot skipped slots
             // that fit (phase-3 audit: measured slot cost ~5.6 GB vs the
             // 8.2 this printed on 08-14).
-            size_t need = ENG_FIXED_BYTES - (size_t)kEngBase + kvb + (kvb >> 3) +
-                          (256ull << 20);
+            size_t need = ENG_FIXED_BYTES - (size_t)kEngBase + kvb + (kvb >> 3) + kSlotPad;
             if (freeb < need) {
                 fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB needed\n", si,
                         freeb / 1e9, need / 1e9);

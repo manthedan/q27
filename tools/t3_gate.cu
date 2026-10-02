@@ -12,6 +12,7 @@
 // would show the extraction as exposed.
 //
 //   build/t3_gate <t2pack> <t3pack> [--layers N] [--bench] [--only blk.0.]
+//   build/t3_gate --synthetic   (random matrices at off-model shapes, no packs needed)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,7 +60,87 @@ static size_t diff_rows(const float* da, const float* db, int64_t n, int64_t* fi
     return nd;
 }
 
+// --synthetic: random ternary matrices at shapes the model never uses (tail
+// windows of 3 and 4 chunks per lane, single-group rows, rows not a multiple
+// of the 8-row block), built host-side in BOTH file layouts from the same
+// trits, uploaded through the same device paths the loader uses
+// (t2_interleave_device / t3_relayout_device), and held to the same bitwise
+// contract as the pack gate: gemv w1/2/5/8 and the T3->T2 conversion.
+static int synthetic() {
+    const int rows_set[] = {1, 3, 8, 9, 33, 130};
+    const int cols_set[] = {128, 256, 384, 640, 1024, 1152, 2176, 3072, 4096, 4224, 4992, 5120, 5248, 6144, 6272, 7296, 9344, 10240, 17408, 20608};
+    std::mt19937 rng(7);
+    int fails = 0, cases = 0;
+    const int NB = 8;
+    for (int cols : cols_set) for (int rows : rows_set) {
+        cases++;
+        const size_t n = (size_t)rows * cols;
+        std::vector<uint8_t> code(n);
+        for (auto& c : code) c = (uint8_t)(rng() % 3);
+        std::vector<uint8_t> t2((size_t)rows * cols / 4, 0), t3((size_t)rows * (cols / 128) * 26, 0);
+        for (size_t i = 0; i < n; i++) t2[i / 4] |= (uint8_t)(code[i] << ((i % 4) * 2));
+        for (int r = 0; r < rows; r++)
+            for (int g = 0; g < cols / 128; g++)
+                for (int b = 0; b < 26; b++) {
+                    int v = 0, pw = 1;
+                    for (int k = 0; k < 5; k++, pw *= 3) {
+                        const int j = 5 * b + k;
+                        v += (j < 128 ? code[(size_t)r * cols + g * 128 + j] : 1) * pw;
+                    }
+                    t3[((size_t)r * (cols / 128) + g) * 26 + b] = (uint8_t)v;
+                }
+        std::vector<__half> sc((size_t)rows * (cols / 128));
+        for (auto& x : sc) x = __float2half(0.001f + (rng() % 1000) * 1e-5f);
+        uint8_t *d2, *d3raw, *d3, *conv; __half* ds;
+        const uint64_t b3 = q27k::t3_device_bytes(rows, cols);
+        CUDA_CHECK(cudaMalloc(&d2, t2.size())); CUDA_CHECK(cudaMalloc(&d3raw, t3.size()));
+        CUDA_CHECK(cudaMalloc(&d3, b3)); CUDA_CHECK(cudaMalloc(&conv, t2.size()));
+        CUDA_CHECK(cudaMalloc(&ds, sc.size() * 2));
+        CUDA_CHECK(cudaMemcpy(d2, t2.data(), t2.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d3raw, t3.data(), t3.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ds, sc.data(), sc.size() * 2, cudaMemcpyHostToDevice));
+        q27k::t2_interleave_device(d2, t2.size());
+        q27k::t3_relayout_device(d3raw, d3, rows, cols);
+        CUDA_CHECK(cudaMemset(conv, 0xEE, t2.size()));
+        q27k::t3_to_t2_device(d3, conv, rows, cols);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<uint8_t> ha(t2.size()), hb(t2.size());
+        CUDA_CHECK(cudaMemcpy(ha.data(), d2, t2.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hb.data(), conv, t2.size(), cudaMemcpyDeviceToHost));
+        bool ok = ha == hb;
+        q27k::XQuant xq[NB];
+        float* d_x; CUDA_CHECK(cudaMalloc(&d_x, cols * 4));
+        for (int k = 0; k < NB; k++) {
+            std::vector<float> x = rand_vec(cols, 100u + k + (uint32_t)cols);
+            CUDA_CHECK(cudaMemcpy(d_x, x.data(), cols * 4, cudaMemcpyHostToDevice));
+            xq[k] = q27k::xquant_alloc(cols); q27k::quantize_x(d_x, cols, xq[k]);
+        }
+        float *ya, *yb; CUDA_CHECK(cudaMalloc(&ya, (size_t)NB * rows * 4)); CUDA_CHECK(cudaMalloc(&yb, (size_t)NB * rows * 4));
+        int64_t first;
+        q27k::gemv_t2(d2, ds, xq[0], ya, rows, cols); q27k::gemv_t3(d3, ds, xq[0], yb, rows, cols);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        bool g1 = diff_rows(ya, yb, rows, &first) == 0;
+        bool gn = true;
+        for (int nb : {2, 5, 8}) {
+            float* yas[NB]; float* ybs[NB];
+            for (int k = 0; k < NB; k++) { yas[k] = ya + (size_t)k * rows; ybs[k] = yb + (size_t)k * rows; }
+            q27k::gemv_t2_n(d2, ds, xq, nb, yas, rows, cols); q27k::gemv_t3_n(d3, ds, xq, nb, ybs, rows, cols);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            for (int k = 0; k < nb; k++) gn &= diff_rows(yas[k], ybs[k], rows, &first) == 0;
+        }
+        if (!(ok && g1 && gn)) {
+            fails++;
+            printf("synthetic rows=%d cols=%d: conv=%s gemv=%s gemv_n=%s  FAIL\n", rows, cols, ok ? "ok" : "DIFF", g1 ? "ok" : "DIFF", gn ? "ok" : "DIFF");
+        }
+        for (int k = 0; k < NB; k++) xq_free(xq[k]);
+        cudaFree(d_x); cudaFree(ya); cudaFree(yb); cudaFree(d2); cudaFree(d3raw); cudaFree(d3); cudaFree(conv); cudaFree(ds);
+    }
+    printf("t3_gate --synthetic: %d shapes, %d FAIL%s\n", cases, fails, fails ? "" : " -- bitwise at every shape");
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--synthetic")) return synthetic();
     if (argc < 3) {
         fprintf(stderr, "usage: %s <t2pack> <t3pack> [--layers N] [--bench] [--only prefix]\n", argv[0]);
         return 2;

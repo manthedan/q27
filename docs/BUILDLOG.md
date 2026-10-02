@@ -15714,6 +15714,44 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-01 (az): bug hunt over v0.13.0..HEAD -- a silent T3 GEMV error on unused widths, the CLI DFlash2 map::at, an estimator mismatch
+
+Two tracks over the ~800 src lines since v0.13.0: dynamic (compute-sanitizer
+and a new shape fuzz) and an independent read-only review of the diff.
+
+- **gemv_t3 / gemv_t3_n dropped a chunk at five-chunk tail windows**
+  (cols % 5120 in 4224..4992, e.g. 4224, 4992, 9344): the tail switch had cases
+  1-3 and sent everything else to the 4-chunk instantiation, while the relayout
+  and the T3->T2 conversion correctly carry five. Silent wrong decode (prefill
+  right, through the conversion). Latent: Bonsai's shapes (5120/6144/17408) make
+  tails of 0, 1 and 2 chunks per lane. Found by the review; reproduced by the
+  new `t3_gate --synthetic` (random ternary matrices at off-model shapes, both
+  file layouts from the same trits, the loader's own upload paths): 18 of 120
+  shapes failed, all at those widths. Fixed (`case 4` + `default: <5>` in both
+  kernels); 120/120 bitwise on the 3090 and the 5090, the 400-matrix pack gate
+  unchanged.
+- **CLI `--dflash2` died with map::at on serving packs**, a trap noted on
+  09-18 and never explained: `Dflash2::alloc()` builds the mask-token row from
+  the engine embedding when one is set, else from the pack's fp16
+  target.embed, which serving packs drop; the CLI called alloc() before
+  set_engine_embed (the server orders it right). Moved; the CLI DFlash2 run on
+  the T3 pack now matches plain decode (k=1, md5 e8a16115).
+- **Q27_FIXED_STACK_GB: the slot-skip checks still charged 256 MB per slot**
+  while the pool sizing no longer reserved it, so the last projected slot
+  could be skipped with its pool share unused. One `kSlotPad` /
+  `kPoolSlackFixed` now feeds the projection, the pool floor and both skip
+  checks; without the env every site computes what it did before.
+- repack refuses `--slim` with `--bonsai2-container q4x` (it would emit Q4
+  embeddings the CUDA loader rejects at boot).
+- Harness: gate12g's hog log was appended, so its "hog: holding" wait could
+  match the previous run's line and start a leg on the full card; truncated now.
+
+Clean: compute-sanitizer memcheck (+leak), initcheck, racecheck and synccheck
+over every T3 kernel at all 84 (now 120) fuzz shapes, 0 errors; the pack gate
+and fuzz on sm_120 too (every earlier T3 gate was sm_86). Perf note, not a
+bug: on sm_86 gemv_t3_n spills 12-24 B at widths 4-8 (the MTP ladder's verify
+widths on 3060-class cards), where gemv_t2_n is clean.
+
 ## 2026-09-27 (ay): llama.cpp's n-gram drafting ideas, replayed on our traffic -- only the index rebuild was worth taking
 
 Prompted by jadidbourbaki's prompt-lookup post (llama.cpp's n-gram drafter,

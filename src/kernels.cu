@@ -997,7 +997,11 @@ __global__ void k_gemv_t3(const uint8_t* __restrict__ W, const __half* __restric
             case 1: t3_unit_acc<1, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
             case 2: t3_unit_acc<2, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
             case 3: t3_unit_acc<3, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
-            default: t3_unit_acc<4, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            case 4: t3_unit_acc<4, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            // ni == 5: a tail of 129..159 chunks (cols % 5120 in 4224..4992) -- the
+            // relayout and the T2 conversion carry five chunks per unit here; until
+            // 2026-10-01 this fell to <4> and dropped the fifth (t3_gate --synthetic)
+            default: t3_unit_acc<5, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
         }
     }
     acc = warp_reduce(acc);
@@ -1064,7 +1068,8 @@ __global__ void __launch_bounds__(256, N < 3 ? 4 : N < Q27_GEMV_3CTA_MIN_Q4 ? 3 
             case 1: t3_unit_acc_n<N, 1, true>(acc, w, ch0, n_chunks, sr, L); break;
             case 2: t3_unit_acc_n<N, 2, true>(acc, w, ch0, n_chunks, sr, L); break;
             case 3: t3_unit_acc_n<N, 3, true>(acc, w, ch0, n_chunks, sr, L); break;
-            default: t3_unit_acc_n<N, 4, true>(acc, w, ch0, n_chunks, sr, L); break;
+            case 4: t3_unit_acc_n<N, 4, true>(acc, w, ch0, n_chunks, sr, L); break;
+            default: t3_unit_acc_n<N, 5, true>(acc, w, ch0, n_chunks, sr, L); break; // ni == 5 (see k_gemv_t3)
         }
     }
 #pragma unroll

@@ -905,6 +905,9 @@ def main():
                          "error variance to scale quantization; use it to price the shipped "
                          "sidecars, not to answer whether fp4 weights are viable")
     args = ap.parse_args()
+    if args.slim and args.bonsai2_container == "q4x":
+        ap.error("--slim stores token_embd/output as T2_G128; it needs a t2/t3 container "
+                 "(q4x would emit Q4 embeddings the CUDA loader rejects)")
     global Q8_EXTRA, Q4_HEAD, PF4, FP4_ROUND
     if args.q8:
         Q8_EXTRA = re.compile(args.q8)
