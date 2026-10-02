@@ -2947,8 +2947,9 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
                                             uint32_t scale_off, BackendBuffer* aux) {
     if (!kv_heads || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: invalid KV attribution store");
-    if (mode != 1 && mode != 2 && mode != 3 && mode != 4)
-        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K), 2 (V), 3 (except-mask), or 4 (e4m3 both sides)");
+    if (mode < 1 || mode > 7)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 1 (K), 2 (V), 3 (except-mask), "
+                                 "4 (e4m3), 5 (int8/32) or 6 (int8/128)");
     if (mode == 3) {
         // Exception mode: head carries the per-layer (head, side) bitmask
         // (bit = head*2 + side); flags modifiers are side-arm-only.
@@ -2956,10 +2957,10 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
             throw std::runtime_error("q27 Metal: KV exception mask out of range");
         if (flags)
             throw std::runtime_error("q27 Metal: KV exception mode takes no round-trip flags");
-    } else if (mode == 4) {
-        // fp8 control arm: head is ignored, no turbo3 scale to modify.
+    } else if (mode >= 4) {
+        // fp8 / int8 control arms: head is ignored, no turbo3 scale to modify.
         if (flags)
-            throw std::runtime_error("q27 Metal: KV e4m3 mode takes no round-trip flags");
+            throw std::runtime_error("q27 Metal: KV e4m3/int8 modes take no round-trip flags");
     } else if (head != UINT32_MAX && head >= kv_heads)
         throw std::runtime_error("q27 Metal: KV attribution head out of range");
     if (flags & ~7u)

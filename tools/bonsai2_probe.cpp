@@ -70,6 +70,10 @@ int main(int argc,char** argv) {
         if(chunked && !engine.chunked_prefill())
             throw std::runtime_error("Q27_PROBE_PREFILL=chunk: this pack has no chunked prefill");
         if(!chunked && engine.chunked_prefill()) engine.set_chunked_prefill(false);
+        // Q27_PROBE_KV_ATTRIB=1|2|4: fp16 cache with K-only / V-only turbo3
+        // round-trip, or e4m3 round-trip of both sides (MetalEngine::set_kv_attrib).
+        if(const char* attrib=std::getenv("Q27_PROBE_KV_ATTRIB"); attrib && *attrib)
+            engine.set_kv_attrib(static_cast<uint32_t>(std::strtoul(attrib,nullptr,10)));
 #endif
         for(size_t i=0;i<tokens.size();++i) {
 #ifdef Q27_PRISM_REFERENCE

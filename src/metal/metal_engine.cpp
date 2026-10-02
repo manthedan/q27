@@ -669,8 +669,9 @@ void MetalEngine::set_kv_attrib(uint32_t mode) {
     // Mode 4 (fp8-KV control arm): e4m3 round-trip of BOTH sides, every
     // head — production-exact for a transform-free codec. Mode 3 is set
     // via set_kv_attrib_except only (it needs the cell masks).
-    if (mode > 2 && mode != 4)
-        throw std::runtime_error("q27 Metal: KV attribution mode must be 0 (off), 1 (K), 2 (V), or 4 (e4m3 both sides)");
+    if (mode == 3 || mode > 7)
+        throw std::runtime_error("q27 Metal: KV attribution mode must be 0 (off), 1 (K), 2 (V), 4 (e4m3 both "
+                                 "sides), 5 (int8/32 both sides) or 6 (int8/128 both sides)");
     if (mode && turbo3_kv_)
         throw std::runtime_error("q27 Metal: KV attribution requires an fp16-KV engine (drop --kv turbo3)");
     // Any change after rows are cached — including turning attribution off

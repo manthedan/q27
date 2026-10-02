@@ -4742,7 +4742,11 @@ kernel void q27_kv_store_turbo3_rows(device const float *k [[buffer(0)]],
 // 8-bit exception mask (bit = head*2 + side): set bits stay clean fp16.
 // Mode 4 (fp8-KV control arm) round-trips BOTH sides of every head
 // through the e4m3 grid; head is ignored. Transform-free, so this arm is
-// production-exact — see q27_e4m3_roundtrip.
+// production-exact — see q27_e4m3_roundtrip. Modes 5/6 (int8 KV arms)
+// round-trip BOTH sides through symmetric int8 with a half absmax scale per
+// 32 (q8_0 layout, 8.5 bits) or per 128 (8.125 bits) values. Mode 7 is
+// mode 5 inside turbo3's signed 128-point WHT (the rotate-then-quantize
+// cache of ExLlamaV3-style designs).
 // flags: step-2 scaling
 // arms (docs/plans/2026-07-16-kv-codec-step2.md) — SCALE32 keeps the
 // group scale in f32 through the round-trip, FEATURE descales each
@@ -4765,6 +4769,7 @@ kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
                                           uint j [[thread_index_in_threadgroup]]) {
     const uint h = group.x >> 1, g = group.x & 1, token = group.z;
     if (h >= args.kv_heads || group.y >= 2 || token >= args.tokens) return;
+    threadgroup float int8_amax[4], int8_rot[128];
     device const float *src = (group.y ? v : k) +
         (ulong)token * args.kv_heads * 256 + (ulong)h * 256 + g * 128;
     device half *dst = (group.y ? vc : kc) +
@@ -4785,6 +4790,31 @@ kernel void q27_kv_store_f16_attrib_rows(device const float *k [[buffer(0)]],
     // (head, side) bit is set in the per-layer exception mask riding
     // args.head — bit = head*2 + side, matching census cell numbering.
     if (args.mode == 4u) { dst[j] = half(q27_e4m3_roundtrip(src[j])); return; }
+    if (args.mode == 7u) {
+        threadgroup float *rot = int8_rot;
+        rot[j] = src[j] * float(turbo_s1[j]);
+        turbo_butterfly(rot, j);
+        const float y = rot[j] * turbo_inv_sqrt_128 * float(turbo_s2[j]);
+        const float scale = float(half(simd_max(fabs(y)) / 127.0f));
+        const float yq = scale > 0.0f ? clamp(rint(y / scale), -127.0f, 127.0f) * scale : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        rot[j] = yq * float(turbo_s2[j]);
+        turbo_butterfly(rot, j);
+        dst[j] = half(rot[j] * turbo_inv_sqrt_128 * float(turbo_s1[j]));
+        return;
+    }
+    if (args.mode == 5u || args.mode == 6u) {
+        // Simdgroups are 32 consecutive j: simd_max is the per-32 absmax.
+        float amax = simd_max(fabs(src[j]));
+        if (args.mode == 6u) {
+            if ((j & 31u) == 0) int8_amax[j >> 5] = amax;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            amax = max(max(int8_amax[0], int8_amax[1]), max(int8_amax[2], int8_amax[3]));
+        }
+        const float scale = float(half(amax / 127.0f));
+        dst[j] = half(scale > 0.0f ? clamp(rint(src[j] / scale), -127.0f, 127.0f) * scale : 0.0f);
+        return;
+    }
     if (args.mode == 3u) {
         if (args.head & (1u << (h * 2u + group.y))) { dst[j] = half(src[j]); return; }
     } else if (args.mode != (group.y ? 2u : 1u) ||

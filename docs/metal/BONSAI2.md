@@ -200,6 +200,22 @@ but its next-token NLL is indistinguishable from the reference at this sample
 size (-0.4% PPL, +/-1.4%). Use fp16 up to 16K; `serve --kv turbo3` for longer
 contexts. The native agent has no `--kv` option and always uses fp16.
 
+8-bit KV candidates, measured as store-time round-trips on the same 4K input
+(fp16 cache and kernels, so only the codec differs; `Q27_PROBE_KV_ATTRIB`):
+
+| codec | bits | argmax | mean KL |
+|---|---|---|---|
+| fp16 | 16 | 127/127 | ~1e-8 |
+| int8, scale/32, after 128-point WHT | 8.5 | 126/127 | 9.1e-6 |
+| int8, scale/32 (q8_0 layout) | 8.5 | 126/127 | 1.4e-5 |
+| int8, scale/128 | 8.1 | 125/127 | 3.1e-5 |
+| fp8 e4m3 | 8 | 125/127 | 4.1e-4 |
+| turbo3 (K and V) | ~3.1 | 124/127 | 1.1e-2 |
+
+turbo3's error splits about evenly between K (5.9e-3) and V (4.3e-3).
+Rotated int8 is the candidate for a near-fp16 32K tier; it is not implemented
+as a storage format yet.
+
 ## Batched prefill
 
 T2 packs ingest prompts in chunks of up to 96 tokens through the same layer
