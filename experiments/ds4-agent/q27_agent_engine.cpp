@@ -991,15 +991,17 @@ extern "C" q27_agent_status q27_agent_generate(
                 engine->session->chunked_prefill() && remaining >= 2 &&
                 !tools_masking && !tools_may_engage && !sample_plain &&
                 !think_budget_armed;
-            // Suffix bursts: same gates, greedy only (the verify argmax is the
-            // greedy contract), packs without MTP. Rounds whose suffix match
-            // is too short fall back to one serial step inside suffix_step.
+            // Suffix bursts: same gates, packs without MTP. Greedy verifies
+            // by argmax; sampled verifies by exact rejection sampling of the
+            // served distribution (mtp_sample_round's walk). Rounds whose
+            // suffix match is too short fall back to one serial step inside
+            // suffix_step.
             const bool can_suffix =
                 !can_mtp && engine->suffix_width >= 2 &&
                 !engine->session->has_mtp() &&
                 engine->session->chunked_prefill() && remaining >= 2 &&
-                !tools_masking && !tools_may_engage && !use_sample &&
-                !think_budget_armed;
+                !tools_masking && !tools_may_engage &&
+                !(use_sample && sample_plain) && !think_budget_armed;
 
             if (can_mtp || can_suffix) {
                 std::vector<uint32_t> committed;
@@ -1015,7 +1017,9 @@ extern "C" q27_agent_status q27_agent_generate(
                     next_pending = engine->session->suffix_step(
                         engine->suffix_drafter, current, remaining, eos,
                         engine->suffix_width,
-                        q27::MetalEngine::SUFFIX_MIN_MATCH, committed);
+                        q27::MetalEngine::SUFFIX_MIN_MATCH, committed, nullptr,
+                        use_sample ? &params : nullptr,
+                        use_sample ? &rng : nullptr);
                 } else if (use_sample) {
                     next_pending = engine->session->mtp_sample_round(
                         current, remaining, eos, engine->mtp_width, live_width,
@@ -1084,7 +1088,8 @@ extern "C" q27_agent_status q27_agent_generate(
                  * open). KV and ledger are burst-aligned at this point, so
                  * force-close here instead of publishing one more think
                  * token first (codex P2). Overshoot is bounded by the burst
-                 * width (≤3 tokens); per-token enforcement resumes on the
+                 * width (MTP ≤3 tokens, suffix bursts up to --suffix W-1);
+                 * per-token enforcement resumes on the
                  * serial path the gate now forces. */
                 if (max_think > 0 && think_span.in_think &&
                     think_span.think_tokens >= max_think) {

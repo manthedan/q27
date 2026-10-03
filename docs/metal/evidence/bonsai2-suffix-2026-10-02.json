@@ -1,0 +1,81 @@
+{
+ "date": "2026-10-02",
+ "device": "Apple M4 / 16 GiB (mini)",
+ "pack": "bonsai2-27b-t2-slim.q27",
+ "method": "SuffixDraft n-gram drafts (min match 12), batched chunk verify up to W lanes; greedy = argmax walk, sampled = spec_rejection_accept with point-mass drafts",
+ "cli_greedy": {
+  "repeated_list_w16": {
+   "plain_tok_s": 10.3,
+   "suffix_tok_s": 20.2,
+   "identical": true
+  },
+  "narrative": {
+   "delta": "-0.6%..+0.2%",
+   "bursts": 0,
+   "identical": true
+  },
+  "reverse_list_n160_w16": {
+   "tok_s": 14.69,
+   "bursts": 7,
+   "fallbacks": 76,
+   "drafted": 89,
+   "accepted": 77,
+   "identical_to_plain": true
+  }
+ },
+ "cli_sampled": {
+  "t1e-4_equals_greedy": true,
+  "fixed_seed_repeatable": true,
+  "t0.7_k20_p0.95": {
+   "plain_tok_s": 10.66,
+   "suffix_tok_s": [
+    10.61,
+    10.32
+   ],
+   "bursts": 3,
+   "drafted": 25,
+   "accepted": 11
+  },
+  "t1.0_k20_p0.95": {
+   "plain_tok_s": 10.75,
+   "suffix_tok_s": 10.72,
+   "bursts": 0
+  }
+ },
+ "agent_file_copy_400_tokens": {
+  "t0": {
+   "plain_s": 63,
+   "suffix_s": 41,
+   "identical": true
+  },
+  "t1.0_k20_p0.95": {
+   "seed11": {
+    "plain_s": 63.9,
+    "suffix_s": 41.8
+   },
+   "seed12": {
+    "plain_s": 67.0,
+    "suffix_s": 43.4
+   },
+   "all_four_outputs_identical": true
+  }
+ },
+ "server_chat_file_copy_400_tokens": {
+  "greedy": {
+   "plain_s": 49.5,
+   "suffix_s": 27.8,
+   "identical": true
+  },
+  "t1.0_k20_p0.95_seed5_prefix_cached": {
+   "plain_s": 37.2,
+   "suffix_s": 13.5,
+   "identical": true
+  },
+  "speculation_stats": {
+   "rounds": 50,
+   "committed": 780
+  }
+ },
+ "cpu_exactness": "test_sampling Monte Carlo: p0 marginal, p1 after accepted draft, bonus lane, p=0 draft; mutation (10% acceptance bias) fails the test",
+ "launcher": "--suffix 16 default for agent/tui/serve; T3 pack server warns and disables"
+}

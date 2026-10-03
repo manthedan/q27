@@ -175,7 +175,8 @@ short-context correctness, not a long-context or task-benchmark claim.
 - **PTQ1_0 / the 5.95 GB dense pack**: not supported by this converter yet.
 - **Chunked prefill for T3 and legacy Bonsai packs**: those stay serial. T2
   packs use the float-activation chunk path (see "Batched prefill").
-- **MTP**: the checkpoint has no MTP layer; requesting it fails.
+- **MTP**: the checkpoint has no MTP layer; requesting it fails. Suffix
+  bursts are the speculation path instead (see "Speculative decoding").
 - **Vision**: this port is text-only; no vision tower/mmproj is loaded.
 - **Prefix snapshots on T3/legacy Bonsai packs**: they need chunked prefill,
   so only T2 packs get them (see "Prefix snapshots").
@@ -267,6 +268,46 @@ extra argmax flip on a near-tie, 338/340; 4K cuts 15/15, mean KL 1.5e-7) and
 nothing guards against activations above half's 65504. A byte-LUT trit unpack
 in the float kernel gave no speedup (41.1 vs 40.9 tok/s), so the GEMM is
 MMA/staging-bound, not unpack-bound.
+
+## Speculative decoding (suffix bursts)
+
+Bonsai 2 has no MTP layer, so speculation drafts from the context instead: an
+n-gram drafter (`SuffixDraft`) proposes the continuation of the longest earlier
+match (at least 12 tokens), and one chunk forward verifies up to W lanes (2-48,
+snapped to 16/32/48-lane tiles). The launcher passes `--suffix 16` to `agent`,
+`tui` and `serve` (`Q27_SUFFIX=0` disables it; it is skipped when you pass
+`--suffix`, `--mtp` or `--constrain-tools`). It needs chunked prefill, so T2
+packs only; T3 packs decode serially and the server says so at startup.
+
+Greedy verifies by argmax and is byte-identical to plain greedy. Sampled
+decoding verifies by exact rejection sampling of the served distribution
+(accept a draft d with probability p(d), else sample p without d), so each
+token has the same distribution as plain sampling. The random stream is consumed
+differently, so one seed gives different text with and without `--suffix`.
+Bursts only fire while the model reproduces text already in the context:
+copying or editing files, repeating lists, quoting. On new prose they almost
+never fire and cost nothing measurable. Tool-constrained decoding, an armed
+think budget and `Q27_SAMPLE_PLAIN` run serially.
+
+Measured on the M4 / 16 GiB mini, t2-slim
+([evidence](evidence/bonsai2-suffix-2026-10-02.json)):
+
+| case | plain | `--suffix 16` | output |
+|---|---|---|---|
+| CLI, repeated list, greedy | 10.3 tok/s | 20.2 tok/s | identical |
+| CLI, narrative text, greedy | | -0.6%..+0.2% (0 bursts) | identical |
+| CLI, T=0.7 / 1.0 (bursts rarely fire) | 10.66 / 10.75 tok/s | 10.61 / 10.72 tok/s | |
+| agent, 400-token file copy, T=0 | 63 s | 41 s | identical |
+| agent, same, T=1.0 top-p 0.95 top-k 20 (2 seeds) | 63.9 / 67.0 s | 41.8 / 43.4 s | identical |
+| server chat, same, greedy | 49.5 s | 27.8 s | identical |
+| server chat, same, T=1.0 (prefix cached) | 37.2 s | 13.5 s | identical |
+
+Sampled checks: at T=1e-4 the sampled path reproduces greedy byte for byte;
+a fixed seed repeats byte for byte; and `build/test_sampling` checks the walk's
+marginals by Monte Carlo (first token, token after an accepted draft, bonus
+lane, and a draft outside the nucleus). Sampled bursts read top-k per lane, so
+`top_k` 0 or above 256 falls back to a full-vocabulary readback per lane (slow,
+but still exact). With two server slots, a busy peer caps bursts at 12 lanes.
 
 ## Recovered experiments
 

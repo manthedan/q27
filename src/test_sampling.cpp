@@ -216,6 +216,60 @@ int main() {
             return 1;
     }
 
+    // Exactness with deterministic (point-mass) drafts, the suffix and MTP
+    // case: the first sampled token is distributed as p0, and the token
+    // after an accepted draft as p1. The draft is deliberately not argmax.
+    {
+        auto dist = [](std::vector<double> w) {
+            q27::ServedDistribution d;
+            for (uint32_t t = 0; t < w.size(); t++) d.tokens.push_back(t);
+            d.weights = w;
+            d.total = 1.0;
+            d.argmax_token = 0;
+            return d;
+        };
+        const std::vector<double> p0 = {0.5, 0.3, 0.15, 0.05};
+        const std::vector<double> p1 = {0.1, 0.6, 0.2, 0.1};
+        const std::vector<q27::ServedDistribution> lanes = {
+            dist(p0), dist(p1), dist({0.25, 0.25, 0.25, 0.25})};
+        const uint32_t drafts[] = {1, 2};
+        std::mt19937_64 walk_rng(5);
+        const int trials = 400000;
+        std::vector<double> first(4, 0.0), second(4, 0.0), bonus(4, 0.0);
+        double after_draft = 0.0, all_accept = 0.0;
+        for (int i = 0; i < trials; i++) {
+            const auto r = q27::spec_rejection_accept(lanes.data(), 3, drafts, walk_rng);
+            const uint32_t t1 = r.n >= 2 ? drafts[0] : r.pending;
+            first[t1] += 1.0;
+            if (t1 == drafts[0]) {
+                second[r.n >= 3 ? drafts[1] : r.pending] += 1.0;
+                after_draft += 1.0;
+            }
+            if (r.n == 3) {
+                bonus[r.pending] += 1.0;
+                all_accept += 1.0;
+            }
+        }
+        for (uint32_t t = 0; t < 4; t++)
+            if (std::fabs(first[t] / trials - p0[t]) > 0.005 ||
+                std::fabs(second[t] / after_draft - p1[t]) > 0.006 ||
+                std::fabs(bonus[t] / all_accept - 0.25) > 0.015)
+                return 1;
+        // A draft outside the served support (p=0) always rejects, and the
+        // residual is the whole distribution.
+        const std::vector<q27::ServedDistribution> narrow = {
+            dist({0.7, 0.3}), dist({0.5, 0.5})};
+        const uint32_t outside[] = {3};
+        std::vector<double> residual(2, 0.0);
+        const int narrow_trials = 100000;
+        for (int i = 0; i < narrow_trials; i++) {
+            const auto r = q27::spec_rejection_accept(narrow.data(), 2, outside, walk_rng);
+            if (r.n != 1 || r.exclude != 3 || r.pending > 1) return 1;
+            residual[r.pending] += 1.0;
+        }
+        if (std::fabs(residual[0] / narrow_trials - 0.7) > 0.006) return 1;
+    }
+
     std::puts("CPU sampling: PASS");
     return 0;
 }

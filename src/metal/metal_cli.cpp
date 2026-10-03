@@ -132,8 +132,6 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--tokens and --prompt are mutually exclusive");
         if (mtp_width && suffix_width)
             throw std::runtime_error("--mtp and --suffix are mutually exclusive");
-        if (sampling.temperature > 0 && suffix_width)
-            throw std::runtime_error("--suffix is greedy-only");
         if (sampling.temperature > 0 && mtp_width)
             throw std::runtime_error("sampling cannot be combined with --mtp");
         if (validate_only) {
@@ -176,10 +174,12 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        std::vector<uint32_t> generated = sampling.temperature > 0
-            ? engine.generate_sampled(prompt, count, sampling)
+        std::vector<uint32_t> generated =
+            suffix_width ? engine.generate_suffix(prompt, count, suffix_width,
+                                                  q27::MetalEngine::SUFFIX_MIN_MATCH, UINT32_MAX,
+                                                  &sampling)
+            : sampling.temperature > 0 ? engine.generate_sampled(prompt, count, sampling)
             : mtp_width ? engine.generate_mtp(prompt, count, mtp_width)
-            : suffix_width ? engine.generate_suffix(prompt, count, suffix_width)
                         : engine.generate(prompt, count);
         if (!dump_token_ids.empty()) write_token_ids(dump_token_ids, generated);
 

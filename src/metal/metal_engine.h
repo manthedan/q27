@@ -137,7 +137,8 @@ class MetalEngine {
     std::vector<uint32_t> generate_suffix(const std::vector<uint32_t>& prompt,
                                           uint32_t count, uint32_t width,
                                           uint32_t minimum_match = SUFFIX_MIN_MATCH,
-                                          uint32_t eos = UINT32_MAX);
+                                          uint32_t eos = UINT32_MAX,
+                                          const SamplingParams* params = nullptr);
     // The pre-lever-2 serial walk (one step() per proposal): the batched
     // path's A/B control and byte-level reference. width 2..12.
     std::vector<uint32_t> generate_suffix_serial(const std::vector<uint32_t>& prompt,

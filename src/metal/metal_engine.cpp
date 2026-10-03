@@ -3296,8 +3296,11 @@ uint32_t MetalEngine::suffix_step(SuffixDraft& drafter, uint32_t pending, uint32
 
 std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& prompt,
                                                    uint32_t count, uint32_t width,
-                                                   uint32_t minimum_match, uint32_t eos) {
+                                                   uint32_t minimum_match, uint32_t eos,
+                                                   const SamplingParams* params) {
     if (prompt.empty()) throw std::runtime_error("q27 Metal: prompt is empty");
+    const bool sampled = params && params->temperature > 0.0f;
+    if (sampled) validate_sampling(*params);
     if (width < 2 || width > VERIFY_CHUNK_MAX)
         throw std::runtime_error("q27 Metal: suffix width must be 2..VERIFY_CHUNK_MAX");
     if (!chunked_prefill_)
@@ -3310,6 +3313,10 @@ std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& 
     if ((uint64_t)prompt.size() + count > max_context_ + 1)
         throw std::runtime_error("q27 Metal: prompt/generation exceeds context");
     uint32_t pending = ingest_prompt(prompt, false, true);
+    // Sampled runs draw the first token like generate_sampled (one rng
+    // stream seeded from params.seed); later tokens come from suffix_step.
+    std::mt19937_64 rng(sampled ? params->seed : 0);
+    if (sampled) pending = sample_from_logits(*params, rng);
     last_spec_stats_ = {};
     last_suffix_stats_ = {};
     std::vector<int> history(prompt.begin(), prompt.end());
@@ -3322,7 +3329,8 @@ std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& 
         if (pending == eos) break;
         if (output.size() + 1 == count) { output.push_back(pending); break; }
         pending = suffix_step(drafter, pending, (uint32_t)(count - output.size()),
-                              eos, width, minimum_match, committed);
+                              eos, width, minimum_match, committed, nullptr,
+                              sampled ? params : nullptr, sampled ? &rng : nullptr);
         for (uint32_t token : committed) {
             if (token == eos) return output;
             output.push_back(token);

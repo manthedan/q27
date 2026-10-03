@@ -15,7 +15,7 @@ case "$ACTION" in
       '  ./q27 tui [args]     Ratatui frontend over the same native agent' \
       '  ./q27 serve [args]   local HTTP service on 127.0.0.1:8080' \
       'Models/setup: docs/metal/BONSAI2.md' \
-      'Overrides: Q27_BONSAI2_DIR, Q27_BONSAI2_PACK, Q27_CONTEXT, Q27_METAL_SOURCE'
+      'Overrides: Q27_BONSAI2_DIR, Q27_BONSAI2_PACK, Q27_CONTEXT, Q27_SUFFIX, Q27_METAL_SOURCE'
     exit 0 ;;
   build) exec make -C "$ROOT" -j2 build/q27-metal build/q27-metal-server agent ;;
   agent|tui|serve) ;;
@@ -29,12 +29,23 @@ TOKENIZER="$MODEL_DIR/bonsai2.tok"
 }
 export Q27_METAL_SOURCE="${Q27_METAL_SOURCE:-$ROOT/src/metal/q27_kernels.metal}"
 export Q27_MODEL_PROFILE=bonsai2-qwen38-v1
+# Suffix-burst speculation (n-gram drafts from the context, verified in one
+# batch; exact for greedy and sampled decoding). Q27_SUFFIX=0 turns it off.
+# Skipped when the caller picks a decode mode the server must run serially.
+SUFFIX_ARGS=()
+if [[ "${Q27_SUFFIX:-16}" != 0 ]]; then
+  SUFFIX_ARGS=(--suffix "${Q27_SUFFIX:-16}")
+  for arg in "$@"; do
+    case "$arg" in --suffix|--mtp|--constrain-tools) SUFFIX_ARGS=() ;; esac
+  done
+fi
 case "$ACTION" in
   serve)
     make -C "$ROOT" -j2 build/q27-metal-server >&2
     exec "$ROOT/build/q27-metal-server" "$MODEL" "$TOKENIZER" \
       --ctx "$CONTEXT" --slots 1 --think --think-budget 0 \
-      --temperature-default 1.0 --top-p-default 0.95 --top-k-default 20 "$@" ;;
+      --temperature-default 1.0 --top-p-default 0.95 --top-k-default 20 \
+      ${SUFFIX_ARGS[@]+"${SUFFIX_ARGS[@]}"} "$@" ;;
   agent|tui)
     make -C "$ROOT" -j2 agent >&2
     if [[ "$ACTION" == tui ]]; then
@@ -42,9 +53,11 @@ case "$ACTION" in
       export Q27_AGENT="$ROOT/build/q27-agent"
       exec "$ROOT/build/q27-tui" -- "$MODEL" "$TOKENIZER" \
         --context "$CONTEXT" --workspace "$WORKSPACE" \
-        --temperature 1.0 --top-p 0.95 --top-k 20 "$@"
+        --temperature 1.0 --top-p 0.95 --top-k 20 \
+        ${SUFFIX_ARGS[@]+"${SUFFIX_ARGS[@]}"} "$@"
     fi
     exec "$ROOT/build/q27-agent" "$MODEL" "$TOKENIZER" \
       --context "$CONTEXT" --workspace "$WORKSPACE" \
-      --temperature 1.0 --top-p 0.95 --top-k 20 "$@" ;;
+      --temperature 1.0 --top-p 0.95 --top-k 20 \
+      ${SUFFIX_ARGS[@]+"${SUFFIX_ARGS[@]}"} "$@" ;;
 esac

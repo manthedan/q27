@@ -5,6 +5,7 @@
 
 #include "../tokenizer.h"
 #include "../toolconstrain.h"
+#include "../suffixdraft.h"
 #include <cerrno>
 #include "../../third_party/httplib.h"
 #include "../../third_party/json.hpp"
@@ -547,6 +548,9 @@ struct Runtime {
     };
     std::vector<std::unique_ptr<Slot>> slots;
     uint32_t mtp_width;
+    // Suffix-burst width (--suffix): n-gram drafts verified in one chunk,
+    // for packs without an MTP layer. 0 = off.
+    uint32_t suffix_width=0;
     uint32_t context;
     bool model_has_mtp=false;
     bool model_chunked_prefill=false;
@@ -1785,6 +1789,48 @@ struct Runtime {
                     if(!deliver(token)) { stopped=true; break; }
                 }
             }
+        } else if(suffix_width!=0 && !engine.has_mtp() && engine.chunked_prefill() &&
+                  !bounded_reasoning && !(sampling.temperature>0.0f && sample_plain)) {
+            // Suffix bursts: greedy verifies by argmax, sampled by exact
+            // rejection sampling; short matches fall back to one serial step
+            // inside suffix_step. Only burst rounds count as speculation.
+            const bool sampled=sampling.temperature>0.0f;
+            std::mt19937_64 rng(sampling.seed);
+            q27::SuffixDraft drafter;
+            drafter.reset(std::vector<int>(prompt.begin(),prompt.end()));
+            if(sampled) {
+                auto gpu=lease_now();
+                pending=engine.sample_from_logits(sampling,rng);
+            }
+            std::vector<uint32_t> committed;
+            bool stopped=false;
+            while(!stopped && produced<budget_task.n_max) {
+                if(produced+1==budget_task.n_max) {
+                    if(pending!=eos_id) deliver(pending);
+                    else cause=q27::MetalEngine::StopCause::Eos;
+                    break;
+                }
+                committed.clear();
+                bool burst=false;
+                // A latency-sensitive peer caps the burst at 12 lanes (the
+                // MTP ceiling), so its wait stays within one quantum.
+                const uint32_t round_width=std::min(suffix_width,quantum_width(slot));
+                {
+                    auto gpu=lease_now();
+                    pending=engine.suffix_step(drafter,pending,budget_task.n_max-produced,eos_id,
+                                               round_width,q27::MetalEngine::SUFFIX_MIN_MATCH,
+                                               committed,&burst,sampled?&sampling:nullptr,
+                                               sampled?&rng:nullptr);
+                }
+                if(burst) {
+                    spec_rounds_total.fetch_add(1,std::memory_order_relaxed);
+                    spec_committed_total.fetch_add(committed.size(),std::memory_order_relaxed);
+                }
+                for(uint32_t token:committed) {
+                    if(token==eos_id) { cause=q27::MetalEngine::StopCause::Eos; stopped=true; break; }
+                    if(!deliver(token)) { stopped=true; break; }
+                }
+            }
         } else if(sampling.temperature>0.0f) {
             std::mt19937_64 rng(sampling.seed);
             while(produced<budget_task.n_max) {
@@ -2081,7 +2127,7 @@ static int mark_supervisor_lock_close_on_exec() {
 int main(int argc,char** argv) {
     if (mark_supervisor_lock_close_on_exec() != 0) return 2;
     if(argc<3) {
-        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12] [--kv fp16|turbo3|q8] [--prefix-entries N] [--constrain-tools] [--think] [--request-think] [--think-budget N] [--slots N] [--trace path]\n"
+        fprintf(stderr,"usage: %s model.q27 tokenizer.tok [--host 127.0.0.1] [--port 8080] [--ctx N|auto] [--mtp 2..12 | --suffix 2..48] [--kv fp16|turbo3|q8] [--prefix-entries N] [--constrain-tools] [--think] [--request-think] [--think-budget N] [--slots N] [--trace path]\n"
                        "       [--snapshot-dir path] [--snapshot-max-mb 1..16777216] [--snapshot-auto 0..16777216] [--snapshot-spine-pin 0|1] [--max-tokens-default N] [--budget-mb 1..16777216]\n"
                        "       [--temperature-default T] [--top-p-default P] [--top-k-default K] [--api-key KEY] [--api-key-file path]\n"
                        "       (the snapshot/max-tokens/budget/sampling-default flags fall back to their env twins Q27_METAL_{SNAPSHOT_DIR,SNAPSHOT_MAX_MB,SNAPSHOT_AUTO,SNAPSHOT_SPINE_PIN,MAX_TOKENS_DEFAULT,BUDGET_MB,TEMPERATURE_DEFAULT,TOP_P_DEFAULT,TOP_K_DEFAULT}; an explicit flag wins)\n",argv[0]);
@@ -2090,7 +2136,7 @@ int main(int argc,char** argv) {
     try {
         std::string model=argv[1],tok=argv[2],host="127.0.0.1";
         std::string trace_path,snapshot_dir;
-        uint32_t port=8080,context=0,width=0,prefix_entries=1,slot_count=2;
+        uint32_t port=8080,context=0,width=0,suffix_width=0,prefix_entries=1,slot_count=2;
         // Shipped-semantics knobs as flags (homebrew Phase-2 pre-tag);
         // sentinel = flag absent, Runtime falls back to the env twin.
         // snapshot_auto keeps a signed sentinel because 0 is meaningful
@@ -2137,6 +2183,7 @@ int main(int argc,char** argv) {
                 }
             }
             else if(arg=="--mtp" && i+1<argc) width=parse_u32(argv[++i],"--mtp");
+            else if(arg=="--suffix" && i+1<argc) suffix_width=parse_u32(argv[++i],"--suffix");
             else if(arg=="--prefix-entries" && i+1<argc) prefix_entries=parse_u32(argv[++i],"--prefix-entries");
             else if(arg=="--slots" && i+1<argc) slot_count=parse_u32(argv[++i],"--slots");
             else if(arg=="--kv" && i+1<argc) { kv=q27::parse_kv_kind(argv[++i]); }
@@ -2212,6 +2259,10 @@ int main(int argc,char** argv) {
         // per-slot charge. Side-inclusive snapshots at maximum context put
         // the wrap within uint32 range; 4096 entries exceeds real deployments.
         if(prefix_entries>4096) throw std::runtime_error("--prefix-entries must be 0..4096");
+        if(suffix_width && (suffix_width<2 || suffix_width>q27::MetalEngine::VERIFY_CHUNK_MAX))
+            throw std::runtime_error("--suffix width must be 2..48");
+        if(suffix_width && width) throw std::runtime_error("--mtp and --suffix are mutually exclusive");
+        if(constrain_tools && suffix_width) throw std::runtime_error("--constrain-tools requires serial decode; drop --suffix");
         if(constrain_tools && width) throw std::runtime_error("--constrain-tools requires serial decode; drop --mtp (verify-lane masks are not wired on Metal)");
         // The latency guarantee (wait <= one active quantum) holds with one
         // competing slot. More than two requires extending the scheduler and
@@ -2254,10 +2305,19 @@ int main(int argc,char** argv) {
         Runtime runtime(model,tok,context,kv,width,prefix_entries,constrain_tools,slot_count,
                         budget_mb,snapshot_dir,snapshot_max_mb,snapshot_auto,max_tokens_default,spine_pin,
                         think_default);
+        if(suffix_width && runtime.model_has_mtp)
+            throw std::runtime_error("--suffix is for packs without an MTP layer; use --mtp");
+        if(suffix_width && !runtime.model_chunked_prefill) {
+            // Warn, not fail: the launcher passes --suffix by default and
+            // T3/legacy Bonsai packs decode serially (as the native agent).
+            fprintf(stderr,"[suffix] pack has no chunked prefill; suffix bursts disabled\n");
+            suffix_width=0;
+        }
+        runtime.suffix_width=suffix_width;
         if(!trace_path.empty()) {
             runtime.trace.open(trace_path);
             runtime.trace.event({{"kind","boot"},{"ctx",runtime.context},{"kv",q27::kv_kind_name(kv)},
-                                 {"mtp",width},{"slots",runtime.slots.size()},
+                                 {"mtp",width},{"suffix",suffix_width},{"slots",runtime.slots.size()},
                                  {"model",runtime.model_name},{"artifact_sha1",runtime.resident_model_sha1()},
                                  {"runtime",runtime.serving_identity()},{"boot_id",runtime.boot_id}});
         }
@@ -4455,8 +4515,9 @@ int main(int argc,char** argv) {
                     "`lsof -nP -iTCP:%u -sTCP:LISTEN`)\n",host.c_str(),port,port);
             return 1;
         }
-        fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u, slots=%zu)\n",
-                host.c_str(),port,runtime.context,q27::kv_kind_name(kv),width,runtime.slots.size());
+        fprintf(stderr,"q27 Metal server listening on http://%s:%u (ctx=%u, kv=%s, mtp=%u, suffix=%u, slots=%zu)\n",
+                host.c_str(),port,runtime.context,q27::kv_kind_name(kv),width,suffix_width,
+                runtime.slots.size());
         if(!server.listen_after_bind()) throw std::runtime_error("server listen failed");
         return 0;
     } catch(const std::exception& e) { fprintf(stderr,"%s\n",e.what()); return 1; }
