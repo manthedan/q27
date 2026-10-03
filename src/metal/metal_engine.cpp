@@ -1758,12 +1758,16 @@ void MetalEngine::chunk_matmul(const BackendTensor& w, const BackendQuantized& x
     backend_.matmul_t2_float(w, *rotated, count, out);
 }
 
-// Chunk-row LM head (verify/oracle/teacher-force/suffix paths). Bonsai 2's
-// head is a rotated T2 matrix; these int8 paths have no rotation and are not
-// validated for it, so they fail loudly instead of returning wrong logits.
+// Chunk-row LM head (verify/oracle/teacher-force/suffix paths). Every
+// caller has just written the normalized float rows to cfinal_ (and their
+// int8 copy to x5). Bonsai 2's head is a rotated T2 matrix: rotate those
+// float rows and run the float T2 GEMM, as the serial head does.
 void MetalEngine::chunk_head(const BackendQuantized& x5, uint32_t count) {
-    if (bonsai_chunk_)
-        throw std::runtime_error("q27 Metal: chunked LM-head paths are not supported for Bonsai 2");
+    if (bonsai_chunk_) {
+        chunk_matmul(weight("output.weight"), x5, &rotate_rows(*cfinal_, N_EMBD, false, count),
+                     count, *clogits_);
+        return;
+    }
     backend_.matmul_quantized(weight("output.weight"), x5, count, *clogits_);
 }
 
@@ -2321,6 +2325,48 @@ uint32_t MetalEngine::mtp_round(uint32_t pending, uint32_t remaining, uint32_t e
 
 // Sampled MTP: greedy drafts, rejection-sample accept (Phase 0 host walk).
 // Draft + verify match mtp_round; only the accept/pending tail differs.
+std::vector<ServedDistribution> MetalEngine::lane_distributions(uint32_t live,
+                                                               const SamplingParams& params) {
+    // Prefer per-lane GPU top-k when top_k is set (card recipe uses 20):
+    // ~k floats/ids per lane instead of full VOCAB readback + partial_sort.
+    // Fall back to full logits on opt-out, top_k==0, or degenerate over-set.
+    std::vector<ServedDistribution> lane_dists(live);
+    bool used_topk = false;
+    if (gpu_sample_ && params.temperature > 0.0f &&
+        params.top_k >= 1 && params.top_k <= 256) {
+        used_topk = true;
+        for (uint32_t lane = 0; lane < live; lane++) {
+            // Bind clogits_ row via byte offset — no full-row copy into logits_.
+            // topk requires its own command (CPU-clears count); not batchable.
+            const uint64_t row_off = (uint64_t)lane * VOCAB * sizeof(float);
+            backend_.topk(*clogits_, VOCAB, params.top_k, *topk_values_,
+                          *topk_indices_, *topk_count_, row_off);
+            uint32_t count = 0;
+            backend_.read(*topk_count_, 0, &count, sizeof(count));
+            if (count < params.top_k || count > TOPK_CAPACITY) {
+                used_topk = false;
+                break;
+            }
+            std::vector<float> values(count);
+            std::vector<uint32_t> indices(count);
+            backend_.read(*topk_values_, 0, values.data(), count * sizeof(float));
+            backend_.read(*topk_indices_, 0, indices.data(), count * sizeof(uint32_t));
+            lane_dists[lane] = build_served_from_candidates(
+                values.data(), indices.data(), count, params);
+        }
+    }
+    if (!used_topk) {
+        std::vector<float> lane_logits((size_t)live * VOCAB);
+        backend_.read(*clogits_, 0, lane_logits.data(),
+                      (uint64_t)live * VOCAB * sizeof(float));
+        for (uint32_t lane = 0; lane < live; lane++)
+            lane_dists[lane] = build_served_distribution(
+                lane_logits.data() + (size_t)lane * VOCAB, VOCAB, params);
+    }
+    last_lane_topk_ = used_topk;
+    return lane_dists;
+}
+
 uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uint32_t eos,
                                        uint32_t width, uint32_t& live_width,
                                        const SamplingParams& params, std::mt19937_64& rng,
@@ -2382,43 +2428,8 @@ uint32_t MetalEngine::mtp_sample_round(uint32_t pending, uint32_t remaining, uin
     std::vector<uint32_t> drafts(live - 1);
     for (uint32_t i = 0; i + 1 < live; i++) drafts[i] = lanes[i + 1];
 
-    // Prefer per-lane GPU top-k when top_k is set (card recipe uses 20):
-    // ~k floats/ids per lane instead of full VOCAB readback + partial_sort.
-    // Fall back to full logits on opt-out, top_k==0, or degenerate over-set.
-    std::vector<ServedDistribution> lane_dists(live);
-    bool used_topk = false;
-    if (gpu_sample_ && params.temperature > 0.0f &&
-        params.top_k >= 1 && params.top_k <= 256) {
-        used_topk = true;
-        for (uint32_t lane = 0; lane < live; lane++) {
-            // Bind clogits_ row via byte offset — no full-row copy into logits_.
-            // topk requires its own command (CPU-clears count); not batchable.
-            const uint64_t row_off = (uint64_t)lane * VOCAB * sizeof(float);
-            backend_.topk(*clogits_, VOCAB, params.top_k, *topk_values_,
-                          *topk_indices_, *topk_count_, row_off);
-            uint32_t count = 0;
-            backend_.read(*topk_count_, 0, &count, sizeof(count));
-            if (count < params.top_k || count > TOPK_CAPACITY) {
-                used_topk = false;
-                break;
-            }
-            std::vector<float> values(count);
-            std::vector<uint32_t> indices(count);
-            backend_.read(*topk_values_, 0, values.data(), count * sizeof(float));
-            backend_.read(*topk_indices_, 0, indices.data(), count * sizeof(uint32_t));
-            lane_dists[lane] = build_served_from_candidates(
-                values.data(), indices.data(), count, params);
-        }
-    }
-    if (!used_topk) {
-        std::vector<float> lane_logits((size_t)live * VOCAB);
-        backend_.read(*clogits_, 0, lane_logits.data(),
-                      (uint64_t)live * VOCAB * sizeof(float));
-        for (uint32_t lane = 0; lane < live; lane++)
-            lane_dists[lane] = build_served_distribution(
-                lane_logits.data() + (size_t)lane * VOCAB, VOCAB, params);
-    }
-
+    std::vector<ServedDistribution> lane_dists = lane_distributions(live, params);
+    const bool used_topk = last_lane_topk_;
     SpecRejectResult accept =
         spec_rejection_accept(lane_dists.data(), live, drafts.data(), rng);
     // accepted drafts before first reject (or all), for width adaptation.
@@ -3148,7 +3159,11 @@ std::vector<uint32_t> MetalEngine::generate_mtp_sampled(const std::vector<uint32
 // walk by the same argument as mtp_round (modulo the documented
 // tolerance-gated chunk-GEMM class).
 uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint32_t* lanes,
-                                   uint32_t live, std::vector<uint32_t>& committed) {
+                                   uint32_t live, std::vector<uint32_t>& committed,
+                                   const SamplingParams* params, std::mt19937_64* rng) {
+    const bool sampled = params && params->temperature > 0.0f;
+    if (sampled && !rng) throw std::runtime_error("q27 Metal: sampled suffix round needs an rng");
+    if (sampled) validate_sampling(*params);
     if (remaining < 2)
         throw std::runtime_error("q27 Metal: suffix round needs remaining >= 2 (emit the last token directly)");
     if (active_mask_ >= 0)
@@ -3171,13 +3186,24 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
         backend_.rmsnorm_rows_quantized(*ch_, weight("output_norm.weight"), *cfinal_,
                                         N_EMBD, live, EPS, x5);
         chunk_head(x5, live);
-        backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
+        if (!sampled) backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
         batch.finish();
     }
-    std::vector<uint32_t> predictions(live);
-    backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
+    std::vector<uint32_t> predictions;
+    std::vector<ServedDistribution> lane_dists;
+    SpecRejectResult walk{};
     uint32_t accepted = 0;
-    while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
+    if (sampled) {
+        // Deterministic drafts: exact speculative sampling of the served
+        // distribution (mtp_sample_round's walk).
+        lane_dists = lane_distributions(live, *params);
+        walk = spec_rejection_accept(lane_dists.data(), live, lanes + 1, *rng);
+        accepted = walk.n - 1;
+    } else {
+        predictions.resize(live);
+        backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
+        while (accepted + 1 < live && predictions[accepted] == lanes[accepted + 1]) accepted++;
+    }
     uint32_t commit_n = std::min(accepted + 1, remaining);
     uint32_t encoded = commit_n == remaining ? commit_n - 1 : commit_n;
     for (uint32_t i = 0; i < commit_n; i++)
@@ -3202,13 +3228,20 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
     // at the dispatch site, not the driver's bookkeeping.
     static const bool trace = getenv("Q27_SUFFIX_TRACE") != nullptr;
     if (trace)
-        fprintf(stderr, "suffix round: live %u accepted %u committed %u\n", live, accepted, commit_n);
-    return predictions[commit_n - 1];
+        fprintf(stderr, "suffix round: live %u accepted %u committed %u%s\n", live, accepted, commit_n,
+                sampled ? " (sampled)" : "");
+    if (!sampled) return predictions[commit_n - 1];
+    // Full walk used -> its pending is already sampled; a remaining/EOS clamp
+    // samples from the last committed lane (mtp_sample_round semantics).
+    if (commit_n == walk.n) return walk.pending;
+    return sample_served(lane_dists[commit_n - 1], *rng, /*exclude=*/-1);
 }
 
 uint32_t MetalEngine::suffix_step(SuffixDraft& drafter, uint32_t pending, uint32_t remaining,
                                   uint32_t eos, uint32_t width, uint32_t minimum_match,
-                                  std::vector<uint32_t>& committed, bool* burst) {
+                                  std::vector<uint32_t>& committed, bool* burst,
+                                  const SamplingParams* params, std::mt19937_64* rng) {
+    const bool sampled = params && params->temperature > 0.0f;
     if (remaining < 2)
         throw std::runtime_error("q27 Metal: suffix step needs remaining >= 2 (emit the last token directly)");
     if (width < 2 || width > VERIFY_CHUNK_MAX)
@@ -3248,7 +3281,7 @@ uint32_t MetalEngine::suffix_step(SuffixDraft& drafter, uint32_t pending, uint32
         uint32_t lanes[VERIFY_CHUNK_MAX];
         lanes[0] = pending;
         for (uint32_t i = 1; i < live; i++) lanes[i] = (uint32_t)proposals[i - 1];
-        pending = suffix_round(remaining, eos, lanes, live, committed);
+        pending = suffix_round(remaining, eos, lanes, live, committed, params, rng);
         for (uint32_t tok : committed) drafter.append((int)tok);
         return pending;
     }
@@ -3256,7 +3289,9 @@ uint32_t MetalEngine::suffix_step(SuffixDraft& drafter, uint32_t pending, uint32
     last_spec_stats_.rounds++;
     committed.push_back(pending);
     drafter.append((int)pending);
-    return step(pending);
+    if (!sampled) return step(pending);
+    (void)step(pending);
+    return sample_from_logits(*params, *rng);
 }
 
 std::vector<uint32_t> MetalEngine::generate_suffix(const std::vector<uint32_t>& prompt,

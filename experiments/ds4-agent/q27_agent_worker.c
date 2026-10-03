@@ -53,6 +53,7 @@ struct q27_agent_worker {
     uint32_t context;
     uint32_t mtp_width;
     uint32_t kv_kind;
+    uint32_t suffix_width;
 
     q27_agent_worker_state state;
     int init_done;
@@ -463,6 +464,7 @@ static void *worker_main(void *opaque) {
         engine = NULL;
     }
     if (engine) q27_agent_engine_set_mtp_width(engine, worker->mtp_width);
+    if (engine) q27_agent_engine_set_suffix_width(engine, worker->suffix_width);
     if (engine) worker->xml_dialect = q27_agent_engine_tool_dialect_xml(engine);
 
     pthread_mutex_lock(&worker->mu);
@@ -609,6 +611,7 @@ q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
                                              uint32_t context,
                                              const char *workspace_root,
                                              uint32_t mtp_width, uint32_t kv_kind,
+                                             uint32_t suffix_width,
                                              char *error, size_t error_cap) {
     if (!model_path || !tokenizer_path || !workspace_root) {
         copy_error(error, error_cap,
@@ -632,6 +635,7 @@ q27_agent_worker *q27_agent_worker_start_at(const char *model_path,
     worker->context = context;
     worker->mtp_width = mtp_width;
     worker->kv_kind = kv_kind;
+    worker->suffix_width = suffix_width;
     worker->state = Q27_WORKER_STARTING;
     struct stat workspace_stat;
     if (!worker->model_path || !worker->tokenizer_path ||
@@ -692,7 +696,7 @@ q27_agent_worker *q27_agent_worker_start(const char *model_path,
                                           uint32_t context,
                                           char *error, size_t error_cap) {
     return q27_agent_worker_start_at(model_path, tokenizer_path, context, ".",
-                                     /*mtp_width=*/0, /*kv_kind=*/0, error, error_cap);
+                                     /*mtp_width=*/0, /*kv_kind=*/0, /*suffix_width=*/0, error, error_cap);
 }
 
 q27_agent_status q27_agent_worker_submit(

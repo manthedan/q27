@@ -153,9 +153,13 @@ class MetalEngine {
     // the next pending token. remaining must be >= 2 (the caller emits the
     // final token directly). burst, when non-null, reports whether this
     // round dispatched a batched verify (server /stats attribution).
+    // params/rng select the sampled variant (bursts via the sampled
+    // suffix_round; fallback rounds sample instead of taking the argmax).
     uint32_t suffix_step(SuffixDraft& drafter, uint32_t pending, uint32_t remaining,
                          uint32_t eos, uint32_t width, uint32_t minimum_match,
-                         std::vector<uint32_t>& committed, bool* burst = nullptr);
+                         std::vector<uint32_t>& committed, bool* burst = nullptr,
+                         const SamplingParams* params = nullptr,
+                         std::mt19937_64* rng = nullptr);
     // Suffix-burst diagnostics for the last generate_suffix run: rounds that
     // fell back to serial, and fired-burst lane counts by full-tile bucket.
     struct SuffixStats {
@@ -281,8 +285,17 @@ class MetalEngine {
     // Suffix-burst round: oracle_round's caller-lane verify machinery with
     // mtp_round's real acceptance walk and early-EOS clamp. lanes[0] must be
     // the pending token; live = 2..VERIFY_CHUNK_MAX. Returns the next pending.
+    // With params (temperature > 0) and rng, acceptance is exact rejection
+    // sampling of the served distribution against the deterministic drafts
+    // (spec_rejection_accept, as mtp_sample_round) instead of the argmax walk.
     uint32_t suffix_round(uint32_t remaining, uint32_t eos, const uint32_t* lanes,
-                          uint32_t live, std::vector<uint32_t>& committed);
+                          uint32_t live, std::vector<uint32_t>& committed,
+                          const SamplingParams* params = nullptr,
+                          std::mt19937_64* rng = nullptr);
+    // Served per-lane distributions of the last verify batch (clogits_ rows):
+    // GPU top-k when top_k is set, else full-row readback.
+    std::vector<ServedDistribution> lane_distributions(uint32_t live, const SamplingParams& params);
+    bool last_lane_topk_ = false;   // lane_distributions took the GPU top-k path
 
     std::shared_ptr<Snapshot> capture_state();
     void restore_state(const Snapshot& snapshot);

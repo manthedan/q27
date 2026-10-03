@@ -5,6 +5,7 @@
 
 #include "../../src/metal/metal_engine.h"
 #include "../../src/sampling.h"
+#include "../../src/suffixdraft.h"
 #include "../../src/tokenizer.h"
 #include "../../src/toolconstrain.h"
 #include "q27_agent_model.h"
@@ -143,6 +144,11 @@ struct q27_agent_engine {
     unsigned char tokenizer_sha1[20] = {0};
     uint32_t context;
     uint32_t mtp_width = 0; // 0 = serial; 2..12 = free-decode MTP quanta
+    // 0 = off; 2..VERIFY_CHUNK_MAX = greedy suffix-burst verification on
+    // packs without MTP (drafts from the transcript's own token stream).
+    uint32_t suffix_width = 0;
+    q27::SuffixDraft suffix_drafter;
+    std::vector<int> suffix_stream;
     bool xml_dialect = false;
     bool qwen38_profile = false;
 
@@ -230,6 +236,14 @@ extern "C" void q27_agent_engine_set_mtp_width(q27_agent_engine *engine,
     if (width == 1) width = 0;
     if (width > 12) width = 12;
     engine->mtp_width = width;
+}
+
+extern "C" void q27_agent_engine_set_suffix_width(q27_agent_engine *engine,
+                                                  uint32_t width) {
+    if (!engine) return;
+    if (width < 2) width = 0;
+    if (width > q27::MetalEngine::VERIFY_CHUNK_MAX) width = q27::MetalEngine::VERIFY_CHUNK_MAX;
+    engine->suffix_width = width;
 }
 
 extern "C" int q27_agent_engine_tool_dialect_xml(
@@ -977,12 +991,32 @@ extern "C" q27_agent_status q27_agent_generate(
                 engine->session->chunked_prefill() && remaining >= 2 &&
                 !tools_masking && !tools_may_engage && !sample_plain &&
                 !think_budget_armed;
+            // Suffix bursts: same gates, greedy only (the verify argmax is the
+            // greedy contract), packs without MTP. Rounds whose suffix match
+            // is too short fall back to one serial step inside suffix_step.
+            const bool can_suffix =
+                !can_mtp && engine->suffix_width >= 2 &&
+                !engine->session->has_mtp() &&
+                engine->session->chunked_prefill() && remaining >= 2 &&
+                !tools_masking && !tools_may_engage && !use_sample &&
+                !think_budget_armed;
 
-            if (can_mtp) {
+            if (can_mtp || can_suffix) {
                 std::vector<uint32_t> committed;
                 const uint32_t pos_before = engine->session->position();
                 uint32_t next_pending;
-                if (use_sample) {
+                if (can_suffix) {
+                    // The ledger is the committed stream (prompt + emitted,
+                    // excluding the pending token); sync() is incremental
+                    // and rebuilds if a dropped burst tail diverged it.
+                    const auto& ledger = engine->agent_session.tokens();
+                    engine->suffix_stream.assign(ledger.begin(), ledger.end());
+                    engine->suffix_drafter.sync(engine->suffix_stream);
+                    next_pending = engine->session->suffix_step(
+                        engine->suffix_drafter, current, remaining, eos,
+                        engine->suffix_width,
+                        q27::MetalEngine::SUFFIX_MIN_MATCH, committed);
+                } else if (use_sample) {
                     next_pending = engine->session->mtp_sample_round(
                         current, remaining, eos, engine->mtp_width, live_width,
                         params, rng, committed);

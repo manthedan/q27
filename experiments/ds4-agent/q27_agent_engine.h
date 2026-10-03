@@ -55,6 +55,8 @@ void q27_agent_engine_close(q27_agent_engine *engine);
 // active masks stay serial so JSON stays fail-closed. Budget-armed thinking
 // also stays serial so the per-token think-budget check can fire.
 void q27_agent_engine_set_mtp_width(q27_agent_engine *engine, uint32_t width);
+// Greedy suffix-burst width (0 = off; 2..48), packs without MTP.
+void q27_agent_engine_set_suffix_width(q27_agent_engine *engine, uint32_t width);
 uint32_t q27_agent_engine_mtp_width(const q27_agent_engine *engine);
 int q27_agent_engine_tool_dialect_xml(const q27_agent_engine *engine);
 

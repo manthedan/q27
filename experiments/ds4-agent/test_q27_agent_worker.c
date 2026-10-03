@@ -43,6 +43,10 @@ void q27_agent_engine_close(q27_agent_engine *engine) {
     free(engine);
 }
 
+void q27_agent_engine_set_suffix_width(q27_agent_engine *engine, uint32_t width) {
+    (void)engine;
+    (void)width;
+}
 void q27_agent_engine_set_mtp_width(q27_agent_engine *engine, uint32_t width) {
     (void)engine;
     (void)width;

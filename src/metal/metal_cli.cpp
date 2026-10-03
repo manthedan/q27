@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text] "
-                "[-n count] [--ctx count] [--mtp width] [--kv fp16|turbo3|q8] [--prefill chunk|serial] "
+                "[-n count] [--ctx count] [--mtp width | --suffix width] [--kv fp16|turbo3|q8] [--prefill chunk|serial] "
                 "[--temperature T --top-p P --top-k K --seed S] [--dump-token-ids file]\n",
                 argv[0]);
         return 1;
@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
         const std::string model_path = argv[1];
         const std::string tokenizer_path = argv[2];
         std::string token_list, prompt_text, dump_token_ids;
-        uint32_t count = 1, context = 128, mtp_width = 0;
+        uint32_t count = 1, context = 128, mtp_width = 0, suffix_width = 0;
         q27::SamplingParams sampling;
         bool validate_only = false, serial_prefill = false;
         q27::KvKind kv_kind = q27::KvKind::F16;
@@ -105,6 +105,7 @@ int main(int argc, char** argv) {
             else if (arg == "-n" && i + 1 < argc) count = parse_u32(argv[++i], "-n");
             else if (arg == "--ctx" && i + 1 < argc) context = parse_u32(argv[++i], "--ctx");
             else if (arg == "--mtp" && i + 1 < argc) mtp_width = parse_u32(argv[++i], "--mtp");
+            else if (arg == "--suffix" && i + 1 < argc) suffix_width = parse_u32(argv[++i], "--suffix");
             else if (arg == "--kv" && i + 1 < argc) {
                 const std::string mode = argv[++i];
                 kv_kind = q27::parse_kv_kind(mode);
@@ -129,6 +130,10 @@ int main(int argc, char** argv) {
         q27::validate_sampling(sampling);
         if (token_list_supplied && prompt_supplied)
             throw std::runtime_error("--tokens and --prompt are mutually exclusive");
+        if (mtp_width && suffix_width)
+            throw std::runtime_error("--mtp and --suffix are mutually exclusive");
+        if (sampling.temperature > 0 && suffix_width)
+            throw std::runtime_error("--suffix is greedy-only");
         if (sampling.temperature > 0 && mtp_width)
             throw std::runtime_error("sampling cannot be combined with --mtp");
         if (validate_only) {
@@ -174,6 +179,7 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> generated = sampling.temperature > 0
             ? engine.generate_sampled(prompt, count, sampling)
             : mtp_width ? engine.generate_mtp(prompt, count, mtp_width)
+            : suffix_width ? engine.generate_suffix(prompt, count, suffix_width)
                         : engine.generate(prompt, count);
         if (!dump_token_ids.empty()) write_token_ids(dump_token_ids, generated);
 
@@ -183,6 +189,15 @@ int main(int argc, char** argv) {
         const double elapsed = std::chrono::duration<double>(finished - loaded).count();
         fprintf(stderr, "%zu tokens in %.2f s (%.2f tok/s), position %u\n",
                 generated.size(), elapsed, generated.size() / elapsed, engine.position());
+        if (suffix_width) {
+            const auto spec = engine.last_spec_stats();
+            const auto bursts = engine.last_suffix_stats();
+            fprintf(stderr, "suffix: %llu burst rounds, %llu serial fallbacks, %llu drafts, %llu accepted\n",
+                    static_cast<unsigned long long>(bursts.burst_rounds),
+                    static_cast<unsigned long long>(bursts.fallback_rounds),
+                    static_cast<unsigned long long>(spec.drafted),
+                    static_cast<unsigned long long>(spec.accepted));
+        }
         if (mtp_width) {
             const auto spec = engine.last_spec_stats();
             fprintf(stderr, "speculation: %llu rounds, %llu drafts, %llu accepted (%.1f%%)\n",
