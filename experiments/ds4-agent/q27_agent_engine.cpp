@@ -1015,6 +1015,10 @@ extern "C" q27_agent_status q27_agent_generate(
                 max_think > 0 && think_span.in_think;
             const bool can_mtp =
                 live_width >= 2 && engine->session->has_mtp() &&
+                // Prefill ends in step(), which invalidates the MTP lanes; until
+                // the agent warms them (needs an MTP pack to verify), decode
+                // serially rather than fail the turn in mtp_round().
+                engine->session->mtp_cache_valid() &&
                 engine->session->chunked_prefill() && remaining >= 2 &&
                 !tools_masking && !tools_may_engage && !sample_plain &&
                 !think_budget_armed;

@@ -3103,8 +3103,12 @@ int main(int argc, char **argv) {
             if (fp1_bye_reason &&
                 (!strcmp(fp1_bye_reason, "stdin_eof") ||
                  !strcmp(fp1_bye_reason, "quit"))) {
-                ok = 1;
-                interrupted = 0;
+                // Recoverable turn failures already reset ok inside the
+                // loop, so ok == 0 here is fatal (worker ERROR, failed
+                // durable save): keep it, and let bye carry "error" rather
+                // than reporting a clean quit with exit status 0.
+                if (ok) interrupted = 0;
+                else fp1_bye_reason = NULL;
             }
         }
         q27_fp1_control_stop();

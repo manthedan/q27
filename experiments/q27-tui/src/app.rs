@@ -69,6 +69,8 @@ pub struct Model {
     pub assistant_buf: String,
     /// Trailing bytes of a UTF-8 character split across token deltas.
     pub assistant_utf8_tail: Vec<u8>,
+    /// Same carry for the open tool card (shell output arrives in 16 KiB reads).
+    pub tool_utf8_tail: Vec<u8>,
     pub last_error: Option<String>,
     pub status_line: String,
     pub input_enabled: bool,
@@ -106,6 +108,7 @@ impl Default for Model {
             scrollback: Vec::new(),
             assistant_buf: String::new(),
             assistant_utf8_tail: Vec::new(),
+            tool_utf8_tail: Vec::new(),
             last_error: None,
             status_line: String::new(),
             input_enabled: false,
@@ -299,10 +302,15 @@ impl Model {
                 // Binary chunks arrive base64 with invalid UTF-8: show a
                 // visible placeholder instead of dropping them (r11 P2),
                 // and sanitize control bytes before render (r11 P2).
-                let t = match ev.payload_text() {
+                // A read boundary can split one UTF-8 character: carry an
+                // incomplete tail into the next chunk; only genuinely invalid
+                // bytes make the chunk a binary placeholder.
+                let bytes = ev.payload_bytes().unwrap_or_default();
+                self.tool_utf8_tail.extend_from_slice(&bytes);
+                let t = match take_utf8_prefix(&mut self.tool_utf8_tail) {
                     Some(t) => sanitize_terminal_text(&t),
                     None => {
-                        let n = ev.payload_bytes().map(|b| b.len()).unwrap_or(0);
+                        let n = std::mem::take(&mut self.tool_utf8_tail).len();
                         format!("\u{27e8}binary chunk: {n} bytes\u{27e9}")
                     }
                 };
@@ -351,6 +359,17 @@ impl Model {
                 }
             }
             "tool_done" => {
+                if !self.tool_utf8_tail.is_empty() {
+                    let tail = std::mem::take(&mut self.tool_utf8_tail);
+                    let t = sanitize_terminal_text(&String::from_utf8_lossy(&tail));
+                    if let Some(Block::Tool { body, open: true, .. }) =
+                        self.scrollback.iter_mut().rev().find(|b| {
+                            matches!(b, Block::Tool { open: true, .. })
+                        })
+                    {
+                        body.push_str(&t);
+                    }
+                }
                 let exit = ev.tool_exit_code;
                 if let Some(Block::Tool {
                     exit: e, open, ..
@@ -406,6 +425,11 @@ impl Model {
                     .payload_text()
                     .or_else(|| ev.text.clone())
                     .unwrap_or_default());
+                // Error notices (e.g. a failed auto-save) are the latest
+                // error too: a later bye:error must not report an older one.
+                if sev == "error" && !text.is_empty() {
+                    self.last_error = Some(text.clone());
+                }
                 self.scrollback.push(Block::Notice {
                     severity: sev,
                     text,
@@ -606,9 +630,35 @@ fn drain_utf8(buf: &mut Vec<u8>) -> String {
     out
 }
 
+/// Valid UTF-8 prefix of `buf`, leaving only an incomplete trailing
+/// character (at most 3 bytes) behind; None if `buf` has invalid bytes.
+fn take_utf8_prefix(buf: &mut Vec<u8>) -> Option<String> {
+    let valid = match std::str::from_utf8(buf) {
+        Ok(_) => buf.len(),
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => return None,
+    };
+    let rest = buf.split_off(valid);
+    let out = String::from_utf8(std::mem::replace(buf, rest)).ok()?;
+    Some(out)
+}
+
 #[cfg(test)]
 mod utf8_tests {
-    use super::drain_utf8;
+    use super::{drain_utf8, take_utf8_prefix};
+
+    #[test]
+    fn tool_chunks_carry_split_character_but_flag_binary() {
+        let euro = "€".as_bytes();
+        let mut tail = b"ok ".to_vec();
+        tail.extend_from_slice(&euro[..1]);
+        assert_eq!(take_utf8_prefix(&mut tail).as_deref(), Some("ok "));
+        tail.extend_from_slice(&euro[1..]);
+        assert_eq!(take_utf8_prefix(&mut tail).as_deref(), Some("€"));
+        assert!(tail.is_empty());
+        let mut bin = vec![0xff, 0xfe, b'a'];
+        assert_eq!(take_utf8_prefix(&mut bin), None);
+    }
 
     #[test]
     fn split_character_is_carried_across_deltas() {
@@ -639,6 +689,28 @@ mod turn_order_tests {
 
     fn ev(json: &str) -> ServerEvent {
         ServerEvent::parse_line(json).unwrap()
+    }
+
+    #[test]
+    fn error_notice_supersedes_older_rejection() {
+        let mut m = Model::default();
+        m.apply(&ev(r#"{"type":"rejected","text":"queue full"}"#));
+        m.apply(&ev(r#"{"type":"notice","severity":"error","text":"durable session auto-save failed"}"#));
+        assert_eq!(m.last_error.as_deref(), Some("durable session auto-save failed"));
+    }
+
+    #[test]
+    fn tool_output_split_character_renders() {
+        let mut m = Model::default();
+        m.apply(&ev(r#"{"type":"tool_start","tool_kind":"shell"}"#));
+        // "€" = e2 82 ac, split across two base64 chunks.
+        m.apply(&ev(r#"{"type":"tool_output","data_b64":"4oI="}"#));
+        m.apply(&ev(r#"{"type":"tool_output","data_b64":"rA=="}"#));
+        m.apply(&ev(r#"{"type":"tool_done","tool_exit_code":0}"#));
+        match m.scrollback.last() {
+            Some(Block::Tool { body, .. }) => assert_eq!(body, "€"),
+            _ => panic!("no tool block"),
+        }
     }
 
     #[test]

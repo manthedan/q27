@@ -169,6 +169,9 @@ class MetalEngine {
         uint64_t lanes_le16 = 0, lanes_32 = 0, lanes_48 = 0; // dispatched live widths
     };
     SuffixStats last_suffix_stats() const { return last_suffix_stats_; }
+    // MTP lane state matches the current prefix (step() and chunked prefill
+    // invalidate it; warm_mtp prefill and MTP rounds keep it).
+    bool mtp_cache_valid() const { return mtp_cache_valid_; }
     uint32_t ingest_prompt(const std::vector<uint32_t>& tokens, bool warm_mtp,
                            bool reset_first = true);
     // One bounded token-serial prefill quantum. Unlike step(), this optionally
