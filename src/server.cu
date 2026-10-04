@@ -750,11 +750,6 @@ int main(int argc, char** argv) {
     // so the last projected slot could be skipped with its pool share unused).
     const size_t kSlotPad = fixed_env > 0 ? 0 : (256ull << 20);
     const double kPoolSlackFixed = 0.15e9;
-    const size_t ENG_FIXED_BYTES = fixed_env > 0
-        ? (size_t)fixed_env // the measured stack, exactly (see Q27_FIXED_STACK_GB above)
-        : (size_t)(kEngBase + kEngGraphs + kEngGdn +
-                   (pf_arena_on ? 0.25e9 : 1.0e9) -
-                   (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave));
 
     // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17), and
     // multi-slot-aware since 2026-07-18: each borrowing engine carries its
@@ -769,6 +764,18 @@ int main(int argc, char** argv) {
     // will construct N engines from this same pair.)
     q27::Model shared_model = q27::Model::open(model);
     validate_arch(shared_model); // before the upload, not in Engine::init after it
+    // Q27_DRAFT_VOCAB's gathered head is allocated per engine, AFTER the
+    // pool below has taken its VRAM, so it is part of every slot's fixed
+    // stack (2026-10-04: a 63 MB head OOMed an 8 GB-card boot at construction).
+    const DraftVocabPlan dv_plan = draft_vocab_plan(shared_model);
+    const double dv_reserve = (double)dv_plan.bytes();
+    if (dv_plan.on) fprintf(stderr, "Q27_DRAFT_VOCAB: reserving %.0f MB per slot for the draft head\n", dv_reserve / 1e6);
+    const size_t ENG_FIXED_BYTES = (fixed_env > 0
+        ? (size_t)fixed_env // the measured stack, exactly (see Q27_FIXED_STACK_GB above)
+        : (size_t)(kEngBase + kEngGraphs + kEngGdn +
+                   (pf_arena_on ? 0.25e9 : 1.0e9) -
+                   (constrain_tools ? 0.0 : kEngMonoSave) - (sampled_on ? 0.0 : kEngSampSave)))
+        + (size_t)dv_reserve;
     q27::set_tool_dialect_for_model(shared_model.meta_json); // per-model tool dialect (BUILDLOG 2026-08-14)
     q27::DeviceModel shared_dm(shared_model);
     fprintf(stderr, "uploading weights...\n");
@@ -888,10 +895,10 @@ int main(int argc, char** argv) {
             // the 262144/57344/... single-slot picks). Reuses the hoisted
             // width/arch-scaled terms; kEngGdn is the M1 record+fold figure
             // (committed + snap + arena -- the spare role sets are gone).
-            const double single_fixed = fixed_env > 0 ? fixed_env
-                                        : base + kEngGraphs + kEngGdn -
-                                          (constrain_tools ? 0.0 : kEngMonoSave) -
-                                          (sampled_on ? 0.0 : kEngSampSave);
+            const double single_fixed = (fixed_env > 0 ? fixed_env
+                                         : base + kEngGraphs + kEngGdn -
+                                           (constrain_tools ? 0.0 : kEngMonoSave) -
+                                           (sampled_on ? 0.0 : kEngSampSave)) + dv_reserve;
             long budget, c;
             if (n_slots <= 1) {
                 // sm_86/89 carry a fatter, ctx-scaled graph zoo + a larger

@@ -23,8 +23,8 @@ set -euo pipefail
 DIR=${BONSAI2_DIR:-$HOME/bonsai2}
 Q27_REF=${Q27_REF:-v0.14.1}          # the q27 release this was tested with (T3 pack + the faster T3 GEMV)
 HF=https://huggingface.co/signalnine/Bonsai-2-27B-q27/resolve/main
-PACK=bonsai2-27b-t3-slim.q27; STACK=0.6
-if [ "${1:-}" = "--mtp" ]; then PACK=bonsai2-27b-t3-mtp-slim.q27; STACK=0.8; fi
+PACK=bonsai2-27b-t3-slim.q27; STACK=0.6; DV=0
+if [ "${1:-}" = "--mtp" ]; then PACK=bonsai2-27b-t3-mtp-slim.q27; STACK=0.8; DV=40960; fi
 PORT=${PORT:-8090}
 
 say() { printf '\n== %s\n' "$*"; }
@@ -76,8 +76,11 @@ cat > "$DIR/run.sh" <<EOF
 # Q27_FIXED_STACK_GB is the engine's measured non-KV footprint for this build;
 # the KV cache takes whatever VRAM is left (turbo5k format on Ampere).
 # Q27_BATCH=0 = no multi-slot conductor: one slot decodes ~20% faster without it.
+# Q27_DRAFT_VOCAB (--mtp pack, q27 >= v0.14.3; older builds ignore it): the MTP
+# draft head reads a 63 MB subset of the vocab instead of 318 MB, +2-6% decode
+# on a 3090 at the 8 GB point for ~3K tokens of window. 0 turns it off.
 cd "$DIR"
-exec env Q27_FIXED_STACK_GB=$STACK Q27_BATCH=0 ./q27/build/q27-server-12g models/$PACK models/qwen38-27b-mtp.tok \\
+exec env Q27_FIXED_STACK_GB=$STACK Q27_BATCH=0 Q27_DRAFT_VOCAB=\${Q27_DRAFT_VOCAB:-$DV} ./q27/build/q27-server-12g models/$PACK models/qwen38-27b-mtp.tok \\
   --slots 1 --host 127.0.0.1 --port $PORT \\
   --think --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0 "\$@"
 EOF

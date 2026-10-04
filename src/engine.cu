@@ -1485,6 +1485,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < n; k++) out.push_back(em[k]);
             if (e.suffix_on)
                 for (int k = 0; k < n; k++) e.sfx.append(em[k]);
+            e.dv_observe(em, n); // Q27_DRAFT_VOCAB (no-op when off)
             rounds++;
             total_emitted += n;
             hist[n - 1]++;

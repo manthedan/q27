@@ -56,6 +56,8 @@ for leg in ${LEGS:-plain d2}; do
     plain) run_leg plain -E Q27_BATCH=0 -E Q27_FIXED_STACK_GB=${FIXED:-0.9} ;;
     fusedplain) run_leg fusedplain -E Q27_FIXED_STACK_GB=${FIXED:-0.9} ;;   # the server default: conductor on, k=1 fused rounds
     mtp)   run_leg mtp -E Q27_BATCH=0 -E Q27_FIXED_STACK_GB=${FIXED:-0.9} ;;
+    mtppmin) run_leg mtppmin -E Q27_BATCH=0 -E Q27_FIXED_STACK_GB=${FIXED:-0.9} -E Q27_PMIN=0.3 ;;   # full head, drafting knob moved: the server-greedy draft-sensitivity control
+    mtpdv) run_leg mtpdv -E Q27_BATCH=0 -E Q27_FIXED_STACK_GB=${FIXED:-0.9} -E Q27_DRAFT_VOCAB=${DV:-40960} ;;   # reduced-vocab draft head (BUILDLOG (bb))
     d2)    run_leg d2 -E Q27_BATCH=0 -E Q27_FIXED_STACK_GB=${FIXED:-0.9} -E Q27_DFLASH2=/mnt/ai/models/bonsai2-27b-dflash2-bf16/bonsai2-dflash2-q8-serve.d2w -E Q27_DFLASH2_RESERVE_GB=1 ;;
   esac
 done

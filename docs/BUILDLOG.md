@@ -15714,6 +15714,42 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-04 (bc): Q27_DRAFT_VOCAB on Bonsai 8 GB -- reserved in the estimator, generated tokens join the subset, on in the --mtp installer
+
+**The estimator didn't know about the head.** The KV pool is sized before any
+engine exists, and `dv_init` allocated the gathered head afterwards. On the 8 GB
+point (3090 + hog, T3+MTP slim pack) the 63 MB head OOMed at construction.
+`draft_vocab_plan()` (engine.cuh) now sizes the head once, and both the
+allocation and the server's per-slot fixed stack (`ENG_FIXED_BYTES`,
+`single_fixed`) read it, so the pool gives up those bytes (0.34 -> 0.29 GB at
+16K). The allocation is also soft now: a failed malloc keeps the full head with
+a warning. The host id mirror is pinned (the pageable DMA path flips bits on
+this host).
+
+**Generated tokens weren't draftable.** The CLI on the 3090 (Bonsai T3+MTP, the
+5-token salad prompt, greedy) was bitwise but slower: 2.91 -> 2.55 tok/round,
+93.2 -> 84.5 t/s. That output loops on tokens outside both the static ids and
+the 5-token prompt: 81 distinct, 213 occurrences in 1,500 tokens. `dv_observe`
+now appends each committed token that is in neither set to the next free
+context row (only rows past every in-flight copy, so no sync). The prompt fills
+at most 3/4 of the context rows (up to 1K held back). Result: 2.77 tok/round,
+92.1 t/s (still bitwise). The remaining gap is first sightings, which the full
+head drafts and the subset can't.
+
+**Gate (3090 at the 8 GB point, 8.3 GB free, turbo5k, --ctx 16384, Q27_BATCH=0, server greedy):**
+
+    t/s short/cities/long/code   full head 120.9/123.5/103.1/108.4   draft vocab 124.8/126.8/105.1/114.7  (+3.2/+2.7/+1.9/+5.8%)
+    control: full head, Q27_PMIN 0.5 -> 0.3   texts diverge on 3 of 4 prompts (chars 211, 197, 1520)
+    draft vocab vs full head                   diverges on long/code (chars 936, 366)
+    5090 CLI (Qwen3.8, after dv_observe)       md5 8f735a13 both ways, 169.9 -> 184.1 t/s
+
+Server greedy on the 3090 is draft-sensitive too: the full head with only PMIN
+moved diverges earlier than the subset does. The CLI is bitwise on both GPUs.
+`tools/install-bonsai2-8gb.sh --mtp` now writes `Q27_DRAFT_VOCAB=40960` into
+run.sh (overridable; builds before this ignore it). That costs ~3K tokens of
+window at 18.6 KB/token. The non-MTP default pack has no draft head and is
+unchanged. Still unmeasured: real agentic traffic, and a 3060-class card.
+
 ## 2026-10-04 (bb): reduced-vocab MTP draft head (Q27_DRAFT_VOCAB) -- draft steps 37% cheaper, ladder +4-18% on the 5090, opt-in
 
 Idea from Strata's `--draft-vocab` (Qwen3.8-Flash-Next engine): the MTP draft
