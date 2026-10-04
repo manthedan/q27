@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# q27-report — assemble a diagnostic bundle a user can send back to the
+# maintainer. This is the remote-development loop for the large quants
+# (q6/q6k/q8) the maintainer's laptop cannot run.
+#
+#   q27-report                 # bench --fast on installed packs, then bundle
+#   q27-report --full          # bench --full, then bundle
+#   q27-report --full --tiers q8,q6k,q6,default   # bench just these packs
+#   q27-report --from <dir>    # bundle an existing bench run dir (no re-run)
+#   q27-report --out <path>    # bundle output path (default ./q27-report-<ts>.tgz)
+#
+# The bundle contains: machine header, thermal anchors, every `result:` line,
+# per-leg stdout/stderr logs, generation samples + md5, and a MANIFEST with
+# artifact names + md5 + quant_policy. No model weights, no prompts beyond
+# the fixed canonical one, nothing private — it is safe to email.
+set -u
+SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+HERE="$(cd "$(dirname "$SRC")" && pwd)"
+. "$HERE/../lib/q27_bench_lib.sh"
+
+MODE="fast"
+FROM=""
+OUT=""
+TIERS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fast) MODE="fast"; shift ;;
+        --full) MODE="full"; shift ;;
+        --from) FROM="$2"; shift 2 ;;
+        --out) OUT="$2"; shift 2 ;;
+        --tiers) TIERS="$2"; shift 2 ;;
+        --help|-h) sed -n '2,17p' "$0"; exit 0 ;;
+        *) echo "q27-report: unknown arg $1" >&2; exit 2 ;;
+    esac
+done
+# Normalize --tiers "a,b,c" -> "a b c" for the bench positional args.
+TIERS="$(printf '%s' "$TIERS" | tr ',' ' ')"
+
+TS="$(date +%Y%m%d-%H%M%S)"
+[ -z "$OUT" ] && OUT="$PWD/q27-report-$TS.tgz"
+
+# 1) Get a bench run dir.
+if [ -n "$FROM" ]; then
+    RUN_DIR="$FROM"
+    [ -d "$RUN_DIR" ] || { echo "q27-report: --from dir $RUN_DIR not found" >&2; exit 1; }
+else
+    BENCH="$(command -v q27-bench || echo "$HERE/q27-bench")"
+    echo "q27-report: running q27-bench --$MODE $TIERS ..."
+    # shellcheck disable=SC2086
+    "$BENCH" "--$MODE" $TIERS || echo "q27-report: bench had failures (bundling anyway)"
+    # newest bench run dir
+    RUN_DIR="$(ls -dt "$(q27_home)"/../bench/*/ 2>/dev/null | head -1)"
+    RUN_DIR="${RUN_DIR%/}"
+    [ -d "$RUN_DIR" ] || { echo "q27-report: no bench run dir found" >&2; exit 1; }
+fi
+echo "q27-report: bundling $RUN_DIR"
+
+# 2) Stage the bundle.
+STAGE="$(mktemp -d)/q27-report-$TS"
+mkdir -p "$STAGE"
+trap 'rm -rf "$(dirname "$STAGE")"' EXIT
+
+{
+    q27_machine_header
+    q27_thermal_snapshot bundle
+} > "$STAGE/machine.txt"
+
+# Copy every leg log + the bench.log, and pull the result lines together.
+cp "$RUN_DIR"/* "$STAGE"/ 2>/dev/null || true
+grep -h '^result: ' "$RUN_DIR"/*.log 2>/dev/null > "$STAGE/results.txt" || true
+grep -h '^result: ' "$RUN_DIR"/bench.log 2>/dev/null > "$STAGE/results.txt" || true
+
+# 3) MANIFEST: per requested (--tiers) or installed pack, the identity the
+# maintainer needs.
+manifest_names() {
+    if [ -n "$TIERS" ]; then printf '%s\n' $TIERS; else q27_registry_names; fi
+}
+{
+    echo "# q27 report manifest ($TS)"
+    for n in $(manifest_names); do
+        art="$(q27_artifact_path "$n" 2>/dev/null || true)" || continue
+        [ -n "$art" ] || continue
+        echo "pack: $n"
+        echo "  artifact: $(basename "$art")"
+        echo "  md5: $(md5 -q "$art" 2>/dev/null || echo '?')"
+        echo "  quant_policy: $(q27_registry_field "$n" 3)"
+        echo "  experimental: $(q27_registry_field "$n" 11)"
+        echo "  expect_md5: $(q27_registry_field "$n" 5)"
+    done
+} > "$STAGE/MANIFEST.txt"
+
+# 4) Tar it up.
+tar -czf "$OUT" -C "$(dirname "$STAGE")" "$(basename "$STAGE")"
+echo "q27-report: wrote $OUT ($(du -h "$OUT" | cut -f1))"
+echo "q27-report: send this file back. It contains no model weights and no private prompts."

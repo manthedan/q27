@@ -1,0 +1,19 @@
+#!/bin/sh
+# Source-checkout launcher for the native lock helper. Release assembly replaces
+# this shim with build/q27-lock-exec so packaged installs need no Python runtime.
+set -u
+SRC="$0"
+while [ -L "$SRC" ]; do
+    LINK="$(readlink "$SRC")"
+    case "$LINK" in
+        /*) SRC="$LINK" ;;
+        *) SRC="$(dirname "$SRC")/$LINK" ;;
+    esac
+done
+HERE="$(cd "$(dirname "$SRC")" && pwd)"
+NATIVE="${Q27_LOCK_EXEC_BIN:-$HERE/../../build/q27-lock-exec}"
+if [ ! -x "$NATIVE" ]; then
+    echo "q27: native q27-lock-exec not built; run make build/q27-lock-exec" >&2
+    exit 75
+fi
+exec "$NATIVE" "$@"

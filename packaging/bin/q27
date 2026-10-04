@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+# q27 — supervisor for the q27 Metal engine: model install, switching,
+# serving, and benchmarking. The engine binaries (q27-metal*) stay narrow
+# and dependency-free; this wrapper owns the multi-GB weight lifecycle and
+# the one-model-at-a-time discipline so users don't have to.
+#
+#   q27 pull [name]     recommend by RAM, or fetch a specific pack (resumable,
+#                       checksum-verified) into ~/.q27/models/<name>/
+#   q27 serve [name]    start the server on a pack (refuses if one is running)
+#   q27 agent [name]    start the native coding agent (default: b1; prefers
+#                       Ratatui q27-tui / FP1 over classic linenoise — see Q27_AGENT_UI)
+#   q27 ls              list installed packs + sizes + which is servable
+#   q27 rm <name>       delete a pack's cache
+#   q27 bench [--fast|--full] [packs..]   run the benchmark suite
+#   q27 report [...]    build a send-back diagnostic bundle
+#   q27 recommend       print the pack + context table for THIS machine
+#   q27 help
+set -u
+# Resolve symlinks (Homebrew links bin/q27 -> libexec/q27/bin/q27) so the
+# relative lib/models/tools lookups land beside the REAL script, not the link.
+SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+HERE="$(cd "$(dirname "$SRC")" && pwd)"
+. "$HERE/../lib/q27_bench_lib.sh"
+
+CMD="${1:-help}"; [ $# -gt 0 ] && shift
+
+ram_gb() { echo $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )); }
+
+q27_model_profile() {
+    local n="$1" profile
+    profile="$(q27_registry_field "$n" 13)" || return 1
+    case "$profile" in
+        bonsai-agent-v1|qwen36-v1|qwen38-thinking-v1)
+            printf '%s' "$profile" ;;
+        *)
+            echo "q27: pack $n has unknown model profile '${profile:-<empty>}'" >&2
+            return 1 ;;
+    esac
+}
+
+# ---- recommendation logic: largest pack that fits with ctx headroom ----
+# macOS caps GPU-usable memory ~65-75% of RAM; weights are mmap'd/pageable,
+# but we recommend against the working-set budget with headroom for the OS
+# and the user's browser. ctx budget scales with what is left after weights.
+recommend_pack() {
+    local ram; ram="$(ram_gb)"
+    # Walk registry from largest min_ram to smallest; pick the first that fits
+    # comfortably (ram >= min_ram) and is not experimental.
+    local best="" bestmin=0 n min exp
+    for n in $(q27_registry_names); do
+        exp="$(q27_registry_field "$n" 11)"
+        [ "$exp" = "yes" ] && continue
+        min="$(q27_registry_field "$n" 7)"
+        if [ "$ram" -ge "$min" ] && [ "$min" -gt "$bestmin" ]; then best="$n"; bestmin="$min"; fi
+    done
+    printf '%s' "$best"
+}
+
+cmd_recommend() {
+    local ram; ram="$(ram_gb)"
+    echo "This machine: ${ram} GB unified memory"
+    echo
+    printf '%-9s %-8s %-10s %-6s %s\n' "pack" "weights" "min_ram" "fits?" "note"
+    local n wg min exp fits
+    for n in $(q27_registry_names); do
+        wg="$(q27_registry_field "$n" 6)"; min="$(q27_registry_field "$n" 7)"; exp="$(q27_registry_field "$n" 11)"
+        if [ "$ram" -ge "$min" ]; then fits="yes"; else fits="NO"; fi
+        [ "$exp" = "yes" ] && fits="$fits(exp)"
+        printf '%-9s %-8s %-10s %-6s %s\n' "$n" "${wg}G" "${min}G" "$fits" "$(q27_registry_field "$n" 12 | cut -c1-60)"
+    done
+    echo
+    local rec; rec="$(recommend_pack)"
+    echo "Recommended pack for this machine: ${rec:-none (too little RAM)}"
+    echo "Context window: the wrapper sizes ctx to the memory left after weights"
+    echo "(see docs/MODELS.md for the full quant x context fit table)."
+}
+
+cmd_ls() {
+    local n art
+    printf '%-9s %-10s %-8s %s\n' "pack" "installed" "size" "path"
+    for n in $(q27_registry_names); do
+        if art="$(q27_artifact_path "$n" 2>/dev/null)"; then
+            printf '%-9s %-10s %-8s %s\n' "$n" "yes" "$(du -h "$art" 2>/dev/null | cut -f1)" "$art"
+        else
+            printf '%-9s %-10s\n' "$n" "-"
+        fi
+    done
+}
+
+cmd_rm() {
+    local n="${1:?usage: q27 rm <name>}"
+    q27_registry_field "$n" 1 >/dev/null 2>&1 || { echo "q27 rm: unknown pack $n" >&2; exit 1; }
+    local d; d="$(q27_home)/$n"
+    [ -d "$d" ] || { echo "q27 rm: $n not installed"; exit 0; }
+    echo "q27 rm: deleting $d ($(du -sh "$d" 2>/dev/null | cut -f1))"
+    rm -rf "$d"
+}
+
+q27_source_model() {
+    local name="$1" filename="$2" root p expected_sha expected_md5 actual
+    if [ -n "${Q27_SOURCE_ROOT:-}" ]; then
+        root="$Q27_SOURCE_ROOT"
+    else
+        root="$(cd "$HERE/../.." 2>/dev/null && pwd)" || return 1
+    fi
+    expected_sha="$(q27_registry_field "$name" 14)" || return 1
+    expected_md5="$(q27_registry_field "$name" 5)" || return 1
+    for p in "$root/models/$filename" "$root"/models/*/"$filename"; do
+        [ -f "$p" ] || continue
+        if [ -n "$expected_sha" ]; then
+            actual="$(q27_sha256_file "$p" 2>/dev/null)"
+            [ "$actual" = "$expected_sha" ] || continue
+        elif [ -n "$expected_md5" ]; then
+            actual="$(q27_md5_file "$p" 2>/dev/null)"
+            [ "$actual" = "$expected_md5" ] || continue
+        fi
+        printf '%s' "$p"; return 0
+    done
+    return 1
+}
+
+q27_source_tokenizer() {
+    local name="$1" root p tokfile toksha actual
+    if [ -n "${Q27_SOURCE_ROOT:-}" ]; then
+        root="$Q27_SOURCE_ROOT"
+    else
+        root="$(cd "$HERE/../.." 2>/dev/null && pwd)" || return 1
+    fi
+    tokfile="$(q27_registry_field "$name" 16)" || return 1
+    toksha="$(q27_registry_field "$name" 17)" || return 1
+    if [ -n "$tokfile" ]; then
+        [ -n "$toksha" ] || return 1
+        for p in "$root/models/$tokfile" "$root"/models/*/"$tokfile"; do
+            [ -f "$p" ] || continue
+            actual="$(q27_sha256_file "$p" 2>/dev/null)"
+            [ "$actual" != "$toksha" ] && continue
+            printf '%s' "$p"; return 0
+        done
+        return 1
+    fi
+    for p in "$root/models/qwen36-27b-mtp/qwen36-27b-mtp.tok" \
+             "$root"/models/*/*.tok; do
+        [ -f "$p" ] || continue
+        [ "$(head -c 4 "$p" 2>/dev/null)" = "Q27T" ] || continue
+        printf '%s' "$p"; return 0
+    done
+    return 1
+}
+
+q27_resident_consumer() {
+    pgrep -x q27-metal-server >/dev/null 2>&1 ||
+        pgrep -f '^([^[:space:]]*/)?q27-metal-server([[:space:]]|$)' \
+            >/dev/null 2>&1 ||
+        pgrep -x q27-agent >/dev/null 2>&1 ||
+        pgrep -f '^([^[:space:]]*/)?q27-agent([[:space:]]|$)' \
+            >/dev/null 2>&1 ||
+        pgrep -x q27-tui >/dev/null 2>&1 ||
+        pgrep -f '^([^[:space:]]*/)?q27-tui([[:space:]]|$)' \
+            >/dev/null 2>&1
+}
+
+q27_run_consumer() {
+    local run lock_exec
+    if q27_resident_consumer; then
+        echo "q27: a low-level q27 server or native agent is already running." >&2
+        return 1
+    fi
+    lock_exec="$HERE/q27-lock-exec"
+    [ -x "$lock_exec" ] || {
+        echo "q27: q27-lock-exec helper not found" >&2; return 1; }
+    run="${Q27_RUN_DIR:-${TMPDIR:-/tmp}/q27-$UID}"
+
+    # The helper takes a nonblocking kernel flock and then execs the consumer.
+    # Both exec steps preserve the wrapper PID, while the inherited lock fd is
+    # released by the kernel on every normal, error, signal, and crash exit.
+    exec "$lock_exec" "$run/consumer.lock" "$@"
+}
+
+cmd_serve() {
+    local n="${1:-$(recommend_pack)}"
+    [ -n "$n" ] || { echo "q27 serve: no pack fits this machine; see \`q27 recommend\`" >&2; exit 1; }
+    local art tok server model_profile
+    local -a serve_args=(--port 8080
+        --snapshot-dir "${Q27_SNAPSHOT_DIR:-$HOME/.q27/snapshots}"
+        --max-tokens-default "${Q27_MAX_TOKENS:-16384}")
+    art="$(q27_artifact_path "$n")" || { echo "q27 serve: $n not installed — run \`q27 pull $n\`" >&2; exit 1; }
+    tok="$(q27_tokenizer_path "$n")" || { echo "q27 serve: $n tokenizer missing — re-run \`q27 pull $n\`" >&2; exit 1; }
+    server="$(q27_bin q27-metal-server)" || { echo "q27 serve: q27-metal-server not found" >&2; exit 1; }
+    model_profile="$(q27_model_profile "$n")" || exit 1
+    case "$model_profile" in
+        qwen38-thinking-v1)
+            # Profile default is thinking-on. An explicit operator override
+            # remains available without coupling behavior to the pack name.
+            case "${Q27_SERVE_THINK:-1}" in
+                0|no|false) ;;
+                1|yes|true) serve_args+=(--think) ;;
+                *) echo "q27 serve: Q27_SERVE_THINK must be 0 or 1" >&2; exit 1 ;;
+            esac
+            serve_args+=(
+                --temperature-default "${Q27_SERVE_TEMPERATURE:-${Q27_METAL_TEMPERATURE_DEFAULT:-1.0}}"
+                --top-p-default "${Q27_SERVE_TOP_P:-${Q27_METAL_TOP_P_DEFAULT:-0.95}}"
+                --top-k-default "${Q27_SERVE_TOP_K:-${Q27_METAL_TOP_K_DEFAULT:-20}}"
+            )
+            ;;
+    esac
+    export Q27_MODEL_PROFILE="$model_profile"
+    echo "q27 serve: $n ($(basename "$art")) profile=$model_profile on 127.0.0.1:8080"
+    echo "  export ANTHROPIC_BASE_URL=http://localhost:8080"
+    q27_run_consumer "$server" "$art" "$tok" "${serve_args[@]}"
+}
+
+# Prefer Ratatui FP1 client when available. Override with Q27_AGENT_UI:
+#   auto (default) — TTY + q27-tui present → tui; else classic linenoise agent
+#   tui|ratatui|fp1 — require q27-tui
+#   classic|linenoise|agent|c — force legacy q27-agent TUI
+q27_agent_want_tui() {
+    case "${Q27_AGENT_UI:-auto}" in
+        tui|ratatui|fp1) return 0 ;;
+        classic|linenoise|agent|c) return 1 ;;
+        auto|"")
+            # One-shot / machine-output invocations never get the
+            # interactive client (r22 codex P2).
+            local a
+            for a in "$@"; do
+                case "$a" in
+                    -p|--prompt|--prompt=*|--output-format|--output-format=*|--frontend-proto|--frontend-proto=*)
+                        return 1 ;;
+                esac
+            done
+            [ -t 0 ] && [ -t 1 ] && return 0
+            return 1
+            ;;
+        *)
+            echo "q27 agent: unknown Q27_AGENT_UI=${Q27_AGENT_UI} (use auto|tui|classic)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_agent() {
+    local n="${Q27_AGENT_PACK:-b1}" agent tui
+    case "${1:-}" in
+        --help|-h)
+            agent="$(q27_bin q27-agent)" || {
+                echo "q27 agent: q27-agent binary not found" >&2; exit 1; }
+            exec "$agent" --help ;;
+    esac
+    case "${1:-}" in
+        ""|-*) ;;
+        *) n="$1"; shift ;;
+    esac
+    case "${1:-}" in
+        --help|-h)
+            agent="$(q27_bin q27-agent)" || {
+                echo "q27 agent: q27-agent binary not found" >&2; exit 1; }
+            exec "$agent" --help ;;
+    esac
+    q27_registry_field "$n" 1 >/dev/null 2>&1 || {
+        echo "q27 agent: unknown pack $n (see \`q27 recommend\`)" >&2; exit 1; }
+
+    local art tok artifact_file context workspace max_tokens model_profile
+    artifact_file="$(q27_registry_field "$n" 4)"
+    model_profile="$(q27_model_profile "$n")" || exit 1
+    art="$(q27_artifact_path "$n" 2>/dev/null ||
+           q27_source_model "$n" "$artifact_file" 2>/dev/null)" || {
+        echo "q27 agent: $n is not installed — run \`q27 pull $n\`" >&2
+        echo "  source checkouts may also place $artifact_file beneath models/" >&2
+        exit 1
+    }
+    tok="$(q27_tokenizer_path "$n" 2>/dev/null ||
+           q27_source_tokenizer "$n" 2>/dev/null)" || {
+        echo "q27 agent: tokenizer missing — re-run \`q27 pull $n\`" >&2; exit 1; }
+    agent="$(q27_bin q27-agent)" || {
+        echo "q27 agent: q27-agent binary not found" >&2; exit 1; }
+    context="${Q27_AGENT_CONTEXT:-32768}"
+    if [ -n "${Q27_AGENT_WORKSPACE:-}" ]; then
+        workspace="$Q27_AGENT_WORKSPACE"
+    else
+        workspace="$(pwd -P)" || {
+            echo "q27 agent: cannot resolve the current workspace" >&2; exit 1; }
+    fi
+    max_tokens="${Q27_AGENT_MAX_TOKENS:-auto}"
+    # Data-driven model profiles own soft sampling defaults. Never infer them
+    # from a pack-name prefix or quant-policy label: the selected Qwen3.8 tier
+    # may be renamed after the q4s/c-small comparison. Explicit user variables
+    # always win, including Q27_AGENT_TEMPERATURE=0 for greedy decode.
+    local sample_source=""
+    local sample_args=()
+    local temp=""
+    if [ -z "${Q27_AGENT_TEMPERATURE+x}" ]; then
+        case "$model_profile" in
+            bonsai-agent-v1)
+                temp=0.6
+                sample_source="bonsai-default"
+                ;;
+            qwen38-thinking-v1)
+                temp=1.0
+                sample_source="qwen38-profile"
+                ;;
+        esac
+    else
+        temp="${Q27_AGENT_TEMPERATURE}"
+        sample_source="env"
+    fi
+    if [ -n "$temp" ]; then
+        sample_args+=(--temperature "$temp")
+        # Companions only when actually sampling (temp>0). Greedy temp=0
+        # stays on the binary's pure-argmax path.
+        if awk -v t="$temp" 'BEGIN{exit !(t+0>0)}'; then
+            if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
+                sample_args+=(--top-p "$Q27_AGENT_TOP_P")
+            else
+                sample_args+=(--top-p 0.95)
+            fi
+            if [ -n "${Q27_AGENT_TOP_K:-}" ]; then
+                sample_args+=(--top-k "$Q27_AGENT_TOP_K")
+            else
+                sample_args+=(--top-k 20)
+            fi
+        fi
+    else
+        if [ -n "${Q27_AGENT_TOP_P:-}" ]; then
+            sample_args+=(--top-p "$Q27_AGENT_TOP_P")
+        fi
+        if [ -n "${Q27_AGENT_TOP_K:-}" ]; then
+            sample_args+=(--top-k "$Q27_AGENT_TOP_K")
+        fi
+    fi
+    if [ -n "${Q27_AGENT_SEED:-}" ]; then
+        sample_args+=(--seed "$Q27_AGENT_SEED")
+    fi
+    # MTP free-decode is opt-in: Q27_AGENT_MTP=N (0 disables). No implicit
+    # default — sampled MTP measured ~0.87x plain decode on the official pack
+    # (overnight 2026-07-21) and Bonsai packs have no MTP layer at all, so an
+    # implicit default is slower-or-inert everywhere today.
+    local mtp_args=()
+    if [ -n "${Q27_AGENT_MTP:-}" ]; then
+        mtp_args+=(--mtp "$Q27_AGENT_MTP")
+    fi
+    # Hard-stop open <think> after N tokens (agent-side; model has no budget).
+    # Unset/empty = unlimited within max-tokens.
+    if [ -n "${Q27_AGENT_MAX_THINK_TOKENS:-}" ]; then
+        sample_args+=(--max-think-tokens "$Q27_AGENT_MAX_THINK_TOKENS")
+    fi
+    if [ -n "${Q27_AGENT_NO_THINK:-}" ] && [ "$Q27_AGENT_NO_THINK" != "0" ]; then
+        sample_args+=(--no-think)
+    fi
+
+    local common_args=(
+        --context "$context" --max-tokens "$max_tokens"
+        --auto-tools --workspace "$workspace"
+    )
+    if [ -n "${Q27_AGENT_SESSION:-}" ]; then
+        common_args+=(--session "$Q27_AGENT_SESSION")
+    fi
+
+    local ui="classic"
+    tui=""
+    if q27_agent_want_tui "$@"; then
+        tui="$(q27_bin q27-tui 2>/dev/null || true)"
+        if [ -n "$tui" ]; then
+            ui="tui"
+        else
+            case "${Q27_AGENT_UI:-auto}" in
+                tui|ratatui|fp1)
+                    echo "q27 agent: Q27_AGENT_UI=${Q27_AGENT_UI} but q27-tui not found" >&2
+                    echo "  build with: make build/q27-tui   (or cargo build -r -C experiments/q27-tui)" >&2
+                    exit 1
+                    ;;
+            esac
+            echo "q27 agent: q27-tui not found; falling back to classic agent UI" >&2
+        fi
+    fi
+
+    export Q27_MODEL_PROFILE="$model_profile"
+    echo "q27 agent: pack=$n context=$context workspace=$workspace ui=$ui profile=$model_profile" >&2
+    echo "  automatic tools enabled; shell retains your local account's filesystem access" >&2
+    if [ ${#sample_args[@]} -gt 0 ]; then
+        case "$sample_source" in
+            bonsai-default)
+                echo "  sampling: ${sample_args[*]}  (bonsai default; Q27_AGENT_TEMPERATURE=0 for greedy)" >&2 ;;
+            qwen38-profile)
+                echo "  sampling: ${sample_args[*]}  (qwen38 profile; Q27_AGENT_TEMPERATURE=0 for greedy)" >&2 ;;
+            *)
+                echo "  sampling: ${sample_args[*]}" >&2 ;;
+        esac
+    fi
+    if [ ${#mtp_args[@]} -gt 0 ]; then
+        echo "  mtp: ${mtp_args[*]}" >&2
+    fi
+    # Under `set -u`, empty `"${arr[@]}"` is unbound on some bashes — expand
+    # optional arg arrays only when present.
+    local run_args=("${common_args[@]}")
+    if [ ${#sample_args[@]} -gt 0 ]; then
+        run_args+=("${sample_args[@]}")
+    fi
+    if [ ${#mtp_args[@]} -gt 0 ]; then
+        run_args+=("${mtp_args[@]}")
+    fi
+    if [ $# -gt 0 ]; then
+        run_args+=("$@")
+    fi
+
+    if [ "$ui" = "tui" ]; then
+        # q27-tui spawns q27-agent --frontend-proto 1; point it at the same
+        # binary the wrapper resolved (Homebrew/PATH/dev build).
+        export Q27_AGENT="$agent"
+        # Metal shader auto-discovery also walks from the agent binary; keep
+        # explicit source-root hint when running from a checkout.
+        if [ -z "${Q27_METAL_SOURCE:-}" ]; then
+            local root shader
+            if [ -n "${Q27_SOURCE_ROOT:-}" ]; then
+                root="$Q27_SOURCE_ROOT"
+            else
+                root="$(cd "$HERE/../.." 2>/dev/null && pwd)" || root=""
+            fi
+            if [ -n "$root" ]; then
+                shader="$root/src/metal/q27_kernels.metal"
+                if [ -f "$shader" ]; then
+                    export Q27_METAL_SOURCE="$shader"
+                fi
+            fi
+        fi
+        q27_run_consumer "$tui" -- "$art" "$tok" "${run_args[@]}"
+        return $?
+    fi
+
+    q27_run_consumer "$agent" "$art" "$tok" "${run_args[@]}"
+}
+
+cmd_bench()  { exec "$HERE/q27-bench" "$@"; }
+cmd_report() { exec "$HERE/q27-report" "$@"; }
+
+cmd_pull() {
+    local n="${1:-}"
+    if [ -z "$n" ]; then n="$(recommend_pack)"; echo "q27 pull: no pack given, recommending by RAM -> $n"; fi
+    [ -n "$n" ] || { echo "q27 pull: no pack fits this machine" >&2; exit 1; }
+    q27_registry_field "$n" 1 >/dev/null 2>&1 || { echo "q27 pull: unknown pack $n (see \`q27 recommend\`)" >&2; exit 1; }
+    local fetch; fetch="$HERE/q27-fetch"
+    [ -x "$fetch" ] || { echo "q27 pull: q27-fetch helper missing" >&2; exit 1; }
+    exec "$fetch" "$n"
+}
+
+case "$CMD" in
+    pull) cmd_pull "$@" ;;
+    serve) cmd_serve "$@" ;;
+    agent|chat) cmd_agent "$@" ;;
+    ls|list) cmd_ls "$@" ;;
+    rm|remove) cmd_rm "$@" ;;
+    bench) cmd_bench "$@" ;;
+    report) cmd_report "$@" ;;
+    recommend) cmd_recommend "$@" ;;
+    help|--help|-h)
+        awk 'NR == 1 { next } /^set -u$/ { exit } { sub(/^# ?/, ""); print }' "$0" ;;
+    *) echo "q27: unknown command $CMD (try \`q27 help\`)" >&2; exit 2 ;;
+esac

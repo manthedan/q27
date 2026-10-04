@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# q27-fetch — download + verify one pack from the registry. Called by
+# `q27 pull <name>`; rarely invoked directly. Three source kinds:
+#   direct  download the .q27 (and .tok) from HF; pinned rows verify both SHA-256 values
+#   repack  download the source GGUF, repack locally (lossless), verify the
+#           artifact against the published digest, export the tokenizer
+#   local   produced on this machine (e.g. the M1 graft) — point the user at
+#           the build tool instead of downloading
+# Downloads are resumable (curl -C -) and every artifact is checksum-gated
+# before it is considered installed. Mirrors tools/fetch_weights.sh's
+# verified pattern, generalized over the registry.
+set -u
+SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+HERE="$(cd "$(dirname "$SRC")" && pwd)"
+. "$HERE/../lib/q27_bench_lib.sh"
+
+NAME="${1:?usage: q27-fetch <name> (see \`q27 recommend\`)}"
+FIELD() { q27_registry_field "$NAME" "$1" || { echo "q27-fetch: unknown pack $NAME" >&2; exit 1; }; }
+
+ART_FILE="$(FIELD 4)"; EXPECT_MD5="$(FIELD 5)"; REPO="$(FIELD 8)"
+KIND="$(FIELD 9)"; TOK_KIND="$(FIELD 10)"; EXP="$(FIELD 11)"
+ART_SHA="$(FIELD 14)"; HF_REV="$(FIELD 15)"
+TOK_FILE="$(FIELD 16)"; TOK_SHA="$(FIELD 17)"
+DEST="$(q27_home)/$NAME"
+ART="$DEST/$ART_FILE"
+
+sha256_file() { q27_sha256_file "$1"; }
+
+[ "$EXP" = "yes" ] && echo "q27-fetch: NOTE — $NAME is EXPERIMENTAL: $(FIELD 12)"
+mkdir -p "$DEST"
+
+# Map a registry name to its source GGUF filename / repo revision / digests.
+# These are pinned so an upstream re-upload cannot drift in (the fetch_weights
+# pattern). direct tiers need no source GGUF.
+source_gguf_for() {
+    case "$NAME" in
+        t2) echo "Ternary-Bonsai-27B-Q2_0.gguf" ;;
+        b1) echo "Bonsai-27B-Q1_0.gguf" ;;
+        *)  echo "" ;;
+    esac
+}
+source_rev_for() {
+    case "$NAME" in
+        t2) echo "20e435f518bd5b882795954aba81e80a91894321" ;;
+        b1) echo "main" ;;  # TODO: pin once upstream tags a stable revision
+        *)  echo "main" ;;
+    esac
+}
+source_sha_for() {
+    case "$NAME" in
+        t2) echo "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757" ;;
+        b1) echo "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0" ;;
+        *)  echo "" ;;
+    esac
+}
+artifact_sha_for() {
+    case "$NAME" in
+        t2) echo "25392b471d2e5c55798c2ea77d8b53fbbd1f720318e5ff23bd8c49e5d378e549" ;;
+        b1) echo "84cf2400fafb27e9ce35b72d478299d2a855c902e2e495fb9564e13f06f9da52" ;;
+        *)  echo "" ;;
+    esac
+}
+
+hf_download() { # $1=remote-file $2=dest  (resumable)
+    local file="$1" dest="$2" rev="main"
+    # Repack sources retain their legacy source-specific revision map. New
+    # direct manifests pin one immutable commit for BOTH artifact/tokenizer.
+    if [ "$KIND" = "repack" ]; then rev="$(source_rev_for)"
+    elif [ -n "$HF_REV" ]; then rev="$HF_REV"
+    fi
+    # Optional auth: an HF_TOKEN lifts anonymous -> free-tier resolver quotas
+    # (3,000 -> 5,000 req/5min) and unlocks gated repos. Anonymous curl is fine
+    # for our public direct tiers (one resumable artifact), so this is purely
+    # opt-in — unset means no header, no dependency.
+    local -a auth=()
+    [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+
+    # OPT-IN fast path: `hf download`. Off by default — curl is the predictable,
+    # resumable default (~11 MB/s single stream, which we measured BEATS the CLI
+    # on our plain-LFS repo). The CLI can win on a fast link + Xet-backed repo
+    # (hf_xet scales up to 64 parallel streams), but its adaptive concurrency
+    # starts at 1 stream and ramps slowly — and on plain-LFS repos like ours it
+    # was ~5x SLOWER than curl (~2 vs ~11 MB/s). So we only use it when the user
+    # explicitly opts in with Q27_USE_HF_CLI=1 (and has a parallel backend:
+    # hf_transfer+HF_HUB_ENABLE_HF_TRANSFER=1, or hf_xet). The CLI honors
+    # HF_TOKEN itself. Integrity is unchanged: the caller still md5/sha-verifies
+    # the result. Q27_NO_HF_CLI=1 also forces curl.
+    local hf_fast=""
+    if [ -n "${Q27_USE_HF_CLI:-}" ] && [ -z "${Q27_NO_HF_CLI:-}" ] \
+       && command -v hf >/dev/null 2>&1; then
+        if command -v python3 >/dev/null 2>&1 && python3 -c 'import hf_transfer' 2>/dev/null; then
+            if [ "${HF_HUB_ENABLE_HF_TRANSFER:-}" = "1" ]; then
+                hf_fast=1
+            fi
+        elif command -v python3 >/dev/null 2>&1 && python3 -c 'import hf_xet' 2>/dev/null; then
+            hf_fast=1
+        fi
+        if [ -z "$hf_fast" ]; then
+            echo "q27-fetch: Q27_USE_HF_CLI set but no parallel backend" >&2
+            echo "  (hf_transfer+HF_HUB_ENABLE_HF_TRANSFER=1, or hf_xet); using curl" >&2
+        fi
+    fi
+    if [ -n "$hf_fast" ]; then
+        local dl_dir cli_stage
+        dl_dir="$(dirname "$dest")"
+        cli_stage="$dl_dir/.q27-hf-download.$$"
+        rm -rf "$cli_stage"; mkdir -p "$cli_stage"
+        # Never point the CLI at the install directory: it writes the remote
+        # filename directly, which would transiently publish unverified bytes
+        # before a pinned caller could rename its .part file.
+        if hf download "$REPO" "$file" --revision "$rev" --local-dir "$cli_stage" >/dev/null 2>&1 \
+           && [ -f "$cli_stage/$file" ]; then
+            mv -f "$cli_stage/$file" "$dest"
+            rm -rf "$cli_stage"
+            return 0
+        fi
+        rm -rf "$cli_stage"
+        echo "q27-fetch: hf CLI fast path failed; falling back to curl" >&2
+    fi
+
+    # ${auth[@]+...} (not bare "${auth[@]}") so an empty array is safe under
+    # `set -u` on bash 3.2 (macOS /bin/bash), which errors on empty-array
+    # expansion. Expands to nothing when auth is empty, the header when set.
+    curl -L --fail --continue-at - ${auth[@]+"${auth[@]}"} \
+        "https://huggingface.co/$REPO/resolve/$rev/$file" -o "$dest"
+}
+
+case "$KIND" in
+    local)
+        echo "q27-fetch: $NAME is a LOCAL artifact, not downloadable."
+        echo "  $(FIELD 12)"
+        echo "  Place the artifact at $ART"
+        echo "  Place its matching .tok file in $DEST/"
+        if [ -n "$EXPECT_MD5" ]; then
+            echo "  Expected artifact MD5: $EXPECT_MD5"
+            if [ -f "$ART" ]; then
+                actual_md5="$(q27_md5_file "$ART")"
+                [ "$actual_md5" = "$EXPECT_MD5" ] || {
+                    echo "q27-fetch: md5 MISMATCH for $ART_FILE — refusing local pack" >&2
+                    exit 1
+                }
+                echo "q27-fetch: $ART_FILE present and verified"
+            fi
+        fi
+        exit 0
+        ;;
+    direct)
+        # Manifest-v2 direct packs use one immutable HF commit and exact
+        # filenames/digests for both products. Download into resumable staging
+        # paths, verify the pair, then atomically publish each name. Existing
+        # verified files may be reused while repairing only their sibling.
+        if [ -n "$ART_SHA$HF_REV$TOK_FILE$TOK_SHA" ]; then
+            [ -n "$ART_SHA" ] && [ -n "$HF_REV" ] &&
+            [ -n "$TOK_FILE" ] && [ -n "$TOK_SHA" ] || {
+                echo "q27-fetch: incomplete pinned direct manifest for $NAME" >&2; exit 1; }
+            [[ "$ART_SHA" =~ ^[0-9a-f]{64}$ ]] &&
+            [[ "$TOK_SHA" =~ ^[0-9a-f]{64}$ ]] &&
+            [[ "$HF_REV" =~ ^[0-9a-f]{40}$ ]] || {
+                echo "q27-fetch: pinned direct manifest has malformed digest/revision" >&2; exit 1; }
+            [ "$TOK_KIND" = "direct" ] || {
+                echo "q27-fetch: pinned direct manifest requires a direct tokenizer" >&2; exit 1; }
+
+            TOK="$DEST/$TOK_FILE"
+            ART_PART="$ART.part"
+            TOK_PART="$TOK.part"
+            art_staged=0
+            tok_staged=0
+            artifact_valid() {
+                [ -f "$1" ] && [ "$(sha256_file "$1")" = "$ART_SHA" ] &&
+                { [ -z "$EXPECT_MD5" ] || [ "$(q27_md5_file "$1")" = "$EXPECT_MD5" ]; }
+            }
+            tokenizer_valid() {
+                [ -f "$1" ] && [ "$(head -c 4 "$1" 2>/dev/null)" = "Q27T" ] &&
+                [ "$(sha256_file "$1")" = "$TOK_SHA" ]
+            }
+            if artifact_valid "$ART" && tokenizer_valid "$TOK"; then
+                echo "q27-fetch: $ART_FILE and $TOK_FILE already present and verified"
+                exit 0
+            fi
+            if ! artifact_valid "$ART"; then
+                if ! artifact_valid "$ART_PART"; then
+                    echo "q27-fetch: downloading pinned $ART_FILE from $REPO@$HF_REV ($(FIELD 6) GiB)"
+                    if ! hf_download "$ART_FILE" "$ART_PART"; then
+                        # A complete file resumed at EOF may yield HTTP 416;
+                        # discard only after its digest failed, then retry clean.
+                        rm -f "$ART_PART"
+                        hf_download "$ART_FILE" "$ART_PART" || exit 1
+                    fi
+                fi
+                artifact_valid "$ART_PART" || {
+                    rm -f "$ART_PART"
+                    echo "q27-fetch: SHA-256/MD5 MISMATCH on $ART_FILE — aborting" >&2
+                    exit 1
+                }
+                art_staged=1
+            else
+                rm -f "$ART_PART"
+            fi
+            if ! tokenizer_valid "$TOK"; then
+                if ! tokenizer_valid "$TOK_PART"; then
+                    echo "q27-fetch: downloading pinned $TOK_FILE from $REPO@$HF_REV"
+                    if ! hf_download "$TOK_FILE" "$TOK_PART"; then
+                        rm -f "$TOK_PART"
+                        hf_download "$TOK_FILE" "$TOK_PART" || exit 1
+                    fi
+                fi
+                tokenizer_valid "$TOK_PART" || {
+                    rm -f "$TOK_PART"
+                    echo "q27-fetch: tokenizer SHA-256/magic MISMATCH — aborting" >&2
+                    exit 1
+                }
+                tok_staged=1
+            else
+                rm -f "$TOK_PART"
+            fi
+            # Recheck the complete pair immediately before publication. A
+            # valid installed sibling and a verified staged sibling are both
+            # acceptable; stale extra *.tok files are deliberately ignored.
+            artifact_valid "$ART" || artifact_valid "$ART_PART" || exit 1
+            tokenizer_valid "$TOK" || tokenizer_valid "$TOK_PART" || exit 1
+            if [ "$tok_staged" = 1 ]; then
+                mv -f "$TOK_PART" "$TOK" || {
+                    echo "q27-fetch: cannot publish $TOK_FILE" >&2; exit 1; }
+            fi
+            if [ "$art_staged" = 1 ]; then
+                mv -f "$ART_PART" "$ART" || {
+                    echo "q27-fetch: cannot publish $ART_FILE" >&2; exit 1; }
+            fi
+            artifact_valid "$ART" && tokenizer_valid "$TOK" || {
+                echo "q27-fetch: published pair failed final verification" >&2; exit 1; }
+            echo "q27-fetch: $NAME installed at $DEST (immutable revision $HF_REV)"
+            exit 0
+        fi
+
+        # A legacy tokenizer is only trusted if it parses (Q27T magic), not merely
+        # present — a partial curl -C - remnant must not be accepted (codex P1).
+        tok_valid() {
+            local t; for t in "$DEST"/*.tok; do
+                [ -f "$t" ] || continue
+                [ "$(head -c 4 "$t" 2>/dev/null)" = "Q27T" ] && return 0
+            done; return 1
+        }
+        # Validate a freshly downloaded staged tokenizer, then publish it
+        # atomically. Returns nonzero (leaving nothing behind) on a bad magic.
+        tok_valid_mv() {
+            local part="$1" final="$2"
+            if [ -f "$part" ] && [ "$(head -c 4 "$part" 2>/dev/null)" = "Q27T" ]; then
+                mv -f "$part" "$final"; return 0
+            fi
+            rm -f "$part"; return 1
+        }
+        # Fast path needs BOTH the artifact verified AND a valid tokenizer; a
+        # verified artifact with a missing/invalid .tok (a prior run that died
+        # mid-tokenizer-download) must fall through and repair, not exit
+        # "already present" and dead-end the user (codex P2).
+        if [ -f "$ART" ] && [ -n "$EXPECT_MD5" ] && [ "$(q27_md5_file "$ART")" = "$EXPECT_MD5" ] \
+           && tok_valid; then
+            echo "q27-fetch: $ART_FILE already present and verified"; exit 0
+        fi
+        # Only re-download the artifact if it is missing or fails verification;
+        # a healthy artifact is left alone even when we fell through to repair
+        # the tokenizer.
+        if [ ! -f "$ART" ] || { [ -n "$EXPECT_MD5" ] && [ "$(q27_md5_file "$ART")" != "$EXPECT_MD5" ]; }; then
+            echo "q27-fetch: downloading $ART_FILE from $REPO ($(FIELD 6) GiB)"
+            hf_download "$ART_FILE" "$ART"
+            if [ -n "$EXPECT_MD5" ] && [ "$(q27_md5_file "$ART")" != "$EXPECT_MD5" ]; then
+                echo "q27-fetch: md5 MISMATCH on $ART_FILE — aborting"; exit 1
+            fi
+        fi
+        if [ "$TOK_KIND" = "direct" ] && ! tok_valid; then
+            echo "q27-fetch: downloading tokenizer"
+            # The tokenizer shares the artifact's basename (<name>.tok). The
+            # official tiers predate this and ship qwen36-27b-mtp.tok. Download
+            # to a temp name and mv into place only on success, so a failed or
+            # partial attempt never masquerades as installed; and remove the
+            # derived-name attempt before falling back so it cannot shadow the
+            # official tokenizer in q27_tokenizer_path's first-glob pick.
+            tok_base="${ART_FILE%.q27}.tok"
+            if hf_download "$tok_base" "$DEST/$tok_base.part" && tok_valid_mv "$DEST/$tok_base.part" "$DEST/$tok_base"; then
+                :
+            else
+                rm -f "$DEST/$tok_base.part" "$DEST/$tok_base"
+                hf_download "qwen36-27b-mtp.tok" "$DEST/qwen36-27b-mtp.tok.part" \
+                    && tok_valid_mv "$DEST/qwen36-27b-mtp.tok.part" "$DEST/qwen36-27b-mtp.tok" \
+                    || { rm -f "$DEST/qwen36-27b-mtp.tok.part"; echo "q27-fetch: tokenizer download failed — re-run \`q27 pull $NAME\` to resume"; exit 1; }
+            fi
+        fi
+        echo "q27-fetch: $NAME installed at $DEST"
+        ;;
+    repack)
+        python3 -c "import numpy, gguf" 2>/dev/null || {
+            echo "q27-fetch: the repack needs python3 with numpy and gguf:"
+            echo "  python3 -m pip install numpy gguf"; exit 1; }
+        GGUF_NAME="$(source_gguf_for)"; SRC_SHA="$(source_sha_for)"
+        OUT_SHA="$(artifact_sha_for)"; GGUF="$DEST/$GGUF_NAME"
+        if [ -f "$ART" ] && [ "$(sha256_file "$ART")" = "$OUT_SHA" ] \
+           && ls "$DEST"/*.tok >/dev/null 2>&1; then
+            echo "q27-fetch: $ART_FILE already present and verified"; exit 0
+        fi
+        if [ ! -f "$GGUF" ] || [ "$(sha256_file "$GGUF")" != "$SRC_SHA" ]; then
+            echo "q27-fetch: downloading source $GGUF_NAME from $REPO"
+            hf_download "$GGUF_NAME" "$GGUF"
+            [ "$(sha256_file "$GGUF")" = "$SRC_SHA" ] || {
+                echo "q27-fetch: source GGUF sha256 MISMATCH — aborting"; exit 1; }
+        fi
+        echo "q27-fetch: source verified; repacking (lossless)"
+        REPACK="$(q27_bin_repack)"
+        python3 "$REPACK" "$GGUF" "$ART" || { echo "q27-fetch: repack failed"; exit 1; }
+        [ "$(sha256_file "$ART")" = "$OUT_SHA" ] || {
+            echo "q27-fetch: repacked artifact sha256 MISMATCH (deterministic repack;" \
+                 "this means a code/source change) — do not use it"; exit 1; }
+        python3 "$(q27_bin_export_tok)" "$GGUF" "$DEST/$NAME.tok" || {
+            echo "q27-fetch: tokenizer export failed"; exit 1; }
+        echo "q27-fetch: $NAME installed at $DEST (source GGUF kept; delete to save disk)"
+        ;;
+    *) echo "q27-fetch: unknown source_kind $KIND for $NAME" >&2; exit 1 ;;
+esac

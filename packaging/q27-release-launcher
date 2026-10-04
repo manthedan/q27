@@ -1,0 +1,18 @@
+#!/bin/sh
+# Relocatable release-tarball entry point: bin/q27 -> packaging/bin/q27.
+set -u
+SRC="$0"
+while [ -L "$SRC" ]; do
+    LINK="$(readlink "$SRC")"
+    case "$LINK" in
+        /*) SRC="$LINK" ;;
+        *) SRC="$(dirname "$SRC")/$LINK" ;;
+    esac
+done
+HERE="$(cd "$(dirname "$SRC")" && pwd)"
+WRAPPER="$HERE/../packaging/bin/q27"
+if [ ! -x "$WRAPPER" ]; then
+    echo "q27: packaged supervisor not found at $WRAPPER" >&2
+    exit 1
+fi
+exec "$WRAPPER" "$@"

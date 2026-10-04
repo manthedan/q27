@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# q27-bench — user-facing benchmark suite for the q27 Metal engine.
+#
+# Two modes:
+#   q27-bench --fast            synthetic ceiling per installed-tier route +
+#                               a quick real decode on the default pack.
+#                               No big download required for the synthetic
+#                               legs; a few minutes total.
+#   q27-bench --full  [packs..] synthetic ceiling PLUS real-artifact decode
+#                               and prefill per installed pack, greedy and
+#                               MTP where the pack supports it, with a
+#                               fixed-prompt generation sample + md5 so the
+#                               maintainer can eyeball quality remotely.
+#   q27-bench --full --tiers q8,q6k,q6,default
+#                               restrict to a comma-separated pack list
+#                               (same as naming them positionally).
+#
+# Every leg emits one machine-parseable `result: ...` line to stdout. Logs
+# and thermal anchors go to a run dir (printed at the end) so q27-report can
+# bundle them. Run it, send the bundle back — this is how we develop the
+# large quants (q6k/q8) we cannot run on the maintainer's laptop.
+#
+# Safe to run any time; it is read-only against models and never starts a
+# server. It WILL load big artifacts on --full, so don't run it while a
+# q27 server is serving (one-model-at-a-time house rule).
+set -u
+SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+HERE="$(cd "$(dirname "$SRC")" && pwd)"
+# shellcheck source=../lib/q27_bench_lib.sh
+. "$HERE/../lib/q27_bench_lib.sh"
+
+MODE="fast"
+PACKS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fast) MODE="fast"; shift ;;
+        --full) MODE="full"; shift ;;
+        --tiers) PACKS="$PACKS $(printf '%s' "$2" | tr ',' ' ')"; shift 2 ;;
+        --help|-h)
+            sed -n '2,22p' "$0"; exit 0 ;;
+        -*) echo "q27-bench: unknown flag $1" >&2; exit 2 ;;
+        *) PACKS="$PACKS $1"; shift ;;
+    esac
+done
+# Trim leading space and validate pack names against the registry.
+PACKS="$(printf '%s' "$PACKS" | sed 's/^ *//;s/  */ /g')"
+if [ -n "$PACKS" ]; then
+    for p in $PACKS; do
+        q27_registry_field "$p" 1 >/dev/null 2>&1 || {
+            echo "q27-bench: unknown pack '$p' (see \`q27 recommend\`)" >&2; exit 2; }
+    done
+fi
+
+DECODE_BENCH="$(q27_bin metal_decode_bench 2>/dev/null || true)"
+PREFILL_BENCH="$(q27_bin metal_prefill_bench 2>/dev/null || true)"
+CLI="$(q27_bin q27-metal 2>/dev/null || true)"
+
+RUN_DIR="$(q27_home)/../bench/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$RUN_DIR"
+LOG="$RUN_DIR/bench.log"
+
+emit() { # one result line, both to stdout and the log
+    echo "result: $*" | tee -a "$LOG"
+}
+
+# Default packs: everything installed under Q27_HOME that the registry knows.
+installed_packs() {
+    local n
+    for n in $(q27_registry_names); do
+        q27_artifact_path "$n" >/dev/null 2>&1 && printf '%s ' "$n"
+    done
+}
+[ -z "$PACKS" ] && PACKS="$(installed_packs)"
+
+# dtype route string the synthetic benches expect for a pack's quant_policy.
+dtype_for() { # $1=quant_policy -> q4q8|t2|b1
+    case "$1" in
+        bonsai-t2-v1) echo t2 ;;
+        bonsai-b1-v1|bonsai-mixed-v1) echo b1 ;;
+        *) echo q4q8 ;;
+    esac
+}
+
+q27_machine_header | tee -a "$LOG"
+q27_thermal_snapshot start | tee -a "$LOG"
+emit "mode: $MODE"
+emit "packs: ${PACKS:-none-installed}"
+
+# ---- Synthetic ceiling legs (memory-safe, no artifact) ----
+# These tell a user their per-route ceiling BEFORE committing to a 17-28 GB
+# download, and they exercise the q8/q6k route even where the artifact is
+# too big for the machine (decode_bench q4q8 covers the official route).
+if [ -n "$DECODE_BENCH" ]; then
+    # One representative route per family actually installed, plus q4q8 if
+    # any official tier is present.
+    seen=" "
+    for p in $PACKS; do
+        qp="$(q27_registry_field "$p" 3)"; dt="$(dtype_for "$qp")"
+        case "$seen" in *" $dt "*) continue ;; esac
+        seen="$seen$dt "
+        out="$RUN_DIR/decode-$dt.out"
+        Q27_BENCH_POWER_LOG="$RUN_DIR/power-$dt.log" \
+            "$DECODE_BENCH" --dtype "$dt" --tokens 64 --seq 2048 >"$out" 2>&1
+        line="$(grep 'decode step:' "$out" | tail -1)"
+        emit "synthetic-decode dtype=$dt :: ${line:-FAILED}"
+    done
+else
+    emit "synthetic-decode: SKIPPED (metal_decode_bench not found)"
+fi
+
+# ---- Real-artifact legs ----
+# fast: only the first installed pack, greedy, short. full: every pack,
+# greedy + mtp (official tiers) + a prefill measurement + generation sample.
+run_real() { # $1=pack
+    local p="$1" art tok qp exp
+    art="$(q27_artifact_path "$p")" || { emit "real $p: SKIPPED (artifact missing)"; return; }
+    tok="$(q27_tokenizer_path "$p")" || { emit "real $p: SKIPPED (tokenizer missing)"; return; }
+    qp="$(q27_registry_field "$p" 3)"
+    exp="$(q27_registry_field "$p" 11)"
+    [ -z "$CLI" ] && { emit "real $p: SKIPPED (q27-metal not found)"; return; }
+
+    local md5sum_art; md5sum_art="$(md5 -q "$art" 2>/dev/null || echo '?')"
+    emit "real $p: artifact=$(basename "$art") md5=$md5sum_art quant_policy=$qp experimental=$exp"
+
+    # Greedy decode, fixed prompt. --tokens avoids any tokenizer-encode
+    # variance; the canonical 5-token prompt is the cross-engine standard.
+    local out="$RUN_DIR/real-$p-greedy.out"
+    Q27_BENCH_POWER_LOG="$RUN_DIR/power-$p.log" \
+        "$CLI" "$art" "$tok" --tokens 760,6511,314,9338,369 -n 128 --ctx 4096 \
+        >"$out" 2>"$RUN_DIR/real-$p-greedy.err"
+    local tps; tps="$(sed -n 's/^\([0-9]*\) tokens in .* (\([0-9.]*\) tok\/s).*/\2/p' "$RUN_DIR/real-$p-greedy.err" | tail -1)"
+    emit "real $p: greedy-decode tok/s=${tps:-FAILED}"
+
+    # Generation sample + md5 (quality eyeball / regression tripwire).
+    local gen; gen="$(grep '^generated:' "$out" | head -1)"
+    local genmd5; genmd5="$(printf '%s' "$gen" | md5 -q)"
+    emit "real $p: greedy-sample-md5=$genmd5"
+    printf '%s\n' "$gen" > "$RUN_DIR/real-$p-sample.txt"
+
+    if [ "$MODE" = "full" ]; then
+        # MTP speculative decode on official tiers (every non-Bonsai pack
+        # carries the trained MTP head: default/q4s/q6/q6k/q8 all do).
+        if [ "$(dtype_for "$qp")" = "q4q8" ]; then
+            local mout="$RUN_DIR/real-$p-mtp.out"
+            "$CLI" "$art" "$tok" --tokens 760,6511,314,9338,369 -n 128 --ctx 4096 --mtp 8 \
+                >"$mout" 2>"$RUN_DIR/real-$p-mtp.err"
+            local mtps; mtps="$(sed -n 's/^\([0-9]*\) tokens in .* (\([0-9.]*\) tok\/s).*/\2/p' "$RUN_DIR/real-$p-mtp.err" | tail -1)"
+            emit "real $p: mtp8-decode tok/s=${mtps:-FAILED}"
+        fi
+        # Prefill via the synthetic prefill bench on this route (the artifact
+        # prefill leg is paging-dominated and slow; the synthetic ceiling is
+        # the comparable number).
+        if [ -n "$PREFILL_BENCH" ]; then
+            local dt; dt="$(dtype_for "$qp")"
+            # prefill bench only supports q4q8|t2; map b1->t2 (closest ternary route).
+            [ "$dt" = "b1" ] && dt="t2"
+            local pout="$RUN_DIR/prefill-$p.out"
+            "$PREFILL_BENCH" --dtype "$dt" --prompt 512 --chunk 12 >"$pout" 2>&1
+            local pline; pline="$(grep '^prefill:' "$pout" | tail -1)"
+            emit "real $p: prefill-ceiling :: ${pline:-FAILED}"
+        fi
+    fi
+}
+
+if [ -z "$PACKS" ]; then
+    emit "real: SKIPPED (no packs installed; run \`q27 pull <name>\` first)"
+else
+    if [ "$MODE" = "fast" ]; then
+        # Only the first installed pack, greedy only.
+        set -- $PACKS
+        [ $# -gt 0 ] && run_real "$1"
+    else
+        for p in $PACKS; do run_real "$p"; done
+    fi
+fi
+
+q27_thermal_snapshot end | tee -a "$LOG"
+emit "run_dir: $RUN_DIR"
+echo "q27-bench: logs in $RUN_DIR (bundle with \`q27 report\`)"
