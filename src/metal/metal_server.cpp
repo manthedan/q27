@@ -1731,11 +1731,17 @@ struct Runtime {
         tc.enabled=q27::metal_tool_constraint_enabled(
             constrain_tools,!tool_names.empty(),sampling.temperature==0.0f,
             effective_speculation_width(sampling,bounded_reasoning),forced_tool_choice);
-        const auto grammar_schema=q27::tool_grammar_schema_for_names(grammar_tools,tool_names);
-        {
+        // Only a live constraint needs the schema: building it can throw on a
+        // closed schema that requires an undeclared key, which must not fail
+        // unconstrained requests (the pre-branch behavior ignored schemas).
+        if(tc.enabled) {
+            const auto grammar_schema=q27::tool_grammar_schema_for_names(grammar_tools,tool_names);
             auto gpu=lease_now();
             tc.begin(tool_names,grammar_schema.properties,grammar_schema.required,
                      q27::tool_dialect_xml(),grammar_schema.present,grammar_schema.additional);
+        } else {
+            auto gpu=lease_now();
+            tc.begin(tool_names);
         }
         // Scope-exit constraint cleanup: runs on normal return, client
         // disconnect, and engine exceptions alike, and never throws (a
