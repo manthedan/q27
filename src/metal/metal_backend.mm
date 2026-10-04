@@ -1,4 +1,6 @@
 #import <Foundation/Foundation.h>
+#include <climits>
+#include <cstdlib>
 #import <Metal/Metal.h>
 
 #include <CommonCrypto/CommonDigest.h>
@@ -109,11 +111,37 @@ NSString* source_tree_shader_path() {
     return [checkout stringByAppendingPathComponent:@"src/metal/q27_kernels.metal"];
 }
 
+// Real directory of the running executable, symlinks resolved (a Homebrew
+// bin/ link must find the Cellar layout, not the link's directory).
+std::string executable_directory() {
+    uint32_t size = 0;
+    (void)_NSGetExecutablePath(nullptr, &size);
+    if (!size) return {};
+    std::vector<char> path(size + 1, 0);
+    if (_NSGetExecutablePath(path.data(), &size) != 0) return {};
+    char resolved[PATH_MAX];
+    const char* canonical = realpath(path.data(), resolved);
+    std::string value = canonical ? canonical : path.data();
+    const size_t slash = value.rfind('/');
+    return slash == std::string::npos ? std::string() : value.substr(0, slash);
+}
+
 NSString* load_kernel_source() {
     NSFileManager* files = [NSFileManager defaultManager];
     NSMutableArray<NSString*>* candidates = [NSMutableArray array];
     if (const char* override_path = getenv("Q27_METAL_SOURCE"))
         [candidates addObject:[NSString stringWithUTF8String:override_path]];
+    // Prebuilt releases are relocatable: the release archive keeps the shader
+    // at <prefix>/share/q27_kernels.metal and the Homebrew formula at
+    // <prefix>/share/q27/q27_kernels.metal, both beside bin/. Neither carries
+    // a build-host path, and both precede any cwd-relative fallback.
+    const std::string exe_dir = executable_directory();
+    if (!exe_dir.empty()) {
+        const std::string tarball = exe_dir + "/../share/q27_kernels.metal";
+        const std::string cellar = exe_dir + "/../share/q27/q27_kernels.metal";
+        [candidates addObject:[NSString stringWithUTF8String:tarball.c_str()]];
+        [candidates addObject:[NSString stringWithUTF8String:cellar.c_str()]];
+    }
 #ifdef Q27_SHADER_PATH
     // Installed binaries trust the share-dir shader baked in at build time.
     // A source file in the process working directory must not override it;
