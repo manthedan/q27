@@ -130,6 +130,12 @@ BonsaiRotation MetalEngine::validate_architecture() const {
         else if (policy=="q6k-v1") q8_extra="(ssm_out|attn_output|ffn_down|ffn_gate)\\.";
         else if (policy=="q8-v1") q8_extra=".*";
         else if (policy=="v1.4") q8_extra="(ssm_out|attn_output)\\.";
+        // Qwen3.8 c-small (the 24 GB tier published as metal-v0.7.0's q38
+        // pack): shared Q4 head, Q8 attn_output on top of the always-Q8
+        // attn_k/attn_v/MTP block. Recipe string as the repack writes it.
+        else if (policy=="q38-c-small-v1") {
+            q4_head=true; q8_extra="^blk\\.[0-9]+\\.attn_output\\.weight$";
+        }
         else throw std::runtime_error("q27 Metal: unsupported quantization policy: "+policy);
         if (q4_head) {
             if (!meta.contains("q4_head") || !meta["q4_head"].is_boolean() ||
@@ -223,6 +229,8 @@ BonsaiRotation MetalEngine::validate_architecture() const {
         if (policy=="q8-v1") return DType::Q8_G128;
         if ((policy=="v1.4" || policy=="q6-v1" || policy=="q6k-v1") &&
             (has_suffix(name,".ssm_out.weight") || has_suffix(name,".attn_output.weight")))
+            return DType::Q8_G128;
+        if (policy=="q38-c-small-v1" && has_suffix(name,".attn_output.weight"))
             return DType::Q8_G128;
         if ((policy=="q5f-v1" || policy=="q6-v1" ||
              policy=="q6f-v1" || policy=="q6k-v1") &&
