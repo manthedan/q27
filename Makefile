@@ -8,6 +8,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
+.PHONY: test-packaging test-lock-exec test-release-packaging-helpers test-shader-discovery
 .PHONY: all clean test-inspect test-repack test-repack-canonical test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
 build/q27: src/engine.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
@@ -538,7 +539,14 @@ test-metal-backend: build/test-metal-backend build/test-metal-ops build/test_bon
 	./build/test-metal-backend
 	./build/test-metal-ops
 	./build/test_bonsai_hadamard
+
+# Release archives and the Homebrew formula find the shader beside bin/
+# (share/ or share/q27/); see load_kernel_source().
+test-shader-discovery: build/test-metal-backend tools/test_shader_discovery.sh
+	Q27_SHADER_DISCOVERY_BIN=$(CURDIR)/build/test-metal-backend tools/test_shader_discovery.sh
 else
+test-shader-discovery:
+	@echo "test-shader-discovery requires macOS" >&2; exit 1
 test-metal-backend:
 	@echo "test-metal-backend requires macOS" >&2; exit 1
 metal-engine:
@@ -561,3 +569,22 @@ include experiments/ds4-agent/Makefile.inc
 
 build/dflash2_smoke: tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@
+
+# ---- packaging / release (packaging/, tools/assemble_release_tarball.sh) ----
+build/q27-lock-exec: tools/q27_lock_exec.c | build
+	$(CC) -O2 -Wall -Wextra -Werror tools/q27_lock_exec.c -o $@
+
+test-lock-exec: build/q27-lock-exec tools/test_q27_lock_exec.sh
+	tools/test_q27_lock_exec.sh
+
+test-release-packaging-helpers: tools/stage_homebrew_formula.sh tools/test_stage_homebrew_formula.sh \
+                                tools/test_q27_fetch_manifest.sh tools/homebrew_release_smoke.sh \
+                                tools/packaged_agent_driver.sh tools/packaged_api_driver.py
+	tools/test_stage_homebrew_formula.sh
+	tools/test_q27_fetch_manifest.sh
+	bash -n tools/homebrew_release_smoke.sh tools/packaged_agent_driver.sh tools/test_q27_fetch_manifest.sh
+	python3 -c 'compile(open("tools/packaged_api_driver.py", encoding="utf-8").read(), "tools/packaged_api_driver.py", "exec")'
+
+# Model-free packaging gates: wrapper behavior, lock helper, release helpers.
+test-packaging: build/q27-lock-exec test-lock-exec test-release-packaging-helpers
+	./packaging/test_q27_wrapper.sh
