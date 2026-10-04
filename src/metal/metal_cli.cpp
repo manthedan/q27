@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
         if (sampling.temperature > 0 && mtp_width)
             throw std::runtime_error("sampling cannot be combined with --mtp");
         if (validate_only) {
-            if (token_list_supplied || prompt_supplied || mtp_width ||
+            if (token_list_supplied || prompt_supplied || mtp_width || suffix_width ||
                 sampling.temperature > 0 || !dump_token_ids.empty())
                 throw std::runtime_error("--validate-only cannot be combined with generation options");
         } else {
