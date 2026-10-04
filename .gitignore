@@ -7,3 +7,4 @@ models/
 logs/
 .venv/
 experiments/q27-tui/target/
+.DS_Store
