@@ -464,7 +464,26 @@ static void test_p4_queue_and_tool_start(void) {
     fclose(f);
 }
 
+/* Sol 6.1 review: the drain clears quit_requested so a prompt queued BEFORE
+ * the quit can run; that must not reopen admission for prompts after it. */
+static void test_quit_barrier_survives_drain(void) {
+    q27_fp1_op prompt = {0}, quit = {0}, popped = {0};
+    prompt.kind = Q27_FP1_OP_PROMPT;
+    prompt.text = "before quit";
+    quit.kind = Q27_FP1_OP_QUIT;
+    CHECK(q27_fp1_control_post_for_test(&prompt) == 1);
+    CHECK(q27_fp1_control_post_for_test(&quit) == 1);
+    q27_fp1_control_clear_quit();          /* main loop starts the drain */
+    prompt.text = "after quit";
+    CHECK(q27_fp1_control_post_for_test(&prompt) == 0);
+    while (q27_fp1_control_wait_op(&popped, 0) == 1) {
+        CHECK(!popped.text || strcmp(popped.text, "after quit") != 0);
+        q27_fp1_op_free(&popped);
+    }
+}
+
 int main(void) {
+    test_quit_barrier_survives_drain();
     test_utf8();
     test_json_escape();
     test_v0_shape();

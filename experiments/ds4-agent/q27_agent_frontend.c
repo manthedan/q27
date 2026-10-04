@@ -717,6 +717,11 @@ typedef struct {
     int stop;
     int cancel_requested;
     int quit_requested;
+    /* Sticky admission barrier: set with every quit, never cleared by the
+     * main loop's drain (clear_quit only lifts quit_requested so a prompt
+     * queued BEFORE the quit can run). Post-quit ops stay rejected and the
+     * reader stops reading. */
+    int quit_barrier;
     char quit_reason[32];
     int wake_pipe[2];
     /* Silent drops are forbidden (§2.6): bounded per-request rejection ring
@@ -1374,6 +1379,7 @@ static int ctl_apply_op(q27_fp1_op *op) {
     }
     if (op->kind == Q27_FP1_OP_QUIT) {
         g_ctl.quit_requested = 1;
+        g_ctl.quit_barrier = 1;
         snprintf(g_ctl.quit_reason, sizeof(g_ctl.quit_reason), "quit");
         q27_fp1_op_free(op);
         pthread_cond_broadcast(&g_ctl.cv);
@@ -1383,7 +1389,7 @@ static int ctl_apply_op(q27_fp1_op *op) {
     /* Ordered quit barrier (r17 codex P1): anything parsed AFTER a quit
      * must not run — a same-read `quit\nprompt …` burst would otherwise
      * execute post-quit work (including tools) before bye. */
-    if (g_ctl.quit_requested) {
+    if (g_ctl.quit_barrier) {
         ctl_note_drop_locked(op, "quit");
         q27_fp1_op_free(op);
         pthread_mutex_unlock(&g_ctl.mu);
@@ -1409,6 +1415,7 @@ static int ctl_apply_op(q27_fp1_op *op) {
 static void fp1_signal_quit(const char *reason) {
     pthread_mutex_lock(&g_ctl.mu);
     g_ctl.quit_requested = 1;
+    g_ctl.quit_barrier = 1;
     snprintf(g_ctl.quit_reason, sizeof(g_ctl.quit_reason), "%s",
              reason ? reason : "error");
     pthread_cond_broadcast(&g_ctl.cv);
@@ -1424,7 +1431,7 @@ static void *fp1_reader_main(void *arg) {
     unsigned char buf[4096];
     for (;;) {
         pthread_mutex_lock(&g_ctl.mu);
-        int stop = g_ctl.stop || g_ctl.quit_requested;
+        int stop = g_ctl.stop || g_ctl.quit_barrier;
         int wake_fd = g_ctl.wake_pipe[0];
         pthread_mutex_unlock(&g_ctl.mu);
         if (stop) break;
@@ -1464,6 +1471,7 @@ static void *fp1_reader_main(void *arg) {
         if (n == 0) {
             pthread_mutex_lock(&g_ctl.mu);
             g_ctl.quit_requested = 1;
+            g_ctl.quit_barrier = 1;
             snprintf(g_ctl.quit_reason, sizeof(g_ctl.quit_reason), "stdin_eof");
             pthread_cond_broadcast(&g_ctl.cv);
             pthread_mutex_unlock(&g_ctl.mu);
@@ -1529,6 +1537,7 @@ int q27_fp1_control_start(void) {
     g_ctl.stop = 0;
     g_ctl.cancel_requested = 0;
     g_ctl.quit_requested = 0;
+    g_ctl.quit_barrier = 0;
     g_ctl.quit_reason[0] = '\0';
     g_ctl.head = 0;
     g_ctl.len = 0;
