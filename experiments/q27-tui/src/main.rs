@@ -575,7 +575,7 @@ fn dispatch_input(
 fn local_help() -> &'static str {
     "keys: Enter send · Esc/^C cancel · ^Q quit\n\
      ↑/PgUp older · ↓/PgDn/End current output · Home top\n\
-     (empty input) t thinking · T theme · m markdown\n\
+     Ctrl-T thinking · Ctrl-Y theme · Ctrl-O markdown\n\
      /cancel /help /save /compact /session /new /read /search /shell /queue_clear"
 }
 
@@ -766,7 +766,7 @@ Keys:
   ↑/PgUp      older history
   ↓/PgDn/End  toward current LLM output (cannot scroll past it)
   Home        top of transcript
-  t / T / m   thinking / theme / markdown (empty input)
+  Ctrl-T / Ctrl-Y / Ctrl-O   thinking / theme / markdown
   /cancel     same as Esc while a turn is running
 
 Notes:

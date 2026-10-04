@@ -254,12 +254,12 @@ fn push_thinking_lines(
         return;
     }
     // Live stream always shows the full think body (no mid-sentence ellipsis).
-    // Completed turns honor show_thinking; [t] collapses them to a one-liner.
+    // Completed turns honor show_thinking; Ctrl-T collapses them to a one-liner.
     let expand = model.show_thinking || open;
     if !expand {
         let n = th.lines().count().max(1);
         lines.push(Line::from(Span::styled(
-            format!("  ▸ thinking collapsed ({n} lines)  [t]"),
+            format!("  ▸ thinking collapsed ({n} lines)  [Ctrl-T]"),
             Style::default().fg(theme.thinking),
         )));
         return;
