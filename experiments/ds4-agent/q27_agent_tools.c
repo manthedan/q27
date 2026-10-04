@@ -1441,7 +1441,9 @@ static q27_agent_status run_shell(int workspace_fd,
         }
         if (call_status == Q27_AGENT_CANCELLED || result->exit_code == -1)
             break;
-        pid_t waited = waitpid(pid, &status, WNOHANG);
+        // Reap once: after the leader is collected, later drain iterations
+        // must not waitpid() again (ECHILD would fail a successful command).
+        pid_t waited = child_done ? 0 : waitpid(pid, &status, WNOHANG);
         if (waited == pid) {
             child_done = 1;
             // Retire background members as soon as the authoritative shell

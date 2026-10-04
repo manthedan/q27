@@ -872,7 +872,25 @@ static void test_serial_fail_closed() {
     }
 }
 
+// Engage veto (native agent: opener inside a Markdown fence): no engage while
+// vetoed, the marker passes as prose; engaging resumes once the veto lifts.
+static void test_engage_suppressed_veto() {
+    Rig r;
+    bool fenced = true;
+    r.tc.engage_suppressed = [&fenced] { return fenced; };
+    int em[2] = {T_MARK, T_GET};
+    CHECK(r.tc.scan_round(em, 2) == -1);
+    CHECK(!r.tc.active);
+    CHECK(r.tc.engaged == 0);
+    fenced = false;
+    int em2[1] = {T_MARK};
+    CHECK(r.tc.scan_round(em2, 1) == 1);
+    CHECK(r.tc.active);
+    CHECK(r.tc.engaged == 1);
+}
+
 int main() {
+    test_engage_suppressed_veto();
     test_serial_fail_closed();
     test_c1_engage_truncate_midround();
     test_c2_marker_spans_rounds();

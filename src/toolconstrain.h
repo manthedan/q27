@@ -35,6 +35,11 @@ struct BasicToolConstrainer {
     ToolMaskCache<ToolGrammarXml>* cache_xml = nullptr; // parallel cache for the XML dialect
     std::vector<int>* host2dev = nullptr;
     bool enabled = false, active = false;
+    // Optional veto on engaging (both <tool_call> and bare <function=): the
+    // native agent sets it to "inside a Markdown fence", so a fenced example
+    // call decodes as prose instead of being masked, closed, and stopped on.
+    // The tail still advances. Unset (HTTP server): no change.
+    std::function<bool()> engage_suppressed;
     bool pool_dead = false; // sticky: mask pool filled up this request
     // Q27_TG_REENGAGE (XML dialect): re-engage the grammar on a bare
     // <function= opener (no <tool_call> wrapper) during scan_round -- the
@@ -317,7 +322,8 @@ struct BasicToolConstrainer {
                 // fire when the opener COMPLETES within this token (mirror of
                 // the <tool_call> test: skip only when it ended earlier)
                 if (bp != std::string::npos &&
-                    bp + 9 > tail.size() - bytes.size()) {
+                    bp + 9 > tail.size() - bytes.size() &&
+                    !(engage_suppressed && engage_suppressed())) {
                     std::string rem = tail.substr(bp);
                     tg_xml.reset(names, params_per_name, required_per_name, schema_present, allow_additional);
                     active = true;
@@ -357,6 +363,7 @@ struct BasicToolConstrainer {
             // engage only when the marker COMPLETES within this token; any
             // remainder bytes after it already belong to the call body
             if (pos == std::string::npos || pos + 11 <= tail.size() - bytes.size()) continue;
+            if (engage_suppressed && engage_suppressed()) continue;
             std::string rem = tail.substr(pos + 11);
             if (dialect_xml) tg_xml.reset(names, params_per_name, required_per_name, schema_present, allow_additional);
             else tg.reset(names);

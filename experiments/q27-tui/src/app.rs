@@ -253,9 +253,10 @@ impl Model {
                     // keep the busy phase (Esc must stay live; r15 codex P2).
                     self.phase = Phase::Tool;
                 }
-                if !toolish {
-                    self.finish_assistant_if_any();
-                }
+                // Finalize every completed assistant turn, tool calls too:
+                // left open, the post-tool reply appended to the same buffer
+                // (message moved below its tool card, think spans merged).
+                self.finish_assistant_if_any();
                 if let Some(o) = ev.output_tokens {
                     self.gen_tokens = o;
                 }
@@ -280,6 +281,7 @@ impl Model {
                 }
             }
             "tool_start" => {
+                self.finish_assistant_if_any();
                 self.phase = Phase::Tool;
                 self.input_enabled = self.has_queue_feature();
                 let kind = ev.tool_kind.clone().unwrap_or_else(|| "tool".into());
@@ -627,5 +629,42 @@ mod utf8_tests {
         let mut tail = vec![b'x', 0xff, b'y'];
         assert_eq!(drain_utf8(&mut tail), "x\u{FFFD}y");
         assert!(tail.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod turn_order_tests {
+    use super::*;
+    use crate::proto::ServerEvent;
+
+    fn ev(json: &str) -> ServerEvent {
+        ServerEvent::parse_line(json).unwrap()
+    }
+
+    #[test]
+    fn auto_tool_turns_stay_in_order() {
+        let mut m = Model::default();
+        m.apply(&ev(r#"{"type":"text_delta","text":"<think>a</think>call"}"#));
+        m.apply(&ev(r#"{"type":"turn_done","tool_call_complete":true}"#));
+        m.apply(&ev(r#"{"type":"tool_start","tool_kind":"read"}"#));
+        m.apply(&ev(r#"{"type":"text_delta","text":"<think>b</think>answer"}"#));
+        m.apply(&ev(r#"{"type":"turn_done","tool_call_complete":false}"#));
+        let kinds: Vec<&str> = m
+            .scrollback
+            .iter()
+            .map(|b| match b {
+                Block::Assistant { .. } => "assistant",
+                Block::Tool { .. } => "tool",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["assistant", "tool", "assistant"]);
+        match &m.scrollback[2] {
+            Block::Assistant { thinking, body } => {
+                assert_eq!(thinking.as_deref().map(str::trim), Some("b"));
+                assert_eq!(body.trim(), "answer");
+            }
+            _ => unreachable!(),
+        }
     }
 }

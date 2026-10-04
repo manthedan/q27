@@ -705,6 +705,9 @@ extern "C" q27_agent_status q27_agent_generate(
 
         using ToolConstrainer =
             q27::BasicToolConstrainer<q27::MetalEngine, q27::Tokenizer>;
+        // Every byte streamed this turn: the fence state the constrainer's
+        // engage veto reads (same rule the parser applies afterwards).
+        std::string emitted_text;
         std::optional<ToolConstrainer> constrainer;
         if (enable_tools) {
             if (!engine->tool_masks_ready) {
@@ -723,6 +726,16 @@ extern "C" q27_agent_status q27_agent_generate(
             constrainer->cache_xml = &engine->tool_masks_xml;
             constrainer->host2dev = engine->xml_dialect ? &engine->tool_host2dev_xml : &engine->tool_host2dev;
             constrainer->enabled = true;
+            // A tool opener inside a Markdown fence is an example: don't mask,
+            // close, and stop on it (the parser would refuse to run it, and
+            // the cycle would fail on the engine/parser disagreement).
+            constrainer->engage_suppressed = [&emitted_text] {
+                const size_t think_close = emitted_text.rfind("</think>");
+                const size_t scope =
+                    think_close == std::string::npos ? 0 : think_close + 8;
+                return q27::native_agent::inside_markdown_fence(
+                    emitted_text, emitted_text.size(), scope);
+            };
             constrainer->prepare_serial_masks = [engine] {
                 // Serial step/read has completed before this boundary. Keep
                 // only bounded device residency, never stale dialect indices.
@@ -774,6 +787,7 @@ extern "C" q27_agent_status q27_agent_generate(
             // history rendering then recovers the reasoning channel exactly.
             static constexpr char opener[] = "<think>\n";
             if (!sink(opener, sizeof(opener) - 1, opaque)) return cancelled();
+            emitted_text.append(opener, sizeof(opener) - 1);
             think_span.in_think = true;
             think_span.ever_opened = true;
         }
@@ -823,6 +837,7 @@ extern "C" q27_agent_status q27_agent_generate(
                     !sink(bytes.data(), bytes.size(), opaque)) {
                     return false;
                 }
+                emitted_text += bytes;
                 think_span.observe_token(bytes);
                 ++produced;
                 if (output_tokens) *output_tokens = produced;
@@ -900,6 +915,7 @@ extern "C" q27_agent_status q27_agent_generate(
             }
             if (!bytes.empty() && !sink(bytes.data(), bytes.size(), opaque))
                 return -1;
+            emitted_text += bytes;
             // Track thinking span after the sink publishes (bytes are
             // committed). Burst tokens pass through here too, so the think
             // budget accounting covers the MTP path. Only BEFORE any tool
@@ -922,6 +938,9 @@ extern "C" q27_agent_status q27_agent_generate(
             return 0;
         };
 
+        // EOS predicted right after the last token at the exact max_tokens
+        // bound still counts as a natural finish (header contract).
+        bool exact_bound_eos = false;
         auto finalize_last = [&](uint32_t token, bool already_encoded) -> void {
             try {
                 if (!engine->agent_session.record_emitted(token))
@@ -945,10 +964,14 @@ extern "C" q27_agent_status q27_agent_generate(
                     return;
                 }
                 try {
-                    (void)engine->session->step(token);
+                    const uint32_t next = engine->session->step(token);
                     if (!engine->agent_session.mark_pending_encoded())
                         throw std::runtime_error(
                             "agent session final-token mismatch");
+                    // Classification only: the prediction is not emitted.
+                    exact_bound_eos =
+                        (use_sample ? engine->session->sample_from_logits(params, rng)
+                                    : next) == eos;
                 } catch (const std::exception& e) {
                     engine->agent_session.invalidate();
                     engine->poisoned = true;
@@ -1175,8 +1198,8 @@ extern "C" q27_agent_status q27_agent_generate(
         }
         if (output_tokens) *output_tokens = produced;
         if (eos_reached)
-            *eos_reached = current == eos && !stopped_for_tool_call &&
-                           !think_budget_fallback_stop;
+            *eos_reached = (current == eos || exact_bound_eos) &&
+                           !stopped_for_tool_call && !think_budget_fallback_stop;
         if (think_budget_fallback_stop) {
             set_error(error, error_cap,
                       "thinking token budget reached (no room to continue)");
