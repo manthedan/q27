@@ -67,6 +67,8 @@ pub struct Model {
     pub queue_len: u32,
     pub scrollback: Vec<Block>,
     pub assistant_buf: String,
+    /// Trailing bytes of a UTF-8 character split across token deltas.
+    pub assistant_utf8_tail: Vec<u8>,
     pub last_error: Option<String>,
     pub status_line: String,
     pub input_enabled: bool,
@@ -103,6 +105,7 @@ impl Default for Model {
             queue_len: 0,
             scrollback: Vec::new(),
             assistant_buf: String::new(),
+            assistant_utf8_tail: Vec::new(),
             last_error: None,
             status_line: String::new(),
             input_enabled: false,
@@ -228,7 +231,11 @@ impl Model {
             "text_delta" => {
                 self.phase = Phase::Generating;
                 self.input_enabled = self.has_queue_feature();
-                if let Some(t) = ev.payload_text() {
+                // Byte-level tokens can split one character across deltas:
+                // decode through a carry buffer instead of per delta.
+                if let Some(bytes) = ev.payload_bytes() {
+                    self.assistant_utf8_tail.extend_from_slice(&bytes);
+                    let t = drain_utf8(&mut self.assistant_utf8_tail);
                     // Model output is untrusted terminal input too (r12 P2).
                     let t = sanitize_terminal_text(&t);
                     self.assistant_buf.push_str(&t);
@@ -429,6 +436,7 @@ impl Model {
                 if ev.action.as_deref() == Some("new") && st == "ok" {
                     self.scrollback.clear();
                     self.assistant_buf.clear();
+                    self.assistant_utf8_tail.clear();
                 }
                 let act = ev.action.as_deref().unwrap_or("session");
                 self.status_line = format!("{act} {st}");
@@ -491,6 +499,12 @@ impl Model {
     }
 
     fn finish_assistant_if_any(&mut self) {
+        if !self.assistant_utf8_tail.is_empty() {
+            // A turn ending mid-character: show it as U+FFFD, not nothing.
+            let tail = std::mem::take(&mut self.assistant_utf8_tail);
+            let t = sanitize_terminal_text(&String::from_utf8_lossy(&tail));
+            self.assistant_buf.push_str(&t);
+        }
         if !self.assistant_buf.is_empty() {
             let t = std::mem::take(&mut self.assistant_buf);
             let (thinking, body) = split_thinking(&t);
@@ -554,5 +568,64 @@ impl Model {
         } else {
             "markdown: off".into()
         };
+    }
+}
+
+/// Decode the longest complete UTF-8 prefix of `buf`, leaving an incomplete
+/// trailing sequence (at most 3 bytes) in place for the next delta. Invalid
+/// bytes decode as U+FFFD.
+fn drain_utf8(buf: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    let mut start = 0;
+    loop {
+        match std::str::from_utf8(&buf[start..]) {
+            Ok(s) => {
+                out.push_str(s);
+                start = buf.len();
+                break;
+            }
+            Err(e) => {
+                let valid = start + e.valid_up_to();
+                out.push_str(std::str::from_utf8(&buf[start..valid]).unwrap());
+                match e.error_len() {
+                    Some(n) => {
+                        out.push('\u{FFFD}');
+                        start = valid + n;
+                    }
+                    None => {
+                        start = valid;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    buf.drain(..start);
+    out
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::drain_utf8;
+
+    #[test]
+    fn split_character_is_carried_across_deltas() {
+        let euro = "€".as_bytes(); // e2 82 ac
+        let mut tail = Vec::new();
+        tail.extend_from_slice(b"a");
+        tail.extend_from_slice(&euro[..2]);
+        assert_eq!(drain_utf8(&mut tail), "a");
+        assert_eq!(tail, &euro[..2]);
+        tail.extend_from_slice(&euro[2..]);
+        tail.extend_from_slice(b"b");
+        assert_eq!(drain_utf8(&mut tail), "€b");
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn invalid_bytes_become_replacement_not_stuck() {
+        let mut tail = vec![b'x', 0xff, b'y'];
+        assert_eq!(drain_utf8(&mut tail), "x\u{FFFD}y");
+        assert!(tail.is_empty());
     }
 }

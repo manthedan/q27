@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
                 auto shared=q27::MetalEngine::open_shared(argv[1]);
                 (void)q27::MetalEngine::serving_reservation_bytes(*shared,1,q27::KvKind::F16,0);
             } catch(const std::runtime_error& error) {
-                rejected=std::string(error.what()).find("needs a non-empty")!=std::string::npos;
+                rejected=std::string(error.what()).find("a non-empty Q27_METAL_KV_FP16_CELLS")!=std::string::npos;
             }
             if(had_cells) setenv("Q27_METAL_KV_FP16_CELLS",saved_cells.c_str(),1);
             else unsetenv("Q27_METAL_KV_FP16_CELLS");

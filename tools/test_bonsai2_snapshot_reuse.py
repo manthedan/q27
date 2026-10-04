@@ -5,13 +5,24 @@ fresh server (no snapshots) vs save-then-hit in one process vs hit after a
 restart (disk load). Runs one server at a time, context 4096.
 
 Usage: test_bonsai2_snapshot_reuse.py SERVER MODEL TOKENIZER"""
-import json, os, socket, subprocess, sys, tempfile, threading, time, urllib.request
+import atexit, json, os, socket, subprocess, sys, tempfile, threading, time, urllib.request
 
 SERVER, MODEL, TOK = sys.argv[1:4]
 README = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")).read()[:9000]
 PAYLOAD = {"model": "q27-metal", "system": "You are a concise assistant.\n\n" + README,
            "messages": [{"role": "user", "content": "In two sentences, what is this project?"}],
            "max_tokens": 48, "temperature": 0}
+
+
+LIVE = set()
+
+
+@atexit.register
+def _kill_live():
+    # A failed request (HTTP error, timeout, bad JSON) exits before stop();
+    # never leave a model-bearing server holding the GPU for the next gate.
+    for p in list(LIVE):
+        p.kill(); p.wait()
 
 
 def start(snapdir):
@@ -22,6 +33,7 @@ def start(snapdir):
     if snapdir:
         args += ["--snapshot-dir", snapdir, "--snapshot-max-mb", "4096"]
     p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    LIVE.add(p)
     ready = threading.Event(); lines = []
     def drain():
         for line in p.stderr:
@@ -45,6 +57,7 @@ def ask(port, snapshot):
 
 def stop(p):
     p.terminate(); p.wait(30)
+    LIVE.discard(p)
 
 
 p, port, _ = start(None)

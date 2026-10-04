@@ -267,8 +267,11 @@ def evaluate_ab(run_dir: Path, tag: str, incumbent: Path, candidate: Path,
                         "detail": tail(run_dir / f"{tag}.pair{p}{arm}.log")}
             sink.append(ms)
     inc_med, cand_med = statistics.median(inc), statistics.median(cand)
+    # Median of PAIRED ratios (each pair shares its drift window), not the
+    # ratio of independent medians, which can accept a per-pair slowdown.
+    ratio = statistics.median(c / i for i, c in zip(inc, cand))
     return {"status": "ok", "incumbent_ms": inc_med, "candidate_ms": cand_med,
-            "ratio": cand_med / inc_med, "order": "".join(order),
+            "ratio": ratio, "order": "".join(order),
             "incumbent_all": inc, "candidate_all": cand}
 
 
@@ -324,7 +327,10 @@ def main() -> None:
     args = ap.parse_args()
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(args.run_dir) if args.run_dir else REPO / "logs" / f"kernel-agent-{stamp}"
+    # Absolute: subprocesses run with cwd=REPO, so a caller-relative run dir
+    # would point their shader override at a missing file (silent fallback).
+    run_dir = (Path(args.run_dir).resolve() if args.run_dir
+               else REPO / "logs" / f"kernel-agent-{stamp}")
     run_dir.mkdir(parents=True, exist_ok=True)
     gpu_lock = Path(args.gpu_lock)
     ledger = (run_dir / "ledger.jsonl").open("a")

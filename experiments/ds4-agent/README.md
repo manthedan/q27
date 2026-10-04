@@ -85,8 +85,8 @@ printf '%s\n' '{"v":1,"op":"prompt","text":"hi"}' '{"v":1,"op":"quit"}' |
 cd experiments/q27-tui && cargo run --release -- -- MODEL.q27 MODEL.tok --auto-tools
 ```
 
-**`q27-tui` keys (empty prompt line):** `t` expand/collapse finished thinking
-(default **collapsed**); `T` cycle theme; `m` toggle markdown. Live open
+**`q27-tui` keys:** Ctrl-T expand/collapse finished thinking
+(default **collapsed**); Ctrl-Y cycle theme; Ctrl-O toggle markdown. Live open
 `<think>` always streams in full. **Esc** / **Ctrl-C** / `/cancel` interrupt.
 
 Legacy `--output-format jsonl` (v0) is unchanged. FP1 forces the event stream

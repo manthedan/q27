@@ -24,6 +24,7 @@ class MetalBackend final : public ComputeBackend {
     static const char* shader_abi_tag();
     std::string shader_source_sha1() const;
     bool gemm_half_enabled() const;
+    bool t2_float_half_enabled() const;   // Q27_METAL_T2F_HALF prefill staging
     bool gemm_half_q4_enabled() const;
     uint32_t gqa_tile() const;
     uint32_t gqa_block() const;

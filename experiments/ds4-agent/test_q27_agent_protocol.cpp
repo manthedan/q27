@@ -63,6 +63,35 @@ int main() {
                 "</parameter></function>\n```", call, error, sizeof(error), 1, 1) ==
               Q27_TOOL_CALL_NONE,
           "wrapperless native XML inside a markdown fence is not executed");
+    // Engine stops at </tool_call>, so the example's closing fence never
+    // arrives: the opener's fence state alone must keep it from running.
+    CHECK(parse("Example:\n```xml\n<tool_call><function=shell><parameter=command>"
+                "touch example.txt</parameter></function></tool_call>", call, error,
+                sizeof(error), 1, 1) == Q27_TOOL_CALL_NONE,
+          "wrapped native XML inside a markdown fence is not executed");
+    CHECK(parse("Example:\n```json\n<tool_call>{\"name\":\"shell\",\"arguments\":"
+                "{\"command\":\"touch x\"}}</tool_call>", call, error, sizeof(error)) ==
+              Q27_TOOL_CALL_NONE,
+          "wrapped JSON call inside a markdown fence is not executed");
+    CHECK(parse("Example:\n```\nnot a call\n```\n<tool_call><function=read>"
+                "<parameter=path>src/a.cc</parameter></function></tool_call>", call,
+                error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID &&
+              std::strcmp(call.request.path, "src/a.cc") == 0,
+          "wrapped call after a closed fence still executes");
+    q27_agent_tool_call_free(&call);
+    // The XML constrainer forces </tool_call> after a bare <function=...>;
+    // recovery must not add a second closer.
+    CHECK(parse("<function=read><parameter=path>src/b.cc</parameter></function>"
+                "</tool_call>", call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_VALID &&
+              std::strcmp(call.request.path, "src/b.cc") == 0,
+          "wrapperless call with its constrained closer executes");
+    q27_agent_tool_call_free(&call);
+    CHECK(parse("<function=read><parameter=path>src/b.cc</parameter></function>\n"
+                "</tool_call>", call, error, sizeof(error), 1, 1) ==
+              Q27_TOOL_CALL_VALID,
+          "wrapperless call with a newline before its closer executes");
+    q27_agent_tool_call_free(&call);
     CHECK(parse("Example:\n``````xml\n<function=shell><parameter=command>"
                 "echo unsafe</parameter></function>\n``````", call, error,
                 sizeof(error), 1, 1) == Q27_TOOL_CALL_NONE,

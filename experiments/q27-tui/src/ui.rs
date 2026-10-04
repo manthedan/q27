@@ -47,29 +47,37 @@ fn draw_scrollback(
     tick: Instant,
 ) -> u16 {
     let lines = build_scrollback_lines(model, theme, tick);
-    let max_scroll = max_scroll_for(&lines, area);
-
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll.min(max_scroll), 0));
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let max_scroll = max_scroll_for(&para, area);
+    let para = para.scroll((scroll.min(max_scroll), 0));
     frame.render_widget(para, area);
     max_scroll
 }
 
-fn max_scroll_for(lines: &[Line<'_>], area: Rect) -> u16 {
+/// Exact post-wrap height from the same Paragraph that renders: a per-line
+/// width/viewport estimate undercounts word wrap and hid the transcript tail.
+fn max_scroll_for(para: &Paragraph<'_>, area: Rect) -> u16 {
     if area.height == 0 {
         return 0;
     }
-    let width = area.width.max(1) as usize;
-    // Approximate post-wrap line count (Paragraph uses the same wrap).
-    let mut wrapped = 0usize;
-    for line in lines {
-        let w = line.width().max(1);
-        wrapped += w.div_ceil(width).max(1);
-    }
-    wrapped
+    para.line_count(area.width.max(1))
         .saturating_sub(area.height as usize)
         .min(u16::MAX as usize) as u16
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn word_wrap_rows_are_counted() {
+        // 20 six-letter words in a 10-column viewport: word wrap puts one
+        // word per row (20 rows); the width estimate said ceil(139/10)=14.
+        let text = vec!["abcdef"; 20].join(" ");
+        let para = Paragraph::new(vec![Line::from(text)]).wrap(Wrap { trim: false });
+        let area = Rect::new(0, 0, 10, 5);
+        assert_eq!(max_scroll_for(&para, area), 15);
+    }
 }
 
 fn build_scrollback_lines(model: &Model, theme: &Theme, tick: Instant) -> Vec<Line<'static>> {

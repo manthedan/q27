@@ -714,6 +714,17 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         static const std::string open = "<tool_call>";
         static const std::string close = "</tool_call>";
         size_t begin = text.find(open);
+        // A wrapped call inside a Markdown fence is an example, not a call
+        // (same rule as the wrapperless path below). Fenced-only output ends
+        // the turn as prose: the engine stops at </tool_call> either way.
+        if (begin != std::string::npos) {
+            const size_t think_close = text.rfind("</think>", begin);
+            const size_t scope = think_close == std::string::npos ? 0 : think_close + 8;
+            while (begin != std::string::npos &&
+                   q27::native_agent::inside_markdown_fence(text, begin, scope))
+                begin = text.find(open, begin + open.size());
+            if (begin == std::string::npos) return Q27_TOOL_CALL_NONE;
+        }
         if (begin == std::string::npos) {
             if (!xml_dialect) return Q27_TOOL_CALL_NONE;
             bool saw_top_level_candidate = false;
@@ -760,7 +771,14 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
                 set_error(error, error_cap, "invalid native XML tool call");
                 return Q27_TOOL_CALL_INVALID;
             }
-            text.insert(native_end, close);
+            // The XML constrainer already emits </tool_call> after a bare
+            // <function=...>; only synthesize the closer when it is absent.
+            size_t tail = native_end;
+            while (tail < text.size() &&
+                   (text[tail] == ' ' || text[tail] == '\t' ||
+                    text[tail] == '\r' || text[tail] == '\n')) tail++;
+            if (text.compare(tail, close.size(), close) != 0)
+                text.insert(native_end, close);
             text.insert(native_begin, open);
             begin = native_begin;
         }

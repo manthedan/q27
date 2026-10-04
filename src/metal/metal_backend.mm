@@ -878,6 +878,7 @@ const char* MetalBackend::shader_abi_tag() { return kShaderAbiTag; }
 
 std::string MetalBackend::shader_source_sha1() const { return impl_->shader_hash; }
 bool MetalBackend::gemm_half_enabled() const { return impl_->gemm_half; }
+bool MetalBackend::t2_float_half_enabled() const { return impl_->t2_float_matmul_h != nil; }
 bool MetalBackend::gemm_half_q4_enabled() const { return impl_->gemm_half_q4; }
 uint32_t MetalBackend::gqa_tile() const { return impl_->gqa_tile; }
 uint32_t MetalBackend::gqa_block() const { return impl_->gqa_block; }

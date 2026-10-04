@@ -1617,11 +1617,15 @@ static int save_session_ex(q27_agent_worker *worker, const char *manifest_path,
         size_t n = strlen(snapshot_path);
         char *tmp = malloc(n + 5);
         if (tmp) { memcpy(tmp, snapshot_path, n); memcpy(tmp+n, ".tmp", 5); unlink(tmp); free(tmp); }
-    } else if (ok && current_snapshot_name) {
+    } else if (current_snapshot_name) {
+        // ok, or publication == 2: the manifest rename committed and now
+        // names this snapshot even though directory durability is uncertain.
+        // Adopt it as the CAS baseline either way, or every later save and
+        // discard fails "manifest changed" against the stale name.
         free(*current_snapshot_name);
         *current_snapshot_name = snapshot_name;
         snapshot_name = NULL;
-        tui_diagf( "[q27-agent session saved: %s]\n", manifest_path);
+        if (ok) tui_diagf( "[q27-agent session saved: %s]\n", manifest_path);
     }
     if (jsonl) {
         if (q27_fp1_protocol()) {

@@ -1108,6 +1108,7 @@ std::array<unsigned char,20> MetalEngine::snapshot_runtime_identity() const {
     add_string(backend_.name());
     add_u32(backend_.gemm_half_enabled());
     add_u32(backend_.gemm_half_q4_enabled());
+    add_u32(backend_.t2_float_half_enabled());
     add_u32(backend_.gqa_tile());
     add_u32(backend_.gqa_block());
     add_u32(backend_.gqa_threshold());
@@ -3242,6 +3243,8 @@ uint32_t MetalEngine::suffix_step(SuffixDraft& drafter, uint32_t pending, uint32
                                   std::vector<uint32_t>& committed, bool* burst,
                                   const SamplingParams* params, std::mt19937_64* rng) {
     const bool sampled = params && params->temperature > 0.0f;
+    if (sampled && !rng)
+        throw std::runtime_error("q27 Metal: sampled suffix step needs an rng");
     if (remaining < 2)
         throw std::runtime_error("q27 Metal: suffix step needs remaining >= 2 (emit the last token directly)");
     if (width < 2 || width > VERIFY_CHUNK_MAX)

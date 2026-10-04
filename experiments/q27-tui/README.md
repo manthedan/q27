@@ -53,9 +53,9 @@ The TUI restores the terminal on error/panic; if a prior version left raw mode o
 | Ctrl-C | cancel active turn, or clear input when idle |
 | Ctrl-D / Ctrl-Q | quit (`op: quit` → backend `bye`) |
 | PgUp / PgDn | scroll stream |
-| `t` | toggle thinking (`<think>…</think>`) expand/collapse |
-| `T` | cycle theme (`dark` → `ocean` → `ember` → `mono`) |
-| `m` | toggle markdown rendering on finalized assistant turns |
+| Ctrl-T | toggle thinking (`<think>…</think>`) expand/collapse |
+| Ctrl-Y | cycle theme (`dark` → `ocean` → `ember` → `mono`) |
+| Ctrl-O | toggle markdown rendering on finalized assistant turns |
 
 Slash → structured FP1 ops: `/help` `/save` `/compact` `/session` `/new` `/read` `/search` `/shell` `/queue_clear`.
 

@@ -538,8 +538,12 @@ extern "C" q27_agent_status q27_agent_engine_load_session(
             engine->session->load_state_fd(pinned.value, snapshot_path);
         if (restored != info.position || restored > engine->context)
             throw std::runtime_error("snapshot restored an unexpected Metal position");
-        if (pending && engine->session->pending_from_logits() != info.tokens.back())
-            throw std::runtime_error("snapshot pending logits do not match token ledger");
+        // The pending token is not checked against the resident logits'
+        // argmax: a sampled turn legitimately leaves a non-argmax token
+        // pending (KV full at the turn's end). The SHA-256 manifest digest
+        // above already pins the payload; only reject impossible ids.
+        if (pending && info.tokens.back() >= engine->tokenizer->vocab_size())
+            throw std::runtime_error("snapshot pending token is outside the vocabulary");
         if (!engine->agent_session.restore(info.tokens, pending))
             throw std::runtime_error("snapshot token ledger could not be restored");
         engine->poisoned = false;

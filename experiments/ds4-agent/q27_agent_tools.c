@@ -277,7 +277,9 @@ static int open_regular(int rootfd, const char *path, int flags,
     int parent = -1;
     char *leaf = NULL;
     if (!open_parent(rootfd, path, &parent, &leaf, result)) return -1;
-    int fd = openat(parent, leaf, flags | O_NOFOLLOW | O_CLOEXEC);
+    // O_NONBLOCK: a FIFO (or device) leaf must not block the worker in
+    // open() before the S_ISREG check below; cleared again for regular files.
+    int fd = openat(parent, leaf, flags | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         result_errno(result, "cannot open tool file");
         close(parent);
@@ -294,6 +296,14 @@ static int open_regular(int rootfd, const char *path, int flags,
     if (!S_ISREG(st->st_mode)) {
         errno = EINVAL;
         result_errno(result, "tool target is not a regular file");
+        close(fd);
+        close(parent);
+        free(leaf);
+        return -1;
+    }
+    const int fl = fcntl(fd, F_GETFL);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) != 0) {
+        result_errno(result, "cannot configure tool file");
         close(fd);
         close(parent);
         free(leaf);

@@ -431,6 +431,20 @@ int main(void) {
     CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out, &result) ==
               Q27_AGENT_OK && result.exit_code == -1,
           "final symlink is rejected");
+    {
+        // A writerless FIFO used to block open() forever; SIGALRM kills the
+        // test instead of hanging it if that regresses.
+        char fifo[512];
+        snprintf(fifo, sizeof(fifo), "%s/sub/pipe", root);
+        CHECK(mkfifo(fifo, 0600) == 0, "FIFO fixture created");
+        request.path = "sub/pipe";
+        alarm(5);
+        CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out, &result) ==
+                  Q27_AGENT_OK && result.exit_code == -1,
+              "FIFO read target is rejected without blocking");
+        alarm(0);
+        unlink(fifo);
+    }
     request.path = "../etc/passwd";
     CHECK(q27_agent_tool_execute(workspace_fd, &request, sink, alive, &out, &result) ==
               Q27_AGENT_OK && result.exit_code == -1,

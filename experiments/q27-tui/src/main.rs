@@ -385,15 +385,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             scroll = max_scroll;
                             follow_bottom = true;
                         }
-                        // Presentation toggles only when the input line is empty
-                        // so typing "the" / "make" still works.
-                        (KeyCode::Char('t'), KeyModifiers::NONE) if input.is_empty() => {
+                        // Presentation toggles are Ctrl chords: bare letters always
+                        // type (a bare `t` ate the first letter of "the ...").
+                        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
                             model_state.toggle_thinking();
                         }
-                        (KeyCode::Char('T'), KeyModifiers::SHIFT) if input.is_empty() => {
+                        (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
                             model_state.cycle_theme();
                         }
-                        (KeyCode::Char('m'), KeyModifiers::NONE) if input.is_empty() => {
+                        (KeyCode::Char('o'), m) if m.contains(KeyModifiers::CONTROL) => {
                             model_state.toggle_markdown();
                         }
                         (KeyCode::Char(c), KeyModifiers::NONE)
@@ -417,6 +417,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(terminal);
     backend.kill();
 
+    // `bye` with reason "error" is the agent reporting a fatal failure
+    // (engine or session save), not a clean quit: surface it and exit 1.
+    if fatal.is_none() && model_state.bye_reason.as_deref() == Some("error") {
+        let detail = model_state
+            .last_error
+            .clone()
+            .unwrap_or_else(|| read_log_tail(&log_path, 40));
+        fatal = Some(format!(
+            "agent stopped with an error\n{detail}\nfull log: {}",
+            log_path.display()
+        ));
+    }
     if let Some(msg) = fatal {
         return Err(msg.into());
     }
