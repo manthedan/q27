@@ -7,7 +7,7 @@
 > Source-checkout milestone only; no new Homebrew/prebuilt release is implied.
 > The upstream engine documentation follows below.
 
-A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GDN+attention, trained-in MTP heads), their fine-tunes, and PrismML's **Ternary Bonsai 2 27B** (2-bit, Hadamard-folded) on a single RTX 5090 (3090 and 4090/Ada also supported; Apple-silicon Metal backend for the q4s tier). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
+A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GDN+attention, trained-in MTP heads), their fine-tunes, and PrismML's **Ternary Bonsai 2 27B** (2-bit, Hadamard-folded) on a single RTX 5090 (3090 and 4090/Ada also supported, 8-12 GB Ampere cards for Bonsai 2; Apple-silicon Metal backend for the q4s tier). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
 ## Why this is interesting
 
@@ -81,7 +81,8 @@ canonicals in the HF model card.
 
 ## Quickstart
 
-Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.8+ at
+Requirements: an NVIDIA GPU with 24GB+ VRAM (Bonsai 2 runs on 8-12 GB
+cards, below), CUDA toolkit 12.8+ at
 `/usr/local/cuda`, gcc. `make` builds one tri-arch binary (sm_86 + sm_89 +
 sm_120; arch dispatch at runtime). 12.8 is the floor on every card: the build
 links an `sm_120a` object unconditionally. Prebuilt linux x86_64 binaries
@@ -141,12 +142,13 @@ The engine auto-selects 3.8's trained XML tool dialect from the artifact name.
 Qwen3.8-27B with every projection ternary (one fp16 scale per 128) in a
 Hadamard-rotated basis and no MTP block. q27 serves it natively: the repack
 keeps the ternary values exact in a 2-bit container (`T2_G128`, 9.44 GB for
-the whole model, embeddings and head in exact Q8), the engine rotates the
+the whole model, embeddings and head in exact Q8; T2 too under `--slim`, and
+the body at five trits per byte for 8 GB cards, below), the engine rotates the
 activations itself (sign + Walsh-Hadamard per 1024-block, fused into the
 activation quantizers), decode runs 2-bit dp4a GEMVs, prefill and the
 speculative verify run the int8 tensor-core GEMMs off a 2-bit staging
-unpack, and DFlash2 drafts against the ternary target with the Qwen3.8 Q8
-pack (the pack has no MTP head, so DFlash2 is the only drafter). The pack
+unpack, and DFlash2 drafts against the ternary target. PrismML ships no MTP
+head; a third-party one now packs in (below), so both drafters work. The pack
 is at [signalnine/Bonsai-2-27B-q27](https://huggingface.co/signalnine/Bonsai-2-27B-q27)
 with the tokenizer and checksums. Bit-exact
 containers mean the port is checkable against the reference fork: teacher-
@@ -158,7 +160,7 @@ matches `llama-perplexity` on the same GGUF to 0.15% (8.2767 vs 8.2643 at
 |---|--:|--:|--:|---|---|
 | Qwen3.8 default (v2) | 17.00 | 7.3121 | 30/30 | 6/6 @ ~120K | ~220 t/s |
 | Bonsai 2 (T2) | 9.44 | 9.2508 | 25/30 | 6/6 @ ~90K | 233 t/s on the 700-token prompt, 346 on cities; round 14.8 ms; plain 110 t/s |
-| Bonsai 2 (T3, `--bonsai2-container t3 --slim`) | 6.06 | 9.2513 (bitwise the T2 pack on the 3090) | same model | same model | the 8 GB-card pack; decode at the T2 pack's speed |
+| Bonsai 2 (T3, `--bonsai2-container t3 --slim`) | 6.06 | 9.2513 (bitwise the T2 pack on the 3090) | same model | same model | the 8 GB-card pack; on a 3090 it decodes 79-82 t/s plain vs the T2 pack's 74-76 (v0.14.1) |
 
 Same protocol as the table above (chunk 512, fp8 KV; the same-card pair on
 the 3090 is 9.2513 vs 7.3102). The 2.3 GB engine stack plus the 9.44 GB
@@ -202,11 +204,14 @@ verify has the engine's own near-tie flips on either model).
 On a 12 GB card (3060 class): `repack.py --slim` stores the embedding and
 head as T2 too (exact; 7.2 GB, or 7.6 GB with the MTP head), the
 `build/q27-server-12g` target is a single sm_86 image with 8 lanes and
-256-row prefill chunks, and `Q27_FIXED_STACK_GB=0.9` tells the pool sizer
-what that build actually costs. Simulated at 11.7 GB free on the 3090: 32K
-context plain, 20K with the MTP ladder, bitwise the full pack's plain
-decode; the 2.1 GB DFlash2 pack leaves only 4K there, so the MTP pack is
-the 12 GB drafter (BUILDLOG 2026-09-19 (av)).
+256-row prefill chunks, and `Q27_FIXED_STACK_GB` tells the pool sizer what
+that build actually costs: since v0.14.0 the value is the exact non-KV
+reserve, measured at 0.54 GB for the plain pack (use 0.6) and 0.74 with the
+MTP ladder (0.8). Simulated at 11.7 GB free on the 3090 (09-19, at 0.9 under
+the older and more conservative pool reserve, so today's windows are a
+little larger): 32K context plain, 20K with the MTP ladder, bitwise the full
+pack's plain decode; the 2.1 GB DFlash2 pack leaves only 4K there, so the MTP
+pack is the 12 GB drafter (BUILDLOG 2026-09-19 (av)).
 
 On an 8 GB card: `repack.py --bonsai2-container t3 --slim` packs the body
 as `T3_G128`, five trits per byte (1.6 bpw; 6.06 GB, or 6.49 GB with the
@@ -216,11 +221,15 @@ what the T2 kernel sums, so the pack is bitwise the T2 pack at every width
 converts each matrix into a 22 MB T2 scratch on the fly (+4% wall). With
 `Q27_FIXED_STACK_GB=0.6` and the Ampere-default turbo5k KV, a headless
 RTX 3060 Ti measures 36.9K context, 42 t/s decode and 481 tok/s prefill
-(first field report, 09-22); the 3090 simulation put 45K at 8.0 GB free,
-12K with the MTP ladder (`Q27_FIXED_STACK_GB=0.8`), and 24K plain with a
-display on the card. Decode runs at the T2 pack's speed rather than 24%
-under it -- the digit extraction is exposed on the 3090 (BUILDLOG
-2026-09-20 (aw)).
+(first field report, 09-22, on v0.14.0); the 3090 simulation put 45K at 8.0
+GB free, 12K with the MTP ladder (`Q27_FIXED_STACK_GB=0.8`), and 24K plain
+with a display on the card. v0.14.1 cut the T3 GEMV's instruction count by
+a fifth, so the pack now decodes faster than the T2 one (79-82 vs 74-76 t/s
+plain on a 3090; BUILDLOG 2026-09-20 (aw), 2026-09-25 (ax)). Single-slot
+serving should set `Q27_BATCH=0` (the conductor's k=1 fused round costs
+15-20% here: 66-67 vs 79-82 t/s on a 3090). `tools/install-bonsai2-8gb.sh` builds, downloads, verifies and
+smoke-tests the whole setup, and `tools/bench-bonsai2-8gb.sh` produces a
+one-file field report.
 
 ```bash
 # Bonsai 2: repack the PTQ1_0 GGUF (exact, ~3 min, default container t2),
@@ -269,13 +278,13 @@ Expect ~170-230 t/s decode on a 5090 depending on traffic shape, warm
 multi-turn prefills from the prefix cache, and `count_tokens` plus
 anthropic-shaped context-limit errors so Claude Code compacts correctly.
 
-## State of the engine (2026-09-21)
+## State of the engine (2026-10-01)
 
 One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
 persistent prefix cache that hits on real agentic traffic, and a tool-call
 parser measured against a labelled corpus of the model's own drift. Current
-release: [v0.14.1](https://github.com/signalnine/q27/releases).
+release: [v0.14.2](https://github.com/signalnine/q27/releases).
 
 Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
@@ -294,8 +303,8 @@ under [bench/crossengine/](bench/crossengine/):
   512 t/s with a third-party MTP head repacked into the pack. Small cards
   (v0.14.0): slim packs and a sm_86 build put it on 12 GB (32K context),
   and a five-trits-per-byte container, bitwise the 2-bit pack, on 8 GB
-  (6.06 GB; a 3060 Ti measures 36.9K context at 42 t/s;
-  `tools/install-bonsai2-8gb.sh`).
+  (6.06 GB; a 3060 Ti measures 36.9K context at 42 t/s on v0.14.0, and
+  v0.14.1's T3 GEMV is ~10% faster on a 3090; `tools/install-bonsai2-8gb.sh`).
 - Claude Code traffic, 12 SWE-bench instances, medium effort (the only
   level both engines render), 2026-09-10 re-bench: **q27 v0.11.3 218-222
   t/s** aggregate decode (232-233 median, 4.05-4.10 tok/round, two runs)
@@ -437,7 +446,10 @@ lives in [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 - **Weights**: custom 4-bit symmetric groupwise (group 64, fp16 scales),
   packed for coalesced 128B warp loads, dequant fused into GEMV. Repacked
-  offline from the BF16 GGUF ([docs/FORMAT.md](docs/FORMAT.md)).
+  offline from the BF16 GGUF ([docs/FORMAT.md](docs/FORMAT.md)). Bonsai 2's
+  ternary weights stay exact in 2-bit (`T2_G128`) or five-trits-per-byte
+  (`T3_G128`) containers, relaid at upload so the T3 GEMV is bitwise the T2
+  one.
 - **KV cache**: fp16 on the CLI (canonicals stay bitwise); the server
   defaults to fp8 E4M3 on sm_89+ (scale-free saturating conversion -- amax
   sits 3.8x under the E4M3 max) and turbo5k on Ampere. turbo3 3-bit
@@ -797,6 +809,16 @@ real coding while MTP nearly doubled stock llama.cpp.
   leaves block and inline level on accuracy while the block arm eats 28
   truncations to inline's 0; a budget converting even part of those should
   put the block arm ahead.
+- **The width>=4 near-tie flips are unexplained.** Multi-lane verify at
+  width 4 and up flips near-tie words against plain decode on both cards and
+  both models; `tools/width_probe.cu` shows every single-round mechanism is
+  bitwise, so it is a multi-round effect. Next instrument: a per-round lane-0
+  logits dump in the server.
+- **A 3060 Ti's 1500-token reply differed from the 3090's** (the other three
+  gated prompts matched byte for byte; his build used nvcc 13.4, ours 13.2).
+  `tools/bench-bonsai2-8gb.sh` now saves replies so a rerun can locate it.
+- **gemv_t3_n spills on sm_86 at widths 4-8** (12-24 B), the MTP ladder's
+  verify widths on 3060-class cards; gemv_t2_n is clean there. Perf only.
 - **turbo5k's tail is not a subset of turbo3's**: it fixes 89 of turbo3's 114
   catastrophic positions and introduces 40 new ones. Net -43%, but a workload
   fine on one is not guaranteed fine on the other. TCQ filed as its own plan,

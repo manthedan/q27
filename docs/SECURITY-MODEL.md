@@ -125,6 +125,15 @@ malicious `.q27` is not in the threat model.
 > offset arithmetic, and the embedding-gather bound. The manifest checks the tensor
 > TABLE, not the payload bytes behind it. Treat third-party `.q27`/`.tok` files as
 > out of scope still -- this is a narrower door, not a closed one.
+>
+> **Code check 2026-10-01:** the loader half is narrower than the line above
+> says. `loader.cpp` bounds-checks every data and scale offset against the
+> file with overflow-safe arithmetic, requires 256-byte alignment, and
+> `validate_tensor_payload()` checks each payload's exact size and the T2/T3
+> code ranges (since 2026-07-28 / 2026-08-01). Tokenizer header reads throw on
+> truncation (`read_exact`, 2026-08-02). The embedding-gather kernels
+> (`k_embed_row_q8` / `k_embed_row_t2`) still index the row by token id with
+> no bound.
 
 **Also out: `Q27_TOOL_SPLIT` documented race** (`engine.cuh:1343`). Already known,
 already opt-in, already documented OFF under `--slots`. Not a new finding.
@@ -304,7 +313,9 @@ tenancy findings (#2 leak-half, #8) are unaffected and still require the
 proxy-based disposition this doc recommends if the deployment is genuinely
 multi-tenant or internet-facing.
 
+---
 
+## When this model breaks (re-activation triggers)
 
 This entire doc is contingent. The out-of-scope findings become live again the instant any
 of these becomes true -- treat this list as the tripwire:

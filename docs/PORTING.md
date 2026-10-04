@@ -15,7 +15,7 @@ engine was built against.
 ## What is fixed at compile time
 
 **There are TWO constant tables and a port has to edit both.** The CUDA engine
-declares them at `src/engine.cuh:38-46`; `MetalEngine` declares its own private
+declares them at `src/engine.cuh:44-52`; `MetalEngine` declares its own private
 copy at `src/metal/metal_engine.h`. They agree exactly today, all fourteen
 values, and nothing enforces that they keep agreeing: each is checked against
 the artifact independently, so a port that updates one and forgets the other
@@ -45,13 +45,13 @@ container spec in `docs/FORMAT.md`) and not an engine job.
 `GDN_CH` is the packed q/k/v channel width the causal conv runs over: q and k
 each take `linear_num_key_heads` (16) heads and v takes
 `linear_num_value_heads` (48), all at dim 128, so (16 + 16 + 48) x 128 =
-10240. The conv ring is allocated at `3 * GDN_CH` (`engine.cu:996`), which is
+10240. The conv ring is allocated at `3 * GDN_CH` (`engine.cuh:1483`), which is
 `linear_conv_kernel_dim - 1` history slots; a kernel dim other than 4 changes
-that factor.
+that factor (`validate_arch()` pins `qwen35.ssm.conv_kernel` to 4).
 
 `N_ROT` is the only derived one. The model uses partial rotary embedding, so
 q27 rotates the first 64 of each 256-wide head and passes the rest through
-(`rope_neox_partial`, `engine.cuh:1076`). The config also carries mrope
+(`rope_neox_partial`, `engine.cuh:1739`). The config also carries mrope
 (`mrope_interleaved`, `mrope_section [11, 11, 10]`, summing to the 32 rotary
 pairs), which only bites for multimodal position ids. q27 implements the text
 stack, so the sections collapse to ordinary rope and are not read.
@@ -70,21 +70,24 @@ naming the offending key. So the failure mode for a wrong checkpoint is a clear
 message at startup, not silently wrong numbers. Neither validator can tell you
 a checkpoint will work; they only tell you it will not.
 
-The Metal validator is the stricter of the two, because it is a q4s-only engine
-slice: it additionally requires `quant_policy == "q4s-v1"`, the full tensor
-name/dtype/shape table, and the attention layout discussed below. The CUDA
-validator is deliberately tier-agnostic, since `quant_policy`, `q4_head` and
-`q8_extra` differ across the seven published tiers and say nothing about the
-graph.
+The Metal validator is the stricter of the two: it additionally pins
+`quant_policy` to a known recipe (the published Q tiers `q4s-v1`, `q5f-v1`,
+`q6-v1`, `q6f-v1`, `q6k-v1`, `q8-v1`, `v1.4`, with their exact `q4_head` /
+`q8_extra` metadata, or the v1 Bonsai `bonsai-t2-v1` / `bonsai-b1-v1` /
+`bonsai-mixed-v1` packs), the full tensor name/dtype/shape table, and the
+attention layout discussed below. It does not accept the Bonsai 2 policies
+(`bonsai2-*`), so Bonsai 2 is CUDA-only today. The CUDA validator is
+deliberately tier-agnostic, since `quant_policy`, `q4_head` and `q8_extra`
+differ across the published tiers and say nothing about the graph.
 
 ## What is already data-driven
 
 Do not add these to the checklist. They flow through without a code change.
 
-**Which layers are full attention, on the CUDA path.** `tools/repack.py:136-145`
+**Which layers are full attention, on the CUDA path.** `tools/repack.py:1018-1027`
 derives `attn_layers` by inspecting tensor names, writes it into the `.q27`
-metadata, and `engine.cuh:710-717` reads it back into `attn_layer[]`. Every
-consumer asks `is_attn_layer(il)` (`engine.cuh:2575`) rather than computing an
+metadata, and `engine.cuh:1119-1135` reads it back into `attn_layer[]`. Every
+consumer asks `is_attn_layer(il)` (`engine.cuh:3632`) rather than computing an
 interval. A checkpoint with a different `full_attention_interval`, or an
 irregular layout that no interval describes, needs no CUDA engine edit -- the
 KV allocation and the layer dispatch both loop over the flag.
@@ -107,8 +110,8 @@ outside the engine (`docs/FORMAT.md`).
 
 A checkpoint can match the table above and still not run.
 
-- **Decode `cols` must be a multiple of `VG_KB` = 256.** `vgemm.cuh:69`
-  documents it and `vgemm.cu:337` aborts rather than corrupt. The current
+- **Decode `cols` must be a multiple of `VG_KB` = 256.** `vgemm.cuh:70-71`
+  documents it and `vgemm.cu:463` aborts rather than corrupt. The current
   shapes are 5120 (20x), 6144 (24x) and 17408 (68x).
 - **The KV formats tile 128-element groups.** `QK_TURBO3` and `QK_TURBO5` are
   both 128 (`turbo3.cuh:22`, `turbo5.cuh:33`), and the WHT group size is the
@@ -119,7 +122,10 @@ A checkpoint can match the table above and still not run.
 - **The MTP head is one layer.** `mtp_num_hidden_layers` is 1, and the draft
   ladder (`D_MAX_MTP`, `docs/plans/2026-07-13-mtp-draft-head.md`) is built on
   that shape. A checkpoint with no MTP head still decodes, but loses the
-  speculative path that most of q27's margin comes from.
+  speculative path that most of q27's margin comes from. Bonsai 2 27B is
+  the live example: 64 blocks, no MTP layer of its own (`has_mtp` is keyed
+  on `blk.64.nextn.eh_proj.weight`; `repack.py --mtp-safetensors` can append
+  an external head).
 
 ## Triage
 
@@ -196,6 +202,16 @@ depth on 3.8). Constants portability and recipe portability are different
 claims; this file covers only the first.
 
 ## Recon log
+
+### Bonsai 2 27B (2026-09-18)
+
+PrismML's Ternary Bonsai 2 27B is Qwen3.8-27B retrained ternary: every
+constant in the table above matches, so it is a repack (`tools/repack.py`,
+`--bonsai2-container t2|t2+q4x|q4x|t3`, optional `--slim`) plus one engine
+addition that is not a constant: the Hadamard rotation of each matmul input
+(`bonsai2` in `engine.cuh`; contract in `docs/FORMAT.md`). Its weights use
+the T2_G128 and T3_G128 dtypes. The CUDA engine serves it; the Metal
+validator rejects the `bonsai2-*` policies.
 
 ### Qwen3.8-27B release
 

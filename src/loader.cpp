@@ -109,7 +109,7 @@ bool cuda_weight_dtype_supported(DType dtype) {
         case DType::Q8_G128:
         case DType::Q4_G64:
         case DType::FP4_G16: // uploadable bytes; consumed only by the pf4 prefill leg
-        case DType::T2_G128: // Bonsai 2 Phase 2: decode GEMVs (gemv_t2); prefill reads the .q4x shadow
+        case DType::T2_G128: // Bonsai 2: decode GEMVs (gemv_t2) + the T2 MMA prefill GEMM (gemm_t2_T)
         case DType::T3_G128: // Bonsai 2 8 GB packs (2026-09-20): gemv_t3 + the T2 prefill scratch
             return true;
         case DType::B1_G128:

@@ -1,6 +1,6 @@
 # q27 RunPod Serverless image -- BUILD FROM SOURCE (recommended default).
 #
-# Why source, not the prebuilt release tarball: the v0.3.1 binaries link
+# Why source, not the prebuilt release tarball: the release binaries link
 # the CUDA 13.2 runtime and need host driver r580+. RunPod serverless
 # hosts are not guaranteed that new. Building against 12.8 here lowers the
 # floor to r570+ (covers essentially every current RunPod GPU host).
@@ -13,7 +13,7 @@
 FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends git g++ make ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-ARG Q27_REF=v0.3.1
+ARG Q27_REF=v0.14.2
 RUN git clone --depth 1 --branch ${Q27_REF} https://github.com/signalnine/q27 /src
 WORKDIR /src
 # sm_86 (A5000/A6000) + sm_89 (4090/L40/L40S) cover the 24-48GB serverless
@@ -30,10 +30,9 @@ COPY --from=build /src/build/q27-server-w8 /opt/q27/q27-server-w8
 COPY handler.py /handler.py
 ENV Q27_BIN=/opt/q27/q27-server-w8 \
     Q27_MODEL=/runpod-volume/qwen36-27b-mtp-q4s.q27 \
-    Q27_TOK=/runpod-volume/qwen36-27b-mtp.tok \
-    Q27_KV=turbo3
-# Q27_KV=turbo3 default = full 262K window on a 24GB card. Set Q27_KV=fp8
-# for max single-stream speed at less context, or unset on sm_86 (turbo3
-# is the sm_86 default). For greedy-only serving add Q27_SAMPLED=0 to
-# skip ~600MB of sampled graphs and shorten cold boot.
+    Q27_TOK=/runpod-volume/qwen36-27b-mtp.tok
+# KV format: the server picks per arch (fp8 on sm_89+, turbo5k on sm_86).
+# Set Q27_KV=turbo3 for the deepest window (more tail error). For
+# greedy-only serving add Q27_SAMPLED=0 to skip the sampled graphs and
+# shorten cold boot.
 CMD ["python3", "-u", "/handler.py"]

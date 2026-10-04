@@ -6,6 +6,15 @@ Extracted from mainline llama.cpp build 1491 by direct source read:
 An earlier agent-generated summary had three material errors (K-head count, QK dims, attention scale);
 everything below is from the source, not the summary.
 
+Bonsai 2 27B (PrismML's ternary Qwen3.8-27B, 2026-09-18) runs this same
+forward pass with two differences: no MTP layer (blocks 0..63 only, unless a
+pack appends an external MTP head as an unrotated `blk.64`), and every
+projection except `ssm_alpha`/`ssm_beta` is stored in a Hadamard-rotated
+basis, so the engine sign-flips and Walsh-Hadamard-transforms each matmul
+input per 1024-block and inverse-rotates the embedding row. Its weights are
+T2_G128 or T3_G128 instead of Q4/Q8. The runtime contract is in FORMAT.md
+("Bonsai 2 packs").
+
 ## Dimensions
 
 | | |
@@ -97,7 +106,9 @@ check llama.cpp speculative.cpp recursion before implementing multi-depth].
 ## KV/state budget (decode, f16 KV)
 
 - 16 attention layers + 1 MTP layer: 17 x 4 heads x 256 x 2(K,V) x 2B = 68 KB/token
-- 32K ctx: 2.2 GB f16 (FP8 later: 1.1 GB)
+- 32K ctx: 2.2 GB f16, 1.1 GB fp8. The engine default is fp16 (`Q27_KV`
+  unset); the server's default profile sets `Q27_KV=fp8` on sm_89+ and
+  `turbo5k` on Ampere (`server.cu`), and `--kv-fp16` / `Q27_PROFILE=ref` keep fp16
 - DeltaNet: 151 MB state + 48 x 3 x 10240 x 4B = 5.9 MB conv rings (constant, no growth)
 
 ## Verification flags (resolve during M1 validation)

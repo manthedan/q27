@@ -13,6 +13,11 @@ single-turn benchmarks warmed the ring once and never paid that cost again.
 DFlash2 is a real win with warm context and not a serving default until the
 prefill feeds the ring. This is the whole reason to run a live trial.
 
+**Update (BUILDLOG 2026-09-07 (g)-(i), 2026-09-08 (e)):** the live loss is
+superseded. Ring retention across turns, the last-token row and the sampled
+selector walk flipped the same harness to a DFlash2 win, and production moved
+to the DFlash2 config on 09-08. The numbers below are the 09-06 record.
+
 Full working log: `docs/plans/2026-09-06-dflash2-integration.md`. Rig and raw
 data: this directory.
 
