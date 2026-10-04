@@ -1475,6 +1475,7 @@ int main(int argc, char** argv) {
             e.sfx.reset(toks);
             e.sfx_valid = false;
         }
+        e.dv_set_context(toks); // Q27_DRAFT_VOCAB (no-op when off)
         int total_emitted = 0, rounds = 0, hist[W_MAX] = {0}; // a round emits up to W_MAX tokens
         while ((int)out.size() < n_gen) {
             if (P + e.ctx_round_reserve() > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
@@ -1484,6 +1485,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < n; k++) out.push_back(em[k]);
             if (e.suffix_on)
                 for (int k = 0; k < n; k++) e.sfx.append(em[k]);
+            e.dv_observe(em, n); // Q27_DRAFT_VOCAB (no-op when off)
             rounds++;
             total_emitted += n;
             hist[n - 1]++;

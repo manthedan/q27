@@ -1254,6 +1254,30 @@ void t3_to_t2_device(const uint8_t* W3, uint8_t* W2, int64_t rows, int64_t cols,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---- reduced-vocab draft head (kernels.cuh) ----
+__global__ void k_head_gather_rows(const uint8_t* __restrict__ src, const __half* __restrict__ ss,
+                                   size_t row_bytes, int row_scales, const int* __restrict__ ids,
+                                   uint8_t* __restrict__ dst, __half* __restrict__ ds) {
+    const int r = blockIdx.x;
+    const size_t id = (size_t)ids[r];
+    const uint32_t* s32 = (const uint32_t*)(src + id * row_bytes);  // row_bytes % 4 == 0 (cols % 64)
+    uint32_t* d32 = (uint32_t*)(dst + (size_t)r * row_bytes);
+    for (size_t i = threadIdx.x; i < row_bytes / 4; i += blockDim.x) d32[i] = s32[i];
+    for (int i = threadIdx.x; i < row_scales; i += blockDim.x)
+        ds[(size_t)r * row_scales + i] = ss[id * row_scales + i];
+}
+void head_gather_rows(const uint8_t* src, const __half* src_scales, size_t row_bytes, int row_scales,
+                      const int* d_ids, int n, uint8_t* dst, __half* dst_scales, cudaStream_t st) {
+    if (n <= 0) return;
+    k_head_gather_rows<<<n, 256, 0, st>>>(src, src_scales, row_bytes, row_scales, d_ids, dst, dst_scales);
+    CUDA_CHECK(cudaGetLastError());
+}
+__global__ void k_remap_id(int* p, const int* map) { *p = map[*p]; }
+void remap_id(int* p, const int* map, cudaStream_t st) {
+    k_remap_id<<<1, 1, 0, st>>>(p, map);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ---- Bonsai 2 activation rotation (kernels.cuh for the contract) ----
 // One 256-thread block per 1024-element chunk; the butterfly pairs (j, j+h)
 // with the low element taking a+b and the high one a-b, each element written

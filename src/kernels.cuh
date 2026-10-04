@@ -101,6 +101,17 @@ void gemv_t3_n(const uint8_t* W, const __half* S, const XQuant* xqs, int nbatch,
 void t3_to_t2_device(const uint8_t* W3, uint8_t* W2, int64_t rows, int64_t cols,
                      cudaStream_t st = 0);
 
+// ---- reduced-vocab draft head (2026-10-04, Q27_DRAFT_VOCAB) ----
+// Gather rows ids[0..n) of a row-major head (data + per-row scales) into a
+// compact copy; row_bytes / row_scales are per-row sizes of the source dtype
+// (Q4_G64: cols/2 B + cols/64 halves; Q8_G128: cols B + cols/128; T2_G128:
+// cols/4 B + cols/128; T2 rows keep their device-interleaved words).
+void head_gather_rows(const uint8_t* src, const __half* src_scales, size_t row_bytes,
+                      int row_scales, const int* d_ids, int n, uint8_t* dst, __half* dst_scales,
+                      cudaStream_t st = 0);
+// *p = map[*p] (a draft argmax over the compact head -> a vocabulary id)
+void remap_id(int* p, const int* map, cudaStream_t st = 0);
+
 // y = x * rsqrt(mean(x^2) + eps) * w      (single vector, n elements)
 void rmsnorm(const float* x, const float* w, float* y, int n, float eps, cudaStream_t st = 0);
 

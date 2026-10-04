@@ -38,6 +38,7 @@ class PrefixRam {
         char* p = nullptr;      // pinned
         size_t cap = 0;
         size_t bytes = 0;
+        bool inflight = false;  // handed out by acquire(), not yet published/abandoned
         ~Blob() {
             if (p) cudaFreeHost(p);
         }
@@ -108,16 +109,23 @@ class PrefixRam {
     // holds it) before allocating, so the pinned malloc happens at most
     // max_slots_ times over the server's life -- and zero times once prealloc()
     // has run, which is the serving path.
+    //
+    // In-flight slots count against max_slots_ (2026-10-04): acquire() takes
+    // the slot out of lru_, so counting lru_ alone let a second concurrent
+    // acquire() see a free slot and cudaMallocHost one more -- over the pinned
+    // budget, on the serving path -- and publish() never trimmed it back.
     BlobPtr acquire(size_t need) {
         if (!enabled() || need > slot_bytes_) return nullptr;
         std::lock_guard<std::mutex> lk(m_);
-        if ((int)lru_.size() >= max_slots_) {
+        if ((int)lru_.size() + inflight_ >= max_slots_) {
             for (auto it = lru_.begin(); it != lru_.end(); ++it) {
                 if (it->use_count() > 1) continue;  // someone is still reading it
                 BlobPtr b = *it;
                 lru_.erase(it);
                 b->toks.clear();
                 b->bytes = need;
+                b->inflight = true;
+                inflight_++;
                 return b;
             }
             return nullptr;  // every slot busy: caller falls back to its own staging
@@ -132,7 +140,21 @@ class PrefixRam {
         }
         b->cap = slot_bytes_;
         b->bytes = need;
+        b->inflight = true;
+        inflight_++;
         return b;
+    }
+
+    // Give back an acquired slot that was never filled (e.g. the disk read
+    // failed). It returns to the LRU empty, oldest position, so its pinned
+    // allocation is reused instead of freed here and re-allocated later.
+    void abandon(const BlobPtr& b) {
+        if (!b) return;
+        std::lock_guard<std::mutex> lk(m_);
+        if (b->inflight) { b->inflight = false; inflight_--; }
+        b->toks.clear();
+        lru_.erase(std::remove(lru_.begin(), lru_.end(), b), lru_.end());
+        lru_.insert(lru_.begin(), b);
     }
 
     // Publish a filled slot. Replaces any entry with the same prefix length and
@@ -140,6 +162,7 @@ class PrefixRam {
     void publish(const BlobPtr& b, const std::vector<int>& prompt, int L) {
         if (!b || !enabled() || L <= 0 || (size_t)L > prompt.size()) return;
         std::lock_guard<std::mutex> lk(m_);
+        if (b->inflight) { b->inflight = false; inflight_--; }
         b->toks.assign(prompt.begin(), prompt.begin() + L);
         lru_.erase(std::remove_if(lru_.begin(), lru_.end(),
                                   [&](const BlobPtr& x) {
@@ -168,6 +191,7 @@ class PrefixRam {
     mutable std::mutex m_;
     std::vector<BlobPtr> lru_;  // front = least recently used
     size_t slot_bytes_ = 0;
+    int inflight_ = 0;  // acquired slots not yet published/abandoned (guarded by m_)
     int max_slots_ = 0;
 };
 

@@ -15714,6 +15714,154 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-04 (bc): Q27_DRAFT_VOCAB on Bonsai 8 GB -- reserved in the estimator, generated tokens join the subset, on in the --mtp installer
+
+**The estimator didn't know about the head.** The KV pool is sized before any
+engine exists, and `dv_init` allocated the gathered head afterwards. On the 8 GB
+point (3090 + hog, T3+MTP slim pack) the 63 MB head OOMed at construction.
+`draft_vocab_plan()` (engine.cuh) now sizes the head once, and both the
+allocation and the server's per-slot fixed stack (`ENG_FIXED_BYTES`,
+`single_fixed`) read it, so the pool gives up those bytes (0.34 -> 0.29 GB at
+16K). The allocation is also soft now: a failed malloc keeps the full head with
+a warning. The host id mirror is pinned (the pageable DMA path flips bits on
+this host).
+
+**Generated tokens weren't draftable.** The CLI on the 3090 (Bonsai T3+MTP, the
+5-token salad prompt, greedy) was bitwise but slower: 2.91 -> 2.55 tok/round,
+93.2 -> 84.5 t/s. That output loops on tokens outside both the static ids and
+the 5-token prompt: 81 distinct, 213 occurrences in 1,500 tokens. `dv_observe`
+now appends each committed token that is in neither set to the next free
+context row (only rows past every in-flight copy, so no sync). The prompt fills
+at most 3/4 of the context rows (up to 1K held back). Result: 2.77 tok/round,
+92.1 t/s (still bitwise). The remaining gap is first sightings, which the full
+head drafts and the subset can't.
+
+**Gate (3090 at the 8 GB point, 8.3 GB free, turbo5k, --ctx 16384, Q27_BATCH=0, server greedy):**
+
+    t/s short/cities/long/code   full head 120.9/123.5/103.1/108.4   draft vocab 124.8/126.8/105.1/114.7  (+3.2/+2.7/+1.9/+5.8%)
+    control: full head, Q27_PMIN 0.5 -> 0.3   texts diverge on 3 of 4 prompts (chars 211, 197, 1520)
+    draft vocab vs full head                   diverges on long/code (chars 936, 366)
+    5090 CLI (Qwen3.8, after dv_observe)       md5 8f735a13 both ways, 169.9 -> 184.1 t/s
+
+Server greedy on the 3090 is draft-sensitive too: the full head with only PMIN
+moved diverges earlier than the subset does. The CLI is bitwise on both GPUs.
+`tools/install-bonsai2-8gb.sh --mtp` now writes `Q27_DRAFT_VOCAB=40960` into
+run.sh (overridable; builds before this ignore it). That costs ~3K tokens of
+window at 18.6 KB/token. The non-MTP default pack has no draft head and is
+unchanged. Still unmeasured: real agentic traffic, and a 3060-class card.
+
+## 2026-10-04 (bb): reduced-vocab MTP draft head (Q27_DRAFT_VOCAB) -- draft steps 37% cheaper, ladder +4-18% on the 5090, opt-in
+
+Idea from Strata's `--draft-vocab` (Qwen3.8-Flash-Next engine): the MTP draft
+only PROPOSES, verify keeps the full head, so a draft head over a vocabulary
+subset leaves output unchanged; a token outside the subset just isn't drafted.
+
+**Coverage, measured first** (781K output tokens of 1,246 recorded Claude Code
+turns, Bonsai legs, Qwen3.8 tokenizer): a static subset alone is weak (ids <
+40960: 94.9%; agentic output is full of identifiers the model just read), but
+static + the request's own prompt tokens covers 99.35% at 40K (6.5 misses per
+1000 output tokens), 99.74% at 64K, 99.98% at 97K. Residual misses are
+reasoning words above id 40K ("Actually", "Hmm"); the tool tags sit at the top
+of the vocab and are always included.
+
+**Cost, measured** (5090, `tools/head_bench.cu`): the Q4 head GEMV is 0.40 ms
+of a 0.85 ms ladder draft step (the MTP block's eight matmuls are 0.11); a
+47K-row head is 0.08 ms.
+
+**Implementation:** `Q27_DRAFT_VOCAB=N` (default off) gathers head rows
+(Q4/Q8/T2 sources) for ids [0, N) + the top 320 ids (specials) + up to
+`Q27_DRAFT_VOCAB_CTX` (8192) distinct prompt tokens into a fixed-shape draft
+head (pad rows duplicate a real row, so captured graphs keep their shape);
+`mtp_tail` argmaxes over it and `remap_id` maps the index back. The context
+rows are regathered per request (`dv_set_context`, next to the suffix index
+sync). Solo engines only (`Q27_BATCH=0`): fused rounds share one head across
+members with different prompts. Sampled rounds use the same argmax drafts, so
+rejection sampling stays exact.
+
+**Gate (5090, Qwen3.8 default pack, MTP ladder):**
+
+    CLI greedy 1500 tok   md5 8f735a13 with and without (bitwise); 176.2 -> 183.7 t/s (2nd run 172.5 -> 184.2), 3.03 -> 2.99 tok/round
+    server, suffix on     t/s long/code/edit  170.7/193.0/167.4 -> 178.6/202.6/196.8 (N=40960), 178.9/201.8/195.6 (N=65536)
+    server, suffix off    171.2/193.0/159.8 -> 178.4/195.3/171.5
+    draft ms per step     0.86 -> 0.54
+
+Server greedy texts differ from the full-head run after 544-1,569 chars. Not
+the subset: with the full head, changing only Q27_PMIN (0.5 -> 0.3) diverges
+earlier (251-1,233 chars) -- server greedy on the 5090 depends on round
+segmentation (the 09-07/09-18 width finding); the CLI ladder, which is not
+sensitive on this prompt, is bitwise. N=40960 and 65536 run the same speed;
+40960 is the cheaper head. Not yet measured: Bonsai's T3+MTP pack (T2 head,
+0.21 ms of the step on the 5090; likely a larger share on a 3060), and real
+agentic traffic.
+
+## 2026-10-04 (ba): second bug hunt -- a server-killing tool schema, a stack-overflow body, a cache key that trusted file size
+
+CPU-only this time (the GPUs were serving). Every CPU suite, tokenizer parity,
+a sustained parser fuzz, and two independent read-only reviews of the oldest
+unreviewed surfaces: the KV pool / incremental-KV banker / prefix caches, and
+the HTTP-to-engine request path.
+
+**Fixed:**
+
+- **A common MCP tool schema could kill the server.** Drift modes 11 and 23
+  read each declared property's type with nlohmann `value("type",
+  std::string())`, which throws `type_error.302` when `type` is an array --
+  `["string","null"]`, valid JSON Schema and common in MCP tools; mode 22's
+  zero-arg check threw `306` on `"parameters": null` or a string. Those run
+  inside the streaming parse, in an httplib content provider, and httplib's
+  ThreadPool calls providers with no try: `std::terminate`, every in-flight
+  request dropped. Reproduced by a new drift-suite test against the pre-fix
+  header (4 of 5 shapes threw, including the plain mode-23 `{"command":...}
+  </function>` drift). Fixed at the root (`schema_prop_is_string`, which also
+  treats a string-admitting type array as a string param, and an is_object
+  guard) and at the boundary: all three streaming providers now go through
+  `guard_provider`, which logs, closes the stream and keeps the process.
+- **A deeply nested body overflowed the worker stack.** nlohmann parses and
+  destroys iteratively but copies and `dump()`s recursively; a ~2 MB
+  million-deep `input_schema` on `/v1/messages/count_tokens` was a SIGSEGV no
+  catch can stop. `q27::parse_request_body` pre-scans bracket depth (strings
+  skipped) and refuses past 512 at all four parse sites, through their
+  existing 400 paths.
+- **Prefix-cache entries keyed on model path + size only**, so a same-size
+  pack swapped in at the same path restored GDN/KV state from other weights.
+  The key now hashes size, mtime, inode and device. One-time cost: existing
+  cache roots go cold on upgrade.
+- **The pinned RAM tier overshot its budget**: `acquire()` took slots out of
+  the LRU without counting them, so concurrent acquires each `cudaMallocHost`ed
+  another ~1 GB slot on the serving path, and a failed disk read freed its
+  slot instead of returning it. In-flight slots now count; `abandon()` returns
+  unfilled ones.
+- **`allowed_tools` reordered against `tools` paired names with the wrong
+  schemas** under `--constrain-tools` (the grammar indexes params by name
+  index); names are rebuilt from the filtered tools.
+- **Responses streaming gave a message and a recovered tool call the same
+  `output_index`** on a truncated tool tail; `emit_call` closes an open message
+  first.
+- **`/health?verify=1` skipped auth** while running a full GPU weight
+  checksum; only a bare `/health` is exempt now.
+- `prompt + max_tokens` overflowed int at `max_tokens = INT_MAX` (UB, masked
+  by a later clamp); a float `seed` like 1e30 was a UB float-to-int cast.
+- **test-inspect had been red since v0.14.0**: the loader contract test still
+  asserted T3_G128 is CUDA-unsupported. None of the T3 gates ran that suite.
+
+**Clean:** test-tools (incl. extract_check against the integration harness's
+embedded `handle()`), test-inspect, corpus-check 165/165, kv_bank, conductor,
+sampling, suffixdraft, argmax_tie; tokenizer parity vs HF on all four probe
+sets (2.52M strings, all identical); the tool-parser fuzz under ASan+UBSan, 475,625 runs in 15 min, 0 crashes (its harness uses a fixed well-formed schema, which is why it never reached the schema crash above).
+
+**Found, not fixed (open):**
+- KV waiters can starve: `claim_slot` and parked growth retry on every
+  condvar wake with no ticket order, and the banker check guarantees some
+  completion order exists, not that a large waiter's turn comes. Needs an
+  aging reservation; design work.
+- A failed admission destroys an idle conversation's cache:
+  `kv_release_for_takeover()` runs before the safety check, so an "unsafe"
+  or "short" outcome still evicts.
+- RAM-tier hits don't refresh the disk entry's LRU stamp; a second process on
+  the same cache root sweeps the first's in-flight tmp files; one idle MTP
+  page per max-window lineage; tokens and state are read from two separate
+  opens.
+
 ## 2026-10-01 (az): bug hunt over v0.13.0..HEAD -- a silent T3 GEMV error on unused widths, the CLI DFlash2 map::at, an estimator mismatch
 
 Two tracks over the ~800 src lines since v0.13.0: dynamic (compute-sanitizer

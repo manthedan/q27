@@ -28,6 +28,30 @@
 #include <vector>
 
 using json = nlohmann::json;
+
+// copy of server.cu's guard_provider (the harness embeds handle(), which uses it)
+// A throw out of an httplib content provider is fatal: httplib's
+// ThreadPool::worker calls the provider with no try, so the exception reaches
+// std::terminate and drops every in-flight request (found 2026-10-04: a tool
+// schema property typed ["string","null"] threw out of the streaming parse).
+// Every streaming handler's provider goes through this adapter: log, close the
+// stream, keep the process. Unwinding still runs the handler's guards (slot
+// release, batch member drain) because they live in the provider's frame.
+template <class F>
+static auto guard_provider(F f) {
+    return [f = std::move(f)](size_t offset, auto& sink) mutable -> bool {
+        try {
+            return f(offset, sink);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[stream] provider threw: %s -- stream closed\n", e.what());
+        } catch (...) {
+            fprintf(stderr, "[stream] provider threw (non-std) -- stream closed\n");
+        }
+        sink.done();
+        return true;
+    };
+}
+
 using q27::Msg;
 using q27::StreamSplitter;
 
@@ -606,7 +630,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
 auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
         req_log_body("oai", chat ? "/v1/chat/completions" : "/v1/completions", req.body);
         json body;
-        try { body = json::parse(req.body); }
+        try { body = q27::parse_request_body(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
         // Default when the client omits max_tokens: a generous floor, unified
         // across all three API shapes. Clamped to the context window below, so a
@@ -749,7 +773,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                             "application/json");
             return;
         }
-        if ((int)prompt.size() + n_max > max_slot_ctx)
+        if ((long long)prompt.size() + n_max > max_slot_ctx) // long long: n_max can be INT_MAX
             n_max = max_slot_ctx - (int)prompt.size();
         // Q27_SAMPLED=0 preflight: the sampled graphs were never captured.
         // (Q27_FORCE_TEMP>0 is a boot-time FATAL on such boots, so the
@@ -1001,6 +1025,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
+            guard_provider(
             // EVERY handler local this lambda reads must be captured BY VALUE:
             // httplib runs the provider from write_response(), long after this
             // handler's frame is dead (routing() and write_response() are
@@ -1276,7 +1301,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 sink.write(done.data(), done.size());
                 sink.done();
                 return true;
-            });
+            }));
     };
 
     handle(req, res, chat);

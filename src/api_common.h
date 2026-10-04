@@ -2774,7 +2774,13 @@ inline OpenAIToolSelection select_openai_tools(const json& body,const ToolChoice
             if (allowed.count(tool["function"]["name"].get<std::string>()))
                 filtered.push_back(std::move(tool));
         selected.tools=std::move(filtered);
-        selected.names=choice.allowed_names;
+        // names must stay index-aligned with tools: the grammar looks up a
+        // tool's params/required keys by the index of its name, and
+        // choice.allowed_names is in tool_choice order, not declaration order
+        // (2026-10-04: a reordered allowed_tools paired B's name with A's schema)
+        selected.names.clear();
+        for (const auto& tool : selected.tools)
+            selected.names.push_back(tool["function"]["name"].get<std::string>());
     }
     if (choice.mode == ToolChoice::FORCED && selected.names.empty())
         throw std::runtime_error("tool_choice requires at least one valid function tool");
@@ -4911,6 +4917,49 @@ inline std::string first_balanced_object(const std::string& s) {
 }
 
 
+// Request bodies nested past this depth are refused before parsing.
+// nlohmann parses and destroys iteratively, but its copy constructor and
+// dump() recurse, so a ~2 MB body nested a million levels deep (an
+// input_schema, say) overflowed the HTTP worker's stack -- a SIGSEGV no catch
+// can stop, reachable by any client that passes auth (2026-10-04). Real tool
+// schemas nest a few dozen levels at most.
+inline constexpr int kMaxRequestJsonDepth = 512;
+inline json parse_request_body(const std::string& body) {
+    int depth = 0;
+    bool in_str = false;
+    for (size_t i = 0; i < body.size(); i++) {
+        const char c = body[i];
+        if (in_str) {
+            if (c == '\\') i++;
+            else if (c == '"') in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '{' || c == '[') {
+            if (++depth > kMaxRequestJsonDepth)
+                throw std::runtime_error("request JSON nested deeper than 512 levels");
+        } else if (c == '}' || c == ']') {
+            depth--;
+        }
+    }
+    return json::parse(body);
+}
+
+// A JSON-Schema property whose type admits a string: "string", or a type
+// array containing it (["string","null"] is valid JSON Schema and common in
+// MCP tools). Never throws -- nlohmann's value("type", std::string()) throws
+// type_error.302 on an array, and these run inside the streaming parse, where
+// a throw ended the process (2026-10-04).
+inline bool schema_prop_is_string(const json& p) {
+    if (!p.is_object()) return false;
+    const auto t = p.find("type");
+    if (t == p.end()) return false;
+    if (t->is_string()) return t->get_ref<const std::string&>() == "string";
+    if (t->is_array())
+        for (const auto& x : *t)
+            if (x.is_string() && x.get_ref<const std::string&>() == "string") return true;
+    return false;
+}
+
 inline bool recover_raw_value_call(const std::string& text, const json& tools,
                                    std::vector<ToolCall>& out) {
     size_t mo = text.rfind("{\"name\"");
@@ -4935,8 +4984,7 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
         const json& pr = (*fn)["parameters"];
         if (pr.contains("properties") && pr["properties"].is_object())
             for (auto it = pr["properties"].begin(); it != pr["properties"].end(); ++it)
-                if (it.value().is_object() &&
-                    it.value().value("type", std::string()) == "string")
+                if (schema_prop_is_string(it.value()))
                     strkeys.push_back(it.key());
     }
     if (strkeys.empty()) return false;
@@ -5045,8 +5093,7 @@ inline bool recover_args_object_call(const std::string& text, const json& tools,
            fn["parameters"]["properties"].is_object()) {
             props=fn["parameters"]["properties"];
             for(auto it=props.begin();it!=props.end();++it)
-                if(it.value().is_object() &&
-                   it.value().value("type",std::string())=="string")
+                if(schema_prop_is_string(it.value()))
                     strkeys.push_back(it.key());
         }
         json parsed;
@@ -5746,9 +5793,13 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
             for (const auto& t : *tools) {
                 if (!t.contains("function") ||
                     t["function"].value("name", std::string()) != nm) continue;
-                const json params = t["function"].value("parameters", json::object());
-                const json req = params.value("required", json::array());
-                return !req.is_array() || req.empty();
+                // parameters arrive verbatim from the client: null or a
+                // string must not throw here (value() on a non-object does)
+                const json& fn = t["function"];
+                const auto pit = fn.find("parameters");
+                if (pit == fn.end() || !pit->is_object()) return true;
+                const auto rit = pit->find("required");
+                return rit == pit->end() || !rit->is_array() || rit->empty();
             }
             return false;
         };

@@ -7,8 +7,10 @@
 int main() {
     using q27::DType;
 
-    for (DType dtype : {DType::F32, DType::F16, DType::Q8_G128, DType::Q4_G64,
-                        DType::T2_G128, DType::T3_G128}) {
+    // T2_G128 (Bonsai 2) and T3_G128 (Bonsai 2 8 GB packs, 2026-09-20) are
+    // CUDA dtypes; FP4_G16 uploads as the pf4 prefill sidecar.
+    for (DType dtype : {DType::F32, DType::F16, DType::Q8_G128, DType::Q4_G64, DType::T2_G128,
+                        DType::T3_G128, DType::FP4_G16}) {
         if (!q27::cuda_weight_dtype_supported(dtype)) {
             std::fprintf(stderr, "CUDA-compatible dtype rejected: %s\n",
                          q27::dtype_name(dtype));
