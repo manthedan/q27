@@ -15714,6 +15714,74 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-04 (ba): second bug hunt -- a server-killing tool schema, a stack-overflow body, a cache key that trusted file size
+
+CPU-only this time (the GPUs were serving). Every CPU suite, tokenizer parity,
+a sustained parser fuzz, and two independent read-only reviews of the oldest
+unreviewed surfaces: the KV pool / incremental-KV banker / prefix caches, and
+the HTTP-to-engine request path.
+
+**Fixed:**
+
+- **A common MCP tool schema could kill the server.** Drift modes 11 and 23
+  read each declared property's type with nlohmann `value("type",
+  std::string())`, which throws `type_error.302` when `type` is an array --
+  `["string","null"]`, valid JSON Schema and common in MCP tools; mode 22's
+  zero-arg check threw `306` on `"parameters": null` or a string. Those run
+  inside the streaming parse, in an httplib content provider, and httplib's
+  ThreadPool calls providers with no try: `std::terminate`, every in-flight
+  request dropped. Reproduced by a new drift-suite test against the pre-fix
+  header (4 of 5 shapes threw, including the plain mode-23 `{"command":...}
+  </function>` drift). Fixed at the root (`schema_prop_is_string`, which also
+  treats a string-admitting type array as a string param, and an is_object
+  guard) and at the boundary: all three streaming providers now go through
+  `guard_provider`, which logs, closes the stream and keeps the process.
+- **A deeply nested body overflowed the worker stack.** nlohmann parses and
+  destroys iteratively but copies and `dump()`s recursively; a ~2 MB
+  million-deep `input_schema` on `/v1/messages/count_tokens` was a SIGSEGV no
+  catch can stop. `q27::parse_request_body` pre-scans bracket depth (strings
+  skipped) and refuses past 512 at all four parse sites, through their
+  existing 400 paths.
+- **Prefix-cache entries keyed on model path + size only**, so a same-size
+  pack swapped in at the same path restored GDN/KV state from other weights.
+  The key now hashes size, mtime, inode and device. One-time cost: existing
+  cache roots go cold on upgrade.
+- **The pinned RAM tier overshot its budget**: `acquire()` took slots out of
+  the LRU without counting them, so concurrent acquires each `cudaMallocHost`ed
+  another ~1 GB slot on the serving path, and a failed disk read freed its
+  slot instead of returning it. In-flight slots now count; `abandon()` returns
+  unfilled ones.
+- **`allowed_tools` reordered against `tools` paired names with the wrong
+  schemas** under `--constrain-tools` (the grammar indexes params by name
+  index); names are rebuilt from the filtered tools.
+- **Responses streaming gave a message and a recovered tool call the same
+  `output_index`** on a truncated tool tail; `emit_call` closes an open message
+  first.
+- **`/health?verify=1` skipped auth** while running a full GPU weight
+  checksum; only a bare `/health` is exempt now.
+- `prompt + max_tokens` overflowed int at `max_tokens = INT_MAX` (UB, masked
+  by a later clamp); a float `seed` like 1e30 was a UB float-to-int cast.
+- **test-inspect had been red since v0.14.0**: the loader contract test still
+  asserted T3_G128 is CUDA-unsupported. None of the T3 gates ran that suite.
+
+**Clean:** test-tools (incl. extract_check against the integration harness's
+embedded `handle()`), test-inspect, corpus-check 165/165, kv_bank, conductor,
+sampling, suffixdraft, argmax_tie; tokenizer parity vs HF on all four probe
+sets (2.52M strings, all identical); the tool-parser fuzz under ASan+UBSan, 475,625 runs in 15 min, 0 crashes (its harness uses a fixed well-formed schema, which is why it never reached the schema crash above).
+
+**Found, not fixed (open):**
+- KV waiters can starve: `claim_slot` and parked growth retry on every
+  condvar wake with no ticket order, and the banker check guarantees some
+  completion order exists, not that a large waiter's turn comes. Needs an
+  aging reservation; design work.
+- A failed admission destroys an idle conversation's cache:
+  `kv_release_for_takeover()` runs before the safety check, so an "unsafe"
+  or "short" outcome still evicts.
+- RAM-tier hits don't refresh the disk entry's LRU stamp; a second process on
+  the same cache root sweeps the first's in-flight tmp files; one idle MTP
+  page per max-window lineage; tokens and state are read from two separate
+  opens.
+
 ## 2026-10-01 (az): bug hunt over v0.13.0..HEAD -- a silent T3 GEMV error on unused widths, the CLI DFlash2 map::at, an estimator mismatch
 
 Two tracks over the ~800 src lines since v0.13.0: dynamic (compute-sanitizer

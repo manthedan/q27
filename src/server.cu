@@ -117,8 +117,15 @@ static q27k::SampleParams parse_sample(const json& body) {
             return atoll(e);
         }();
         static std::atomic<unsigned long long> auto_seed_ctr{0};
-        if (body.contains("seed") && body["seed"].is_number())
-            s.seed = (unsigned long long)body["seed"].get<long long>();
+        if (body.contains("seed") && body["seed"].is_number()) {
+            const json& sj = body["seed"];
+            if (sj.is_number_unsigned()) s.seed = sj.get<unsigned long long>();
+            else if (sj.is_number_integer()) s.seed = (unsigned long long)sj.get<long long>();
+            else {  // a float seed: use its bits (a float-to-int cast of 1e30 is UB)
+                const double d = sj.get<double>();
+                memcpy(&s.seed, &d, sizeof d);
+            }
+        }
         else if (force_temp > 0.0) {
             s.seed = ++force_seed_ctr;   // distinct independent draw per forced request
             fprintf(stderr, "[force-sample] temp=%.3f top_p=%.3f seed=%llu\n",
@@ -310,6 +317,28 @@ static void req_log_body(const char* api, const char* path, const std::string& b
     fwrite(line.data(), 1, line.size(), f);
     fputc('\n', f);
     fflush(f);
+}
+
+// A throw out of an httplib content provider is fatal: httplib's
+// ThreadPool::worker calls the provider with no try, so the exception reaches
+// std::terminate and drops every in-flight request (found 2026-10-04: a tool
+// schema property typed ["string","null"] threw out of the streaming parse).
+// Every streaming handler's provider goes through this adapter: log, close the
+// stream, keep the process. Unwinding still runs the handler's guards (slot
+// release, batch member drain) because they live in the provider's frame.
+template <class F>
+static auto guard_provider(F f) {
+    return [f = std::move(f)](size_t offset, auto& sink) mutable -> bool {
+        try {
+            return f(offset, sink);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[stream] provider threw: %s -- stream closed\n", e.what());
+        } catch (...) {
+            fprintf(stderr, "[stream] provider threw (non-std) -- stream closed\n");
+        }
+        sink.done();
+        return true;
+    };
 }
 
 int main(int argc, char** argv) {
@@ -1000,8 +1029,21 @@ int main(int argc, char** argv) {
                         : kve && !strcmp(kve, "turbo5k") ? KV_T5K
                         : kve && !strcmp(kve, "int8g64") ? KV_I8G64
                                                          : KV_F16;
-        size_t model_bytes = 0;
-        { struct stat st; if (::stat(model.c_str(), &st) == 0) model_bytes = (size_t)st.st_size; }
+        // Model identity for the cache key: size alone let a same-size pack
+        // swapped in at the same path (a re-quant with the same layout, a
+        // retargeted symlink) restore GDN/KV state computed with other
+        // weights (2026-10-04 review). Size + mtime + inode + device catch
+        // any rewrite; the cost is a cold cache after the file is touched.
+        uint64_t model_bytes = 0;
+        {
+            struct stat st;
+            if (::stat(model.c_str(), &st) == 0) {
+                const int64_t id[] = {(int64_t)st.st_size, (int64_t)st.st_mtim.tv_sec,
+                                      (int64_t)st.st_mtim.tv_nsec, (int64_t)st.st_ino,
+                                      (int64_t)st.st_dev};
+                model_bytes = q27::pfx_fnv1a64(id, sizeof id, 0xcbf29ce484222325ULL);
+            }
+        }
         const uint64_t compat =
             q27::pfx_compat_hash(model, model_bytes, N_LAYER, N_KV, HEAD_DIM, GDN_HEADS, GDN_DIM,
                                  GDN_CH, kvk, q27::PFX_VERSION);
@@ -2291,7 +2333,10 @@ int main(int argc, char** argv) {
     // tokenization, or any generation work.
     if (!api_keys.empty()) {
         srv.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
-            if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
+            // bare /health stays open for liveness probes; ?verify=1 runs a
+            // full weight checksum on the GPU, so it needs the key (2026-10-04)
+            if (req.path == "/health" && !req.has_param("verify"))
+                return httplib::Server::HandlerResponse::Unhandled;
             if (req.path == "/metrics") return httplib::Server::HandlerResponse::Unhandled;
             std::string provided = q27::extract_api_key(req.get_header_value("Authorization"),
                                                          req.get_header_value("x-api-key"));
@@ -2425,7 +2470,7 @@ int main(int argc, char** argv) {
     auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
         req_log_body("oai", chat ? "/v1/chat/completions" : "/v1/completions", req.body);
         json body;
-        try { body = json::parse(req.body); }
+        try { body = q27::parse_request_body(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
         // Default when the client omits max_tokens: a generous floor, unified
         // across all three API shapes. Clamped to the context window below, so a
@@ -2568,7 +2613,7 @@ int main(int argc, char** argv) {
                             "application/json");
             return;
         }
-        if ((int)prompt.size() + n_max > max_slot_ctx)
+        if ((long long)prompt.size() + n_max > max_slot_ctx) // long long: n_max can be INT_MAX
             n_max = max_slot_ctx - (int)prompt.size();
         // Q27_SAMPLED=0 preflight: the sampled graphs were never captured.
         // (Q27_FORCE_TEMP>0 is a boot-time FATAL on such boots, so the
@@ -2820,6 +2865,7 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
+            guard_provider(
             // EVERY handler local this lambda reads must be captured BY VALUE:
             // httplib runs the provider from write_response(), long after this
             // handler's frame is dead (routing() and write_response() are
@@ -3095,7 +3141,7 @@ int main(int argc, char** argv) {
                 sink.write(done.data(), done.size());
                 sink.done();
                 return true;
-            });
+            }));
     };
 
     // ---------------- Anthropic /v1/messages ----------------
@@ -3160,7 +3206,7 @@ int main(int argc, char** argv) {
     srv.Post("/v1/messages/count_tokens",
              [&](const httplib::Request& req, httplib::Response& res) {
         json body;
-        try { body = json::parse(req.body); }
+        try { body = q27::parse_request_body(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
         if (!body.contains("messages") || !body["messages"].is_array()) {
             anthropic_400(res, "messages: Field required");
@@ -3186,7 +3232,7 @@ int main(int argc, char** argv) {
     srv.Post("/v1/messages", [&](const httplib::Request& req, httplib::Response& res) {
         req_log_body("anth", "/v1/messages", req.body);
         json body;
-        try { body = json::parse(req.body); }
+        try { body = q27::parse_request_body(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
         int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Messages); // unified default (see /v1/chat/completions)
         bool stream = q27::jbool(body, "stream", false);
@@ -3287,7 +3333,7 @@ int main(int argc, char** argv) {
                           "(greedy-only)");
             return;
         }
-        if ((int)prompt.size() + n_max > max_slot_ctx)
+        if ((long long)prompt.size() + n_max > max_slot_ctx) // long long: n_max can be INT_MAX
             n_max = max_slot_ctx - (int)prompt.size();
         long rid = req_counter++;
         std::string mid = "msg_q27_" + std::to_string(rid);
@@ -3458,6 +3504,7 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
+            guard_provider(
             // by-value or dangling: see the /v1/chat/completions twin
             // resp_model by VALUE (issue #45, 2026-09-15): it is a handler
             // local, and this provider runs after the handler has returned.
@@ -3705,7 +3752,7 @@ int main(int argc, char** argv) {
                 ev("message_stop", {{"type", "message_stop"}});
                 sink.done();
                 return true;
-            });
+            }));
     });
 
     // ---------------- OpenAI Responses API (Codex CLI) ----------------
@@ -3720,7 +3767,7 @@ int main(int argc, char** argv) {
     srv.Post("/v1/responses", [&](const httplib::Request& req, httplib::Response& res) {
         req_log_body("resp", "/v1/responses", req.body);
         json body;
-        try { body = json::parse(req.body); }
+        try { body = q27::parse_request_body(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
 
         long rid = req_counter++;
@@ -3950,7 +3997,7 @@ int main(int argc, char** argv) {
                             "application/json");
             return;
         }
-        if ((int)prompt.size() + n_max > max_slot_ctx)
+        if ((long long)prompt.size() + n_max > max_slot_ctx) // long long: n_max can be INT_MAX
             n_max = max_slot_ctx - (int)prompt.size();
         bool stream = q27::jbool(body, "stream", false);
 
@@ -4242,6 +4289,7 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
+            guard_provider(
             // by-value or dangling: see the /v1/chat/completions twin
             [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt,
              thinking, tcfg, sys_len, tchoice, response_choice,
@@ -4376,6 +4424,11 @@ int main(int argc, char** argv) {
                     if(!call.ok || !q27::tool_choice_allows_call(
                             response_choice,eligible_call_names,call.name,tool_counter))
                         return false;
+                    // close an open message first: it holds msg_index ==
+                    // out_index, and the call below takes out_index too (the
+                    // truncated-tail recovery reached here with text open and
+                    // gave both items the same output_index, 2026-10-04)
+                    if(msg_index>=0) flush_text(false);
                     const int call_index=tool_counter++;
                     const std::string cid="call_q27_"+std::to_string(rid)+"_"+
                                           std::to_string(call_index);
@@ -4716,7 +4769,7 @@ int main(int argc, char** argv) {
                 ev({{"type", terminal.event}, {"response", final_response}});
                 sink.done();
                 return true;
-            });
+            }));
     });
 
     srv.Post("/v1/chat/completions",

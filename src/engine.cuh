@@ -5516,6 +5516,7 @@ struct Engine {
                     pfx_last_persist = pe.L;
                 } else {
                     fprintf(stderr, "[pfx] read FAILED for %s -- cold prefill\n", pe.path.c_str());
+                    if (slot) pram->abandon(slot);  // keep the pinned slot for reuse
                 }
             }
             if (base == 0) pfx_last_persist = 0; // new chain: allow a fresh persist

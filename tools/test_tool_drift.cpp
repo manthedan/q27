@@ -2655,6 +2655,64 @@ static void test_repeated_opener_is_not_shown_as_text() {
     }
 }
 
+// 2026-10-04: request bodies nested past 512 levels are refused before
+// parsing (nlohmann's copy/dump recurse; a million-deep schema was a SIGSEGV).
+static void test_request_depth_guard() {
+    auto nest = [](int d) { return std::string(d, '[') + std::string(d, ']'); };
+    bool deep_threw = false, ok_parsed = false, str_ok = false;
+    try { (void)q27::parse_request_body("{\"a\":" + nest(100000) + "}"); }
+    catch (const std::runtime_error&) { deep_threw = true; }
+    try { ok_parsed = q27::parse_request_body("{\"a\":" + nest(400) + "}").is_object(); }
+    catch (...) {}
+    // brackets inside strings (and escaped quotes) do not count
+    try { str_ok = q27::parse_request_body("{\"s\":\"" + std::string(5000, '[') + "\\\"\"}").is_object(); }
+    catch (...) {}
+    ok(deep_threw, "request depth guard: 100000-deep body refused");
+    ok(ok_parsed, "request depth guard: 400-deep body parses");
+    ok(str_ok, "request depth guard: brackets inside strings ignored");
+}
+
+// 2026-10-04: client-supplied schemas the drift chain must survive without a
+// throw (a throw inside the streaming parse ended the process). "type" as an
+// array (["string","null"], valid JSON Schema, common in MCP tools) made
+// value("type", std::string()) throw type_error.302 in modes 11/23, and
+// "parameters": null or a string made the mode-22 zero-arg check throw 306.
+static void test_hostile_schemas_never_throw() {
+    json tools = json::parse(R"([
+      {"type":"function","function":{"name":"Bash","parameters":{"type":"object",
+        "properties":{"command":{"type":["string","null"]},"n":{"type":5},"z":{}},
+        "required":["command"]}}},
+      {"type":"function","function":{"name":"memex_recall","parameters":null}},
+      {"type":"function","function":{"name":"Probe","parameters":"not an object"}}
+    ])");
+    const char* texts[] = {
+        "<tool_call>{\"command\":\"ls -la\"}</function></tool_call>",
+        "{\"command\":\"ls\"}\n</function>\n</tool_call>",
+        "<parameter=memex_recall>\n</function>",
+        "<parameter=probe>\n</function>\n</tool_call>",
+        "<function=Bash>\n<parameter=command>\nls\n</function>",
+    };
+    for (const char* t : texts) {
+        bool threw = false;
+        try {
+            std::string pre, remaining;
+            std::vector<q27::ToolCall> out;
+            (void)q27::parse_bare_tool_calls(t, &pre, &tools, true, true, &remaining);
+            (void)q27::recover_args_object_call(t, tools, out);
+            (void)q27::recover_raw_value_call(t, tools, out);
+        } catch (const std::exception& e) {
+            threw = true;
+            printf("    threw: %s\n", e.what());
+        }
+        ok(!threw, (std::string("hostile schema, no throw: ") + t).c_str());
+    }
+    ok(q27::schema_prop_is_string(json::parse(R"({"type":["string","null"]})")) &&
+           !q27::schema_prop_is_string(json::parse(R"({"type":["integer","null"]})")) &&
+           !q27::schema_prop_is_string(json::parse(R"({"type":5})")) &&
+           q27::schema_prop_is_string(json::parse(R"({"type":"string"})")),
+       "schema_prop_is_string: string and string-admitting type arrays only");
+}
+
 int main() {
     if (getenv("Q27_TOOL_STRICT")) {
         test_tool_segment_strict_leg();
@@ -2677,6 +2735,8 @@ int main() {
     test_aborted_second_call();
     test_batch_mixed_opener_spellings();
     test_zero_arg_mode22_call();
+    test_hostile_schemas_never_throw();
+    test_request_depth_guard();
     test_parameter_name_opener();
     test_json_terminator_in_xml_dialect();
     test_placeholder_name_on_next_line();
