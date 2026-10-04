@@ -15714,6 +15714,50 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-04 (bb): reduced-vocab MTP draft head (Q27_DRAFT_VOCAB) -- draft steps 37% cheaper, ladder +4-18% on the 5090, opt-in
+
+Idea from Strata's `--draft-vocab` (Qwen3.8-Flash-Next engine): the MTP draft
+only PROPOSES, verify keeps the full head, so a draft head over a vocabulary
+subset leaves output unchanged; a token outside the subset just isn't drafted.
+
+**Coverage, measured first** (781K output tokens of 1,246 recorded Claude Code
+turns, Bonsai legs, Qwen3.8 tokenizer): a static subset alone is weak (ids <
+40960: 94.9%; agentic output is full of identifiers the model just read), but
+static + the request's own prompt tokens covers 99.35% at 40K (6.5 misses per
+1000 output tokens), 99.74% at 64K, 99.98% at 97K. Residual misses are
+reasoning words above id 40K ("Actually", "Hmm"); the tool tags sit at the top
+of the vocab and are always included.
+
+**Cost, measured** (5090, `tools/head_bench.cu`): the Q4 head GEMV is 0.40 ms
+of a 0.85 ms ladder draft step (the MTP block's eight matmuls are 0.11); a
+47K-row head is 0.08 ms.
+
+**Implementation:** `Q27_DRAFT_VOCAB=N` (default off) gathers head rows
+(Q4/Q8/T2 sources) for ids [0, N) + the top 320 ids (specials) + up to
+`Q27_DRAFT_VOCAB_CTX` (8192) distinct prompt tokens into a fixed-shape draft
+head (pad rows duplicate a real row, so captured graphs keep their shape);
+`mtp_tail` argmaxes over it and `remap_id` maps the index back. The context
+rows are regathered per request (`dv_set_context`, next to the suffix index
+sync). Solo engines only (`Q27_BATCH=0`): fused rounds share one head across
+members with different prompts. Sampled rounds use the same argmax drafts, so
+rejection sampling stays exact.
+
+**Gate (5090, Qwen3.8 default pack, MTP ladder):**
+
+    CLI greedy 1500 tok   md5 8f735a13 with and without (bitwise); 176.2 -> 183.7 t/s (2nd run 172.5 -> 184.2), 3.03 -> 2.99 tok/round
+    server, suffix on     t/s long/code/edit  170.7/193.0/167.4 -> 178.6/202.6/196.8 (N=40960), 178.9/201.8/195.6 (N=65536)
+    server, suffix off    171.2/193.0/159.8 -> 178.4/195.3/171.5
+    draft ms per step     0.86 -> 0.54
+
+Server greedy texts differ from the full-head run after 544-1,569 chars. Not
+the subset: with the full head, changing only Q27_PMIN (0.5 -> 0.3) diverges
+earlier (251-1,233 chars) -- server greedy on the 5090 depends on round
+segmentation (the 09-07/09-18 width finding); the CLI ladder, which is not
+sensitive on this prompt, is bitwise. N=40960 and 65536 run the same speed;
+40960 is the cheaper head. Not yet measured: Bonsai's T3+MTP pack (T2 head,
+0.21 ms of the step on the 5090; likely a larger share on a 3060), and real
+agentic traffic.
+
 ## 2026-10-04 (ba): second bug hunt -- a server-killing tool schema, a stack-overflow body, a cache key that trusted file size
 
 CPU-only this time (the GPUs were serving). Every CPU suite, tokenizer parity,

@@ -416,6 +416,25 @@ struct Engine {
     float* bz_xrot = nullptr;              // rotated copy of the GDN input (alpha/beta read the raw one)
     float* bz_ogp = nullptr;               // permuted GDN value output
     float* bz_xrotT = nullptr;             // prefill twins (PF_T rows)
+    // Reduced-vocab draft head (Q27_DRAFT_VOCAB=N, 2026-10-04): the MTP draft
+    // step's vocab GEMV is ~half its wall (0.40 of 0.85 ms on a 5090), and the
+    // draft only has to PROPOSE; verify keeps the full head, so output is
+    // unchanged and a token outside the subset just isn't drafted. The subset
+    // is ids [0, N) + the top special/control ids + every token of the current
+    // prompt (identifiers the model writes are ones it just read; 99.35% of
+    // recorded Claude Code output at N=40960, 6.5 misses per 1000 tokens).
+    // Rows are gathered into dv_head (fixed dv_rows, so captured graphs keep
+    // their shape; unused rows duplicate a real one), and mtp_tail maps the
+    // argmax index back through d_dv_ids. Solo engines only (Q27_BATCH=0):
+    // fused rounds share one head across members' different prompts.
+    bool dv_on = false;
+    int dv_rows = 0, dv_nstatic = 0, dv_ctx_cap = 0;
+    DevTensor dv_head;
+    int* d_dv_ids = nullptr;
+    std::vector<int> dv_ids;              // host mirror of d_dv_ids
+    std::vector<uint8_t> dv_in_static;    // VOCAB flags
+    size_t dv_row_bytes = 0;
+    int dv_row_scales = 0;
     // T3_G128 packs (8 GB cards, 2026-09-20): the prefill GEMM's T2 scratch,
     // sized for the largest T3 matrix (mmT rewrites each one into it first).
     uint8_t* t3_pf_w = nullptr;
@@ -1640,6 +1659,7 @@ struct Engine {
                         mx / 1e6);
             }
         }
+        dv_init();
     }
 
   public:
@@ -2026,15 +2046,93 @@ struct Engine {
         q27k::rmsnorm(x_mtp, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, st);
         attn_block(il, x1, y, kv_ktab(kv_mtp_pair()), kv_vtab(kv_mtp_pair()), pos_src, st);
     }
+    // The draft head source: the Q4 copy when present (verify keeps the full
+    // head either way), else output.weight.
+    const DevTensor& draft_head_src() {
+        return dm.model_has("output_q4.weight") ? dm.get("output_q4.weight") : dm.get("output.weight");
+    }
+    void dv_init() {
+        const char* e = getenv("Q27_DRAFT_VOCAB");
+        const int n = e ? atoi(e) : 0;
+        if (n <= 0 || !has_mtp) return;
+        const char* b = getenv("Q27_BATCH");
+        if (b && atoi(b) != 0) {
+            fprintf(stderr, "Q27_DRAFT_VOCAB: off (needs Q27_BATCH=0: fused rounds share one head)\n");
+            return;
+        }
+        const DevTensor& h = draft_head_src();
+        const int64_t cols = (int64_t)h.cols;
+        switch (h.dtype) {
+            case DType::Q4_G64: dv_row_bytes = cols / 2; dv_row_scales = (int)(cols / 64); break;
+            case DType::Q8_G128: dv_row_bytes = cols; dv_row_scales = (int)(cols / 128); break;
+            case DType::T2_G128: dv_row_bytes = cols / 4; dv_row_scales = (int)(cols / 128); break;
+            default:
+                fprintf(stderr, "Q27_DRAFT_VOCAB: off (draft head dtype %s unsupported)\n", dtype_name(h.dtype));
+                return;
+        }
+        const int vocab = (int)h.rows;
+        const int nstat = std::min(n, vocab);
+        dv_in_static.assign(vocab, 0);
+        dv_ids.clear();
+        for (int i = 0; i < nstat; i++) { dv_ids.push_back(i); dv_in_static[i] = 1; }
+        // control/special tokens (<tool_call>, <think>, <|im_end|>, ...) live at the top
+        for (int i = std::max(nstat, vocab - 320); i < vocab; i++) { dv_ids.push_back(i); dv_in_static[i] = 1; }
+        dv_nstatic = (int)dv_ids.size();
+        const char* c = getenv("Q27_DRAFT_VOCAB_CTX");
+        dv_ctx_cap = c ? std::max(0, atoi(c)) : 8192;
+        dv_rows = std::min(vocab, dv_nstatic + dv_ctx_cap);
+        while ((int)dv_ids.size() < dv_rows) dv_ids.push_back(dv_ids[0]); // pad: duplicate a real row
+        CUDA_CHECK(cudaMalloc((void**)&d_dv_ids, (size_t)dv_rows * sizeof(int)));
+        dv_head.dtype = h.dtype;
+        dv_head.rows = (uint64_t)dv_rows;
+        dv_head.cols = h.cols;
+        CUDA_CHECK(cudaMalloc(&dv_head.data, (size_t)dv_rows * dv_row_bytes));
+        CUDA_CHECK(cudaMalloc(&dv_head.scales, (size_t)dv_rows * dv_row_scales * sizeof(__half)));
+        dv_head.data_bytes = (size_t)dv_rows * dv_row_bytes;
+        dv_head.scales_bytes = (size_t)dv_rows * dv_row_scales * sizeof(__half);
+        dv_upload(0, dv_rows);
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        dv_on = true;
+        fprintf(stderr, "Q27_DRAFT_VOCAB: draft head %d rows (%d static + %d per-request context) of %d, "
+                        "%.0f MB vs %.0f MB\n", dv_rows, dv_nstatic, dv_rows - dv_nstatic, vocab,
+                dv_head.data_bytes / 1e6, (double)vocab * dv_row_bytes / 1e6);
+    }
+    // upload ids [lo, hi) and gather those head rows (stream-ordered on stm)
+    void dv_upload(int lo, int hi) {
+        if (hi <= lo) return;
+        const DevTensor& h = draft_head_src();
+        CUDA_CHECK(cudaMemcpyAsync(d_dv_ids + lo, dv_ids.data() + lo, (size_t)(hi - lo) * sizeof(int),
+                                   cudaMemcpyHostToDevice, stm));
+        q27k::head_gather_rows((const uint8_t*)h.data, (const __half*)h.scales, dv_row_bytes,
+                               dv_row_scales, d_dv_ids + lo, hi - lo,
+                               (uint8_t*)dv_head.data + (size_t)lo * dv_row_bytes,
+                               (__half*)dv_head.scales + (size_t)lo * dv_row_scales, stm);
+    }
+    // Per request: the context rows become this prompt's distinct tokens that
+    // are not already static (first come first kept, up to dv_ctx_cap).
+    void dv_set_context(const std::vector<int>& prompt) {
+        if (!dv_on) return;
+        std::vector<int> ctx;
+        std::vector<uint8_t> seen;
+        ctx.reserve(dv_ctx_cap);
+        seen.assign(dv_in_static.size(), 0);
+        for (int t : prompt) {
+            if (t < 0 || t >= (int)dv_in_static.size() || dv_in_static[t] || seen[t]) continue;
+            seen[t] = 1;
+            ctx.push_back(t);
+            if ((int)ctx.size() >= dv_ctx_cap) break;
+        }
+        for (int i = 0; i < dv_rows - dv_nstatic; i++)
+            dv_ids[dv_nstatic + i] = i < (int)ctx.size() ? ctx[i] : dv_ids[0];
+        dv_upload(dv_nstatic, dv_rows);
+    }
     void mtp_post(const MtpLaneView& v) {
         const int il = 64;
         const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
         const float* sn = (const float*)T(il, "nextn.shared_head_norm.weight").data;
         // drafts use the Q4 head copy when present (verify keeps the Q8 head,
         // so output remains exactly the faithful model's greedy text)
-        const DevTensor* head = dm.model_has("output_q4.weight")
-                                    ? &dm.get("output_q4.weight")
-                                    : &dm.get("output.weight");
+        const DevTensor* head = dv_on ? &dv_head : &draft_head_src();
         if (v.vw == 1) {
             q27k::add_inplace(v.x_mtp[0], v.y[0], N_EMBD, v.stm);
             q27k::rmsnorm(v.x_mtp[0], pn, v.x1[0], N_EMBD, EPS, v.stm);
@@ -2071,12 +2169,14 @@ struct Engine {
         mtp_mm(v, *head, v.lg);
     }
     void mtp_tail(const MtpLaneView& v) {
+        const int nlog = dv_on ? dv_rows : VOCAB;
         for (int t = 0; t < v.vw; t++) {
             if (v.margin_dst[t])
-                q27k::argmax_margin(v.lg[t], VOCAB, v.draft_dst[t], v.margin_dst[t],
+                q27k::argmax_margin(v.lg[t], nlog, v.draft_dst[t], v.margin_dst[t],
                                     v.am_blk1[t], v.am_blk2[t], v.stm);
             else
-                q27k::argmax(v.lg[t], VOCAB, v.draft_dst[t], v.amax[t], v.stm);
+                q27k::argmax(v.lg[t], nlog, v.draft_dst[t], v.amax[t], v.stm);
+            if (dv_on) q27k::remap_id(v.draft_dst[t], d_dv_ids, v.stm); // subset index -> token id
         }
     }
     // solo mtp_forward = composition over mtp_solo_view() -- byte-identical
@@ -5392,6 +5492,7 @@ struct Engine {
         // takes the slot over. Q27_MAXD_RESET=1 is the stricter
         // every-request reset.
         if (maxd_auto && maxd_reset) dctl.reset();
+        dv_set_context(prompt); // Q27_DRAFT_VOCAB: this prompt's tokens join the draft head
         // Suffix drafter: bring the match index to this request's full
         // prompt (multi-turn re-renders arrive whole). sync() keeps the index
         // of the prefix this slot's stream shares with the prompt and indexes
