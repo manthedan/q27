@@ -184,6 +184,8 @@ fn clip_long_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
                 budget -= n;
                 kept.push(span);
             } else {
+                // Cuts by char, so a combining mark right at the cut can be
+                // dropped; only the last glyph before the elision marker.
                 let cut: String = span.content.chars().take(budget).collect();
                 kept.push(Span::styled(cut, span.style));
                 budget = 0;
@@ -852,6 +854,46 @@ mod draw_cost {
         // The visible giant line is re-wrapped each frame, but only its
         // clipped MAX_LINE_CHARS, not 5 MB.
         assert!(cache.wrapped_last_frame <= MAX_LINE_CHARS + 64, "{}", cache.wrapped_last_frame);
+    }
+
+    /// Clipping keeps exactly MAX_LINE_CHARS chars across span boundaries,
+    /// keeps their styles, and leaves short lines untouched.
+    #[test]
+    fn clip_long_lines_keeps_exact_prefix() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let short = Line::from(vec![Span::raw("ab"), Span::styled("cd", bold)]);
+        let long = Line::from(vec![
+            Span::raw("é".repeat(MAX_LINE_CHARS - 3)),
+            Span::styled("x".repeat(10), bold),
+            Span::raw("never shown"),
+        ]);
+        let out = clip_long_lines(vec![short.clone(), long]);
+        assert_eq!(out[0], short);
+        let spans = &out[1].spans;
+        assert_eq!(spans.len(), 3, "{spans:?}");
+        assert_eq!(spans[0].content, "é".repeat(MAX_LINE_CHARS - 3));
+        assert_eq!(spans[1].content, "xxx");
+        assert_eq!(spans[1].style, bold);
+        let elided = MAX_LINE_CHARS - 3 + 10 + "never shown".len() - MAX_LINE_CHARS;
+        assert_eq!(spans[2].content, format!(" … [{elided} chars elided]"));
+    }
+
+    /// The live stream is clipped too: a model streaming one huge line
+    /// (a base64 blob) keeps scroll in range and the frame cheap.
+    #[test]
+    fn live_stream_giant_line_is_clipped() {
+        let mut m = Model::default();
+        m.phase = Phase::Generating;
+        m.assistant_buf = "y".repeat(3_000_000);
+        let (w, h) = (40u16, 20u16);
+        let mut cache = ScrollbackCache::default();
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let tick = Instant::now();
+        let (max, buf) = frame(&mut term, &m, &mut cache, u32::MAX, tick);
+        assert!((max as usize) < MAX_LINE_CHARS, "max scroll {max}");
+        let rows = scrollback_rows(&buf, w, h - 4);
+        assert!(rows.iter().any(|r| r.contains("elided")), "{rows:?}");
+        assert!(cache.wrapped_last_frame <= 3 * MAX_LINE_CHARS, "{}", cache.wrapped_last_frame);
     }
 
     /// Wall-clock probe: `cargo test --release draw_cost -- --ignored --nocapture`.

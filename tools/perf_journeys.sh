@@ -100,6 +100,13 @@ done
 # pass nor something to record.
 [ -s "$measured" ] || { echo "no journeys measured (empty pack list?)" >&2; exit 2; }
 
+# Validate an existing baseline before either path: the --record merge treats
+# line 1 as the header and would drop a headerless file's first row.
+if [ -f "$baseline" ]; then
+    [ "$(head -n 1 "$baseline")" = "$(printf 'pack\tmetric\tvalue\tbetter')" ] || {
+        echo "malformed $baseline: first line must be the header (pack, metric, value, better)" >&2; exit 2; }
+fi
+
 if [ "$record" = 1 ]; then
     # Replace the measured packs' rows; keep every other pack's baseline.
     mkdir -p "$(dirname "$baseline")"
@@ -116,8 +123,6 @@ if [ "$record" = 1 ]; then
     exit 0
 fi
 [ -f "$baseline" ] || { echo "no baseline for $machine ($baseline); run with --record on an idle machine" >&2; exit 1; }
-[ "$(head -n 1 "$baseline")" = "$(printf 'pack\tmetric\tvalue\tbetter')" ] || {
-    echo "malformed $baseline: first line must be the header (pack, metric, value, better)" >&2; exit 2; }
 
 awk -F'\t' -v band="$band" '
     NR == FNR { if (FNR > 1) { base[$1 "\t" $2] = $3; order[++n] = $1 "\t" $2 }; next }
