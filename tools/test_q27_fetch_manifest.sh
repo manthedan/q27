@@ -168,8 +168,12 @@ grep -A1 -F "/resolve/$rev_b/artifact-b.q27" "$tmp/curl.log" | grep -q '^offset=
 # A pull already running for the pack holds its kernel lock: a second pull is
 # refused; once the holder exits (however it exits) the next pull proceeds.
 rm -rf "$tmp/home/moved"
-"$tmp/pkg/bin/q27-lock-exec" "$tmp/home/.locks/moved.lock" sleep 30 & holder=$!
-for _ in {1..50}; do [[ -e "$tmp/home/.locks/moved.lock" ]] && break; sleep 0.1; done
+# The holder signals only after q27-lock-exec has taken the flock (the lock
+# file itself may already exist from earlier pulls).
+"$tmp/pkg/bin/q27-lock-exec" "$tmp/home/.locks/moved.lock" \
+  sh -c ': >"$1"; exec sleep 30' _ "$tmp/holder-ready" & holder=$!
+for _ in {1..100}; do [[ -e "$tmp/holder-ready" ]] && break; sleep 0.1; done
+[[ -e "$tmp/holder-ready" ]]
 if "$tmp/pkg/bin/q27-fetch" moved >"$tmp/locked.out" 2>&1; then
   echo "q27-fetch ran while another pull held the pack lock" >&2; exit 1
 fi

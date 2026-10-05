@@ -577,7 +577,7 @@ build/q27-lock-exec: tools/q27_lock_exec.c | build
 test-lock-exec: build/q27-lock-exec tools/test_q27_lock_exec.sh
 	tools/test_q27_lock_exec.sh
 
-test-release-packaging-helpers: tools/stage_homebrew_formula.sh tools/test_stage_homebrew_formula.sh \
+test-release-packaging-helpers: build/q27-lock-exec tools/stage_homebrew_formula.sh tools/test_stage_homebrew_formula.sh \
                                 tools/test_q27_fetch_manifest.sh tools/homebrew_release_smoke.sh \
                                 tools/packaged_agent_driver.sh tools/packaged_api_driver.py
 	tools/test_stage_homebrew_formula.sh
