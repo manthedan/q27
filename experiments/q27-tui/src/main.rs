@@ -155,8 +155,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut input = String::new();
     // scroll = lines from top of content. 0 = oldest; max = current LLM output.
-    let mut scroll: u16 = 0;
-    let mut max_scroll: u16 = 0;
+    let mut scroll: u32 = 0;
+    let mut max_scroll: u32 = 0;
+    let mut scrollback_cache = ui::ScrollbackCache::default();
     // Stick to bottom (current stream) until the user scrolls up into history.
     let mut follow_bottom = true;
     let session_start = Instant::now();
@@ -172,7 +173,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         max_scroll = 0;
         terminal.draw(|f| {
-            max_scroll = ui::draw(f, &model_state, &input, scroll, session_start);
+            max_scroll = ui::draw(f, &model_state, &mut scrollback_cache, &input, scroll, session_start);
         })?;
         if follow_bottom {
             scroll = max_scroll;
@@ -250,7 +251,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         if model_state.phase == app::Phase::Stopped && model_state.bye_reason.is_some() {
             terminal.draw(|f| {
-                let _ = ui::draw(f, &model_state, &input, scroll, session_start);
+                let _ = ui::draw(f, &model_state, &mut scrollback_cache, &input, scroll, session_start);
             })?;
             std::thread::sleep(Duration::from_millis(250));
             break;
@@ -307,7 +308,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "waiting for backend to finish…".into();
                             let _ = terminal.draw(|f| {
                                 let _ =
-                                    ui::draw(f, &model_state, &input, scroll, session_start);
+                                    ui::draw(f, &model_state, &mut scrollback_cache, &input, scroll, session_start);
                             });
                             match backend.try_recv() {
                                 Ok(BackendEvent::Server(ev)) => model_state.apply(&ev),

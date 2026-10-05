@@ -2,7 +2,7 @@
 
 use crate::app::{Block, Model, Phase};
 use crate::md::{render_markdown, split_thinking_live};
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeId};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,10 +18,11 @@ const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 pub fn draw(
     frame: &mut Frame,
     model: &Model,
+    cache: &mut ScrollbackCache,
     input: &str,
-    scroll: u16,
+    scroll: u32,
     tick: Instant,
-) -> u16 {
+) -> u32 {
     let theme = model.theme.palette();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -32,37 +33,116 @@ pub fn draw(
         ])
         .split(frame.area());
 
-    let max_scroll = draw_scrollback(frame, chunks[0], model, scroll, &theme, tick);
+    let max_scroll = draw_scrollback(frame, chunks[0], model, cache, scroll, &theme, tick);
     draw_input(frame, chunks[1], model, input, &theme);
     draw_footer(frame, chunks[2], model, &theme, tick);
     max_scroll
+}
+
+/// Per-block render cache. Finished blocks keep their styled lines and wrapped
+/// height, so a frame wraps only the rows on screen plus whatever changed.
+/// Before this, every frame rebuilt and word-wrapped the whole transcript
+/// twice (height, then render): O(transcript) per frame, ~94 ms at 400 turns.
+#[derive(Default)]
+pub struct ScrollbackCache {
+    /// Everything besides the block itself that changes its rendering.
+    key: Option<(ThemeId, bool, bool, u16)>,
+    entries: Vec<CachedBlock>,
+    /// Lines word-wrapped by the last frame (cost probe for the tests).
+    pub wrapped_last_frame: usize,
+}
+
+struct CachedBlock {
+    block: Block,
+    lines: Vec<Line<'static>>,
+    height: usize,
 }
 
 fn draw_scrollback(
     frame: &mut Frame,
     area: Rect,
     model: &Model,
-    scroll: u16,
+    cache: &mut ScrollbackCache,
+    scroll: u32,
     theme: &Theme,
     tick: Instant,
-) -> u16 {
-    let lines = build_scrollback_lines(model, theme, tick);
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let max_scroll = max_scroll_for(&para, area);
-    let para = para.scroll((scroll.min(max_scroll), 0));
+) -> u32 {
+    let width = area.width.max(1);
+    let spin = spinner_char(tick);
+    let key = (model.theme, model.show_thinking, model.markdown, width);
+    if cache.key != Some(key) {
+        cache.key = Some(key);
+        cache.entries.clear();
+    }
+    cache.wrapped_last_frame = 0;
+
+    // Segments in display order: header, blocks, live tail, each as
+    // (lines, wrapped height). Blocks are re-rendered only when they changed
+    // or are an open tool card (its spinner animates).
+    let header = header_lines(model, theme);
+    let header_h = wrapped_height(&header, width);
+    let tail = live_lines(model, theme, spin);
+    let tail_h = wrapped_height(&tail, width);
+    let mut wrapped = header.len() + tail.len();
+
+    cache.entries.truncate(model.scrollback.len());
+    for (i, block) in model.scrollback.iter().enumerate() {
+        let live_card = matches!(block, Block::Tool { open: true, .. });
+        if !live_card && cache.entries.get(i).is_some_and(|e| e.block == *block) {
+            continue;
+        }
+        let lines = block_lines(block, model, theme, spin);
+        wrapped += lines.len();
+        let entry = CachedBlock { block: block.clone(), height: wrapped_height(&lines, width), lines };
+        if i < cache.entries.len() {
+            cache.entries[i] = entry;
+        } else {
+            cache.entries.push(entry);
+        }
+    }
+
+    let mut segs: Vec<(&Vec<Line<'static>>, usize)> = Vec::with_capacity(cache.entries.len() + 2);
+    segs.push((&header, header_h));
+    segs.extend(cache.entries.iter().map(|e| (&e.lines, e.height)));
+    segs.push((&tail, tail_h));
+
+    let total: usize = segs.iter().map(|s| s.1).sum();
+    let max_scroll = total.saturating_sub(area.height as usize).min(u32::MAX as usize) as u32;
+    let top = scroll.min(max_scroll) as usize;
+    let bottom = top + area.height as usize;
+
+    // Gather only segments overlapping [top, bottom).
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut start = 0usize;
+    let mut offset = 0usize;
+    for (seg_lines, h) in &segs {
+        let end = start + h;
+        if end > top && start < bottom {
+            if lines.is_empty() {
+                offset = top - start;
+            }
+            lines.extend(seg_lines.iter().cloned());
+            wrapped += seg_lines.len();
+        }
+        start = end;
+        if start >= bottom {
+            break;
+        }
+    }
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((offset.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(para, area);
+    cache.wrapped_last_frame = wrapped;
     max_scroll
 }
 
-/// Exact post-wrap height from the same Paragraph that renders: a per-line
-/// width/viewport estimate undercounts word wrap and hid the transcript tail.
-fn max_scroll_for(para: &Paragraph<'_>, area: Rect) -> u16 {
-    if area.height == 0 {
-        return 0;
-    }
-    para.line_count(area.width.max(1))
-        .saturating_sub(area.height as usize)
-        .min(u16::MAX as usize) as u16
+/// Rows `lines` occupy once word-wrapped to `width` (ratatui wraps each Line
+/// independently, so per-segment heights sum to the whole-transcript height).
+fn wrapped_height(lines: &[Line<'static>], width: u16) -> usize {
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
 }
 
 #[cfg(test)]
@@ -74,15 +154,12 @@ mod scroll_tests {
         // 20 six-letter words in a 10-column viewport: word wrap puts one
         // word per row (20 rows); the width estimate said ceil(139/10)=14.
         let text = vec!["abcdef"; 20].join(" ");
-        let para = Paragraph::new(vec![Line::from(text)]).wrap(Wrap { trim: false });
-        let area = Rect::new(0, 0, 10, 5);
-        assert_eq!(max_scroll_for(&para, area), 15);
+        assert_eq!(wrapped_height(&[Line::from(text)], 10), 20);
     }
 }
 
-fn build_scrollback_lines(model: &Model, theme: &Theme, tick: Instant) -> Vec<Line<'static>> {
+fn header_lines(model: &Model, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let spin = spinner_char(tick);
 
     if !model.model_path.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -98,87 +175,93 @@ fn build_scrollback_lines(model: &Model, theme: &Theme, tick: Instant) -> Vec<Li
                 .add_modifier(Modifier::BOLD),
         )));
     }
+    lines
+}
 
-    for block in &model.scrollback {
-        match block {
-            Block::User(t) => {
-                lines.push(Line::from(Span::styled("you", theme.role("you"))));
-                for l in t.lines() {
+fn block_lines(block: &Block, model: &Model, theme: &Theme, spin: char) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match block {
+        Block::User(t) => {
+            lines.push(Line::from(Span::styled("you", theme.role("you"))));
+            for l in t.lines() {
+                lines.push(Line::from(format!("  {l}")));
+            }
+            lines.push(Line::from(""));
+        }
+        Block::Assistant { thinking, body } => {
+            lines.push(Line::from(Span::styled(
+                "assistant",
+                theme.role("assistant"),
+            )));
+            push_thinking_lines(&mut lines, model, theme, thinking.as_deref(), false, spin);
+            if model.markdown {
+                lines.extend(render_markdown(body, theme, "  "));
+            } else {
+                for l in body.lines() {
                     lines.push(Line::from(format!("  {l}")));
                 }
-                lines.push(Line::from(""));
             }
-            Block::Assistant { thinking, body } => {
-                lines.push(Line::from(Span::styled(
-                    "assistant",
-                    theme.role("assistant"),
-                )));
-                push_thinking_lines(&mut lines, model, theme, thinking.as_deref(), false, spin);
-                if model.markdown {
-                    lines.extend(render_markdown(body, theme, "  "));
+            lines.push(Line::from(""));
+        }
+        Block::Tool {
+            kind,
+            detail,
+            body,
+            exit,
+            open,
+        } => {
+            let head = if *open {
+                format!("{spin} ┌─ {kind} {detail}")
+            } else {
+                format!(
+                    "┌─ {kind} {}  exit={}",
+                    detail,
+                    exit.map(|e| e.to_string()).unwrap_or_else(|| "?".into())
+                )
+            };
+            lines.push(Line::from(Span::styled(
+                head,
+                Style::default().fg(theme.tool),
+            )));
+            let collapsed = collapse(body, 12);
+            for l in collapsed.lines() {
+                lines.push(Line::from(format!("│ {l}")));
+            }
+            lines.push(Line::from(Span::styled(
+                "└─",
+                Style::default().fg(theme.tool),
+            )));
+            lines.push(Line::from(""));
+        }
+        Block::Notice { severity, text } => {
+            let mut first = true;
+            for l in text.lines() {
+                if first {
+                    lines.push(Line::from(Span::styled(
+                        format!("[{severity}] {l}"),
+                        theme.notice(severity),
+                    )));
+                    first = false;
                 } else {
-                    for l in body.lines() {
-                        lines.push(Line::from(format!("  {l}")));
-                    }
+                    lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        theme.notice(severity),
+                    )));
                 }
-                lines.push(Line::from(""));
-            }
-            Block::Tool {
-                kind,
-                detail,
-                body,
-                exit,
-                open,
-            } => {
-                let head = if *open {
-                    format!("{spin} ┌─ {kind} {detail}")
-                } else {
-                    format!(
-                        "┌─ {kind} {}  exit={}",
-                        detail,
-                        exit.map(|e| e.to_string()).unwrap_or_else(|| "?".into())
-                    )
-                };
-                lines.push(Line::from(Span::styled(
-                    head,
-                    Style::default().fg(theme.tool),
-                )));
-                let collapsed = collapse(body, 12);
-                for l in collapsed.lines() {
-                    lines.push(Line::from(format!("│ {l}")));
-                }
-                lines.push(Line::from(Span::styled(
-                    "└─",
-                    Style::default().fg(theme.tool),
-                )));
-                lines.push(Line::from(""));
-            }
-            Block::Notice { severity, text } => {
-                let mut first = true;
-                for l in text.lines() {
-                    if first {
-                        lines.push(Line::from(Span::styled(
-                            format!("[{severity}] {l}"),
-                            theme.notice(severity),
-                        )));
-                        first = false;
-                    } else {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {l}"),
-                            theme.notice(severity),
-                        )));
-                    }
-                }
-            }
-            Block::System(t) => {
-                lines.push(Line::from(Span::styled(
-                    t.clone(),
-                    Style::default().fg(theme.dim),
-                )));
             }
         }
+        Block::System(t) => {
+            lines.push(Line::from(Span::styled(
+                t.clone(),
+                Style::default().fg(theme.dim),
+            )));
+        }
     }
+    lines
+}
 
+fn live_lines(model: &Model, theme: &Theme, spin: char) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     // Live assistant stream (with streaming thinking).
     if !model.assistant_buf.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -436,4 +519,173 @@ fn collapse(s: &str, max_lines: usize) -> String {
     let mut out = lines[..head].join("\n");
     out.push_str(&format!("\n… ({} more lines)", lines.len() - head));
     out
+}
+
+#[cfg(test)]
+mod draw_cost {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    /// A long agent session: `turns` rounds of prompt, thinking + markdown
+    /// answer, and a tool card, with an answer streaming.
+    pub(crate) fn long_session(turns: usize) -> Model {
+        let mut m = Model::default();
+        m.model_path = "models/bonsai2/bonsai2-27b-t2-slim.q27".into();
+        m.show_thinking = true;
+        let para = "The quick brown fox **jumps** over the `lazy` dog, then reads src/main.rs and edits it. ";
+        for i in 0..turns {
+            m.scrollback.push(Block::User(format!("turn {i}: fix the parser bug in module {i}")));
+            let mut body = String::from("## Plan\n\n");
+            for j in 0..6 {
+                body.push_str(&format!("- step {j}: {}\n", para));
+            }
+            body.push_str("\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n");
+            body.push_str(&para.repeat(8));
+            m.scrollback.push(Block::Assistant {
+                thinking: Some(para.repeat(12)),
+                body,
+            });
+            m.scrollback.push(Block::Tool {
+                kind: "shell".into(),
+                detail: "cargo test".into(),
+                body: (0..40).map(|k| format!("test case_{k} ... ok\n")).collect(),
+                exit: Some(0),
+                open: false,
+            });
+        }
+        m.assistant_buf = format!("<think>{}</think>{}", para.repeat(4), para.repeat(6));
+        m.phase = Phase::Generating;
+        m
+    }
+
+    fn frame(term: &mut Terminal<TestBackend>, m: &Model, cache: &mut ScrollbackCache, scroll: u32, tick: Instant) -> (u32, Buffer) {
+        let mut max = 0;
+        term.draw(|f| max = draw(f, m, cache, "", scroll, tick)).unwrap();
+        (max, term.backend().buffer().clone())
+    }
+
+    /// The pre-cache renderer: whole transcript in one wrapped Paragraph.
+    fn reference(m: &Model, w: u16, h: u16, scroll: u32, tick: Instant) -> (u32, Buffer) {
+        let theme = m.theme.palette();
+        let spin = spinner_char(tick);
+        let mut lines = header_lines(m, &theme);
+        for b in &m.scrollback {
+            lines.extend(block_lines(b, m, &theme, spin));
+        }
+        lines.extend(live_lines(m, &theme, spin));
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let rows = h - 4; // input box (3) + footer (1)
+        let max = para.line_count(w).saturating_sub(rows as usize) as u32;
+        let para = para.scroll((scroll.min(max) as u16, 0));
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            let area = Rect::new(0, 0, w, rows);
+            f.render_widget(para, area);
+        })
+        .unwrap();
+        (max, term.backend().buffer().clone())
+    }
+
+    fn scrollback_rows(buf: &Buffer, w: u16, rows: u16) -> Vec<String> {
+        (0..rows)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect()
+    }
+
+    fn assert_matches_reference(m: &Model, cache: &mut ScrollbackCache, w: u16, h: u16, scroll: u32) {
+        let tick = Instant::now();
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let (max, got) = frame(&mut term, m, cache, scroll, tick);
+        let (want_max, want) = reference(m, w, h, scroll, tick);
+        assert_eq!(max, want_max, "max scroll (w={w} scroll={scroll})");
+        assert_eq!(
+            scrollback_rows(&got, w, h - 4),
+            scrollback_rows(&want, w, h - 4),
+            "rows (w={w} scroll={scroll})"
+        );
+    }
+
+    #[test]
+    fn windowed_render_matches_whole_transcript_render() {
+        let mut m = long_session(12);
+        let mut cache = ScrollbackCache::default();
+        for (w, h) in [(120u16, 40u16), (37, 17), (200, 60)] {
+            for scroll in [0u32, 1, 7, 50, 333, 1000, u32::MAX] {
+                assert_matches_reference(&m, &mut cache, w, h, scroll);
+            }
+        }
+        // Mutations must invalidate: an open card streaming output, then
+        // closing; a toggle; a theme switch; a cleared stream.
+        m.scrollback.push(Block::Tool {
+            kind: "shell".into(),
+            detail: "make".into(),
+            body: "line 1\n".into(),
+            exit: None,
+            open: true,
+        });
+        assert_matches_reference(&m, &mut cache, 120, 40, u32::MAX);
+        if let Some(Block::Tool { body, open, exit, .. }) = m.scrollback.last_mut() {
+            body.push_str("line 2\nline 3\n");
+            *open = false;
+            *exit = Some(2);
+        }
+        assert_matches_reference(&m, &mut cache, 120, 40, u32::MAX);
+        if let Some(Block::User(t)) = m.scrollback.get_mut(3) {
+            t.push_str(" (edited)");
+        }
+        assert_matches_reference(&m, &mut cache, 120, 40, 0);
+        m.show_thinking = false;
+        assert_matches_reference(&m, &mut cache, 120, 40, 200);
+        m.markdown = false;
+        assert_matches_reference(&m, &mut cache, 120, 40, 200);
+        m.theme = m.theme.next();
+        assert_matches_reference(&m, &mut cache, 120, 40, 200);
+        m.scrollback.truncate(5);
+        m.assistant_buf.clear();
+        assert_matches_reference(&m, &mut cache, 120, 40, u32::MAX);
+    }
+
+    /// Ratchet: a steady-state frame (nothing changed but the stream) wraps
+    /// the same number of lines at 10 turns and at 400 — frame cost no longer
+    /// grows with the transcript. Before the cache, 400 turns wrapped ~30k.
+    #[test]
+    fn steady_frame_cost_is_independent_of_session_length() {
+        let tick = Instant::now();
+        let mut cost = Vec::new();
+        for turns in [10, 400] {
+            let m = long_session(turns);
+            let mut cache = ScrollbackCache::default();
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            frame(&mut term, &m, &mut cache, u32::MAX, tick);
+            frame(&mut term, &m, &mut cache, u32::MAX, tick);
+            cost.push(cache.wrapped_last_frame);
+        }
+        assert_eq!(cost[0], cost[1], "steady-state wrapped lines: {cost:?}");
+        assert!(cost[1] <= 200, "steady-state frame wraps {} lines", cost[1]);
+    }
+
+    /// Wall-clock probe: `cargo test --release draw_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_draw_time_by_session_length() {
+        for turns in [10, 100, 400] {
+            let m = long_session(turns);
+            let mut cache = ScrollbackCache::default();
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let tick = Instant::now();
+            frame(&mut term, &m, &mut cache, u32::MAX, tick);
+            let frames = 40;
+            let start = Instant::now();
+            for _ in 0..frames {
+                frame(&mut term, &m, &mut cache, u32::MAX, tick);
+            }
+            eprintln!(
+                "turns={turns:4} per-frame {:8.3} ms, wrapped lines {}",
+                start.elapsed().as_secs_f64() * 1e3 / frames as f64,
+                cache.wrapped_last_frame
+            );
+        }
+    }
 }

@@ -32,7 +32,7 @@ fn sanitize_terminal_text(s: &str) -> String {
         .collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     User(String),
     Assistant {
