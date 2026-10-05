@@ -7,6 +7,7 @@ cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 mkdir -p "$tmp/pkg/bin" "$tmp/pkg/lib" "$tmp/fake-bin" "$tmp/remote" "$tmp/home"
 cp "$root/packaging/bin/q27-fetch" "$tmp/pkg/bin/"
+cp "$root/build/q27-lock-exec" "$tmp/pkg/bin/q27-lock-exec"
 cp "$root/packaging/lib/q27_bench_lib.sh" "$tmp/pkg/lib/"
 chmod +x "$tmp/pkg/bin/q27-fetch"
 
@@ -164,20 +165,19 @@ MOCK_DROP_ONCE="$tmp/drop-once" "$tmp/pkg/bin/q27-fetch" moved >/dev/null
 grep -A1 -F "/resolve/$rev_b/artifact-b.q27" "$tmp/curl.log" | grep -q '^offset=[1-9]'
 [[ "$(sha "$tmp/home/moved/artifact-b.q27")" = "$art_b_sha" ]]
 
-# A pull already running for the pack is refused; a lock left by a dead
-# process is stale and taken over; the lock is released afterwards.
+# A pull already running for the pack holds its kernel lock: a second pull is
+# refused; once the holder exits (however it exits) the next pull proceeds.
 rm -rf "$tmp/home/moved"
-mkdir -p "$tmp/home/moved/.q27-fetch.lock"
-sleep 30 & live=$!
-echo "$live" >"$tmp/home/moved/.q27-fetch.lock/pid"
+"$tmp/pkg/bin/q27-lock-exec" "$tmp/home/.locks/moved.lock" sleep 30 & holder=$!
+for _ in {1..50}; do [[ -e "$tmp/home/.locks/moved.lock" ]] && break; sleep 0.1; done
 if "$tmp/pkg/bin/q27-fetch" moved >"$tmp/locked.out" 2>&1; then
   echo "q27-fetch ran while another pull held the pack lock" >&2; exit 1
 fi
 grep -q "another pull of moved is running" "$tmp/locked.out"
-kill "$live"; wait "$live" 2>/dev/null || true
+[[ ! -e "$tmp/home/moved" ]]
+kill -9 "$holder"; wait "$holder" 2>/dev/null || true
 "$tmp/pkg/bin/q27-fetch" moved >/dev/null
 [[ "$(sha "$tmp/home/moved/artifact-b.q27")" = "$art_b_sha" ]]
-[[ ! -e "$tmp/home/moved/.q27-fetch.lock" ]]
 
 # A symlinked .part must not let the download write through to its target.
 rm -rf "$tmp/home/moved"

@@ -23,6 +23,18 @@ FIELD() { q27_registry_field "$NAME" "$1" || { echo "q27-fetch: unknown pack $NA
 q27_registry_field "$NAME" 1 >/dev/null 2>&1 || {
     echo "q27-fetch: unknown pack $NAME (see \`q27 recommend\`)" >&2; exit 1; }
 
+# One pull per pack at a time: concurrent pulls share the resumable .part
+# names, so they would corrupt or delete each other's staging. Re-exec under
+# a kernel flock (q27-lock-exec), which the kernel drops on any exit, so a
+# crashed pull never leaves a stale lock behind.
+if [ "${Q27_FETCH_LOCKED:-}" != "$NAME" ]; then
+    [ -x "$HERE/q27-lock-exec" ] || {
+        echo "q27-fetch: q27-lock-exec helper not found" >&2; exit 1; }
+    Q27_FETCH_LOCKED="$NAME" Q27_LOCK_BUSY="another pull of $NAME is running" \
+        exec "$HERE/q27-lock-exec" "$(q27_home)/.locks/$NAME.lock" "$SRC" "$NAME"
+fi
+unset Q27_LOCK_BUSY
+
 ART_FILE="$(FIELD 4)"; EXPECT_MD5="$(FIELD 5)"; REPO="$(FIELD 8)"
 KIND="$(FIELD 9)"; TOK_KIND="$(FIELD 10)"; EXP="$(FIELD 11)"
 ART_SHA="$(FIELD 14)"; HF_REV="$(FIELD 15)"
@@ -33,24 +45,9 @@ ART="$DEST/$ART_FILE"
 sha256_file() { q27_sha256_file "$1"; }
 
 [ "$EXP" = "yes" ] && echo "q27-fetch: NOTE — $NAME is EXPERIMENTAL: $(FIELD 12)"
+
 mkdir -p "$DEST"
 [ -L "$DEST" ] && { echo "q27-fetch: $DEST is a symlink — refusing" >&2; exit 1; }
-
-# One pull per pack at a time: concurrent pulls share the resumable .part
-# names, so they would corrupt or delete each other's staging. mkdir is
-# atomic; a lock whose owner is gone is stale and taken over.
-LOCK="$DEST/.q27-fetch.lock"
-take_lock() { mkdir "$LOCK" 2>/dev/null && echo $$ >"$LOCK/pid"; }
-if ! take_lock; then
-    owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-        echo "q27-fetch: another pull of $NAME is running (pid $owner)" >&2; exit 1
-    fi
-    rm -rf "$LOCK"
-    take_lock || { echo "q27-fetch: cannot lock $DEST" >&2; exit 1; }
-fi
-trap 'rm -rf "$LOCK"' EXIT
-trap 'exit 130' INT TERM HUP
 
 # Map a registry name to its source GGUF filename / repo revision / digests.
 # These are pinned so an upstream re-upload cannot drift in (the fetch_weights

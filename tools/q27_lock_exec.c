@@ -161,8 +161,12 @@ int main(int argc, char **argv) {
         const int saved = errno;
         close(fd);
         close(dir_fd);
-        if (saved == EWOULDBLOCK || saved == EAGAIN)
-            die_code(75, "a q27 server or native agent is already running (one model at a time)");
+        if (saved == EWOULDBLOCK || saved == EAGAIN) {
+            // Q27_LOCK_BUSY lets a non-model holder (q27-fetch) name itself.
+            const char *busy = getenv("Q27_LOCK_BUSY");
+            die_code(75, "%s", busy && *busy ? busy :
+                     "a q27 server or native agent is already running (one model at a time)");
+        }
         errno = saved;
         die_errno("cannot launch locked consumer:", lock_path);
     }

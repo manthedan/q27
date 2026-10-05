@@ -15,6 +15,12 @@ seed="${3:-}"
 [[ -f "$tarball" ]] || { echo "tarball not found: $tarball" >&2; exit 1; }
 root="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON="${PYTHON:-$(command -v python3)}"
+# The smoke later runs from its temp dir: pin a relative interpreter path now.
+case "$PYTHON" in
+  /*) ;;
+  */*) PYTHON="$(cd "$(dirname "$PYTHON")" && pwd)/$(basename "$PYTHON")" ;;
+  *) PYTHON="$(command -v "$PYTHON")" ;;
+esac
 port=8080
 if ! "$PYTHON" - "$port" <<'PY'
 import socket, sys
