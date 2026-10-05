@@ -10,12 +10,18 @@
 # before it is considered installed. Mirrors tools/fetch_weights.sh's
 # verified pattern, generalized over the registry.
 set -u
-SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+# Follow the whole symlink chain; a relative target is relative to the
+# directory of the link that holds it (Homebrew: bin -> Cellar -> libexec).
+SRC="$0"; while [ -L "$SRC" ]; do LINK="$(readlink "$SRC")"; case "$LINK" in /*) SRC="$LINK" ;; *) SRC="$(dirname "$SRC")/$LINK" ;; esac; done
 HERE="$(cd "$(dirname "$SRC")" && pwd)"
 . "$HERE/../lib/q27_bench_lib.sh"
 
 NAME="${1:?usage: q27-fetch <name> (see \`q27 recommend\`)}"
 FIELD() { q27_registry_field "$NAME" "$1" || { echo "q27-fetch: unknown pack $NAME" >&2; exit 1; }; }
+# FIELD runs inside $(...), where its exit leaves only the subshell: reject an
+# unknown name here, before any path is built from it.
+q27_registry_field "$NAME" 1 >/dev/null 2>&1 || {
+    echo "q27-fetch: unknown pack $NAME (see \`q27 recommend\`)" >&2; exit 1; }
 
 ART_FILE="$(FIELD 4)"; EXPECT_MD5="$(FIELD 5)"; REPO="$(FIELD 8)"
 KIND="$(FIELD 9)"; TOK_KIND="$(FIELD 10)"; EXP="$(FIELD 11)"
@@ -169,6 +175,16 @@ case "$KIND" in
                 [ -f "$1" ] && [ "$(sha256_file "$1")" = "$ART_SHA" ] &&
                 { [ -z "$EXPECT_MD5" ] || [ "$(q27_md5_file "$1")" = "$EXPECT_MD5" ]; }
             }
+            # One retry. Only an HTTP error (curl exit 22, e.g. 416 when a
+            # corrupt .part already reaches EOF) restarts from zero; a transport
+            # drop keeps the bytes and the retry resumes with a range request.
+            fetch_part() { # remote-file part-path
+                local rc
+                hf_download "$1" "$2"; rc=$?
+                [ "$rc" -eq 0 ] && return 0
+                [ "$rc" -eq 22 ] && rm -f "$2"
+                hf_download "$1" "$2"
+            }
             tokenizer_valid() {
                 [ -f "$1" ] && [ "$(head -c 4 "$1" 2>/dev/null)" = "Q27T" ] &&
                 [ "$(sha256_file "$1")" = "$TOK_SHA" ]
@@ -180,12 +196,7 @@ case "$KIND" in
             if ! artifact_valid "$ART"; then
                 if ! artifact_valid "$ART_PART"; then
                     echo "q27-fetch: downloading pinned $ART_FILE from $REPO@$HF_REV ($(FIELD 6) GiB)"
-                    if ! hf_download "$ART_FILE" "$ART_PART"; then
-                        # A complete file resumed at EOF may yield HTTP 416;
-                        # discard only after its digest failed, then retry clean.
-                        rm -f "$ART_PART"
-                        hf_download "$ART_FILE" "$ART_PART" || exit 1
-                    fi
+                    fetch_part "$ART_FILE" "$ART_PART" || exit 1
                 fi
                 artifact_valid "$ART_PART" || {
                     rm -f "$ART_PART"
@@ -199,10 +210,7 @@ case "$KIND" in
             if ! tokenizer_valid "$TOK"; then
                 if ! tokenizer_valid "$TOK_PART"; then
                     echo "q27-fetch: downloading pinned $TOK_FILE from $REPO@$HF_REV"
-                    if ! hf_download "$TOK_FILE" "$TOK_PART"; then
-                        rm -f "$TOK_PART"
-                        hf_download "$TOK_FILE" "$TOK_PART" || exit 1
-                    fi
+                    fetch_part "$TOK_FILE" "$TOK_PART" || exit 1
                 fi
                 tokenizer_valid "$TOK_PART" || {
                     rm -f "$TOK_PART"

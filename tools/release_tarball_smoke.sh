@@ -56,20 +56,27 @@ if [[ -n "$seed" ]]; then
   done
 fi
 clean_path="$smoke/userbin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Run from outside any source tree. No subshell: the backgrounded server's $!
+# must be the env process that execs down to q27-metal-server.
+cd "$smoke"
 run_q27() {
-  ( cd "$smoke" && env -i HOME="$HOME" PATH="$clean_path" TMPDIR="${TMPDIR:-/tmp}" \
-      Q27_HOME="$qhome" Q27_RUN_DIR="$smoke/home/run" \
-      Q27_SNAPSHOT_DIR="$smoke/home/snapshots" "$q27" "$@" )
+  env -i HOME="$HOME" PATH="$clean_path" TMPDIR="${TMPDIR:-/tmp}" \
+    Q27_HOME="$qhome" Q27_RUN_DIR="$smoke/home/run" \
+    Q27_SNAPSHOT_DIR="$smoke/home/snapshots" "$q27" "$@"
 }
 
 run_q27 help >/dev/null
 run_q27 pull "$pack" >"$smoke/pull.out" 2>&1 || { cat "$smoke/pull.out" >&2; exit 1; }
 run_q27 recommend >"$smoke/recommend.out"
-grep -Fq "Recommended pack for this machine: $pack" "$smoke/recommend.out" || {
-  echo "recommend did not pick $pack:" >&2; cat "$smoke/recommend.out" >&2; exit 1; }
+# recommend names one pack per machine; any pack under test must at least fit.
+grep -Eq "^$pack[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+yes" "$smoke/recommend.out" || {
+  echo "recommend does not list $pack as fitting:" >&2; cat "$smoke/recommend.out" >&2; exit 1; }
 model_profile="$(awk -F'\t' -v n="$pack" '$1==n { print $13 }' "$dist/packaging/models.tsv")"
 
-run_q27 serve "$pack" >"$smoke/server.out" 2>"$smoke/server.err" &
+env -i HOME="$HOME" PATH="$clean_path" TMPDIR="${TMPDIR:-/tmp}" \
+  Q27_HOME="$qhome" Q27_RUN_DIR="$smoke/home/run" \
+  Q27_SNAPSHOT_DIR="$smoke/home/snapshots" \
+  "$q27" serve "$pack" >"$smoke/server.out" 2>"$smoke/server.err" &
 server_pid=$!
 for _ in {1..600}; do
   curl -fsS --max-time 1 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break

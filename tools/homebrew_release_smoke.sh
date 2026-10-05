@@ -142,9 +142,8 @@ else
 fi
 [[ -f "$qhome/$pack/$artifact_file" ]]
 run_q27 recommend >"$smoke/recommend.out"
-if [[ "$pack_mode" = public ]]; then
-  grep -Fq "Recommended pack for this machine: $pack" "$smoke/recommend.out"
-fi
+grep -Eq "^$pack[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+yes" "$smoke/recommend.out" || {
+  echo "recommend does not list $pack as fitting" >&2; cat "$smoke/recommend.out" >&2; exit 1; }
 
 env -i HOME="$HOME" PATH="$clean_path" TMPDIR="${TMPDIR:-/tmp}" \
   Q27_HOME="$qhome" Q27_RUN_DIR="$run_dir" Q27_SNAPSHOT_DIR="$snapshots" \

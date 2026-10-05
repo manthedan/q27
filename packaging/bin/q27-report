@@ -14,7 +14,9 @@
 # artifact names + md5 + quant_policy. No model weights, no prompts beyond
 # the fixed canonical one, nothing private — it is safe to email.
 set -u
-SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+# Follow the whole symlink chain; a relative target is relative to the
+# directory of the link that holds it (Homebrew: bin -> Cellar -> libexec).
+SRC="$0"; while [ -L "$SRC" ]; do LINK="$(readlink "$SRC")"; case "$LINK" in /*) SRC="$LINK" ;; *) SRC="$(dirname "$SRC")/$LINK" ;; esac; done
 HERE="$(cd "$(dirname "$SRC")" && pwd)"
 . "$HERE/../lib/q27_bench_lib.sh"
 

@@ -83,9 +83,9 @@ impl Backend {
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr_file));
 
-        // Metal loads q27_kernels.metal at runtime from cwd-relative paths
-        // (or Q27_METAL_SOURCE). The TUI is often launched from
-        // experiments/q27-tui/, so inject the repo shader when unset.
+        // Metal finds q27_kernels.metal next to its executable in release and
+        // Homebrew layouts. A dev build (build/q27-agent) gets its checkout's
+        // shader injected here, keyed off the agent binary, never the cwd.
         if std::env::var_os("Q27_METAL_SOURCE").is_none() {
             if let Some(shader) = discover_metal_source(agent_bin) {
                 cmd.env("Q27_METAL_SOURCE", shader);
@@ -231,12 +231,11 @@ impl Drop for Backend {
     }
 }
 
-/// Walk from the agent binary and CWD looking for `src/metal/q27_kernels.metal`.
+/// Walk up from the agent binary looking for `src/metal/q27_kernels.metal`.
+/// The cwd is deliberately not searched: an installed agent launched inside
+/// some other q27 checkout must keep its own packaged shader.
 fn discover_metal_source(agent_bin: &Path) -> Option<PathBuf> {
     let mut roots = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
     if let Some(parent) = agent_bin.parent() {
         // build/q27-agent → repo root is parent of build/
         roots.push(parent.to_path_buf());
@@ -286,4 +285,29 @@ fn spawn_stdout_reader<R: std::io::Read + Send + 'static>(stdout: R, tx: Sender<
         }
         let _ = tx.send(BackendEvent::Exited(None));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::discover_metal_source;
+    use std::path::Path;
+
+    #[test]
+    fn packaged_agent_ignores_a_checkout_in_cwd() {
+        // cargo runs tests inside this repository, so a cwd walk would find
+        // its src/metal shader; an agent outside any checkout must not.
+        let dir = std::env::temp_dir().join(format!("q27-tui-pkg-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let found = discover_metal_source(&bin.join("q27-agent"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn dev_agent_finds_its_checkout_shader() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let found = discover_metal_source(&repo.join("build/q27-agent")).unwrap();
+        assert!(found.ends_with("src/metal/q27_kernels.metal"));
+    }
 }

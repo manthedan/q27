@@ -14,7 +14,7 @@ multi-GB weight lifecycle:
     q27 pull           # download + verify the recommended pack (~/.q27/models)
     q27 serve          # boot the server (refuses if one is already running)
     q27 ls             # what's installed
-    q27 bench --fast   # quick synthetic ceiling + a real decode
+    q27 bench --fast   # a real greedy decode on the first installed pack
     q27 report --full  # build a send-back diagnostic bundle (see below)
 
 `q27 agent` runs the native coding agent on the default Bonsai 2 pack:
@@ -147,10 +147,14 @@ Model artifacts (`.q27`) and tokenizers (`.tok`) are deliberately not
 packaged — they are multi-GB and carry their own model licenses. See the
 top-level README for repack instructions.
 
-Release flow: tag (`vX.Y.Z`), push the tag, then update `url`/`sha256` in
-`packaging/homebrew/q27.rb`:
-
-    curl -sL https://github.com/manthedan/q27/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+Release flow: assemble the prebuilt archive
+(`tools/assemble_release_tarball.sh metal-vX.Y.Z DIR`, binaries built with
+`MACOSX_DEPLOYMENT_TARGET=13.0`), stage a candidate formula pinned to that exact file
+(`tools/stage_homebrew_formula.sh packaging/homebrew/q27.rb ARCHIVE OUT X.Y.Z`
+writes a local `file://` url, the version and the archive's sha256), smoke it
+with `tools/homebrew_release_smoke.sh`, then tag, attach the same archive to the
+GitHub release, and publish the formula with the release `url` and that same
+sha256. The source-archive sha256 is not the formula's sha256.
 
 ## Weights (separate from the formula)
 

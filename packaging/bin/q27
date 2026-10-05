@@ -19,7 +19,9 @@
 set -u
 # Resolve symlinks (Homebrew links bin/q27 -> libexec/q27/bin/q27) so the
 # relative lib/models/tools lookups land beside the REAL script, not the link.
-SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+# Follow the whole symlink chain; a relative target is relative to the
+# directory of the link that holds it (Homebrew: bin -> Cellar -> libexec).
+SRC="$0"; while [ -L "$SRC" ]; do LINK="$(readlink "$SRC")"; case "$LINK" in /*) SRC="$LINK" ;; *) SRC="$(dirname "$SRC")/$LINK" ;; esac; done
 HERE="$(cd "$(dirname "$SRC")" && pwd)"
 . "$HERE/../lib/q27_bench_lib.sh"
 
@@ -72,8 +74,8 @@ cmd_recommend() {
     echo
     local rec; rec="$(recommend_pack)"
     echo "Recommended pack for this machine: ${rec:-none (too little RAM)}"
-    echo "Context window: the wrapper sizes ctx to the memory left after weights"
-    echo "(see docs/MODELS.md for the full quant x context fit table)."
+    echo "Context: Bonsai 2 packs default to 16K (fp16 KV on a 16 GB Mac; --kv q8"
+    echo "reaches 64K). See doc/BONSAI2.md in the release archive."
 }
 
 cmd_ls() {

@@ -49,10 +49,11 @@ cat >"$tmp/fake-bin/curl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 : "${MOCK_REMOTE:?}" "${MOCK_CURL_LOG:?}"
-dest= url=
+dest= url= resume=0
 while (($#)); do
   case "$1" in
     -o) dest="$2"; shift 2 ;;
+    --continue-at) resume=1; shift 2 ;;
     http://*|https://*) url="$1"; shift ;;
     *) shift ;;
   esac
@@ -66,7 +67,17 @@ case "$url" in
   */resolve/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/token-b.tok) src=token-b.tok ;;
   *) exit 22 ;;
 esac
-cp "$MOCK_REMOTE/$src" "$dest"
+offset=0
+if (( resume )) && [[ -f "$dest" ]]; then offset=$(wc -c <"$dest" | tr -d ' '); fi
+size=$(wc -c <"$MOCK_REMOTE/$src" | tr -d ' ')
+printf 'offset=%s\n' "$offset" >>"$MOCK_CURL_LOG"
+(( offset > size )) && exit 22   # range not satisfiable
+if [[ -n "${MOCK_DROP_ONCE:-}" && -e "$MOCK_DROP_ONCE" ]]; then
+  rm -f "$MOCK_DROP_ONCE"          # transport drop halfway: keep what arrived
+  head -c $(( size / 2 )) "$MOCK_REMOTE/$src" >"$dest"
+  exit 18
+fi
+tail -c +$(( offset + 1 )) "$MOCK_REMOTE/$src" >>"$dest"
 EOF
 chmod +x "$tmp/fake-bin/curl"
 export PATH="$tmp/fake-bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -143,6 +154,15 @@ grep -Fq "/resolve/$rev_a/token-a.tok" "$tmp/curl.log"
 grep -Fq "/resolve/$rev_b/artifact-b.q27" "$tmp/curl.log"
 grep -Fq "/resolve/$rev_b/token-b.tok" "$tmp/curl.log"
 ! grep -Fq '/resolve/main/' "$tmp/curl.log"
+
+# A transport drop mid-download keeps the received bytes; the retry resumes
+# from that offset instead of starting over.
+rm -rf "$tmp/home/moved"
+: >"$tmp/curl.log"
+: >"$tmp/drop-once"
+MOCK_DROP_ONCE="$tmp/drop-once" "$tmp/pkg/bin/q27-fetch" moved >/dev/null
+grep -A1 -F "/resolve/$rev_b/artifact-b.q27" "$tmp/curl.log" | grep -q '^offset=[1-9]'
+[[ "$(sha "$tmp/home/moved/artifact-b.q27")" = "$art_b_sha" ]]
 
 rm -rf "$tmp/home/bad-art" "$tmp/home/bad-tok"
 if "$tmp/pkg/bin/q27-fetch" bad-art >/dev/null 2>&1; then

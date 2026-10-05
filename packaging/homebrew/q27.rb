@@ -43,7 +43,8 @@ class Q27 < Formula
     (libexec/"q27/lib").install "packaging/lib/q27_bench_lib.sh"
     (libexec/"q27").install "packaging/models.tsv"
     (libexec/"q27/share/q27-tools").install "share/q27-tools/repack.py",
-                                           "share/q27-tools/export_tokenizer.py"
+                                           "share/q27-tools/export_tokenizer.py",
+                                           "share/q27-tools/prism_gguf.py"
     # The wrapper resolves its lib/models/tools relative to its own real
     # path, but its symlink-chase uses `dirname "$0"` rather than `dirname
     # "$SRC"`, so it breaks on Homebrew's nested symlink chain

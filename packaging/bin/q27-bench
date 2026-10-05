@@ -24,7 +24,9 @@
 # server. It WILL load big artifacts on --full, so don't run it while a
 # q27 server is serving (one-model-at-a-time house rule).
 set -u
-SRC="$0"; while [ -L "$SRC" ]; do SRC="$(readlink "$SRC")"; case "$SRC" in /*) ;; *) SRC="$(dirname "$0")/$SRC";; esac; done
+# Follow the whole symlink chain; a relative target is relative to the
+# directory of the link that holds it (Homebrew: bin -> Cellar -> libexec).
+SRC="$0"; while [ -L "$SRC" ]; do LINK="$(readlink "$SRC")"; case "$LINK" in /*) SRC="$LINK" ;; *) SRC="$(dirname "$SRC")/$LINK" ;; esac; done
 HERE="$(cd "$(dirname "$SRC")" && pwd)"
 # shellcheck source=../lib/q27_bench_lib.sh
 . "$HERE/../lib/q27_bench_lib.sh"
@@ -73,8 +75,11 @@ installed_packs() {
 [ -z "$PACKS" ] && PACKS="$(installed_packs)"
 
 # dtype route string the synthetic benches expect for a pack's quant_policy.
-dtype_for() { # $1=quant_policy -> q4q8|t2|b1
+dtype_for() { # $1=quant_policy -> q4q8|t2|b1|bonsai2
     case "$1" in
+        # Bonsai 2: no MTP head and no synthetic route for its float-activation
+        # prefill or slim containers; only the real greedy legs apply.
+        bonsai2-*) echo bonsai2 ;;
         bonsai-t2-v1) echo t2 ;;
         bonsai-b1-v1|bonsai-mixed-v1) echo b1 ;;
         *) echo q4q8 ;;
@@ -96,6 +101,7 @@ if [ -n "$DECODE_BENCH" ]; then
     seen=" "
     for p in $PACKS; do
         qp="$(q27_registry_field "$p" 3)"; dt="$(dtype_for "$qp")"
+        [ "$dt" = bonsai2 ] && continue
         case "$seen" in *" $dt "*) continue ;; esac
         seen="$seen$dt "
         out="$RUN_DIR/decode-$dt.out"
@@ -152,6 +158,10 @@ run_real() { # $1=pack
         # the comparable number).
         if [ -n "$PREFILL_BENCH" ]; then
             local dt; dt="$(dtype_for "$qp")"
+            if [ "$dt" = bonsai2 ]; then
+                emit "real $p: prefill-ceiling :: N/A (no synthetic Bonsai 2 route)"
+                return
+            fi
             # prefill bench only supports q4q8|t2; map b1->t2 (closest ternary route).
             [ "$dt" = "b1" ] && dt="t2"
             local pout="$RUN_DIR/prefill-$p.out"

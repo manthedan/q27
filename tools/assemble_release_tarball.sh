@@ -66,7 +66,8 @@ cp packaging/bin/* "$ROOT/packaging/bin/"
 cp build/q27-lock-exec "$ROOT/packaging/bin/q27-lock-exec"
 cp packaging/lib/q27_bench_lib.sh "$ROOT/packaging/lib/"
 cp packaging/models.tsv "$ROOT/packaging/models.tsv"
-cp tools/repack.py tools/export_tokenizer.py "$ROOT/share/q27-tools/"
+# export_tokenizer.py imports its GGUF reader from prism_gguf.py.
+cp tools/repack.py tools/export_tokenizer.py tools/prism_gguf.py "$ROOT/share/q27-tools/"
 
 # User-facing docs.
 cp README.md docs/QA_BEFORE_RELEASES.md docs/SECURITY-MODEL.md \

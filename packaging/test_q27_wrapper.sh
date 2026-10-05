@@ -565,6 +565,43 @@ printf '%s\n%s\n' "$TMP/archive-home/b1/bonsai-27b-b1.q27" \
 diff -u "$TMP/archive-server-expected" "$TMP/archive-server-paths"
 grep -Fxq 'bonsai-agent-v1' "$TMP/archive-server-profile"
 
+# Homebrew reaches the leaf tools through two relative links:
+# <brew>/bin/X -> ../Cellar/q27/V/bin/X -> ../libexec/q27/bin/X. Each hop is
+# relative to the directory of the link holding it, not to the first $0.
+brew_root="$TMP/brew"
+cellar="$brew_root/Cellar/q27/9.9.9"
+mkdir -p "$cellar/libexec/q27/bin" "$cellar/libexec/q27/lib" "$cellar/bin" "$brew_root/bin"
+cp "$ROOT"/packaging/bin/q27* "$cellar/libexec/q27/bin/"
+cp "$ROOT/packaging/lib/q27_bench_lib.sh" "$cellar/libexec/q27/lib/"
+cp "$ROOT/packaging/models.tsv" "$cellar/libexec/q27/models.tsv"
+for t in q27 q27-fetch q27-bench q27-report; do
+    ln -s "../libexec/q27/bin/$t" "$cellar/bin/$t"
+    ln -s "../Cellar/q27/9.9.9/bin/$t" "$brew_root/bin/$t"
+done
+if Q27_HOME="$TMP/brew-home" PATH="/usr/bin:/bin" \
+       "$brew_root/bin/q27-fetch" ../../escape >"$TMP/brew-fetch.out" 2>&1; then
+    echo "FAIL: q27-fetch accepted an unknown pack" >&2; exit 1
+fi
+# These scripts run without errexit, so a failed library source is only
+# visible on stderr: require clean stderr and output that needs the registry.
+PATH="$TMP/pgrep-only:/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$brew_root/bin/q27" recommend >"$TMP/brew-recommend.out" 2>"$TMP/brew-recommend.err"
+grep -q '^Recommended pack for this machine: ' "$TMP/brew-recommend.out"
+grep -q '^b2 ' "$TMP/brew-recommend.out"
+PATH="/usr/bin:/bin" "$brew_root/bin/q27-report" --help >/dev/null 2>"$TMP/brew-report.err"
+for e in "$TMP/brew-recommend.err" "$TMP/brew-report.err" "$TMP/brew-fetch.out"; do
+    [ -f "$e" ] || continue
+    if grep -q 'No such file or directory' "$e"; then
+        echo "FAIL: Homebrew link chain did not resolve the packaged library:" >&2
+        cat "$e" >&2; exit 1
+    fi
+done
+grep -q 'unknown pack ../../escape' "$TMP/brew-fetch.out" || {
+    echo "FAIL: q27-fetch did not start through the Homebrew link chain" >&2
+    cat "$TMP/brew-fetch.out" >&2; exit 1; }
+[ ! -e "$TMP/escape" ] && [ ! -e "$TMP/brew-home" ] || {
+    echo "FAIL: q27-fetch created directories for an unknown pack" >&2; exit 1; }
+
 # A source checkout resolves its gitignored model tree without requiring the
 # installed ~/.q27 layout.
 mkdir -p "$TMP/source/models/bonsai-27b-b1" \
