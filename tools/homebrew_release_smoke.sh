@@ -56,6 +56,7 @@ fi
 smoke="$(mktemp -d "${TMPDIR:-/tmp}/q27-homebrew-smoke.XXXXXX")"
 installed_attempted=0
 server_pid=""
+smoke_tap=""
 cleanup() {
   set +e
   if [[ -n "$server_pid" ]]; then
@@ -64,20 +65,29 @@ cleanup() {
   fi
   if [[ "$installed_attempted" -eq 1 ]] &&
      [[ -n "$(brew list --versions q27 2>/dev/null || true)" ]]; then
-    brew uninstall --formula q27 >/dev/null 2>&1 || true
+    brew uninstall --formula "${smoke_tap:+$smoke_tap/}q27" >/dev/null 2>&1 || true
   fi
+  [[ -n "$smoke_tap" ]] && brew untap --force "$smoke_tap" >/dev/null 2>&1
   rm -rf "$smoke"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
+# Homebrew 7 installs formulae only from taps: stage the candidate in a
+# throwaway local tap (removed on exit) instead of installing by file path.
+smoke_tap="q27smoke/candidate"
+brew untap --force "$smoke_tap" >/dev/null 2>&1 || true
+brew tap-new --no-git "$smoke_tap" >/dev/null
+cp "$formula" "$(brew --repository "$smoke_tap")/Formula/q27.rb"
 installed_attempted=1
-brew install --formula "$formula"
+brew install --formula "$smoke_tap/q27"
 [[ -n "$(brew list --versions q27 2>/dev/null || true)" ]] || {
   echo "Homebrew did not register the candidate q27 formula" >&2
   exit 1
 }
-prefix="$(brew --prefix q27)"
+# Other taps (the published one) may also carry a q27 formula: always use
+# the fully qualified candidate name from here on.
+prefix="$(brew --prefix "$smoke_tap/q27")"
 q27="$prefix/bin/q27"
 lock_exec="$prefix/libexec/q27/bin/q27-lock-exec"
 [[ -x "$q27" && -x "$lock_exec" ]] || {
@@ -118,7 +128,7 @@ case "$source_kind/$experimental" in
     exit 1
     ;;
 esac
-brew test q27
+brew test "$smoke_tap/q27"
 
 qhome="$smoke/home/models"
 run_dir="$smoke/home/run"
@@ -175,8 +185,9 @@ env -i HOME="$HOME" PATH="$clean_path" TMPDIR="${TMPDIR:-/tmp}" \
   PYTHON="$PYTHON" Q27_HOME="$qhome" \
   "$root/tools/packaged_agent_driver.sh" "$q27" "$pack"
 
-brew uninstall --formula q27
+brew uninstall --formula "$smoke_tap/q27"
 installed_attempted=0
+brew untap --force "$smoke_tap" >/dev/null 2>&1 || true
 trap - EXIT INT TERM HUP
 rm -rf "$smoke"
 echo "Homebrew release smoke: PASS ($pack, $pack_mode)"
