@@ -1,0 +1,20 @@
+leg        inst turns/i think K/i think/turn >2K turns text K/i tools/i out tok/i  gold wall/i
+q27seed      12    21.8      32.8       1501       17%      3.7    21.2     12250 11/12     75
+piseed       12    18.7      22.3       1194       14%      2.9    17.9      8593 11/12     53
+piladr       12    22.5      24.0       1066       16%      2.9    21.9      9756 11/12     73
+
+iid                           q27seed t/thK/out     piseed t/thK/out     piladr t/thK/out
+pallets__flask-5014          16/   12/   4821*   17/   11/   4657*   25/    8/   4906*
+psf__requests-1142           28/   34/  12859*   11/   11/   4832*   12/   13/   5415*
+psf__requests-1724           17/   20/   7916    17/   14/   5902     9/    9/   3449 
+psf__requests-1766           12/    6/   3208*    4/    2/    858*   18/   24/  10288*
+psf__requests-1921           24/   45/  13889*   13/    8/   4138*    8/   15/   5880*
+pydata__xarray-4075          24/   34/  11431*   12/    7/   3740*   13/    9/   4266*
+pydata__xarray-4094          75/  131/  47022*   59/   82/  28915*   49/   66/  23255*
+pylint-dev__pylint-4970      25/   60/  25932*   51/   67/  25505*   38/   57/  21786*
+pylint-dev__pylint-6903       3/    1/    902*   18/   30/  11432*   22/   26/  10543*
+pytest-dev__pytest-10081     17/   30/   9902*   12/   25/   7844*   41/   44/  16680*
+pytest-dev__pytest-5262      13/   11/   5673*    7/    9/   4249*   32/   16/  10118*
+pytest-dev__pytest-5809       8/    9/   3451*    3/    2/   1048*    3/    1/    491*
+
+* = patch touched a gold file

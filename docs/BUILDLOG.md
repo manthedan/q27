@@ -15714,6 +15714,38 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-05 (bd): Qwen3.8-27B-pi -- same gold, 30% less wall on the agentic campaign, and the base drafter accepts more
+
+bytkim/Qwen3.8-27B-pi (Apache-2.0; SFT on successful Pi agent-harness coding
+sessions, then GRPO with a reasoning-efficiency reward) repacked from its
+BF16 GGUF + its own MTP GGUF with the base default recipe (v2.0, Q8
+attn_output), 16.996 GB, wsum e18697210b412d64 on two loads. Tokenizer and
+chat template byte-identical to base.
+
+Two repack fixes it needed (44b6b20): its GGUF names itself "Source Step8
+Derived Mtp", and the engine keys the XML tool dialect and every 3.8 template
+rule on a "qwen38" substring in general.name, so `--name` now applies to any
+pack (not just Bonsai 2); and newer llama.cpp GGUFs carry a per-layer
+`qwen35.attention.recurrent_layers` (64 entries, the MTP view 65 with a
+trailing 0), which the split-join check rejected as a mismatch. It now
+accepts exactly that shape when it matches full_attention_interval, with
+tests for the bad shapes.
+
+Campaign (bench/crossengine/agentic-2026-10-05-pi, 12 instances, medium,
+Q27_SEED=random, same afternoon, same binary):
+
+    leg      model  drafter          gold   turns  think K  out tok  wall s  agg t/s  tok/round
+    q27seed  base   DFlash2 Q8       11/12  21.8   32.8     12250    75      226.8    4.14
+    piseed   Pi     DFlash2 Q8       11/12  18.7   22.3      8593    53      242.2    4.36
+    piladr   Pi     own MTP, ladder  11/12  22.5   24.0      9756    73      187.9    3.56
+
+Pi does the same work with 30% fewer output tokens and 32% less thinking,
+and the base-trained DFlash2 drafter accepts more of its text (4.36 vs 4.14
+tok/round). DFlash2 still beats Pi's own MTP head single-slot. Scope: one
+sampled trial per instance per leg; gold is the touched-a-gold-file proxy.
+Not done: production stays on base (production was stopped on request);
+effort xhigh/low arms; a publishable pack (Apache permits it).
+
 ## 2026-10-04 (bc): Q27_DRAFT_VOCAB on Bonsai 8 GB -- reserved in the estimator, generated tokens join the subset, on in the --mtp installer
 
 **The estimator didn't know about the head.** The KV pool is sized before any
