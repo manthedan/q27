@@ -73,6 +73,13 @@ for pack in $PACKS; do
         python3 tools/test_bonsai2_serving.py build/q27-metal-server "$pack" "$TOK"
     run_gate "$tag native" "$EVID/$tag-native.log" \
         python3 tools/test_bonsai2_native.py build/q27-agent "$pack" "$TOK"
+    # Prefix snapshots need chunked prefill, which only T2 packs have; on T3
+    # the server ignores snapshot hints, so these gates do not apply.
+    case "$tag" in
+        *-t3*)
+            skip "$tag recovery + snapshot-reuse (T3: no chunked prefill, no prefix snapshots)"
+            continue ;;
+    esac
     run_gate "$tag recovery" "$EVID/$tag-recovery.log" \
         make test-metal-recovery MODEL="$pack" TOKENIZER="$TOK"
     run_gate "$tag snapshot-reuse" "$EVID/$tag-snapshot-reuse.log" \

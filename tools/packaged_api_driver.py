@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Hermetic HTTP contract gate for an installed Qwen3.8 q27 package."""
+"""Hermetic HTTP round-trip gate for an installed q27 package.
+
+The revival server accepts (maps or ignores) unsupported request fields like
+upstream; the strict-rejection contract of the unreleased metal-v0.7.0
+branch is not checked here."""
 
 import argparse
 import json
@@ -34,16 +38,6 @@ def request_json(base, path, payload, timeout=300):
 def get_json(base, path):
     with urllib.request.urlopen(base.rstrip("/") + path, timeout=30) as response:
         return response.status, json.loads(response.read())
-
-
-def error_message(body):
-    error = body.get("error", body) if isinstance(body, dict) else {}
-    return error.get("message", "") if isinstance(error, dict) else ""
-
-
-def require_rejected(label, status, body):
-    require(400 <= status < 500 and error_message(body),
-            f"{label} was not explicitly rejected: status={status} body={body}")
 
 
 def weather_tools():
@@ -157,119 +151,6 @@ def exercise_round_trips(base):
             f"packaged Anthropic tool call failed: {status} {anthropic}")
 
 
-def exercise_rejection_contracts(base):
-    chat = {
-        "model": "q27-metal",
-        "messages": [{"role": "user", "content": "Reply briefly."}],
-        "max_tokens": 16,
-    }
-    responses = {
-        "model": "q27-metal",
-        "input": "Reply briefly.",
-        "max_output_tokens": 16,
-    }
-    for effort in ("low", "medium", "xhigh", "unknown", 7):
-        for label, path, body in (
-                ("Chat", "/v1/chat/completions", chat),
-                ("Responses", "/v1/responses", responses)):
-            payload = dict(body)
-            payload["reasoning_effort"] = effort
-            status, result = request_json(base, path, payload)
-            require_rejected(f"{label} reasoning_effort={effort!r}", status, result)
-
-    payload = dict(responses)
-    payload["reasoning"] = {"effort": "medium"}
-    status, result = request_json(base, "/v1/responses", payload)
-    require_rejected("Responses reasoning object", status, result)
-
-    for label, path, body in (
-            ("Chat", "/v1/chat/completions", chat),
-            ("Responses", "/v1/responses", responses)):
-        payload = dict(body)
-        payload["preserve_thinking"] = True
-        status, result = request_json(base, path, payload)
-        require_rejected(f"{label} preserve_thinking", status, result)
-
-    ignored_thinking_controls = (
-        ("Chat enable_thinking", "/v1/chat/completions",
-         dict(chat, enable_thinking=False)),
-        ("Chat thinking_token_budget", "/v1/chat/completions",
-         dict(chat, thinking_token_budget=512)),
-        ("Chat nested thinking budget", "/v1/chat/completions",
-         dict(chat, chat_template_kwargs={"thinking_budget": 512})),
-        ("Anthropic thinking disabled", "/v1/messages", {
-            "model": "q27-metal", "max_tokens": 16,
-            "thinking": {"type": "disabled"},
-            "messages": [{"role": "user", "content": "Reply briefly."}],
-        }),
-    )
-    for label, path, payload in ignored_thinking_controls:
-        status, result = request_json(base, path, payload)
-        require_rejected(label, status, result)
-
-    historical = (
-        ("Chat reasoning_content history", "/v1/chat/completions", {
-            "model": "q27-metal", "max_tokens": 16,
-            "messages": [
-                {"role": "assistant", "content": "answer",
-                 "reasoning_content": "private chain"},
-                {"role": "user", "content": "continue"},
-            ],
-        }),
-        ("Responses reasoning history", "/v1/responses", {
-            "model": "q27-metal", "max_output_tokens": 16,
-            "input": [
-                {"type": "reasoning", "summary": []},
-                {"role": "user", "content": "continue"},
-            ],
-        }),
-    )
-    for label, path, payload in historical:
-        status, result = request_json(base, path, payload)
-        require_rejected(label, status, result)
-
-    unsupported = (("min_p", 0.1), ("presence_penalty", 1.0),
-                   ("frequency_penalty", 0.5), ("repetition_penalty", 1.1))
-    for key, value in unsupported:
-        for label, path, body in (
-                ("Chat", "/v1/chat/completions", chat),
-                ("Responses", "/v1/responses", responses)):
-            payload = dict(body)
-            payload[key] = value
-            status, result = request_json(base, path, payload)
-            require_rejected(f"{label} unsupported {key}", status, result)
-
-    media_cases = (
-        ("Chat image_url", "/v1/chat/completions", {
-            "model": "q27-metal", "max_tokens": 16,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "Describe this."},
-                {"type": "image_url", "image_url": {"url":
-                 "data:image/png;base64,iVBORw0KGgo="}},
-            ]}],
-        }),
-        ("Responses input_image", "/v1/responses", {
-            "model": "q27-metal", "max_output_tokens": 16,
-            "input": [{"role": "user", "content": [
-                {"type": "input_text", "text": "Describe this."},
-                {"type": "input_image", "image_url":
-                 "data:image/png;base64,iVBORw0KGgo="},
-            ]}],
-        }),
-        ("Anthropic image", "/v1/messages", {
-            "model": "q27-metal", "max_tokens": 16,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "Describe this."},
-                {"type": "image", "source": {"type": "base64",
-                 "media_type": "image/png", "data": "iVBORw0KGgo="}},
-            ]}],
-        }),
-    )
-    for label, path, payload in media_cases:
-        status, result = request_json(base, path, payload)
-        require_rejected(label, status, result)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("base_url")
@@ -286,7 +167,6 @@ def main():
                 health.get("model_family") == "qwen38" and
                 health.get("tool_dialect") == "xml",
                 f"packaged server identity mismatch: {health}")
-    exercise_rejection_contracts(args.base_url)
     exercise_round_trips(args.base_url)
     print(f"packaged API contracts: PASS ({args.expected_profile})")
 
