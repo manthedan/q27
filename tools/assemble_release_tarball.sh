@@ -8,6 +8,19 @@ cd "$(dirname "$0")/.."
 VERSION=${1:?usage: assemble_release_tarball.sh <version> <staging-dir>}
 STAGE=${2:?usage: assemble_release_tarball.sh <version> <staging-dir>}
 ROOT="$STAGE/q27-$VERSION-macos-arm64"
+# Must match the formula's `depends_on macos:` floor (ventura = 13.0).
+MIN_MACOS=${Q27_MIN_MACOS:-13.0}
+
+# A binary built without MACOSX_DEPLOYMENT_TARGET inherits the build
+# machine's OS as its floor and would refuse to launch on older Macs.
+check_minos() {
+    local got
+    got=$(otool -l "$1" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+    [ "$got" = "$MIN_MACOS" ] || {
+        echo "$1 targets macOS ${got:-?}, want $MIN_MACOS — rebuild with MACOSX_DEPLOYMENT_TARGET=$MIN_MACOS" >&2
+        exit 1
+    }
+}
 
 rm -rf "$ROOT"
 mkdir -p "$ROOT/bin" "$ROOT/share" "$ROOT/packaging/bin" "$ROOT/packaging/lib" \
@@ -16,23 +29,25 @@ mkdir -p "$ROOT/bin" "$ROOT/share" "$ROOT/packaging/bin" "$ROOT/packaging/lib" \
 # Prebuilt binaries (C++ + Rust TUI). All must be present — a partial
 # tarball is worse than none.
 for b in q27-metal q27-metal-server q27-agent q27-tui tokenize_to_bin \
-         metal_decode_bench metal_prefill_bench; do
+         metal_prefill_bench; do
     [ -x "build/$b" ] || { echo "missing build/$b" >&2; exit 1; }
     # No Homebrew/store rpaths allowed in a relocatable tarball.
     if otool -L "build/$b" | grep -qE "homebrew|/usr/local/opt"; then
         echo "build/$b links a Homebrew cellar path — rebuild clean" >&2
         exit 1
     fi
+    check_minos "build/$b"
     cp "build/$b" "$ROOT/bin/$b"
 done
 [ -x build/q27-lock-exec ] || {
-    echo "missing build/q27-lock-exec (the eighth required executable)" >&2
+    echo "missing build/q27-lock-exec (the seventh required executable)" >&2
     exit 1
 }
 if otool -L build/q27-lock-exec | grep -qE "homebrew|/usr/local/opt"; then
     echo "build/q27-lock-exec links a Homebrew cellar path — rebuild clean" >&2
     exit 1
 fi
+check_minos build/q27-lock-exec
 [ -x packaging/q27-release-launcher ] || {
     echo "missing packaging/q27-release-launcher" >&2
     exit 1
@@ -54,8 +69,9 @@ cp packaging/models.tsv "$ROOT/packaging/models.tsv"
 cp tools/repack.py tools/export_tokenizer.py "$ROOT/share/q27-tools/"
 
 # User-facing docs.
-cp README.md docs/GETTING-STARTED.md docs/MODELS.md docs/QA_BEFORE_RELEASES.md \
-   docs/SECURITY-MODEL.md "$ROOT/doc/"
+cp README.md docs/QA_BEFORE_RELEASES.md docs/SECURITY-MODEL.md \
+   docs/metal/BONSAI2.md experiments/ds4-agent/THIRD_PARTY_NOTICES.md "$ROOT/doc/"
+cp packaging/README.md "$ROOT/doc/PACKAGING.md"
 cp LICENSE "$ROOT/" 2>/dev/null || true
 
 tar -C "$STAGE" -czf "$STAGE/q27-$VERSION-macos-arm64.tar.gz" \

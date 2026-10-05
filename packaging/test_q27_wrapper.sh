@@ -27,6 +27,9 @@ mkdir -p "$TMP/home/b1" "$TMP/bin" "$TMP/work space"
 printf 'fixture-b1-artifact\n' >"$TMP/home/b1/bonsai-27b-b1.q27"
 printf 'Q27Tfixture-b1-tokenizer\n' >"$TMP/home/b1/model.tok"
 printf 'fixture-q38-artifact\n' >"$TMP/q38-good.q27"
+mkdir -p "$TMP/home/b2"
+printf 'fixture-b2-artifact\n' >"$TMP/home/b2/bonsai2-27b-t2-slim.q27"
+printf 'Q27Tfixture-b2-tokenizer\n' >"$TMP/home/b2/qwen38-27b-mtp.tok"
 md5_fixture() {
     if command -v md5 >/dev/null 2>&1; then md5 -q "$1"
     else md5sum "$1" | awk '{print $1}'
@@ -34,9 +37,18 @@ md5_fixture() {
 }
 b1_md5="$(md5_fixture "$TMP/home/b1/bonsai-27b-b1.q27")"
 q38_md5="$(md5_fixture "$TMP/q38-good.q27")"
-awk -F'\t' -v OFS='\t' -v b1="$b1_md5" -v q38="$q38_md5" '
+sha256_fixture() {
+    if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+    else sha256sum "$1" | awk '{print $1}'
+    fi
+}
+b2_sha="$(sha256_fixture "$TMP/home/b2/bonsai2-27b-t2-slim.q27")"
+b2_tok_sha="$(sha256_fixture "$TMP/home/b2/qwen38-27b-mtp.tok")"
+awk -F'\t' -v OFS='\t' -v b1="$b1_md5" -v q38="$q38_md5" \
+    -v b2="$b2_sha" -v b2tok="$b2_tok_sha" '
     $1 == "b1" { $5=b1 }
     $1 == "q38-q4s" { $5=q38 }
+    $1 == "b2" { $5=""; $14=b2; $17=b2tok }
     { print }
 ' "$ROOT/packaging/models.tsv" >"$TMP/models.tsv"
 export Q27_REGISTRY="$TMP/models.tsv"
@@ -415,6 +427,73 @@ if grep -Fxq -- '--no-think' "$TMP/q38-agent-args"; then
 fi
 wait_lock_clear || {
     echo "FAIL: q38 consumer flock remained held after child exit" >&2; exit 1; }
+
+# Bonsai 2 (bonsai2-qwen38-v1) is the default agent pack: 16K context,
+# thinking left on, trained sampling, and suffix-16 speculation unless the
+# operator picked a width, disabled it, or chose MTP.
+(
+    unset Q27_AGENT_CONTEXT
+    Q27_CAPTURE="$TMP/b2-agent-args" Q27_PROFILE_CAPTURE="$TMP/b2-agent-profile" \
+        PATH="$TMP/bin:/usr/bin:/bin" \
+        "$ROOT/packaging/bin/q27" agent >/dev/null 2>"$TMP/b2-agent.err" || { cat "$TMP/b2-agent.err" >&2; exit 1; }
+)
+grep -Fxq "$TMP/home/b2/bonsai2-27b-t2-slim.q27" "$TMP/b2-agent-args"
+grep -Fxq "$TMP/home/b2/qwen38-27b-mtp.tok" "$TMP/b2-agent-args"
+grep -Fxq 'bonsai2-qwen38-v1' "$TMP/b2-agent-profile"
+grep -A1 '^--context$' "$TMP/b2-agent-args" | grep -qx '16384'
+grep -A1 '^--temperature$' "$TMP/b2-agent-args" | grep -qx '1.0'
+grep -A1 '^--top-p$' "$TMP/b2-agent-args" | grep -qx '0.95'
+grep -A1 '^--top-k$' "$TMP/b2-agent-args" | grep -qx '20'
+grep -A1 '^--suffix$' "$TMP/b2-agent-args" | grep -qx '16'
+if grep -Fxq -- '--no-think' "$TMP/b2-agent-args"; then
+    echo "FAIL: bonsai2 profile disabled thinking" >&2; exit 1
+fi
+wait_lock_clear || {
+    echo "FAIL: b2 agent consumer flock remained held" >&2; exit 1; }
+b2_suffix_count() { grep -cx -- '--suffix' "$1" || true; }
+Q27_CAPTURE="$TMP/b2-agent-nosuffix" Q27_SUFFIX=0 PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" agent b2 >/dev/null 2>&1
+[ "$(b2_suffix_count "$TMP/b2-agent-nosuffix")" = 0 ] || {
+    echo "FAIL: Q27_SUFFIX=0 did not disable suffix bursts" >&2; exit 1; }
+Q27_CAPTURE="$TMP/b2-agent-mtp" Q27_AGENT_MTP=2 PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" agent b2 >/dev/null 2>&1
+[ "$(b2_suffix_count "$TMP/b2-agent-mtp")" = 0 ] || {
+    echo "FAIL: Q27_AGENT_MTP still added --suffix" >&2; exit 1; }
+grep -A1 '^--mtp$' "$TMP/b2-agent-mtp" | grep -qx '2'
+Q27_CAPTURE="$TMP/b2-agent-width" PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" agent b2 --suffix 4 >/dev/null 2>&1
+[ "$(b2_suffix_count "$TMP/b2-agent-width")" = 1 ] || {
+    echo "FAIL: explicit --suffix was doubled by the wrapper default" >&2; exit 1; }
+grep -A1 '^--suffix$' "$TMP/b2-agent-width" | grep -qx '4'
+wait_lock_clear || {
+    echo "FAIL: b2 agent consumer flock remained held" >&2; exit 1; }
+
+# serve: profile args first, then the caller's args forwarded verbatim.
+Q27_SERVER_CAPTURE="$TMP/b2-server-args" \
+    Q27_SERVER_PROFILE_CAPTURE="$TMP/b2-server-profile" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" serve b2 --ctx 8192 >/dev/null
+grep -Fxq 'bonsai2-qwen38-v1' "$TMP/b2-server-profile"
+grep -Fxq -- '--think' "$TMP/b2-server-args"
+grep -A1 '^--think-budget$' "$TMP/b2-server-args" | grep -qx '0'
+grep -A1 '^--temperature-default$' "$TMP/b2-server-args" | grep -qx '1.0'
+grep -A1 '^--top-p-default$' "$TMP/b2-server-args" | grep -qx '0.95'
+grep -A1 '^--top-k-default$' "$TMP/b2-server-args" | grep -qx '20'
+grep -A1 '^--suffix$' "$TMP/b2-server-args" | grep -qx '16'
+tail -2 "$TMP/b2-server-args" | tr '\n' ' ' | grep -qx -- '--ctx 8192 '
+wait_lock_clear || {
+    echo "FAIL: b2 serve consumer flock remained held" >&2; exit 1; }
+Q27_SERVER_CAPTURE="$TMP/b2-server-nothink" Q27_SERVE_THINK=0 \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$ROOT/packaging/bin/q27" serve b2 --suffix 8 >/dev/null
+if grep -Eqx -- '--think|--think-budget' "$TMP/b2-server-nothink"; then
+    echo "FAIL: Q27_SERVE_THINK=0 did not override the bonsai2 profile" >&2; exit 1
+fi
+[ "$(b2_suffix_count "$TMP/b2-server-nothink")" = 1 ] || {
+    echo "FAIL: serve doubled an explicit --suffix" >&2; exit 1; }
+grep -A1 '^--suffix$' "$TMP/b2-server-nothink" | grep -qx '8'
+wait_lock_clear || {
+    echo "FAIL: b2 serve consumer flock remained held" >&2; exit 1; }
 
 # metal-v0.7.0 validates only Bonsai 2: the inherited Qwen rows stay listed
 # (they fit 24 GB) but are flagged experimental/not re-validated, so a 24 GB

@@ -27,7 +27,7 @@ class Q27 < Formula
   def install
     # Prebuilt binaries (built with MACOSX_DEPLOYMENT_TARGET=13.0).
     %w[q27-metal q27-metal-server q27-agent q27-tui
-       metal_decode_bench metal_prefill_bench].each do |b|
+       metal_prefill_bench].each do |b|
       bin.install "bin/#{b}"
     end
     bin.install "bin/tokenize_to_bin" => "q27-tokenize"
@@ -64,21 +64,19 @@ class Q27 < Formula
 
   def caveats
     <<~EOS
-      q27 needs a model artifact (.q27) and tokenizer (.tok), which are not
-      distributed with this formula. Repack instructions and supported
-      checkpoints: https://github.com/manthedan/q27#weights
+      q27 needs a model pack (.q27) and tokenizer (.tok), which are not
+      distributed with this formula. Fetch the default Bonsai 2 pack
+      (6.7 GB, SHA-256 verified) and start the agent or server:
 
-        q27-metal MODEL.q27 TOKENIZER.tok --prompt "..." -n 64
-        q27-metal-server MODEL.q27 TOKENIZER.tok --port 8080
+        q27 pull b2
+        q27 agent            # Ratatui TUI on a terminal; Q27_AGENT_UI=classic
+        q27 serve            # OpenAI/Anthropic-compatible API on :8080
 
-      Chunked prefill and speculative decoding need an Apple7+ GPU family
-      device (M1 or newer). 16 GB unified memory is a practical minimum for
-      the 27B ternary artifact.
+      `q27 recommend` lists every pack and what fits this Mac. Bonsai 2 packs
+      run on 16 GB Apple silicon (M1 or newer). Other packs in the registry
+      are marked experimental and were not re-validated in this release.
 
-      The agent defaults to the Ratatui TUI on a terminal (Q27_AGENT_UI=auto);
-      Q27_AGENT_UI=classic keeps the linenoise UI:
-
-        q27 agent MODEL.q27 MODEL.tok --session work.q27agent
+      Bonsai 2 weights: Created using Bonsai by Prism ML (Apache 2.0).
 
       Binaries find the Metal shader relative to the brewed Cellar path; a
       custom source tree can be forced with
