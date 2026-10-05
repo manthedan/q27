@@ -23,6 +23,21 @@
 namespace q27 {
 namespace {
 
+// Every GPU dispatch goes through these two so tools/perf_ceilings.sh can
+// gate on an exact count. Process-wide: dispatches are encoded both from
+// Impl helpers and MetalBackend methods, and a process runs one backend.
+std::atomic<uint64_t> g_dispatches{0};
+
+inline void q27_dispatch_groups(id<MTLComputeCommandEncoder> enc, MTLSize groups, MTLSize threads) {
+    g_dispatches.fetch_add(1, std::memory_order_relaxed);
+    [enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
+inline void q27_dispatch_threads(id<MTLComputeCommandEncoder> enc, MTLSize grid, MTLSize threads) {
+    g_dispatches.fetch_add(1, std::memory_order_relaxed);
+    [enc dispatchThreads:grid threadsPerThreadgroup:threads];
+}
+
 class MetalBuffer final : public BackendBuffer {
   public:
     explicit MetalBuffer(id<MTLBuffer> buffer, bool writable = true)
@@ -459,8 +474,7 @@ struct MetalBackend::Impl {
             [enc setBuffer:vc.handle() offset:0 atIndex:2];
             [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
             [enc setBytes:&args length:sizeof(args) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks, 1)
-                threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake(kv_heads, n_blocks, 1), MTLSizeMake((NSUInteger)gqa * 32, 1, 1));
             // The merge consumes device writes from the producer dispatch.
             // Dispatches inside one compute encoder are not ordered by tracked
             // resource hazards, so make that dependency explicit.
@@ -470,8 +484,7 @@ struct MetalBackend::Impl {
             [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
             [enc setBuffer:output.handle() offset:0 atIndex:1];
             [enc setBytes:&args length:sizeof(args) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(q_heads, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake(q_heads, 1, 1), MTLSizeMake(32, 1, 1));
             if (own) finish_command("GQA attention");
         }
     }
@@ -511,8 +524,7 @@ struct MetalBackend::Impl {
             [enc setBuffer:vc.handle() offset:0 atIndex:2];
             [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
             [enc setBytes:&args length:sizeof(args) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, tiled ? (tokens + 1) / 2 : tokens)
-                threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake(kv_heads, n_blocks_max, tiled ? (tokens + 1) / 2 : tokens), MTLSizeMake((NSUInteger)gqa * 32, 1, 1));
             // The row merge consumes the producer's device writes in this
             // encoder; explicitly order the two dispatches.
             id<MTLResource> partial_resources[] = { gqa_partials.handle() };
@@ -521,8 +533,7 @@ struct MetalBackend::Impl {
             [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
             [enc setBuffer:output.handle() offset:(NSUInteger)out_byte_offset atIndex:1];
             [enc setBytes:&args length:sizeof(args) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake(q_heads, tokens, 1), MTLSizeMake(32, 1, 1));
             if (own) finish_command("GQA chunked attention");
         }
     }
@@ -538,9 +549,9 @@ struct MetalBackend::Impl {
     std::vector<const char*> op_labels;
     std::map<std::string, ProfileStat> profile_stats;
     uint64_t profiled_command_buffers = 0;
-    // Always-on, deterministic work counts (tools/perf_ceilings.sh ratchets).
+    // Always-on, deterministic (tools/perf_ceilings.sh ratchets); GPU
+    // dispatches are counted in q27_dispatch_groups/threads.
     uint64_t command_buffers_started = 0;
-    uint64_t operations_encoded = 0;
     double gpu_busy_seconds = 0.0;
     double cpu_wait_seconds = 0.0;
     MTLTimestamp calibration_cpu = 0, calibration_gpu = 0;
@@ -575,7 +586,6 @@ struct MetalBackend::Impl {
     id<MTLComputeCommandEncoder> encoder_for_operation(bool& own_command, const char* label) {
         own_command = !batching;
         if (own_command) start_command(false);
-        operations_encoded++;
         if (profile) {
             if (op_labels.size() >= kMaxProfiledOps) {
                 abort_command();
@@ -982,7 +992,7 @@ void MetalBackend::copy(const BackendBuffer& src, uint64_t src_offset,
         [enc setBuffer:sb.handle() offset:(NSUInteger)src_offset atIndex:0];
         [enc setBuffer:db.handle() offset:(NSUInteger)dst_offset atIndex:1];
         [enc setBytes:&bytes length:sizeof(bytes) atIndex:2];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)bytes,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake((NSUInteger)bytes,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("copy");
     }
 }
@@ -1240,8 +1250,7 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
                              weight.dtype == DType::B1_G128;
         const NSUInteger row_groups = ternary
             ? (NSUInteger)(weight.rows + 31) / 32 : (NSUInteger)(weight.rows + 7) / 8;
-        [encoder dispatchThreadgroups:MTLSizeMake(row_groups, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_groups(encoder, MTLSizeMake(row_groups, 1, 1), MTLSizeMake(256, 1, 1));
         if (own_command) impl_->finish_command("matvec");
     }
 }
@@ -1272,7 +1281,7 @@ void MetalBackend::matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
         [enc setBuffer:ad.handle() offset:(NSUInteger)a.data_offset atIndex:0]; [enc setBuffer:ao.handle() offset:0 atIndex:1];
         [enc setBuffer:bd.handle() offset:(NSUInteger)b.data_offset atIndex:2]; [enc setBuffer:bo.handle() offset:0 atIndex:3];
         [enc setBuffer:input.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)std::max(a.rows,b.rows),1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)std::max(a.rows,b.rows),1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("fused matvec pair");
     }
 }
@@ -1294,7 +1303,7 @@ void MetalBackend::quantize(const BackendBuffer& x, BackendQuantized& out) {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_quantize_x"); [enc setComputePipelineState:impl_->quantize];
         [enc setBuffer:xb.handle() offset:0 atIndex:0]; [enc setBuffer:values.handle() offset:0 atIndex:1];
         [enc setBuffer:scales.handle() offset:0 atIndex:2]; [enc setBytes:&out.count length:4 atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(out.count/32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(out.count/32,1,1), MTLSizeMake(32,1,1));
         if(own) impl_->finish_command("activation quantize");
     }
 }
@@ -1337,7 +1346,7 @@ void MetalBackend::matvec_quantized(const BackendTensor& weight,
         // other dtypes keep 1 row/simdgroup.
         const NSUInteger rpg = (weight.dtype==DType::Q4_G64 ||
                                 weight.dtype==DType::B1_G128) ? 32 : 8;
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+rpg-1)/rpg,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(weight.rows+rpg-1)/rpg,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("quantized matvec");
     }
 }
@@ -1373,7 +1382,7 @@ void MetalBackend::matvec_x2(const BackendTensor& weight,
         [enc setBuffer:xa.handle() offset:0 atIndex:2]; [enc setBuffer:xb.handle() offset:0 atIndex:3];
         [enc setBuffer:ya.handle() offset:0 atIndex:4]; [enc setBuffer:yb.handle() offset:0 atIndex:5];
         [enc setBytes:&args length:sizeof(args) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(weight.rows+31)/32,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("x2 matvec");
     }
 }
@@ -1408,7 +1417,7 @@ void MetalBackend::matvec_quantized_x2(const BackendTensor& weight,
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3];
         [enc setBuffer:out.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(weight.rows+7)/8,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("x2 quantized matvec");
     }
 }
@@ -1477,7 +1486,7 @@ void MetalBackend::matmul_quantized(const BackendTensor& weight,const BackendQua
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0]; [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2]; [enc setBuffer:xs.handle() offset:0 atIndex:3]; [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows+31)/32,(NSUInteger)(x_rows+15)/16,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(weight.rows+31)/32,(NSUInteger)(x_rows+15)/16,1), MTLSizeMake(128,1,1));
         if(own) impl_->finish_command("quantized simdgroup matmul");
     }
 }
@@ -1513,9 +1522,8 @@ void MetalBackend::matmul_t2_float(const BackendTensor& weight, const BackendBuf
         [enc setBuffer:xv.handle() offset:0 atIndex:2];
         [enc setBuffer:out.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(weight.rows + 31) / 32,
-                                              (NSUInteger)(x_rows + 15) / 16, 1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(weight.rows + 31) / 32,
+                                              (NSUInteger)(x_rows + 15) / 16, 1), MTLSizeMake(128, 1, 1));
         if (own) impl_->finish_command("float T2 simdgroup matmul");
     }
 }
@@ -1579,9 +1587,8 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
             [enc setBuffer:xs.handle() offset:0 atIndex:3];
             [enc setBuffer:out.handle() offset:0 atIndex:4];
             [enc setBytes:&args length:sizeof(args) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32,
-                                                  (NSUInteger)(x_rows + 15) / 16, 1)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(rows + 31) / 32,
+                                                  (NSUInteger)(x_rows + 15) / 16, 1), MTLSizeMake(128, 1, 1));
             if (own) impl_->finish_command(arm == 'k' ? "mma roofline k" : "mma roofline f");
         }
         return;
@@ -1618,8 +1625,7 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
             [enc setBuffer:impl_->dr_xt_scratch offset:0 atIndex:1];
             [enc setBytes:&args length:sizeof(args) atIndex:2];
             const uint64_t pre_threads = (uint64_t)cols * tokens_pad;
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((pre_threads + 255) / 256), 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)((pre_threads + 255) / 256), 1, 1), MTLSizeMake(256, 1, 1));
             // The GEMM reads the xT the pre-pass wrote, ordered by default
             // per-resource hazard tracking rather than the encoder.
             [enc setComputePipelineState:arm == '2' ? impl_->mm_dr2_p : impl_->mm_dr_p];
@@ -1629,10 +1635,9 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
             [enc setBuffer:xs.handle() offset:0 atIndex:3];
             [enc setBuffer:out.handle() offset:0 atIndex:4];
             [enc setBytes:&args length:sizeof(args) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 63) / 64,
+            q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(rows + 63) / 64,
                                                   (NSUInteger)(x_rows + (arm == '2' ? 15 : 31)) /
-                                                      (arm == '2' ? 16 : 32), 1)
-                threadsPerThreadgroup:MTLSizeMake(arm == '2' ? 128 : 256, 1, 1)];
+                                                      (arm == '2' ? 16 : 32), 1), MTLSizeMake(arm == '2' ? 128 : 256, 1, 1));
             if (own) impl_->finish_command("mm direct-rhs probe");
         }
         return;
@@ -1649,8 +1654,7 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
             [enc setBuffer:wb.handle() offset:0 atIndex:0];
             [enc setBuffer:out.handle() offset:0 atIndex:1];
             [enc setBytes:&args length:sizeof(args) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1), MTLSizeMake(128, 1, 1));
             if (own) impl_->finish_command("mma roofline a");
             return;
         }
@@ -1683,8 +1687,7 @@ void MetalBackend::mma_roofline(char arm, uint32_t rows, uint32_t cols, uint32_t
         [enc setBuffer:xs.handle() offset:0 atIndex:3];
         [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(x_rows + 15) / 16, 1), MTLSizeMake(128, 1, 1));
         if (own) impl_->finish_command("mma roofline b");
     }
 }
@@ -1723,8 +1726,7 @@ void MetalBackend::matvec_b1_probe(int candidate, uint32_t rows, uint32_t cols,
             [enc setBuffer:sb.handle() offset:0 atIndex:1];
             [enc setBuffer:sb.handle() offset:(NSUInteger)planes_bytes atIndex:2];
             [enc setBytes:&args length:sizeof(args) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(nb, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake(nb, 1, 1), MTLSizeMake(128, 1, 1));
             // The dot reads what the preprocess wrote, ordered by default
             // per-resource hazard tracking rather than the encoder.
             [enc setComputePipelineState:impl_->b1_popcount_p];
@@ -1734,8 +1736,7 @@ void MetalBackend::matvec_b1_probe(int candidate, uint32_t rows, uint32_t cols,
             [enc setBuffer:sb.handle() offset:(NSUInteger)planes_bytes atIndex:3];
             [enc setBuffer:out.handle() offset:0 atIndex:4];
             [enc setBytes:&args length:sizeof(args) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 7) / 8, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(rows + 7) / 8, 1, 1), MTLSizeMake(256, 1, 1));
             if (own) impl_->finish_command("b1 popcount probe");
             return;
         }
@@ -1748,8 +1749,7 @@ void MetalBackend::matvec_b1_probe(int candidate, uint32_t rows, uint32_t cols,
         [enc setBuffer:xb.handle() offset:0 atIndex:2];
         [enc setBuffer:out.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(rows + 31) / 32, 1, 1), MTLSizeMake(256, 1, 1));
         if (own) impl_->finish_command(sel ? "b1 select probe" : "b1 signxor probe");
     }
 }
@@ -1831,9 +1831,8 @@ void MetalBackend::matvec_q4_probe(int candidate, const BackendTensor& weight,
         [enc setBuffer:xs.handle() offset:0 atIndex:3];
         [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(
-                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(
+                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1), MTLSizeMake(256, 1, 1));
         if (own) impl_->finish_command("q4 probe");
     }
 }
@@ -1900,9 +1899,8 @@ void MetalBackend::matvec_b1r2_probe(int candidate, const BackendTensor& weight,
         [enc setBuffer:xs.handle() offset:0 atIndex:3];
         [enc setBuffer:out.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(
-                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(
+                (NSUInteger)(weight.rows + rows_per_group - 1) / rows_per_group, 1, 1), MTLSizeMake(256, 1, 1));
         if (own) impl_->finish_command("b1 r2 probe");
     }
 }
@@ -1935,7 +1933,7 @@ void MetalBackend::embedding_q8(const BackendTensor& weight, uint32_t token,
         [enc setBytes:&token length:sizeof(token) atIndex:3];
         uint32_t cols = (uint32_t)weight.cols;
         [enc setBytes:&cols length:sizeof(cols) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(cols, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_threads(enc, MTLSizeMake(cols, 1, 1), MTLSizeMake(256, 1, 1));
         if (own) impl_->finish_command("embedding");
     }
 }
@@ -1973,7 +1971,7 @@ void MetalBackend::embedding_from_device(const BackendTensor& weight, const Back
         [enc setBuffer:tokb.handle() offset:0 atIndex:3];
         uint32_t cols = (uint32_t)weight.cols;
         [enc setBytes:&cols length:sizeof(cols) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(cols, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_threads(enc, MTLSizeMake(cols, 1, 1), MTLSizeMake(256, 1, 1));
         if (own) impl_->finish_command("embedding (device token)");
     }
 }
@@ -1999,8 +1997,7 @@ void MetalBackend::bonsai_hadamard(const BackendBuffer& x, const BackendBuffer& 
         [enc setBuffer:sb.handle() offset:0 atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof(args) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(n / 1024,rows,1)
-             threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(n / 1024,rows,1), MTLSizeMake(256,1,1));
         if (own) impl_->finish_command("Bonsai Hadamard");
     }
 }
@@ -2020,7 +2017,7 @@ void MetalBackend::rmsnorm(const BackendBuffer& x, const BackendTensor& weight,
         [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof(args) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(1,1,1), MTLSizeMake(kReduceThreads,1,1));
         if (own) impl_->finish_command("rmsnorm");
     }
 }
@@ -2041,7 +2038,7 @@ void MetalBackend::rmsnorm_quantized(const BackendBuffer& x,const BackendTensor&
         [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2]; [enc setBuffer:values.handle() offset:0 atIndex:3];
         [enc setBuffer:scales.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(1,1,1), MTLSizeMake(kReduceThreads,1,1));
         if(own) impl_->finish_command("fused rmsnorm quantize");
     }
 }
@@ -2060,7 +2057,7 @@ void MetalBackend::rmsnorm_heads(BackendBuffer& x, const BackendTensor& weight,
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(heads,1,1), MTLSizeMake(kReduceThreads,1,1));
         if (own) impl_->finish_command("head rmsnorm");
     }
 }
@@ -2075,7 +2072,7 @@ void MetalBackend::l2norm_heads(BackendBuffer& x, uint32_t heads, uint32_t head_
         [enc setComputePipelineState:impl_->l2_heads];
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBytes:&args length:sizeof(args) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(heads,1,1), MTLSizeMake(kReduceThreads,1,1));
         if (own) impl_->finish_command("l2norm");
     }
 }
@@ -2090,7 +2087,7 @@ void MetalBackend::silu_mul(const BackendBuffer& gate, const BackendBuffer& up,
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_silu_mul"); [enc setComputePipelineState:impl_->silu];
         [enc setBuffer:g.handle() offset:0 atIndex:0]; [enc setBuffer:u.handle() offset:0 atIndex:1];
         [enc setBuffer:o.handle() offset:0 atIndex:2]; [enc setBytes:&n length:4 atIndex:3];
-        [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(n,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("silu multiply");
     }
 }
@@ -2102,7 +2099,7 @@ void MetalBackend::add_inplace(BackendBuffer& x, const BackendBuffer& y, uint32_
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_add_inplace"); [enc setComputePipelineState:impl_->add];
         [enc setBuffer:a.handle() offset:0 atIndex:0]; [enc setBuffer:b.handle() offset:0 atIndex:1];
         [enc setBytes:&n length:4 atIndex:2];
-        [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(n,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("residual add");
     }
 }
@@ -2119,7 +2116,7 @@ void MetalBackend::concat(const BackendBuffer& a, uint32_t a_count,
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_concat"); [enc setComputePipelineState:impl_->concat];
         [enc setBuffer:ab.handle() offset:0 atIndex:0]; [enc setBuffer:bb.handle() offset:0 atIndex:1]; [enc setBuffer:ob.handle() offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof(args) atIndex:3];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)total,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake((NSUInteger)total,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("concat");
     }
 }
@@ -2133,7 +2130,7 @@ void MetalBackend::sigmoid_gate_mul(BackendBuffer& out, const BackendBuffer& qg,
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_sigmoid_gate_mul"); [enc setComputePipelineState:impl_->sigmoid_gate];
         [enc setBuffer:o.handle() offset:0 atIndex:0]; [enc setBuffer:gates.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
-        [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(n,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("sigmoid gate");
     }
 }
@@ -2147,7 +2144,7 @@ void MetalBackend::rope_neox(BackendBuffer& x, uint32_t heads, uint32_t head_dim
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_rope_neox"); [enc setComputePipelineState:impl_->rope];
         [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBytes:&args length:sizeof(args) atIndex:1];
-        [enc dispatchThreads:MTLSizeMake(n_rot/2,heads,1) threadsPerThreadgroup:MTLSizeMake(n_rot/2,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(n_rot/2,heads,1), MTLSizeMake(n_rot/2,1,1));
         if(own) impl_->finish_command("rope");
     }
 }
@@ -2159,7 +2156,7 @@ void MetalBackend::argmax(const BackendBuffer& x, uint32_t n, BackendBuffer& out
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_argmax"); [enc setComputePipelineState:impl_->argmax];
         [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&n length:4 atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(1,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("argmax");
     }
 }
@@ -2185,7 +2182,7 @@ void MetalBackend::topk(const BackendBuffer& x, uint32_t n, uint32_t k,
         [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:ib.handle() offset:0 atIndex:2]; [enc setBuffer:cb.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(1,1,1), MTLSizeMake(1024,1,1));
         if(own) impl_->finish_command("top-k");
     }
 }
@@ -2204,8 +2201,7 @@ void MetalBackend::mask_logits(BackendBuffer& logits, const BackendBuffer& masks
         [enc setBuffer:lb.handle() offset:0 atIndex:0];
         [enc setBuffer:mb.handle() offset:(NSUInteger)mask_offset atIndex:1];
         [enc setBytes:&n length:sizeof(n) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake((n + 255) / 256, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake((n + 255) / 256, 1, 1), MTLSizeMake(256, 1, 1));
         if (own) impl_->finish_command("mask logits");
     }
 }
@@ -2264,7 +2260,7 @@ void MetalBackend::kv_store_f16(const BackendBuffer& k, const BackendBuffer& v,
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(row_length,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(row_length,1,1), MTLSizeMake(256,1,1));
         if(own) impl_->finish_command("KV store");
     }
 }
@@ -2278,7 +2274,7 @@ void MetalBackend::turbo_wht(BackendBuffer& x, uint32_t heads, uint32_t stride,
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_turbo_wht"); [enc setComputePipelineState:impl_->turbo_wht];
         [enc setBuffer:xb.handle() offset:0 atIndex:0]; [enc setBytes:&args length:sizeof(args) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)heads*2,1,1) threadsPerThreadgroup:MTLSizeMake(kTurboThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)heads*2,1,1), MTLSizeMake(kTurboThreads,1,1));
         if(own) impl_->finish_command("turbo3 WHT");
     }
 }
@@ -2302,7 +2298,7 @@ void MetalBackend::kv_store_turbo3(const BackendBuffer& k, const BackendBuffer& 
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,1) threadsPerThreadgroup:MTLSizeMake(kTurboThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)kv_heads*2,2,1), MTLSizeMake(kTurboThreads,1,1));
         if(own) impl_->finish_command("turbo3 KV store");
     }
 }
@@ -2335,7 +2331,7 @@ void MetalBackend::attention_turbo3(const BackendBuffer& q, uint32_t q_stride,
         [enc setComputePipelineState:q8 ? impl_->attention_q8 : impl_->attention_turbo3];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(q_heads,1,1), MTLSizeMake(kReduceThreads,1,1));
         if(own) impl_->finish_command("turbo3 attention");
     }
 }
@@ -2378,16 +2374,14 @@ void MetalBackend::attention_turbo3_gqa_headmajor(const BackendBuffer& q, uint32
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks, 1)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(kv_heads, n_blocks, 1), MTLSizeMake((NSUInteger)gqa * 32, 1, 1));
         id<MTLResource> partial_resources[] = { gqa_partials.handle() };
         [enc memoryBarrierWithResources:partial_resources count:1];
         [enc setComputePipelineState:impl_->attention_gqa_merge_p];
         [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
         [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&margs length:sizeof(margs) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(q_heads, 1, 1), MTLSizeMake(32, 1, 1));
         if (own) impl_->finish_command("hm probe attention");
     }
 }
@@ -2436,16 +2430,14 @@ void MetalBackend::attention_turbo3_causal_gqa_bf(const BackendBuffer& q, uint32
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, (tokens + 1) / 2)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(kv_heads, n_blocks_max, (tokens + 1) / 2), MTLSizeMake((NSUInteger)gqa * 32, 1, 1));
         id<MTLResource> partial_resources[] = { gqa_partials.handle() };
         [enc memoryBarrierWithResources:partial_resources count:1];
         [enc setComputePipelineState:impl_->attention_gqa_merge_rows_p];
         [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
         [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(q_heads, tokens, 1), MTLSizeMake(32, 1, 1));
         if (own) impl_->finish_command("bf probe attention");
     }
 }
@@ -2491,16 +2483,14 @@ void MetalBackend::attention_turbo3_causal_gqa_tiled(const BackendBuffer& q, uin
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks_max, (tokens + tile - 1) / tile)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(kv_heads, n_blocks_max, (tokens + tile - 1) / tile), MTLSizeMake((NSUInteger)gqa * 32, 1, 1));
         id<MTLResource> partial_resources[] = { gqa_partials.handle() };
         [enc memoryBarrierWithResources:partial_resources count:1];
         [enc setComputePipelineState:impl_->attention_gqa_merge_rows_p];
         [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
         [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads, tokens, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(q_heads, tokens, 1), MTLSizeMake(32, 1, 1));
         if (own) impl_->finish_command("tiled probe attention");
     }
 }
@@ -2531,7 +2521,7 @@ void MetalBackend::attention_f16(const BackendBuffer& q, uint32_t q_stride,
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_attention_f16"); [enc setComputePipelineState:impl_->attention];
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(q_heads,1,1), MTLSizeMake(kReduceThreads,1,1));
         if(own) impl_->finish_command("FP16 attention");
     }
 }
@@ -2550,7 +2540,7 @@ void MetalBackend::gdn_gates(const BackendBuffer& alpha, const BackendBuffer& be
         [enc setBuffer:ar.handle() offset:0 atIndex:0]; [enc setBuffer:br.handle() offset:0 atIndex:1];
         [enc setBuffer:a.handle() offset:(NSUInteger)ssm_a.data_offset atIndex:2]; [enc setBuffer:dt.handle() offset:(NSUInteger)ssm_dt.data_offset atIndex:3];
         [enc setBuffer:go.handle() offset:0 atIndex:4]; [enc setBuffer:bo.handle() offset:0 atIndex:5]; [enc setBytes:&heads length:4 atIndex:6];
-        [enc dispatchThreads:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; if(own) impl_->finish_command("GDN gates");
+        q27_dispatch_threads(enc, MTLSizeMake(heads,1,1), MTLSizeMake(64,1,1)); if(own) impl_->finish_command("GDN gates");
     }
 }
 
@@ -2565,7 +2555,7 @@ void MetalBackend::conv_step(const BackendBuffer& ring_src, BackendBuffer& ring_
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_conv_step"); [enc setComputePipelineState:impl_->conv];
         [enc setBuffer:src.handle() offset:0 atIndex:0]; [enc setBuffer:dst.handle() offset:0 atIndex:1]; [enc setBuffer:q.handle() offset:0 atIndex:2];
         [enc setBuffer:w.handle() offset:(NSUInteger)conv_weight.data_offset atIndex:3]; [enc setBuffer:o.handle() offset:0 atIndex:4]; [enc setBytes:&channels length:4 atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(channels,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; if(own) impl_->finish_command("GDN convolution");
+        q27_dispatch_threads(enc, MTLSizeMake(channels,1,1), MTLSizeMake(256,1,1)); if(own) impl_->finish_command("GDN convolution");
     }
 }
 
@@ -2585,7 +2575,7 @@ void MetalBackend::delta_step(const BackendBuffer& state_src, BackendBuffer& sta
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_delta_step"); [enc setComputePipelineState:impl_->delta];
         [enc setBuffer:src.handle() offset:0 atIndex:0]; [enc setBuffer:dst.handle() offset:0 atIndex:1]; [enc setBuffer:cv.handle() offset:0 atIndex:2];
         [enc setBuffer:gb.handle() offset:0 atIndex:3]; [enc setBuffer:bb.handle() offset:0 atIndex:4]; [enc setBuffer:o.handle() offset:0 atIndex:5]; [enc setBytes:&args length:sizeof(args) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(512,1,1)]; if(own) impl_->finish_command("DeltaNet recurrence");
+        q27_dispatch_groups(enc, MTLSizeMake(value_heads,1,1), MTLSizeMake(512,1,1)); if(own) impl_->finish_command("DeltaNet recurrence");
     }
 }
 
@@ -2599,7 +2589,7 @@ void MetalBackend::gated_norm_gdn(const BackendBuffer& x, const BackendTensor& w
     @autoreleasepool {
         bool own; auto enc=impl_->encoder_for_operation(own, "q27_gated_norm_gdn"); [enc setComputePipelineState:impl_->gated_norm];
         [enc setBuffer:xb.handle() offset:0 atIndex:0]; [enc setBuffer:w.handle() offset:(NSUInteger)weight.data_offset atIndex:1]; [enc setBuffer:gb.handle() offset:0 atIndex:2]; [enc setBuffer:o.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)]; if(own) impl_->finish_command("GDN gated norm");
+        q27_dispatch_groups(enc, MTLSizeMake(heads,1,1), MTLSizeMake(kReduceThreads,1,1)); if(own) impl_->finish_command("GDN gated norm");
     }
 }
 
@@ -2634,7 +2624,7 @@ void MetalBackend::embedding_q8_rows(const BackendTensor& weight, const uint32_t
         [enc setBuffer:scales.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:output.handle() offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof(args) atIndex:3];
-        [enc dispatchThreads:MTLSizeMake(weight.cols, count, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_threads(enc, MTLSizeMake(weight.cols, count, 1), MTLSizeMake(256, 1, 1));
         if (own) impl_->finish_command("chunked embedding");
     }
 }
@@ -2663,7 +2653,7 @@ void MetalBackend::rmsnorm_rows_quantized(const BackendBuffer& x, const BackendT
         [enc setBuffer:values.handle() offset:0 atIndex:3];
         [enc setBuffer:scales.handle() offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(rows,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(rows,1,1), MTLSizeMake(kReduceThreads,1,1));
         if (own) impl_->finish_command("chunked rmsnorm quantize");
     }
 }
@@ -2696,8 +2686,7 @@ void MetalBackend::matvec_f16_pair_rows(const BackendTensor& a, BackendBuffer& a
         [enc setBuffer:ad.handle() offset:(NSUInteger)a.data_offset atIndex:0]; [enc setBuffer:ao.handle() offset:0 atIndex:1];
         [enc setBuffer:bd.handle() offset:(NSUInteger)b.data_offset atIndex:2]; [enc setBuffer:bo.handle() offset:0 atIndex:3];
         [enc setBuffer:input.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)std::max(a.rows,b.rows), rows, 1)
-                threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)std::max(a.rows,b.rows), rows, 1), MTLSizeMake(256,1,1));
         if (own) impl_->finish_command("chunked F16 matvec pair");
     }
 }
@@ -2725,7 +2714,7 @@ void MetalBackend::gdn_gates_rows(const BackendBuffer& alpha, const BackendBuffe
         [enc setBuffer:dt.handle() offset:(NSUInteger)ssm_dt.data_offset atIndex:3];
         [enc setBuffer:go.handle() offset:0 atIndex:4]; [enc setBuffer:bo.handle() offset:0 atIndex:5];
         [enc setBytes:&args length:sizeof(args) atIndex:6];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)heads * tokens, 1, 1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake((NSUInteger)heads * tokens, 1, 1), MTLSizeMake(64,1,1));
         if (own) impl_->finish_command("chunked GDN gates");
     }
 }
@@ -2752,7 +2741,7 @@ void MetalBackend::conv_chunk(const BackendBuffer& ring_src, BackendBuffer& ring
         [enc setBuffer:q.handle() offset:0 atIndex:2];
         [enc setBuffer:w.handle() offset:(NSUInteger)conv_weight.data_offset atIndex:3];
         [enc setBuffer:o.handle() offset:0 atIndex:4]; [enc setBytes:&args length:sizeof(args) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(channels,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(channels,1,1), MTLSizeMake(256,1,1));
         if (own) impl_->finish_command("chunked GDN convolution");
     }
 }
@@ -2784,7 +2773,7 @@ void MetalBackend::delta_chunk(const BackendBuffer& state_src, BackendBuffer& st
         [enc setBuffer:cv.handle() offset:0 atIndex:2];
         [enc setBuffer:gb.handle() offset:0 atIndex:3]; [enc setBuffer:bb.handle() offset:0 atIndex:4];
         [enc setBuffer:o.handle() offset:0 atIndex:5]; [enc setBytes:&args length:sizeof(args) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(512,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(value_heads,1,1), MTLSizeMake(512,1,1));
         if (own) impl_->finish_command("chunked DeltaNet recurrence");
     }
 }
@@ -2802,7 +2791,7 @@ void MetalBackend::l2norm_rows(BackendBuffer& x, uint32_t heads, uint32_t head_d
         [enc setComputePipelineState:impl_->l2_rows];
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBytes:&args length:sizeof(args) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake(heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(heads,tokens,1), MTLSizeMake(kReduceThreads,1,1));
         if (own) impl_->finish_command("chunked l2norm");
     }
 }
@@ -2821,7 +2810,7 @@ void MetalBackend::rope_neox_rows(BackendBuffer& x, uint32_t heads, uint32_t hea
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_rope_neox_rows");
         [enc setComputePipelineState:impl_->rope_rows];
         [enc setBuffer:input.handle() offset:0 atIndex:0]; [enc setBytes:&args length:sizeof(args) atIndex:1];
-        [enc dispatchThreads:MTLSizeMake(n_rot/2,heads,tokens) threadsPerThreadgroup:MTLSizeMake(n_rot/2,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(n_rot/2,heads,tokens), MTLSizeMake(n_rot/2,1,1));
         if (own) impl_->finish_command("chunked rope");
     }
 }
@@ -2886,7 +2875,7 @@ void MetalBackend::kv_store_f16_rows(const BackendBuffer& k, const BackendBuffer
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(row_length,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(row_length,tokens,1), MTLSizeMake(256,1,1));
         if (own) impl_->finish_command("chunked KV store");
     }
 }
@@ -2923,7 +2912,7 @@ void MetalBackend::kv_store_f16_head_rows_side(const BackendBuffer& k, const Bac
         [enc setBuffer:vb.handle() offset:(NSUInteger)src_off atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(row_length,tokens,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake(row_length,tokens,1), MTLSizeMake(256,1,1));
         if (own) impl_->finish_command("KV side store");
     }
 }
@@ -2949,7 +2938,7 @@ void MetalBackend::attention_f16_window(const BackendBuffer& q, uint32_t q_strid
         [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:(NSUInteger)out_off atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(win_heads,1,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(win_heads,1,1), MTLSizeMake(kReduceThreads,1,1));
         if(own) impl_->finish_command("window FP16 attention");
     }
 }
@@ -2977,7 +2966,7 @@ void MetalBackend::attention_f16_causal_window(const BackendBuffer& q, uint32_t 
         [enc setBuffer:kc.handle() offset:0 atIndex:1]; [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:(NSUInteger)out_off atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(win_heads,tokens,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(win_heads,tokens,1), MTLSizeMake(kReduceThreads,1,1));
         if(own) impl_->finish_command("window causal FP16 attention");
     }
 }
@@ -3003,8 +2992,7 @@ void MetalBackend::kv_store_turbo3_rows(const BackendBuffer& k, const BackendBuf
         [enc setBuffer:kb.handle() offset:0 atIndex:0]; [enc setBuffer:vb.handle() offset:0 atIndex:1];
         [enc setBuffer:kc.handle() offset:0 atIndex:2]; [enc setBuffer:vc.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
-                threadsPerThreadgroup:MTLSizeMake(kTurboThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)kv_heads*2,2,tokens), MTLSizeMake(kTurboThreads,1,1));
         if (own) impl_->finish_command("chunked turbo3 KV store");
     }
 }
@@ -3067,8 +3055,7 @@ void MetalBackend::kv_store_f16_attrib_rows(const BackendBuffer& k, const Backen
         [enc setBytes:&args length:sizeof(args) atIndex:4];
         if (aux) [enc setBuffer:metal_buffer(*aux).handle() offset:0 atIndex:5];
         else [enc setBuffer:impl_->attrib_dummy offset:0 atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads*2,2,tokens)
-                threadsPerThreadgroup:MTLSizeMake(kTurboThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)kv_heads*2,2,tokens), MTLSizeMake(kTurboThreads,1,1));
         if (own) impl_->finish_command("KV attribution store");
     }
 }
@@ -3122,7 +3109,7 @@ void MetalBackend::attention_f16_causal(const BackendBuffer& q, uint32_t q_strid
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads,gqa_from,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(q_heads,gqa_from,1), MTLSizeMake(kReduceThreads,1,1));
         if (own) impl_->finish_command("chunked FP16 attention");
     }
 }
@@ -3176,7 +3163,7 @@ void MetalBackend::attention_turbo3_causal(const BackendBuffer& q, uint32_t q_st
         [enc setBuffer:qb.handle() offset:0 atIndex:0]; [enc setBuffer:kc.handle() offset:0 atIndex:1];
         [enc setBuffer:vc.handle() offset:0 atIndex:2];
         [enc setBuffer:output.handle() offset:0 atIndex:3]; [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(q_heads,gqa_from,1) threadsPerThreadgroup:MTLSizeMake(kReduceThreads,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(q_heads,gqa_from,1), MTLSizeMake(kReduceThreads,1,1));
         if (own) impl_->finish_command("chunked turbo3 attention");
     }
 }
@@ -3195,7 +3182,7 @@ void MetalBackend::sigmoid_gate_mul_rows(BackendBuffer& out, const BackendBuffer
         [enc setComputePipelineState:impl_->sigmoid_gate_rows];
         [enc setBuffer:o.handle() offset:0 atIndex:0]; [enc setBuffer:gates.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_threads(enc, MTLSizeMake((NSUInteger)n,1,1), MTLSizeMake(256,1,1));
         if (own) impl_->finish_command("chunked sigmoid gate");
     }
 }
@@ -3215,7 +3202,7 @@ void MetalBackend::argmax_rows(const BackendBuffer& x, uint32_t n, uint32_t rows
         [enc setBuffer:input.handle() offset:0 atIndex:0];
         [enc setBuffer:output.handle() offset:0 atIndex:1];
         [enc setBytes:&args length:sizeof(args) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(rows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        q27_dispatch_groups(enc, MTLSizeMake(rows,1,1), MTLSizeMake(256,1,1));
         if (own) impl_->finish_command("chunked argmax");
     }
 }
@@ -3239,8 +3226,7 @@ void MetalBackend::nll_rows(const BackendBuffer& logits, const BackendBuffer& ta
         [enc setBuffer:tgt.handle() offset:0 atIndex:1];
         [enc setBuffer:out.handle() offset:0 atIndex:2];
         [enc setBytes:&args length:sizeof(args) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        q27_dispatch_groups(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(256, 1, 1));
         if (own) impl_->finish_command("nll rows");
     }
 }
@@ -3271,7 +3257,7 @@ void MetalBackend::profile_reset() {
 }
 
 MetalBackend::DispatchCounters MetalBackend::dispatch_counters() const {
-    return {impl_->command_buffers_started, impl_->operations_encoded};
+    return {impl_->command_buffers_started, g_dispatches.load(std::memory_order_relaxed)};
 }
 
 uint64_t MetalBackend::recommended_working_set_size() const {

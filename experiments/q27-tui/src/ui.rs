@@ -55,6 +55,9 @@ pub struct ScrollbackCache {
 struct CachedBlock {
     block: Block,
     lines: Vec<Line<'static>>,
+    /// Wrapped rows per line: lets a frame slice the visible lines out of a
+    /// block of any size instead of re-wrapping the whole block.
+    heights: Vec<usize>,
     height: usize,
 }
 
@@ -76,13 +79,13 @@ fn draw_scrollback(
     }
     cache.wrapped_last_frame = 0;
 
-    // Segments in display order: header, blocks, live tail, each as
-    // (lines, wrapped height). Blocks are re-rendered only when they changed
-    // or are an open tool card (its spinner animates).
+    // Segments in display order: header, blocks, live tail. Blocks are
+    // re-rendered only when they changed or are an open tool card (its
+    // spinner animates).
     let header = header_lines(model, theme);
-    let header_h = wrapped_height(&header, width);
+    let header_h = line_heights(&header, width);
     let tail = live_lines(model, theme, spin);
-    let tail_h = wrapped_height(&tail, width);
+    let tail_h = line_heights(&tail, width);
     let mut wrapped = header.len() + tail.len();
 
     cache.entries.truncate(model.scrollback.len());
@@ -93,7 +96,8 @@ fn draw_scrollback(
         }
         let lines = block_lines(block, model, theme, spin);
         wrapped += lines.len();
-        let entry = CachedBlock { block: block.clone(), height: wrapped_height(&lines, width), lines };
+        let heights = line_heights(&lines, width);
+        let entry = CachedBlock { block: block.clone(), height: heights.iter().sum(), heights, lines };
         if i < cache.entries.len() {
             cache.entries[i] = entry;
         } else {
@@ -101,34 +105,40 @@ fn draw_scrollback(
         }
     }
 
-    let mut segs: Vec<(&Vec<Line<'static>>, usize)> = Vec::with_capacity(cache.entries.len() + 2);
-    segs.push((&header, header_h));
-    segs.extend(cache.entries.iter().map(|e| (&e.lines, e.height)));
-    segs.push((&tail, tail_h));
+    let mut segs: Vec<(&[Line<'static>], &[usize], usize)> = Vec::with_capacity(cache.entries.len() + 2);
+    segs.push((&header, &header_h, header_h.iter().sum()));
+    segs.extend(cache.entries.iter().map(|e| (e.lines.as_slice(), e.heights.as_slice(), e.height)));
+    segs.push((&tail, &tail_h, tail_h.iter().sum()));
 
-    let total: usize = segs.iter().map(|s| s.1).sum();
+    let total: usize = segs.iter().map(|s| s.2).sum();
     let max_scroll = total.saturating_sub(area.height as usize).min(u32::MAX as usize) as u32;
     let top = scroll.min(max_scroll) as usize;
     let bottom = top + area.height as usize;
 
-    // Gather only segments overlapping [top, bottom).
+    // Gather only the lines overlapping rows [top, bottom). `offset` is the
+    // rows of the first gathered line above the viewport (< one line's height).
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut start = 0usize;
     let mut offset = 0usize;
-    for (seg_lines, h) in &segs {
-        let end = start + h;
-        if end > top && start < bottom {
-            if lines.is_empty() {
-                offset = top - start;
-            }
-            lines.extend(seg_lines.iter().cloned());
-            wrapped += seg_lines.len();
+    let mut row = 0usize;
+    'segments: for (seg_lines, seg_heights, seg_total) in &segs {
+        if row + seg_total <= top {
+            row += seg_total;
+            continue;
         }
-        start = end;
-        if start >= bottom {
-            break;
+        for (line, h) in seg_lines.iter().zip(seg_heights.iter()) {
+            if row >= bottom {
+                break 'segments;
+            }
+            if row + h > top {
+                if lines.is_empty() {
+                    offset = top - row;
+                }
+                lines.push(line.clone());
+            }
+            row += h;
         }
     }
+    wrapped += lines.len();
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((offset.min(u16::MAX as usize) as u16, 0));
@@ -137,8 +147,16 @@ fn draw_scrollback(
     max_scroll
 }
 
-/// Rows `lines` occupy once word-wrapped to `width` (ratatui wraps each Line
-/// independently, so per-segment heights sum to the whole-transcript height).
+/// Wrapped rows of each line at `width` (ratatui wraps every Line
+/// independently, so these sum to the whole-transcript height).
+fn line_heights(lines: &[Line<'static>], width: u16) -> Vec<usize> {
+    lines
+        .iter()
+        .map(|l| Paragraph::new(l.clone()).wrap(Wrap { trim: false }).line_count(width))
+        .collect()
+}
+
+#[cfg(test)]
 fn wrapped_height(lines: &[Line<'static>], width: u16) -> usize {
     Paragraph::new(lines.to_vec())
         .wrap(Wrap { trim: false })
@@ -664,6 +682,46 @@ mod draw_cost {
         }
         assert_eq!(cost[0], cost[1], "steady-state wrapped lines: {cost:?}");
         assert!(cost[1] <= 200, "steady-state frame wraps {} lines", cost[1]);
+    }
+
+    /// One block taller than u16::MAX rows: scrolling anywhere in it (and to
+    /// the bottom) shows the right lines, and a frame wraps only what is on
+    /// screen, not the block (Sol 6.1 review: offset clamped at 65,535 and
+    /// the whole visible block re-wrapped each frame).
+    #[test]
+    fn giant_block_scrolls_and_stays_cheap() {
+        let n = 70_000;
+        let mut m = Model::default();
+        m.phase = Phase::Idle;
+        m.scrollback.push(Block::User(
+            (0..n).map(|k| format!("line {k}")).collect::<Vec<_>>().join("\n"),
+        ));
+        let (w, h) = (80u16, 24u16);
+        let rows = h - 4;
+        let mut cache = ScrollbackCache::default();
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let tick = Instant::now();
+        // Rows: "you", "  line 0" .. "  line 69999", "".
+        let total = n + 2;
+        let (max, _) = frame(&mut term, &m, &mut cache, u32::MAX, tick);
+        assert_eq!(max as usize, total - rows as usize);
+        for top in [0usize, 1, 65_534, 65_535, 65_536, 69_000, max as usize] {
+            let (_, buf) = frame(&mut term, &m, &mut cache, top as u32, tick);
+            let got = scrollback_rows(&buf, w, rows);
+            let expect = |row: usize| match row {
+                0 => "you".to_string(),
+                r if r <= n => format!("  line {}", r - 1),
+                _ => String::new(),
+            };
+            for (i, text) in got.iter().enumerate() {
+                assert_eq!(text.trim_end(), expect(top + i), "scroll {top}, row {i}");
+            }
+            assert!(
+                cache.wrapped_last_frame <= rows as usize + 2,
+                "scroll {top}: wrapped {} lines",
+                cache.wrapped_last_frame
+            );
+        }
     }
 
     /// Wall-clock probe: `cargo test --release draw_cost -- --ignored --nocapture`.

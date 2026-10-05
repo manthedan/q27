@@ -20,7 +20,8 @@ to the t2-slim and t3-slim Bonsai 2 packs under `models/bonsai2/`
 - **Tier C — packaging/docs** (no model): `test-tools`, `test-inspect`,
   `test-agent`, `test-repack` + `test-bonsai2-repack`, `test-packaging`
   (wrapper selftest, lock helper, formula staging, fetch manifest),
-  `test-shader-discovery`, the TUI's `cargo test`.
+  `test-shader-discovery`, `test-perf-gates` (ratchet logic, fake CLI), the
+  TUI's `cargo test`.
 - **Tier B — serving/agent/engine changes:** C + `test-metal-backend` + per
   pack the live Bonsai 2 serving, native-agent, Metal recovery and
   snapshot-reuse gates + the perf ratchets below.
@@ -36,7 +37,7 @@ the staged formula (needs a machine without an existing `q27` keg).
 
 - `tools/perf_ceilings.sh` — exact. Fixed greedy workloads (512-token
   prefill, 64 decode steps, a suffix-burst copy) through
-  `q27-metal --counters`; Metal command buffers and encoded operations
+  `q27-metal --counters`; Metal command buffers and GPU dispatches
   must not exceed `perf/ceilings.tsv`. Counts are deterministic, so there
   is no noise band and the gate is valid on a busy machine. When a change
   lowers a count, `--ratchet` lowers the ceiling in the same commit;

@@ -2,7 +2,7 @@
 # perf_ceilings.sh [--ratchet] [PACK...] — deterministic work-count gate.
 #
 # Runs fixed greedy workloads through build/q27-metal --counters and compares
-# the Metal command buffers and encoded operations against perf/ceilings.tsv.
+# the Metal command buffers and GPU dispatches against perf/ceilings.tsv.
 # Same binary + pack + workload give the same counts on every run, so the gate
 # is exact (no noise band): a count above its ceiling fails. A count below its
 # ceiling is reported; --ratchet then lowers that ceiling (ceilings only go down).
@@ -41,13 +41,13 @@ The lighthouse keeper climbed the spiral stairs each evening, counted one hundre
 Repeated paragraph:
 "
 
-# run TAG PACK ARGS... -> "generated command_buffers operations". Callers
+# run TAG PACK ARGS... -> "generated command_buffers dispatches". Callers
 # assign the result (r=$(run ...) || exit 1) so a failure stops the gate.
 run() {
     local tag=$1 pack=$2 out; shift 2
     out=$("$cli" "$pack" "$tok" "$@" --counters 2>&1 >/dev/null) || {
         echo "$out" >&2; echo "q27-metal failed ($tag)" >&2; return 1; }
-    out=$(echo "$out" | sed -n 's/^counters: prompt=[0-9]* generated=\([0-9]*\) command_buffers=\([0-9]*\) operations=\([0-9]*\)$/\1 \2 \3/p')
+    out=$(echo "$out" | sed -n 's/^counters: prompt=[0-9]* generated=\([0-9]*\) command_buffers=\([0-9]*\) dispatches=\([0-9]*\)$/\1 \2 \3/p')
     [ -n "$out" ] || { echo "q27-metal printed no counters line ($tag)" >&2; return 1; }
     echo "$out"
 }
@@ -62,7 +62,7 @@ for pack in $packs; do
     r=$(run prefill512 "$pack" --tokens "$long_prompt" -n 1 --ctx 1024) || exit 1
     set -- $r
     record "$name" prefill512.command_buffers "$2"
-    record "$name" prefill512.operations "$3"
+    record "$name" prefill512.dispatches "$3"
 
     # Decode cost per token = (n=65 run) - (n=1 run) over the same prompt: the
     # difference is exactly 64 decode steps, prefill cancels out.
@@ -73,7 +73,7 @@ for pack in $packs; do
     set -- $r
     [ "$1" = 65 ] || { echo "$name: decode workload stopped at $1 tokens (EOS); change short_prompt" >&2; exit 1; }
     record "$name" decode64.command_buffers $(( $2 - base_cb ))
-    record "$name" decode64.operations $(( $3 - base_ops ))
+    record "$name" decode64.dispatches $(( $3 - base_ops ))
 
     # Suffix bursts on a copy task (the agent's file-edit shape). Counts
     # depend on draft acceptance, which is deterministic under greedy decode.
@@ -83,7 +83,7 @@ for pack in $packs; do
     set -- $r
     [ "$1" = 48 ] || { echo "$name: suffix workload stopped at $1 tokens (EOS); change copy_prompt" >&2; exit 1; }
     record "$name" suffix_copy48.command_buffers "$2"
-    record "$name" suffix_copy48.operations "$3"
+    record "$name" suffix_copy48.dispatches "$3"
 done
 
 # Compare against ceilings; with --ratchet, write the lowered table back.
@@ -91,7 +91,7 @@ done
 awk -F'\t' -v ratchet="$ratchet" -v out="$work/new.tsv" '
     NR == FNR { if (FNR > 1) { key = $1 "\t" $2; ceil[key] = $3; order[++n] = key } else header = $0; next }
     {
-        key = $1 "\t" $2; val = $3 + 0
+        key = $1 "\t" $2; val = $3 + 0; seen[key] = 1; measured_pack[$1] = 1
         if (!(key in ceil)) {
             if (ratchet) { printf "NEW   %-28s %-34s %12d\n", $1, $2, val; ceil[key] = val; order[++n] = key }
             else { printf "FAIL  %-28s %-34s %12d (no ceiling; run --ratchet)\n", $1, $2, val; fails++ }
@@ -106,6 +106,14 @@ awk -F'\t' -v ratchet="$ratchet" -v out="$work/new.tsv" '
         else printf "ok    %-28s %-34s %12d\n", $1, $2, val
     }
     END {
+        # A ceiling for a measured pack that no workload produced: the gate
+        # would silently stop covering it.
+        for (i = 1; i <= n; i++) {
+            split(order[i], kp, "\t")
+            if ((kp[1] in measured_pack) && !(order[i] in seen)) {
+                printf "FAIL  %-28s %-34s not measured (workload removed? delete the row in a reviewed commit)\n", kp[1], kp[2]; fails++
+            }
+        }
         if (ratchet && !fails) {
             print header > out
             for (i = 1; i <= n; i++) print order[i] "\t" ceil[order[i]] > out

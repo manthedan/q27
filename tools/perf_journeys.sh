@@ -43,19 +43,22 @@ The lighthouse keeper climbed the spiral stairs each evening, counted one hundre
 Repeated paragraph:
 "
 
-# timed TAG PACK ARGS... -> "load_seconds generate_seconds generated"
+# timed EXPECT TAG PACK ARGS... -> "load_seconds generate_seconds generated";
+# fails unless exactly EXPECT tokens were generated (an early EOS would
+# otherwise read as a speedup).
 timed() {
-    local tag=$1 pack=$2 out load gen n; shift 2
+    local expect=$1 tag=$2 pack=$3 out load gen n; shift 3
     out=$("$cli" "$pack" "$tok" "$@" 2>&1 >/dev/null) || {
         echo "$out" >&2; echo "q27-metal failed ($tag)" >&2; return 1; }
     load=$(echo "$out" | sed -n 's/^Metal model ready on .* in \([0-9.]*\) s .*/\1/p')
     gen=$(echo "$out" | sed -n 's/^\([0-9]*\) tokens in \([0-9.]*\) s .*/\2/p')
     n=$(echo "$out" | sed -n 's/^\([0-9]*\) tokens in .*/\1/p')
     [ -n "$load" ] && [ -n "$gen" ] || { echo "$out" >&2; echo "unparsed timing ($tag)" >&2; return 1; }
+    [ "$n" = "$expect" ] || { echo "$tag: generated $n tokens, expected $expect (EOS?)" >&2; return 1; }
     echo "$load $gen $n"
 }
 
-# best_of TAG PACK ARGS... -> best (minimum) "load gen n" over $reps runs
+# best_of EXPECT TAG PACK ARGS... -> best (minimum) "load gen n" over $reps runs
 best_of() {
     local i r l g n="" best_load="" best_gen=""
     for i in $(seq "$reps"); do
@@ -76,27 +79,34 @@ for pack in $packs; do
     name=$(basename "$pack" .q27)
     echo "== $name (best of $reps)"
 
-    r=$(best_of prefill512 "$pack" --tokens "$long_prompt" -n 1 --ctx 1024) || exit 1
+    r=$(best_of 1 prefill512 "$pack" --tokens "$long_prompt" -n 1 --ctx 1024) || exit 1
     set -- $r
     record_row "$name" load_s "$1" lower
     record_row "$name" prefill512_tps "$(awk -v s="$2" 'BEGIN { printf "%.2f", 512 / s }')" higher
 
-    r=$(best_of decode1 "$pack" --tokens "$short_prompt" -n 1 --ctx 512) || exit 1
+    r=$(best_of 1 decode1 "$pack" --tokens "$short_prompt" -n 1 --ctx 512) || exit 1
     set -- $r; base=$2
-    r=$(best_of decode129 "$pack" --tokens "$short_prompt" -n 129 --ctx 512) || exit 1
+    r=$(best_of 129 decode129 "$pack" --tokens "$short_prompt" -n 129 --ctx 512) || exit 1
     set -- $r
-    [ "$3" = 129 ] || { echo "$name: decode stopped at $3 tokens (EOS)" >&2; exit 1; }
     record_row "$name" decode_tps "$(awk -v a="$2" -v b="$base" 'BEGIN { printf "%.2f", 128 / (a - b) }')" higher
 
     case "$name" in *-t3*) continue ;; esac
-    r=$(best_of suffix-copy "$pack" --prompt "$copy_prompt" -n 48 --ctx 1024 --suffix 16) || exit 1
+    r=$(best_of 48 suffix-copy "$pack" --prompt "$copy_prompt" -n 48 --ctx 1024 --suffix 16) || exit 1
     set -- $r
     record_row "$name" suffix_copy_s "$2" lower
 done
 
 if [ "$record" = 1 ]; then
+    # Replace the measured packs' rows; keep every other pack's baseline.
     mkdir -p "$(dirname "$baseline")"
-    { printf 'pack\tmetric\tvalue\tbetter\n'; cat "$measured"; } > "$baseline"
+    {
+        printf 'pack\tmetric\tvalue\tbetter\n'
+        if [ -f "$baseline" ]; then
+            awk -F'\t' 'NR == FNR { m[$1] = 1; next } FNR > 1 && !($1 in m)' "$measured" "$baseline"
+        fi
+        cat "$measured"
+    } > "$work/baseline.new"
+    mv "$work/baseline.new" "$baseline"
     column -t -s"$(printf '\t')" "$baseline"
     echo "baseline written: $baseline"
     exit 0
@@ -107,7 +117,7 @@ awk -F'\t' -v band="$band" '
     NR == FNR { if (FNR > 1) base[$1 "\t" $2] = $3; next }
     {
         key = $1 "\t" $2; v = $3 + 0
-        if (!(key in base)) { printf "new   %-24s %-16s %10.2f (no baseline)\n", $1, $2, v; next }
+        if (!(key in base)) { printf "FAIL  %-24s %-16s %10.2f (no baseline; --record on an idle machine)\n", $1, $2, v; fails++; next }
         b = base[key] + 0
         # Slowdown in percent, whichever direction is better.
         slow = ($4 == "higher") ? 100 * (b - v) / b : 100 * (v - b) / b

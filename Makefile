@@ -54,7 +54,7 @@ build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/mark
 # process-lifetime memo, so the drift suite runs twice -- once tolerant, once
 # strict -- because the strict leg's assertions cannot share a process with the
 # tolerant ones.
-.PHONY: test-tools perf-ceilings perf-journeys
+.PHONY: test-tools test-perf-gates perf-ceilings perf-journeys
 # extract_check first: the integration harness embeds server.cu's handle()
 # byte-for-byte, and a stale copy tests logic that no longer ships (it had
 # drifted for ten commits before anything noticed).
@@ -514,6 +514,8 @@ build/test_snapshot_store_shared: tools/test_snapshot_store_shared.cpp \
 
 # Perf ratchets (docs/QA_BEFORE_RELEASES.md): exact work-count ceilings, and
 # wall-clock journeys against this machine's baseline (quiet machine only).
+test-perf-gates:
+	bash tools/test_perf_gates.sh
 perf-ceilings: build/q27-metal
 	tools/perf_ceilings.sh
 perf-journeys: build/q27-metal
