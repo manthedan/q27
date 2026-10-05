@@ -23,7 +23,7 @@ to the t2-slim and t3-slim Bonsai 2 packs under `models/bonsai2/`
   `test-shader-discovery`, the TUI's `cargo test`.
 - **Tier B — serving/agent/engine changes:** C + `test-metal-backend` + per
   pack the live Bonsai 2 serving, native-agent, Metal recovery and
-  snapshot-reuse gates.
+  snapshot-reuse gates + the perf ratchets below.
 - **Tier A — numerics:** B + the independent Prism reference oracle
   (`tools/bonsai2_gate.sh`, needs `PRISM_DIR`) + the 8-restart session soak.
 
@@ -31,6 +31,25 @@ Release candidates additionally run `tools/release_tarball_smoke.sh` on the
 assembled archive (fresh HOME, scrubbed PATH: pull, recommend, serve + API
 contracts, native-agent tool loop) and `tools/homebrew_release_smoke.sh` on
 the staged formula (needs a machine without an existing `q27` keg).
+
+**Perf ratchets** (tier B; speed claims are gates, not one-off numbers):
+
+- `tools/perf_ceilings.sh` — exact. Fixed greedy workloads (512-token
+  prefill, 64 decode steps, a suffix-burst copy) through
+  `q27-metal --counters`; Metal command buffers and encoded operations
+  must not exceed `perf/ceilings.tsv`. Counts are deterministic, so there
+  is no noise band and the gate is valid on a busy machine. When a change
+  lowers a count, `--ratchet` lowers the ceiling in the same commit;
+  ceilings never go up without a reviewed reason in the commit message.
+- `tools/perf_journeys.sh` — wall clock, best of 3, against
+  `perf/baseline-<hw.model>-<GiB>.tsv`; fails beyond a 10% band
+  (`Q27_PERF_BAND`). Quiet machine only (contended-machine rule). Record a
+  new baseline (`--record`) only for a reviewed speedup or a new machine.
+- The TUI's frame-cost test (`steady_frame_cost_is_independent_of_session_length`,
+  in `cargo test`) keeps per-frame redraw work constant in transcript
+  length.
+- A new ratchet counts only after it was shown to fail on a deliberately
+  slowed build (see `perf/README.md`).
 
 **CUDA-side legs** (§2 yukon gates, `constrain_gate.sh`, `ckpt_gate.sh`)
 run on yukon or not at all; on the Metal lane record them as N/A with

@@ -5,7 +5,7 @@
 # GPU jobs) at once. bash 3.2-safe.
 #
 #   C  hermetic: CPU suites, repack, packaging, shader discovery, TUI tests
-#   B  C + Metal backend suite + live Bonsai 2 gates on every pack
+#   B  C + Metal backend suite + live Bonsai 2 gates on every pack + perf ratchets
 #   A  B + independent Prism reference oracle (needs PRISM_DIR) + session soak
 #
 # Packs: Q27_GATE_PACKS (space-separated .q27 paths), default the t2-slim and
@@ -85,6 +85,15 @@ for pack in $PACKS; do
     run_gate "$tag snapshot-reuse" "$EVID/$tag-snapshot-reuse.log" \
         python3 tools/test_bonsai2_snapshot_reuse.py build/q27-metal-server "$pack" "$TOK"
 done
+# Perf ratchets: exact work counts always; wall-clock journeys need a quiet
+# machine and a recorded baseline (Q27_PERF_JOURNEYS=0 skips with a note).
+make build/q27-metal >>"$EVID/build.log" 2>&1 || { fail "build q27-metal (log: $EVID/build.log)"; finish; }
+run_gate "perf ceilings" "$EVID/perf-ceilings.log" env Q27_GATE_TOK="$TOK" tools/perf_ceilings.sh $PACKS
+if [ "${Q27_PERF_JOURNEYS:-1}" = 0 ]; then
+    skip "perf journeys (Q27_PERF_JOURNEYS=0: machine not quiet)"
+else
+    run_gate "perf journeys" "$EVID/perf-journeys.log" env Q27_GATE_TOK="$TOK" tools/perf_journeys.sh $PACKS
+fi
 [ "$TIER" = "B" ] && finish
 
 # ---- Tier A: reference oracle + soak -----------------------------------------
