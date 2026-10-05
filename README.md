@@ -129,6 +129,26 @@ recipe the full 19-task suite scores **0.928 hidden / 0.895 composite**
 same suite scored 0.511 -- the recipe is the difference, not the checkpoint.
 The engine auto-selects 3.8's trained XML tool dialect from the artifact name.
 
+### Qwen3.8-27B-pi (agentic fine-tune, 2026-10-05)
+
+[bytkim/Qwen3.8-27B-pi](https://huggingface.co/bytkim/Qwen3.8-27B-pi) is a
+Qwen3.8-27B fine-tune for agentic coding (SFT on successful Pi agent-harness
+sessions, then GRPO with a reasoning-efficiency reward; Apache-2.0). Same
+architecture, tokenizer and chat template as base, so it is a repack with the
+base default recipe, using its own MTP head. The pack is at
+[signalnine/Qwen3.8-27B-pi-q27](https://huggingface.co/signalnine/Qwen3.8-27B-pi-q27).
+
+On the 12-instance Claude Code SWE-bench campaign, same binary and same
+afternoon as a base control, it lands the same patches (gold 11/12) in 53
+instead of 75 seconds per instance, with 30% fewer output tokens and 32% less
+thinking. The base-trained DFlash2 drafter accepts more of Pi's text than
+base's (4.36 vs 4.14 tokens per round, 242 vs 227 t/s), so serve it with the
+same DFlash2 pack as base
+(`bench/crossengine/agentic-2026-10-05-pi/`, BUILDLOG 2026-10-05 (bd)). Its
+GGUF names itself "Source Step8 Derived Mtp", and q27 keys the XML tool
+dialect and the 3.8 prompt rules on `qwen38` in the name, so repacking it (or
+any 3.8 fine-tune with a similar name) needs `repack.py --name`.
+
 ### Bonsai 2 27B (ternary Qwen3.8, 2026-09-18)
 
 [PrismML's Ternary Bonsai 2 27B](https://prismml.com/news/bonsai-2-27b) is
