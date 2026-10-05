@@ -4,8 +4,9 @@ This is the **source-checkout revival**: upstream v0.14.1 (which serves Bonsai 2
 on CUDA) plus Bonsai 2 Metal support and the recovered native agent/TUI. Metal
 reads **upstream's own Bonsai 2 packs** (`tools/repack.py --slim`, FORMAT.md
 "Bonsai 2 packs"); the revival's earlier `bonsai2-t2-hadamard-v1` container is
-retired and rejected at load. It does not replace your Homebrew installation or
-publish a release. Reference parity and the short-context runtime gates pass on
+retired and rejected at load. The packaged release (metal-v0.7.0, Homebrew or
+the prebuilt archive) runs the same engine via `q27 pull b2` / `q27 agent` /
+`q27 serve`; this page covers the source checkout. Reference parity and the short-context runtime gates pass on
 an M4 / 16 GiB mini (one engine/slot, context 2048); the original revival
 parity run was on a base M4 / 24 GiB laptop.
 
@@ -180,8 +181,8 @@ short-context correctness, not a long-context or task-benchmark claim.
 - **Vision**: this port is text-only; no vision tower/mmproj is loaded.
 - **Prefix snapshots on T3/legacy Bonsai packs**: they need chunked prefill,
   so only T2 packs get them (see "Prefix snapshots").
-- **Homebrew/prebuilt release** and cold start/persistence soak: still pending.
-  The serving/native gates run at context 2048.
+- **Long-context serving gates**: the serving/native gates run at context
+  2048; longer contexts are covered by the measurements below, not by gates.
 
 ## Context on a 16 GiB Mac
 
