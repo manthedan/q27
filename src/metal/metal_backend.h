@@ -328,6 +328,12 @@ class MetalBackend final : public ComputeBackend {
     // from the attribution table. No-op when profiling is disabled.
     void profile_reset();
 
+    // Deterministic work counts since construction: command buffers started
+    // and operations encoded. Same model, prompt and greedy decode give the
+    // same counts on every run, so tools/perf_ceilings.sh gates on them.
+    struct DispatchCounters { uint64_t command_buffers = 0; uint64_t operations = 0; };
+    DispatchCounters dispatch_counters() const;
+
     uint64_t recommended_working_set_size() const;
     // Live device allocation total (weights are already inside this once the
     // artifact is mapped) — the measured-free half of --ctx auto sizing.

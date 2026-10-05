@@ -1,0 +1,11 @@
+pack	metric	ceiling
+bonsai2-27b-t2-slim	prefill512.command_buffers	8
+bonsai2-27b-t2-slim	prefill512.operations	9801
+bonsai2-27b-t2-slim	decode64.command_buffers	16
+bonsai2-27b-t2-slim	decode64.operations	97792
+bonsai2-27b-t2-slim	suffix_copy48.command_buffers	82
+bonsai2-27b-t2-slim	suffix_copy48.operations	62605
+bonsai2-27b-t3-slim	prefill512.command_buffers	65
+bonsai2-27b-t3-slim	prefill512.operations	780291
+bonsai2-27b-t3-slim	decode64.command_buffers	16
+bonsai2-27b-t3-slim	decode64.operations	97792

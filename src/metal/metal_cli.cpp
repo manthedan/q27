@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s model.q27 tokenizer.tok [--validate-only | --tokens id,id,... | --prompt text] "
                 "[-n count] [--ctx count] [--mtp width | --suffix width] [--kv fp16|turbo3|q8] [--prefill chunk|serial] "
-                "[--temperature T --top-p P --top-k K --seed S] [--dump-token-ids file]\n",
+                "[--temperature T --top-p P --top-k K --seed S] [--dump-token-ids file] [--counters]\n",
                 argv[0]);
         return 1;
     }
@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
         std::string token_list, prompt_text, dump_token_ids;
         uint32_t count = 1, context = 128, mtp_width = 0, suffix_width = 0;
         q27::SamplingParams sampling;
-        bool validate_only = false, serial_prefill = false;
+        bool validate_only = false, serial_prefill = false, counters = false;
         q27::KvKind kv_kind = q27::KvKind::F16;
         bool token_list_supplied = false, prompt_supplied = false;
 
@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
             else if (arg == "--seed" && i + 1 < argc)
                 sampling.seed = parse_u64(argv[++i], "--seed");
             else if (arg == "--dump-token-ids" && i + 1 < argc) dump_token_ids = argv[++i];
+            else if (arg == "--counters") counters = true;
             else throw std::runtime_error("unknown/incomplete argument: " + arg);
         }
 
@@ -174,6 +175,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        const auto counters_before = engine.backend().dispatch_counters();
         std::vector<uint32_t> generated =
             suffix_width ? engine.generate_suffix(prompt, count, suffix_width,
                                                   q27::MetalEngine::SUFFIX_MIN_MATCH, UINT32_MAX,
@@ -182,6 +184,15 @@ int main(int argc, char** argv) {
             : mtp_width ? engine.generate_mtp(prompt, count, mtp_width)
                         : engine.generate(prompt, count);
         if (!dump_token_ids.empty()) write_token_ids(dump_token_ids, generated);
+        if (counters) {
+            // Generation only (load excluded); one machine-readable line for
+            // tools/perf_ceilings.sh.
+            const auto after = engine.backend().dispatch_counters();
+            fprintf(stderr, "counters: prompt=%zu generated=%zu command_buffers=%llu operations=%llu\n",
+                    prompt.size(), generated.size(),
+                    static_cast<unsigned long long>(after.command_buffers - counters_before.command_buffers),
+                    static_cast<unsigned long long>(after.operations - counters_before.operations));
+        }
 
         const auto finished = std::chrono::steady_clock::now();
         std::vector<int> ids(generated.begin(), generated.end());

@@ -538,6 +538,9 @@ struct MetalBackend::Impl {
     std::vector<const char*> op_labels;
     std::map<std::string, ProfileStat> profile_stats;
     uint64_t profiled_command_buffers = 0;
+    // Always-on, deterministic work counts (tools/perf_ceilings.sh ratchets).
+    uint64_t command_buffers_started = 0;
+    uint64_t operations_encoded = 0;
     double gpu_busy_seconds = 0.0;
     double cpu_wait_seconds = 0.0;
     MTLTimestamp calibration_cpu = 0, calibration_gpu = 0;
@@ -556,6 +559,7 @@ struct MetalBackend::Impl {
             throw std::runtime_error("q27 Metal: command batch already active");
         command = [queue commandBuffer];
         if (!command) throw std::runtime_error("q27 Metal: command creation failed");
+        command_buffers_started++;
         if (profile) {
             op_labels.clear();
         } else {
@@ -571,6 +575,7 @@ struct MetalBackend::Impl {
     id<MTLComputeCommandEncoder> encoder_for_operation(bool& own_command, const char* label) {
         own_command = !batching;
         if (own_command) start_command(false);
+        operations_encoded++;
         if (profile) {
             if (op_labels.size() >= kMaxProfiledOps) {
                 abort_command();
@@ -3247,6 +3252,7 @@ void MetalBackend::synchronize() {
             throw std::runtime_error("q27 Metal: end command batch before synchronizing");
         id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
         if (!command) throw std::runtime_error("q27 Metal: command creation failed");
+        impl_->command_buffers_started++;
         [command commit];
         [command waitUntilCompleted];
         if (command.status == MTLCommandBufferStatusError) {
@@ -3262,6 +3268,10 @@ void MetalBackend::profile_reset() {
     impl_->profiled_command_buffers = 0;
     impl_->gpu_busy_seconds = 0.0;
     impl_->cpu_wait_seconds = 0.0;
+}
+
+MetalBackend::DispatchCounters MetalBackend::dispatch_counters() const {
+    return {impl_->command_buffers_started, impl_->operations_encoded};
 }
 
 uint64_t MetalBackend::recommended_working_set_size() const {
