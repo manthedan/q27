@@ -6,8 +6,9 @@
 #
 #   q27 pull [name]     recommend by RAM, or fetch a specific pack (resumable,
 #                       checksum-verified) into ~/.q27/models/<name>/
-#   q27 serve [name]    start the server on a pack (refuses if one is running)
-#   q27 agent [name]    start the native coding agent (default: b1; prefers
+#   q27 serve [name] [server args]  start the server on a pack (refuses if
+#                       one is running; extra args go to q27-metal-server)
+#   q27 agent [name]    start the native coding agent (default: b2, Bonsai 2; prefers
 #                       Ratatui q27-tui / FP1 over classic linenoise — see Q27_AGENT_UI)
 #   q27 ls              list installed packs + sizes + which is servable
 #   q27 rm <name>       delete a pack's cache
@@ -30,7 +31,7 @@ q27_model_profile() {
     local n="$1" profile
     profile="$(q27_registry_field "$n" 13)" || return 1
     case "$profile" in
-        bonsai-agent-v1|qwen36-v1|qwen38-thinking-v1)
+        bonsai-agent-v1|bonsai2-qwen38-v1|qwen36-v1|qwen38-thinking-v1)
             printf '%s' "$profile" ;;
         *)
             echo "q27: pack $n has unknown model profile '${profile:-<empty>}'" >&2
@@ -176,8 +177,27 @@ q27_run_consumer() {
     exec "$lock_exec" "$run/consumer.lock" "$@"
 }
 
+# Suffix-burst speculation (n-gram drafts verified in one batch; exact for
+# greedy and sampled decode) is the Bonsai 2 default: those packs have no MTP
+# head. Q27_SUFFIX=N sets the width (0 disables); skipped when the caller
+# already picked a decode mode that must run serially.
+q27_suffix_args() {
+    local w="${Q27_SUFFIX:-16}" a
+    [ "$w" = 0 ] && return 0
+    for a in "$@"; do
+        case "$a" in --suffix|--suffix=*|--mtp|--mtp=*|--constrain-tools) return 0 ;; esac
+    done
+    printf '%s\n' --suffix "$w"
+}
+
 cmd_serve() {
-    local n="${1:-$(recommend_pack)}"
+    # Optional pack name first; any remaining args go to q27-metal-server.
+    local n=""
+    case "${1:-}" in
+        ""|-*) ;;
+        *) n="$1"; shift ;;
+    esac
+    [ -n "$n" ] || n="$(recommend_pack)"
     [ -n "$n" ] || { echo "q27 serve: no pack fits this machine; see \`q27 recommend\`" >&2; exit 1; }
     local art tok server model_profile
     local -a serve_args=(--port 8080
@@ -202,7 +222,24 @@ cmd_serve() {
                 --top-k-default "${Q27_SERVE_TOP_K:-${Q27_METAL_TOP_K_DEFAULT:-20}}"
             )
             ;;
+        bonsai2-qwen38-v1)
+            # Bonsai 2 is Qwen3.8-format: thinking on with an unbounded budget,
+            # the trained sampling defaults, and suffix bursts.
+            case "${Q27_SERVE_THINK:-1}" in
+                0|no|false) ;;
+                1|yes|true) serve_args+=(--think --think-budget 0) ;;
+                *) echo "q27 serve: Q27_SERVE_THINK must be 0 or 1" >&2; exit 1 ;;
+            esac
+            serve_args+=(
+                --temperature-default "${Q27_SERVE_TEMPERATURE:-1.0}"
+                --top-p-default "${Q27_SERVE_TOP_P:-0.95}"
+                --top-k-default "${Q27_SERVE_TOP_K:-20}"
+            )
+            local a
+            while IFS= read -r a; do serve_args+=("$a"); done < <(q27_suffix_args "$@")
+            ;;
     esac
+    [ $# -gt 0 ] && serve_args+=("$@")
     export Q27_MODEL_PROFILE="$model_profile"
     echo "q27 serve: $n ($(basename "$art")) profile=$model_profile on 127.0.0.1:8080"
     echo "  export ANTHROPIC_BASE_URL=http://localhost:8080"
@@ -238,7 +275,7 @@ q27_agent_want_tui() {
 }
 
 cmd_agent() {
-    local n="${Q27_AGENT_PACK:-b1}" agent tui
+    local n="${Q27_AGENT_PACK:-b2}" agent tui
     case "${1:-}" in
         --help|-h)
             agent="$(q27_bin q27-agent)" || {
@@ -272,7 +309,12 @@ cmd_agent() {
         echo "q27 agent: tokenizer missing — re-run \`q27 pull $n\`" >&2; exit 1; }
     agent="$(q27_bin q27-agent)" || {
         echo "q27 agent: q27-agent binary not found" >&2; exit 1; }
-    context="${Q27_AGENT_CONTEXT:-32768}"
+    # Bonsai 2 on a 16 GiB Mac measured its ceiling at 16K (fp16 KV); the
+    # Qwen tiers keep the 32K default sized for 24 GB+ machines.
+    case "$model_profile" in
+        bonsai2-qwen38-v1) context="${Q27_AGENT_CONTEXT:-16384}" ;;
+        *) context="${Q27_AGENT_CONTEXT:-32768}" ;;
+    esac
     if [ -n "${Q27_AGENT_WORKSPACE:-}" ]; then
         workspace="$Q27_AGENT_WORKSPACE"
     else
@@ -296,6 +338,10 @@ cmd_agent() {
             qwen38-thinking-v1)
                 temp=1.0
                 sample_source="qwen38-profile"
+                ;;
+            bonsai2-qwen38-v1)
+                temp=1.0
+                sample_source="bonsai2-profile"
                 ;;
         esac
     else
@@ -336,6 +382,10 @@ cmd_agent() {
     local mtp_args=()
     if [ -n "${Q27_AGENT_MTP:-}" ]; then
         mtp_args+=(--mtp "$Q27_AGENT_MTP")
+    elif [ "$model_profile" = bonsai2-qwen38-v1 ]; then
+        # No MTP head on Bonsai 2: suffix bursts are the speculation path.
+        local a
+        while IFS= read -r a; do mtp_args+=("$a"); done < <(q27_suffix_args "$@")
     fi
     # Hard-stop open <think> after N tokens (agent-side; model has no budget).
     # Unset/empty = unlimited within max-tokens.
@@ -381,12 +431,14 @@ cmd_agent() {
                 echo "  sampling: ${sample_args[*]}  (bonsai default; Q27_AGENT_TEMPERATURE=0 for greedy)" >&2 ;;
             qwen38-profile)
                 echo "  sampling: ${sample_args[*]}  (qwen38 profile; Q27_AGENT_TEMPERATURE=0 for greedy)" >&2 ;;
+            bonsai2-profile)
+                echo "  sampling: ${sample_args[*]}  (bonsai2 profile; Q27_AGENT_TEMPERATURE=0 for greedy)" >&2 ;;
             *)
                 echo "  sampling: ${sample_args[*]}" >&2 ;;
         esac
     fi
     if [ ${#mtp_args[@]} -gt 0 ]; then
-        echo "  mtp: ${mtp_args[*]}" >&2
+        echo "  speculation: ${mtp_args[*]}" >&2
     fi
     # Under `set -u`, empty `"${arr[@]}"` is unbound on some bashes — expand
     # optional arg arrays only when present.

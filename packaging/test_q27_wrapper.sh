@@ -416,9 +416,9 @@ fi
 wait_lock_clear || {
     echo "FAIL: q38 consumer flock remained held after child exit" >&2; exit 1; }
 
-# c-small is the explicit supported winner when its 24 GB minimum ties the
-# legacy Qwen3.6 default. Recommendation precedence is intentional registry
-# order and must not regress to the older pack.
+# metal-v0.7.0 validates only Bonsai 2: the inherited Qwen rows stay listed
+# (they fit 24 GB) but are flagged experimental/not re-validated, so a 24 GB
+# machine is recommended the validated b2 pack, never an unvalidated tier.
 cat >"$TMP/bin/sysctl" <<'EOF'
 #!/bin/sh
 [ "$*" = "-n hw.memsize" ] && { echo 25769803776; exit 0; }
@@ -427,8 +427,8 @@ EOF
 chmod +x "$TMP/bin/sysctl"
 PATH="$TMP/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     "$ROOT/packaging/bin/q27" recommend >"$TMP/recommend-24gb"
-grep -Eq '^q38[[:space:]]+14\.63G[[:space:]]+24G[[:space:]]+yes' "$TMP/recommend-24gb"
-grep -Fq 'Recommended pack for this machine: q38' "$TMP/recommend-24gb"
+grep -Eq '^q38[[:space:]]+14\.63G[[:space:]]+24G[[:space:]]+yes\(exp\)' "$TMP/recommend-24gb"
+grep -Fq 'Recommended pack for this machine: b2' "$TMP/recommend-24gb"
 rm -f "$TMP/bin/sysctl"
 
 # Pinned product mismatches may not fall through to legacy source-tree globs.
