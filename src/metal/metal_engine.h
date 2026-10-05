@@ -551,6 +551,11 @@ class MetalEngine {
     void project_pair(const BackendTensor& a, BackendBuffer& a_out,
                       const BackendTensor& b, BackendBuffer& b_out,
                       const BackendBuffer& x_float, const BackendQuantized& xq);
+    // Projections of one input: bonsai weights sharing a rotation binding get
+    // the input rotated once, not per weight (same result, fewer dispatches).
+    using Projection = std::pair<const BackendTensor*, BackendBuffer*>;
+    void project_shared(std::initializer_list<Projection> projections,
+                        const BackendBuffer& x_float, const BackendQuantized& xq);
     void gdn_block(uint32_t layer);
     void attention_block(uint32_t layer, uint32_t pos);
     void ffn(uint32_t layer);

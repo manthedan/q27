@@ -1608,12 +1608,34 @@ void MetalEngine::project(const BackendTensor& w, const BackendBuffer& x_float,
     else backend_.matvec_quantized(w, xq, out);
 }
 
+void MetalEngine::project_shared(std::initializer_list<Projection> projections,
+                                 const BackendBuffer& x_float, const BackendQuantized& xq) {
+    // One rotation serves the group only when every weight is rotated with
+    // the same signs and grouping (signs are keyed by input width).
+    const RotationBinding* shared = nullptr;
+    bool all_same = projections.size() > 1;
+    for (const Projection& p : projections) {
+        const auto it = rotated_weights_.find(p.first);
+        if (it == rotated_weights_.end()) { all_same = false; break; }
+        if (!shared) shared = &it->second;
+        else if (it->second.signs != shared->signs || it->second.grouped_gdn != shared->grouped_gdn ||
+                 p.first->cols != projections.begin()->first->cols) { all_same = false; break; }
+    }
+    if (!all_same) {
+        for (const Projection& p : projections) project(*p.first, x_float, xq, *p.second);
+        return;
+    }
+    const BackendTensor& first = *projections.begin()->first;
+    backend_.bonsai_hadamard(x_float, *shared->signs, *rotation_scratch_,
+                             uint32_t(first.cols), false, shared->grouped_gdn);
+    for (const Projection& p : projections) backend_.matvec(*p.first, *rotation_scratch_, *p.second);
+}
+
 void MetalEngine::project_pair(const BackendTensor& a, BackendBuffer& a_out,
                                const BackendTensor& b, BackendBuffer& b_out,
                                const BackendBuffer& x_float, const BackendQuantized& xq) {
     if (is_bonsai_dtype(a.dtype) || is_bonsai_dtype(b.dtype)) {
-        project(a, x_float, xq, a_out);
-        project(b, x_float, xq, b_out);
+        project_shared({{&a, &a_out}, {&b, &b_out}}, x_float, xq);
     } else {
         backend_.matvec_quantized_pair(a, a_out, b, b_out, xq);
     }
@@ -1640,11 +1662,18 @@ void MetalEngine::gdn_block(uint32_t layer) {
 }
 
 void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
-    project(layer_weight(layer, "attn_q.weight"), *x1_, q5120_, *qg_);
+    const BackendTensor& wq = layer_weight(layer, "attn_q.weight");
+    const BackendTensor& wk = layer_weight(layer, "attn_k.weight");
+    const BackendTensor& wv = layer_weight(layer, "attn_v.weight");
+    if (is_bonsai_dtype(wq.dtype)) {
+        // q, k, v share x1_: one rotation for all three (Bonsai).
+        project_shared({{&wq, qg_.get()}, {&wk, kbuf_.get()}, {&wv, vbuf_.get()}}, *x1_, q5120_);
+    } else {
+        project(wq, *x1_, q5120_, *qg_);
+        project_pair(wk, *kbuf_, wv, *vbuf_, *x1_, q5120_);
+    }
     backend_.rmsnorm_heads(*qg_, layer_weight(layer, "attn_q_norm.weight"),
                            N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS);
-    project_pair(layer_weight(layer,"attn_k.weight"),*kbuf_,
-                 layer_weight(layer,"attn_v.weight"),*vbuf_,*x1_,q5120_);
     backend_.rmsnorm_heads(*kbuf_, layer_weight(layer, "attn_k_norm.weight"),
                            N_KV, HEAD_DIM, HEAD_DIM, EPS);
     backend_.rope_neox(*qg_, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, pos, FREQ_BASE);
