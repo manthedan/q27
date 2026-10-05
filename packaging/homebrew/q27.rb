@@ -15,10 +15,10 @@
 class Q27 < Formula
   desc "Ternary-quantized 27B LLM inference engine for Apple silicon (Metal)"
   homepage "https://github.com/manthedan/q27"
-  url "https://github.com/manthedan/q27/releases/download/metal-v0.6.1/q27-metal-v0.6.1-macos-arm64.tar.gz"
+  url "https://github.com/manthedan/q27/releases/download/metal-v0.7.0/q27-metal-v0.7.0-macos-arm64.tar.gz"
   # Explicit: the asset name's "arm64" otherwise parses as the version.
-  version "0.6.1"
-  sha256 "67fe7b214af92bb75a26af8b0b9978dcb3f984ad8efc8308788b7ecddb9268fa"
+  version "0.7.0"
+  sha256 "aff6f329a550869cffc6e6b117f9f3a13607ca83e0bff82b89f01b47a08845eb"
   license "MIT"
 
   depends_on arch: :arm64
