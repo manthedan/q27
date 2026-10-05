@@ -164,6 +164,37 @@ MOCK_DROP_ONCE="$tmp/drop-once" "$tmp/pkg/bin/q27-fetch" moved >/dev/null
 grep -A1 -F "/resolve/$rev_b/artifact-b.q27" "$tmp/curl.log" | grep -q '^offset=[1-9]'
 [[ "$(sha "$tmp/home/moved/artifact-b.q27")" = "$art_b_sha" ]]
 
+# A pull already running for the pack is refused; a lock left by a dead
+# process is stale and taken over; the lock is released afterwards.
+rm -rf "$tmp/home/moved"
+mkdir -p "$tmp/home/moved/.q27-fetch.lock"
+sleep 30 & live=$!
+echo "$live" >"$tmp/home/moved/.q27-fetch.lock/pid"
+if "$tmp/pkg/bin/q27-fetch" moved >"$tmp/locked.out" 2>&1; then
+  echo "q27-fetch ran while another pull held the pack lock" >&2; exit 1
+fi
+grep -q "another pull of moved is running" "$tmp/locked.out"
+kill "$live"; wait "$live" 2>/dev/null || true
+"$tmp/pkg/bin/q27-fetch" moved >/dev/null
+[[ "$(sha "$tmp/home/moved/artifact-b.q27")" = "$art_b_sha" ]]
+[[ ! -e "$tmp/home/moved/.q27-fetch.lock" ]]
+
+# A symlinked .part must not let the download write through to its target.
+rm -rf "$tmp/home/moved"
+mkdir -p "$tmp/home/moved"
+printf 'victim\n' >"$tmp/victim"
+ln -s "$tmp/victim" "$tmp/home/moved/artifact-b.q27.part"
+"$tmp/pkg/bin/q27-fetch" moved >/dev/null
+[[ "$(cat "$tmp/victim")" = victim ]]
+[[ "$(sha "$tmp/home/moved/artifact-b.q27")" = "$art_b_sha" ]]
+
+# The release archive keeps lib under packaging/ and tools under share/.
+mkdir -p "$tmp/archive/packaging/lib" "$tmp/archive/share/q27-tools"
+cp "$tmp/pkg/lib/q27_bench_lib.sh" "$tmp/archive/packaging/lib/"
+: >"$tmp/archive/share/q27-tools/repack.py"
+found="$(bash -c '. "$1"; q27_bin_repack' _ "$tmp/archive/packaging/lib/q27_bench_lib.sh")"
+[[ "$found" -ef "$tmp/archive/share/q27-tools/repack.py" ]]
+
 rm -rf "$tmp/home/bad-art" "$tmp/home/bad-tok"
 if "$tmp/pkg/bin/q27-fetch" bad-art >/dev/null 2>&1; then
   echo "bad artifact SHA-256 was accepted" >&2; exit 1

@@ -110,8 +110,10 @@ q27_registry_field() {
 q27_tool_py() {
     local name="$1" here
     here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # source tools/, Homebrew libexec/q27/share/q27-tools, release archive
+    # <root>/share/q27-tools (lib is <root>/packaging/lib there).
     for cand in "$here/../../tools/$name" "$here/../share/q27-tools/$name" \
-                "$here/../q27-tools/$name"; do
+                "$here/../../share/q27-tools/$name" "$here/../q27-tools/$name"; do
         [ -f "$cand" ] && { printf '%s' "$cand"; return 0; }
     done
     return 1
