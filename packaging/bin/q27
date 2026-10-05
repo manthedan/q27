@@ -224,7 +224,11 @@ cmd_serve() {
             ;;
         bonsai2-qwen38-v1)
             # Bonsai 2 is Qwen3.8-format: thinking on with an unbounded budget,
-            # the trained sampling defaults, and suffix bursts.
+            # the trained sampling defaults, and suffix bursts. One 16K slot is
+            # the gated 16 GiB configuration (the server's own default is two
+            # auto-sized slots); caller args come later and win.
+            serve_args+=(--ctx "${Q27_SERVE_CONTEXT:-16384}"
+                         --slots "${Q27_SERVE_SLOTS:-1}")
             case "${Q27_SERVE_THINK:-1}" in
                 0|no|false) ;;
                 1|yes|true) serve_args+=(--think --think-budget 0) ;;

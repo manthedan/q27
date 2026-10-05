@@ -480,6 +480,10 @@ grep -A1 '^--temperature-default$' "$TMP/b2-server-args" | grep -qx '1.0'
 grep -A1 '^--top-p-default$' "$TMP/b2-server-args" | grep -qx '0.95'
 grep -A1 '^--top-k-default$' "$TMP/b2-server-args" | grep -qx '20'
 grep -A1 '^--suffix$' "$TMP/b2-server-args" | grep -qx '16'
+grep -A1 '^--slots$' "$TMP/b2-server-args" | grep -qx '1'
+# The profile's --ctx 16384 precedes the caller's --ctx 8192 (server: last wins).
+grep -A1 '^--ctx$' "$TMP/b2-server-args" | grep -x '[0-9]*' | tr '\n' ' ' |
+    grep -qx '16384 8192 '
 tail -2 "$TMP/b2-server-args" | tr '\n' ' ' | grep -qx -- '--ctx 8192 '
 wait_lock_clear || {
     echo "FAIL: b2 serve consumer flock remained held" >&2; exit 1; }
@@ -547,10 +551,14 @@ chmod 755 "$archive/bin/q27" "$archive/bin/q27-metal-server" \
 printf 'fixture-b1-artifact\n' >"$TMP/archive-home/b1/bonsai-27b-b1.q27"
 printf 'Q27Tfixture-b1-tokenizer\n' >"$TMP/archive-home/b1/model.tok"
 ln -s ../../archive/q27-test-macos-arm64/bin/q27 "$TMP/archive-prefix/bin/q27"
+# Only the fake pgrep joins PATH: a model consumer running on this machine
+# must not trip resident detection, and no other fixture binary leaks in.
+mkdir -p "$TMP/pgrep-only"
+cp "$TMP/bin/pgrep" "$TMP/pgrep-only/pgrep"
 Q27_HOME="$TMP/archive-home" Q27_RUN_DIR="$TMP/archive-run" \
     Q27_SERVER_CAPTURE="$TMP/archive-server-args" \
     Q27_SERVER_PROFILE_CAPTURE="$TMP/archive-server-profile" \
-    PATH="/usr/bin:/bin" "$TMP/archive-prefix/bin/q27" serve b1 >/dev/null
+    PATH="$TMP/pgrep-only:/usr/bin:/bin" "$TMP/archive-prefix/bin/q27" serve b1 >/dev/null
 head -2 "$TMP/archive-server-args" >"$TMP/archive-server-paths"
 printf '%s\n%s\n' "$TMP/archive-home/b1/bonsai-27b-b1.q27" \
     "$TMP/archive-home/b1/model.tok" >"$TMP/archive-server-expected"

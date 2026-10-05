@@ -17,37 +17,34 @@ multi-GB weight lifecycle:
     q27 bench --fast   # quick synthetic ceiling + a real decode
     q27 report --full  # build a send-back diagnostic bundle (see below)
 
-The current source checkout adds the native-agent supervisor planned for the
-next tagged release. Friends testing it before that release should build from
-source, place the B1 artifact/tokenizer under `models/` (or `q27 pull b1`),
-and run:
+`q27 agent` runs the native coding agent on the default Bonsai 2 pack:
 
-    make agent
-    # or one-time PATH shim (uses ~/.grok/bin when first on PATH):
-    make install-dev-q27
-    q27 agent b1
+    q27 pull b2        # 6.7 GB, SHA-256 verified
+    q27 agent          # interactive; tools are bounded to the current directory
 
 On a TTY, `q27 agent` prefers the Rust Ratatui client (`q27-tui` / FP1);
 scripts and pipes fall back to the classic linenoise agent. Force either UI
 with `Q27_AGENT_UI=tui` or `Q27_AGENT_UI=classic`.
 
 In `q27-tui`, thinking is **collapsed by default** (one-line summary after the
-turn). Press **`t`** on an empty prompt to expand/collapse the full `<think>`
-trace. Live streaming still shows the open think span in full while it runs.
-**Esc** / **Ctrl-C** cancel the active turn; **`/cancel`** is the same.
+turn). **Ctrl-T** expands/collapses the full `<think>` trace; **Ctrl-Y** switches
+the theme and **Ctrl-O** toggles markdown rendering. Live streaming still shows the open think span
+in full while it runs. **Esc** / **Ctrl-C** cancel the active turn; **`/cancel`**
+is the same.
 
-The underlying `./packaging/bin/q27 agent [pack]` defaults to context 32768,
-adaptive generation limits, automatic tools, and the physical current
-workspace. **Decode is profile-driven:** `packaging/models.tsv` assigns a
-stable `model_profile` independent of pack name and quant label. Bonsai profiles
-soft-default to sampling (T=0.6, top_p=0.95, top_k=20); the Qwen3.8 thinking
-profile uses the card-aligned T=1.0, top_p=0.95, top_k=20; Qwen3.6 stays greedy
-unless you set temperature. Override with:
+`q27 agent [pack]` uses adaptive generation limits, automatic tools, and the
+physical current workspace. **Decode is profile-driven:** `packaging/models.tsv`
+assigns a stable `model_profile` independent of pack name and quant label.
+Bonsai 2 (`bonsai2-qwen38-v1`) runs thinking-on with T=1.0, top_p=0.95,
+top_k=20, a 16K context (the measured fp16-KV ceiling on a 16 GiB Mac), and
+suffix-burst speculation (`--suffix 16`; exact for greedy and sampled decode).
+Bonsai 1 profiles soft-default to T=0.6; the Qwen3.8 thinking profile uses
+T=1.0/0.95/20; Qwen3.6 stays greedy unless you set temperature. Override with:
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `Q27_AGENT_PACK` | `b1` | Model pack name |
-| `Q27_AGENT_CONTEXT` | `32768` | Context window |
+| `Q27_AGENT_PACK` | `b2` | Model pack name |
+| `Q27_AGENT_CONTEXT` | `16384` (Bonsai 2), else `32768` | Context window |
 | `Q27_AGENT_WORKSPACE` | cwd | Tool sandbox root |
 | `Q27_AGENT_MAX_TOKENS` | `auto` | Whole-turn gen bound (thinking **+** answer); `auto` ≤ 16384 |
 | `Q27_AGENT_MAX_THINK_TOKENS` | *unset* (**off**) | After N tokens in open `<think>`, force `</think>` and **continue the answer**; **not** a model feature |
@@ -55,7 +52,9 @@ unless you set temperature. Override with:
 | `Q27_AGENT_SESSION` | *unset* | Session snapshot path |
 | `Q27_AGENT_UI` | `auto` | `tui` \| `classic` \| `auto` |
 | `Q27_AGENT_TEMPERATURE` / `TOP_P` / `TOP_K` / `SEED` | model profile | Sampling; explicit values win and temperature 0 forces greedy |
-| `Q27_AGENT_MTP` | *unset* (**off**) | Opt-in MTP draft width (fenced-body bursts on official packs) |
+| `Q27_AGENT_MTP` | *unset* (**off**) | Opt-in MTP draft width (fenced-body bursts on official packs); replaces suffix bursts when set |
+| `Q27_SERVE_CONTEXT` / `Q27_SERVE_SLOTS` | `16384` / `1` (Bonsai 2) | Server window and slot count for Bonsai 2 packs; other profiles use the server's `--ctx auto` and its slot default |
+| `Q27_SUFFIX` | `16` (Bonsai 2) | Suffix-burst speculation width for `q27 serve`/`q27 agent`; `0` disables; skipped when you pass `--suffix`, `--mtp`, or `--constrain-tools` |
 | `Q27_SERVE_THINK` | profile default | `0` disables or `1` enables the server thinking default |
 | `Q27_SERVE_TEMPERATURE` / `TOP_P` / `TOP_K` | model profile | Server defaults for requests that omit sampling fields; explicit request fields still win |
 
@@ -69,9 +68,9 @@ by `Q27_AGENT_MAX_TOKENS` (or adaptive `auto`). To cap runaway think under
 sampled decode:
 
 ```sh
-Q27_AGENT_MAX_THINK_TOKENS=2048 Q27_AGENT_MAX_TOKENS=4096 q27 agent b1
+Q27_AGENT_MAX_THINK_TOKENS=2048 Q27_AGENT_MAX_TOKENS=4096 q27 agent
 # or disable thinking entirely:
-Q27_AGENT_NO_THINK=1 q27 agent b1
+Q27_AGENT_NO_THINK=1 q27 agent
 ```
 
 When the think cap hits, the agent injects `</think>\n\n` (stream + KV) and
@@ -92,10 +91,12 @@ the server:
 
 Model artifacts (`.q27`) and tokenizers (`.tok`) are NOT in the formula —
 they are multi-GB and carry their own licenses. `q27 pull` fetches and
-checksum-verifies them per `packaging/models.tsv`. See
-[docs/MODELS.md](../docs/MODELS.md) for the pack/context/speed tables.
+checksum-verifies them per `packaging/models.tsv`; `q27 recommend` lists every
+pack. metal-v0.7.0 validates the Bonsai 2 packs (`b2`, `b2-t3`); the other rows
+are marked experimental and were last validated in metal-v0.6.1. See
+[BONSAI2.md](../docs/metal/BONSAI2.md) for gates, speeds and context limits.
 
-The selected Qwen3.8 pack is `q38` (c-small): `q27 pull q38` resolves the
+The Qwen3.8 pack (not re-validated in metal-v0.7.0) is `q38` (c-small): `q27 pull q38` resolves the
 artifact and exact tokenizer at immutable HF commit
 `fc7656476a9a7e83d58151f99620fe19b22b3688`, verifies both SHA-256 values,
 and publishes neither file until the staged pair passes. Every serve/agent
@@ -152,6 +153,22 @@ Release flow: tag (`vX.Y.Z`), push the tag, then update `url`/`sha256` in
     curl -sL https://github.com/manthedan/q27/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
 
 ## Weights (separate from the formula)
+
+### Bonsai 2 (`b2`, `b2-t3`)
+
+`b2` is a lossless repack of Prism ML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`
+(Apache 2.0; "Created using Bonsai by Prism ML") into the slim T2 container
+Metal requires, hosted with its LICENSE, NOTICE and repro command at
+`manthedan/q27-bonsai-packs` (commit `6d59ea13`):
+
+    bonsai2-27b-t2-slim.q27  7,195,341,824 bytes
+    sha256 b85094a0f53c68c25fc73c28e70e05462620417698c7b08a8977d475391f0aeb
+
+`b2-t3` (`bonsai2-27b-t3-slim.q27`) and the shared tokenizer come from
+upstream's `signalnine/Bonsai-2-27B-q27`. Both reproduce byte for byte with
+`tools/repack.py --bonsai2-container t2|t3 --slim` (docs/metal/BONSAI2.md).
+
+### Bonsai 1 T2
 
 The T2 artifact is a bit-exact repack of PrismML's Ternary-Bonsai-27B
 Q2_0 GGUF (QAT ternary of the Qwen3.6-27B base; Apache-licensed per the

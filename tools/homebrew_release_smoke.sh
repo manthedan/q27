@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 && $# -ne 4 ]]; then
-  echo "usage: $0 STAGING_FORMULA QWEN38_PACK [LOCAL_MODEL LOCAL_TOKENIZER]" >&2
+  echo "usage: $0 STAGING_FORMULA PACK [LOCAL_MODEL LOCAL_TOKENIZER]" >&2
   exit 2
 fi
 formula="$1"
@@ -21,16 +21,22 @@ fi
   echo "staging formula must be a regular non-symlink file: $formula" >&2
   exit 1
 }
-[[ -n "$pack" ]] || { echo "Qwen3.8 pack name is empty" >&2; exit 2; }
+[[ -n "$pack" ]] || { echo "pack name is empty" >&2; exit 2; }
 command -v brew >/dev/null 2>&1 || { echo "Homebrew is required" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 PYTHON="${PYTHON:-$(command -v python3)}"
 [[ -x "$PYTHON" ]] || { echo "python3 is required for the release gate" >&2; exit 1; }
 
-expected_ram="${Q27_HOMEBREW_EXPECT_RAM_GB:-24}"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+# The pack's registry row sets the RAM floor and the expected model profile.
+pack_row="$(awk -F'\t' -v n="$pack" '$1==n { print $7 "\t" $13; found++ }
+  END { exit found!=1 }' "$root/packaging/models.tsv")" || {
+  echo "pack $pack is absent or duplicated in packaging/models.tsv" >&2; exit 1; }
+IFS=$'\t' read -r min_ram model_profile <<<"$pack_row"
+min_ram="${Q27_HOMEBREW_MIN_RAM_GB:-$min_ram}"
 ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-[[ "$ram_gb" -eq "$expected_ram" ]] || {
-  echo "Homebrew release smoke requires exactly ${expected_ram} GB RAM; got $ram_gb" >&2
+[[ "$ram_gb" -ge "$min_ram" ]] || {
+  echo "pack $pack needs ${min_ram} GB RAM; this machine has $ram_gb" >&2
   exit 1
 }
 if [[ -n "$(brew list --versions q27 2>/dev/null || true)" ]]; then
@@ -47,7 +53,6 @@ then
   exit 1
 fi
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
 smoke="$(mktemp -d "${TMPDIR:-/tmp}/q27-homebrew-smoke.XXXXXX")"
 installed_attempted=0
 server_pid=""
@@ -89,7 +94,7 @@ pack_policy="$(awk -F'\t' -v n="$pack" '
   $1==n { found++; kind=$9; experimental=$11; artifact=$4; digest=$5 }
   END { if(found!=1) exit 1; print kind "\t" experimental "\t" artifact "\t" digest }
 ' "$registry")" || {
-  echo "selected Qwen3.8 pack is absent or duplicated in the installed registry" >&2
+  echo "selected pack is absent or duplicated in the installed registry" >&2
   exit 1
 }
 IFS=$'\t' read -r source_kind experimental artifact_file artifact_md5 <<<"$pack_policy"
@@ -160,7 +165,7 @@ curl -fsS --max-time 2 http://127.0.0.1:8080/health >/dev/null
 
 env -i HOME="$HOME" PATH="$(dirname "$PYTHON"):/usr/bin:/bin:/usr/sbin:/sbin" \
   TMPDIR="${TMPDIR:-/tmp}" "$PYTHON" "$root/tools/packaged_api_driver.py" \
-  http://127.0.0.1:8080 qwen38-thinking-v1
+  http://127.0.0.1:8080 "$model_profile"
 kill "$server_pid"
 wait "$server_pid" || true
 server_pid=""
@@ -175,4 +180,4 @@ brew uninstall --formula q27
 installed_attempted=0
 trap - EXIT INT TERM HUP
 rm -rf "$smoke"
-echo "Homebrew local-asset Qwen3.8 release smoke: PASS"
+echo "Homebrew release smoke: PASS ($pack, $pack_mode)"

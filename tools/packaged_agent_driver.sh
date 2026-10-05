@@ -74,4 +74,4 @@ require(not any(event.get("type") in ("error", "rejected", "generation_stalled")
                 for event in events), f"native agent emitted a failure event: {types}")
 PY
 
-echo "packaged native-agent Qwen3.8 tool loop: PASS"
+echo "packaged native-agent tool loop: PASS ($pack)"
