@@ -1,34 +1,36 @@
 # QA before releases — the single release checklist
 
-**Status: v2 (2026-07-22, risk tiers + the gate runner).** One place that
-collects the gates currently scattered across the chronicle, `make`
-targets, and `tools/`. A gate with a stale or skipped leg is recorded in
-the release notes with its reason; an unrecorded skip is a process
+**Status: v3 (2026-10-05, Bonsai 2 revival line).** One place that
+collects the release gates. A gate with a stale or skipped leg is recorded
+in the release notes with its reason; an unrecorded skip is a process
 failure (masked-failure lesson: the checklist must be able to fail).
+v3 re-scopes the automated tiers to Bonsai 2 (the release default); the
+§1-§6 checklists below are the v2 (Qwen3.6-era) legs, kept for packs that
+are re-validated later.
 
-## Risk tiers (v2)
+## Risk tiers (v3)
 
 Run the tier matching the release's delta; when in doubt, take the
 higher tier. The tier and its rationale belong in the release notes.
-`tools/release_gates.sh <A|B|C>` runs the whole tier, captures evidence
-to a dated dir, and prints the ledger.
+`tools/release_gates.sh <A|B|C> [evidence-dir]` runs the whole tier,
+strictly serially, captures evidence and prints the ledger. Packs default
+to the t2-slim and t3-slim Bonsai 2 packs under `models/bonsai2/`
+(`Q27_GATE_PACKS`, `Q27_GATE_TOK` override).
 
-- **Tier A — numerics.** Anything touching `src/metal/q27_kernels.metal`,
-  `metal_engine.cpp/.h`, `metal_backend.mm/.h`, `sampling.h`,
-  `tokenizer.*`, `loader.cpp`, KV/snapshot formats. Everything in this
-  document: §1–§4 in full.
-- **Tier B — serving.** Server handlers/protocol (`metal_server.cpp`),
-  shared headers (`api_common.h`, `stream_split.h`, `tool_preamble.h`,
-  `toolgram.h`, `toolconstrain.h`), agent/TUI fronts, CLI. §1 (build,
-  test-cpu, tokenizer), the chunk-parity 384 sentinel (§2 first leg
-  only — proves decode was not touched by accident), §3 live-server
-  gates. Known-at-v2 notes: `constrain_gate.sh`/`ckpt_gate.sh` are
-  CUDA-side scripts (nvcc / CUDA `[gen]` log lines) — record as N/A;
-  G8d (Responses custom tool) rides the qwen36 think-forever pathology
-  and fails on model verbosity, not protocol — record, don't chase.
-- **Tier C — packaging/docs.** Formula, wrapper, README/docs, tooling
-  that never touches the engine: clean build + `test-cpu` +
-  `packaging/test_q27_wrapper.sh`.
+- **Tier C — packaging/docs** (no model): `test-tools`, `test-inspect`,
+  `test-agent`, `test-repack` + `test-bonsai2-repack`, `test-packaging`
+  (wrapper selftest, lock helper, formula staging, fetch manifest),
+  `test-shader-discovery`, the TUI's `cargo test`.
+- **Tier B — serving/agent/engine changes:** C + `test-metal-backend` + per
+  pack the live Bonsai 2 serving, native-agent, Metal recovery and
+  snapshot-reuse gates.
+- **Tier A — numerics:** B + the independent Prism reference oracle
+  (`tools/bonsai2_gate.sh`, needs `PRISM_DIR`) + the 8-restart session soak.
+
+Release candidates additionally run `tools/release_tarball_smoke.sh` on the
+assembled archive (fresh HOME, scrubbed PATH: pull, recommend, serve + API
+contracts, native-agent tool loop) and `tools/homebrew_release_smoke.sh` on
+the staged formula (needs a machine without an existing `q27` keg).
 
 **CUDA-side legs** (§2 yukon gates, `constrain_gate.sh`, `ckpt_gate.sh`)
 run on yukon or not at all; on the Metal lane record them as N/A with
@@ -40,8 +42,8 @@ to run them).
 while the box is in use; take short contended spots and cite the
 chronicle's quiet-machine numbers, or defer with a recorded reason.
 
-Box legend: **M4** = the 24 GB serving Mac (this repo's metal lane),
-**yukon** = the CUDA 5090 box, **mini** = the 16 GB secondary mac.
+Box legend: **M4** = the 24 GB laptop, **mini** = the 16 GB M4 mini (the
+revival's gate machine), **yukon** = the Linux CUDA box.
 
 ## 0. Preconditions
 
