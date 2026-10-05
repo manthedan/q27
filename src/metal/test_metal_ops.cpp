@@ -447,6 +447,29 @@ int test_q8_kv(q27::MetalBackend& backend) {
         if (std::memcmp(chunk_rows.data() + (size_t)t * qh * dim, serial_rows[t].data(), (size_t)qh * dim * 4)) {
             fprintf(stderr, "q8 chunk-causal row %u differs from serial decode\n", t); failures++; break;
         }
+    // Dispatch accounting (tools/perf_ceilings.sh): the blocked-GQA decode
+    // route encodes a producer and a merge dispatch through one encoder where
+    // the serial route encodes one, so the counted difference must be exactly
+    // one. A dispatch that bypasses q27_dispatch_groups/threads makes it 0.
+    {
+        const auto count = [&](uint32_t threshold) {
+            backend.set_gqa_threshold(threshold);
+            const auto before = backend.dispatch_counters();
+            (void)serial_q8(tokens - 1, seq);
+            const auto after = backend.dispatch_counters();
+            return after.dispatches - before.dispatches;
+        };
+        const uint64_t serial = count(0), blocked = count(1);
+        backend.set_gqa_threshold(0);
+        if (blocked != serial + 1) {
+            fprintf(stderr, "dispatch count: blocked GQA %llu vs serial %llu (want serial + 1)\n",
+                    (unsigned long long)blocked, (unsigned long long)serial);
+            failures++;
+        } else {
+            printf("dispatch count: blocked GQA %llu = serial %llu + merge\n",
+                   (unsigned long long)blocked, (unsigned long long)serial);
+        }
+    }
     // Blocked-GQA routes (decode and chunk) vs the serial kernel.
     backend.set_gqa_threshold(1);
     const auto gqa_last = serial_q8(tokens - 1, seq);

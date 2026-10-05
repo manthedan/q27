@@ -61,6 +61,7 @@ for pack in $packs; do
 
     r=$(run prefill512 "$pack" --tokens "$long_prompt" -n 1 --ctx 1024) || exit 1
     set -- $r
+    [ "$1" = 1 ] || { echo "$name: prefill workload generated $1 tokens, expected 1" >&2; exit 1; }
     record "$name" prefill512.command_buffers "$2"
     record "$name" prefill512.dispatches "$3"
 
@@ -68,6 +69,7 @@ for pack in $packs; do
     # difference is exactly 64 decode steps, prefill cancels out.
     r=$(run decode1 "$pack" --tokens "$short_prompt" -n 1 --ctx 512) || exit 1
     set -- $r
+    [ "$1" = 1 ] || { echo "$name: decode workload generated $1 tokens, expected 1" >&2; exit 1; }
     base_cb=$2 base_ops=$3
     r=$(run decode65 "$pack" --tokens "$short_prompt" -n 65 --ctx 512) || exit 1
     set -- $r
@@ -86,8 +88,16 @@ for pack in $packs; do
     record "$name" suffix_copy48.dispatches "$3"
 done
 
+# No packs (e.g. an empty argument) means nothing was measured: not a pass.
+[ -s "$measured" ] || { echo "no workloads measured (empty pack list?)" >&2; exit 2; }
+
 # Compare against ceilings; with --ratchet, write the lowered table back.
-[ -f "$ceilings" ] || printf 'pack\tmetric\tceiling\n' > "$ceilings"
+header=$(printf 'pack\tmetric\tceiling')
+[ -f "$ceilings" ] || printf '%s\n' "$header" > "$ceilings"
+# An empty or headerless table would make awk read the measurements as the
+# table and compare nothing.
+[ "$(head -n 1 "$ceilings")" = "$header" ] || {
+    echo "malformed $ceilings: first line must be the header (pack, metric, ceiling)" >&2; exit 2; }
 awk -F'\t' -v ratchet="$ratchet" -v out="$work/new.tsv" '
     NR == FNR { if (FNR > 1) { key = $1 "\t" $2; ceil[key] = $3; order[++n] = key } else header = $0; next }
     {

@@ -96,6 +96,10 @@ for pack in $packs; do
     record_row "$name" suffix_copy_s "$2" lower
 done
 
+# No packs (e.g. an empty argument) means nothing was measured: neither a
+# pass nor something to record.
+[ -s "$measured" ] || { echo "no journeys measured (empty pack list?)" >&2; exit 2; }
+
 if [ "$record" = 1 ]; then
     # Replace the measured packs' rows; keep every other pack's baseline.
     mkdir -p "$(dirname "$baseline")"
@@ -112,11 +116,13 @@ if [ "$record" = 1 ]; then
     exit 0
 fi
 [ -f "$baseline" ] || { echo "no baseline for $machine ($baseline); run with --record on an idle machine" >&2; exit 1; }
+[ "$(head -n 1 "$baseline")" = "$(printf 'pack\tmetric\tvalue\tbetter')" ] || {
+    echo "malformed $baseline: first line must be the header (pack, metric, value, better)" >&2; exit 2; }
 
 awk -F'\t' -v band="$band" '
-    NR == FNR { if (FNR > 1) base[$1 "\t" $2] = $3; next }
+    NR == FNR { if (FNR > 1) { base[$1 "\t" $2] = $3; order[++n] = $1 "\t" $2 }; next }
     {
-        key = $1 "\t" $2; v = $3 + 0
+        key = $1 "\t" $2; v = $3 + 0; seen[key] = 1; measured_pack[$1] = 1
         if (!(key in base)) { printf "FAIL  %-24s %-16s %10.2f (no baseline; --record on an idle machine)\n", $1, $2, v; fails++; next }
         b = base[key] + 0
         # Slowdown in percent, whichever direction is better.
@@ -125,6 +131,15 @@ awk -F'\t' -v band="$band" '
         if (slow > band) fails++
         printf "%s  %-24s %-16s %10.2f  baseline %10.2f  %+6.1f%% %s\n", tag, $1, $2, v, b, -slow, (slow > 0 ? "slower" : "faster")
     }
-    END { exit fails ? 1 : 0 }' "$baseline" "$measured" && status=0 || status=$?
+    END {
+        # A baseline metric for a measured pack that no journey produced.
+        for (i = 1; i <= n; i++) {
+            split(order[i], kp, "\t")
+            if ((kp[1] in measured_pack) && !(order[i] in seen)) {
+                printf "FAIL  %-24s %-16s not measured (journey removed? re-record in a reviewed commit)\n", kp[1], kp[2]; fails++
+            }
+        }
+        exit fails ? 1 : 0
+    }' "$baseline" "$measured" && status=0 || status=$?
 [ "$status" -eq 0 ] && echo "perf journeys: PASS (band ${band}%)" || echo "perf journeys: FAIL (band ${band}%)"
 exit "$status"

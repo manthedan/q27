@@ -17,7 +17,12 @@ n=1; counters=0; suffix=0
 while [ $# -gt 0 ]; do
   case "$1" in -n) n=$2; shift ;; --counters) counters=1 ;; --suffix) suffix=1; shift ;; esac; shift
 done
-[ "$suffix" = 1 ] && [ -n "${FAKE_SUFFIX_EOS:-}" ] && n=$FAKE_SUFFIX_EOS
+if [ "$suffix" = 1 ] && [ -n "${FAKE_SUFFIX_EOS:-}" ]; then
+  # FAKE_SUFFIX_EOS_CALL=k: only the k-th suffix run stops early.
+  calls=$(( $(cat "$FAKE_STATE/suffix_calls" 2>/dev/null || echo 0) + 1 ))
+  echo "$calls" > "$FAKE_STATE/suffix_calls"
+  [ "$calls" = "${FAKE_SUFFIX_EOS_CALL:-$calls}" ] && n=$FAKE_SUFFIX_EOS
+fi
 [ "${FAKE_FAIL:-0}" = 1 ] && { echo "fake failure" >&2; exit 1; }
 [ -n "${FAKE_EOS:-}" ] && [ "$n" -gt "$FAKE_EOS" ] && n=$FAKE_EOS
 spt=${FAKE_SPT:-0.1}
@@ -32,8 +37,10 @@ SH
 chmod +x "$work/q27-metal"
 mkdir -p "$work/models"
 : > "$work/models/fake-t2.q27"; : > "$work/models/fake-t3.q27"; : > "$work/tok"
-export Q27_METAL_CLI="$work/q27-metal" Q27_GATE_TOK="$work/tok"
+export Q27_METAL_CLI="$work/q27-metal" Q27_GATE_TOK="$work/tok" FAKE_STATE="$work"
 export Q27_PERF_CEILINGS="$work/ceilings.tsv" Q27_PERF_BASELINE="$work/baseline.tsv" Q27_PERF_REPS=2
+export Q27_PERF_BAND=10
+unset Q27_GATE_PACKS
 T2="$work/models/fake-t2.q27" T3="$work/models/fake-t3.q27"
 ceil="$root/tools/perf_ceilings.sh" jour="$root/tools/perf_journeys.sh"
 
@@ -65,6 +72,8 @@ check "unmeasured pack rows are left alone" 0 "PASS" "$ceil" "$T3"
 check "cli failure fails" 1 "q27-metal failed" env FAKE_FAIL=1 "$ceil" "$T3"
 check "missing counters line fails" 1 "no counters line" env FAKE_NOCOUNT=1 "$ceil" "$T3"
 check "early EOS fails" 1 "stopped at" env FAKE_EOS=20 "$ceil" "$T3"
+check "prefill generating nothing fails" 1 "prefill workload generated 0" env FAKE_EOS=0 "$ceil" "$T3"
+check "empty pack list fails" 2 "no workloads measured" "$ceil" ""
 check "early EOS on suffix copy fails" 1 "suffix workload stopped at 40" env FAKE_SUFFIX_EOS=40 "$ceil" "$T2"
 
 # ---- perf_journeys.sh ----
@@ -79,6 +88,23 @@ check "other pack still gated after partial record" 1 "FAIL +fake-t3" env FAKE_S
 grep -v "^fake-t3	decode_tps" "$work/baseline.tsv" > "$work/b" && mv "$work/b" "$work/baseline.tsv"
 check "metric missing from baseline: fails" 1 "FAIL +fake-t3 +decode_tps .*no baseline" "$jour" "$T3"
 check "early EOS on suffix copy fails" 1 "expected 48" env FAKE_SUFFIX_EOS=40 "$jour" "$T2"
+rm -f "$work/suffix_calls"
+check "early EOS in a later repetition only fails" 1 "expected 48" env FAKE_SUFFIX_EOS=40 FAKE_SUFFIX_EOS_CALL=2 "$jour" "$T2"
 check "cli failure fails" 1 "q27-metal failed" env FAKE_FAIL=1 "$jour" "$T2"
+cp "$work/baseline.tsv" "$work/baseline.before"
+check "empty pack list: record refuses" 2 "no journeys measured" "$jour" --record ""
+cmp -s "$work/baseline.tsv" "$work/baseline.before" || { echo "FAIL: empty --record changed the baseline"; exit 1; }
+check "empty pack list: check fails" 2 "no journeys measured" "$jour" ""
+cp "$work/baseline.tsv" "$work/baseline.keep"
+printf 'fake-t2\textra_s\t1.0\tlower\n' >> "$work/baseline.tsv"
+check "baseline row no journey measures: fails" 1 "extra_s +not measured" "$jour" "$T2"
+: > "$work/baseline.tsv"
+check "empty baseline: fails" 2 "malformed" "$jour" "$T2"
+mv "$work/baseline.keep" "$work/baseline.tsv"
+cp "$work/ceilings.tsv" "$work/ceilings.keep"
+: > "$work/ceilings.tsv"
+check "empty ceilings: fails" 2 "malformed" "$ceil" "$T2"
+check "empty ceilings: ratchet refuses too" 2 "malformed" "$ceil" --ratchet "$T2"
+mv "$work/ceilings.keep" "$work/ceilings.tsv"
 
 echo "perf gate tests: $pass passed"

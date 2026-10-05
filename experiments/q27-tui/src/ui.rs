@@ -23,6 +23,19 @@ pub fn draw(
     scroll: u32,
     tick: Instant,
 ) -> u32 {
+    draw_with_spin(frame, model, cache, input, scroll, tick, spinner_char(tick))
+}
+
+/// `draw` with the spinner frame fixed by the caller (tests pin it).
+fn draw_with_spin(
+    frame: &mut Frame,
+    model: &Model,
+    cache: &mut ScrollbackCache,
+    input: &str,
+    scroll: u32,
+    tick: Instant,
+    spin: char,
+) -> u32 {
     let theme = model.theme.palette();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -33,7 +46,7 @@ pub fn draw(
         ])
         .split(frame.area());
 
-    let max_scroll = draw_scrollback(frame, chunks[0], model, cache, scroll, &theme, tick);
+    let max_scroll = draw_scrollback(frame, chunks[0], model, cache, scroll, &theme, spin);
     draw_input(frame, chunks[1], model, input, &theme);
     draw_footer(frame, chunks[2], model, &theme, tick);
     max_scroll
@@ -48,7 +61,9 @@ pub struct ScrollbackCache {
     /// Everything besides the block itself that changes its rendering.
     key: Option<(ThemeId, bool, bool, u16)>,
     entries: Vec<CachedBlock>,
-    /// Lines word-wrapped by the last frame (cost probe for the tests).
+    /// Chars word-wrapped by the last frame (cost probe for the tests). Not
+    /// counted: the per-frame equality check of each block against its cached
+    /// copy (a memcmp over the transcript, ~0.2 ms at 400 turns).
     pub wrapped_last_frame: usize,
 }
 
@@ -68,10 +83,9 @@ fn draw_scrollback(
     cache: &mut ScrollbackCache,
     scroll: u32,
     theme: &Theme,
-    tick: Instant,
+    spin: char,
 ) -> u32 {
     let width = area.width.max(1);
-    let spin = spinner_char(tick);
     let key = (model.theme, model.show_thinking, model.markdown, width);
     if cache.key != Some(key) {
         cache.key = Some(key);
@@ -86,7 +100,7 @@ fn draw_scrollback(
     let header_h = line_heights(&header, width);
     let tail = live_lines(model, theme, spin);
     let tail_h = line_heights(&tail, width);
-    let mut wrapped = header.len() + tail.len();
+    let mut wrapped = line_chars(&header) + line_chars(&tail);
 
     cache.entries.truncate(model.scrollback.len());
     for (i, block) in model.scrollback.iter().enumerate() {
@@ -95,7 +109,7 @@ fn draw_scrollback(
             continue;
         }
         let lines = block_lines(block, model, theme, spin);
-        wrapped += lines.len();
+        wrapped += line_chars(&lines);
         let heights = line_heights(&lines, width);
         let entry = CachedBlock { block: block.clone(), height: heights.iter().sum(), heights, lines };
         if i < cache.entries.len() {
@@ -138,13 +152,58 @@ fn draw_scrollback(
             row += h;
         }
     }
-    wrapped += lines.len();
+    wrapped += line_chars(&lines);
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((offset.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(para, area);
     cache.wrapped_last_frame = wrapped;
     max_scroll
+}
+
+/// Longest line shown, in chars. A single line wraps to at most this many
+/// rows, which keeps a line's in-viewport offset inside ratatui's u16 scroll
+/// (a minified bundle or base64 blob in tool output is one multi-MB line), and
+/// bounds the per-frame cost of re-wrapping a visible line.
+const MAX_LINE_CHARS: usize = 8_192;
+
+fn clip_long_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    for line in lines.iter_mut() {
+        let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if chars <= MAX_LINE_CHARS {
+            continue;
+        }
+        let mut budget = MAX_LINE_CHARS;
+        let mut kept = Vec::new();
+        for span in line.spans.drain(..) {
+            if budget == 0 {
+                break;
+            }
+            let n = span.content.chars().count();
+            if n <= budget {
+                budget -= n;
+                kept.push(span);
+            } else {
+                let cut: String = span.content.chars().take(budget).collect();
+                kept.push(Span::styled(cut, span.style));
+                budget = 0;
+            }
+        }
+        kept.push(Span::styled(
+            format!(" … [{} chars elided]", chars - MAX_LINE_CHARS),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        line.spans = kept;
+    }
+    lines
+}
+
+fn line_chars(lines: &[Line<'static>]) -> usize {
+    lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.chars().count())
+        .sum()
 }
 
 /// Wrapped rows of each line at `width` (ratatui wraps every Line
@@ -193,7 +252,7 @@ fn header_lines(model: &Model, theme: &Theme) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )));
     }
-    lines
+    clip_long_lines(lines)
 }
 
 fn block_lines(block: &Block, model: &Model, theme: &Theme, spin: char) -> Vec<Line<'static>> {
@@ -275,7 +334,7 @@ fn block_lines(block: &Block, model: &Model, theme: &Theme, spin: char) -> Vec<L
             )));
         }
     }
-    lines
+    clip_long_lines(lines)
 }
 
 fn live_lines(model: &Model, theme: &Theme, spin: char) -> Vec<Line<'static>> {
@@ -336,7 +395,7 @@ fn live_lines(model: &Model, theme: &Theme, spin: char) -> Vec<Line<'static>> {
         )));
     }
 
-    lines
+    clip_long_lines(lines)
 }
 
 fn push_thinking_lines(
@@ -578,16 +637,28 @@ mod draw_cost {
         m
     }
 
+    const SPIN: char = '⠋';
+
     fn frame(term: &mut Terminal<TestBackend>, m: &Model, cache: &mut ScrollbackCache, scroll: u32, tick: Instant) -> (u32, Buffer) {
+        frame_spin(term, m, cache, scroll, tick, SPIN)
+    }
+
+    fn frame_spin(
+        term: &mut Terminal<TestBackend>,
+        m: &Model,
+        cache: &mut ScrollbackCache,
+        scroll: u32,
+        tick: Instant,
+        spin: char,
+    ) -> (u32, Buffer) {
         let mut max = 0;
-        term.draw(|f| max = draw(f, m, cache, "", scroll, tick)).unwrap();
+        term.draw(|f| max = draw_with_spin(f, m, cache, "", scroll, tick, spin)).unwrap();
         (max, term.backend().buffer().clone())
     }
 
     /// The pre-cache renderer: whole transcript in one wrapped Paragraph.
-    fn reference(m: &Model, w: u16, h: u16, scroll: u32, tick: Instant) -> (u32, Buffer) {
+    fn reference(m: &Model, w: u16, h: u16, scroll: u32, spin: char) -> (u32, Buffer) {
         let theme = m.theme.palette();
-        let spin = spinner_char(tick);
         let mut lines = header_lines(m, &theme);
         for b in &m.scrollback {
             lines.extend(block_lines(b, m, &theme, spin));
@@ -606,6 +677,10 @@ mod draw_cost {
         (max, term.backend().buffer().clone())
     }
 
+    fn scrollback_cells(buf: &Buffer, w: u16, rows: u16) -> Vec<ratatui::buffer::Cell> {
+        (0..rows).flat_map(|y| (0..w).map(move |x| (x, y))).map(|p| buf[p].clone()).collect()
+    }
+
     fn scrollback_rows(buf: &Buffer, w: u16, rows: u16) -> Vec<String> {
         (0..rows)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
@@ -616,12 +691,17 @@ mod draw_cost {
         let tick = Instant::now();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let (max, got) = frame(&mut term, m, cache, scroll, tick);
-        let (want_max, want) = reference(m, w, h, scroll, tick);
+        let (want_max, want) = reference(m, w, h, scroll, SPIN);
         assert_eq!(max, want_max, "max scroll (w={w} scroll={scroll})");
         assert_eq!(
             scrollback_rows(&got, w, h - 4),
             scrollback_rows(&want, w, h - 4),
             "rows (w={w} scroll={scroll})"
+        );
+        // Styles too: a stale theme keeps the symbols and changes colours.
+        assert!(
+            scrollback_cells(&got, w, h - 4) == scrollback_cells(&want, w, h - 4),
+            "cell styles (w={w} scroll={scroll})"
         );
     }
 
@@ -680,8 +760,8 @@ mod draw_cost {
             frame(&mut term, &m, &mut cache, u32::MAX, tick);
             cost.push(cache.wrapped_last_frame);
         }
-        assert_eq!(cost[0], cost[1], "steady-state wrapped lines: {cost:?}");
-        assert!(cost[1] <= 200, "steady-state frame wraps {} lines", cost[1]);
+        assert_eq!(cost[0], cost[1], "steady-state wrapped chars: {cost:?}");
+        assert!(cost[1] <= 20_000, "steady-state frame wraps {} chars", cost[1]);
     }
 
     /// One block taller than u16::MAX rows: scrolling anywhere in it (and to
@@ -717,11 +797,61 @@ mod draw_cost {
                 assert_eq!(text.trim_end(), expect(top + i), "scroll {top}, row {i}");
             }
             assert!(
-                cache.wrapped_last_frame <= rows as usize + 2,
-                "scroll {top}: wrapped {} lines",
+                cache.wrapped_last_frame <= 20 * (rows as usize + 2),
+                "scroll {top}: wrapped {} chars",
                 cache.wrapped_last_frame
             );
         }
+    }
+
+    /// An open tool card is re-rendered every frame so its spinner animates;
+    /// a cached copy would freeze it (Opus review).
+    #[test]
+    fn open_tool_card_spinner_animates() {
+        let mut m = long_session(2);
+        m.assistant_buf.clear();
+        m.scrollback.push(Block::Tool {
+            kind: "shell".into(),
+            detail: "make".into(),
+            body: "building\n".into(),
+            exit: None,
+            open: true,
+        });
+        let (w, h) = (100u16, 30u16);
+        let mut cache = ScrollbackCache::default();
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let tick = Instant::now();
+        for spin in ['⠋', '⠙', '⠹'] {
+            let (_, got) = frame_spin(&mut term, &m, &mut cache, u32::MAX, tick, spin);
+            let (_, want) = reference(&m, w, h, u32::MAX, spin);
+            assert_eq!(scrollback_rows(&got, w, h - 4), scrollback_rows(&want, w, h - 4), "spin {spin}");
+            assert!(
+                scrollback_rows(&got, w, h - 4).iter().any(|r| r.contains(spin)),
+                "spinner {spin} not on screen"
+            );
+        }
+    }
+
+    /// One line longer than u16::MAX rows (tool output with a minified
+    /// bundle): clipped with a marker, so scrolling to its end neither panics
+    /// nor blanks the viewport (Opus review).
+    #[test]
+    fn single_giant_line_is_clipped_and_scrolls() {
+        let mut m = Model::default();
+        m.phase = Phase::Idle;
+        m.scrollback.push(Block::User("x".repeat(5_000_000)));
+        let (w, h) = (80u16, 24u16);
+        let mut cache = ScrollbackCache::default();
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let tick = Instant::now();
+        let (max, _) = frame(&mut term, &m, &mut cache, u32::MAX, tick);
+        assert!((max as usize) < MAX_LINE_CHARS, "max scroll {max}");
+        let (_, buf) = frame(&mut term, &m, &mut cache, u32::MAX, tick);
+        let rows = scrollback_rows(&buf, w, h - 4);
+        assert!(rows.iter().any(|r| r.contains("chars elided")), "{rows:?}");
+        // The visible giant line is re-wrapped each frame, but only its
+        // clipped MAX_LINE_CHARS, not 5 MB.
+        assert!(cache.wrapped_last_frame <= MAX_LINE_CHARS + 64, "{}", cache.wrapped_last_frame);
     }
 
     /// Wall-clock probe: `cargo test --release draw_cost -- --ignored --nocapture`.
@@ -740,7 +870,7 @@ mod draw_cost {
                 frame(&mut term, &m, &mut cache, u32::MAX, tick);
             }
             eprintln!(
-                "turns={turns:4} per-frame {:8.3} ms, wrapped lines {}",
+                "turns={turns:4} per-frame {:8.3} ms, wrapped chars {}",
                 start.elapsed().as_secs_f64() * 1e3 / frames as f64,
                 cache.wrapped_last_frame
             );
