@@ -552,6 +552,9 @@ struct MetalBackend::Impl {
     // Always-on, deterministic (tools/perf_ceilings.sh ratchets); GPU
     // dispatches are counted in q27_dispatch_groups/threads.
     uint64_t command_buffers_started = 0;
+    // GPU execution time of committed command buffers (GPUEndTime -
+    // GPUStartTime): a speed signal that CPU contention does not distort.
+    double gpu_seconds_total = 0.0;
     double gpu_busy_seconds = 0.0;
     double cpu_wait_seconds = 0.0;
     MTLTimestamp calibration_cpu = 0, calibration_gpu = 0;
@@ -639,6 +642,8 @@ struct MetalBackend::Impl {
             throw std::runtime_error(message);
         }
 #endif
+        if (command.GPUEndTime > command.GPUStartTime)
+            gpu_seconds_total += command.GPUEndTime - command.GPUStartTime;
         if (profile) resolve_profile_samples();
         command = nil;
         batching = false;
@@ -3257,7 +3262,7 @@ void MetalBackend::profile_reset() {
 }
 
 MetalBackend::DispatchCounters MetalBackend::dispatch_counters() const {
-    return {impl_->command_buffers_started, g_dispatches.load(std::memory_order_relaxed)};
+    return {impl_->command_buffers_started, g_dispatches.load(std::memory_order_relaxed), impl_->gpu_seconds_total};
 }
 
 uint64_t MetalBackend::recommended_working_set_size() const {

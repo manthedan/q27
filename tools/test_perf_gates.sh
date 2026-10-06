@@ -30,7 +30,7 @@ case "$pack" in *"${FAKE_SLOW_PACK:-none}"*) spt=$(awk -v s="$spt" 'BEGIN { prin
 echo "Metal model ready on Fake in 1.00 s (shader sha1 0)" >&2
 echo "$n tokens in $(awk -v n="$n" -v s="$spt" 'BEGIN { printf "%.4f", 1 + n * s }') s (1.0 tok/s), position 1" >&2
 if [ "$counters" = 1 ] && [ "${FAKE_NOCOUNT:-0}" != 1 ]; then
-  echo "counters: prompt=1 generated=$n command_buffers=$(( 3 + n * ${FAKE_CB:-1} )) dispatches=$(( 100 + n * ${FAKE_DISP:-10} ))" >&2
+  echo "counters: prompt=1 generated=$n command_buffers=$(( 3 + n * ${FAKE_CB:-1} )) dispatches=$(( 100 + n * ${FAKE_DISP:-10} )) gpu_ms=1.25" >&2
 fi
 echo "generated:x"
 SH

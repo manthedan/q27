@@ -188,10 +188,11 @@ int main(int argc, char** argv) {
             // Generation only (load excluded); one machine-readable line for
             // tools/perf_ceilings.sh.
             const auto after = engine.backend().dispatch_counters();
-            fprintf(stderr, "counters: prompt=%zu generated=%zu command_buffers=%llu dispatches=%llu\n",
+            fprintf(stderr, "counters: prompt=%zu generated=%zu command_buffers=%llu dispatches=%llu gpu_ms=%.2f\n",
                     prompt.size(), generated.size(),
                     static_cast<unsigned long long>(after.command_buffers - counters_before.command_buffers),
-                    static_cast<unsigned long long>(after.dispatches - counters_before.dispatches));
+                    static_cast<unsigned long long>(after.dispatches - counters_before.dispatches),
+                    (after.gpu_seconds - counters_before.gpu_seconds) * 1e3);
         }
 
         const auto finished = std::chrono::steady_clock::now();

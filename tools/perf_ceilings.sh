@@ -47,7 +47,7 @@ run() {
     local tag=$1 pack=$2 out; shift 2
     out=$("$cli" "$pack" "$tok" "$@" --counters 2>&1 >/dev/null) || {
         echo "$out" >&2; echo "q27-metal failed ($tag)" >&2; return 1; }
-    out=$(echo "$out" | sed -n 's/^counters: prompt=[0-9]* generated=\([0-9]*\) command_buffers=\([0-9]*\) dispatches=\([0-9]*\)$/\1 \2 \3/p')
+    out=$(echo "$out" | sed -n 's/^counters: prompt=[0-9]* generated=\([0-9]*\) command_buffers=\([0-9]*\) dispatches=\([0-9]*\)\( gpu_ms=.*\)\{0,1\}$/\1 \2 \3/p')
     [ -n "$out" ] || { echo "q27-metal printed no counters line ($tag)" >&2; return 1; }
     echo "$out"
 }

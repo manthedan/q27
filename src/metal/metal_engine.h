@@ -484,6 +484,10 @@ class MetalEngine {
     std::unordered_map<const BackendTensor*, RotationBinding> rotated_weights_;
     std::unordered_map<uint32_t, std::shared_ptr<BackendBuffer>> rotation_signs_;
     std::shared_ptr<BackendBuffer> rotation_scratch_;
+    // Serial decode: true when no projection fed by the 5120-wide norms reads
+    // the int8 activation copy (all-Bonsai packs), so the norm skips
+    // quantization. The float output is computed identically either way.
+    bool decode_norm_float_only_ = false;
     // Bonsai 2 batched prefill (T2 packs): chunk projections rotate float
     // rows into crot_ and run the float T2 GEMM instead of int8 activations.
     bool bonsai_chunk_ = false;

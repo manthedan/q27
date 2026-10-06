@@ -570,6 +570,18 @@ MetalEngine::MetalEngine(std::shared_ptr<Shared> shared, uint32_t context, KvKin
                 rotation_signs_.at(uint32_t(w.cols)), name.find(".ssm_out.") != std::string::npos});
         }
     }
+    {
+        // Every projection fed by attn_norm / post_attention_norm / output_norm.
+        const std::vector<const char*> attention_inputs = {"attn_q.weight", "attn_k.weight", "attn_v.weight",
+                                                          "ffn_gate.weight", "ffn_up.weight"};
+        const std::vector<const char*> gdn_inputs = {"attn_qkv.weight", "attn_gate.weight",
+                                                    "ffn_gate.weight", "ffn_up.weight"};
+        bool all_bonsai = is_bonsai_dtype(weight("output.weight").dtype);
+        for (uint32_t layer = 0; layer < N_LAYER; layer++)
+            for (const char* leaf : attention_layer(layer) ? attention_inputs : gdn_inputs)
+                all_bonsai = all_bonsai && is_bonsai_dtype(layer_weight(layer, leaf).dtype);
+        decode_norm_float_only_ = all_bonsai;
+    }
     layers_.resize(N_LAYER);
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         if (attention_layer(layer)) {
@@ -1755,15 +1767,18 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_f
         backend_.copy(*rotation_scratch_, 0, *h_, 0, uint64_t(N_EMBD) * 4);
     }
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
-        backend_.rmsnorm_quantized(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+        if (decode_norm_float_only_) backend_.rmsnorm(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS);
+        else backend_.rmsnorm_quantized(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
         if (attention_layer(layer)) attention_block(layer, pos); else gdn_block(layer);
         backend_.add_inplace(*h_, *y_, N_EMBD);
-        backend_.rmsnorm_quantized(*h_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+        if (decode_norm_float_only_) backend_.rmsnorm(*h_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS);
+        else backend_.rmsnorm_quantized(*h_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
         ffn(layer);
         backend_.add_inplace(*h_, *y_, N_EMBD);
     }
     if(produce_logits)
-        backend_.rmsnorm_quantized(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+        if (decode_norm_float_only_) backend_.rmsnorm(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS);
+        else backend_.rmsnorm_quantized(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
     else
         backend_.rmsnorm(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS);
     if (produce_logits) {

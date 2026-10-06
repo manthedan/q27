@@ -332,7 +332,9 @@ class MetalBackend final : public ComputeBackend {
     // GPU dispatches encoded (process-wide). Same model, prompt and greedy
     // decode give the same counts on every run, so tools/perf_ceilings.sh
     // gates on the difference across a workload.
-    struct DispatchCounters { uint64_t command_buffers = 0; uint64_t dispatches = 0; };
+    // gpu_seconds is not deterministic (it is time), but CPU load does not
+    // distort it: the A/B signal for small kernel changes on a busy machine.
+    struct DispatchCounters { uint64_t command_buffers = 0; uint64_t dispatches = 0; double gpu_seconds = 0.0; };
     DispatchCounters dispatch_counters() const;
 
     uint64_t recommended_working_set_size() const;
