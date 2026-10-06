@@ -1,7 +1,7 @@
 # DFlash2 speculative decoding on Metal — plan (2026-10-06)
 
 Written with Astra (gpt-6-astra, session 01a11340), against master 5dcf4df.
-Status: **plan; M1 is the go/no-go milestone.**
+Status: **M1 measured — NO-GO on M4 for now** (see "M1 outcome" below). The plan stands for hardware with more matrix throughput.
 
 ## Why
 
@@ -120,3 +120,37 @@ Notes:
   agent traffic first.
 - The parked `q27_matvec_t2_g128_x2` s_k = 1.093 is aggregate speedup: two
   vectors cost ~1.83 single passes. The new K=2 prototype measures 1.38.
+
+## M1 outcome (2026-10-06, mini M4) — NO-GO on M4
+
+Measured per full Bonsai 2 layer stack (head excluded), GPU min-of-N, decode
+step ~72 ms:
+
+| verify kernel | W=1 | W=4 | W=8 | exactness |
+|---|---|---|---|---|
+| prefill GEMM, 16-token tile (before) | 292 | 299 | 300 | chunk-path numerics |
+| same, 8-token tile (`q27_matmul_t2_mm_f8`, landed a620712) | 166 | 171 | 174 | bitwise = 16-token tile |
+| 8-token tile, 64 rows/TG | — | 176 | 180 | bitwise |
+| 8-token tile, register scale fold (no Sc round trip) | — | 175 | 178 | bitwise |
+| register-direct MMA, no threadgroup memory (MLX fragment layout, verified on M4) | 193+ | 200+ | 201+ | bitwise |
+| K-vector select-form (exact vs decode) | — | 4.9x–65x | 136x | bitwise = decode matvec |
+
+Why it stops there: the M4 GPU's matrix peak is **3.85 TFLOP/s** (resident
+operands, half x float = float x float = half x half; `scratchpad mma_peak`).
+An 8-token tile does 389 GFLOP per layer stack whatever W is (4 tokens pad to
+8), so ~101 ms at 100% of peak; the 8-token kernel runs at ~59% (174 ms), the
+production prefill at ~72%. The exact select-form path is ALU-bound per vector
+(~4 ops per weight per vector; decode itself sits near both limits).
+
+With verify ~170 ms, `speedup = 80A / (25 + V + 10W)` at A=3.8 is ~1.29x at
+W=4 and ~1.11x at W=8 (Astra) — before any acceptance loss at W=4, and against
+13–22 days of work. Below the plan's gate (verify <= 130 ms at W=4, needing
+~78% of matrix peak). Not pursued further on M4.
+
+What landed from M1: the 8-token tile for small batches (bit-identical,
+6-token prompt 386 -> 264 ms GPU; helps short follow-up turns and prefill
+tails). Suffix bursts verify 16 tokens per round, so they keep the 16 tile.
+
+Revisit when: Apple GPUs with much higher matrix throughput per byte of
+bandwidth (e.g. M5-class GPUs with per-core neural accelerators), or a
+drafter/verify scheme that needs fewer target FLOPs per accepted token.
