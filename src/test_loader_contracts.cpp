@@ -100,6 +100,41 @@ int main() {
         return 1;
     }
 
+    // T2 reserved-code scan (64-bit word path): codes 0..2 in every field
+    // pattern pass, including 2-then-1 neighbours whose bits are adjacent;
+    // a single code 3 at any byte/field is rejected.
+    {
+        uint8_t t2[64];
+        uint8_t t2_scales[4] = {};
+        q27::Tensor t2_tensor;
+        t2_tensor.name = "test.t2";
+        t2_tensor.dtype = DType::T2_G128;
+        t2_tensor.shape = {2, 128};
+        t2_tensor.data = t2;
+        t2_tensor.scales = t2_scales;
+        t2_tensor.data_size = sizeof(t2);
+        t2_tensor.scales_size = sizeof(t2_scales);
+        for (size_t i = 0; i < sizeof(t2); i++) {
+            const unsigned codes[4] = {unsigned(i % 3), unsigned((i / 3) % 3), 2u, 1u};
+            t2[i] = uint8_t(codes[0] | codes[1] << 2 | codes[2] << 4 | codes[3] << 6);
+        }
+        if (!q27::validate_tensor_payload(t2_tensor).empty()) {
+            std::fputs("valid T2 payload rejected\n", stderr);
+            return 1;
+        }
+        for (size_t i = 0; i < sizeof(t2); i++) {
+            for (int field = 0; field < 4; field++) {
+                const uint8_t saved = t2[i];
+                t2[i] = uint8_t(t2[i] | (3u << (2 * field)));
+                if (q27::validate_tensor_payload(t2_tensor) != "T2 payload contains reserved code 3") {
+                    std::fprintf(stderr, "T2 code 3 at byte %zu field %d accepted\n", i, field);
+                    return 1;
+                }
+                t2[i] = saved;
+            }
+        }
+    }
+
     std::puts("loader CUDA dtype contracts: PASS");
     return 0;
 }

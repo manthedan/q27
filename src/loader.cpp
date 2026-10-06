@@ -6,6 +6,9 @@
 #include <unistd.h>
 
 #include <cstring>
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -83,7 +86,17 @@ std::string validate_tensor_payload(const Tensor& tensor) {
 
 
     if (tensor.dtype == DType::T2_G128) {
-        for (uint64_t i = 0; i < tensor.data_size; i++) {
+        // A 2-bit field is 3 iff both its bits are set: test 32 fields per
+        // 64-bit word (the per-field byte loop made a 6.7 GB pack take ~13 s
+        // to open), then the tail bytes field by field.
+        constexpr uint64_t low_bits = 0x5555555555555555ull;
+        uint64_t i = 0;
+        for (; i + 8 <= tensor.data_size; i += 8) {
+            uint64_t word;
+            std::memcpy(&word, tensor.data + i, 8);
+            if (word & (word >> 1) & low_bits) return "T2 payload contains reserved code 3";
+        }
+        for (; i < tensor.data_size; i++) {
             const uint8_t byte = tensor.data[i];
             for (int shift = 0; shift < 8; shift += 2)
                 if (((byte >> shift) & 3u) == 3u)
@@ -222,9 +235,14 @@ Model Model::open(const std::string& path) {
     struct stat st{};
     if (fstat(fd, &st) != 0) { close(fd); throw std::runtime_error("q27: fstat failed"); }
     size_t sz = (size_t)st.st_size;
-    void* base = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    void* base = mmap(nullptr, sz, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (base == MAP_FAILED) throw std::runtime_error("q27: mmap failed");
+    // Open validates every payload byte front to back, then the backend reads
+    // it all again: ask for sequential read-ahead of the whole file instead
+    // of one page fault per 16 KiB (advisory; failure is harmless).
+    madvise(base, sz, MADV_SEQUENTIAL);
+    madvise(base, sz, MADV_WILLNEED);
 
     Model m;
     m.map_base_ = base;
@@ -295,12 +313,29 @@ Model Model::open(const std::string& path) {
                                          t.name);
             t.scales = nullptr;
         }
-        const std::string payload_error = validate_tensor_payload(t);
-        if (!payload_error.empty())
-            throw std::runtime_error("q27: invalid tensor payload " + t.name + ": " +
-                                     payload_error);
         m.index.emplace(t.name, i);
     }
+    // Payload scans touch every byte of the mapping; on macOS each first touch
+    // of a 16 KiB page is a soft fault, and one thread faulting through a
+    // 6.7 GB pack took ~11 s. Faults on different cores proceed in parallel,
+    // so scan tensors concurrently there. The first failing tensor in file
+    // order is reported, as with the sequential scan.
+    std::vector<std::string> payload_errors(m.tensors.size());
+    struct ScanJob { const std::vector<Tensor>* tensors; std::vector<std::string>* errors; };
+    ScanJob job{&m.tensors, &payload_errors};
+    auto scan = [](void* context, size_t i) {
+        auto* j = static_cast<ScanJob*>(context);
+        (*j->errors)[i] = validate_tensor_payload((*j->tensors)[i]);
+    };
+#ifdef __APPLE__
+    dispatch_apply_f(m.tensors.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job, scan);
+#else
+    for (size_t i = 0; i < m.tensors.size(); i++) scan(&job, i);
+#endif
+    for (size_t i = 0; i < m.tensors.size(); i++)
+        if (!payload_errors[i].empty())
+            throw std::runtime_error("q27: invalid tensor payload " + m.tensors[i].name + ": " +
+                                     payload_errors[i]);
     return m;
 }
 
