@@ -1,7 +1,7 @@
 // Metal simdgroup-MMA peak probe: half x float, float x float and half x half
 // 8x8x8 MMAs on resident operands, four independent accumulator chains, all
-// stored to device memory (dead chains were optimized away in earlier
-// versions and read 15-19 TFLOP/s). Mini M4: 3.85 TFLOP/s for all three.
+// stored to device memory per simdgroup (dead chains were optimized away in
+// earlier versions and read 15-19 TFLOP/s). Mini M4: 3.83-3.95 TFLOP/s for all three.
 //   c++ -O2 -std=c++17 -fobjc-arc tools/metal_mma_peak.mm -framework Foundation -framework Metal -o build/metal_mma_peak
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -11,7 +11,8 @@ static const char* kSrc = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 template <typename TA, typename TB>
-inline void body(device float *out, uint gid, ushort lane, uint iters, threadgroup float *t) {
+inline void body(device float *out, uint gid, ushort lane, ushort sg, uint iters, threadgroup float *tg) {
+    threadgroup float *t = tg + sg * 256;   // private staging per simdgroup
     // Operands from memory (non-uniform): no constant folding.
     for (uint i = lane; i < 64; i += 32) t[i] = float((i * 37 + gid) % 17) * 0.01f;
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -29,12 +30,12 @@ inline void body(device float *out, uint gid, ushort lane, uint iters, threadgro
         simdgroup_multiply_accumulate(c3, a, b1, c3);
     }
     // Every accumulator reaches device memory: no chain is dead.
-    device float *o = out + (ulong)gid * 1024 + (lane / 32) * 256;
+    device float *o = out + (ulong)gid * 1024 + sg * 256;   // private output per simdgroup
     simdgroup_store(c0, o, 8); simdgroup_store(c1, o + 64, 8); simdgroup_store(c2, o + 128, 8); simdgroup_store(c3, o + 192, 8);
 }
-kernel void mma_hf(device float *out [[buffer(0)]], constant uint &iters [[buffer(1)]], uint gid [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) { threadgroup float t[256]; body<half, float>(out, gid, lane, iters, t); }
-kernel void mma_ff(device float *out [[buffer(0)]], constant uint &iters [[buffer(1)]], uint gid [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) { threadgroup float t[256]; body<float, float>(out, gid, lane, iters, t); }
-kernel void mma_hh(device float *out [[buffer(0)]], constant uint &iters [[buffer(1)]], uint gid [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) { threadgroup float t[256]; body<half, half>(out, gid, lane, iters, t); }
+kernel void mma_hf(device float *out [[buffer(0)]], constant uint &iters [[buffer(1)]], uint gid [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { threadgroup float t[4 * 256]; body<half, float>(out, gid, lane, sg, iters, t); }
+kernel void mma_ff(device float *out [[buffer(0)]], constant uint &iters [[buffer(1)]], uint gid [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { threadgroup float t[4 * 256]; body<float, float>(out, gid, lane, sg, iters, t); }
+kernel void mma_hh(device float *out [[buffer(0)]], constant uint &iters [[buffer(1)]], uint gid [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { threadgroup float t[4 * 256]; body<half, half>(out, gid, lane, sg, iters, t); }
 )MSL";
 int main() { @autoreleasepool {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); NSError* e = nil;
