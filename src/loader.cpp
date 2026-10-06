@@ -238,9 +238,15 @@ Model Model::open(const std::string& path) {
     void* base = mmap(nullptr, sz, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (base == MAP_FAILED) throw std::runtime_error("q27: mmap failed");
-    // Open validates every payload byte front to back, then the backend reads
-    // it all again: ask for sequential read-ahead of the whole file instead
-    // of one page fault per 16 KiB (advisory; failure is harmless).
+    // MAP_SHARED maps the page cache directly (MAP_PRIVATE re-faulted every
+    // page on each start). Contract, for either mapping type: a pack is never
+    // modified in place while mapped -- q27 pull replaces packs by rename, so
+    // a mapped inode keeps its bytes; in-place writes would change weights
+    // after validation, and truncation can SIGBUS.
+    // Open validates every payload byte front to back: ask for sequential
+    // read-ahead of the whole file (advisory; failure is harmless). Reset to
+    // normal after validation so the scan hint does not invite early
+    // reclamation during upload.
     madvise(base, sz, MADV_SEQUENTIAL);
     madvise(base, sz, MADV_WILLNEED);
 
@@ -332,6 +338,7 @@ Model Model::open(const std::string& path) {
 #else
     for (size_t i = 0; i < m.tensors.size(); i++) scan(&job, i);
 #endif
+    madvise(base, sz, MADV_NORMAL);
     for (size_t i = 0; i < m.tensors.size(); i++)
         if (!payload_errors[i].empty())
             throw std::runtime_error("q27: invalid tensor payload " + m.tensors[i].name + ": " +
