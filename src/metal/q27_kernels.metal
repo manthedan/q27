@@ -1970,119 +1970,6 @@ kernel void q27_matmul_t2_mm(
 // Float-activation T2 chunk GEMM (Bonsai 2 batched prefill): the tiling of
 // q27_matmul_t2_mm with float activations staged directly instead of int8 x
 // scale, matching the serial path's float-activation T2 GEMV contract.
-kernel void q27_matmul_t2_mm_f(
-        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
-        device const float *x [[buffer(2)]],
-        device float *out [[buffer(3)]], constant MatmulArgs &args [[buffer(4)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float Wt[32 * 64];
-    threadgroup float Xt[64 * 16];
-    threadgroup float Sc[4 * 128];
-    const uint row0 = group.x * 32;
-    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
-    if (row0 >= args.rows) return;
-    const uint rlast = args.rows - 1;
-    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
-    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
-    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
-    const uint xtok = tok0 + xloc;                       // device rows are global
-    const bool xvalid = xtok < args.x_rows;
-    device const float *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
-    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
-    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
-    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
-    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    float4 racc = 0.0f;
-    threadgroup float *sc = Sc + sg * 128;
-    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
-        {
-            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
-            threadgroup float *dst = Wt + wrow * 64 + wcb;
-            dst[0]  = float(int(wp         & 3u) - 1);
-            dst[1]  = float(int((wp >>  2) & 3u) - 1);
-            dst[2]  = float(int((wp >>  4) & 3u) - 1);
-            dst[3]  = float(int((wp >>  6) & 3u) - 1);
-            dst[4]  = float(int((wp >>  8) & 3u) - 1);
-            dst[5]  = float(int((wp >> 10) & 3u) - 1);
-            dst[6]  = float(int((wp >> 12) & 3u) - 1);
-            dst[7]  = float(int((wp >> 14) & 3u) - 1);
-            dst[8]  = float(int((wp >> 16) & 3u) - 1);
-            dst[9]  = float(int((wp >> 18) & 3u) - 1);
-            dst[10] = float(int((wp >> 20) & 3u) - 1);
-            dst[11] = float(int((wp >> 22) & 3u) - 1);
-            dst[12] = float(int((wp >> 24) & 3u) - 1);
-            dst[13] = float(int((wp >> 26) & 3u) - 1);
-            dst[14] = float(int((wp >> 28) & 3u) - 1);
-            dst[15] = float(int((wp >> 30)      ) - 1);
-        }
-        {
-            const float4 xa = xvalid ? *(device const float4 *)(xsrc + c0 + xcb) : 0.0f;
-            const float4 xb = xvalid ? *(device const float4 *)(xsrc + c0 + xcb + 4) : 0.0f;
-            threadgroup float *dst = Xt + xcb * 16 + xloc;
-            dst[0 * 16] = xa.x; dst[1 * 16] = xa.y; dst[2 * 16] = xa.z; dst[3 * 16] = xa.w;
-            dst[4 * 16] = xb.x; dst[5 * 16] = xb.y; dst[6 * 16] = xb.z; dst[7 * 16] = xb.w;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint k8 = 0; k8 < 64; k8 += 8) {
-            simdgroup_float8x8 a, b;
-            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
-            simdgroup_load(b, Xt + k8 * 16, 16);
-            simdgroup_multiply_accumulate(acc0, a, b, acc0);
-            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
-            simdgroup_multiply_accumulate(acc1, a, b, acc1);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // One weight scale spans 128 columns = two 64-column tiles: keep the
-        // MMA accumulators across both and flush (scale fold) once per scale
-        // group. cols is a multiple of 128, so the last tile always flushes.
-        if (c0 & 64) {
-            simdgroup_store(acc0, sc, 8);
-            simdgroup_store(acc1, sc + 64, 8);
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            const float wsA = float(weight_scales[wsrowA + c0 / 128]);
-            const float wsB = float(weight_scales[wsrowB + c0 / 128]);
-            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
-                    float4(wsA, wsB, wsA, wsB);
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        }
-    }
-    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
-    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
-    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
-    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
-    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
-}
-
-// Half-staging variant of the T2 chunk GEMM (default path,
-// Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
-// variant G′): tiles are half — doubled simdgroup-MMA rate, halved
-// threadgroup traffic — and BOTH operands stay integer-exact in half: trits
-// on the weight side, raw int8 on the activation side. Accumulators are
-// FLOAT (mixed-precision MMA), keeping int8 x trit sums exact to 2^24.
-// Scales fold at the flush instead of at staging: each 64-K staged tile
-// accumulates its two 32-K sub-slabs (the x-scale groups) into separate
-// accumulator pairs, folded into racc in ONE barrier region per tile with
-// component (row, token) scaled by ws(row) * xs(token, sub-slab). (Variant
-// A staged prescaled activations and failed the shape suite; half
-// ACCUMULATION rounds past 2048 — variant B's 32-K half flush moved the
-// 2K NLL +0.4%.)
-// Trit code -> half bit pattern: (c-1) as f16 is one of three constants
-// (code 3 decodes to +2, preserving the arithmetic unpack's behavior for
-// a corrupt pack byte). The MMA roofline measured the unpack/convert
-// chain at 13.5% of the production GEMM (C/Beq, docs/plans/2026-07-16-
-// mma-roofline.md); constructing the bit pattern directly deletes the
-// integer subtract and int->half convert per element — the roofline's
-// ONE authorized targeted round. The staged halves are identical values,
-// so kernel output is bit-identical to the arithmetic unpack (pre/post
-// artifact A/B gates the change).
-constant ushort q27_t2_half_lut[4] = {0xbc00, 0x0000, 0x3c00, 0x4000};
-
 // Byte -> 4 trit halves (little-endian codes): one constant-memory gather
 // replaces four shift/mask/select chains. 2 KB, generated from the 2-bit
 // code map (code 3 -> +2.0h, matching the arithmetic unpack).
@@ -2344,6 +2231,116 @@ constant half4 q27_t2_half4_lut[256] = {
     half4(1.0h, 2.0h, 2.0h, 2.0h),
     half4(2.0h, 2.0h, 2.0h, 2.0h),
 };
+
+kernel void q27_matmul_t2_mm_f(
+        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
+        device const float *x [[buffer(2)]],
+        device float *out [[buffer(3)]], constant MatmulArgs &args [[buffer(4)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    // Weights stage as half: the trits (-1/0/+1, unscaled) are
+    // exact in half, so the mixed half x float MMA computes the same products
+    // as float staging, with half the threadgroup traffic and footprint
+    // (bit-identical outputs; tools/metal_t2_prefill_bench.mm: -17% GEMM).
+    // Activations and accumulators stay float.
+    threadgroup half Wt[32 * 64];
+    threadgroup float Xt[64 * 16];
+    threadgroup float Sc[4 * 128];
+    const uint row0 = group.x * 32;
+    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
+    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
+    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xtok = tok0 + xloc;                       // device rows are global
+    const bool xvalid = xtok < args.x_rows;
+    device const float *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
+    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
+    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
+    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float4 racc = 0.0f;
+    threadgroup float *sc = Sc + sg * 128;
+    for (uint c0 = 0; c0 < args.cols; c0 += 64) {
+        {
+            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
+            // One byte-LUT gather per 4 trits (wcb is a multiple of 16, so the
+            // half4 stores are aligned).
+            threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
+            dst[0] = q27_t2_half4_lut[wp         & 0xffu];
+            dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
+            dst[2] = q27_t2_half4_lut[(wp >> 16) & 0xffu];
+            dst[3] = q27_t2_half4_lut[wp >> 24         ];
+        }
+        {
+            const float4 xa = xvalid ? *(device const float4 *)(xsrc + c0 + xcb) : 0.0f;
+            const float4 xb = xvalid ? *(device const float4 *)(xsrc + c0 + xcb + 4) : 0.0f;
+            threadgroup float *dst = Xt + xcb * 16 + xloc;
+            dst[0 * 16] = xa.x; dst[1 * 16] = xa.y; dst[2 * 16] = xa.z; dst[3 * 16] = xa.w;
+            dst[4 * 16] = xb.x; dst[5 * 16] = xb.y; dst[6 * 16] = xb.z; dst[7 * 16] = xb.w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k8 = 0; k8 < 64; k8 += 8) {
+            simdgroup_half8x8 a;
+            simdgroup_float8x8 b;
+            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
+            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_multiply_accumulate(acc0, a, b, acc0);
+            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
+            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // One weight scale spans 128 columns = two 64-column tiles: keep the
+        // MMA accumulators across both and flush (scale fold) once per scale
+        // group. cols is a multiple of 128, so the last tile always flushes.
+        if (c0 & 64) {
+            simdgroup_store(acc0, sc, 8);
+            simdgroup_store(acc1, sc + 64, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+            const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA, wsB, wsA, wsB);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
+    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
+    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
+    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+}
+
+// Half-staging variant of the T2 chunk GEMM (default path,
+// Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
+// variant G′): tiles are half — doubled simdgroup-MMA rate, halved
+// threadgroup traffic — and BOTH operands stay integer-exact in half: trits
+// on the weight side, raw int8 on the activation side. Accumulators are
+// FLOAT (mixed-precision MMA), keeping int8 x trit sums exact to 2^24.
+// Scales fold at the flush instead of at staging: each 64-K staged tile
+// accumulates its two 32-K sub-slabs (the x-scale groups) into separate
+// accumulator pairs, folded into racc in ONE barrier region per tile with
+// component (row, token) scaled by ws(row) * xs(token, sub-slab). (Variant
+// A staged prescaled activations and failed the shape suite; half
+// ACCUMULATION rounds past 2048 — variant B's 32-K half flush moved the
+// 2K NLL +0.4%.)
+// Trit code -> half bit pattern: (c-1) as f16 is one of three constants
+// (code 3 decodes to +2, preserving the arithmetic unpack's behavior for
+// a corrupt pack byte). The MMA roofline measured the unpack/convert
+// chain at 13.5% of the production GEMM (C/Beq, docs/plans/2026-07-16-
+// mma-roofline.md); constructing the bit pattern directly deletes the
+// integer subtract and int->half convert per element — the roofline's
+// ONE authorized targeted round. The staged halves are identical values,
+// so kernel output is bit-identical to the arithmetic unpack (pre/post
+// artifact A/B gates the change).
+constant ushort q27_t2_half_lut[4] = {0xbc00, 0x0000, 0x3c00, 0x4000};
+
 
 kernel void q27_matmul_t2_mm_h(
         device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
