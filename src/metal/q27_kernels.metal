@@ -2232,29 +2232,27 @@ constant half4 q27_t2_half4_lut[256] = {
     half4(2.0h, 2.0h, 2.0h, 2.0h),
 };
 
-kernel void q27_matmul_t2_mm_f(
-        device const uchar *weights [[buffer(0)]], device const half *weight_scales [[buffer(1)]],
-        device const float *x [[buffer(2)]],
-        device float *out [[buffer(3)]], constant MatmulArgs &args [[buffer(4)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
+// TOK = token tile: 16 for prefill chunks; 8 for small batches (speculative
+// verify, short tails), where a 16-wide tile would pad half its MMA work. Both
+// instances run the same per-element MMA sequence and scale flushes, so their
+// outputs are bit-identical to each other (tools/metal_t2_prefill_bench.mm).
+template <uint TOK>
+inline void q27_matmul_t2_mm_f_body(
+        device const uchar *weights, device const half *weight_scales, device const float *x,
+        device float *out, constant MatmulArgs &args, uint2 group, uint tid, ushort lane, ushort sg,
+        threadgroup half *Wt, threadgroup float *Xt, threadgroup float *Sc) {
     // Weights stage as half: the trits (-1/0/+1, unscaled) are
     // exact in half, so the mixed half x float MMA computes the same products
     // as float staging, with half the threadgroup traffic and footprint
     // (bit-identical outputs; tools/metal_t2_prefill_bench.mm: -17% GEMM).
     // Activations and accumulators stay float.
-    threadgroup half Wt[32 * 64];
-    threadgroup float Xt[64 * 16];
-    threadgroup float Sc[4 * 128];
     const uint row0 = group.x * 32;
-    const uint tok0 = group.y * 16;   // 16-token tile (wide-chunk grid)
+    const uint tok0 = group.y * TOK;
     if (row0 >= args.rows) return;
     const uint rlast = args.rows - 1;
     const uint wrow = tid / 4, wcb = (tid % 4) * 16;
     device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
-    const uint xloc = tid % 16, xcb = (tid / 16) * 8;   // Xt column is tile-local
+    const uint xloc = tid % TOK, xcb = (tid / TOK) * (TOK / 2);   // Xt column is tile-local
     const uint xtok = tok0 + xloc;                       // device rows are global
     const bool xvalid = xtok < args.x_rows;
     device const float *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
@@ -2264,7 +2262,7 @@ kernel void q27_matmul_t2_mm_f(
     simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     float4 racc = 0.0f;
-    threadgroup float *sc = Sc + sg * 128;
+    threadgroup float *sc = Sc + sg * 8 * TOK;
     for (uint c0 = 0; c0 < args.cols; c0 += 64) {
         {
             const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
@@ -2277,21 +2275,26 @@ kernel void q27_matmul_t2_mm_f(
             dst[3] = q27_t2_half4_lut[wp >> 24         ];
         }
         {
+            // Both loads before any store (latency hiding), as the 16-only kernel did.
             const float4 xa = xvalid ? *(device const float4 *)(xsrc + c0 + xcb) : 0.0f;
-            const float4 xb = xvalid ? *(device const float4 *)(xsrc + c0 + xcb + 4) : 0.0f;
-            threadgroup float *dst = Xt + xcb * 16 + xloc;
-            dst[0 * 16] = xa.x; dst[1 * 16] = xa.y; dst[2 * 16] = xa.z; dst[3 * 16] = xa.w;
-            dst[4 * 16] = xb.x; dst[5 * 16] = xb.y; dst[6 * 16] = xb.z; dst[7 * 16] = xb.w;
+            const float4 xb = TOK == 16 && xvalid ? *(device const float4 *)(xsrc + c0 + xcb + 4) : 0.0f;
+            threadgroup float *dst = Xt + xcb * TOK + xloc;
+            dst[0 * TOK] = xa.x; dst[1 * TOK] = xa.y; dst[2 * TOK] = xa.z; dst[3 * TOK] = xa.w;
+            if (TOK == 16) {
+                dst[4 * TOK] = xb.x; dst[5 * TOK] = xb.y; dst[6 * TOK] = xb.z; dst[7 * TOK] = xb.w;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint k8 = 0; k8 < 64; k8 += 8) {
             simdgroup_half8x8 a;
             simdgroup_float8x8 b;
             simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
-            simdgroup_load(b, Xt + k8 * 16, 16);
+            simdgroup_load(b, Xt + k8 * TOK, TOK);
             simdgroup_multiply_accumulate(acc0, a, b, acc0);
-            simdgroup_load(b, Xt + k8 * 16 + 8, 16);
-            simdgroup_multiply_accumulate(acc1, a, b, acc1);
+            if (TOK == 16) {
+                simdgroup_load(b, Xt + k8 * TOK + 8, TOK);
+                simdgroup_multiply_accumulate(acc1, a, b, acc1);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // One weight scale spans 128 columns = two 64-column tiles: keep the
@@ -2299,23 +2302,44 @@ kernel void q27_matmul_t2_mm_f(
         // group. cols is a multiple of 128, so the last tile always flushes.
         if (c0 & 64) {
             simdgroup_store(acc0, sc, 8);
-            simdgroup_store(acc1, sc + 64, 8);
+            if (TOK == 16) simdgroup_store(acc1, sc + 64, 8);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             const float wsA = float(weight_scales[wsrowA + c0 / 128]);
             const float wsB = float(weight_scales[wsrowB + c0 / 128]);
-            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
-                    float4(wsA, wsB, wsA, wsB);
+            if (TOK == 16)
+                racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                        float4(wsA, wsB, wsA, wsB);
+            else
+                racc.xy += float2(sc[lane], sc[lane + 32]) * float2(wsA, wsB);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            if (TOK == 16) acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         }
     }
     const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
     if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
     if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
-    if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
-    if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+    if (TOK == 16) {
+        if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
+        if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+    }
 }
+
+#define Q27_MATMUL_T2_MM_F(NAME, TOK)                                                              \
+kernel void NAME(device const uchar *weights [[buffer(0)]],                                       \
+                 device const half *weight_scales [[buffer(1)]], device const float *x [[buffer(2)]], \
+                 device float *out [[buffer(3)]], constant MatmulArgs &args [[buffer(4)]],          \
+                 uint2 group [[threadgroup_position_in_grid]],                                     \
+                 uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], \
+                 ushort sg [[simdgroup_index_in_threadgroup]]) {                                   \
+    threadgroup half Wt[32 * 64];                                                                  \
+    threadgroup float Xt[64 * TOK];                                                                \
+    threadgroup float Sc[4 * 8 * TOK];                                                             \
+    q27_matmul_t2_mm_f_body<TOK>(weights, weight_scales, x, out, args, group, tid, lane, sg,       \
+                                 Wt, Xt, Sc);                                                      \
+}
+Q27_MATMUL_T2_MM_F(q27_matmul_t2_mm_f, 16)
+Q27_MATMUL_T2_MM_F(q27_matmul_t2_mm_f8, 8)
 
 // Half-staging variant of the T2 chunk GEMM (default path,
 // Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
