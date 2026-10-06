@@ -1,9 +1,9 @@
 // T2 float-activation prefill GEMM microbenchmark (Bonsai 2 chunked prefill).
 //
-//   build/metal_t2_prefill_bench KERNELS.metal name:tok [name:tok ...]
+//   build/metal_t2_prefill_bench KERNELS.metal name[:tok[:rows_per_tg[:threads]]] ...
 //
 // Each kernel has the q27_matmul_t2_mm_f signature (weights, scales, float x,
-// out, MatmulArgs) and a 32-row x `tok`-token tile on 128 threads. Runs every
+// out, MatmulArgs); default tile 32 rows x 16 tokens on 128 threads. Runs every
 // per-chunk projection shape of a t2-slim layer stack at X_ROWS tokens
 // (default 96 = PREFILL_CHUNK_MAX), arms interleaved per trial, and prints GPU
 // ms per chunk (token-weighted by calls per chunk) plus max relative output
@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -29,7 +30,7 @@ const Shape kShapes[] = {
     {6144, 5120, 48},   {12288, 5120, 16}, {1024, 5120, 32},
 };
 struct MatmulArgs { uint32_t rows, cols, x_rows, simdgroups; };
-struct Arm { std::string name; uint32_t tok = 16; id<MTLComputePipelineState> pso; };
+struct Arm { std::string name; uint32_t tok = 16, rows_per_tg = 32, threads = 128; id<MTLComputePipelineState> pso; };
 
 }  // namespace
 
@@ -48,9 +49,17 @@ int main(int argc, char** argv) {
         std::vector<Arm> arms;
         for (int i = 2; i < argc; i++) {
             Arm a; std::string spec = argv[i];
-            const size_t c = spec.find(':');
-            a.name = spec.substr(0, c);
-            if (c != std::string::npos) a.tok = (uint32_t)std::stoul(spec.substr(c + 1));
+            // name[:tok[:rows_per_tg[:threads]]]
+            std::vector<std::string> f;
+            for (size_t p = 0, c; ; p = c + 1) {
+                c = spec.find(':', p);
+                f.push_back(spec.substr(p, c == std::string::npos ? std::string::npos : c - p));
+                if (c == std::string::npos) break;
+            }
+            a.name = f[0];
+            if (f.size() > 1) a.tok = (uint32_t)std::stoul(f[1]);
+            if (f.size() > 2) a.rows_per_tg = (uint32_t)std::stoul(f[2]);
+            if (f.size() > 3) a.threads = (uint32_t)std::stoul(f[3]);
             id<MTLFunction> fn = [lib newFunctionWithName:@(a.name.c_str())];
             if (!fn) { fprintf(stderr, "no kernel %s\n", a.name.c_str()); return 1; }
             a.pso = [dev newComputePipelineStateWithFunction:fn error:&err];
@@ -81,7 +90,12 @@ int main(int argc, char** argv) {
             __fp16* sp = (__fp16*)sc.contents;
             for (uint64_t i = 0; i < sb / 2; i++) sp[i] = (__fp16)(0.01f + 0.02f * (rng() % 1000) / 1000.0f);
             float* xp = (float*)x.contents;
-            for (uint64_t i = 0; i < (uint64_t)s.cols * x_rows; i++) xp[i] = std::sin(0.37f * (float)(i % 9973)) + 0.01f * (float)(rng() % 100);
+            // X_SCALE stretches activations past half's range (65504) and below
+            // its precision, so a kernel that rounded activations to half fails
+            // the bitwise comparison below.
+            const float x_scale = getenv("X_SCALE") ? (float)atof(getenv("X_SCALE")) : 1.0f;
+            for (uint64_t i = 0; i < (uint64_t)s.cols * x_rows; i++)
+                xp[i] = x_scale * (std::sin(0.37f * (float)(i % 9973)) + 0.01f * (float)(rng() % 100) + 1e-4f * (float)(rng() % 7));
             MatmulArgs args{s.rows, s.cols, x_rows, 1};
             flops_chunk += 2.0 * s.rows * s.cols * x_rows * s.calls;
 
@@ -102,8 +116,9 @@ int main(int argc, char** argv) {
                     [enc setBuffer:outs[k] offset:0 atIndex:3];
                     [enc setBytes:&args length:sizeof(args) atIndex:4];
                     for (int r = 0; r < reps; r++)
-                        [enc dispatchThreadgroups:MTLSizeMake((s.rows + 31) / 32, (x_rows + a.tok - 1) / a.tok, 1)
-                            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        [enc dispatchThreadgroups:MTLSizeMake((s.rows + a.rows_per_tg - 1) / a.rows_per_tg,
+                                                              (x_rows + a.tok - 1) / a.tok, 1)
+                            threadsPerThreadgroup:MTLSizeMake(a.threads, 1, 1)];
                     [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
                     if (cb.status == MTLCommandBufferStatusError) { fprintf(stderr, "%s failed\n", a.name.c_str()); return 1; }
                     best[k] = std::min(best[k], (cb.GPUEndTime - cb.GPUStartTime) / reps);
@@ -114,8 +129,17 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < arms.size(); k++) {
                 const float* o = (const float*)outs[k].contents;
                 double max_rel = 0.0;
-                for (uint64_t i = 0; i < (uint64_t)s.rows * x_rows; i++)
+                uint64_t bit_diffs = 0, nonfinite = 0;
+                for (uint64_t i = 0; i < (uint64_t)s.rows * x_rows; i++) {
                     max_rel = std::max(max_rel, (double)std::fabs(o[i] - ref[i]) / (std::fabs(ref[i]) + 1e-2));
+                    uint32_t ob, rb;
+                    std::memcpy(&ob, &o[i], 4); std::memcpy(&rb, &ref[i], 4);
+                    bit_diffs += ob != rb;
+                    nonfinite += !std::isfinite(o[i]);
+                }
+                if (bit_diffs || nonfinite)
+                    fprintf(stderr, "  %s %ux%u: %llu values differ bitwise, %llu non-finite\n", arms[k].name.c_str(),
+                            s.rows, s.cols, (unsigned long long)bit_diffs, (unsigned long long)nonfinite);
                 chunk_ms[k] += best[k] * 1e3 * s.calls;
                 char cell[64];
                 snprintf(cell, sizeof cell, "%7.3f ms (d %.0e)", best[k] * 1e3, max_rel);
