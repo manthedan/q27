@@ -673,8 +673,32 @@ def _require_qwen38_metadata(reader, label):
                 f"{name}: {actual!r} != {expected!r}")
 
 
+def _check_recurrent_layers(primary, companion):
+    """Newer llama.cpp GGUFs carry a per-layer qwen35.attention.recurrent_layers
+    array (2026-10, e.g. bytkim/Qwen3.8-27B-pi-GGUF): 64 entries in the base
+    view, 65 in the MTP view, whose extra trailing 0 is the MTP block (full
+    attention, not recurrent). Accept exactly that shape, and only when it
+    agrees with full_attention_interval; older GGUFs carry neither."""
+    name = "qwen35.attention.recurrent_layers"
+    pf, cf = primary.fields.get(name), companion.fields.get(name)
+    if pf is None and cf is None:
+        return
+    if pf is None or cf is None:
+        raise ValueError(f"--mtp architecture metadata mismatch: {name} present in one view only")
+    p = _normalized_metadata(pf.contents())
+    c = _normalized_metadata(cf.contents())
+    iv = _normalized_metadata(primary.fields["qwen35.full_attention_interval"].contents())
+    want = [0 if (i + 1) % iv == 0 else 1 for i in range(64)]
+    if p != want or c != want + [0]:
+        raise ValueError(f"--mtp architecture metadata mismatch: {name} "
+                         f"(primary {len(p)} entries, companion {len(c)}; expected the "
+                         f"full_attention_interval={iv} pattern plus a trailing MTP 0)")
+
+
 def _check_split_architecture_metadata(primary, companion):
-    allowed = {"qwen35.block_count", "qwen35.nextn_predict_layers"}
+    allowed = {"qwen35.block_count", "qwen35.nextn_predict_layers",
+               "qwen35.attention.recurrent_layers"}  # checked by _check_recurrent_layers
+    _check_recurrent_layers(primary, companion)
     primary_fields = {name: _normalized_metadata(field.contents())
                       for name, field in primary.fields.items()
                       if name.startswith("qwen35.") and name not in allowed}
@@ -857,8 +881,10 @@ def main():
                          "engine's T2 embedding lookups and head GEMV are bitwise the Q8 ones) and "
                          "no output_q4.weight copy -- 9.44 -> ~7.5 GB, the 12 GB-card pack (2026-09-19)")
     ap.add_argument("--name", default=None,
-                    help="general.name to write for Bonsai 2 packs (default 'Bonsai2 Ternary Qwen38 27b'; "
-                         "must contain qwen38 for the engine's dialect/template keying)")
+                    help="general.name to write (Bonsai 2 packs default to 'Bonsai2 Ternary Qwen38 27b'; "
+                         "other packs keep the GGUF's unless given). Must contain qwen38 for the "
+                         "engine's XML dialect and 3.8 template keying -- set it for 3.8 fine-tunes "
+                         "whose GGUF name lacks it)")
     ap.add_argument("--report", type=int, default=15)
     ap.add_argument("--q8", default=None,
                     help="extra tensor-name regex forced to Q8_G128 (v1.4 policy experiments)")
@@ -1006,6 +1032,14 @@ def main():
     if mtp_reader:
         meta["qwen35.block_count"] = 65
         meta["qwen35.nextn_predict_layers"] = 1
+        rl = mtp_reader.fields.get("qwen35.attention.recurrent_layers")
+        if rl is not None:  # the 65-entry view (validated in merge_mtp_tensors)
+            meta["qwen35.attention.recurrent_layers"] = _normalized_metadata(rl.contents())
+    if args.name and not bonsai2:
+        # Fine-tunes ship arbitrary general.name values ("Source Step8 Derived
+        # Mtp" for bytkim/Qwen3.8-27B-pi); the engine keys the XML tool
+        # dialect and the 3.8 template rules on a "qwen38" substring.
+        meta["general.name"] = args.name
     if bonsai2:
         # The GGUF's general.name is "Hf"; the engine keys the tool dialect and
         # the 3.8 template rules on a "qwen38" substring (api_common.h

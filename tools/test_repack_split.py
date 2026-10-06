@@ -128,6 +128,22 @@ def main():
         Reader("Qwen3.8-27B", 65, companion_tensors(), nextn=1,
                metadata={"qwen35.embedding_length": 5120.0}),
     )
+    # newer llama.cpp GGUFs: per-layer recurrent_layers, 64 + a trailing MTP 0
+    iv = repack.QWEN35_REQUIRED_METADATA["qwen35.full_attention_interval"]
+    rl64 = [0 if (i + 1) % iv == 0 else 1 for i in range(64)]
+    rl_key = "qwen35.attention.recurrent_layers"
+    def rl_pair(p_rl, c_rl):
+        pm = {"qwen35.embedding_length": 5120}
+        cm = {"qwen35.embedding_length": 5120}
+        if p_rl is not None: pm[rl_key] = p_rl
+        if c_rl is not None: cm[rl_key] = c_rl
+        return (Reader("Qwen3.8-27B", 64, tensors_for(repack.QWEN35_BASE_TENSORS), metadata=pm),
+                Reader("Qwen3.8-27B", 65, companion_tensors(), nextn=1, metadata=cm))
+    assert len(repack.merge_mtp_tensors(*rl_pair(rl64, rl64 + [0]))) == 866
+    expect_error("present in one view only", *rl_pair(rl64, None))
+    expect_error("recurrent_layers", *rl_pair(rl64, rl64))          # no MTP entry
+    expect_error("recurrent_layers", *rl_pair(rl64, rl64 + [1]))    # MTP marked recurrent
+    expect_error("recurrent_layers", *rl_pair([1] * 64, [1] * 64 + [0]))  # contradicts the interval
     expect_error(
         "primary tensor manifest mismatch",
         Reader("Qwen3.8-27B", 64,
