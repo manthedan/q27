@@ -136,7 +136,7 @@ step ~72 ms:
 | K-vector select-form (exact vs decode) | — | 4.9x–65x | 136x | bitwise = decode matvec |
 
 Why it stops there: the M4 GPU's matrix peak is **3.85 TFLOP/s** (resident
-operands, half x float = float x float = half x half; `scratchpad mma_peak`).
+operands, half x float = float x float = half x half; `tools/metal_mma_peak.mm`).
 An 8-token tile does 389 GFLOP per layer stack whatever W is (4 tokens pad to
 8), so ~101 ms at 100% of peak; the 8-token kernel runs at ~59% (174 ms), the
 production prefill at ~72%. The exact select-form path is ALU-bound per vector
