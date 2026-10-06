@@ -2036,16 +2036,21 @@ kernel void q27_matmul_t2_mm_f(
             simdgroup_multiply_accumulate(acc1, a, b, acc1);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_store(acc0, sc, 8);
-        simdgroup_store(acc1, sc + 64, 8);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        const float wsA = float(weight_scales[wsrowA + c0 / 128]);
-        const float wsB = float(weight_scales[wsrowB + c0 / 128]);
-        racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
-                float4(wsA, wsB, wsA, wsB);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        // One weight scale spans 128 columns = two 64-column tiles: keep the
+        // MMA accumulators across both and flush (scale fold) once per scale
+        // group. cols is a multiple of 128, so the last tile always flushes.
+        if (c0 & 64) {
+            simdgroup_store(acc0, sc, 8);
+            simdgroup_store(acc1, sc + 64, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const float wsA = float(weight_scales[wsrowA + c0 / 128]);
+            const float wsB = float(weight_scales[wsrowB + c0 / 128]);
+            racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
+                    float4(wsA, wsB, wsA, wsB);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
     }
     const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
     if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
