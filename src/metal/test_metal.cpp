@@ -392,9 +392,15 @@ int test_t2(q27::MetalBackend& backend) {
                 return 1;
             }
         }
+        // Large enough to pass every size check as both input and output, so
+        // only the alias guard can reject it.
+        auto aliased = backend.allocate(cols * sizeof(float));
+        backend.write(*aliased, 0, x.data(), x.size() * sizeof(float));
         bool aliased_rejected = false;
-        try { backend.matvec_accumulate(device_weight, *acc_y, *acc_y); }
-        catch (const std::runtime_error&) { aliased_rejected = true; }
+        try { backend.matvec_accumulate(device_weight, *aliased, *aliased); }
+        catch (const std::runtime_error& error) {
+            aliased_rejected = std::string(error.what()).find("aliases") != std::string::npos;
+        }
         if (!aliased_rejected) { fputs("T2 accumulate accepted aliased input/output\n", stderr); return 1; }
     }
     auto quantized = backend.allocate_quantized(cols);
