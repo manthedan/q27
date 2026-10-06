@@ -1620,6 +1620,23 @@ void MetalEngine::project(const BackendTensor& w, const BackendBuffer& x_float,
     else backend_.matvec_quantized(w, xq, out);
 }
 
+void MetalEngine::project_residual(const BackendTensor& w, const BackendBuffer& x_float,
+                                   const BackendQuantized& xq) {
+    if (w.dtype == DType::T2_G128) {
+        const auto rotation = rotated_weights_.find(&w);
+        if (rotation != rotated_weights_.end()) {
+            backend_.bonsai_hadamard(x_float, *rotation->second.signs, *rotation_scratch_,
+                                     uint32_t(w.cols), false, rotation->second.grouped_gdn);
+            backend_.matvec_accumulate(w, *rotation_scratch_, *h_);
+        } else {
+            backend_.matvec_accumulate(w, x_float, *h_);
+        }
+        return;
+    }
+    project(w, x_float, xq, *y_);
+    backend_.add_inplace(*h_, *y_, N_EMBD);
+}
+
 void MetalEngine::project_shared(std::initializer_list<Projection> projections,
                                  const BackendBuffer& x_float, const BackendQuantized& xq) {
     // One rotation serves the group only when every weight is rotated with
@@ -1670,7 +1687,7 @@ void MetalEngine::gdn_block(uint32_t layer) {
                             *gated_out_, GDN_HEADS, GDN_DIM, EPS);
     const BackendTensor& ssm_out_w = layer_weight(layer, "ssm_out.weight");
     if (!is_bonsai_dtype(ssm_out_w.dtype)) backend_.quantize(*gated_out_, q6144_);
-    project(ssm_out_w, *gated_out_, q6144_, *y_);
+    project_residual(ssm_out_w, *gated_out_, q6144_);
 }
 
 void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
@@ -1736,7 +1753,7 @@ void MetalEngine::attention_block(uint32_t layer, uint32_t pos) {
     backend_.sigmoid_gate_mul(*attn_out_, *qg_, N_HEAD, HEAD_DIM);
     const BackendTensor& attn_out_w = layer_weight(layer, "attn_output.weight");
     if (!is_bonsai_dtype(attn_out_w.dtype)) backend_.quantize(*attn_out_, q6144_);
-    project(attn_out_w, *attn_out_, q6144_, *y_);
+    project_residual(attn_out_w, *attn_out_, q6144_);
 }
 
 void MetalEngine::ffn(uint32_t layer) {
@@ -1745,7 +1762,7 @@ void MetalEngine::ffn(uint32_t layer) {
     backend_.silu_mul(*ffn_gate_, *ffn_up_, *ffn_gate_, N_FFN);
     const BackendTensor& ffn_down_w = layer_weight(layer, "ffn_down.weight");
     if (!is_bonsai_dtype(ffn_down_w.dtype)) backend_.quantize(*ffn_gate_, q17408_);
-    project(ffn_down_w, *ffn_gate_, q17408_, *y_);
+    project_residual(ffn_down_w, *ffn_gate_, q17408_);
 }
 
 // position_ advances at the call site after successful finish, so a backend
@@ -1769,16 +1786,14 @@ void MetalEngine::encode_token(uint32_t token, bool produce_logits, bool token_f
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
         if (decode_norm_float_only_) backend_.rmsnorm(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS);
         else backend_.rmsnorm_quantized(*h_,layer_weight(layer,"attn_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+        // Blocks add their output projection into h_ (project_residual).
         if (attention_layer(layer)) attention_block(layer, pos); else gdn_block(layer);
-        backend_.add_inplace(*h_, *y_, N_EMBD);
         if (decode_norm_float_only_) backend_.rmsnorm(*h_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS);
         else backend_.rmsnorm_quantized(*h_,layer_weight(layer,"post_attention_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
         ffn(layer);
-        backend_.add_inplace(*h_, *y_, N_EMBD);
     }
-    if(produce_logits)
-        if (decode_norm_float_only_) backend_.rmsnorm(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS);
-        else backend_.rmsnorm_quantized(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
+    if (produce_logits && !decode_norm_float_only_)
+        backend_.rmsnorm_quantized(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS,q5120_);
     else
         backend_.rmsnorm(*h_,weight("output_norm.weight"),*x1_,N_EMBD,EPS);
     if (produce_logits) {

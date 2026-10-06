@@ -52,6 +52,9 @@ class MetalBackend final : public ComputeBackend {
     void poison() noexcept;
     void matvec(const BackendTensor& weight, const BackendBuffer& x,
                 BackendBuffer& y) override;
+    // y += W·x (T2_G128 only): the decode residual add folded into the
+    // projection epilogue. Bit-identical to matvec + add_inplace.
+    void matvec_accumulate(const BackendTensor& weight, const BackendBuffer& x, BackendBuffer& y);
     void matvec_pair(const BackendTensor& a, BackendBuffer& a_out,
                      const BackendTensor& b, BackendBuffer& b_out,
                      const BackendBuffer& x) override;
@@ -360,6 +363,8 @@ class MetalBackend final : public ComputeBackend {
     bool supports_quantized_matmul() const;
 
   private:
+    void matvec_impl(const BackendTensor& weight, const BackendBuffer& x, BackendBuffer& y,
+                     bool accumulate);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

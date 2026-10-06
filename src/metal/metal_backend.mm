@@ -287,6 +287,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> q8;
     id<MTLComputePipelineState> q4;
     id<MTLComputePipelineState> t2;
+    id<MTLComputePipelineState> t2_acc;
     id<MTLComputePipelineState> t3;
     id<MTLComputePipelineState> b1;
     id<MTLComputePipelineState> t2_quantized_matmul_h;
@@ -747,6 +748,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->q8 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_g128");
         impl_->q4 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_g64");
         impl_->t2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128");
+        impl_->t2_acc = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_g128_acc");
         impl_->t3 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t3_g128");
         impl_->b1 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_g128");
         impl_->mask_logits_p = make_pipeline(impl_->device, impl_->library, @"q27_mask_logits");
@@ -1174,6 +1176,19 @@ void MetalBackend::poison() noexcept {
 
 void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
                           BackendBuffer& y) {
+    matvec_impl(weight, x, y, false);
+}
+
+void MetalBackend::matvec_accumulate(const BackendTensor& weight, const BackendBuffer& x,
+                                     BackendBuffer& y) {
+    if (weight.dtype != DType::T2_G128)
+        throw std::runtime_error("q27 Metal: matvec_accumulate supports T2_G128 only");
+    if (&x == &y) throw std::runtime_error("q27 Metal: matvec_accumulate input aliases output");
+    matvec_impl(weight, x, y, true);
+}
+
+void MetalBackend::matvec_impl(const BackendTensor& weight, const BackendBuffer& x,
+                               BackendBuffer& y, bool accumulate) {
     if (!weight.data) throw std::runtime_error("q27 Metal: matvec weight has no data");
     if (!weight.rows || !weight.cols || weight.rows > UINT32_MAX || weight.cols > UINT32_MAX)
         throw std::runtime_error("q27 Metal: unsupported matvec dimensions");
@@ -1213,7 +1228,10 @@ void MetalBackend::matvec(const BackendTensor& weight, const BackendBuffer& x,
         case DType::F16: pipeline = impl_->f16; label = "q27_matvec_f16"; break;
         case DType::Q8_G128: pipeline = impl_->q8; label = "q27_matvec_q8_g128"; break;
         case DType::Q4_G64: pipeline = impl_->q4; label = "q27_matvec_q4_g64"; break;
-        case DType::T2_G128: pipeline = impl_->t2; label = "q27_matvec_t2_g128"; break;
+        case DType::T2_G128:
+            pipeline = accumulate ? impl_->t2_acc : impl_->t2;
+            label = accumulate ? "q27_matvec_t2_g128_acc" : "q27_matvec_t2_g128";
+            break;
         case DType::T3_G128: pipeline = impl_->t3; label = "q27_matvec_t3_g128"; break;
         case DType::B1_G128: pipeline = impl_->b1; label = "q27_matvec_b1_g128"; break;
         // No Metal kernel: rejected above. The case is still listed because this

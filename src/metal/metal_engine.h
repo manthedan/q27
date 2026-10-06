@@ -557,6 +557,10 @@ class MetalEngine {
                       const BackendBuffer& x_float, const BackendQuantized& xq);
     // Projections of one input: bonsai weights sharing a rotation binding get
     // the input rotated once, not per weight (same result, fewer dispatches).
+    // h_ += w·x: T2 weights accumulate in the matvec epilogue (bit-identical,
+    // one dispatch fewer); other dtypes project into y_ and add_inplace.
+    void project_residual(const BackendTensor& w, const BackendBuffer& x_float,
+                          const BackendQuantized& xq);
     using Projection = std::pair<const BackendTensor*, BackendBuffer*>;
     void project_shared(std::initializer_list<Projection> projections,
                         const BackendBuffer& x_float, const BackendQuantized& xq);

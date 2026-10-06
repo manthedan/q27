@@ -170,15 +170,11 @@ kernel void q27_matvec_q4_g64(
 // Lane layout: lane/8 picks one of four 128-column blocks in flight,
 // (lane%8)*16 the 16-element slice within it; each lane's slice sits inside
 // one scale group by construction.
-kernel void q27_matvec_t2_g128(
-        device const uchar *weights [[buffer(0)]],
-        device const half  *scales  [[buffer(1)]],
-        device const float *x       [[buffer(2)]],
-        device       float *out     [[buffer(3)]],
-        constant MatvecArgs &args   [[buffer(4)]],
-        uint group                   [[threadgroup_position_in_grid]],
-        ushort lane                  [[thread_index_in_simdgroup]],
-        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+template <bool ACCUMULATE>
+inline void q27_matvec_t2_g128_body(
+        device const uchar *weights, device const half *scales, device const float *x,
+        device float *out, constant MatvecArgs &args,
+        uint group, ushort lane, ushort simdgroup) {
     const uint row0 = group * 32 + (uint)simdgroup * 4;   // 32 rows per threadgroup
     if (row0 >= args.rows) return;
     const uint rlast = args.rows - 1;
@@ -207,8 +203,36 @@ kernel void q27_matvec_t2_g128(
     }
     for (uint r = 0; r < 4; r++) {
         const float tot = simd_sum(sumf[r]);
-        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+        // ACCUMULATE: the residual add folded in (out = h). Added after the
+        // reduction, as a separate add_inplace would: bit-identical.
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = ACCUMULATE ? out[row0 + r] + tot : tot;
     }
+}
+
+kernel void q27_matvec_t2_g128(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    q27_matvec_t2_g128_body<false>(weights, scales, x, out, args, group, lane, simdgroup);
+}
+
+// out[row] += W·x: the decode residual add (h += projection) in the matvec
+// epilogue. Single writer per row; x must not alias out.
+kernel void q27_matvec_t2_g128_acc(
+        device const uchar *weights [[buffer(0)]],
+        device const half  *scales  [[buffer(1)]],
+        device const float *x       [[buffer(2)]],
+        device       float *out     [[buffer(3)]],
+        constant MatvecArgs &args   [[buffer(4)]],
+        uint group                   [[threadgroup_position_in_grid]],
+        ushort lane                  [[thread_index_in_simdgroup]],
+        ushort simdgroup             [[simdgroup_index_in_threadgroup]]) {
+    q27_matvec_t2_g128_body<true>(weights, scales, x, out, args, group, lane, simdgroup);
 }
 
 // N=2 slot-batched select-form ternary GEMV (multislot Phase 2 probe): the
