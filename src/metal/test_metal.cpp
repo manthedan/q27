@@ -1,3 +1,4 @@
+#include <cstring>
 #include "metal_backend.h"
 
 #include <cmath>
@@ -374,6 +375,27 @@ int test_t2(q27::MetalBackend& backend) {
             fprintf(stderr, "T2 row %d: got %.7g, want %.7g\n", row, got[row], want[row]);
             return 1;
         }
+    }
+    // matvec_accumulate (decode residual epilogue): y += W·x must equal the
+    // separate matvec + fp32 add bit for bit, and reject aliasing / non-T2.
+    {
+        const float seed[rows] = {1.25f, -3.5e-3f};
+        auto acc_y = backend.allocate(rows * sizeof(float));
+        backend.write(*acc_y, 0, seed, sizeof(seed));
+        backend.matvec_accumulate(device_weight, *device_x, *acc_y);
+        float acc_got[rows];
+        backend.read(*acc_y, 0, acc_got, sizeof(acc_got));
+        for (int row = 0; row < rows; row++) {
+            const float expect = seed[row] + got[row];
+            if (std::memcmp(&acc_got[row], &expect, sizeof(float)) != 0) {
+                fprintf(stderr, "T2 accumulate row %d: got %.9g, want %.9g\n", row, acc_got[row], expect);
+                return 1;
+            }
+        }
+        bool aliased_rejected = false;
+        try { backend.matvec_accumulate(device_weight, *acc_y, *acc_y); }
+        catch (const std::runtime_error&) { aliased_rejected = true; }
+        if (!aliased_rejected) { fputs("T2 accumulate accepted aliased input/output\n", stderr); return 1; }
     }
     auto quantized = backend.allocate_quantized(cols);
     backend.begin_commands(); backend.quantize(*device_x, quantized);

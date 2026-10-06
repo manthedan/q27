@@ -293,39 +293,50 @@ Model Model::open(const std::string& path) {
                length <= file_size - data_base - offset;
     };
 
+    // Structural checks run in file order and stop at the first failing
+    // tensor; payloads are then scanned for the tensors before it, so the
+    // error reported is the first failing tensor in file order, structural
+    // check before payload within a tensor -- as the sequential loop did.
+    size_t structural_bad = m.tensors.size();
+    std::string structural_error;
     for (size_t i = 0; i < m.tensors.size(); i++) {
-        Tensor& t = m.tensors[i];
-        uint64_t doff = (uint64_t)(uintptr_t)t.data;
-        if (doff % ALIGN)
-            throw std::runtime_error("q27: tensor data offset is not 256-byte aligned: " +
-                                     t.name);
-        if (!in_file(doff, t.data_size))
-            throw std::runtime_error("q27: tensor data out of range: " + t.name);
-        t.data = b + data_base + doff;
+        try {
+            Tensor& t = m.tensors[i];
+            uint64_t doff = (uint64_t)(uintptr_t)t.data;
+            if (doff % ALIGN)
+                throw std::runtime_error("q27: tensor data offset is not 256-byte aligned: " +
+                                         t.name);
+            if (!in_file(doff, t.data_size))
+                throw std::runtime_error("q27: tensor data out of range: " + t.name);
+            t.data = b + data_base + doff;
 
-        uint64_t soff = (uint64_t)(uintptr_t)t.scales;
-        if (t.scales_size) {
-            if (!soff)
-                throw std::runtime_error("q27: tensor scale offset is zero: " + t.name);
-            if (soff % ALIGN)
-                throw std::runtime_error("q27: tensor scale offset is not 256-byte aligned: " +
-                                         t.name);
-            if (!in_file(soff, t.scales_size))
-                throw std::runtime_error("q27: tensor scales out of range: " + t.name);
-            t.scales = b + data_base + soff;
-        } else {
-            if (soff)
-                throw std::runtime_error("q27: tensor scale offset must be zero without scales: " +
-                                         t.name);
-            t.scales = nullptr;
+            uint64_t soff = (uint64_t)(uintptr_t)t.scales;
+            if (t.scales_size) {
+                if (!soff)
+                    throw std::runtime_error("q27: tensor scale offset is zero: " + t.name);
+                if (soff % ALIGN)
+                    throw std::runtime_error("q27: tensor scale offset is not 256-byte aligned: " +
+                                             t.name);
+                if (!in_file(soff, t.scales_size))
+                    throw std::runtime_error("q27: tensor scales out of range: " + t.name);
+                t.scales = b + data_base + soff;
+            } else {
+                if (soff)
+                    throw std::runtime_error("q27: tensor scale offset must be zero without scales: " +
+                                             t.name);
+                t.scales = nullptr;
+            }
+            m.index.emplace(t.name, i);
+        } catch (const std::runtime_error& error) {
+            structural_bad = i;
+            structural_error = error.what();
+            break;
         }
-        m.index.emplace(t.name, i);
     }
     // Payload scans touch every byte of the mapping; on macOS each first touch
     // of a 16 KiB page is a soft fault, and one thread faulting through a
     // 6.7 GB pack took ~11 s. Faults on different cores proceed in parallel,
-    // so scan tensors concurrently there. The first failing tensor in file
-    // order is reported, as with the sequential scan.
+    // so scan tensors concurrently there.
     std::vector<std::string> payload_errors(m.tensors.size());
     struct ScanJob { const std::vector<Tensor>* tensors; std::vector<std::string>* errors; };
     ScanJob job{&m.tensors, &payload_errors};
@@ -334,15 +345,16 @@ Model Model::open(const std::string& path) {
         (*j->errors)[i] = validate_tensor_payload((*j->tensors)[i]);
     };
 #ifdef __APPLE__
-    dispatch_apply_f(m.tensors.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job, scan);
+    dispatch_apply_f(structural_bad, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job, scan);
 #else
-    for (size_t i = 0; i < m.tensors.size(); i++) scan(&job, i);
+    for (size_t i = 0; i < structural_bad; i++) scan(&job, i);
 #endif
     madvise(base, sz, MADV_NORMAL);
-    for (size_t i = 0; i < m.tensors.size(); i++)
+    for (size_t i = 0; i < structural_bad; i++)
         if (!payload_errors[i].empty())
             throw std::runtime_error("q27: invalid tensor payload " + m.tensors[i].name + ": " +
                                      payload_errors[i]);
+    if (structural_bad < m.tensors.size()) throw std::runtime_error(structural_error);
     return m;
 }
 

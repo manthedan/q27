@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -99,12 +100,12 @@ kernel void q27_bench_read_roof(device const float4 *w [[buffer(0)]],
         std::mt19937 rng(1234);
         printf("device %s, %d reps per shape, GPU time per call\n", dev.name.UTF8String, reps);
         printf("%-14s %6s", "shape", "calls");
-        printf(" %12s", "roof GB/s");
+        printf(" %12s", "roof GB/s");  // codes-only read kernel
         for (auto& k : kernels) printf(" %28s", k.name.c_str());
         printf("\n");
 
         std::vector<double> token_s(kernels.size(), 0.0);
-        double token_roof_s = 0.0, token_bytes = 0.0;
+        double token_roof_s = 0.0, token_roof_bytes = 0.0, token_bytes = 0.0;
         for (const Shape& s : kShapes) {
             const uint64_t wb = weight_bytes(s), sb = scale_bytes(s);
             // Decode streams every weight from DRAM once per token: rotate
@@ -131,6 +132,9 @@ kernel void q27_bench_read_roof(device const float4 *w [[buffer(0)]],
                 [ws addObject:wc]; [scs addObject:scc];
             }
             Args args{s.rows, s.cols};
+            // Dispatches per command buffer: at least one per copy, so every
+            // trial traverses the whole >= 256 MiB ring (not just `reps` copies).
+            const int calls = std::max(reps, copies);
 
             // Roofline: read the weight bytes once per call.
             id<MTLBuffer> sink = [dev newBufferWithLength:4 * 65536 options:MTLResourceStorageModePrivate];
@@ -142,16 +146,18 @@ kernel void q27_bench_read_roof(device const float4 *w [[buffer(0)]],
                 [enc setComputePipelineState:roof];
                 [enc setBuffer:sink offset:0 atIndex:1];
                 [enc setBytes:&n4 length:4 atIndex:2];
-                for (int i = 0; i < reps; i++) {
+                for (int i = 0; i < calls; i++) {
                     [enc setBuffer:ws[i % copies] offset:0 atIndex:0];
                     [enc dispatchThreads:MTLSizeMake(std::min<uint32_t>(n4, 65536), 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 }
                 [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
-                roof_best = std::min(roof_best, gpu_seconds(cb) / reps);
+                roof_best = std::min(roof_best, gpu_seconds(cb) / calls);
             }
-            printf("%6ux%-7u %6u %12.1f", s.rows, s.cols, s.calls, (wb + sb) / roof_best / 1e9);
+            // The roof kernel reads the codes only; credit just those bytes.
+            printf("%6ux%-7u %6u %12.1f", s.rows, s.cols, s.calls, wb / roof_best / 1e9);
             token_roof_s += roof_best * s.calls;
+            token_roof_bytes += (double)wb * s.calls;
             token_bytes += (double)(wb + sb) * s.calls;
 
             std::vector<float> ref;
@@ -167,7 +173,7 @@ kernel void q27_bench_read_roof(device const float4 *w [[buffer(0)]],
                     [enc setBuffer:out offset:0 atIndex:3];
                     [enc setBytes:&args length:sizeof(args) atIndex:4];
                     const NSUInteger groups = (s.rows + k.rows_per_tg - 1) / k.rows_per_tg;
-                    for (int i = 0; i < reps; i++) {
+                    for (int i = 0; i < calls; i++) {
                         [enc setBuffer:ws[i % copies] offset:0 atIndex:0];
                         [enc setBuffer:scs[i % copies] offset:0 atIndex:1];
                         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
@@ -175,23 +181,33 @@ kernel void q27_bench_read_roof(device const float4 *w [[buffer(0)]],
                     }
                     [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
                     if (cb.status == MTLCommandBufferStatusError) { fprintf(stderr, "\n%s failed\n", k.name.c_str()); return 1; }
-                    best = std::min(best, gpu_seconds(cb) / reps);
+                    best = std::min(best, gpu_seconds(cb) / calls);
                 }
                 token_s[ki] += best * s.calls;
                 const float* op = (const float*)out.contents;
+                // Bitwise + finiteness (std::max would silently skip NaN).
                 double max_rel = 0.0;
+                uint64_t bit_diffs = 0, nonfinite = 0;
+                for (uint32_t i = 0; i < s.rows; i++) nonfinite += !std::isfinite(op[i]);
                 if (ki == 0) ref.assign(op, op + s.rows);
                 else
-                    for (uint32_t i = 0; i < s.rows; i++)
-                        max_rel = std::max(max_rel, (double)std::fabs(op[i] - ref[i]) / (std::fabs(ref[i]) + 1e-3));
+                    for (uint32_t i = 0; i < s.rows; i++) {
+                        uint32_t a, b;
+                        std::memcpy(&a, &op[i], 4); std::memcpy(&b, &ref[i], 4);
+                        bit_diffs += a != b;
+                        const double rel = std::fabs(op[i] - ref[i]) / (std::fabs(ref[i]) + 1e-3);
+                        if (!(rel <= max_rel)) max_rel = std::isnan(rel) ? INFINITY : rel;
+                    }
                 char cell[64];
-                if (ki == 0) snprintf(cell, sizeof cell, "%.1f GB/s", (wb + sb) / best / 1e9);
-                else snprintf(cell, sizeof cell, "%.1f GB/s (err %.1e)", (wb + sb) / best / 1e9, max_rel);
+                if (nonfinite) snprintf(cell, sizeof cell, "NONFINITE x%llu", (unsigned long long)nonfinite);
+                else if (ki == 0) snprintf(cell, sizeof cell, "%.1f GB/s", (wb + sb) / best / 1e9);
+                else snprintf(cell, sizeof cell, "%.1f GB/s (%s %.0e)", (wb + sb) / best / 1e9,
+                              bit_diffs ? "diff" : "same", max_rel);
                 printf(" %28s", cell);
             }
             printf("\n");
         }
-        printf("%-21s %12.1f", "per decode token", token_bytes / token_roof_s / 1e9);
+        printf("%-21s %12.1f", "per decode token", token_roof_bytes / token_roof_s / 1e9);
         for (size_t ki = 0; ki < kernels.size(); ki++) {
             char cell[64];
             snprintf(cell, sizeof cell, "%.1f GB/s %.1f ms", token_bytes / token_s[ki] / 1e9, token_s[ki] * 1e3);
