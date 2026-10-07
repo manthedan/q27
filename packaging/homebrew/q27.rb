@@ -74,8 +74,9 @@ class Q27 < Formula
         q27 serve            # OpenAI/Anthropic-compatible API on :8080
 
       `q27 recommend` lists every pack and what fits this Mac. Bonsai 2 packs
-      run on 16 GB Apple silicon (M1 or newer). Other packs in the registry
-      are marked experimental and were not re-validated in this release.
+      run on 16 GB Apple silicon (M1 or newer). On 24 GB Macs, Qwen3.8 is a
+      validated opt-in: `q27 pull q38`, then `q27 agent q38`. Other packs in
+      the registry are marked experimental and were not re-validated.
 
       Bonsai 2 weights: Created using Bonsai by Prism ML (Apache 2.0).
 

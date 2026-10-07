@@ -4,6 +4,7 @@ with transcript length. Upstream q27 is merged through 5dcf4df.
 
 ```sh
 brew upgrade manthedan/tap/q27      # or: brew install manthedan/tap/q27
+q27 pull b2                         # 6.7 GB, SHA-256 verified (skip if already pulled)
 q27 agent                           # Bonsai 2 (b2), the default on every Mac
 q27 pull q38 && q27 agent q38       # 24 GB Macs: Qwen3.8 27B c-small, 14.6 GB
 ```
