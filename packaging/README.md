@@ -92,11 +92,12 @@ the server:
 Model artifacts (`.q27`) and tokenizers (`.tok`) are NOT in the formula —
 they are multi-GB and carry their own licenses. `q27 pull` fetches and
 checksum-verifies them per `packaging/models.tsv`; `q27 recommend` lists every
-pack. metal-v0.7.0 validates the Bonsai 2 packs (`b2`, `b2-t3`); the other rows
-are marked experimental and were last validated in metal-v0.6.1. See
+pack and recommends `b2` on every Mac it fits. The Bonsai 2 packs (`b2`,
+`b2-t3`, metal-v0.7.0) and `q38` (24 GB, metal-v0.7.1) are validated; the
+other rows are marked experimental and were last validated in metal-v0.6.1. See
 [BONSAI2.md](../docs/metal/BONSAI2.md) for gates, speeds and context limits.
 
-The Qwen3.8 pack (not re-validated in metal-v0.7.0) is `q38` (c-small): `q27 pull q38` resolves the
+The Qwen3.8 pack (24 GB; validated in metal-v0.7.1) is `q38` (c-small): `q27 pull q38` resolves the
 artifact and exact tokenizer at immutable HF commit
 `fc7656476a9a7e83d58151f99620fe19b22b3688`, verifies both SHA-256 values,
 and publishes neither file until the staged pair passes. Every serve/agent

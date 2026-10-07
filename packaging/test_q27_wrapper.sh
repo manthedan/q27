@@ -499,9 +499,9 @@ grep -A1 '^--suffix$' "$TMP/b2-server-nothink" | grep -qx '8'
 wait_lock_clear || {
     echo "FAIL: b2 serve consumer flock remained held" >&2; exit 1; }
 
-# metal-v0.7.0 validates only Bonsai 2: the inherited Qwen rows stay listed
-# (they fit 24 GB) but are flagged experimental/not re-validated, so a 24 GB
-# machine is recommended the validated b2 pack, never an unvalidated tier.
+# q38 is validated (metal-v0.7.1) and fits 24 GB, but the default pack wins
+# wherever it fits: a 24 GB machine is still recommended b2, and q38 is
+# listed as a fitting, non-experimental option.
 cat >"$TMP/bin/sysctl" <<'EOF'
 #!/bin/sh
 [ "$*" = "-n hw.memsize" ] && { echo 25769803776; exit 0; }
@@ -510,7 +510,7 @@ EOF
 chmod +x "$TMP/bin/sysctl"
 PATH="$TMP/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     "$ROOT/packaging/bin/q27" recommend >"$TMP/recommend-24gb"
-grep -Eq '^q38[[:space:]]+14\.63G[[:space:]]+24G[[:space:]]+yes\(exp\)' "$TMP/recommend-24gb"
+grep -Eq '^q38[[:space:]]+14\.63G[[:space:]]+24G[[:space:]]+yes[[:space:]]' "$TMP/recommend-24gb"
 grep -Fq 'Recommended pack for this machine: b2' "$TMP/recommend-24gb"
 rm -f "$TMP/bin/sysctl"
 

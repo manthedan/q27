@@ -9,3 +9,9 @@ bonsai2-27b-t3-slim	prefill512.command_buffers	65
 bonsai2-27b-t3-slim	prefill512.dispatches	706563
 bonsai2-27b-t3-slim	decode64.command_buffers	16
 bonsai2-27b-t3-slim	decode64.dispatches	88576
+qwen38-27b-mtp-c-small	prefill512.command_buffers	8
+qwen38-27b-mtp-c-small	prefill512.dispatches	8746
+qwen38-27b-mtp-c-small	decode64.command_buffers	16
+qwen38-27b-mtp-c-small	decode64.dispatches	80192
+qwen38-27b-mtp-c-small	suffix_copy48.command_buffers	34
+qwen38-27b-mtp-c-small	suffix_copy48.dispatches	20899

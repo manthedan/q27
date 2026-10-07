@@ -28,6 +28,9 @@ HERE="$(cd "$(dirname "$SRC")" && pwd)"
 CMD="${1:-help}"; [ $# -gt 0 ] && shift
 
 ram_gb() { echo $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )); }
+# The default pack for every Mac it fits: agent, serve, pull and recommend
+# agree. Larger validated packs (q38 on 24 GB) are listed but opt-in.
+DEFAULT_PACK=b2
 
 q27_model_profile() {
     local n="$1" profile
@@ -41,14 +44,18 @@ q27_model_profile() {
     esac
 }
 
-# ---- recommendation logic: largest pack that fits with ctx headroom ----
+# ---- recommendation logic: the default pack, else the largest that fits ----
 # macOS caps GPU-usable memory ~65-75% of RAM; weights are mmap'd/pageable,
 # but we recommend against the working-set budget with headroom for the OS
 # and the user's browser. ctx budget scales with what is left after weights.
 recommend_pack() {
     local ram; ram="$(ram_gb)"
-    # Walk registry from largest min_ram to smallest; pick the first that fits
-    # comfortably (ram >= min_ram) and is not experimental.
+    if [ "$(q27_registry_field "$DEFAULT_PACK" 11)" = "no" ] &&
+       [ "$ram" -ge "$(q27_registry_field "$DEFAULT_PACK" 7)" ]; then
+        printf '%s' "$DEFAULT_PACK"; return
+    fi
+    # Otherwise walk the registry for the largest non-experimental pack that
+    # fits comfortably (ram >= min_ram).
     local best="" bestmin=0 n min exp
     for n in $(q27_registry_names); do
         exp="$(q27_registry_field "$n" 11)"
@@ -281,7 +288,7 @@ q27_agent_want_tui() {
 }
 
 cmd_agent() {
-    local n="${Q27_AGENT_PACK:-b2}" agent tui
+    local n="${Q27_AGENT_PACK:-$DEFAULT_PACK}" agent tui
     case "${1:-}" in
         --help|-h)
             agent="$(q27_bin q27-agent)" || {
