@@ -58,6 +58,7 @@ run_gate "test-repack" "$EVID/test-repack.log" make test-repack test-bonsai2-rep
 run_gate "test-packaging" "$EVID/test-packaging.log" make test-packaging
 run_gate "test-shader-discovery" "$EVID/test-shader-discovery.log" make test-shader-discovery
 run_gate "test-perf-gates" "$EVID/test-perf-gates.log" make test-perf-gates
+run_gate "test-canonical-registry" "$EVID/test-canonical-registry.log" make test-canonical-registry
 run_gate "tui-cargo-test" "$EVID/tui.log" \
     cargo test --manifest-path experiments/q27-tui/Cargo.toml --locked
 [ "$TIER" = "C" ] && finish

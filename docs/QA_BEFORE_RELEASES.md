@@ -20,13 +20,18 @@ to the t2-slim and t3-slim Bonsai 2 packs under `models/bonsai2/`
 - **Tier C — packaging/docs** (no model): `test-tools`, `test-inspect`,
   `test-agent`, `test-repack` + `test-bonsai2-repack`, `test-packaging`
   (wrapper selftest, lock helper, formula staging, fetch manifest),
-  `test-shader-discovery`, `test-perf-gates` (ratchet logic, fake CLI), the
-  TUI's `cargo test`.
+  `test-shader-discovery`, `test-perf-gates` (ratchet logic, fake CLI),
+  `test-canonical-registry` (canonical digest lookup), the TUI's `cargo test`.
 - **Tier B — serving/agent/engine changes:** C + `test-metal-backend` + per
   pack the live Bonsai 2 serving, native-agent, Metal recovery and
   snapshot-reuse gates + the perf ratchets below.
 - **Tier A — numerics:** B + the independent Prism reference oracle
   (`tools/bonsai2_gate.sh`, needs `PRISM_DIR`) + the 8-restart session soak.
+
+**Qwen3.8 (24 GB Macs):** `tools/qwen38_laptop_gate.sh` is the whole leg in one
+command: pulls `q38` if missing, then canonical registry, Metal backend,
+Qwen3.8 policy + canonical digest, serving round trips, native agent, and a
+first set of work-count ceilings into the evidence dir.
 
 Release candidates additionally run `tools/release_tarball_smoke.sh` on the
 assembled archive (fresh HOME, scrubbed PATH: pull, recommend, serve + API

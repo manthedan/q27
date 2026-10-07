@@ -8,7 +8,7 @@ CANON_TIER="${CANON_TIER:-q4s}"
 CANON_IDS="760,6511,314,9338,369"
 
 if [[ -z "$MODEL" || -z "$TOKENIZER" ]]; then
-  echo "usage: $0 model-q4s.q27 tokenizer.tok" >&2
+  echo "usage: $0 model.q27 tokenizer.tok" >&2
   exit 2
 fi
 if [[ ! -x "$BIN" ]]; then
@@ -31,11 +31,14 @@ if [[ -z "${CANON_ARCH:-}" ]]; then
   esac
 fi
 
+# shellcheck source=canonical_md5.sh
+source "$(dirname "$0")/canonical_md5.sh"
+# Checkpoint family: CANON_MODEL, else inferred from the artifact name, else
+# Qwen3.6 (this gate's original and default subject).
+CANON_MODEL="${CANON_MODEL:-$(canonical_model_for_path "$MODEL" || echo qwen36-27b-mtp)}"
 if [[ -z "${CANON_MD5:-}" ]]; then
-  # shellcheck source=canonical_md5.sh
-  source "$(dirname "$0")/canonical_md5.sh"
-  if ! CANON_MD5="$(canonical_md5_for "$CANON_ARCH" "$CANON_TIER")"; then
-    echo "no published canonical for architecture=$CANON_ARCH tier=$CANON_TIER" >&2
+  if ! CANON_MD5="$(canonical_md5_for "$CANON_ARCH" "$CANON_TIER" "$CANON_MODEL")"; then
+    echo "no published canonical for architecture=$CANON_ARCH model=$CANON_MODEL tier=$CANON_TIER" >&2
     echo "derive it with a same-device differential before publishing a digest" >&2
     exit 2
   fi
@@ -55,7 +58,7 @@ hash_file() {
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-echo "== gate 1: $CANON_ARCH/$CANON_TIER 128-token canonical"
+echo "== gate 1: $CANON_ARCH/$CANON_MODEL/$CANON_TIER 128-token canonical"
 "$BIN" "$MODEL" "$TOKENIZER" --tokens "$CANON_IDS" -n 128 --ctx 256 --mtp 4 \
   --dump-token-ids "$tmp/mtp.ids" >/dev/null
 md5="$(hash_file "$tmp/mtp.ids")"

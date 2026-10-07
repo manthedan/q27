@@ -54,7 +54,7 @@ build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/mark
 # process-lifetime memo, so the drift suite runs twice -- once tolerant, once
 # strict -- because the strict leg's assertions cannot share a process with the
 # tolerant ones.
-.PHONY: test-tools test-perf-gates perf-ceilings perf-journeys
+.PHONY: test-tools test-perf-gates perf-ceilings perf-journeys test-canonical-registry test-metal-qwen38 test-metal-qwen38-serving test-metal-qwen38-agent
 # extract_check first: the integration harness embeds server.cu's handle()
 # byte-for-byte, and a stale copy tests logic that no longer ships (it had
 # drifted for ten commits before anything noticed).
@@ -521,6 +521,32 @@ perf-ceilings: build/q27-metal
 perf-journeys: build/q27-metal
 	tools/perf_journeys.sh
 
+# Qwen3.8 gates (24 GB Macs; tools/qwen38_laptop_gate.sh runs them all):
+# QWEN38_MODEL / QWEN38_TOKENIZER point at the pack, QWEN38_TIER / QWEN38_PACK
+# name its canonical tier and registry row.
+QWEN38_TIER ?= c-small
+QWEN38_PACK ?= q38
+test-canonical-registry: build/q27-metal
+	tools/test_canonical_md5.sh
+test-metal-qwen38: test-canonical-registry build/q27-metal tools/qwen38_policy_gate.py
+	@test -n "$(QWEN38_MODEL)" || { echo "set QWEN38_MODEL=...q27" >&2; exit 2; }
+	@test -n "$(QWEN38_TOKENIZER)" || { echo "set QWEN38_TOKENIZER=...tok" >&2; exit 2; }
+	./build/q27-metal "$(QWEN38_MODEL)" "$(QWEN38_TOKENIZER)" --validate-only
+	@if [ "$(QWEN38_TIER)" = "c-small" ] || [ "$(QWEN38_TIER)" = "q38-c-small-v1" ]; then \
+		python3 tools/qwen38_policy_gate.py ./build/q27-metal "$(QWEN38_MODEL)" "$(QWEN38_TOKENIZER)"; \
+	fi
+	CANON_MODEL=qwen38-27b-mtp CANON_TIER="$(QWEN38_TIER)" \
+		tools/metal_canonical_gate.sh "$(QWEN38_MODEL)" "$(QWEN38_TOKENIZER)"
+test-metal-qwen38-serving: build/q27-metal-server src/metal/test_qwen38_serving.py
+	@test -n "$(QWEN38_MODEL)" || { echo "set QWEN38_MODEL=...q27" >&2; exit 2; }
+	@test -n "$(QWEN38_TOKENIZER)" || { echo "set QWEN38_TOKENIZER=...tok" >&2; exit 2; }
+	python3 src/metal/test_qwen38_serving.py ./build/q27-metal-server "$(QWEN38_MODEL)" "$(QWEN38_TOKENIZER)"
+test-metal-qwen38-agent: build/q27-agent build/q27-lock-exec tools/qwen38_agent_gate.sh
+	@test -n "$(QWEN38_MODEL)" || { echo "set QWEN38_MODEL=...q27" >&2; exit 2; }
+	@test -n "$(QWEN38_TOKENIZER)" || { echo "set QWEN38_TOKENIZER=...tok" >&2; exit 2; }
+	Q27_GATE_MODEL="$(QWEN38_MODEL)" Q27_GATE_TOK="$(QWEN38_TOKENIZER)" \
+		Q27_GATE_PACK="$(QWEN38_PACK)" tools/qwen38_agent_gate.sh
+
 test-metal-recovery: build/q27-metal-server-test src/metal/test_server_recovery.py
 	@test -n "$(MODEL)" || { echo "set MODEL=...q4s.q27" >&2; exit 2; }
 	@test -n "$(TOKENIZER)" || { echo "set TOKENIZER=...tok" >&2; exit 2; }
@@ -562,6 +588,8 @@ metal-engine:
 	@echo "metal-engine requires macOS" >&2; exit 1
 test-metal-contracts:
 	@echo "test-metal-contracts requires macOS" >&2; exit 1
+test-metal-qwen38 test-metal-qwen38-serving test-metal-qwen38-agent:
+	@echo "$@ requires macOS" >&2; exit 1
 test-metal-recovery:
 	@echo "test-metal-recovery requires macOS" >&2; exit 1
 test-metal-validation:
