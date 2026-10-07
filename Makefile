@@ -588,6 +588,8 @@ metal-engine:
 	@echo "metal-engine requires macOS" >&2; exit 1
 test-metal-contracts:
 	@echo "test-metal-contracts requires macOS" >&2; exit 1
+test-canonical-registry:
+	tools/test_canonical_md5.sh
 test-metal-qwen38 test-metal-qwen38-serving test-metal-qwen38-agent:
 	@echo "$@ requires macOS" >&2; exit 1
 test-metal-recovery:

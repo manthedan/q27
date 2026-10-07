@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Artifact-backed negative contracts for q38-c-small-v1 Metal routing."""
+"""Artifact-backed negative contracts for q38-c-small-v1 Metal routing.
+
+Each fixture is an APFS clone of the real pack with one targeted edit, and must
+be rejected by the ENGINE's policy validation (not by the loader): dtype
+fixtures rewrite the tensor's payload sizes to match the new dtype, so they
+pass Model::open() and reach validate_architecture()'s
+"required tensor mismatch: NAME"; recipe/policy fixtures edit the metadata.
+Ported from the metal-v0.7.0 branch and adapted to this engine's messages.
+"""
 
 import json
 import os
@@ -18,7 +26,18 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def payload_sizes(dtype, shape):
+    rows, cols = shape[0], shape[1] if len(shape) > 1 else 1
+    if dtype == Q8_G128:
+        return rows * cols, rows * (cols // 128) * 2
+    if dtype == Q4_G64:
+        return rows * cols // 2, rows * (cols // 64) * 2
+    raise ValueError(f"unsupported dtype {dtype}")
+
+
 def table(path):
+    """name -> (dtype, dtype_offset, shape, data_offset, scales_offset); offsets
+    of the payload fields are absolute file offsets once data_base is known."""
     entries = {}
     with open(path, "rb") as stream:
         magic, version, count, meta_size = struct.unpack("<IIII", stream.read(16))
@@ -30,14 +49,26 @@ def table(path):
             name = stream.read(name_size).decode()
             dtype_offset = stream.tell()
             dtype, rank = struct.unpack("<BB", stream.read(2))
-            stream.seek(rank * 8 + 32, os.SEEK_CUR)
-            entries[name] = (dtype, dtype_offset)
-    return metadata, meta_raw, entries
+            shape = list(struct.unpack(f"<{rank}Q", stream.read(rank * 8)))
+            doff, dsize, soff, ssize = struct.unpack("<QQQQ", stream.read(32))
+            entries[name] = dict(dtype=dtype, dtype_offset=dtype_offset, shape=shape,
+                                 doff=doff, soff=soff)
+        header_end = stream.tell()
+    data_base = (header_end + 255) // 256 * 256
+    return metadata, meta_raw, entries, data_base
 
 
-def clone(source, destination):
-    # APFS clone: these negative fixtures must not duplicate a 15.7 GB model.
+def clone(source, destination, check_space):
+    # Fixtures must be clones (copy-on-write), never 15.7 GB copies: create
+    # them beside the source (same volume) and verify the first one did not
+    # consume real space.
+    before = os.statvfs(os.path.dirname(destination))
     subprocess.run(["cp", "-c", source, destination], check=True)
+    if check_space:
+        after = os.statvfs(os.path.dirname(destination))
+        used = (before.f_bavail - after.f_bavail) * before.f_frsize
+        require(used < (1 << 30),
+                f"cp -c did not clone (used {used >> 20} MiB); put the pack on an APFS volume")
 
 
 def reject(binary, model, tokenizer, expected):
@@ -54,7 +85,8 @@ def main():
     if len(sys.argv) != 4:
         raise SystemExit(f"usage: {sys.argv[0]} Q27_METAL MODEL TOKENIZER")
     binary, source, tokenizer = map(os.path.abspath, sys.argv[1:])
-    metadata, meta_raw, entries = table(source)
+    metadata, meta_raw, entries, data_base = table(source)
+    file_size = os.path.getsize(source)
     require(metadata.get("quant_policy") == "q38-c-small-v1", str(metadata))
     require(metadata.get("q4_head") is True, "c-small artifact lacks q4_head")
     require(metadata.get("q8_extra") == r"^blk\.[0-9]+\.attn_output\.weight$",
@@ -66,44 +98,58 @@ def main():
         ("blk.64.attn_q.weight", Q8_G128, Q4_G64),
         ("output.weight", Q4_G64, Q8_G128),
     )
-    with tempfile.TemporaryDirectory(prefix="q27-q38-policy.") as work:
+    skipped = []
+    first = True
+    with tempfile.TemporaryDirectory(prefix=".q27-q38-policy.", dir=os.path.dirname(source)) as work:
         for index, (name, old, new) in enumerate(mutations):
             require(name in entries, f"missing required tensor {name}")
-            actual, offset = entries[name]
-            require(actual == old,
-                    f"unexpected source dtype for {name}: {actual}, want {old}")
+            e = entries[name]
+            require(e["dtype"] == old, f"unexpected source dtype for {name}: {e['dtype']}, want {old}")
+            dsize, ssize = payload_sizes(new, e["shape"])
+            if (data_base + e["doff"] + dsize > file_size or
+                    data_base + e["soff"] + ssize > file_size):
+                skipped.append(name)   # resized payload would run past EOF
+                continue
             candidate = os.path.join(work, f"dtype-{index}.q27")
-            clone(source, candidate)
+            clone(source, candidate, first)
+            first = False
             with open(candidate, "r+b", buffering=0) as stream:
-                stream.seek(offset)
+                stream.seek(e["dtype_offset"])
                 stream.write(bytes([new]))
-            reject(binary, candidate, tokenizer, name)
+                rank = len(e["shape"])
+                stream.seek(e["dtype_offset"] + 2 + rank * 8 + 8)
+                stream.write(struct.pack("<Q", dsize))
+                stream.seek(e["dtype_offset"] + 2 + rank * 8 + 24)
+                stream.write(struct.pack("<Q", ssize))
+            reject(binary, candidate, tokenizer, "required tensor mismatch: " + name)
+            os.remove(candidate)
 
         # Recipe metadata is part of the contract even if all table dtypes are
         # otherwise valid.
         needle = b"attn_output"
         require(meta_raw.count(needle) == 1, "q8 recipe marker is not unique")
         candidate = os.path.join(work, "metadata.q27")
-        clone(source, candidate)
-        header = meta_raw.replace(needle, b"attn_outpuX")
+        clone(source, candidate, first)
+        first = False
         with open(candidate, "r+b", buffering=0) as stream:
             stream.seek(16)
-            stream.write(header)
-        reject(binary, candidate, tokenizer, "recipe metadata mismatch")
+            stream.write(meta_raw.replace(needle, b"attn_outpuX"))
+        reject(binary, candidate, tokenizer, "q8_extra does not match quantization policy")
+        os.remove(candidate)
 
         # A misspelled policy must not fall through to the permissive legacy
         # Q4/Q8 route used by older Qwen3.6 artifacts.
         needle = b"q38-c-small-v1"
         require(meta_raw.count(needle) == 1, "quant policy marker is not unique")
         candidate = os.path.join(work, "policy.q27")
-        clone(source, candidate)
-        header = meta_raw.replace(needle, b"q38-c-smalX-v1")
+        clone(source, candidate, first)
         with open(candidate, "r+b", buffering=0) as stream:
             stream.seek(16)
-            stream.write(header)
-        reject(binary, candidate, tokenizer, "unsupported Qwen3.8 quant policy")
+            stream.write(meta_raw.replace(needle, b"q38-c-smalX-v1"))
+        reject(binary, candidate, tokenizer, "unsupported quantization policy")
 
-    print("Qwen3.8 c-small Metal policy negative contracts: PASS")
+    note = f" (skipped, would not fit the file: {', '.join(skipped)})" if skipped else ""
+    print(f"Qwen3.8 c-small Metal policy negative contracts: PASS{note}")
 
 
 if __name__ == "__main__":

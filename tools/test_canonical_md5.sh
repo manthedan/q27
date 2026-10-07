@@ -42,16 +42,20 @@ expect_none "bonsai has no canonical family" canonical_model_for_path models/bon
 
 # The Metal gate selects the Qwen3.8 digest from the artifact name, and names
 # model+tier when a triple is unpublished: it stops at the lookup, before
-# running build/q27-metal (which must exist; the make target builds it).
+# running build/q27-metal (built by the make target on macOS).
 fake="$(mktemp -d "${TMPDIR:-/tmp}/q27-canon-test.XXXXXX")"
 trap 'rm -rf "$fake"' EXIT
 
 : > "$fake/qwen38-27b-mtp-c-small.q27"; : > "$fake/t.tok"
-out=$(CANON_ARCH=metal-m4 CANON_TIER=q5f \
-      "$here/metal_canonical_gate.sh" "$fake/qwen38-27b-mtp-c-small.q27" "$fake/t.tok" 2>&1 || true)
-case "$out" in
-  *"model=qwen38-27b-mtp tier=q5f"*) ;;
-  *) echo "FAIL: gate did not name the inferred qwen38 model: $out"; fail=1 ;;
-esac
+if [ -x "$here/../build/q27-metal" ]; then
+  out=$(env -u CANON_MD5 -u CANON_MODEL CANON_ARCH=metal-m4 CANON_TIER=q5f \
+        "$here/metal_canonical_gate.sh" "$fake/qwen38-27b-mtp-c-small.q27" "$fake/t.tok" 2>&1 || true)
+  case "$out" in
+    *"model=qwen38-27b-mtp tier=q5f"*) ;;
+    *) echo "FAIL: gate did not name the inferred qwen38 model: $out"; fail=1 ;;
+  esac
+else
+  echo "note: no build/q27-metal (non-macOS): Metal gate leg not exercised"
+fi
 
 [ "$fail" = 0 ] && echo "canonical md5 contracts: PASS" || { echo "canonical md5 contracts: FAIL"; exit 1; }

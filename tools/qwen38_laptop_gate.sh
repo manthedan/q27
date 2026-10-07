@@ -3,8 +3,8 @@
 # for a 24 GB Apple Silicon Mac (v0.7.1). Run from a checkout of the release
 # commit; everything runs strictly one after another (one model resident).
 #
-#   1. preflight: macOS arm64, >= 24 GiB RAM, a checkout with no edits to the
-#      engine/tools
+#   1. preflight: macOS arm64, >= 24 GiB RAM, an M4 / M4 Pro (published
+#      canonical), no spaces in paths; builds the binaries
 #   2. pack: QWEN38_MODEL/QWEN38_TOKENIZER if set, else ~/.q27/models/q38
 #      (Q27_HOME), pulling it with `packaging/bin/q27 pull q38` (SHA-256
 #      verified, ~14.6 GB) when missing
@@ -45,6 +45,22 @@ mem_gib=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)
 note "commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown) on $chip, ${mem_gib} GiB, macOS $(sw_vers -productVersion)"
 [ "$mem_gib" -ge 24 ] || { fail "Qwen3.8 needs >= 24 GiB RAM (this Mac: ${mem_gib} GiB)"; finish; }
+# The canonical digest is published for M4 / M4 Pro only (metal_canonical_gate.sh);
+# fail before a 15 GB download on anything else unless CANON_ARCH is set.
+# Same chip probe and list as metal_canonical_gate.sh.
+if [ -z "${CANON_ARCH:-}" ]; then
+    case "$chip" in
+        "Apple M4"|"Apple M4 Pro") ;;
+        *) fail "no published Qwen3.8 canonical for '$chip' (M4 / M4 Pro only); set CANON_ARCH after deriving one"; finish ;;
+    esac
+fi
+# Paths with spaces would split in make and the perf scripts.
+case "$root$EVID${QWEN38_MODEL:-}${QWEN38_TOKENIZER:-}${Q27_HOME:-}" in
+    *" "*) fail "paths must not contain spaces (checkout, evidence dir, pack); use a symlink"; finish ;;
+esac
+# Build first: the pull itself needs build/q27-lock-exec.
+make build/q27-metal build/q27-metal-server build/q27-agent build/q27-lock-exec > "$EVID/build.log" 2>&1 \
+    || { fail "build (log: $EVID/build.log)"; finish; }
 if [ -n "$(git status --short -- src/ tools/ packaging/ Makefile 2>/dev/null)" ]; then
     note "working tree has edits under src/tools/packaging/Makefile: evidence is not for a clean commit"
 fi
@@ -58,7 +74,9 @@ else
     model="$home/q38/$(q27_registry_field q38 4)"
     tok="$home/q38/$(q27_registry_field q38 16)"
     if [ ! -f "$model" ] || [ ! -f "$tok" ]; then
-        free_gib=$(df -g "$HOME" | awk 'NR==2 { print $4 }')
+        # Free space on the filesystem the pull writes to (nearest existing dir).
+        probe=$home; while [ ! -d "$probe" ]; do probe=$(dirname "$probe"); done
+        free_gib=$(df -g "$probe" | awk 'NR==2 { print $4 }')
         [ "${free_gib:-0}" -ge 16 ] || { fail "pulling q38 needs ~15 GB free (have ${free_gib} GB)"; finish; }
         run_gate "pull q38 (SHA-256 verified)" "$EVID/pull.log" env Q27_HOME="$home" packaging/bin/q27 pull q38
     else
@@ -74,14 +92,11 @@ case "$tok" in /*) ;; *) tok="$root/$tok" ;; esac
 note "model $model ($(du -h "$model" | cut -f1))"
 
 # ---- 3. gates ----------------------------------------------------------------
-make build/q27-metal build/q27-metal-server build/q27-agent build/q27-lock-exec > "$EVID/build.log" 2>&1 \
-    || { fail "build (log: $EVID/build.log)"; finish; }
-Q="QWEN38_MODEL=$model QWEN38_TOKENIZER=$tok"
 run_gate "test-canonical-registry" "$EVID/canonical-registry.log" make test-canonical-registry
 run_gate "test-metal-backend" "$EVID/metal-backend.log" make test-metal-backend
-run_gate "qwen38 policy + canonical" "$EVID/qwen38.log" make test-metal-qwen38 $Q
-run_gate "qwen38 serving" "$EVID/qwen38-serving.log" make test-metal-qwen38-serving $Q
-run_gate "qwen38 native agent" "$EVID/qwen38-agent.log" make test-metal-qwen38-agent $Q
+run_gate "qwen38 policy + canonical" "$EVID/qwen38.log" make test-metal-qwen38 "QWEN38_MODEL=$model" "QWEN38_TOKENIZER=$tok"
+run_gate "qwen38 serving" "$EVID/qwen38-serving.log" make test-metal-qwen38-serving "QWEN38_MODEL=$model" "QWEN38_TOKENIZER=$tok"
+run_gate "qwen38 native agent" "$EVID/qwen38-agent.log" make test-metal-qwen38-agent "QWEN38_MODEL=$model" "QWEN38_TOKENIZER=$tok"
 
 # ---- 4. perf: first ceilings for this pack -----------------------------------
 printf 'pack\tmetric\tceiling\n' > "$EVID/perf-ceilings-q38.tsv"
