@@ -20,13 +20,15 @@ profile="$(q27_registry_field "$pack" 13)"
   echo "Q27_GATE_PACK '$pack' does not use qwen38-thinking-v1" >&2; exit 2; }
 [[ -n "$tokenizer_file" ]] || tokenizer_file="${tokenizer##*/}"
 
-home="$(mktemp -d "${TMPDIR:-/tmp}/q27-qwen38-agent-home.XXXXXX")"
+# Stage beside the pack (same volume): a hard link or clone, never a copy of
+# the 15.7 GB pack onto another volume.
+home="$(mktemp -d "$(dirname "$model")/.q27-qwen38-agent-home.XXXXXX")"
 cleanup() { rm -rf "$home"; }
 trap cleanup EXIT
 mkdir -p "$home/$pack"
 stage_file() {
   local src="$1" dst="$2"
-  ln "$src" "$dst" 2>/dev/null || cp "$src" "$dst"
+  ln "$src" "$dst" 2>/dev/null || cp -c "$src" "$dst"
 }
 stage_file "$model" "$home/$pack/$artifact_file"
 stage_file "$tokenizer" "$home/$pack/$tokenizer_file"

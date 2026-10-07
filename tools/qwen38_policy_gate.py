@@ -103,7 +103,6 @@ def main():
         ("blk.64.attn_q.weight", Q8_G128, Q4_G64, "required matrix mismatch: "),
         ("output.weight", Q4_G64, Q8_G128, "required tensor mismatch: "),
     )
-    skipped = []
     first = True
     with tempfile.TemporaryDirectory(prefix=".q27-q38-policy.", dir=os.path.dirname(source)) as work:
         for index, (name, old, new, check) in enumerate(mutations):
@@ -111,13 +110,15 @@ def main():
             e = entries[name]
             require(e["dtype"] == old, f"unexpected source dtype for {name}: {e['dtype']}, want {old}")
             dsize, ssize = payload_sizes(new, e["shape"])
-            if (data_base + e["doff"] + dsize > file_size or
-                    data_base + e["soff"] + ssize > file_size):
-                skipped.append(name)   # resized payload would run past EOF
-                continue
             candidate = os.path.join(work, f"dtype-{index}.q27")
             clone(source, candidate, first)
             first = False
+            # A grown payload (Q4 -> Q8) may run past EOF if the tensor is last
+            # in the file: extend the clone sparsely so the fixture still passes
+            # the loader's range checks and reaches the policy validator.
+            need = max(data_base + e["doff"] + dsize, data_base + e["soff"] + ssize)
+            if need > file_size:
+                os.truncate(candidate, need)
             with open(candidate, "r+b", buffering=0) as stream:
                 stream.seek(e["dtype_offset"])
                 stream.write(bytes([new]))
@@ -153,8 +154,7 @@ def main():
             stream.write(meta_raw.replace(needle, b"q38-c-smalX-v1"))
         reject(binary, candidate, tokenizer, "unsupported quantization policy")
 
-    note = f" (skipped, would not fit the file: {', '.join(skipped)})" if skipped else ""
-    print(f"Qwen3.8 c-small Metal policy negative contracts: PASS{note}")
+    print("Qwen3.8 c-small Metal policy negative contracts: PASS (6 fixtures)")
 
 
 if __name__ == "__main__":

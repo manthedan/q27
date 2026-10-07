@@ -56,7 +56,7 @@ if [ -z "${CANON_ARCH:-}" ]; then
 fi
 # Paths with spaces would split in make and the perf scripts.
 case "$root$EVID${QWEN38_MODEL:-}${QWEN38_TOKENIZER:-}${Q27_HOME:-}" in
-    *" "*) fail "paths must not contain spaces (checkout, evidence dir, pack); use a symlink"; finish ;;
+    *[[:space:]]*) fail "paths must not contain whitespace (checkout, evidence dir, pack); use a symlink"; finish ;;
 esac
 # Build first: the pull itself needs build/q27-lock-exec.
 make build/q27-metal build/q27-metal-server build/q27-agent build/q27-lock-exec > "$EVID/build.log" 2>&1 \
@@ -73,7 +73,7 @@ else
     . packaging/lib/q27_bench_lib.sh
     model="$home/q38/$(q27_registry_field q38 4)"
     tok="$home/q38/$(q27_registry_field q38 16)"
-    case "$model" in *" "*) fail "pack path '$model' contains spaces; set Q27_HOME to a path without spaces"; finish ;; esac
+    case "$model" in *[[:space:]]*) fail "pack path '$model' contains whitespace; set Q27_HOME to a path without it"; finish ;; esac
     if [ ! -f "$model" ] || [ ! -f "$tok" ]; then
         # Free space on the filesystem the pull writes to (nearest existing dir).
         probe=$home/q38; while [ ! -d "$probe" ]; do probe=$(dirname "$probe"); done
