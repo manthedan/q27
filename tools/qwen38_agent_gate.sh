@@ -20,18 +20,18 @@ profile="$(q27_registry_field "$pack" 13)"
   echo "Q27_GATE_PACK '$pack' does not use qwen38-thinking-v1" >&2; exit 2; }
 [[ -n "$tokenizer_file" ]] || tokenizer_file="${tokenizer##*/}"
 
-# Stage beside the pack (same volume): a hard link or clone, never a copy of
-# the 15.7 GB pack onto another volume.
+# Stage beside the pack's real file (same volume, symlinks resolved): a hard
+# link or clone, never a copy of the 15.7 GB pack onto another volume.
+model="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$model")"
 home="$(mktemp -d "$(dirname "$model")/.q27-qwen38-agent-home.XXXXXX")"
 cleanup() { rm -rf "$home"; }
 trap cleanup EXIT
 mkdir -p "$home/$pack"
-stage_file() {
-  local src="$1" dst="$2"
-  ln "$src" "$dst" 2>/dev/null || cp -c "$src" "$dst"
-}
-stage_file "$model" "$home/$pack/$artifact_file"
-stage_file "$tokenizer" "$home/$pack/$tokenizer_file"
+# The pack: link or clone only. The tokenizer (7 MB) may live on another
+# volume: link, clone, or copy.
+ln "$model" "$home/$pack/$artifact_file" 2>/dev/null || cp -c "$model" "$home/$pack/$artifact_file"
+ln "$tokenizer" "$home/$pack/$tokenizer_file" 2>/dev/null || cp -c "$tokenizer" "$home/$pack/$tokenizer_file" 2>/dev/null ||
+  cp "$tokenizer" "$home/$pack/$tokenizer_file"
 
 Q27_HOME="$home" "$root/tools/packaged_agent_driver.sh" \
   "$root/packaging/bin/q27" "$pack"
