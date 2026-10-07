@@ -84,7 +84,9 @@ def reject(binary, model, tokenizer, expected):
 def main():
     if len(sys.argv) != 4:
         raise SystemExit(f"usage: {sys.argv[0]} Q27_METAL MODEL TOKENIZER")
-    binary, source, tokenizer = map(os.path.abspath, sys.argv[1:])
+    # realpath: fixtures are cloned beside the real file (a symlink's directory
+    # may be on another volume, where cp -c would fully copy 15.7 GB).
+    binary, source, tokenizer = map(os.path.realpath, sys.argv[1:])
     metadata, meta_raw, entries, data_base = table(source)
     file_size = os.path.getsize(source)
     require(metadata.get("quant_policy") == "q38-c-small-v1", str(metadata))
@@ -92,16 +94,19 @@ def main():
     require(metadata.get("q8_extra") == r"^blk\.[0-9]+\.attn_output\.weight$",
             "c-small artifact has the wrong q8_extra recipe")
 
+    # (tensor, packed dtype, mutated dtype, engine check that must reject it):
+    # projections go through validate_architecture's matrix(), the head
+    # through require().
     mutations = (
-        ("blk.3.attn_output.weight", Q8_G128, Q4_G64),
-        ("blk.0.ffn_gate.weight", Q4_G64, Q8_G128),
-        ("blk.64.attn_q.weight", Q8_G128, Q4_G64),
-        ("output.weight", Q4_G64, Q8_G128),
+        ("blk.3.attn_output.weight", Q8_G128, Q4_G64, "required matrix mismatch: "),
+        ("blk.0.ffn_gate.weight", Q4_G64, Q8_G128, "required matrix mismatch: "),
+        ("blk.64.attn_q.weight", Q8_G128, Q4_G64, "required matrix mismatch: "),
+        ("output.weight", Q4_G64, Q8_G128, "required tensor mismatch: "),
     )
     skipped = []
     first = True
     with tempfile.TemporaryDirectory(prefix=".q27-q38-policy.", dir=os.path.dirname(source)) as work:
-        for index, (name, old, new) in enumerate(mutations):
+        for index, (name, old, new, check) in enumerate(mutations):
             require(name in entries, f"missing required tensor {name}")
             e = entries[name]
             require(e["dtype"] == old, f"unexpected source dtype for {name}: {e['dtype']}, want {old}")
@@ -121,7 +126,7 @@ def main():
                 stream.write(struct.pack("<Q", dsize))
                 stream.seek(e["dtype_offset"] + 2 + rank * 8 + 24)
                 stream.write(struct.pack("<Q", ssize))
-            reject(binary, candidate, tokenizer, "required tensor mismatch: " + name)
+            reject(binary, candidate, tokenizer, check + name)
             os.remove(candidate)
 
         # Recipe metadata is part of the contract even if all table dtypes are

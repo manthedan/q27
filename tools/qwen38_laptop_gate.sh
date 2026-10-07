@@ -73,9 +73,10 @@ else
     . packaging/lib/q27_bench_lib.sh
     model="$home/q38/$(q27_registry_field q38 4)"
     tok="$home/q38/$(q27_registry_field q38 16)"
+    case "$model" in *" "*) fail "pack path '$model' contains spaces; set Q27_HOME to a path without spaces"; finish ;; esac
     if [ ! -f "$model" ] || [ ! -f "$tok" ]; then
         # Free space on the filesystem the pull writes to (nearest existing dir).
-        probe=$home; while [ ! -d "$probe" ]; do probe=$(dirname "$probe"); done
+        probe=$home/q38; while [ ! -d "$probe" ]; do probe=$(dirname "$probe"); done
         free_gib=$(df -g "$probe" | awk 'NR==2 { print $4 }')
         [ "${free_gib:-0}" -ge 16 ] || { fail "pulling q38 needs ~15 GB free (have ${free_gib} GB)"; finish; }
         run_gate "pull q38 (SHA-256 verified)" "$EVID/pull.log" env Q27_HOME="$home" packaging/bin/q27 pull q38
