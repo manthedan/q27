@@ -318,6 +318,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> t2_quantized_matmul;
     id<MTLComputePipelineState> t2_float_matmul;
     id<MTLComputePipelineState> t2_float_matmul8;   // 8-token tile for x_rows <= 8
+    id<MTLComputePipelineState> t2_float_matmul64;  // 64-row tile for x_rows > 32
     id<MTLComputePipelineState> t2_float_matmul_h;   // experiment, Q27_METAL_T2F_HALF=1
     id<MTLComputePipelineState> b1_quantized_matmul;
     id<MTLComputePipelineState> embedding;
@@ -773,6 +774,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->t2_quantized_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm");
             impl_->t2_float_matmul = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_f");
             impl_->t2_float_matmul8 = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_f8");
+            impl_->t2_float_matmul64 = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_f64");
             impl_->t2_quantized_matmul_h = make_pipeline(impl_->device, impl_->library, @"q27_matmul_t2_mm_h");
             // q27_matmul_q4_mm_h is probe-only pending its valid quiet gate
             // and routes only under Q27_METAL_GEMM_HALF_Q4=1 — built lazily on
@@ -1541,20 +1543,27 @@ void MetalBackend::matmul_t2_float(const BackendTensor& weight, const BackendBuf
     @autoreleasepool {
         const bool h = impl_->t2_float_matmul_h != nil;
         // Small batches (speculative verify, short prompt tails) take the
-        // 8-token tile: a 16-wide tile would pad half its MMA work. Same
-        // per-element arithmetic, so outputs are bit-identical either way.
+        // 8-token tile: a 16-wide tile would pad half its MMA work. Full
+        // prefill chunks (> 32 tokens) take the 64-row tile, which reuses
+        // each weight fragment across two MMAs; below that it halves the
+        // threadgroups and loses. Same per-element arithmetic in all three,
+        // so outputs are bit-identical whichever runs.
         const bool narrow = !h && x_rows <= 8;
+        const bool wide = !h && x_rows > 32;
         const uint32_t tile = narrow ? 8 : 16;
+        const uint32_t tile_rows = wide ? 64 : 32;
         bool own; auto enc = impl_->encoder_for_operation(
-            own, h ? "q27_matmul_t2_mm_fh" : narrow ? "q27_matmul_t2_mm_f8" : "q27_matmul_t2_mm_f");
+            own, h ? "q27_matmul_t2_mm_fh" : narrow ? "q27_matmul_t2_mm_f8"
+                 : wide ? "q27_matmul_t2_mm_f64" : "q27_matmul_t2_mm_f");
         [enc setComputePipelineState:h ? impl_->t2_float_matmul_h
-                                       : narrow ? impl_->t2_float_matmul8 : impl_->t2_float_matmul];
+                                       : narrow ? impl_->t2_float_matmul8
+                                       : wide ? impl_->t2_float_matmul64 : impl_->t2_float_matmul];
         [enc setBuffer:data.handle() offset:(NSUInteger)weight.data_offset atIndex:0];
         [enc setBuffer:ws.handle() offset:(NSUInteger)weight.scales_offset atIndex:1];
         [enc setBuffer:xv.handle() offset:0 atIndex:2];
         [enc setBuffer:out.handle() offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(weight.rows + 31) / 32,
+        q27_dispatch_groups(enc, MTLSizeMake((NSUInteger)(weight.rows + tile_rows - 1) / tile_rows,
                                               (NSUInteger)(x_rows + tile - 1) / tile, 1), MTLSizeMake(128, 1, 1));
         if (own) impl_->finish_command("float T2 simdgroup matmul");
     }

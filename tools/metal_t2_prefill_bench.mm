@@ -3,7 +3,8 @@
 //   build/metal_t2_prefill_bench KERNELS.metal name[:tok[:rows_per_tg[:threads]]] ...
 //
 // Each kernel has the q27_matmul_t2_mm_f signature (weights, scales, float x,
-// out, MatmulArgs); default tile 32 rows x 16 tokens on 128 threads. Runs every
+// out, MatmulArgs); default tile 32 rows x 16 tokens on 128 threads (the
+// production 64-row instance is q27_matmul_t2_mm_f64:16:64:128). Runs every
 // per-chunk projection shape of a t2-slim layer stack at X_ROWS tokens
 // (default 96 = PREFILL_CHUNK_MAX), arms interleaved per trial, and prints GPU
 // ms per chunk (token-weighted by calls per chunk) plus max relative output

@@ -2233,10 +2233,16 @@ constant half4 q27_t2_half4_lut[256] = {
 };
 
 // TOK = token tile: 16 for prefill chunks; 8 for small batches (speculative
-// verify, short tails), where a 16-wide tile would pad half its MMA work. Both
-// instances run the same per-element MMA sequence and scale flushes, so their
-// outputs are bit-identical to each other (tools/metal_t2_prefill_bench.mm).
-template <uint TOK>
+// verify, short tails), where a 16-wide tile would pad half its MMA work.
+// RA = 8-row weight fragments per simdgroup (tile 32*RA rows, 128 threads):
+// full prefill chunks (x_rows > 32) use RA 2, so each simdgroup reuses every
+// loaded fragment twice (4 fragment loads per 4 MMAs instead of 3 per 2):
+// -3% GEMM time on a 96-token chunk, -3% at 48..80; ties at 17..32 and +2% at
+// 9..16 (half the threadgroups), so smaller batches keep RA 1. RA 4,
+// 32-token tiles and 128-column stages were slower (occupancy). All instances run the same per-element MMA sequence and
+// scale flushes, so their outputs are bit-identical to each other
+// (tools/metal_t2_prefill_bench.mm).
+template <uint TOK, uint RA>
 inline void q27_matmul_t2_mm_f_body(
         device const uchar *weights, device const half *weight_scales, device const float *x,
         device float *out, constant MatmulArgs &args, uint2 group, uint tid, ushort lane, ushort sg,
@@ -2246,28 +2252,36 @@ inline void q27_matmul_t2_mm_f_body(
     // as float staging, with half the threadgroup traffic and footprint
     // (bit-identical outputs; tools/metal_t2_prefill_bench.mm: -17% GEMM).
     // Activations and accumulators stay float.
-    const uint row0 = group.x * 32;
+    constexpr uint TB = TOK / 8;
+    const uint row0 = group.x * 32 * RA;
     const uint tok0 = group.y * TOK;
     if (row0 >= args.rows) return;
     const uint rlast = args.rows - 1;
-    const uint wrow = tid / 4, wcb = (tid % 4) * 16;
-    device const uchar *wsrc = weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4);
     const uint xloc = tid % TOK, xcb = (tid / TOK) * (TOK / 2);   // Xt column is tile-local
     const uint xtok = tok0 + xloc;                       // device rows are global
     const bool xvalid = xtok < args.x_rows;
     device const float *xsrc = x + (ulong)min(xtok, args.x_rows - 1) * args.cols;
-    const uint rowA = row0 + sg * 8 + lane / 8, rowB = rowA + 4;
-    const ulong wsrowA = (ulong)min(rowA, rlast) * (args.cols / 128);
-    const ulong wsrowB = (ulong)min(rowB, rlast) * (args.cols / 128);
-    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    float4 racc = 0.0f;
-    threadgroup float *sc = Sc + sg * 8 * TOK;
+    simdgroup_float8x8 acc[RA][TB];
+    float2 racc[RA][TB];
+    ulong wsrowA[RA], wsrowB[RA];
+    for (uint i = 0; i < RA; i++) {
+        for (uint j = 0; j < TB; j++) {
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            racc[i][j] = 0.0f;
+        }
+        const uint rowA = row0 + (sg * RA + i) * 8 + lane / 8;
+        wsrowA[i] = (ulong)min(rowA, rlast) * (args.cols / 128);
+        wsrowB[i] = (ulong)min(rowA + 4, rlast) * (args.cols / 128);
+    }
+    threadgroup float *sc = Sc + sg * RA * TB * 64;
     for (uint c0 = 0; c0 < args.cols; c0 += 64) {
-        {
-            const uint wp = *(device const uint *)(wsrc + (c0 + wcb) / 4);
-            // One byte-LUT gather per 4 trits (wcb is a multiple of 16, so the
-            // half4 stores are aligned).
+        for (uint u = 0; u < RA; u++) {
+            // Thread t stages 16 trits (one uint) of row (u*128+t)/4: one
+            // byte-LUT gather per 4 trits (16-trit offsets keep the half4
+            // stores aligned).
+            const uint idx = u * 128 + tid, wrow = idx / 4, wcb = (idx % 4) * 16;
+            const uint wp = *(device const uint *)(weights + (ulong)min(row0 + wrow, rlast) * (args.cols / 4) +
+                                                   (c0 + wcb) / 4);
             threadgroup half4 *dst = (threadgroup half4 *)(Wt + wrow * 64 + wcb);
             dst[0] = q27_t2_half4_lut[wp         & 0xffu];
             dst[1] = q27_t2_half4_lut[(wp >>  8) & 0xffu];
@@ -2286,14 +2300,12 @@ inline void q27_matmul_t2_mm_f_body(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint k8 = 0; k8 < 64; k8 += 8) {
-            simdgroup_half8x8 a;
-            simdgroup_float8x8 b;
-            simdgroup_load(a, Wt + (uint)sg * 8 * 64 + k8, 64);
-            simdgroup_load(b, Xt + k8 * TOK, TOK);
-            simdgroup_multiply_accumulate(acc0, a, b, acc0);
-            if (TOK == 16) {
-                simdgroup_load(b, Xt + k8 * TOK + 8, TOK);
-                simdgroup_multiply_accumulate(acc1, a, b, acc1);
+            simdgroup_float8x8 b[TB];
+            for (uint j = 0; j < TB; j++) simdgroup_load(b[j], Xt + k8 * TOK + 8 * j, TOK);
+            for (uint i = 0; i < RA; i++) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, Wt + ((uint)sg * RA + i) * 8 * 64 + k8, 64);
+                for (uint j = 0; j < TB; j++) simdgroup_multiply_accumulate(acc[i][j], a, b[j], acc[i][j]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2301,45 +2313,48 @@ inline void q27_matmul_t2_mm_f_body(
         // MMA accumulators across both and flush (scale fold) once per scale
         // group. cols is a multiple of 128, so the last tile always flushes.
         if (c0 & 64) {
-            simdgroup_store(acc0, sc, 8);
-            if (TOK == 16) simdgroup_store(acc1, sc + 64, 8);
+            for (uint i = 0; i < RA; i++)
+                for (uint j = 0; j < TB; j++) simdgroup_store(acc[i][j], sc + (i * TB + j) * 64, 8);
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            const float wsA = float(weight_scales[wsrowA + c0 / 128]);
-            const float wsB = float(weight_scales[wsrowB + c0 / 128]);
-            if (TOK == 16)
-                racc += float4(sc[lane], sc[lane + 32], sc[lane + 64], sc[lane + 96]) *
-                        float4(wsA, wsB, wsA, wsB);
-            else
-                racc.xy += float2(sc[lane], sc[lane + 32]) * float2(wsA, wsB);
+            for (uint i = 0; i < RA; i++) {
+                const float wsA = float(weight_scales[wsrowA[i] + c0 / 128]);
+                const float wsB = float(weight_scales[wsrowB[i] + c0 / 128]);
+                for (uint j = 0; j < TB; j++)
+                    racc[i][j] += float2(sc[(i * TB + j) * 64 + lane], sc[(i * TB + j) * 64 + lane + 32]) *
+                                  float2(wsA, wsB);
+            }
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            if (TOK == 16) acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint i = 0; i < RA; i++)
+                for (uint j = 0; j < TB; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         }
     }
-    const uint tokA = tok0 + lane % 8, tokB = tok0 + 8 + lane % 8;
-    if (rowA < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowA] = racc.x;
-    if (rowB < args.rows && tokA < args.x_rows) out[(ulong)tokA * args.rows + rowB] = racc.y;
-    if (TOK == 16) {
-        if (rowA < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowA] = racc.z;
-        if (rowB < args.rows && tokB < args.x_rows) out[(ulong)tokB * args.rows + rowB] = racc.w;
+    for (uint i = 0; i < RA; i++) {
+        const uint rowA = row0 + (sg * RA + i) * 8 + lane / 8, rowB = rowA + 4;
+        for (uint j = 0; j < TB; j++) {
+            const uint tok = tok0 + 8 * j + lane % 8;
+            if (tok >= args.x_rows) continue;
+            if (rowA < args.rows) out[(ulong)tok * args.rows + rowA] = racc[i][j].x;
+            if (rowB < args.rows) out[(ulong)tok * args.rows + rowB] = racc[i][j].y;
+        }
     }
 }
 
-#define Q27_MATMUL_T2_MM_F(NAME, TOK)                                                              \
+#define Q27_MATMUL_T2_MM_F(NAME, TOK, RA)                                                          \
 kernel void NAME(device const uchar *weights [[buffer(0)]],                                       \
                  device const half *weight_scales [[buffer(1)]], device const float *x [[buffer(2)]], \
                  device float *out [[buffer(3)]], constant MatmulArgs &args [[buffer(4)]],          \
                  uint2 group [[threadgroup_position_in_grid]],                                     \
                  uint tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], \
                  ushort sg [[simdgroup_index_in_threadgroup]]) {                                   \
-    threadgroup half Wt[32 * 64];                                                                  \
+    threadgroup half Wt[32 * RA * 64];                                                             \
     threadgroup float Xt[64 * TOK];                                                                \
-    threadgroup float Sc[4 * 8 * TOK];                                                             \
-    q27_matmul_t2_mm_f_body<TOK>(weights, weight_scales, x, out, args, group, tid, lane, sg,       \
-                                 Wt, Xt, Sc);                                                      \
+    threadgroup float Sc[4 * RA * 8 * TOK];                                                        \
+    q27_matmul_t2_mm_f_body<TOK, RA>(weights, weight_scales, x, out, args, group, tid, lane, sg,   \
+                                     Wt, Xt, Sc);                                                  \
 }
-Q27_MATMUL_T2_MM_F(q27_matmul_t2_mm_f, 16)
-Q27_MATMUL_T2_MM_F(q27_matmul_t2_mm_f8, 8)
+Q27_MATMUL_T2_MM_F(q27_matmul_t2_mm_f64, 16, 2)  // 64 rows x 16 tokens: x_rows > 32
+Q27_MATMUL_T2_MM_F(q27_matmul_t2_mm_f, 16, 1)    // 32 rows x 16 tokens: x_rows 9..32
+Q27_MATMUL_T2_MM_F(q27_matmul_t2_mm_f8, 8, 1)    // 32 rows x 8 tokens: x_rows <= 8
 
 // Half-staging variant of the T2 chunk GEMM (default path,
 // Q27_METAL_GEMM_HALF=0 opts out; docs/plans/2026-07-15-gemm-half-staging.md
