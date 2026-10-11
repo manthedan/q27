@@ -621,7 +621,14 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
             __syncthreads();
             // Once the support has exactly k members, further bisection
             // cannot change it. The shared count makes this branch uniform.
-            if (sh[0] == (float)top_k) break;
+            // Every thread reads sh[0] here and thread 0 overwrites it with
+            // its next partial count before the next barrier, so the read
+            // must complete under a barrier of its own (2026-10-10 sweep: a
+            // warp stalled across that window could break one iteration
+            // early and desynchronize the rest of the block's barriers).
+            const bool support_exact = sh[0] == (float)top_k;
+            __syncthreads();
+            if (support_exact) break;
         }
         if (t == 0) s_pre = fmaxf(s_pre, s_hi); // s_hi keeps <= k tokens
         __syncthreads();

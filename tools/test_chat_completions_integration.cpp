@@ -639,6 +639,16 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
         // explicitly (a grad-level trace wants 16K+). jint/jbool: a
         // present-but-null field reads as absent (see parse_sample).
         int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Chat);
+        // 2026-10-10 sweep: max_tokens 0/negative was a 200 with an empty
+        // choice; n>1 silently returned one choice; stop was ignored.
+        if (n_max < 1 || q27::jint(body, "n", 1) != 1) {
+            res.status = 400;
+            res.set_content(json{{"error", {{"message", n_max < 1 ? "max_tokens must be at least 1" : "n must be 1 (parallel choices are not supported)"},
+                                            {"type", "invalid_request_error"}}}}.dump(), "application/json");
+            return;
+        }
+        if (body.contains("stop") && !body["stop"].is_null())
+            fprintf(stderr, "[chat] stop sequences are not implemented; the request's stop is ignored\n");
         bool stream = q27::jbool(body, "stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the

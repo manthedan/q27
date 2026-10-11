@@ -1162,7 +1162,10 @@ void attn_decode3(CP3 q, int q_stride, const void* const* ktab, const void* cons
     // below); everything else falls through to fd2, so W=2..3 rounds and
     // the plain path are untouched. Numerics are tolerance-class (fp8 Q/P)
     // -- OPT-IN until the acceptance A/B replay gate clears a default flip.
-    if (fd && strcmp(fd, "mma") == 0 && kvk != KV_T3V && ntok >= 4 && ntok <= W_PLUMB) {
+    // W_MAX, not W_PLUMB: the partial scratch and logits2 hold W_MAX lanes
+    // (engine.cuh), and launch_fdmma instantiates widths up to 16 (latent
+    // overrun; sfx_w is clamped to W_MAX today -- 2026-10-10 sweep)
+    if (fd && strcmp(fd, "mma") == 0 && kvk != KV_T3V && ntok >= 4 && ntok <= Q27_W_MAX) {
         static int arch = -1;
         if (arch < 0) {
             int dev, mj, mn;

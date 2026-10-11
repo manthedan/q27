@@ -32,6 +32,12 @@
 #define Q27_W_PLUMB 16
 #endif
 static constexpr int W_PLUMB = Q27_W_PLUMB;
+// Q27_W_MAX (the live-width cap; engine.cuh documents the knob) is needed
+// here too: translation units that never include engine.cuh (spec3.cu) gate
+// kernels on it, and the default build passes no -D for it.
+#ifndef Q27_W_MAX
+#define Q27_W_MAX 12
+#endif
 static_assert(W_PLUMB <= 16, "lane-pointer structs are p[16]; k_attn_fdmma asserts 6*W <= 96");
 // Round outcome layout: {n, t1, dr1..dr(W_PLUMB-1), pending}.
 static constexpr int OUTCOME_INTS = W_PLUMB + 2;

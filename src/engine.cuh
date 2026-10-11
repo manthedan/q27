@@ -699,6 +699,10 @@ struct Engine {
 #define Q27_PF_SB 32
 #endif
     static constexpr int PF_T = Q27_PF_T;
+    // the prefill attention's split partials are indexed by ceil(SB/16)*16 rows
+    // against a PF_T-row arena buffer (prefill.cu); a chunk that is not a
+    // multiple of 16 would write past it (2026-10-10 sweep)
+    static_assert(PF_T % 16 == 0 && PF_T >= 16, "Q27_PF_T must be a multiple of 16");
     static constexpr int PF_SB = Q27_PF_SB; // attention sub-batch (scratch rows)
     int* d_prompt = nullptr;          // whole prompt on device
     int d_prompt_cap = 0;
@@ -5870,6 +5874,14 @@ struct Engine {
             CUDA_CHECK(cudaMemcpyAsync(d_prompt, prompt.data(), (size_t)NP * 4,
                                        cudaMemcpyHostToDevice, stm));
             const DevTensor& onw = dm.get("output_norm.weight");
+            // Strictly > base: when the restored base IS this request's stable
+            // boundary (an identical re-send), the stable snapshot is replaced
+            // by the NP-1 one. Measured 2026-10-10 (5090, 3.8 renderer): that
+            // tail snapshot DOES prefix-match the following turn -- the
+            // history render of the assistant turn starts with the same
+            // "<think>\n" the prefill ended with -- and matched 4 tokens
+            // deeper than the stable one (hit 756 vs 752 of 785). The
+            // "never matches" note below predates the 3.8 renderer.
             const int snap_upto =
                 (stable_len > base && stable_len < NP) ? stable_len : NP - 1;
             int last_ck = base;
@@ -5901,9 +5913,10 @@ struct Engine {
             // P16 write point: the device holds exactly the state for
             // [0, snap_upto) here. Persist ONLY when that boundary is the P8
             // STABLE one -- the same condition snap_upto was computed under.
-            // The NP-1 fallback boundary is not re-renderable: it sits past
-            // the assistant-open + think prefill, so the blob could never
-            // prefix-match a later turn. Measured before this gate existed: a
+            // The NP-1 fallback boundary sits past the assistant-open + think
+            // prefill; on the 3.8 renderer a later turn still matches it (see
+            // snap_upto above), but it is not a boundary other sessions share,
+            // so it is not worth a persisted blob. Measured before this gate existed: a
             // restored request persisted a second 1.09 GB entry at NP-1 that
             // nothing would ever hit again (P16 gate run 1, 2026-07-24).
             const bool pfx_stable_boundary = stable_len > base && stable_len < NP;

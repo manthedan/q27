@@ -2177,13 +2177,31 @@ inline std::vector<Msg> anthropic_msgs(const json& body, const std::string* raw_
         std::string text38;
         std::vector<std::string> calls38;
         size_t bj = 0;
+        // A user message may mix text and tool_result blocks. Tool results
+        // render as a <tool_response> group inside a user turn and plain text
+        // as its own user turn, so the two kinds are split into separate
+        // messages in document order (until 2026-10-10 the text was glued
+        // onto the end of the tool block: "</tool_response>text"). Images and
+        // documents leave a marker: this is a text-only model and a silent
+        // drop made the model answer about content it never saw.
+        int ukind = 0; // user message: 0 nothing yet, 1 text, 2 tool results
+        auto user_switch = [&](int kind) {
+            if (role != "user" || ukind == kind || ukind == 0 || content.empty()) { ukind = kind; return; }
+            msgs.push_back({role, content, {}});
+            content.clear();
+            ukind = kind;
+        };
         if (m["content"].is_string()) content = m["content"];
         else if (m["content"].is_array())
             for (auto& part : m["content"]) {
                 const size_t this_j = bj++;
                 if (!part.is_object()) continue; // bare string in a content array
                 std::string ty = part.value("type", "");
-                if (ty == "text") (asm38 ? text38 : content) += part.value("text", "");
+                if (ty == "text") { user_switch(1); (asm38 ? text38 : content) += part.value("text", ""); }
+                else if (ty == "image" || ty == "document") {
+                    user_switch(1);
+                    (asm38 ? text38 : content) += "[" + ty + " omitted: this model is text-only]\n";
+                }
                 else if (ty == "thinking") think += part.value("thinking", "");
                 else if (ty == "tool_use") {
                     if (asm38) {
@@ -2201,13 +2219,18 @@ inline std::vector<Msg> anthropic_msgs(const json& body, const std::string* raw_
                                                                              : json::object(),
                                                       max_arg);
                 } else if (ty == "tool_result") {
+                    user_switch(2);
                     std::string rc;
                     if (part.contains("content")) {
                         if (part["content"].is_string()) rc = part["content"];
                         else if (part["content"].is_array())
-                            for (auto& b : part["content"])
-                                if (b.is_object() && b.value("type", "") == "text")
-                                    rc += b.value("text", "");
+                            for (auto& b : part["content"]) {
+                                if (!b.is_object()) continue;
+                                const std::string bt = b.value("type", "");
+                                if (bt == "text") rc += b.value("text", "");
+                                else if (bt == "image" || bt == "document")
+                                    rc += "[" + bt + " omitted: this model is text-only]\n";
+                            }
                     }
                     if (!content.empty() && content.back() != '\n') content += "\n";
                     content += tool_response_text(rc, max_resp);

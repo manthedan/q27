@@ -15714,6 +15714,93 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-10 (bf): fourth bug sweep -- request semantics against a live server, the engine lifecycle, prefill, and the KV kernels
+
+Four read-only reviews over the remaining unread surfaces (request-feature
+semantics in api_common.h/server.cu; the engine's per-request lifecycle;
+prefill.cu + the shared arena; kv_pool + the decode attention/KV-format
+kernels and the samplers), every CPU suite plus the nine orphan test
+binaries, `make fuzz` (592,842 runs / 20 min, clean) and `make fuzz-schema`
+(1,280,475 runs / 20 min, clean), and -- new this time -- a black-box
+probe of 25 request features against a live production-config server
+(default tier + DFlash2 Q8, prefix cache on; then the 2-slot conductor
+config with a 4-request burst) plus old-vs-new binary A/Bs on the 5090.
+The sm_120 canonicals were re-gated under the CUDA 13.2.2 toolkit first:
+default tier 8cf639c2..., q4s 10e654eb..., 1500-token 8f735a13, all equal
+to the published values.
+
+**Fixed (request handling):**
+- `max_tokens` 0 or negative was a 200 with an empty message on all three
+  APIs (Anthropic returns 400); OpenAI `n>1` silently returned one choice.
+  Both are 400s now.
+- The Responses bridge rendered Codex's `function_call` history items in
+  the JSON dialect regardless of the boot dialect (XML on a 3.8 boot, so the
+  preamble said XML and the history showed JSON). It uses the boot dialect.
+- A user message mixing `tool_result` and `text` blocks glued the text onto
+  the tool block (`</tool_response>text` inside one tool turn); the kinds
+  now render as separate user messages in document order (tool responses
+  grouped, text as its own turn). Claude Code never sends that shape on our
+  recorded traffic (0 of 13,205 array-content user messages in 837
+  requests), so this is fidelity, not a live defect. llama.cpp's own
+  conversion puts the text turn BEFORE the tool results; document order was
+  kept here.
+- Image and document blocks (in user content and inside tool_result arrays)
+  vanished silently, so the model answered about content it never saw;
+  they leave `[image omitted: this model is text-only]`.
+- `stop_sequences` / OpenAI `stop` are NOT implemented: the server now logs
+  that it is ignoring them. Not built: no recorded request (2,229) carries
+  them; the only optional field real traffic uses is `metadata`.
+
+**Fixed (kernels/engine):**
+- The nucleus sampler's top-k bisection read the shared count for its
+  uniform early exit after a barrier that thread 0 could already have
+  crossed to overwrite it (blocks.cu): a read-after-barrier race. One extra
+  barrier. Seeded sampled texts are byte-identical old vs new (two prompts,
+  5090).
+- The fdmma verify gate admitted widths up to W_PLUMB (16) while its partial
+  scratch and logits2 hold W_MAX (12) lanes -- latent (sfx_w is clamped);
+  the gate reads W_MAX, which cuda_common.h now defines for translation
+  units that never include engine.cuh.
+- `static_assert(PF_T % 16 == 0)`: the prefill attention indexes split
+  partials by ceil(SB/16)*16 rows against a PF_T-row arena buffer.
+- The prefix-cache compat key includes the drafter mode: under DFlash2 the
+  prefill skips the MTP warm, so an entry written then and restored by a
+  ladder boot carried stale MTP rows (acceptance loss until re-warmed).
+  Existing roots go cold once, as with the (ba) key change.
+
+**Reviewed, measured, NOT changed:** the "stable snapshot demoted on a
+re-send" finding (engine.cuh snap_upto). The reading was right about the
+mechanism and wrong about the consequence: on the 3.8 renderer the NP-1
+tail snapshot DOES prefix-match the following turn (the history render of
+the assistant turn starts with the same `<think>\n` the prefill ended
+with). Old-vs-new A/B, identical request twice then a continuation: old
+binary hit 756 of 785 tokens, the "fixed" one 752. Reverted before commit;
+the 07-24 comment that said NP-1 can never match is corrected.
+
+**Found, not fixed:** assistant prefill is rendered as a closed turn plus
+a fresh assistant turn (the model continued correctly in the probe);
+`previous_response_id`, `truncation`, `response_format`, `logprobs`, the
+penalty fields are ignored; Responses history drops `reasoning` items
+(prior-turn thinking is not re-fed, unlike the Messages path);
+`disable_parallel_tool_use` lets a second call leak as text;
+`reasoning_close_fits` lets a close land with zero answer tokens at exactly
+one token count at the context edge; a P16b shared-cut restore carries one
+foreign MTP KV row; two unusable pages per lineage at max_ctx % 64 == 0;
+cache usage fields are absent. The (ba)/(be) open items stand.
+
+**Clean (live):** assistant prefill continues, system arrays with
+cache_control, every tool_choice mode on both APIs, tool_result content
+arrays, tool round trips on all three APIs, count_tokens == usage
+input_tokens (365/365), a client disconnect mid-stream (server healthy,
+"client-stop"), max_tokens 1 and 1e9, stream_options.include_usage +
+[DONE], Responses incomplete_details; the 2-slot burst had no cross-talk.
+**Clean (reviews):** arena serialization under the GPU gate, chunk padding
+and GDN carry, the T3 staging order, DFlash2 tap windows, every pfx_import
+path, per-slot state reset on every entry, cancellation at round
+boundaries only, Philox keying (forced rounds do not perturb seed replay),
+page-table edges and the MTP +1 row, the six KV row-size mirrors, split-K
+empties, sampler fallbacks.
+
 ## 2026-10-07 (be): third bug hunt -- the plain-lanes forced close was broken both ways, a grammar cache that mixed schemas, a re-engage that never fired, and the pack loaders
 
 Four independent read-only reviews over surfaces no earlier hunt had read
