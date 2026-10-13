@@ -162,6 +162,32 @@ int main() {
               "bare call after fenced wrapped examples is run");
         q27_agent_tool_call_free(&call);
     }
+    // The call is the earliest accepted opener: a bare write the engine
+    // closed wins over wrapped calls later in its body or after it, even when
+    // the body holds a literal </think> (Sol/Opus on 93bba89).
+    {
+        const std::string header =
+            "<think>\nplan\n</think>\n\n<function=write><parameter=path>notes.md"
+            "</parameter></function></tool_call>\n";
+        const std::string body =
+            "```markdown\nExample one:\n<tool_call><function=read><parameter=path>x"
+            "</parameter></function></tool_call>\nThe literal tag is </think>\n"
+            "<tool_call><function=shell><parameter=command>echo unsafe</parameter>"
+            "</function></tool_call>\n```\n";
+        const std::string after_call =
+            "<tool_call>\n<function=shell>\n<parameter=command>\nrm -rf build\n"
+            "</parameter>\n</function>\n</tool_call>";
+        for (const std::string& text : {header + body, header + after_call, header + body + after_call}) {
+            const q27_agent_tool_call_status st = parse(text, call, error, sizeof(error), 1, 1);
+            CHECK(st != Q27_TOOL_CALL_VALID || call.request.kind != Q27_TOOL_SHELL,
+                  "later wrapped calls never displace the engaged bare call");
+            q27_agent_tool_call_free(&call);
+        }
+        CHECK(parse(header + body, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID &&
+              call.request.kind == Q27_TOOL_WRITE,
+              "bare write with example calls in its body is the write");
+        q27_agent_tool_call_free(&call);
+    }
     std::string example_then_call =
         "Example:\n```xml\n<function=read><parameter=path>ignored"
         "</parameter></function>\n```\nNow inspect it:\n"

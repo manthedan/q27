@@ -713,52 +713,41 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         std::string text(reinterpret_cast<const char *>(bytes), len);
         static const std::string open = "<tool_call>";
         static const std::string close = "</tool_call>";
+        // The call is the EARLIEST opener, wrapped or bare (XML), that
+        // parser_declines_opener accepts -- the one the engine's veto let the
+        // grammar engage on. Nothing after it is a candidate: a body tool's
+        // fenced payload may hold example calls and a literal </think>, and
+        // those must never be selected over the call the engine closed.
         size_t begin = text.find(open);
-        // A wrapped call inside a Markdown fence is an example, not a call
-        // (parser_declines_opener, the engine veto's rule). With only fenced
-        // wrappers, a bare call later in the turn is still judged below: the
-        // engine engages on it, so the parser must not stop at the examples.
         while (begin != std::string::npos &&
                q27::native_agent::parser_declines_opener(text, begin, false))
             begin = text.find(open, begin + open.size());
-        if (begin == std::string::npos) {
-            if (!xml_dialect) return Q27_TOOL_CALL_NONE;
-            bool saw_top_level_candidate = false;
-            // Each candidate is judged in the scope of the last </think>
-            // before it (parser_declines_opener, the engine veto's rule), so
-            // a literal </think> in a body tool's fenced payload after the
-            // call cannot move the scope past the call.
-            size_t native_begin = text.find("<function=");
+        size_t native_begin = std::string::npos;
+        if (xml_dialect)
+            for (size_t p = text.find("<function="); p != std::string::npos;
+                 p = text.find("<function=", p + 10))
+                if (!q27::native_agent::parser_declines_opener(text, p, true)) {
+                    native_begin = p;
+                    break;
+                }
+        if (native_begin != std::string::npos &&
+            (begin == std::string::npos || native_begin < begin)) {
+            const size_t native_close = text.find("</function>", native_begin);
             size_t native_end = std::string::npos;
-            while (native_begin != std::string::npos) {
-                if (!q27::native_agent::parser_declines_opener(text, native_begin, true)) {
-                    saw_top_level_candidate = true;
-                    const size_t native_close =
-                        text.find("</function>", native_begin);
-                    if (native_close != std::string::npos) {
-                        const size_t candidate_end = native_close + 11;
-                        std::string native_name;
-                        json native_arguments;
-                        bool declared = false;
-                        if (q27::native_agent::parse_native_xml_call_body(
-                                text.substr(native_begin, candidate_end - native_begin),
-                                native_name, native_arguments, &tool_registry())) {
-                            for (size_t i = 0; i < kToolNameCount; ++i)
-                                if (native_name == kToolNames[i]) {
-                                    declared = true;
-                                    break;
-                                }
-                        }
-                        if (declared) {
+            if (native_close != std::string::npos) {
+                const size_t candidate_end = native_close + 11;
+                std::string native_name;
+                json native_arguments;
+                if (q27::native_agent::parse_native_xml_call_body(
+                        text.substr(native_begin, candidate_end - native_begin),
+                        native_name, native_arguments, &tool_registry()))
+                    for (size_t i = 0; i < kToolNameCount; ++i)
+                        if (native_name == kToolNames[i]) {
                             native_end = candidate_end;
                             break;
                         }
-                    }
-                }
-                native_begin = text.find("<function=", native_begin + 10);
             }
             if (native_end == std::string::npos) {
-                if (!saw_top_level_candidate) return Q27_TOOL_CALL_NONE;
                 set_error(error, error_cap, "invalid native XML tool call");
                 return Q27_TOOL_CALL_INVALID;
             }
@@ -773,6 +762,7 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
             text.insert(native_begin, open);
             begin = native_begin;
         }
+        if (begin == std::string::npos) return Q27_TOOL_CALL_NONE;
         const size_t call_start = begin + open.size();
         const size_t end = text.find(close, call_start);
         if (end == std::string::npos) {
