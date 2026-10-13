@@ -111,14 +111,33 @@ inline std::string xml_parameter_unescape(const std::string& value) {
     return out;
 }
 
-inline bool inside_markdown_fence(const std::string& text, size_t pos,
-                                  size_t scope_start = 0) {
+// Markdown/markup state at pos, from one scan of text[scope_start, pos) --
+// only text BEFORE the opener, so the engine (which sees just that prefix)
+// and the parser always agree:
+//  - fenced: inside a ``` / ~~~ fence (up to 3 spaces of indent);
+//  - inline_code: after an unmatched backtick run on the opener's own line;
+//  - nested: an unclosed <function=/<parameter= in prose (depth counted;
+//    tags inside fences and inline code spans are literal text and ignored).
+struct AnswerMarkup {
+    bool fenced = false;
+    bool inline_code = false;
+    bool nested = false;
+};
+
+inline AnswerMarkup answer_markup_at(const std::string& text, size_t pos,
+                                     size_t scope_start = 0) {
+    static const std::string fopen = "<function=", fclose = "</function>",
+                             popen = "<parameter=", pclose = "</parameter>";
+    AnswerMarkup m;
     bool open = false;
     char marker = 0;
     size_t opening_run = 0;
+    size_t fdepth = 0, pdepth = 0;
     for (size_t line_start = scope_start; line_start < pos;) {
         size_t line_end = text.find('\n', line_start);
         if (line_end == std::string::npos) line_end = text.size();
+        const bool in_fence = open;
+        bool fence_line = false;
         size_t p = line_start;
         size_t indent = 0;
         while (p < line_end && indent < 3 && text[p] == ' ') { p++; indent++; }
@@ -132,6 +151,7 @@ inline bool inside_markdown_fence(const std::string& text, size_t pos,
                     open = true;
                     marker = run_marker;
                     opening_run = run;
+                    fence_line = true;
                 } else if (run_marker == marker && run >= opening_run) {
                     size_t tail = run_end;
                     while (tail < line_end &&
@@ -145,10 +165,48 @@ inline bool inside_markdown_fence(const std::string& text, size_t pos,
                 }
             }
         }
+        if (!in_fence && !fence_line) {
+            const size_t seg_end = line_end < pos ? line_end : pos;
+            for (size_t i = line_start; i < seg_end;) {
+                if (text[i] == '`') {
+                    size_t run_end = i;
+                    while (run_end < seg_end && text[run_end] == '`') run_end++;
+                    const size_t run = run_end - i;
+                    size_t j = run_end, match = std::string::npos;
+                    while (j < seg_end) {
+                        if (text[j] != '`') { j++; continue; }
+                        size_t k = j;
+                        while (k < seg_end && text[k] == '`') k++;
+                        if (k - j == run) { match = k; break; }
+                        j = k;
+                    }
+                    if (match == std::string::npos) {
+                        if (seg_end == pos) m.inline_code = true;
+                        i = run_end;
+                    } else {
+                        i = match; // span content is literal text
+                    }
+                } else if (text.compare(i, fopen.size(), fopen) == 0) {
+                    fdepth++; i += fopen.size();
+                } else if (text.compare(i, fclose.size(), fclose) == 0) {
+                    if (fdepth) fdepth--;
+                    i += fclose.size();
+                } else if (text.compare(i, popen.size(), popen) == 0) {
+                    pdepth++; i += popen.size();
+                } else if (text.compare(i, pclose.size(), pclose) == 0) {
+                    if (pdepth) pdepth--;
+                    i += pclose.size();
+                } else {
+                    i++;
+                }
+            }
+        }
         if (line_end == text.size()) break;
         line_start = line_end + 1;
     }
-    return open;
+    m.fenced = open;
+    m.nested = fdepth > 0 || pdepth > 0;
+    return m;
 }
 
 inline bool top_level_markup_boundary(const std::string& text, size_t pos) {
@@ -171,36 +229,6 @@ inline bool unambiguous_native_xml_boundary(const std::string& text, size_t pos,
     return true;
 }
 
-// Is pos inside an open <open ...> block? Counts depth from scope_start (a
-// close with nothing open is ignored), so an inner example's close cannot
-// make a still-open outer block look closed.
-inline bool inside_unclosed_markup_block(const std::string& text, size_t pos,
-                                         const std::string& open,
-                                         const std::string& close,
-                                         size_t scope_start = 0) {
-    size_t depth = 0;
-    for (size_t i = scope_start; i < pos;) {
-        if (text.compare(i, open.size(), open) == 0) {
-            depth++;
-            i += open.size();
-        } else if (text.compare(i, close.size(), close) == 0) {
-            if (depth) depth--;
-            i += close.size();
-        } else {
-            i++;
-        }
-    }
-    return depth > 0;
-}
-
-inline bool nested_native_xml_candidate(const std::string& text, size_t pos,
-                                        size_t scope_start = 0) {
-    return inside_unclosed_markup_block(
-               text, pos, "<function=", "</function>", scope_start) ||
-           inside_unclosed_markup_block(
-               text, pos, "<parameter=", "</parameter>", scope_start);
-}
-
 // Where the answer starts: after the reasoning span's close, i.e. the FIRST
 // </think> when the turn opened with <think>, else the start. A literal
 // </think> later (prose, a fenced example, a body tool's payload) is text and
@@ -216,14 +244,14 @@ inline size_t answer_scope(const std::string& text, size_t pos) {
 
 // Would q27_agent_parse_tool_call decline an opener that starts at pos (text
 // = everything this turn emitted through the opener's token)? Any opener
-// inside a Markdown fence or nested in an unclosed <function=/<parameter=
-// is an example; a bare <function= must also be the first thing in the
+// inside a Markdown fence or inline code, or nested in an unclosed
+// <function=/<parameter= (answer_markup_at), is an example; a bare <function= must also be the first thing in the
 // answer. The engine's constraint veto uses this so it never closes a call
 // the parser won't run, and the parser runs the earliest opener it accepts.
 inline bool parser_declines_opener(const std::string& text, size_t pos, bool bare) {
     const size_t scope = answer_scope(text, pos);
-    if (inside_markdown_fence(text, pos, scope) ||
-        nested_native_xml_candidate(text, pos, scope)) return true;
+    const AnswerMarkup m = answer_markup_at(text, pos, scope);
+    if (m.fenced || m.inline_code || m.nested) return true;
     return bare && !unambiguous_native_xml_boundary(text, pos, scope);
 }
 

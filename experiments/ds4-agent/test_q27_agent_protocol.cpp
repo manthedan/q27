@@ -214,6 +214,39 @@ int main() {
               parse(nested_after_inner, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
               "inner example close does not unnest a later call");
         q27_agent_tool_call_free(&call);
+        // Tags inside a closed fence or an inline code span are literal text:
+        // they neither suppress a later real call nor balance an open example
+        // (Astra on ac81d9f). An unmatched backtick before the opener on its
+        // line is inline code (the engine stops before the closing one).
+        const std::string fence_literals =
+            "<think>\nok\n</think>\n\n```python\na = '<parameter='\nb = '<parameter='\n"
+            "c = '</parameter>'\n```\n<tool_call>\n<function=read>\n<parameter=path>\n"
+            "actual.txt\n</parameter>\n</function>\n</tool_call>";
+        CHECK(parse(fence_literals, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID &&
+              call.request.kind == Q27_TOOL_READ,
+              "unbalanced tags in a closed fence do not suppress a real call");
+        q27_agent_tool_call_free(&call);
+        const std::string balance_then_example =
+            "Example:\n<parameter=value>\n```\n</parameter>\n```\nQuoted `</parameter>` too.\n"
+            "<tool_call><function=shell><parameter=command>echo example</parameter>"
+            "</function></tool_call>";
+        CHECK(parse(balance_then_example, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
+              "fenced or inline closers do not close a prose example");
+        q27_agent_tool_call_free(&call);
+        const std::string inline_example =
+            "Example: `<tool_call><function=shell><parameter=command>echo example"
+            "</parameter></function></tool_call>";
+        CHECK(parser_declines_opener(inline_example, inline_example.find("<tool_call>"), false) &&
+              parse(inline_example, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
+              "inline-code example call is not run");
+        q27_agent_tool_call_free(&call);
+        const std::string after_inline =
+            "Run `ls` first: <tool_call>\n<function=read>\n<parameter=path>\na.txt\n"
+            "</parameter>\n</function>\n</tool_call>";
+        CHECK(!parser_declines_opener(after_inline, after_inline.find("<tool_call>"), false) &&
+              parse(after_inline, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID,
+              "a call after a closed inline span still runs");
+        q27_agent_tool_call_free(&call);
         const std::string nested_wrapped =
             "Example:\n<function=fixture><parameter=value>\n"
             "<tool_call><function=shell><parameter=command>echo example</parameter>"
