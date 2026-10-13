@@ -838,6 +838,13 @@ extern "C" q27_agent_status q27_agent_generate(
                     return false;
                 }
                 emitted_text += bytes;
+                // Keep the constrainer's opener window in step with the text:
+                // "<tool_call" + forced "</think>\n\n" + ">" is not an opener.
+                if (constrainer) {
+                    constrainer->tail += bytes;
+                    if (constrainer->tail.size() > 64)
+                        constrainer->tail.erase(0, constrainer->tail.size() - 64);
+                }
                 think_span.observe_token(bytes);
                 ++produced;
                 if (output_tokens) *output_tokens = produced;

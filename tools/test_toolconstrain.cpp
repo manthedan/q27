@@ -973,37 +973,39 @@ static void test_engage_suppressed_args() {
     CHECK(seen[1] == std::make_tuple(false, std::string("x<tool_call>"), size_t(11)));
 }
 
-// A bare <function= whose same-token remainder cannot start a declared call
-// is prose: it must not engage (and so must not count as a dropped call,
-// which the serial Metal owners treat as fatal). A real one still engages.
-static void test_bare_undeclared_is_prose() {
+// A bare opener whose same-token name fragment is no declared tool's fails
+// closed on the serial path, exactly like a wrapped "<tool_call>xq" entry
+// (test_serial_fail_closed). A declared one engages.
+static void test_bare_undeclared_fails_closed() {
     FakeEngine eng;
     FakeTok t2;
-    t2.vocab = {"</tool_call>", "The format is <function", "=example>", "=bash>\n"};
+    t2.vocab = {"</tool_call>", "The format is <function", "=ex", "=bash>\n"}; // "=get"-style real fragment
     q27::ToolMaskCache<q27::ToolGrammar> cache;
     q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
     cache.init(&t2.vocab, 0);
     cache_xml.init(&t2.vocab, 0);
     std::vector<int> host2dev;
-    TC tc;
-    tc.eng = &eng; tc.tok = &t2; tc.cache = &cache; tc.cache_xml = &cache_xml; tc.host2dev = &host2dev;
-    tc.enabled = true;
-    tc.begin({"bash"}, {{"command"}}, {{}}, /*dialect_xml=*/true);
+    auto make = [&](TC& tc) {
+        tc.eng = &eng; tc.tok = &t2; tc.cache = &cache; tc.cache_xml = &cache_xml; tc.host2dev = &host2dev;
+        tc.enabled = true;
+        tc.begin({"bash"}, {{"command"}}, {{}}, /*dialect_xml=*/true);
+    };
     bool threw = false;
+    TC bad; make(bad);
     try {
-        tc.advance_serial_or_throw(1);
-        tc.advance_serial_or_throw(2);
+        bad.advance_serial_or_throw(1);
+        bad.advance_serial_or_throw(2);
     } catch (const std::runtime_error&) { threw = true; }
-    CHECK(!threw);
-    CHECK(tc.engaged == 0 && !tc.active);
-    tc.advance_serial_or_throw(1);
-    tc.advance_serial_or_throw(3);
-    CHECK(tc.engaged == 1 && tc.active);
+    CHECK(threw);
+    TC good; make(good);
+    good.advance_serial_or_throw(1);
+    good.advance_serial_or_throw(3);
+    CHECK(good.engaged == 1 && good.active);
 }
 
 int main() {
     test_engage_suppressed_args();
-    test_bare_undeclared_is_prose();
+    test_bare_undeclared_fails_closed();
     test_engage_suppressed_veto();
     test_serial_fail_closed();
     test_c1_engage_truncate_midround();

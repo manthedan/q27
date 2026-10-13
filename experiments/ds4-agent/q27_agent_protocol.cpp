@@ -715,32 +715,23 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         static const std::string close = "</tool_call>";
         size_t begin = text.find(open);
         // A wrapped call inside a Markdown fence is an example, not a call
-        // (same rule as the wrapperless path below). Fenced-only output ends
-        // the turn as prose: the engine stops at </tool_call> either way.
-        if (begin != std::string::npos) {
-            const size_t think_close = text.rfind("</think>", begin);
-            const size_t scope = think_close == std::string::npos ? 0 : think_close + 8;
-            while (begin != std::string::npos &&
-                   q27::native_agent::inside_markdown_fence(text, begin, scope))
-                begin = text.find(open, begin + open.size());
-            if (begin == std::string::npos) return Q27_TOOL_CALL_NONE;
-        }
+        // (parser_declines_opener, the engine veto's rule). With only fenced
+        // wrappers, a bare call later in the turn is still judged below: the
+        // engine engages on it, so the parser must not stop at the examples.
+        while (begin != std::string::npos &&
+               q27::native_agent::parser_declines_opener(text, begin, false))
+            begin = text.find(open, begin + open.size());
         if (begin == std::string::npos) {
             if (!xml_dialect) return Q27_TOOL_CALL_NONE;
             bool saw_top_level_candidate = false;
-            size_t native_scope = 0;
-            const size_t think_close = text.rfind("</think>");
-            if (think_close != std::string::npos) native_scope = think_close + 8;
-            size_t native_begin = text.find("<function=", native_scope);
+            // Each candidate is judged in the scope of the last </think>
+            // before it (parser_declines_opener, the engine veto's rule), so
+            // a literal </think> in a body tool's fenced payload after the
+            // call cannot move the scope past the call.
+            size_t native_begin = text.find("<function=");
             size_t native_end = std::string::npos;
             while (native_begin != std::string::npos) {
-                const bool fenced =
-                    q27::native_agent::inside_markdown_fence(text, native_begin, native_scope);
-                const bool boundary = q27::native_agent::unambiguous_native_xml_boundary(
-                    text, native_begin, native_scope);
-                const bool nested = q27::native_agent::nested_native_xml_candidate(
-                    text, native_begin, native_scope);
-                if (!fenced && boundary && !nested) {
+                if (!q27::native_agent::parser_declines_opener(text, native_begin, true)) {
                     saw_top_level_candidate = true;
                     const size_t native_close =
                         text.find("</function>", native_begin);

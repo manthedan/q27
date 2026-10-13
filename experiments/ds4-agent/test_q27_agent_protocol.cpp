@@ -142,6 +142,25 @@ int main() {
                     sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID,
               "veto cases match the parser");
         q27_agent_tool_call_free(&call);
+        // A literal </think> in a body tool's payload after the call does not
+        // move the bare call's scope (engine engaged on it: parser must run it).
+        const std::string body_think =
+            "<think>\nplan\n</think>\n\n<function=write>\n<parameter=path>\nnotes.md\n"
+            "</parameter>\n</function>\n</tool_call>\n"
+            "```markdown\nThe model closes reasoning with </think> first.\n```\n";
+        CHECK(!parser_declines_opener(body_think, body_think.find("<function="), true) &&
+              parse(body_think, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID,
+              "later </think> text does not hide an engaged bare call");
+        q27_agent_tool_call_free(&call);
+        // Fenced wrapped examples earlier do not stop the bare search.
+        const std::string fenced_then_bare =
+            "<think>\n```\n<tool_call>\n<function=read>\n<parameter=path>\nx\n</parameter>\n"
+            "</function>\n</tool_call>\n```\n</think>\n\n<function=read>\n<parameter=path>\n"
+            "src/a.cc\n</parameter>\n</function>\n";
+        CHECK(!parser_declines_opener(fenced_then_bare, fenced_then_bare.rfind("<function="), true) &&
+              parse(fenced_then_bare, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID,
+              "bare call after fenced wrapped examples is run");
+        q27_agent_tool_call_free(&call);
     }
     std::string example_then_call =
         "Example:\n```xml\n<function=read><parameter=path>ignored"
