@@ -138,10 +138,8 @@ struct OpenerCandidate {
 // Scope: from the start, reset at answer_start() for openers after it.
 // An opener is an example (declined) when it is
 //  - inside a ``` / ~~~ fence (up to 3 spaces of indent);
-//  - after an unmatched backtick run on its own line (inline code: the
-//    engine stops before the closing backtick);
-//  - nested in an unclosed <function=/<parameter= in prose (depth counted;
-//    tags in fences and inline code are literal text);
+//  - nested in an unclosed <function=/<parameter= outside fences (depth
+//    counted; tags inside fences are literal text);
 //  - bare, and not the first non-whitespace of the scope or indented more
 //    than 3 spaces / not alone at the start of its line.
 inline size_t first_accepted_opener(const std::string& text,
@@ -151,7 +149,7 @@ inline size_t first_accepted_opener(const std::string& text,
     const size_t scope_at = answer_start(text);
     bool open = false, prose = true;
     char marker = 0;
-    size_t opening_run = 0, fdepth = 0, pdepth = 0, span = 0;
+    size_t opening_run = 0, fdepth = 0, pdepth = 0;
     bool non_ws = false, line_blank = true;
     size_t line_spaces = 0;
     auto classify = [&](size_t line_start) { // fence state for this line
@@ -185,7 +183,6 @@ inline size_t first_accepted_opener(const std::string& text,
             }
         }
         prose = !in_fence && !fence_line;
-        span = 0;
     };
     classify(0);
     size_t ci = 0;
@@ -198,7 +195,7 @@ inline size_t first_accepted_opener(const std::string& text,
         }
         for (; ci < cands.size() && cands[ci].pos <= i; ++ci) {
             const OpenerCandidate& c = cands[ci];
-            bool declined = open || (prose && span) || fdepth || pdepth;
+            bool declined = open || fdepth || pdepth;
             if (!declined && c.bare) declined = non_ws || !line_blank || line_spaces > 3;
             if (!declined) return ci;
         }
@@ -218,15 +215,7 @@ inline size_t first_accepted_opener(const std::string& text,
             if (ch != '\t' && ch != '\r') non_ws = true;
         }
         if (!prose) { i++; continue; }
-        if (ch == '`') {
-            size_t r = i;
-            while (r < text.size() && text[r] == '`') r++;
-            if (!span) span = r - i;
-            else if (r - i == span) span = 0;
-            i = r;
-        } else if (span) {
-            i++;
-        } else if (text.compare(i, fopen.size(), fopen) == 0) {
+        if (text.compare(i, fopen.size(), fopen) == 0) {
             fdepth++; i += fopen.size();
         } else if (text.compare(i, fclose.size(), fclose) == 0) {
             if (fdepth) fdepth--;

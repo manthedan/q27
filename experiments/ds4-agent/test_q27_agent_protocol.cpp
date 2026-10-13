@@ -214,10 +214,9 @@ int main() {
               parse(nested_after_inner, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
               "inner example close does not unnest a later call");
         q27_agent_tool_call_free(&call);
-        // Tags inside a closed fence or an inline code span are literal text:
-        // they neither suppress a later real call nor balance an open example
-        // (Astra on ac81d9f). An unmatched backtick before the opener on its
-        // line is inline code (the engine stops before the closing one).
+        // Tags inside a closed fence are literal text: they neither suppress a
+        // later real call nor balance an open example (Astra on ac81d9f).
+        // Backticks are plain text (inline code is not modelled: Astra r6).
         const std::string fence_literals =
             "<think>\nok\n</think>\n\n```python\na = '<parameter='\nb = '<parameter='\n"
             "c = '</parameter>'\n```\n<tool_call>\n<function=read>\n<parameter=path>\n"
@@ -227,18 +226,11 @@ int main() {
               "unbalanced tags in a closed fence do not suppress a real call");
         q27_agent_tool_call_free(&call);
         const std::string balance_then_example =
-            "Example:\n<parameter=value>\n```\n</parameter>\n```\nQuoted `</parameter>` too.\n"
+            "Example:\n<parameter=value>\n```\n</parameter>\n```\n"
             "<tool_call><function=shell><parameter=command>echo example</parameter>"
             "</function></tool_call>";
         CHECK(parse(balance_then_example, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
-              "fenced or inline closers do not close a prose example");
-        q27_agent_tool_call_free(&call);
-        const std::string inline_example =
-            "Example: `<tool_call><function=shell><parameter=command>echo example"
-            "</parameter></function></tool_call>";
-        CHECK(parser_declines_opener(inline_example, inline_example.find("<tool_call>"), false) &&
-              parse(inline_example, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
-              "inline-code example call is not run");
+              "fenced closers do not close a prose example");
         q27_agent_tool_call_free(&call);
         const std::string after_inline =
             "Run `ls` first: <tool_call>\n<function=read>\n<parameter=path>\na.txt\n"
@@ -247,6 +239,26 @@ int main() {
               parse(after_inline, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID,
               "a call after a closed inline span still runs");
         q27_agent_tool_call_free(&call);
+        const std::string inline_then_call =
+            "Example: `<tool_call> is the opening tag.\n<tool_call><function=shell>"
+            "<parameter=command>echo example</parameter></function></tool_call>";
+        CHECK(parse(inline_then_call, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
+              "the earliest opener is the call, as in both baselines (INVALID here)");
+        q27_agent_tool_call_free(&call);
+        // Astra r6: backticks never hide a real call or a closing tag.
+        for (const std::string& text : {
+                 std::string("Inspect the literal \\` now: <tool_call>\n<function=read>\n"
+                             "<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"),
+                 std::string("Run `echo\nhi` first:\n<tool_call>\n<function=read>\n"
+                             "<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"),
+                 std::string("Example: <parameter=value>literal ` tick</parameter>\n<tool_call>\n"
+                             "<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n"
+                             "</tool_call>")}) {
+            CHECK(parse(text, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID &&
+                      call.request.kind == Q27_TOOL_READ,
+                  "backticks do not suppress a real call");
+            q27_agent_tool_call_free(&call);
+        }
         const std::string nested_wrapped =
             "Example:\n<function=fixture><parameter=value>\n"
             "<tool_call><function=shell><parameter=command>echo example</parameter>"
