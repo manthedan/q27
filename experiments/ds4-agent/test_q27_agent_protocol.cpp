@@ -203,6 +203,17 @@ int main() {
               parse(literal_think, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
               "literal </think> in a fence does not unfence later calls");
         q27_agent_tool_call_free(&call);
+        // Depth, not "last open vs last close": the inner example's
+        // </parameter> must not close the outer open <parameter= (Astra r4).
+        const std::string nested_after_inner =
+            "Example:\n<parameter=value>\n"
+            "<tool_call><function=read><parameter=path></parameter></function></tool_call>\n"
+            "<tool_call><function=shell><parameter=command>echo example</parameter>"
+            "</function></tool_call>";
+        CHECK(parser_declines_opener(nested_after_inner, nested_after_inner.rfind("<tool_call>"), false) &&
+              parse(nested_after_inner, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
+              "inner example close does not unnest a later call");
+        q27_agent_tool_call_free(&call);
         const std::string nested_wrapped =
             "Example:\n<function=fixture><parameter=value>\n"
             "<tool_call><function=shell><parameter=command>echo example</parameter>"

@@ -171,15 +171,26 @@ inline bool unambiguous_native_xml_boundary(const std::string& text, size_t pos,
     return true;
 }
 
+// Is pos inside an open <open ...> block? Counts depth from scope_start (a
+// close with nothing open is ignored), so an inner example's close cannot
+// make a still-open outer block look closed.
 inline bool inside_unclosed_markup_block(const std::string& text, size_t pos,
                                          const std::string& open,
                                          const std::string& close,
                                          size_t scope_start = 0) {
-    if (pos <= scope_start) return false;
-    const size_t opened = text.rfind(open, pos - 1);
-    if (opened == std::string::npos || opened < scope_start) return false;
-    const size_t closed = text.rfind(close, pos - 1);
-    return closed == std::string::npos || closed < opened;
+    size_t depth = 0;
+    for (size_t i = scope_start; i < pos;) {
+        if (text.compare(i, open.size(), open) == 0) {
+            depth++;
+            i += open.size();
+        } else if (text.compare(i, close.size(), close) == 0) {
+            if (depth) depth--;
+            i += close.size();
+        } else {
+            i++;
+        }
+    }
+    return depth > 0;
 }
 
 inline bool nested_native_xml_candidate(const std::string& text, size_t pos,
