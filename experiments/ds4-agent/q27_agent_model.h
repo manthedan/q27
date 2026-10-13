@@ -190,18 +190,30 @@ inline bool nested_native_xml_candidate(const std::string& text, size_t pos,
                text, pos, "<parameter=", "</parameter>", scope_start);
 }
 
+// Where the answer starts: after the reasoning span's close, i.e. the FIRST
+// </think> when the turn opened with <think>, else the start. A literal
+// </think> later (prose, a fenced example, a body tool's payload) is text and
+// never moves it. Openers inside the reasoning span use the start.
+inline size_t answer_scope(const std::string& text, size_t pos) {
+    size_t i = 0;
+    while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
+                               text[i] == '\r' || text[i] == '\n')) i++;
+    if (text.compare(i, 7, "<think>") != 0) return 0;
+    const size_t close = text.find("</think>", i + 7);
+    return close != std::string::npos && close + 8 <= pos ? close + 8 : 0;
+}
+
 // Would q27_agent_parse_tool_call decline an opener that starts at pos (text
-// = everything this turn emitted through the opener's token)? Wrapped
-// <tool_call>: inside a Markdown fence after the last </think>. Bare
-// <function=: also not the first thing after </think>, or nested. The engine's
-// constraint veto uses this so it never closes a call the parser won't run.
+// = everything this turn emitted through the opener's token)? Any opener
+// inside a Markdown fence or nested in an unclosed <function=/<parameter=
+// is an example; a bare <function= must also be the first thing in the
+// answer. The engine's constraint veto uses this so it never closes a call
+// the parser won't run, and the parser runs the earliest opener it accepts.
 inline bool parser_declines_opener(const std::string& text, size_t pos, bool bare) {
-    const size_t think_close =
-        pos ? text.rfind("</think>", pos - 1) : std::string::npos;
-    const size_t scope = think_close == std::string::npos ? 0 : think_close + 8;
-    if (inside_markdown_fence(text, pos, scope)) return true;
-    return bare && (!unambiguous_native_xml_boundary(text, pos, scope) ||
-                    nested_native_xml_candidate(text, pos, scope));
+    const size_t scope = answer_scope(text, pos);
+    if (inside_markdown_fence(text, pos, scope) ||
+        nested_native_xml_candidate(text, pos, scope)) return true;
+    return bare && !unambiguous_native_xml_boundary(text, pos, scope);
 }
 
 inline const nlohmann::json* tool_parameter_properties(

@@ -18,6 +18,8 @@ static q27_agent_tool_call_status parse(const std::string& text,
         &call, error, cap, eos, xml_dialect);
 }
 
+using q27::native_agent::parser_declines_opener;
+
 int main() {
     char error[256] = {0};
     q27_agent_tool_call call{};
@@ -48,8 +50,10 @@ int main() {
           std::strcmp(call.request.path, "src/bare-native.cc") == 0,
           "selected XML dialect normalizes a wrapperless native read call");
     q27_agent_tool_call_free(&call);
+    // Live turns carry the engine-emitted "<think>\n" opener (q27_agent_
+    // engine.cpp); without it a </think> is literal text, not a scope.
     std::string thinking_then_native =
-        "reasoning about the file\n</think>\n"
+        "<think>\nreasoning about the file\n</think>\n"
         "<function=read><parameter=path>src/after-think.cc"
         "</parameter></function>";
     CHECK(parse(thinking_then_native, call, error, sizeof(error), 1, 1) ==
@@ -116,7 +120,6 @@ int main() {
           "quoted native XML examples are not executed");
     // The engine's constraint veto agrees with the parser at the opener.
     {
-        using q27::native_agent::parser_declines_opener;
         auto at = [](const std::string& t, const char *opener) { return t.rfind(opener); };
         const std::string first = "\n<function=read>";
         const std::string after_think = "<think>\nplan\n</think>\n\n<function=read>";
@@ -186,6 +189,27 @@ int main() {
         CHECK(parse(header + body, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID &&
               call.request.kind == Q27_TOOL_WRITE,
               "bare write with example calls in its body is the write");
+        q27_agent_tool_call_free(&call);
+    }
+    // Only the reasoning span's close sets the scope; a literal </think> in
+    // the answer does not reopen fenced text, and a wrapped call nested in an
+    // unclosed bare example is an example too (Astra on 93bba89).
+    {
+        const std::string literal_think =
+            "Examples:\n```xml\n<tool_call>\nLiteral delimiter: </think>\n"
+            "<tool_call><function=shell><parameter=command>echo example</parameter>"
+            "</function></tool_call>";
+        CHECK(parser_declines_opener(literal_think, literal_think.rfind("<tool_call>"), false) &&
+              parse(literal_think, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
+              "literal </think> in a fence does not unfence later calls");
+        q27_agent_tool_call_free(&call);
+        const std::string nested_wrapped =
+            "Example:\n<function=fixture><parameter=value>\n"
+            "<tool_call><function=shell><parameter=command>echo example</parameter>"
+            "</function></tool_call>";
+        CHECK(parser_declines_opener(nested_wrapped, nested_wrapped.find("<tool_call>"), false) &&
+              parse(nested_wrapped, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
+              "wrapped call nested in a bare example is not run");
         q27_agent_tool_call_free(&call);
     }
     std::string example_then_call =
