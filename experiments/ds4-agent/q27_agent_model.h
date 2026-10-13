@@ -138,25 +138,23 @@ struct OpenerCandidate {
 // Scope: from the start, reset at answer_start() for openers after it.
 // An opener is an example (declined) when it is
 //  - inside a ``` / ~~~ fence (up to 3 spaces of indent);
-//  - nested in an unclosed <function=/<parameter= outside fences (depth
-//    counted; tags inside fences are literal text);
 //  - bare, and not the first non-whitespace of the scope or indented more
-//    than 3 spaces / not alone at the start of its line.
+//    than 3 spaces / not alone at the start of its line (so a bare call is
+//    never nested in other markup).
+// Wrapped calls in prose are not checked for nesting: counting tags there
+// suppressed real calls after prose that merely mentions "<parameter=..."
+// (Astra r7); both baselines accept them too.
 inline size_t first_accepted_opener(const std::string& text,
                                     const std::vector<OpenerCandidate>& cands) {
-    static const std::string fopen = "<function=", fclose = "</function>",
-                             popen = "<parameter=", pclose = "</parameter>";
     const size_t scope_at = answer_start(text);
-    bool open = false, prose = true;
+    bool open = false;
     char marker = 0;
-    size_t opening_run = 0, fdepth = 0, pdepth = 0;
+    size_t opening_run = 0;
     bool non_ws = false, line_blank = true;
     size_t line_spaces = 0;
     auto classify = [&](size_t line_start) { // fence state for this line
         size_t line_end = text.find('\n', line_start);
         if (line_end == std::string::npos) line_end = text.size();
-        const bool in_fence = open;
-        bool fence_line = false;
         size_t p = line_start, indent = 0;
         while (p < line_end && indent < 3 && text[p] == ' ') { p++; indent++; }
         if (p < line_end && (text[p] == '`' || text[p] == '~')) {
@@ -169,7 +167,6 @@ inline size_t first_accepted_opener(const std::string& text,
                     open = true;
                     marker = run_marker;
                     opening_run = run;
-                    fence_line = true;
                 } else if (run_marker == marker && run >= opening_run) {
                     size_t tail = run_end;
                     while (tail < line_end && (text[tail] == ' ' || text[tail] == '\t' ||
@@ -182,20 +179,18 @@ inline size_t first_accepted_opener(const std::string& text,
                 }
             }
         }
-        prose = !in_fence && !fence_line;
     };
     classify(0);
     size_t ci = 0;
     for (size_t i = 0;;) {
         if (i == scope_at) { // the answer: fresh scope, read as a line start
             open = false; marker = 0; opening_run = 0;
-            fdepth = pdepth = 0;
             non_ws = false;
             classify(i);
         }
         for (; ci < cands.size() && cands[ci].pos <= i; ++ci) {
             const OpenerCandidate& c = cands[ci];
-            bool declined = open || fdepth || pdepth;
+            bool declined = open;
             if (!declined && c.bare) declined = non_ws || !line_blank || line_spaces > 3;
             if (!declined) return ci;
         }
@@ -214,20 +209,7 @@ inline size_t first_accepted_opener(const std::string& text,
             line_blank = false;
             if (ch != '\t' && ch != '\r') non_ws = true;
         }
-        if (!prose) { i++; continue; }
-        if (text.compare(i, fopen.size(), fopen) == 0) {
-            fdepth++; i += fopen.size();
-        } else if (text.compare(i, fclose.size(), fclose) == 0) {
-            if (fdepth) fdepth--;
-            i += fclose.size();
-        } else if (text.compare(i, popen.size(), popen) == 0) {
-            pdepth++; i += popen.size();
-        } else if (text.compare(i, pclose.size(), pclose) == 0) {
-            if (pdepth) pdepth--;
-            i += pclose.size();
-        } else {
-            i++;
-        }
+        i++;
     }
     return std::string::npos;
 }

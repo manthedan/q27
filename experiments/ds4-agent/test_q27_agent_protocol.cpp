@@ -203,69 +203,33 @@ int main() {
               parse(literal_think, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
               "literal </think> in a fence does not unfence later calls");
         q27_agent_tool_call_free(&call);
-        // Depth, not "last open vs last close": the inner example's
-        // </parameter> must not close the outer open <parameter= (Astra r4).
-        const std::string nested_after_inner =
-            "Example:\n<parameter=value>\n"
-            "<tool_call><function=read><parameter=path></parameter></function></tool_call>\n"
-            "<tool_call><function=shell><parameter=command>echo example</parameter>"
-            "</function></tool_call>";
-        CHECK(parser_declines_opener(nested_after_inner, nested_after_inner.rfind("<tool_call>"), false) &&
-              parse(nested_after_inner, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
-              "inner example close does not unnest a later call");
+        // Sol r7: a declined first wrapper inside prose markup no longer
+        // hands the turn to a later example; and a bare tag prefix mention
+        // does not suppress a real call (JSON dialect).
+        const std::string two_examples =
+            "Example one:\n<parameter=value>\n<tool_call>{\"name\":\"read\",\"arguments\":"
+            "{\"path\":\"a.txt\"}}</tool_call>\n</parameter>\nExample two:\n<tool_call>"
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"touch X\"}}</tool_call>";
+        CHECK(parse(two_examples, call, error, sizeof(error), 1, 0) != Q27_TOOL_CALL_VALID,
+              "a later example never becomes the call (as both baselines)");
         q27_agent_tool_call_free(&call);
-        // Tags inside a closed fence are literal text: they neither suppress a
-        // later real call nor balance an open example (Astra on ac81d9f).
-        // Backticks are plain text (inline code is not modelled: Astra r6).
-        const std::string fence_literals =
-            "<think>\nok\n</think>\n\n```python\na = '<parameter='\nb = '<parameter='\n"
-            "c = '</parameter>'\n```\n<tool_call>\n<function=read>\n<parameter=path>\n"
-            "actual.txt\n</parameter>\n</function>\n</tool_call>";
-        CHECK(parse(fence_literals, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID &&
+        const std::string prefix_mention =
+            "The grep needle is <parameter= (use that literal prefix).\nI will read it now.\n"
+            "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>";
+        CHECK(parse(prefix_mention, call, error, sizeof(error), 1, 0) == Q27_TOOL_CALL_VALID &&
               call.request.kind == Q27_TOOL_READ,
-              "unbalanced tags in a closed fence do not suppress a real call");
+              "a tag prefix mention does not suppress a real call");
         q27_agent_tool_call_free(&call);
-        const std::string balance_then_example =
-            "Example:\n<parameter=value>\n```\n</parameter>\n```\n"
-            "<tool_call><function=shell><parameter=command>echo example</parameter>"
-            "</function></tool_call>";
-        CHECK(parse(balance_then_example, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
-              "fenced closers do not close a prose example");
-        q27_agent_tool_call_free(&call);
-        const std::string after_inline =
-            "Run `ls` first: <tool_call>\n<function=read>\n<parameter=path>\na.txt\n"
-            "</parameter>\n</function>\n</tool_call>";
-        CHECK(!parser_declines_opener(after_inline, after_inline.find("<tool_call>"), false) &&
-              parse(after_inline, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID,
-              "a call after a closed inline span still runs");
-        q27_agent_tool_call_free(&call);
-        const std::string inline_then_call =
-            "Example: `<tool_call> is the opening tag.\n<tool_call><function=shell>"
-            "<parameter=command>echo example</parameter></function></tool_call>";
-        CHECK(parse(inline_then_call, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
-              "the earliest opener is the call, as in both baselines (INVALID here)");
-        q27_agent_tool_call_free(&call);
-        // Astra r6: backticks never hide a real call or a closing tag.
-        for (const std::string& text : {
-                 std::string("Inspect the literal \\` now: <tool_call>\n<function=read>\n"
-                             "<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"),
-                 std::string("Run `echo\nhi` first:\n<tool_call>\n<function=read>\n"
-                             "<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"),
-                 std::string("Example: <parameter=value>literal ` tick</parameter>\n<tool_call>\n"
-                             "<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n"
-                             "</tool_call>")}) {
-            CHECK(parse(text, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID &&
-                      call.request.kind == Q27_TOOL_READ,
-                  "backticks do not suppress a real call");
-            q27_agent_tool_call_free(&call);
-        }
-        const std::string nested_wrapped =
-            "Example:\n<function=fixture><parameter=value>\n"
-            "<tool_call><function=shell><parameter=command>echo example</parameter>"
-            "</function></tool_call>";
-        CHECK(parser_declines_opener(nested_wrapped, nested_wrapped.find("<tool_call>"), false) &&
-              parse(nested_wrapped, call, error, sizeof(error), 1, 1) != Q27_TOOL_CALL_VALID,
-              "wrapped call nested in a bare example is not run");
+        // Prose that mentions tags does not suppress a later real call
+        // (Astra r7); a wrapped call is not checked for nesting (baselines).
+        const std::string mention_then_call =
+            "The opening parameter tag is <parameter=path>. I will inspect the file now.\n"
+            "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n"
+            "</function>\n</tool_call>";
+        CHECK(!parser_declines_opener(mention_then_call, mention_then_call.find("<tool_call>"), false) &&
+              parse(mention_then_call, call, error, sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID &&
+              call.request.kind == Q27_TOOL_READ,
+              "tag mentions in prose do not suppress a real call");
         q27_agent_tool_call_free(&call);
     }
     std::string example_then_call =
