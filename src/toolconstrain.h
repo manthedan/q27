@@ -36,10 +36,14 @@ struct BasicToolConstrainer {
     std::vector<int>* host2dev = nullptr;
     bool enabled = false, active = false;
     // Optional veto on engaging (both <tool_call> and bare <function=): the
-    // native agent sets it to "inside a Markdown fence", so a fenced example
-    // call decodes as prose instead of being masked, closed, and stopped on.
-    // The tail still advances. Unset (HTTP server): no change.
-    std::function<bool()> engage_suppressed;
+    // native agent applies its parser's acceptance rule (fence; for bare
+    // calls also boundary and nesting), so an example call it would not run
+    // decodes as prose instead of being masked, closed, and stopped on.
+    // Arguments: bare opener?, this token's bytes, and how far before the end
+    // of (text emitted so far + those bytes) the opener starts. The tail
+    // still advances. Unset (HTTP server): no change.
+    std::function<bool(bool bare, const std::string& token_bytes, size_t opener_back)>
+        engage_suppressed;
     bool pool_dead = false; // sticky: mask pool filled up this request
     // Q27_TG_REENGAGE (XML dialect): re-engage the grammar on a bare
     // <function= opener (no <tool_call> wrapper) during scan_round -- the
@@ -330,8 +334,24 @@ struct BasicToolConstrainer {
                 // real stream and bare calls decoded unconstrained.
                 if (bp != std::string::npos &&
                     bp + 10 > tail.size() - bytes.size() &&
-                    !(engage_suppressed && engage_suppressed())) {
+                    !(engage_suppressed && engage_suppressed(true, bytes, tail.size() - bp))) {
                     std::string rem = tail.substr(bp);
+                    // Unlike a <tool_call> wrapper, a bare opener whose name
+                    // (as far as this token goes) is no declared tool's
+                    // ("<function=example>" in prose) is not a call: leave it
+                    // as text. Engaging and dropping is fatal for serial
+                    // owners (advance_serial_or_throw). Once the name matches,
+                    // later rejections still drop (fail closed).
+                    const size_t name_end = rem.find('>', 10);
+                    ToolGrammarXml probe = tg_xml;
+                    probe.reset(names, params_per_name, required_per_name, schema_present, allow_additional);
+                    bool name_ok = true;
+                    for (size_t k = 0; k < rem.size() && (name_end == std::string::npos || k <= name_end); k++)
+                        if (!probe.advance(rem[k])) { name_ok = false; break; }
+                    if (!name_ok) {
+                        fprintf(stderr, "[toolgram] bare <function= names no declared tool; left as text\n");
+                        continue;
+                    }
                     tg_xml.reset(names, params_per_name, required_per_name, schema_present, allow_additional);
                     active = true;
                     engaged++;
@@ -370,7 +390,7 @@ struct BasicToolConstrainer {
             // engage only when the marker COMPLETES within this token; any
             // remainder bytes after it already belong to the call body
             if (pos == std::string::npos || pos + 11 <= tail.size() - bytes.size()) continue;
-            if (engage_suppressed && engage_suppressed()) continue;
+            if (engage_suppressed && engage_suppressed(false, bytes, tail.size() - pos)) continue;
             std::string rem = tail.substr(pos + 11);
             if (dialect_xml) tg_xml.reset(names, params_per_name, required_per_name, schema_present, allow_additional);
             else tg.reset(names);

@@ -1,4 +1,5 @@
 #include "q27_agent_protocol.h"
+#include "q27_agent_model.h"
 
 #include <cstdio>
 #include <cstring>
@@ -113,6 +114,33 @@ int main() {
                 "</parameter></function>\"}", call, error, sizeof(error), 1, 1) ==
               Q27_TOOL_CALL_NONE,
           "quoted native XML examples are not executed");
+    // The engine's constraint veto agrees with the parser at the opener.
+    {
+        using q27::native_agent::parser_declines_opener;
+        auto at = [](const std::string& t, const char *opener) { return t.rfind(opener); };
+        const std::string first = "\n<function=read>";
+        const std::string after_think = "<think>\nplan\n</think>\n\n<function=read>";
+        const std::string prose = "Now inspect it:\n<function=read>";
+        const std::string fenced = "Example:\n```xml\n<function=read>";
+        const std::string nested = "<function=fixture><parameter=value>\n<function=shell>";
+        const std::string in_think = "<think>\n<function=read>";
+        const std::string wrapped = "I will inspect it.\n<tool_call>";
+        const std::string wrapped_fenced = "Example:\n```\n<tool_call>";
+        CHECK(!parser_declines_opener(first, at(first, "<function="), true), "veto: bare call first");
+        CHECK(!parser_declines_opener(after_think, at(after_think, "<function="), true), "veto: bare call after </think>");
+        CHECK(parser_declines_opener(prose, at(prose, "<function="), true), "veto: bare call after prose");
+        CHECK(parser_declines_opener(fenced, at(fenced, "<function="), true), "veto: fenced bare call");
+        CHECK(parser_declines_opener(nested, at(nested, "<function="), true), "veto: nested bare call");
+        CHECK(parser_declines_opener(in_think, at(in_think, "<function="), true), "veto: bare call inside <think>");
+        CHECK(!parser_declines_opener(wrapped, at(wrapped, "<tool_call>"), false), "veto: wrapped call after prose");
+        CHECK(parser_declines_opener(wrapped_fenced, at(wrapped_fenced, "<tool_call>"), false), "veto: fenced wrapped call");
+        CHECK(parse(prose + "<parameter=path>a</parameter></function>", call, error,
+                    sizeof(error), 1, 1) == Q27_TOOL_CALL_NONE &&
+              parse(first + "<parameter=path>a</parameter></function>", call, error,
+                    sizeof(error), 1, 1) == Q27_TOOL_CALL_VALID,
+              "veto cases match the parser");
+        q27_agent_tool_call_free(&call);
+    }
     std::string example_then_call =
         "Example:\n```xml\n<function=read><parameter=path>ignored"
         "</parameter></function>\n```\nNow inspect it:\n"

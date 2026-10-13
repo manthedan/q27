@@ -190,6 +190,20 @@ inline bool nested_native_xml_candidate(const std::string& text, size_t pos,
                text, pos, "<parameter=", "</parameter>", scope_start);
 }
 
+// Would q27_agent_parse_tool_call decline an opener that starts at pos (text
+// = everything this turn emitted through the opener's token)? Wrapped
+// <tool_call>: inside a Markdown fence after the last </think>. Bare
+// <function=: also not the first thing after </think>, or nested. The engine's
+// constraint veto uses this so it never closes a call the parser won't run.
+inline bool parser_declines_opener(const std::string& text, size_t pos, bool bare) {
+    const size_t think_close =
+        pos ? text.rfind("</think>", pos - 1) : std::string::npos;
+    const size_t scope = think_close == std::string::npos ? 0 : think_close + 8;
+    if (inside_markdown_fence(text, pos, scope)) return true;
+    return bare && (!unambiguous_native_xml_boundary(text, pos, scope) ||
+                    nested_native_xml_candidate(text, pos, scope));
+}
+
 inline const nlohmann::json* tool_parameter_properties(
         const nlohmann::json* tools, const std::string& name) {
     if (!tools || !tools->is_array()) return nullptr;

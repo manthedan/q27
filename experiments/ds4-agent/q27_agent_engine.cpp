@@ -726,15 +726,15 @@ extern "C" q27_agent_status q27_agent_generate(
             constrainer->cache_xml = &engine->tool_masks_xml;
             constrainer->host2dev = engine->xml_dialect ? &engine->tool_host2dev_xml : &engine->tool_host2dev;
             constrainer->enabled = true;
-            // A tool opener inside a Markdown fence is an example: don't mask,
-            // close, and stop on it (the parser would refuse to run it, and
-            // the cycle would fail on the engine/parser disagreement).
-            constrainer->engage_suppressed = [&emitted_text] {
-                const size_t think_close = emitted_text.rfind("</think>");
-                const size_t scope =
-                    think_close == std::string::npos ? 0 : think_close + 8;
-                return q27::native_agent::inside_markdown_fence(
-                    emitted_text, emitted_text.size(), scope);
+            // Engage only on an opener the parser would run (see
+            // parser_declines_opener); otherwise masking, closing and stopping
+            // on an example fails the cycle on the engine/parser mismatch.
+            constrainer->engage_suppressed = [&emitted_text](
+                    bool bare, const std::string& token_bytes, size_t opener_back) {
+                const std::string text = emitted_text + token_bytes;
+                if (opener_back > text.size()) return true; // starts before this turn
+                return q27::native_agent::parser_declines_opener(
+                    text, text.size() - opener_back, bare);
             };
             constrainer->prepare_serial_masks = [engine] {
                 // Serial step/read has completed before this boundary. Keep

@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstdio>
 #include <string>
+#include <tuple>
 #include <vector>
 
 // ---- fakes ----------------------------------------------------------------
@@ -931,7 +932,7 @@ static void test_serial_fail_closed() {
 static void test_engage_suppressed_veto() {
     Rig r;
     bool fenced = true;
-    r.tc.engage_suppressed = [&fenced] { return fenced; };
+    r.tc.engage_suppressed = [&fenced](bool, const std::string&, size_t) { return fenced; };
     int em[2] = {T_MARK, T_GET};
     CHECK(r.tc.scan_round(em, 2) == -1);
     CHECK(!r.tc.active);
@@ -943,7 +944,66 @@ static void test_engage_suppressed_veto() {
     CHECK(r.tc.engaged == 1);
 }
 
+// The veto learns which opener fired and where it starts: bare, this
+// token's bytes, and the opener's distance from the end of the text through
+// this token (native agent: parser_declines_opener at that position).
+static void test_engage_suppressed_args() {
+    FakeEngine eng;
+    FakeTok t2;
+    t2.vocab = {"</tool_call>", "Now <function", "=bash>\n", "x<tool_call>"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&t2.vocab, 0);
+    cache_xml.init(&t2.vocab, 0);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng; tc.tok = &t2; tc.cache = &cache; tc.cache_xml = &cache_xml; tc.host2dev = &host2dev;
+    tc.enabled = true;
+    tc.begin({"bash"}, {{"command"}}, {{}}, /*dialect_xml=*/true);
+    std::vector<std::tuple<bool, std::string, size_t>> seen;
+    tc.engage_suppressed = [&seen](bool bare, const std::string& bytes, size_t back) {
+        seen.emplace_back(bare, bytes, back);
+        return true;
+    };
+    int em[3] = {1, 2, 3};
+    CHECK(tc.scan_round(em, 3) == -1);
+    CHECK(tc.engaged == 0 && !tc.active);
+    CHECK(seen.size() == 2);
+    CHECK(seen[0] == std::make_tuple(true, std::string("=bash>\n"), size_t(16)));
+    CHECK(seen[1] == std::make_tuple(false, std::string("x<tool_call>"), size_t(11)));
+}
+
+// A bare <function= whose same-token remainder cannot start a declared call
+// is prose: it must not engage (and so must not count as a dropped call,
+// which the serial Metal owners treat as fatal). A real one still engages.
+static void test_bare_undeclared_is_prose() {
+    FakeEngine eng;
+    FakeTok t2;
+    t2.vocab = {"</tool_call>", "The format is <function", "=example>", "=bash>\n"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&t2.vocab, 0);
+    cache_xml.init(&t2.vocab, 0);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng; tc.tok = &t2; tc.cache = &cache; tc.cache_xml = &cache_xml; tc.host2dev = &host2dev;
+    tc.enabled = true;
+    tc.begin({"bash"}, {{"command"}}, {{}}, /*dialect_xml=*/true);
+    bool threw = false;
+    try {
+        tc.advance_serial_or_throw(1);
+        tc.advance_serial_or_throw(2);
+    } catch (const std::runtime_error&) { threw = true; }
+    CHECK(!threw);
+    CHECK(tc.engaged == 0 && !tc.active);
+    tc.advance_serial_or_throw(1);
+    tc.advance_serial_or_throw(3);
+    CHECK(tc.engaged == 1 && tc.active);
+}
+
 int main() {
+    test_engage_suppressed_args();
+    test_bare_undeclared_is_prose();
     test_engage_suppressed_veto();
     test_serial_fail_closed();
     test_c1_engage_truncate_midround();
