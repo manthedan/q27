@@ -3569,7 +3569,11 @@ inline ToolCall parse_tool_call_impl(const std::string& seg) {
 // capture_drift falls back to the thread's context (set by the non-stream
 // resolver) and otherwise keeps identifier-like tool names verbatim.
 inline ToolCall parse_tool_call(const std::string& seg) {
-    if (json_nesting_exceeds(seg, kMaxRequestJsonDepth)) return ToolCall{}; // not a call we can carry
+    if (json_nesting_exceeds(seg, kMaxRequestJsonDepth)) { // not a call we can carry
+        ToolCall tc;
+        tc.raw = seg; // still prose: callers stream a failed call's raw bytes
+        return tc;
+    }
     ToolCall tc = parse_tool_call_impl(seg);
     if (drift_parse_depth == 0 && drift_corpus_path()) {
         if (tc.ok) {

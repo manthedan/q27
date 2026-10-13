@@ -124,6 +124,7 @@ int main() {
         const std::string fenced = "Example:\n```xml\n<function=read>";
         const std::string nested = "<function=fixture><parameter=value>\n<function=shell>";
         const std::string in_think = "<think>\n<function=read>";
+        const std::string indented = "    <function=read>";
         const std::string wrapped = "I will inspect it.\n<tool_call>";
         const std::string wrapped_fenced = "Example:\n```\n<tool_call>";
         CHECK(!parser_declines_opener(first, at(first, "<function="), true), "veto: bare call first");
@@ -132,6 +133,7 @@ int main() {
         CHECK(parser_declines_opener(fenced, at(fenced, "<function="), true), "veto: fenced bare call");
         CHECK(parser_declines_opener(nested, at(nested, "<function="), true), "veto: nested bare call");
         CHECK(parser_declines_opener(in_think, at(in_think, "<function="), true), "veto: bare call inside <think>");
+        CHECK(parser_declines_opener(indented, at(indented, "<function="), true), "veto: indented-code bare call");
         CHECK(!parser_declines_opener(wrapped, at(wrapped, "<tool_call>"), false), "veto: wrapped call after prose");
         CHECK(parser_declines_opener(wrapped_fenced, at(wrapped_fenced, "<tool_call>"), false), "veto: fenced wrapped call");
         CHECK(parse(prose + "<parameter=path>a</parameter></function>", call, error,

@@ -2691,7 +2691,10 @@ static void test_model_depth_guard() {
         std::string pre, rem;
         deep_calls = q27::parse_bare_tool_calls(deep, &pre, &tools, true, true, &rem).size();
         fine_calls = q27::parse_bare_tool_calls(fine, &pre, &tools, true, true, &rem).size();
-        strict_deep_ok = q27::parse_tool_call(deep.substr(11, deep.size() - 23)).ok;
+        const std::string deep_seg = deep.substr(11, deep.size() - 23);
+        const auto strict_deep = q27::parse_tool_call(deep_seg);
+        strict_deep_ok = strict_deep.ok;
+        ok(strict_deep.raw == deep_seg, "model depth guard: refused segment keeps its raw bytes");
         q27::recover_unclosed_tool_tail(deep.substr(0, deep.size() - 14), &tools,
                                         [&](const std::string&) { tail_called = true; },
                                         [](const q27::ToolCall&) { return true; });
