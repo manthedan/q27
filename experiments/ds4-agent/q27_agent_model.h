@@ -11,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace q27::native_agent {
 
@@ -111,35 +112,54 @@ inline std::string xml_parameter_unescape(const std::string& value) {
     return out;
 }
 
-// Markdown/markup state at pos, from one scan of text[scope_start, pos) --
-// only text BEFORE the opener, so the engine (which sees just that prefix)
-// and the parser always agree:
-//  - fenced: inside a ``` / ~~~ fence (up to 3 spaces of indent);
-//  - inline_code: after an unmatched backtick run on the opener's own line;
-//  - nested: an unclosed <function=/<parameter= in prose (depth counted;
-//    tags inside fences and inline code spans are literal text and ignored).
-struct AnswerMarkup {
-    bool fenced = false;
-    bool inline_code = false;
-    bool nested = false;
+// Where the answer starts: just after the reasoning span's close, i.e. the
+// FIRST </think> when the turn opened with <think> (the engine emits
+// "<think>\n" into the parsed stream), else npos (no reasoning span). A
+// literal </think> later is text and never moves it.
+inline size_t answer_start(const std::string& text) {
+    size_t i = 0;
+    while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
+                               text[i] == '\r' || text[i] == '\n')) i++;
+    if (text.compare(i, 7, "<think>") != 0) return std::string::npos;
+    const size_t close = text.find("</think>", i + 7);
+    return close == std::string::npos ? close : close + 8;
+}
+
+struct OpenerCandidate {
+    size_t pos;
+    bool bare; // <function= without a <tool_call> wrapper
 };
 
-inline AnswerMarkup answer_markup_at(const std::string& text, size_t pos,
-                                     size_t scope_start = 0) {
+// The native agent's one rule for tool-call openers, shared by the engine's
+// constraint veto and q27_agent_parse_tool_call. Returns the index of the
+// first candidate (sorted by pos) that is a real call, or npos. One left-to-
+// right pass; each decision reads only text BEFORE the opener, so the
+// engine (which sees just that prefix) and the parser always agree.
+// Scope: from the start, reset at answer_start() for openers after it.
+// An opener is an example (declined) when it is
+//  - inside a ``` / ~~~ fence (up to 3 spaces of indent);
+//  - after an unmatched backtick run on its own line (inline code: the
+//    engine stops before the closing backtick);
+//  - nested in an unclosed <function=/<parameter= in prose (depth counted;
+//    tags in fences and inline code are literal text);
+//  - bare, and not the first non-whitespace of the scope or indented more
+//    than 3 spaces / not alone at the start of its line.
+inline size_t first_accepted_opener(const std::string& text,
+                                    const std::vector<OpenerCandidate>& cands) {
     static const std::string fopen = "<function=", fclose = "</function>",
                              popen = "<parameter=", pclose = "</parameter>";
-    AnswerMarkup m;
-    bool open = false;
+    const size_t scope_at = answer_start(text);
+    bool open = false, prose = true;
     char marker = 0;
-    size_t opening_run = 0;
-    size_t fdepth = 0, pdepth = 0;
-    for (size_t line_start = scope_start; line_start < pos;) {
+    size_t opening_run = 0, fdepth = 0, pdepth = 0, span = 0;
+    bool non_ws = false, line_blank = true;
+    size_t line_spaces = 0;
+    auto classify = [&](size_t line_start) { // fence state for this line
         size_t line_end = text.find('\n', line_start);
         if (line_end == std::string::npos) line_end = text.size();
         const bool in_fence = open;
         bool fence_line = false;
-        size_t p = line_start;
-        size_t indent = 0;
+        size_t p = line_start, indent = 0;
         while (p < line_end && indent < 3 && text[p] == ' ') { p++; indent++; }
         if (p < line_end && (text[p] == '`' || text[p] == '~')) {
             const char run_marker = text[p];
@@ -154,9 +174,8 @@ inline AnswerMarkup answer_markup_at(const std::string& text, size_t pos,
                     fence_line = true;
                 } else if (run_marker == marker && run >= opening_run) {
                     size_t tail = run_end;
-                    while (tail < line_end &&
-                           (text[tail] == ' ' || text[tail] == '\t' ||
-                            text[tail] == '\r')) tail++;
+                    while (tail < line_end && (text[tail] == ' ' || text[tail] == '\t' ||
+                                               text[tail] == '\r')) tail++;
                     if (tail == line_end) {
                         open = false;
                         marker = 0;
@@ -165,94 +184,69 @@ inline AnswerMarkup answer_markup_at(const std::string& text, size_t pos,
                 }
             }
         }
-        if (!in_fence && !fence_line) {
-            const size_t seg_end = line_end < pos ? line_end : pos;
-            for (size_t i = line_start; i < seg_end;) {
-                if (text[i] == '`') {
-                    size_t run_end = i;
-                    while (run_end < seg_end && text[run_end] == '`') run_end++;
-                    const size_t run = run_end - i;
-                    size_t j = run_end, match = std::string::npos;
-                    while (j < seg_end) {
-                        if (text[j] != '`') { j++; continue; }
-                        size_t k = j;
-                        while (k < seg_end && text[k] == '`') k++;
-                        if (k - j == run) { match = k; break; }
-                        j = k;
-                    }
-                    if (match == std::string::npos) {
-                        if (seg_end == pos) m.inline_code = true;
-                        i = run_end;
-                    } else {
-                        i = match; // span content is literal text
-                    }
-                } else if (text.compare(i, fopen.size(), fopen) == 0) {
-                    fdepth++; i += fopen.size();
-                } else if (text.compare(i, fclose.size(), fclose) == 0) {
-                    if (fdepth) fdepth--;
-                    i += fclose.size();
-                } else if (text.compare(i, popen.size(), popen) == 0) {
-                    pdepth++; i += popen.size();
-                } else if (text.compare(i, pclose.size(), pclose) == 0) {
-                    if (pdepth) pdepth--;
-                    i += pclose.size();
-                } else {
-                    i++;
-                }
-            }
+        prose = !in_fence && !fence_line;
+        span = 0;
+    };
+    classify(0);
+    size_t ci = 0;
+    for (size_t i = 0;;) {
+        if (i == scope_at) { // the answer: fresh scope, read as a line start
+            open = false; marker = 0; opening_run = 0;
+            fdepth = pdepth = 0;
+            non_ws = false;
+            classify(i);
         }
-        if (line_end == text.size()) break;
-        line_start = line_end + 1;
+        for (; ci < cands.size() && cands[ci].pos <= i; ++ci) {
+            const OpenerCandidate& c = cands[ci];
+            bool declined = open || (prose && span) || fdepth || pdepth;
+            if (!declined && c.bare) declined = non_ws || !line_blank || line_spaces > 3;
+            if (!declined) return ci;
+        }
+        if (ci == cands.size() || i >= text.size()) break;
+        const char ch = text[i];
+        if (ch == '\n') {
+            i++;
+            line_blank = true;
+            line_spaces = 0;
+            classify(i);
+            continue;
+        }
+        if (ch == ' ') {
+            if (line_blank) line_spaces++;
+        } else {
+            line_blank = false;
+            if (ch != '\t' && ch != '\r') non_ws = true;
+        }
+        if (!prose) { i++; continue; }
+        if (ch == '`') {
+            size_t r = i;
+            while (r < text.size() && text[r] == '`') r++;
+            if (!span) span = r - i;
+            else if (r - i == span) span = 0;
+            i = r;
+        } else if (span) {
+            i++;
+        } else if (text.compare(i, fopen.size(), fopen) == 0) {
+            fdepth++; i += fopen.size();
+        } else if (text.compare(i, fclose.size(), fclose) == 0) {
+            if (fdepth) fdepth--;
+            i += fclose.size();
+        } else if (text.compare(i, popen.size(), popen) == 0) {
+            pdepth++; i += popen.size();
+        } else if (text.compare(i, pclose.size(), pclose) == 0) {
+            if (pdepth) pdepth--;
+            i += pclose.size();
+        } else {
+            i++;
+        }
     }
-    m.fenced = open;
-    m.nested = fdepth > 0 || pdepth > 0;
-    return m;
-}
-
-inline bool top_level_markup_boundary(const std::string& text, size_t pos) {
-    size_t line = text.rfind('\n', pos);
-    line = line == std::string::npos ? 0 : line + 1;
-    size_t spaces = 0;
-    for (size_t i = line; i < pos; ++i) {
-        if (text[i] != ' ') return false;
-        if (++spaces > 3) return false;
-    }
-    return true;
-}
-
-inline bool unambiguous_native_xml_boundary(const std::string& text, size_t pos,
-                                             size_t scope_start = 0) {
-    if (!top_level_markup_boundary(text, pos) || scope_start > pos) return false;
-    for (size_t i = scope_start; i < pos; ++i)
-        if (text[i] != ' ' && text[i] != '\t' &&
-            text[i] != '\r' && text[i] != '\n') return false;
-    return true;
-}
-
-// Where the answer starts: after the reasoning span's close, i.e. the FIRST
-// </think> when the turn opened with <think>, else the start. A literal
-// </think> later (prose, a fenced example, a body tool's payload) is text and
-// never moves it. Openers inside the reasoning span use the start.
-inline size_t answer_scope(const std::string& text, size_t pos) {
-    size_t i = 0;
-    while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
-                               text[i] == '\r' || text[i] == '\n')) i++;
-    if (text.compare(i, 7, "<think>") != 0) return 0;
-    const size_t close = text.find("</think>", i + 7);
-    return close != std::string::npos && close + 8 <= pos ? close + 8 : 0;
+    return std::string::npos;
 }
 
 // Would q27_agent_parse_tool_call decline an opener that starts at pos (text
-// = everything this turn emitted through the opener's token)? Any opener
-// inside a Markdown fence or inline code, or nested in an unclosed
-// <function=/<parameter= (answer_markup_at), is an example; a bare <function= must also be the first thing in the
-// answer. The engine's constraint veto uses this so it never closes a call
-// the parser won't run, and the parser runs the earliest opener it accepts.
+// = everything this turn emitted through the opener's token)?
 inline bool parser_declines_opener(const std::string& text, size_t pos, bool bare) {
-    const size_t scope = answer_scope(text, pos);
-    const AnswerMarkup m = answer_markup_at(text, pos, scope);
-    if (m.fenced || m.inline_code || m.nested) return true;
-    return bare && !unambiguous_native_xml_boundary(text, pos, scope);
+    return first_accepted_opener(text, {{pos, bare}}) == std::string::npos;
 }
 
 inline const nlohmann::json* tool_parameter_properties(

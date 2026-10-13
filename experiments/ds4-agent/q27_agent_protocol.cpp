@@ -713,25 +713,27 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
         std::string text(reinterpret_cast<const char *>(bytes), len);
         static const std::string open = "<tool_call>";
         static const std::string close = "</tool_call>";
-        // The call is the EARLIEST opener, wrapped or bare (XML), that
-        // parser_declines_opener accepts -- the one the engine's veto let the
-        // grammar engage on. Nothing after it is a candidate: a body tool's
-        // fenced payload may hold example calls and a literal </think>, and
-        // those must never be selected over the call the engine closed.
-        size_t begin = text.find(open);
-        while (begin != std::string::npos &&
-               q27::native_agent::parser_declines_opener(text, begin, false))
-            begin = text.find(open, begin + open.size());
-        size_t native_begin = std::string::npos;
-        if (xml_dialect)
-            for (size_t p = text.find("<function="); p != std::string::npos;
-                 p = text.find("<function=", p + 10))
-                if (!q27::native_agent::parser_declines_opener(text, p, true)) {
-                    native_begin = p;
-                    break;
-                }
-        if (native_begin != std::string::npos &&
-            (begin == std::string::npos || native_begin < begin)) {
+        // The call is the EARLIEST opener, wrapped or bare (XML), that the
+        // native opener rule accepts (first_accepted_opener) -- the one the
+        // engine's veto let the grammar engage on. Nothing after it is a
+        // candidate: a body tool's fenced payload may hold example calls and
+        // a literal </think>, and those must never displace the closed call.
+        std::vector<q27::native_agent::OpenerCandidate> openers;
+        for (size_t w = text.find(open), b = xml_dialect ? text.find("<function=") : std::string::npos;
+             w != std::string::npos || b != std::string::npos;) {
+            if (b == std::string::npos || (w != std::string::npos && w < b)) {
+                openers.push_back({w, false});
+                w = text.find(open, w + open.size());
+            } else {
+                openers.push_back({b, true});
+                b = text.find("<function=", b + 10);
+            }
+        }
+        const size_t chosen = q27::native_agent::first_accepted_opener(text, openers);
+        if (chosen == std::string::npos) return Q27_TOOL_CALL_NONE;
+        size_t begin = openers[chosen].bare ? std::string::npos : openers[chosen].pos;
+        const size_t native_begin = openers[chosen].bare ? openers[chosen].pos : std::string::npos;
+        if (native_begin != std::string::npos) {
             const size_t native_close = text.find("</function>", native_begin);
             size_t native_end = std::string::npos;
             if (native_close != std::string::npos) {
@@ -762,7 +764,6 @@ extern "C" q27_agent_tool_call_status q27_agent_parse_tool_call(
             text.insert(native_begin, open);
             begin = native_begin;
         }
-        if (begin == std::string::npos) return Q27_TOOL_CALL_NONE;
         const size_t call_start = begin + open.size();
         const size_t end = text.find(close, call_start);
         if (end == std::string::npos) {
