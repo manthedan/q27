@@ -353,8 +353,9 @@ __device__ __forceinline__ float am_unpack_val(unsigned long long p) {
 
 __global__ void k_argmax_reset(unsigned long long* best) { *best = 0; }
 
-__global__ void k_argmax(const float* __restrict__ x, int n,
+__global__ void k_argmax(const float* __restrict__ x, int n, const int* __restrict__ n_dev,
                          unsigned long long* __restrict__ best) {
+    if (n_dev) n = *n_dev; // Q27_DRAFT_VOCAB: the live row count, past the graph-baked n
     float bv = -FLT_MAX;
     int bi = 0;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
@@ -374,9 +375,10 @@ __global__ void k_argmax_extract(const unsigned long long* best, int* out) {
     *out = am_unpack_idx(*best);
 }
 
-void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cudaStream_t st) {
+void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cudaStream_t st,
+            const int* n_dev) {
     k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
-    k_argmax<<<128, 256, 0, st>>>(x, n, d_scratch);
+    k_argmax<<<128, 256, 0, st>>>(x, n, n_dev, d_scratch);
     k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -388,9 +390,10 @@ void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cu
 // Launch grid matches k_argmax (<<<128,256>>>) so the per-thread index partition --
 // hence every tie-break -- is identical. Margin is pure selection (no fp arithmetic
 // besides the final subtract) so it equals k_margin's value order-independently.
-__global__ void k_argmax_top2(const float* __restrict__ x, int n,
+__global__ void k_argmax_top2(const float* __restrict__ x, int n, const int* __restrict__ n_dev,
                               unsigned long long* __restrict__ blk1,
                               float* __restrict__ blk2) {
+    if (n_dev) n = *n_dev;
     float v1 = -FLT_MAX, v2 = -FLT_MAX;
     int i1 = 0;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
@@ -449,8 +452,8 @@ __global__ void k_top2_finalize(const unsigned long long* __restrict__ blk1,
 }
 
 void argmax_margin(const float* x, int n, int* d_tok, float* d_margin,
-                   unsigned long long* d_blk1, float* d_blk2, cudaStream_t st) {
-    k_argmax_top2<<<128, 256, 0, st>>>(x, n, d_blk1, d_blk2);
+                   unsigned long long* d_blk1, float* d_blk2, cudaStream_t st, const int* n_dev) {
+    k_argmax_top2<<<128, 256, 0, st>>>(x, n, n_dev, d_blk1, d_blk2);
     k_top2_finalize<<<1, 128, 0, st>>>(d_blk1, d_blk2, 128, d_tok, d_margin);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -618,7 +621,14 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
             __syncthreads();
             // Once the support has exactly k members, further bisection
             // cannot change it. The shared count makes this branch uniform.
-            if (sh[0] == (float)top_k) break;
+            // Every thread reads sh[0] here and thread 0 overwrites it with
+            // its next partial count before the next barrier, so the read
+            // must complete under a barrier of its own (2026-10-10 sweep: a
+            // warp stalled across that window could break one iteration
+            // early and desynchronize the rest of the block's barriers).
+            const bool support_exact = sh[0] == (float)top_k;
+            __syncthreads();
+            if (support_exact) break;
         }
         if (t == 0) s_pre = fmaxf(s_pre, s_hi); // s_hi keeps <= k tokens
         __syncthreads();

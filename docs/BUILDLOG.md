@@ -15714,6 +15714,192 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-10 (bf): fourth bug sweep -- request semantics against a live server, the engine lifecycle, prefill, and the KV kernels
+
+Four read-only reviews over the remaining unread surfaces (request-feature
+semantics in api_common.h/server.cu; the engine's per-request lifecycle;
+prefill.cu + the shared arena; kv_pool + the decode attention/KV-format
+kernels and the samplers), every CPU suite plus the nine orphan test
+binaries, `make fuzz` (592,842 runs / 20 min, clean) and `make fuzz-schema`
+(1,280,475 runs / 20 min, clean), and -- new this time -- a black-box
+probe of 25 request features against a live production-config server
+(default tier + DFlash2 Q8, prefix cache on; then the 2-slot conductor
+config with a 4-request burst) plus old-vs-new binary A/Bs on the 5090.
+The sm_120 canonicals were re-gated under the CUDA 13.2.2 toolkit first:
+default tier 8cf639c2..., q4s 10e654eb..., 1500-token 8f735a13, all equal
+to the published values.
+
+**Fixed (request handling):**
+- `max_tokens` 0 or negative was a 200 with an empty message on all three
+  APIs (Anthropic returns 400); OpenAI `n>1` silently returned one choice.
+  Both are 400s now.
+- The Responses bridge rendered Codex's `function_call` history items in
+  the JSON dialect regardless of the boot dialect (XML on a 3.8 boot, so the
+  preamble said XML and the history showed JSON). It uses the boot dialect.
+- A user message mixing `tool_result` and `text` blocks glued the text onto
+  the tool block (`</tool_response>text` inside one tool turn); the kinds
+  now render as separate user messages in document order (tool responses
+  grouped, text as its own turn). Claude Code never sends that shape on our
+  recorded traffic (0 of 13,205 array-content user messages in 837
+  requests), so this is fidelity, not a live defect. llama.cpp's own
+  conversion puts the text turn BEFORE the tool results; document order was
+  kept here.
+- Image and document blocks (in user content and inside tool_result arrays)
+  vanished silently, so the model answered about content it never saw;
+  they leave `[image omitted: this model is text-only]`.
+- `stop_sequences` / OpenAI `stop` are NOT implemented: the server now logs
+  that it is ignoring them. Not built: no recorded request (2,229) carries
+  them; the only optional field real traffic uses is `metadata`.
+
+**Fixed (kernels/engine):**
+- The nucleus sampler's top-k bisection read the shared count for its
+  uniform early exit after a barrier that thread 0 could already have
+  crossed to overwrite it (blocks.cu): a read-after-barrier race. One extra
+  barrier. Seeded sampled texts are byte-identical old vs new (two prompts,
+  5090).
+- The fdmma verify gate admitted widths up to W_PLUMB (16) while its partial
+  scratch and logits2 hold W_MAX (12) lanes -- latent (sfx_w is clamped);
+  the gate reads W_MAX, which cuda_common.h now defines for translation
+  units that never include engine.cuh.
+- `static_assert(PF_T % 16 == 0)`: the prefill attention indexes split
+  partials by ceil(SB/16)*16 rows against a PF_T-row arena buffer.
+- The prefix-cache compat key includes the drafter mode: under DFlash2 the
+  prefill skips the MTP warm, so an entry written then and restored by a
+  ladder boot carried stale MTP rows (acceptance loss until re-warmed).
+  Existing roots go cold once, as with the (ba) key change.
+
+**Reviewed, measured, NOT changed:** the "stable snapshot demoted on a
+re-send" finding (engine.cuh snap_upto). The reading was right about the
+mechanism and wrong about the consequence: on the 3.8 renderer the NP-1
+tail snapshot DOES prefix-match the following turn (the history render of
+the assistant turn starts with the same `<think>\n` the prefill ended
+with). Old-vs-new A/B, identical request twice then a continuation: old
+binary hit 756 of 785 tokens, the "fixed" one 752. Reverted before commit;
+the 07-24 comment that said NP-1 can never match is corrected.
+
+**Found, not fixed:** assistant prefill is rendered as a closed turn plus
+a fresh assistant turn (the model continued correctly in the probe);
+`previous_response_id`, `truncation`, `response_format`, `logprobs`, the
+penalty fields are ignored; Responses history drops `reasoning` items
+(prior-turn thinking is not re-fed, unlike the Messages path);
+`disable_parallel_tool_use` lets a second call leak as text;
+`reasoning_close_fits` lets a close land with zero answer tokens at exactly
+one token count at the context edge; a P16b shared-cut restore carries one
+foreign MTP KV row; two unusable pages per lineage at max_ctx % 64 == 0;
+cache usage fields are absent. The (ba)/(be) open items stand.
+
+**Clean (live):** assistant prefill continues, system arrays with
+cache_control, every tool_choice mode on both APIs, tool_result content
+arrays, tool round trips on all three APIs, count_tokens == usage
+input_tokens (365/365), a client disconnect mid-stream (server healthy,
+"client-stop"), max_tokens 1 and 1e9, stream_options.include_usage +
+[DONE], Responses incomplete_details; the 2-slot burst had no cross-talk.
+**Clean (reviews):** arena serialization under the GPU gate, chunk padding
+and GDN carry, the T3 staging order, DFlash2 tap windows, every pfx_import
+path, per-slot state reset on every entry, cancellation at round
+boundaries only, Philox keying (forced rounds do not perturb seed replay),
+page-table edges and the MTP +1 row, the six KV row-size mirrors, split-K
+empties, sampler fallbacks.
+
+## 2026-10-07 (be): third bug hunt -- the plain-lanes forced close was broken both ways, a grammar cache that mixed schemas, a re-engage that never fired, and the pack loaders
+
+Four independent read-only reviews over surfaces no earlier hunt had read
+(the draft-vocab diff; dflash2.cu + conductor.h + suffixdraft.h + the spec3
+accept loops; the file-format boundary: loader.cpp, tokenizer.cpp,
+device_model.cu, the prefix caches; the output side: stream_split, toolgram,
+toolconstrain, drift_capture, sampling, the SSE emitters), every CPU suite
+including the nine test binaries `make test-tools` does not run
+(test_auth/conductor/depthctl/manifest/prefix_cache/sampling/suffixdraft,
+test_tokenizer --selftest, test_argmax_tie), the parser fuzzer for 15 min
+(448,753 runs, clean), a NEW schema-varying fuzzer (`make fuzz-schema`:
+the tool list rides in the input; 1,253,913 runs in 10 min, clean), and 3090
+probes for everything a reading could not settle. Every finding below was
+reproduced or its test shown to fail on the old code before the fix.
+
+**Fixed:**
+
+- **A forced reasoning close on a plain-lanes pack (Bonsai 2 without the MTP
+  head, no DFlash2 -- the 8/12 GB installer's default pack) was wrong in BOTH
+  serving modes.** The plain token/sample rounds run the pending-EMITTED
+  convention; the forced-close install replaced the last emitted token in
+  d_token. Solo (Q27_BATCH=0): the round forwarded the close and emitted its
+  successor flagged forced -- the model answered, the client never saw the
+  close, the whole answer streamed as reasoning (`--think-budget 64`: solo
+  "thinking:1043 chars, no text block" vs batch "330 | 651"). Batch: the
+  member took the solo forced round (needs_solo_round ran before
+  always_fused), whose plain_first path emitted the close WITHOUT forwarding
+  it, and the next fused round re-snapshotted the stale pending: a doubled
+  token and the model reasoning on past its "close" ("NeedNeed final only one
+  sentence.\n</think>\n\nThe capital..." in the TEXT channel). Reachable
+  with `--think-budget N>0` or `--request-think` budgets; the installer and
+  README recipes pass `--think-budget 0`, so stock setups never tripped it.
+  Fix: decode_step's plain forced branch forwards the last emitted token
+  (its successor discarded), then installs the close as the pending and
+  emits it, the way the Q27_SAMPLE_PLAIN branch already did (first round:
+  the close takes the unemitted pending's place); the conductor keeps
+  always-fused members on the fused path, where prep_round snapshots the
+  installed close as the round's pending. Probe (3090, T3 slim pack, four
+  prompts, greedy): solo == batch byte-identical, close at the cap, answer in
+  TEXT; the T3+MTP pack (ladder, unaffected) byte-identical before and after.
+- **Q27_DRAFT_VOCAB pad rows duplicated row 0, so the top-1/top-2 margin was
+  0 whenever token 0 was the draft** and the depth gate exited after one
+  token. The argmax kernels take an optional device-side row count
+  (graph-safe); dv_set_context/dv_observe publish the live count after the
+  rows it covers. Also off under Q27_DFLASH2 (63 MB and a per-request
+  gather for a head DFlash2 never reads), and freed in ~Engine. CLI bitwise
+  at six shapes (321-row to full-vocab heads), memcheck 0 errors.
+- **The XML tool grammar's mask cache (`--constrain-tools`) keyed the
+  </function>-reachable states on emitted bits + the required key only**;
+  the bits index the current tool's sorted parameter list, so tool A {a,b}
+  after `a` and tool B {b,c} after `b` shared a signature with opposite
+  answers on closing -- and the cache is server-global. The signature now
+  carries every tool's parameter and required lists. test_toolconstrain
+  reproduces (2 FAILED on the old key).
+- **Bare `<function=` re-engage (issue #35, default-on) never fired on a
+  real stream**: `bp + 9 > start` needs the opener's `=` to be a token's
+  second-or-later byte, and the pre-tokenizer always starts a token at `=`
+  (it ends the letter run). The unit test packed the opener into one token.
+  Fixed to `bp + 10`; a test with the real split fails on the old code
+  (3 checks).
+- **A tool-call value nested tens of thousands deep crashed the worker**:
+  nlohmann parses iteratively, then the arguments copy and dump() recurse;
+  "[[[[" is one BPE token. The request-side scanner (ba) is now
+  `json_nesting_exceeds` and guards parse_tool_call, parse_bare_tool_calls
+  and recover_unclosed_tool_tail (deep segments stay prose). Test.
+- **The .d2w DFlash2 pack loader validated nothing**: `ndim` from the file
+  into `int64_t dims[4]` (a 512-byte stack write at ndim 64), nbytes/sbytes
+  past the end of the host buffer into cudaMemcpy, rows that overran the
+  D2_*-sized device buffers. Every length is now checked against the file,
+  every tensor's bytes against its dtype and dims, and the set against a
+  manifest of the 81 tensors (+ the optional target copies). The three real
+  packs load and decode as before (3090: Bonsai Q8 94.7 t/s, q4s + Q8
+  106.8, q4s + Q4 107.0); a truncated pack and an ndim-64 pack are refused
+  with the tensor named.
+- **tokenizer**: an empty added token matched forever in encode() (skipped);
+  the server refuses a .tok with more tokens than the model's vocab (nothing
+  downstream clamps ids; token_embd was read past its end on the device);
+  the CLI's --tokens rejects ids outside [0, VOCAB).
+- **loader.cpp**: meta_len and n_tensors are checked against the file
+  before the resize/reserve (a corrupt header was a bad_alloc abort).
+
+**Measured, not changed:** the splitter's rescans after a provisional closer
+inside a long tool value are quadratic but cheap: 24 ms per 100 KB value,
+227 ms at 300 KB, in 5-byte feeds.
+
+**Found, not fixed:** an engine error mid-stream ends the body without a
+terminal SSE event (clients see EOF, not a hang); a stray `</think>` in TEXT
+reaches the client as text; the mask cache never evicts (--constrain-tools);
+`.pf4` sidecars bypass the tensor manifest (Q27_PREFILL=fp4); the streaming
+classify paths lack the span guard their batch twins have (no mode returns
+npos today); Q27_BONSAI_FUSED=0 serializes members (A/B lever); the (ba) KV
+items stand.
+
+**Clean:** every CPU suite; both fuzzers; the reviews' checked lists --
+dflash2 ring retention/width/accept loops and the sampled residuals,
+suffixdraft sync/eviction, the conductor's union bound/graph key/shutdown
+order, loader bounds arithmetic for all 8 dtypes, prefix-cache size checks
+and the compat key, SSE block indices, the sampler's clamps.
+
 ## 2026-10-05 (bd): Qwen3.8-27B-pi -- same gold, 30% less wall on the agentic campaign, and the base drafter accepts more
 
 bytkim/Qwen3.8-27B-pi (Apache-2.0; SFT on successful Pi agent-harness coding

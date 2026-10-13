@@ -757,6 +757,14 @@ int main(int argc, char** argv) {
     // the post-upload block below; no legacy 8192 fallback.
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);
+    // A .tok with more tokens than the model's embedding rows can encode ids
+    // the device would read past token_embd (nothing downstream clamps them);
+    // the wrong tokenizer file is a one-line error here instead (2026-10-07).
+    if (tok.vocab_size() > (size_t)VOCAB) {
+        fprintf(stderr, "tokenizer: %zu tokens, the model's vocab is %d -- wrong .tok for this model\n",
+                tok.vocab_size(), VOCAB);
+        return 1;
+    }
     const std::vector<int> think_close_ids = tok.encode("</think>\n\n");
     fprintf(stderr, "loading model...\n");
     // P10-A1: weights owned here and shared into the Engine(s) by reference.
@@ -1049,6 +1057,13 @@ int main(int argc, char** argv) {
                                       (int64_t)st.st_mtim.tv_nsec, (int64_t)st.st_ino,
                                       (int64_t)st.st_dev};
                 model_bytes = q27::pfx_fnv1a64(id, sizeof id, 0xcbf29ce484222325ULL);
+                // The drafter mode is part of what an entry holds: under
+                // DFlash2 the prefill skips the MTP warm, so an entry written
+                // then and restored by a ladder boot carries stale MTP rows
+                // (acceptance collapses until decode re-warms them; output is
+                // unaffected). One root per mode (2026-10-10 sweep).
+                const int64_t drafter = getenv("Q27_DFLASH2") ? 2 : 1;
+                model_bytes = q27::pfx_fnv1a64(&drafter, sizeof drafter, model_bytes);
             }
         }
         const uint64_t compat =
@@ -2486,6 +2501,16 @@ int main(int argc, char** argv) {
         // explicitly (a grad-level trace wants 16K+). jint/jbool: a
         // present-but-null field reads as absent (see parse_sample).
         int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Chat);
+        // 2026-10-10 sweep: max_tokens 0/negative was a 200 with an empty
+        // choice; n>1 silently returned one choice; stop was ignored.
+        if (n_max < 1 || q27::jint(body, "n", 1) != 1) {
+            res.status = 400;
+            res.set_content(json{{"error", {{"message", n_max < 1 ? "max_tokens must be at least 1" : "n must be 1 (parallel choices are not supported)"},
+                                            {"type", "invalid_request_error"}}}}.dump(), "application/json");
+            return;
+        }
+        if (body.contains("stop") && !body["stop"].is_null())
+            fprintf(stderr, "[chat] stop sequences are not implemented; the request's stop is ignored\n");
         bool stream = q27::jbool(body, "stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the
@@ -3242,6 +3267,10 @@ int main(int argc, char** argv) {
         try { body = q27::parse_request_body(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
         int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Messages); // unified default (see /v1/chat/completions)
+        if (n_max < 1) { anthropic_400(res, "max_tokens: must be greater than or equal to 1"); return; }
+        if (body.contains("stop_sequences") && body["stop_sequences"].is_array() && !body["stop_sequences"].empty())
+            fprintf(stderr, "[messages] stop_sequences are not implemented; the request's %zu sequence(s) are ignored\n",
+                    body["stop_sequences"].size());
         bool stream = q27::jbool(body, "stream", false);
         auto tk0 = std::chrono::steady_clock::now();
         // Echo the client's requested model name in the response, as the
@@ -3927,8 +3956,10 @@ int main(int argc, char** argv) {
                         } else {
                             args = {{"input", q27::jstr(it, "input")}};
                         }
+                        // the BOOT dialect (XML on a 3.8 boot): until 2026-10-10 this
+                        // rendered Codex's call history as JSON under an XML preamble
                         msgs.push_back({"assistant",
-                                        q27::tool_call_text(q27::jstr(it, "name"), args)});
+                                        q27::tool_call_text_dialect(q27::jstr(it, "name"), args)});
                     } else if (ty == "function_call_output" || ty == "custom_tool_call_output") {
                         std::string out;
                         if (it.contains("output")) {
@@ -3952,6 +3983,12 @@ int main(int argc, char** argv) {
         }
 
         int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Responses); // unified default (see /v1/chat/completions)
+        if (n_max < 1) {
+            res.status = 400;
+            res.set_content(json{{"error",{{"message","max_output_tokens must be at least 1"},
+                                             {"type","invalid_request_error"}}}}.dump(), "application/json");
+            return;
+        }
         // P16 does not apply to this shape (no stable_off / sys_off is computed
         // here), but the engine field is per-engine state -- set it so a
         // previous request's value cannot leak into this one.

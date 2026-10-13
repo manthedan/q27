@@ -541,6 +541,13 @@ struct ToolGrammarXml {
             }
         }
         cur_allow_additional_ = true;
+        // The whole schema, not just the names: token legality in the
+        // </function>-reachable states reads emitted_ bits against the
+        // CURRENT tool's sorted parameter list, and in NAME a token can run
+        // on into "<parameter=k", so two requests whose tools share names
+        // and emitted-bit patterns but differ in parameters must never share
+        // a cached mask (bug hunt 2026-10-07; the cache is server-global). The
+        // present/additionalProperties flags change legality the same way.
         schema_key_.clear();
         for (bool present : schema_present_) schema_key_ += present ? '1' : '0';
         schema_key_ += ':';
@@ -829,7 +836,7 @@ struct ToolGrammarXml {
     std::string required_key_;
     std::string names_key_;
     std::string cur_params_key_;
-    std::string schema_key_;
+    std::string schema_key_; // every tool's flags, params + required (see reset)
     std::string name_pref_;
     std::string key_pref_;
     std::string lit_word_;

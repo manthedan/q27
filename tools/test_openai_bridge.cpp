@@ -258,6 +258,38 @@ static void test_anthropic_msgs_system_array_of_strings() {
     }
 }
 
+// 2026-10-10: a user message mixing tool_result and text blocks renders as
+// two messages (the <tool_response> group, then the text as its own user
+// turn), in document order; until then the text was glued onto the end of
+// the tool block. Image/document blocks leave a marker instead of vanishing.
+static void test_anthropic_msgs_mixed_tool_result_and_text_split() {
+    json body = json::parse(R"({"messages":[{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"t1","content":"out1"},
+        {"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"out2"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]},
+        {"type":"text","text":"<system-reminder>r</system-reminder>"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}]})");
+    auto msgs = q27::anthropic_msgs(body);
+    CHECK(msgs.size() == 2);
+    if (msgs.size() == 2) {
+        CHECK(msgs[0].role == "user" && msgs[0].content.rfind("<tool_response>", 0) == 0);
+        CHECK(msgs[0].content.find("out1") != std::string::npos && msgs[0].content.find("out2") != std::string::npos);
+        CHECK(msgs[0].content.find("[image omitted: this model is text-only]") != std::string::npos);
+        CHECK(msgs[0].content.find("system-reminder") == std::string::npos);
+        CHECK(msgs[1].role == "user");
+        CHECK(msgs[1].content == "<system-reminder>r</system-reminder>[image omitted: this model is text-only]\n");
+    }
+    // text BEFORE the tool results keeps document order too
+    json body2 = json::parse(R"({"messages":[{"role":"user","content":[
+        {"type":"text","text":"lead"},{"type":"tool_result","tool_use_id":"t1","content":"out"}]}]})");
+    auto m2 = q27::anthropic_msgs(body2);
+    CHECK(m2.size() == 2);
+    if (m2.size() == 2) { CHECK(m2[0].content == "lead"); CHECK(m2[1].content.rfind("<tool_response>", 0) == 0); }
+    // a tool-results-only message is still ONE message (the grouped turn)
+    json body3 = json::parse(R"({"messages":[{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"t1","content":"a"},{"type":"tool_result","tool_use_id":"t2","content":"b"}]}]})");
+    CHECK(q27::anthropic_msgs(body3).size() == 1);
+}
+
 static void test_anthropic_msgs_tool_result_bare_string_content() {
     json body = json::parse(R"({"messages":[{"role":"user","content":[
         {"type":"tool_result","content":["bare",{"type":"text","text":"out"}]}]}]})");
@@ -3340,6 +3372,7 @@ int main() {
     test_anthropic_msgs_bare_string_content_part_skipped();
     test_anthropic_msgs_system_array_of_strings();
     test_anthropic_msgs_tool_result_bare_string_content();
+    test_anthropic_msgs_mixed_tool_result_and_text_split();
     test_anthropic_tools_non_array_and_non_object_entries();
     test_tool_choice_absent_is_auto();
     test_tool_choice_none();
